@@ -4512,9 +4512,11 @@ fn refuse_reserved_install_targets(
 ) -> anyhow::Result<()> {
     for target in manifest_install_targets(manifest, platform) {
         anyhow::ensure!(
-            !Path::new(target)
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().ends_with(REPLACEMENT_SUFFIX)),
+            !Path::new(target).components().any(|part| {
+                part.as_os_str()
+                    .to_string_lossy()
+                    .ends_with(REPLACEMENT_SUFFIX)
+            }),
             "install path {target} uses the reserved replacement suffix {REPLACEMENT_SUFFIX}"
         );
     }
@@ -4523,8 +4525,8 @@ fn refuse_reserved_install_targets(
 
 /// Removes what an interrupted replacement left beside the installed trees this
 /// manifest names. Only owned real directories under the data root are visited
-/// or removed, and never a path the manifest itself names. The caller holds the
-/// installation writer.
+/// or removed, and never a path the manifest names or one that holds such a path.
+/// The caller holds the installation writer.
 fn remove_replacement_leftovers(
     data_dir: &Path,
     manifest: &ComponentsManifest,
@@ -4558,7 +4560,7 @@ fn remove_replacement_leftovers(
             }
         }
         let leftover = replacement_scratch(&directory, name);
-        if real && !named.contains(&leftover) {
+        if real && !named.iter().any(|target| target.starts_with(&leftover)) {
             remove_replacement_leftover(&leftover, owner)?;
         }
     }
@@ -4736,22 +4738,32 @@ pub(crate) mod tests {
 
     #[test]
     fn replacement_suffix_is_reserved_for_scratch() {
-        let root = tempfile::tempdir().unwrap();
-        let data = root.path();
-        let manifest = replacement_manifest(&[
-            ("bundle", "tools/bundle"),
-            ("collides", "tools/.bundle.elastos-replace"),
-        ]);
-        let named = data.join("tools/.bundle.elastos-replace");
-        fs::create_dir_all(named.join("installed")).unwrap();
+        for collides in [
+            "tools/.bundle.elastos-replace",
+            "tools/.bundle.elastos-replace/bar",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path();
+            let manifest =
+                replacement_manifest(&[("bundle", "tools/bundle"), ("collides", collides)]);
+            let installed = data.join(collides).join("installed");
+            fs::create_dir_all(&installed).unwrap();
 
-        let error = remove_replacement_leftovers(data, &manifest, &detect_platform()).unwrap_err();
-        assert!(error.to_string().contains("reserved"), "{error:#}");
-        assert!(named.join("installed").is_dir());
-        assert!(admit_release_components(&manifest, &detect_platform())
-            .unwrap_err()
-            .to_string()
-            .contains("reserved"));
+            let error =
+                remove_replacement_leftovers(data, &manifest, &detect_platform()).unwrap_err();
+            assert!(
+                error.to_string().contains("reserved"),
+                "{collides}: {error:#}"
+            );
+            assert!(installed.is_dir(), "{collides}");
+            assert!(
+                admit_release_components(&manifest, &detect_platform())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reserved"),
+                "{collides}"
+            );
+        }
     }
 
     // tokio Mutex so the async prerequisite test can hold the guard across
