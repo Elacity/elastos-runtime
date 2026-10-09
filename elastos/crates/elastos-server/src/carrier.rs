@@ -11246,6 +11246,9 @@ pub(crate) mod tests {
         pub(crate) requests: Arc<StdMutex<Vec<serde_json::Value>>>,
         /// Fixed wait before every answer, standing in for one network round trip.
         pub(crate) delay: Duration,
+        /// When set, reads are answered one at a time, the delay included,
+        /// like a provider bridge that serializes its requests.
+        pub(crate) serial: Option<tokio::sync::Mutex<()>>,
     }
 
     #[async_trait::async_trait]
@@ -11266,8 +11269,12 @@ pub(crate) mod tests {
             &self,
             request: &serde_json::Value,
         ) -> std::result::Result<serde_json::Value, ProviderError> {
+            let _turn = match &self.serial {
+                Some(serial) => Some(serial.lock().await),
+                None => None,
+            };
             let mut logged = request.clone();
-            logged["_fixture_received_at_ms"] = serde_json::json!(std::time::SystemTime::now()
+            logged["_fixture_served_at_ms"] = serde_json::json!(std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis()
@@ -11432,15 +11439,17 @@ pub(crate) mod tests {
         files: std::collections::BTreeMap<String, Vec<u8>>,
         requests: Arc<StdMutex<Vec<serde_json::Value>>>,
     ) -> HolderRuntime {
-        start_slow_content_holder_runtime(seed, files, requests, Duration::ZERO).await
+        start_slow_content_holder_runtime(seed, files, requests, Duration::ZERO, false).await
     }
 
-    /// As `start_content_holder_runtime`, answering each read after `delay`.
+    /// As `start_content_holder_runtime`, answering each read after `delay`,
+    /// one read at a time when `serialized`.
     pub(crate) async fn start_slow_content_holder_runtime(
         seed: u8,
         files: std::collections::BTreeMap<String, Vec<u8>>,
         requests: Arc<StdMutex<Vec<serde_json::Value>>>,
         delay: Duration,
+        serialized: bool,
     ) -> HolderRuntime {
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(ProviderRegistry::new());
@@ -11461,6 +11470,7 @@ pub(crate) mod tests {
                     files,
                     requests,
                     delay,
+                    serial: serialized.then(|| tokio::sync::Mutex::new(())),
                 }),
             )
             .await
