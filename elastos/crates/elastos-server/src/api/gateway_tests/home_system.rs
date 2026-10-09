@@ -5599,11 +5599,12 @@ async fn system_community_membership_is_home_wide_and_requires_current_owner_aut
             .unwrap();
     principal.role = crate::auth::RuntimePrincipalRole::Guest;
     let mut auth = crate::auth::load_auth_state(dir.path()).unwrap();
-    *auth
+    let current = auth
         .principals
         .iter_mut()
         .find(|entry| entry.principal_id == principal.principal_id)
-        .unwrap() = principal;
+        .unwrap();
+    *current = principal;
     crate::auth::save_auth_state(dir.path(), &auth).unwrap();
     let response = app
         .oneshot(

@@ -719,6 +719,7 @@ impl CollaborationContactStore {
 
     /// Outgoing requests still waiting for the other side: signed by this
     /// profile, unexpired, undecided. These are the People "requested" rows.
+    #[cfg(test)]
     pub(crate) fn outgoing_pending_requests(
         &self,
         now: u64,

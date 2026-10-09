@@ -6982,6 +6982,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let bad_service = CollaborationDiscoveryService {
+            community_membership: local_service.community_membership.clone(),
             authority: local_service.authority.clone(),
             registry: local_service.registry.clone(),
             bootstrap_peers: Arc::new(vec![CollaborationBootstrapPeer {
@@ -7197,6 +7198,7 @@ pub(crate) mod tests {
         registry.register(effects.clone()).await;
 
         let mismatched = CollaborationDiscoveryService {
+            community_membership: service.community_membership.clone(),
             authority: service.authority.clone(),
             registry: service.registry.clone(),
             bootstrap_peers: Arc::new(vec![CollaborationBootstrapPeer {
