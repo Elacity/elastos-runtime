@@ -115,7 +115,13 @@ impl CollaborationTransportDriver {
             }
             Ok(CollaborationTransportIngestion::Incoming(accepted)) => {
                 summary.incoming_acceptances += 1;
-                match self.network.send(accepted.acceptance_receipt_bytes()).await {
+                let Ok(receipt_frame) = self
+                    .core
+                    .prepare_transport_frame(accepted.acceptance_receipt_bytes())
+                else {
+                    return false;
+                };
+                match self.network.send(&receipt_frame).await {
                     Ok(CollaborationCarrierSendOutcome::RemoteBroadcast { .. }) => {
                         summary.acceptance_receipt_broadcasts += 1;
                         true
@@ -661,6 +667,168 @@ mod tests {
     async fn mixed_batch_waits_for_retryable_core_work_but_consumes_deterministic_rejections() {
         let fixture = Fixture::new();
         let core = fixture.core();
+    #[tokio::test]
+    async fn emitted_receipts_round_trip_through_carrier_and_settle_once_after_ack_retry() {
+        use crate::collaboration_product::{
+            chat_message_request_binding, CollaborationChatProductPort,
+        };
+        use crate::collaboration_protocol::verify_collaboration_transport_frame;
+
+        let fixture = Fixture::new();
+        let sender = fixture.core();
+        let recipient_root = fixture._temp.path().join("recipient-data");
+        std::fs::create_dir(&recipient_root).unwrap();
+        let (recipient_key, _) = generate_keypair();
+        let recipient = Arc::new(
+            CollaborationCore::new(
+                &recipient_root,
+                recipient_key,
+                fixture.profile.clone(),
+                fixture.grant.clone(),
+                OPERATION_CAPSULE,
+            )
+            .unwrap(),
+        );
+        let sender_port = CollaborationChatProductPort::new(sender.clone()).unwrap();
+        let recipient_port = CollaborationChatProductPort::new(recipient.clone()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (profile_key, _) = generate_keypair();
+        let sender_profile =
+            crate::collaboration_profile_authority::signed_profile_document_for_test(
+                &profile_key,
+                "Sender Profile",
+                None,
+                1,
+                None,
+                now,
+                vec![sender.test_local_device_did()],
+            )
+            .unwrap();
+        let outgoing = sender_port
+            .prepare_message(
+                chat_message_request_binding(
+                    "wire-round-trip",
+                    "runtime-principal",
+                    "one durable row",
+                    &sender_profile,
+                )
+                .unwrap(),
+                "one durable row",
+                &sender_profile,
+                now,
+            )
+            .unwrap();
+        sender_port
+            .project_prepared_message(&fixture.data_root, &outgoing, None)
+            .unwrap();
+        let sender_carrier = FakeCarrier::new();
+        let recipient_carrier = FakeCarrier::new();
+        let sender_driver = fixture.driver(sender.clone(), sender_carrier.clone()).await;
+        let recipient_driver = fixture
+            .driver(recipient.clone(), recipient_carrier.clone())
+            .await;
+        recipient_carrier.observe_durable_incoming_before_send(recipient.clone());
+        let emitted_frames = |carrier: &FakeCarrier| {
+            carrier
+                .requests()
+                .iter()
+                .filter(|request| request["op"] == "gossip_send")
+                .map(|request| request["message"].as_str().unwrap().as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        };
+
+        sender_carrier.push([send_remote()]);
+        assert_eq!(
+            sender_driver
+                .retry_outgoing_once(now)
+                .await
+                .unwrap()
+                .attempted,
+            1
+        );
+        let message_frames = emitted_frames(&sender_carrier);
+        assert_eq!(message_frames.len(), 1);
+        recipient_carrier.push([
+            peek(0, 1, vec![frame(&message_frames[0])]),
+            send_remote(),
+            FakeReply::Error("ack failed"),
+            peek(0, 1, vec![frame(&message_frames[0])]),
+            send_remote(),
+            ack(0, 1, true),
+        ]);
+        assert!(matches!(
+            recipient_driver.process_incoming_once(now).await.unwrap(),
+            CollaborationIncomingOnceOutcome::RetryRequired(_)
+        ));
+        let handoffs = recipient_port.pending_messages().unwrap();
+        assert_eq!(handoffs.len(), 1);
+        let first_row = recipient_port
+            .project_handoff(&recipient_root, &handoffs[0])
+            .unwrap();
+        let replayed_row = recipient_port
+            .project_handoff(&recipient_root, &handoffs[0])
+            .unwrap();
+        assert_eq!(first_row.seq, replayed_row.seq);
+        assert_eq!(
+            recipient_driver.process_incoming_once(now).await.unwrap(),
+            summary(0, 1)
+        );
+        assert!(recipient_port.pending_messages().unwrap().is_empty());
+        assert_eq!(recipient.summary().unwrap().replay_tombstones, 1);
+
+        // Feed the actual driver output through Carrier's bounded decode and the
+        // sender Core. A raw inner receipt stays refused; its signed frame lands.
+        let receipt_frames = emitted_frames(&recipient_carrier);
+        assert_eq!(receipt_frames.len(), 2);
+        assert_eq!(receipt_frames[0], receipt_frames[1]);
+        let receipt = verify_collaboration_transport_frame(&receipt_frames[0]).unwrap();
+        assert_eq!(receipt.source_endpoint_did(), recipient.local_device_did());
+        sender_carrier.push([
+            peek(
+                0,
+                3,
+                vec![
+                    frame(receipt.envelope_bytes()),
+                    frame(&receipt_frames[0]),
+                    frame(&receipt_frames[1]),
+                ],
+            ),
+            ack(0, 3, true),
+        ]);
+        assert_eq!(
+            sender_driver.process_incoming_once(now).await.unwrap(),
+            CollaborationIncomingOnceOutcome::Acknowledged(CollaborationIncomingOnceSummary {
+                carrier_rejected_frames: 1,
+                remote_acceptances: 2,
+                ..CollaborationIncomingOnceSummary::default()
+            })
+        );
+        assert!(sender.pending_outgoing(now).unwrap().is_empty());
+        assert_eq!(sender.summary().unwrap().remotely_accepted_outgoing, 1);
+        assert_eq!(
+            sender_driver.retry_outgoing_once(now).await.unwrap(),
+            CollaborationOutgoingRetrySummary::default()
+        );
+        assert_eq!(emitted_frames(&sender_carrier), message_frames);
+
+        let session = crate::room_service::start_local_runtime_session(
+            &recipient_root,
+            &recipient.local_device_did(),
+            "Recipient Profile",
+            "Receipt wire regression",
+        )
+        .unwrap();
+        let poll = recipient_port
+            .conversation_poll(&recipient_root, &session.token, 0)
+            .unwrap();
+        assert_eq!(poll.objects.len(), 1);
+        assert_eq!(poll.objects[0].body.as_deref(), Some("one durable row"));
+        assert_eq!(poll.objects[0].seq, first_row.seq);
+    }
+
         let (conflict_key, _) = generate_keypair();
         let (conflict_key, original) = remote_message(&fixture, conflict_key, "original");
         let original_frame = transport_frame(&conflict_key, &original);
