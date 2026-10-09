@@ -3625,7 +3625,14 @@ mod tests {
                 b"previous release provider",
             )
             .unwrap();
-            std::fs::create_dir_all(data.join("tools/.fixture-bundle.tmp-1/partial")).unwrap();
+            // Trees an earlier process's interrupted replacements left behind.
+            let leftovers = [
+                data.join("tools/.fixture-bundle.elastos-replace"),
+                data.join("bin/.fixture-provider.elastos-replace"),
+            ];
+            for leftover in &leftovers {
+                std::fs::create_dir_all(leftover.join("partial")).unwrap();
+            }
             let (_source, server, serving) = crate::setup::tests::carrier_cid_source(
                 &data,
                 &source,
@@ -3664,6 +3671,9 @@ mod tests {
                 catalogue,
                 "{version}"
             );
+            for leftover in &leftovers {
+                assert!(!leftover.exists(), "{version}: {}", leftover.display());
+            }
             admit_installed(&data, &binary);
             assert!(!InstallTransaction::has_pending_recovery(&binary));
         }

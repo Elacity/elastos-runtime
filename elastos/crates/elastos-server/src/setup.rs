@@ -291,6 +291,7 @@ async fn run_with_data_dir(
         list_components(&manifest, &data_dir, &platform);
         return Ok(());
     }
+    remove_replacement_leftovers(&data_dir, &manifest, &platform)?;
 
     // Local Elastos pin path only. Trusted source fetch happens over Carrier.
     let ipfs_gateways = build_gateway_list(&data_dir);
@@ -2863,6 +2864,7 @@ pub(crate) async fn repair_installed_support(
     let components =
         crate::installed_release::read_signed_components(data_dir, binary, source, repair_version)?;
     let manifest: ComponentsManifest = serde_json::from_slice(&components)?;
+    remove_replacement_leftovers(data_dir, &manifest, &detect_platform())?;
     if let Some(trust) = &manifest.model_catalog {
         let dest = data_dir.join(MODEL_CATALOG_FILE);
         if !installed_model_catalog_matches(&dest, trust) {
@@ -4415,18 +4417,85 @@ fn atomic_copy_file(src: &Path, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Beside an installed tree: its staged copy before the exchange, the previous tree
+/// after it. One fixed name per target, so any later writer finds what a crash left.
+fn replacement_scratch(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    let mut scratch = std::ffi::OsString::from(".");
+    scratch.push(name);
+    scratch.push(".elastos-replace");
+    parent.join(scratch)
+}
+
 /// Publishes a complete copy of `src` at `dest`. The previous tree stays in place
 /// until one atomic exchange, so an interruption leaves either tree, never neither.
 fn atomic_copy_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
-    let (parent, tmp) = sibling_scratch(dest)?;
-    remove_path(&tmp)?;
-    copy_dir_recursive(src, &tmp)?;
-    sync_tree(&tmp)?;
-    sync_path(&parent)?;
-    replace_directory(&tmp, dest)?;
-    sync_path(&parent)?;
-    // The scratch name now holds the previous tree, when there was one.
-    remove_path(&tmp)
+    let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
+        anyhow::bail!("Destination has no parent: {}", dest.display());
+    };
+    fs::create_dir_all(parent)?;
+    let scratch = replacement_scratch(parent, name);
+    remove_path(&scratch)?;
+    let swapped = (|| {
+        copy_dir_recursive(src, &scratch)?;
+        sync_tree(&scratch)?;
+        sync_path(parent)?;
+        replace_directory(&scratch, dest)?;
+        sync_path(parent)?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    // Before the exchange the scratch holds the staged copy, after it the previous tree.
+    let removed = remove_path(&scratch);
+    swapped.and(removed)
+}
+
+/// Removes what an interrupted replacement left beside the installed trees this
+/// manifest names. Only real directories under the data root are visited.
+fn remove_replacement_leftovers(
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+    platform: &str,
+) -> anyhow::Result<()> {
+    for component in manifest.external.values() {
+        let metadata_path = component.capsule_metadata.as_ref().and_then(|metadata| {
+            resolve_component_capsule_metadata_install_path(
+                metadata,
+                resolve_component_capsule_metadata_platform_info(metadata, platform),
+            )
+        });
+        for relative in [
+            resolve_install_path(component, resolve_platform_info(component, platform)),
+            metadata_path,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let relative = Path::new(relative);
+            let (Some(parent), Some(name)) = (relative.parent(), relative.file_name()) else {
+                continue;
+            };
+            let mut directory = data_dir.to_path_buf();
+            let mut real = true;
+            for part in parent.components() {
+                let std::path::Component::Normal(part) = part else {
+                    real = false;
+                    break;
+                };
+                directory.push(part);
+                // Owned real directories only; a symlinked or foreign parent is left alone.
+                if !fs::symlink_metadata(&directory).is_ok_and(|meta| {
+                    use std::os::unix::fs::MetadataExt;
+                    meta.is_dir() && meta.uid() == unsafe { libc::geteuid() }
+                }) {
+                    real = false;
+                    break;
+                }
+            }
+            if real {
+                remove_path(&replacement_scratch(&directory, name))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn remove_path(path: &Path) -> anyhow::Result<()> {
