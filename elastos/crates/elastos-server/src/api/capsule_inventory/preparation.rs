@@ -1736,6 +1736,11 @@ async fn prepare_capacity(
                         .unwrap();
                     record.state = PreparationState::Preparing;
                     record.reserved_bytes = charge;
+                    if charge > 0 {
+                        // As at a normal start: this preparation takes the kept
+                        // stage over and its reservation covers those bytes.
+                        state.kept_stage = None;
+                    }
                     inventory.save(&state)?;
                     return Ok(true);
                 }
@@ -9608,6 +9613,106 @@ server.serve_forever()
             &Inventory::open(root.path(), false).unwrap().load().unwrap(),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_preparation_capacity_start_takes_the_kept_stage_over() {
+        struct NoOffers;
+        #[async_trait::async_trait]
+        impl elastos_runtime::provider::Provider for NoOffers {
+            fn name(&self) -> &'static str {
+                "no-offers-fixture"
+            }
+            fn schemes(&self) -> Vec<&'static str> {
+                vec![]
+            }
+            async fn handle(
+                &self,
+                _: elastos_runtime::provider::ResourceRequest,
+            ) -> Result<
+                elastos_runtime::provider::ResourceResponse,
+                elastos_runtime::provider::ProviderError,
+            > {
+                panic!("offers only")
+            }
+            async fn send_raw(
+                &self,
+                request: &serde_json::Value,
+            ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+                assert_eq!(request["op"], "offers_list");
+                Ok(serde_json::json!({"status":"ok","data":{
+                    "schema":"elastos.model.offers-list/v1", "provider":"model-provider",
+                    "protocol_version":"elastos.model-provider/v1",
+                    "offers":[], "offer_revisions":{}
+                }}))
+            }
+        }
+        let (root, failed, registry, _) = kept_stage_fixture().await;
+        registry
+            .register_sub_provider("model", Arc::new(NoOffers))
+            .await
+            .unwrap();
+        // A later Use of the same model waited for capacity.
+        let pending = reserve(
+            root.path(),
+            &caller(&context(), &method("use")),
+            "after-capacity",
+            &failed.package_cid,
+        )
+        .unwrap();
+        {
+            let inventory = Inventory::open(root.path(), false).unwrap();
+            let mut state = inventory.load().unwrap();
+            let record = state
+                .records
+                .iter_mut()
+                .find(|r| r.operation_id == pending.operation_id)
+                .unwrap();
+            record.state = PreparationState::CapacityPending;
+            record.reserved_bytes = 0;
+            inventory.save(&state).unwrap();
+        }
+        let worker = Inventory::open(root.path(), false)
+            .unwrap()
+            .worker_lock()
+            .unwrap();
+        let revalidate: Revalidate = Arc::new(|| Ok(()));
+        assert!(prepare_capacity(
+            root.path(),
+            &registry,
+            &pending.operation_id,
+            &AtomicBool::new(false),
+            &revalidate,
+            &worker,
+        )
+        .await
+        .unwrap());
+        drop(worker);
+        let started = load_operation(root.path(), &pending.operation_id).unwrap();
+        let charge = preparation_charge(started.total_bytes).unwrap();
+        assert_eq!(started.state, PreparationState::Preparing);
+        assert_eq!(started.reserved_bytes, charge);
+        assert_eq!(kept_stage_owner(root.path()), None);
+        // Its reservation alone covers the stage: nothing is counted twice.
+        set_cache_budget(root.path(), charge);
+        require_cache_budget(
+            root.path(),
+            &Inventory::open(root.path(), false).unwrap().load().unwrap(),
+        )
+        .unwrap();
+        // Cancel on the old failed attempt leaves the running preparation's stage.
+        let reply = PreparationOwner::default()
+            .invoke(
+                root.path(),
+                Some(registry),
+                caller(&context(), &method("cancel")),
+                "cancel-old-attempt",
+                &serde_json::json!({"operation_id": failed.operation_id}),
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        assert_eq!(reply["state"], "failed");
+        assert!(stage_weights(root.path()).exists());
     }
 
     #[tokio::test]
