@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use gloo_net::http::Request;
@@ -151,6 +151,7 @@ struct App {
     /// Counts card openings, so a late action response only updates the card
     /// that sent it.
     participant_card_opening: Cell<u64>,
+    participant_contact_requests: RefCell<BTreeSet<String>>,
     /// The name that opened the card: its reference, and the message `seq`
     /// when it was a message sender. Lists re-render, so closing the card finds
     /// that exact name again and returns focus to it.
@@ -561,6 +562,7 @@ pub fn start() -> Result<(), JsValue> {
             .map_err(|error| JsValue::from_str(&error))?,
         picker_request: RefCell::new(None),
         participant_card_opening: Cell::new(0),
+        participant_contact_requests: RefCell::new(BTreeSet::new()),
         participant_card_opener: RefCell::new(None),
         state: RefCell::new(state),
         document: document.clone(),
@@ -741,7 +743,19 @@ impl App {
         {
             Ok(changed) => {
                 let mut shell_summary_changed = false;
+                let mut direct_conversations_changed = false;
                 if self.is_shell_mode() {
+                    if shared_selection_guard
+                        .as_ref()
+                        .is_some_and(|guard| !self.selection_guard_is_current(guard))
+                    {
+                        return;
+                    }
+                    match self.refresh_direct_conversations().await {
+                        Ok(changed) => direct_conversations_changed = changed,
+                        Err(401) => return,
+                        Err(_) => {}
+                    }
                     match self
                         .refresh_shell_summary_for_guard(
                             shared_selection_guard
@@ -771,7 +785,11 @@ impl App {
                 if had_transient_error {
                     self.clear_error();
                 }
-                if changed || had_transient_error || shell_summary_changed {
+                if changed
+                    || had_transient_error
+                    || shell_summary_changed
+                    || direct_conversations_changed
+                {
                     let _ = self.render();
                 }
             }
@@ -1852,12 +1870,14 @@ impl App {
     fn handle_session_loss(&self, detail: &str) {
         self.clear_browser_session_request_storage();
         apply_session_loss(&mut self.state.borrow_mut(), self.is_shell_mode(), detail);
+        // Loss invalidates the request's selection guard. Render it here,
+        // before that stale caller returns without updating the screen.
+        let _ = self.render();
     }
 
     fn handle_direct_authority_loss(&self, status: u16) {
         if status == 401 && self.is_shell_mode() {
             self.handle_session_loss(self.session_loss_detail());
-            let _ = self.render();
         }
     }
 
@@ -2707,13 +2727,35 @@ impl App {
     }
 
     fn open_participant_card(&self, participant_ref: &str, message_seq: Option<u64>) {
-        let Some((name, card)) = self.participant_card_for(participant_ref) else {
+        if self.participant_card_for(participant_ref).is_none() {
             return;
-        };
+        }
         self.participant_card_opening
             .set(self.participant_card_opening.get().wrapping_add(1));
         *self.participant_card_opener.borrow_mut() =
             Some((participant_ref.to_string(), message_seq));
+        let _ = self
+            .participant_card
+            .set_attribute("data-participant-ref", participant_ref);
+        self.render_participant_card(participant_ref);
+        let _ = self.participant_card_close.focus();
+    }
+
+    fn refresh_open_participant_card(&self) {
+        if self.participant_card.hidden() {
+            return;
+        }
+        if let Some(participant_ref) = self.participant_card.get_attribute("data-participant-ref") {
+            if !self.render_participant_card(&participant_ref) {
+                self.close_participant_card(true);
+            }
+        }
+    }
+
+    fn render_participant_card(&self, participant_ref: &str) -> bool {
+        let Some((name, card)) = self.participant_card_for(participant_ref) else {
+            return false;
+        };
         let (state_text, action) = participant_card_copy(&card, self.home_token().is_some());
         let activity = self.participant_activity_for(participant_ref);
         self.participant_card_avatar
@@ -2732,7 +2774,13 @@ impl App {
                 let _ = self
                     .participant_card_action
                     .set_attribute("data-card-action", action);
-                self.participant_card_action.set_disabled(false);
+                self.participant_card_action.set_disabled(
+                    action == "add-contact"
+                        && self
+                            .participant_contact_requests
+                            .borrow()
+                            .contains(participant_ref),
+                );
                 self.participant_card_action.set_hidden(false);
             }
             None => {
@@ -2742,11 +2790,8 @@ impl App {
                 self.participant_card_action.set_hidden(true);
             }
         }
-        let _ = self
-            .participant_card
-            .set_attribute("data-participant-ref", participant_ref);
         self.participant_card.set_hidden(false);
-        let _ = self.participant_card_close.focus();
+        true
     }
 
     fn close_participant_card(&self, return_focus: bool) {
@@ -2803,23 +2848,55 @@ impl App {
                 }
             }
             "add-contact" => {
+                if self
+                    .participant_contact_requests
+                    .borrow()
+                    .contains(&participant_ref)
+                {
+                    return;
+                }
                 self.participant_card_action.set_disabled(true);
                 let opening = self.participant_card_opening.get();
+                self.participant_contact_requests
+                    .borrow_mut()
+                    .insert(participant_ref.clone());
+                let request_token = self.home_token();
                 let app = Rc::clone(self);
                 spawn_local(async move {
                     let result = app.request_contact(&participant_ref).await;
-                    if app.participant_card_opening.get() != opening {
+                    app.participant_contact_requests
+                        .borrow_mut()
+                        .remove(&participant_ref);
+                    if app.home_token() != request_token
+                        || app.participant_card_opening.get() != opening
+                    {
+                        app.refresh_open_participant_card();
+                        return;
+                    }
+                    let Some((_, current)) = app.participant_card_for(&participant_ref) else {
+                        app.close_participant_card(true);
+                        return;
+                    };
+                    if current.relationship != "none" {
+                        app.refresh_open_participant_card();
                         return;
                     }
                     match result {
                         Ok(()) => {
-                            app.participant_card_state
-                                .set_text_content(Some(PARTICIPANT_CARD_REQUEST_SENT));
-                            app.participant_card_action.set_hidden(true);
+                            for participant in &mut app.state.borrow_mut().participants {
+                                if let Some(card) = participant.card.as_mut().filter(|card| {
+                                    card.participant_ref == participant_ref
+                                        && card.relationship == "none"
+                                }) {
+                                    card.relationship = "requested".to_string();
+                                    card.can_add_contact = false;
+                                }
+                            }
+                            app.refresh_open_participant_card();
                         }
                         Err(error) => {
+                            app.refresh_open_participant_card();
                             app.participant_card_state.set_text_content(Some(&error));
-                            app.participant_card_action.set_disabled(false);
                         }
                     }
                 });
@@ -3368,6 +3445,7 @@ impl App {
         } else {
             restore_scroll_position(&self.message_list, previous_message_scroll_top);
         }
+        self.refresh_open_participant_card();
         Ok(())
     }
 
@@ -6045,9 +6123,6 @@ fn object_sender_name(object: &ConversationObjectView) -> &str {
 fn participant_shown_name(participant: &ParticipantView) -> &str {
     &participant.display_name
 }
-
-const PARTICIPANT_CARD_REQUEST_SENT: &str =
-    "Contact request sent. They accept or decline it in Inbox.";
 
 /// The card's status line and its one action (label, action id).
 fn participant_card_copy(

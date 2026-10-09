@@ -124,6 +124,8 @@ async function serveFile(response, pathname) {
 
 function startServer(scenario) {
   const initialDirectRecovery = scenario.startsWith("direct-initial-401");
+  const sharedRecovery = scenario === "shared-poll-401";
+  const contactAcceptance = scenario.startsWith("contact-acceptance");
   const holdBoundary = holdBoundaryForScenario(scenario);
   const holds = {
     "initial-conversations": holdBoundary === "initial-conversations"
@@ -138,6 +140,9 @@ function startServer(scenario) {
     "poll-messages": holdBoundary === "poll-messages"
       ? createHold("poll-messages")
       : null,
+    "contact-request": scenario === "contact-acceptance-held-request"
+      ? createHold("contact-request")
+      : null,
   };
   const trace = {
     cycles: [],
@@ -149,8 +154,30 @@ function startServer(scenario) {
     heldReleases: [],
     leaves: 0,
     pollErrors: 0,
+    rejectSharedPoll: false,
+    peerAccepted: false,
+    contactRequested: false,
+    contactRequests: 0,
+    contactResponses: 0,
+    authPosts: 0,
     requests: [],
   };
+  function pollView() {
+    const poll = configuredPoll();
+    if (contactAcceptance) {
+      poll.participants.push({
+        display_name: "Fixture Friend", profile_verified: true, device_label: "",
+        last_seen_at: 1, local_session_count: 0, is_current_session: false,
+        card: {
+          participant_ref: "participant:fixture-friend",
+          relationship: trace.peerAccepted ? "contact" : trace.contactRequested ? "requested" : "none",
+          conversation_id: trace.peerAccepted ? directConversation().conversation_id : null,
+          can_add_contact: !trace.peerAccepted && !trace.contactRequested, active_now: true,
+        },
+      });
+    }
+    return poll;
+  }
   let directConversationResponses = 0;
   let directMessageResponses = 0;
   const server = createServer(async (request, response) => {
@@ -159,6 +186,7 @@ function startServer(scenario) {
       if (url.pathname.startsWith("/api/apps/chat-room")) {
         trace.requests.push(`${request.method} ${url.pathname}`);
       }
+      if (request.method === "POST" && url.pathname.startsWith("/api/auth/")) trace.authPosts += 1;
       if (request.method === "OPTIONS") {
         response.writeHead(204, {
           "access-control-allow-headers": "content-type,x-elastos-home-token",
@@ -171,8 +199,9 @@ function startServer(scenario) {
         const homeOrigin = `http://127.0.0.1:${server.address().port}`;
         const chatSrc = isDirectSwitchScenario(scenario) || initialDirectRecovery
           ? `/apps/chat-room/?conversation_id=direct%3Asha256%3Afixture-conversation${initialDirectRecovery ? `&home_origin=${encodeURIComponent(homeOrigin)}` : ""}#home_token=test-token`
+          : sharedRecovery ? `/apps/chat-room/?home_origin=${encodeURIComponent(homeOrigin)}#home_token=test-token`
           : "/apps/chat-room/#home_token=test-token";
-        const reconnectHost = initialDirectRecovery ? `<script>
+        const reconnectHost = initialDirectRecovery || sharedRecovery ? `<script>
           window.fixtureReconnects = 0;
           window.addEventListener("message", (event) => {
             const data = event.data;
@@ -255,7 +284,7 @@ function startServer(scenario) {
             status: "connected",
             display_name: "Configured User",
             expires_at: 4_000_000_000,
-            poll: configuredPoll(),
+            poll: pollView(),
           },
           200,
           { "set-cookie": "room-session=fixture-session; Max-Age=300; Path=/; HttpOnly; SameSite=Lax" },
@@ -270,7 +299,26 @@ function startServer(scenario) {
           homeToken: request.headers["x-elastos-home-token"] || null,
           origin: request.headers.origin || null,
         });
-        return json(response, configuredPoll());
+        if (sharedRecovery && trace.rejectSharedPoll) {
+          trace.pollErrors += 1;
+          return json(response, { error: "invalid or expired session" }, 401);
+        }
+        return json(response, pollView());
+      }
+      if (url.pathname === "/api/apps/chat-room/contacts/request" && contactAcceptance) {
+        assert(request.method === "POST", "contact request method differs");
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        assert(JSON.parse(body).participant_ref === "participant:fixture-friend", "foreign participant requested");
+        assert(request.headers["x-elastos-home-token"] === "test-token", "contact request lost Home authority");
+        trace.contactRequests += 1;
+        if (holds["contact-request"]) {
+          holds["contact-request"].reached = true;
+          await holds["contact-request"].promise;
+        }
+        trace.contactRequested = true;
+        trace.contactResponses += 1;
+        return json(response, { status: "requested" });
       }
       if (url.pathname === "/api/apps/chat-room/send") {
         trace.current.sends += 1;
@@ -284,7 +332,7 @@ function startServer(scenario) {
           }
           trace.freshDirectRequests += 1;
         }
-        if (scenario === "single-conversation") {
+        if (scenario === "single-conversation" || (contactAcceptance && !trace.peerAccepted)) {
           return json(response, { conversations: [] });
         }
         directConversationResponses += 1;
@@ -494,6 +542,109 @@ async function runScenario(scenario) {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded" });
     let frame = await chatFrame(page);
+
+    if (scenario === "shared-poll-401") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "Shared recovery bootstrap");
+      const originalFrame = frame;
+      const timeOrigin = await frame.evaluate(() => performance.timeOrigin);
+      const draft = "Keep this Community draft after session loss";
+      await frame.locator("#message-input").fill(draft);
+      assert(!(await frame.locator("#reconnect-button").isVisible()), "Reconnect appeared before session loss");
+      const starts = trace.cycles[0].starts;
+      trace.rejectSharedPoll = true;
+      await frame.locator("#reconnect-button").waitFor({ state: "visible", timeout: 15_000 });
+      assert(trace.pollErrors === 1, "Shared recovery did not admit one poll401", trace);
+      assert(await frame.locator("#reconnect-button").isEnabled(), "lost session offers a disabled Reconnect");
+      assert(await frame.locator("#send-button").isDisabled(), "lost Shared session still permits Send");
+      assert(await frame.locator("#message-input").isDisabled(), "lost Shared session still permits composing");
+      assert(await frame.locator("#message-input").inputValue() === draft, "Shared loss replaced the unsent draft");
+      await frame.locator("#error-text").waitFor({ state: "visible" });
+      assert((await frame.locator("#error-text").innerText()).trim(), "Shared loss has no visible explanation");
+      const polls = trace.cycles[0].polls;
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 2200));
+      assert(trace.cycles[0].starts === starts && trace.cycles[0].polls === polls
+        && trace.authPosts === 0 && await page.evaluate(() => window.fixtureReconnects) === 0,
+      "Shared loss performed automatic recovery work", trace);
+      assert(await chatFrame(page) === originalFrame
+        && await frame.evaluate(() => performance.timeOrigin) === timeOrigin,
+      "Shared loss replaced its draft-owning document");
+      return;
+    }
+
+    if (scenario.startsWith("contact-acceptance")) {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "contact acceptance bootstrap");
+      const draft = "Keep this draft while a contact is accepted";
+      await frame.locator("#message-input").fill(draft);
+      assert(await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').count() === 0,
+        "unaccepted contact appeared in the Direct rail");
+      await frame.locator("#participant-toggle").click();
+      await frame.locator('#participant-list [data-participant-ref="participant:fixture-friend"]').click();
+      await frame.waitForFunction(() => document.querySelector("#participant-card-action")?.textContent === "Add contact");
+      await frame.locator("#participant-card-action").click();
+      await waitFor(() => trace.contactRequests === 1);
+      if (holds["contact-request"]) {
+        const polls = trace.cycles[0].polls;
+        await waitFor(() => trace.cycles[0].polls >= polls + 2);
+        assert(await frame.locator("#participant-card-action").isDisabled(),
+          "an unchanged poll re-enabled the in-flight contact request");
+      } else {
+        await frame.waitForFunction(() => document.querySelector("#participant-card-action")?.hidden === true
+          && document.querySelector("#participant-card-state")?.textContent.includes("Waiting"));
+      }
+      await frame.locator("#participant-card-close").focus();
+      trace.peerAccepted = true;
+      await frame.waitForFunction(() => {
+        const card = document.querySelector("#participant-card");
+        const action = document.querySelector("#participant-card-action");
+        return card?.hidden === false && card.dataset.participantRef === "participant:fixture-friend"
+          && document.querySelector("#participant-card-state")?.textContent === "Contact · Active now"
+          && action?.hidden === false && !action.disabled && action.dataset.cardAction === "message"
+          && action.textContent === "Message"
+          && !!document.querySelector('[data-conversation-choice="direct:sha256:fixture-conversation"]');
+      });
+      assert(await frame.evaluate(() => document.activeElement?.id) === "participant-card-close",
+        "acceptance refresh moved focus or reopened the card");
+      assert(trace.directMessages === 0 && trace.cycles[0].sends === 0,
+        "card/rail refresh depended on a new message", trace);
+      assert(await frame.locator("#message-input").inputValue() === draft, "acceptance refresh replaced the draft");
+      if (holds["contact-request"]) {
+        await frame.evaluate(() => {
+          const card = document.querySelector("#participant-card");
+          window.fixtureCardRegressed = false;
+          window.fixtureCardObserver = new MutationObserver(() => {
+            const action = document.querySelector("#participant-card-action");
+            window.fixtureCardRegressed ||= card.hidden
+              || document.querySelector("#participant-card-state")?.textContent !== "Contact · Active now"
+              || action?.hidden !== false || action.disabled || action.dataset.cardAction !== "message";
+          });
+          window.fixtureCardObserver.observe(card, { subtree: true, childList: true, characterData: true, attributes: true });
+        });
+        const responseFinished = page.waitForResponse(response => response.request().method() === "POST"
+          && new URL(response.url()).pathname === "/api/apps/chat-room/contacts/request")
+          .then(response => response.finished());
+        const polls = trace.cycles[0].polls;
+        holds["contact-request"].release();
+        await responseFinished;
+        await waitFor(() => trace.contactResponses === 1 && trace.cycles[0].polls > polls);
+        const regressed = await frame.evaluate(() => {
+          window.fixtureCardObserver.disconnect();
+          return window.fixtureCardRegressed;
+        });
+        assert(!regressed, "a held request response briefly reverted accepted contact state");
+        assert(await frame.locator("#participant-card-state").innerText() === "Contact · Active now"
+          && await frame.locator("#participant-card-action").isVisible()
+          && await frame.locator("#participant-card-action").innerText() === "Message",
+        "a held request response reverted accepted contact state");
+        assert(await frame.evaluate(() => document.activeElement?.id) === "participant-card-close",
+          "held request completion moved the card focus");
+      }
+      assert(trace.contactRequests === 1, "acceptance refresh repeated the contact request", trace);
+      await frame.locator("#participant-card-action").click();
+      await frame.waitForFunction(() => document.body.dataset.chatMode === "direct"
+        && document.querySelector("[data-conversation-choice].active")?.dataset.conversationChoice
+          === "direct:sha256:fixture-conversation");
+      return;
+    }
 
     if (scenario.startsWith("direct-initial-401")) {
       const originalFrame = frame;
@@ -870,6 +1021,7 @@ async function runScenario(scenario) {
     assert(reopenCycle.starts === 1, "reopen did not bootstrap exactly one session", reopenCycle);
     assert(reopenCycle.polls === 1 && !reopenCycle.pollBeforeReady, "reopen polled before bootstrap", reopenCycle);
   } finally {
+    for (const hold of Object.values(holds)) hold?.release();
     await context.close();
     server.close();
     await rm(profile, { recursive: true, force: true });
@@ -889,6 +1041,9 @@ async function main() {
     "direct-switch-hold-poll-messages",
     "direct-initial-401",
     "direct-initial-401-user-selection",
+    "shared-poll-401",
+    "contact-acceptance",
+    "contact-acceptance-held-request",
   ];
   for (const scenario of scenarios) {
     await runScenario(scenario);
