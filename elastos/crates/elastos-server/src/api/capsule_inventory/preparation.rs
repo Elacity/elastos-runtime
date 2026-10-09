@@ -631,7 +631,11 @@ fn reserve_at(
     );
     let inventory = Inventory::open(data_dir, true)?;
     let mut state = inventory.load()?;
-    let expired = state.expire(now);
+    // Persist expiry (and its settled_at) before any refusal below, so a
+    // refused Use does not restart an overdue attempt's history clock.
+    if state.expire(now) {
+        inventory.save(&state)?;
+    }
     if let Some(existing) = state.records.iter().find(|record| {
         record.request_binding.principal == caller.context.principal_id
             && record.request_binding.capsule == caller.capsule
@@ -643,15 +647,7 @@ fn reserve_at(
                 && existing.total_bytes == entry.size_bytes,
             "preparation request identity changed"
         );
-        if expired {
-            inventory.save(&state)?;
-        }
         return Ok(existing.clone());
-    }
-    // Persist expiry (and its settled_at) before any refusal below, so a
-    // refused Use does not restart an overdue attempt's history clock.
-    if expired {
-        inventory.save(&state)?;
     }
     ensure!(
         !state.retirement.as_ref().is_some_and(|retirement| {
@@ -12193,6 +12189,30 @@ server.serve_forever()
         assert_eq!(replay.state, PreparationState::Reserved);
         assert_eq!(replay.created_at, late(120));
         assert_ne!(replay.operation_id, ids[0]);
+    }
+
+    /// A replay refused for a changed identity still saves the expiry it found.
+    #[test]
+    fn model_preparation_refused_replay_keeps_an_overdue_reservations_expiry() {
+        let (root, cid) = fixture();
+        let context = context();
+        let use_method = method("use");
+        let t0 = now().unwrap();
+        let reserved = reserve_at(
+            root.path(),
+            &caller(&context, &use_method),
+            "replayed",
+            &cid,
+            t0,
+        )
+        .unwrap();
+        let mut changed = caller(&context, &use_method);
+        changed.interface = "elastos.capsule.other";
+        let t1 = t0 + RESERVATION_SECONDS;
+        assert!(reserve_at(root.path(), &changed, "replayed", &cid, t1).is_err());
+        let expired = load_operation(root.path(), &reserved.operation_id).unwrap();
+        assert_eq!(expired.state, PreparationState::Expired);
+        assert_eq!(expired.settled_at, Some(t1));
     }
 
     /// A refused Use still saves the expiry of an overdue reservation, so its
