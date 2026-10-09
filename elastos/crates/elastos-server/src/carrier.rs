@@ -4148,7 +4148,9 @@ impl CarrierAvailabilityProvider {
                                                 "Carrier availability fetch after bootstrap refresh failed"
                                             );
                                             final_err = retry_err.to_string();
-                                            in_transit = carrier_read_failed_in_transit(&retry_err);
+                                            // Any refusal for this holder keeps it permanent.
+                                            in_transit &=
+                                                carrier_read_failed_in_transit(&retry_err);
                                         }
                                     }
                                 }
@@ -8135,6 +8137,28 @@ impl std::fmt::Display for CarrierTransportFailure {
     }
 }
 
+/// A failed read of a Carrier answer is in transit only when the stream broke
+/// (reset, lost connection, early end); an answer that is not valid UTF-8 or
+/// otherwise unreadable is the peer's bad answer and stays permanent.
+fn carrier_answer_read_error(error: std::io::Error) -> anyhow::Error {
+    use std::io::ErrorKind;
+    let broke = matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::NotConnected
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::TimedOut
+    );
+    let error = anyhow::Error::new(error);
+    if broke {
+        error.context(CarrierTransportFailure)
+    } else {
+        error
+    }
+}
+
 impl std::error::Error for CarrierProviderDecision {}
 
 fn carrier_provider_invoke_result(response: serde_json::Value) -> Result<serde_json::Value> {
@@ -8437,7 +8461,7 @@ impl CarrierClient {
             limited
                 .read_line(&mut line)
                 .await
-                .context(CarrierTransportFailure)?;
+                .map_err(carrier_answer_read_error)?;
             anyhow::ensure!(
                 line.ends_with('\n'),
                 "bounded Carrier provider response exceeds {CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES} bytes"
@@ -8446,7 +8470,7 @@ impl CarrierClient {
             reader
                 .read_line(&mut line)
                 .await
-                .context(CarrierTransportFailure)?;
+                .map_err(carrier_answer_read_error)?;
         }
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         carrier_provider_invoke_result(response)
@@ -9220,6 +9244,8 @@ pub(crate) mod tests {
         fail_ensure: bool,
         /// Connect tickets whose `ensure` always fails (a dead peer).
         fail_tickets: Vec<String>,
+        /// Connect tickets whose bounded fetch fails in transit.
+        transit_tickets: StdMutex<Vec<String>>,
         reject_admission: bool,
         omit_admission_receipt: bool,
     }
@@ -9250,6 +9276,18 @@ pub(crate) mod tests {
             if invocation.transfer == ProviderTransfer::Stream {
                 if self.fail_tickets.iter().any(|dead| dead == ticket) {
                     return Err(ProviderError::Provider("mock remote fetch failed".into()));
+                }
+                if self
+                    .transit_tickets
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|slow| slow == ticket)
+                {
+                    return Err(ProviderError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "mock answer deadline passed",
+                    )));
                 }
                 return Ok(serde_json::json!({
                     "status": "ok",
@@ -13432,6 +13470,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -13490,6 +13529,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -13546,6 +13586,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -13627,6 +13668,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -13691,6 +13733,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: false,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: true,
             omit_admission_receipt: false,
         });
@@ -13749,6 +13792,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: false,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: false,
             omit_admission_receipt: true,
         });
@@ -16082,6 +16126,131 @@ pub(crate) mod tests {
             source.head_cid,
             "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
         );
+    }
+
+    /// A holder read is in transit only when every attempt for it failed on
+    /// the network path: a refusal on the announced ticket stays permanent even
+    /// when the refreshed ticket then misses its deadline.
+    #[tokio::test]
+    async fn test_carrier_availability_refusal_then_refreshed_ticket_timeout_stays_permanent() {
+        for (seed, refused_first, expected) in [
+            (120u8, true, "carrier_fetch_failed"),
+            (124u8, false, CARRIER_FETCH_IN_TRANSIT_CODE),
+        ] {
+            let (local_sk, local_did) = elastos_identity::derive_did(&[seed; 32]);
+            let holder_seed = [seed + 1; 32];
+            let (_remote_sk, _holder_did, stale_ticket, live_ticket) =
+                holder_tickets_for_secret(holder_seed);
+            let public = iroh::SecretKey::from_bytes(
+                &elastos_identity::derive_did(&holder_seed).0.to_bytes(),
+            )
+            .public();
+            let (gateway, _server) = serve_publisher_bootstrap(publisher_bootstrap_document(
+                &live_ticket,
+                &public.to_string(),
+                "publisher",
+                "elastos.carrier.bootstrap/v1",
+            ))
+            .await;
+            let (provider, invoker, _registry, _data_dir, cid) =
+                availability_provider_with_trusted_source(
+                    stale_ticket.clone(),
+                    public.to_string(),
+                    "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string(),
+                    gateway,
+                    local_sk,
+                    local_did,
+                    if refused_first {
+                        vec![stale_ticket.clone()]
+                    } else {
+                        vec![]
+                    },
+                )
+                .await;
+            let mut transit = vec![live_ticket.clone()];
+            if !refused_first {
+                transit.push(stale_ticket.clone());
+            }
+            *invoker.transit_tickets.lock().unwrap() = transit;
+            let response = provider
+                .send_raw(&serde_json::json!({
+                    "op": "fetch",
+                    "cid": cid,
+                    "path": "weights.gguf",
+                    "bounded_read": true,
+                    "range": {"start": 0, "end": 3},
+                    "transfer": "stream"
+                }))
+                .await
+                .unwrap();
+            assert_eq!(response["code"], expected, "{response}");
+            let requests = invoker.requests.lock().await;
+            for ticket in [&stale_ticket, &live_ticket] {
+                assert!(
+                    requests.iter().any(|request| request["ticket"] == *ticket),
+                    "{requests:?}"
+                );
+            }
+        }
+    }
+
+    /// An answer that is not valid UTF-8 is the holder's bad answer, not a
+    /// failure in transit, so its bounded read is not repeated.
+    #[tokio::test]
+    async fn test_carrier_invalid_utf8_answer_is_not_a_transit_failure() {
+        let bind = |_| async {
+            Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .clear_ip_transports()
+                .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+                .alpns(vec![CARRIER_ALPN.to_vec()])
+                .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+                .unwrap()
+                .bind()
+                .await
+                .unwrap()
+        };
+        let holder = bind(()).await;
+        let consumer = bind(()).await;
+        let address = wait_for_direct_endpoint_addr(&holder).await;
+        let answering = holder.clone();
+        let served = tokio::spawn(async move {
+            let conn = answering.accept().await.unwrap().await.unwrap();
+            let (mut send, recv) = conn.accept_bi().await.unwrap();
+            let mut request = String::new();
+            BufReader::new(recv).read_line(&mut request).await.unwrap();
+            send.write_all(b"\xff\xfe not utf-8\n").await.unwrap();
+            send.finish().unwrap();
+            conn.closed().await;
+        });
+        let invoker = CarrierProviderInvoker::with_carrier_endpoint(consumer.clone());
+        let request = serde_json::json!({"op":"fetch", "cid":"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "path":"weights.gguf", "bounded_read":true, "range":{"start":0,"end":3}});
+        let route = ProviderCarrierRoute::ConnectTicket {
+            connect_ticket: encode_ticket_for(address),
+            peer_did: None,
+            timeout_ms: Some(5_000),
+        };
+        let invocation = ProviderInvocation {
+            source: "carrier-availability".into(),
+            target: "content".into(),
+            op: "fetch".into(),
+            request: request.clone(),
+            transfer: ProviderTransfer::Stream,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(route.clone()),
+        };
+        let error = invoker
+            .invoke_carrier_provider(&route, &invocation, request)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ProviderError::Provider(_)),
+            "an unreadable answer is permanent: {error:?}"
+        );
+        served.abort();
+        holder.close().await;
+        consumer.close().await;
     }
 
     #[tokio::test]
