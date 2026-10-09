@@ -775,10 +775,17 @@ pub(super) async fn chat_room_session_start(
                 discovery_service.as_ref(),
             )
             .unwrap_or(None);
+            let read_snapshot = authority
+                .as_ref()
+                .and_then(|authority| authority.store.read_only_snapshot().ok());
+            let contact_snapshot = read_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.snapshot().ok());
             let summary = crate::room_service::load_summary(&data_dir).ok();
             let local_identity = room_local_profile_identity(&data_dir, &context);
-            let names = room_profile_attribution_names(
+            let names = room_profile_attribution_names_from_snapshot(
                 authority.as_ref(),
+                contact_snapshot.as_ref(),
                 summary.as_ref(),
                 local_identity
                     .as_ref()
@@ -787,6 +794,7 @@ pub(super) async fn chat_room_session_start(
             apply_profile_attribution_to_room_poll(&mut poll, &names);
             cards = Some(participant_card_directory(
                 authority.as_ref(),
+                read_snapshot.as_ref(),
                 discovery_service.as_ref(),
                 presence_port.as_ref(),
                 local_identity.as_ref().map(|(did, _)| did.as_str()),
@@ -1453,8 +1461,23 @@ fn room_transport_view(state: &GatewayState) -> crate::room_service::RoomTranspo
 /// cards (the signed-profile projection recorded at admission — the source a
 /// guest session can verify against). Presence heartbeats are deliberately
 /// not a name source: they prove liveness, not identity.
+#[cfg(test)]
 pub(super) fn room_profile_attribution_names(
     contact_authority: Option<&gateway_home_system::ConfiguredContactAuthority>,
+    room_summary: Option<&crate::room_service::RoomSummary>,
+    local_identity: Option<(&str, &str)>,
+) -> std::collections::HashMap<String, String> {
+    let snapshot = contact_authority.and_then(|authority| authority.store.snapshot().ok());
+    room_profile_attribution_names_from_snapshot(
+        contact_authority,
+        snapshot.as_ref(),
+        room_summary,
+        local_identity,
+    )
+}
+fn room_profile_attribution_names_from_snapshot(
+    contact_authority: Option<&gateway_home_system::ConfiguredContactAuthority>,
+    snapshot: Option<&crate::collaboration_contact_store::CollaborationContactStoreSnapshot>,
     room_summary: Option<&crate::room_service::RoomSummary>,
     local_identity: Option<(&str, &str)>,
 ) -> std::collections::HashMap<String, String> {
@@ -1467,7 +1490,7 @@ pub(super) fn room_profile_attribution_names(
         }
     }
     if let Some(authority) = contact_authority {
-        if let Ok(snapshot) = authority.store.snapshot() {
+        if let Some(snapshot) = snapshot {
             for removed in snapshot.removed() {
                 names.insert(
                     removed.remote_profile_did().to_string(),
@@ -1511,6 +1534,9 @@ fn room_local_profile_identity(
 /// principal's signed contact store and current Discovery view.
 fn participant_card_directory(
     authority: Option<&gateway_home_system::ConfiguredContactAuthority>,
+    read_snapshot: Option<
+        &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+    >,
     discovery_service: Option<
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
@@ -1535,7 +1561,9 @@ fn participant_card_directory(
     let Some(authority) = authority else {
         return directory;
     };
-    let store = authority.store.as_ref();
+    let Some(store) = read_snapshot else {
+        return directory;
+    };
     if let Ok(requests) = store.pending_incoming_requests() {
         for request in requests {
             directory.relationships.insert(
@@ -1560,7 +1588,7 @@ fn participant_card_directory(
         }
     }
     if let Some(service) = discovery_service {
-        if let Ok(status) = service.read_only_status(store, &authority.profile, now) {
+        if let Ok(status) = service.read_only_status_from_snapshot(store, &authority.profile, now) {
             directory.discoverable = status
                 .visible_people()
                 .iter()
@@ -1873,16 +1901,32 @@ pub(super) async fn room_service_poll(
         // row. The plain room keeps its server-stamped home-session and
         // guest names.
         if let Some(context) = launch_context.as_ref() {
-            let authority = gateway_home_system::load_configured_contact_authority_for_context(
-                &data_dir,
-                context,
-                discovery_service.as_ref(),
-            )
-            .unwrap_or(None);
+            let profile = reader_profile
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Chat reader Profile is unavailable"))?;
+            let authority = discovery_service.as_ref().and_then(|service| {
+                gateway_home_system::configured_contact_authority_from_profile(
+                    &data_dir,
+                    context,
+                    service,
+                    profile.clone(),
+                )
+                .ok()
+            });
+            let read_snapshot = authority
+                .as_ref()
+                .and_then(|authority| authority.store.read_only_snapshot().ok());
+            let contact_snapshot = read_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.snapshot().ok());
             let summary = crate::room_service::load_summary(&data_dir).ok();
-            let local_identity = room_local_profile_identity(&data_dir, context);
-            let names = room_profile_attribution_names(
+            let local_identity = Some((
+                profile.document().profile_did.clone(),
+                profile.document().display_name.clone(),
+            ));
+            let names = room_profile_attribution_names_from_snapshot(
                 authority.as_ref(),
+                contact_snapshot.as_ref(),
                 summary.as_ref(),
                 local_identity
                     .as_ref()
@@ -1891,6 +1935,7 @@ pub(super) async fn room_service_poll(
             apply_profile_attribution_to_room_poll(&mut poll, &names);
             cards = Some(participant_card_directory(
                 authority.as_ref(),
+                read_snapshot.as_ref(),
                 discovery_service.as_ref(),
                 presence_port.as_ref(),
                 local_identity.as_ref().map(|(did, _)| did.as_str()),

@@ -357,7 +357,125 @@ struct RemotePresentation {
     event_envelope_hash: String,
 }
 
+/// One freshly verified protected read for a single presentation response.
+/// It borrows its exact scoped store and supplies no mutation or send authority.
+pub(crate) struct CollaborationContactReadSnapshot<'a> {
+    store: &'a CollaborationContactStore,
+    loaded: Option<LoadedState>,
+}
+impl CollaborationContactReadSnapshot<'_> {
+    pub(crate) fn store(&self) -> &CollaborationContactStore {
+        self.store
+    }
+    pub(crate) fn snapshot(&self) -> anyhow::Result<CollaborationContactStoreSnapshot> {
+        let Some(loaded) = self.loaded.as_ref() else {
+            return Ok(CollaborationContactStoreSnapshot {
+                contacts: Vec::new(),
+                removed: Vec::new(),
+            });
+        };
+        Ok(CollaborationContactStoreSnapshot {
+            contacts: derive_contacts(loaded, &self.store.local_profile_did)?,
+            removed: derive_removed_contacts(loaded, &self.store.local_profile_did)?,
+        })
+    }
+
+    pub(crate) fn discovery_enabled(&self) -> anyhow::Result<bool> {
+        Ok(self
+            .loaded
+            .as_ref()
+            .is_some_and(|loaded| loaded.state.discovery_enabled))
+    }
+
+    pub(crate) fn published_local_advertisement(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(loaded) = self.loaded.as_ref() else {
+            return Ok(None);
+        };
+        let Some(published_hash) = loaded
+            .state
+            .published_local_advertisement_envelope_sha256
+            .as_ref()
+        else {
+            return Ok(None);
+        };
+        let advertisement = loaded
+            .advertisements
+            .get(published_hash)
+            .ok_or_else(|| anyhow::anyhow!("published local discovery advertisement is missing"))?;
+        if advertisement.profile_did() != self.store.local_profile_did {
+            anyhow::bail!("published local discovery advertisement belongs to another profile");
+        }
+        if advertisement.message().envelope().payload.expires_at <= now {
+            return Ok(None);
+        }
+        Ok(Some(canonical_signed_collaboration_message_bytes(
+            advertisement.message().envelope(),
+        )?))
+    }
+
+    pub(crate) fn outgoing_pending_requests(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<Vec<CollaborationRelationshipEvent>> {
+        let Some(loaded) = self.loaded.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut requested = Vec::new();
+        for request in loaded.requests.values() {
+            let envelope = &request.message().envelope().payload;
+            if request.requester_profile_did() != self.store.local_profile_did
+                || envelope.expires_at <= now
+                || loaded
+                    .decisions
+                    .contains_key(request.message().envelope_sha256())
+                || loaded
+                    .revoked_request_hashes
+                    .contains(request.message().envelope_sha256())
+            {
+                continue;
+            }
+            let Some(advertisement) = loaded
+                .advertisements
+                .get(request.advertisement_envelope_sha256())
+            else {
+                continue;
+            };
+            requested.push(CollaborationRelationshipEvent {
+                remote_profile_did: advertisement.profile_did().to_string(),
+                display_name: advertisement.display_name().to_string(),
+                handle: advertisement.handle().map(str::to_string),
+                occurred_at: envelope.created_at,
+            });
+        }
+        requested.sort_by(|left, right| {
+            left.occurred_at
+                .cmp(&right.occurred_at)
+                .then_with(|| left.remote_profile_did.cmp(&right.remote_profile_did))
+        });
+        Ok(requested)
+    }
+
+    pub(crate) fn pending_incoming_requests(
+        &self,
+    ) -> anyhow::Result<Vec<PendingIncomingContactRequest>> {
+        let Some(loaded) = self.loaded.as_ref() else {
+            return Ok(Vec::new());
+        };
+        derive_pending_incoming_requests(loaded, &self.store.local_profile_did)
+    }
+}
 impl CollaborationContactStore {
+    pub(crate) fn read_only_snapshot(
+        &self,
+    ) -> anyhow::Result<CollaborationContactReadSnapshot<'_>> {
+        Ok(CollaborationContactReadSnapshot {
+            store: self,
+            loaded: self.load_state()?,
+        })
+    }
     pub(crate) fn new(
         data_root: &Path,
         principal_id: &str,
@@ -389,16 +507,7 @@ impl CollaborationContactStore {
     }
 
     pub(crate) fn snapshot(&self) -> anyhow::Result<CollaborationContactStoreSnapshot> {
-        let Some(loaded) = self.load_state()? else {
-            return Ok(CollaborationContactStoreSnapshot {
-                contacts: Vec::new(),
-                removed: Vec::new(),
-            });
-        };
-        Ok(CollaborationContactStoreSnapshot {
-            contacts: derive_contacts(&loaded, &self.local_profile_did)?,
-            removed: derive_removed_contacts(&loaded, &self.local_profile_did)?,
-        })
+        self.read_only_snapshot()?.snapshot()
     }
 
     pub(crate) fn accepted_profile(
@@ -428,9 +537,7 @@ impl CollaborationContactStore {
 
     /// Missing state is intentionally Discovery-off and remains read-only.
     pub(crate) fn discovery_enabled(&self) -> anyhow::Result<bool> {
-        Ok(self
-            .load_state()?
-            .is_some_and(|loaded| loaded.state.discovery_enabled))
+        self.read_only_snapshot()?.discovery_enabled()
     }
 
     /// Only an explicit People mutation may persist Discovery intent.
@@ -448,26 +555,8 @@ impl CollaborationContactStore {
         &self,
         now: u64,
     ) -> anyhow::Result<Option<Vec<u8>>> {
-        let Some(loaded) = self.load_state()? else {
-            return Ok(None);
-        };
-        let Some(published_hash) = loaded.state.published_local_advertisement_envelope_sha256
-        else {
-            return Ok(None);
-        };
-        let advertisement = loaded
-            .advertisements
-            .get(&published_hash)
-            .ok_or_else(|| anyhow::anyhow!("published local discovery advertisement is missing"))?;
-        if advertisement.profile_did() != self.local_profile_did {
-            anyhow::bail!("published local discovery advertisement belongs to another profile");
-        }
-        if advertisement.message().envelope().payload.expires_at <= now {
-            return Ok(None);
-        }
-        Ok(Some(canonical_signed_collaboration_message_bytes(
-            advertisement.message().envelope(),
-        )?))
+        self.read_only_snapshot()?
+            .published_local_advertisement(now)
     }
 
     /// Clears an expired published/pending advertisement pointer without
@@ -565,42 +654,7 @@ impl CollaborationContactStore {
         &self,
         now: u64,
     ) -> anyhow::Result<Vec<CollaborationRelationshipEvent>> {
-        let Some(loaded) = self.load_state()? else {
-            return Ok(Vec::new());
-        };
-        let mut requested = Vec::new();
-        for request in loaded.requests.values() {
-            let envelope = &request.message().envelope().payload;
-            if request.requester_profile_did() != self.local_profile_did
-                || envelope.expires_at <= now
-                || loaded
-                    .decisions
-                    .contains_key(request.message().envelope_sha256())
-                || loaded
-                    .revoked_request_hashes
-                    .contains(request.message().envelope_sha256())
-            {
-                continue;
-            }
-            let Some(advertisement) = loaded
-                .advertisements
-                .get(request.advertisement_envelope_sha256())
-            else {
-                continue;
-            };
-            requested.push(CollaborationRelationshipEvent {
-                remote_profile_did: advertisement.profile_did().to_string(),
-                display_name: advertisement.display_name().to_string(),
-                handle: advertisement.handle().map(str::to_string),
-                occurred_at: envelope.created_at,
-            });
-        }
-        requested.sort_by(|left, right| {
-            left.occurred_at
-                .cmp(&right.occurred_at)
-                .then_with(|| left.remote_profile_did.cmp(&right.remote_profile_did))
-        });
-        Ok(requested)
+        self.read_only_snapshot()?.outgoing_pending_requests(now)
     }
 
     /// Chains whose terminal decision was Declined, in either direction.
@@ -674,10 +728,7 @@ impl CollaborationContactStore {
     pub(crate) fn pending_incoming_requests(
         &self,
     ) -> anyhow::Result<Vec<PendingIncomingContactRequest>> {
-        let Some(loaded) = self.load_state()? else {
-            return Ok(Vec::new());
-        };
-        derive_pending_incoming_requests(&loaded, &self.local_profile_did)
+        self.read_only_snapshot()?.pending_incoming_requests()
     }
 
     pub(crate) fn pending_incoming_request(
@@ -3774,6 +3825,46 @@ mod tests {
         );
 
         assert_eq!(fs::read(&group_path).unwrap(), group_before);
+    }
+
+    #[test]
+    fn read_snapshot_is_request_local_and_next_read_rechecks_revocation_and_tampering() {
+        let fixture = Fixture::new();
+        let remote_profile_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let remote_device_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let remote =
+            accepted_contact_with_profile(&fixture, &remote_profile_key, &remote_device_key);
+        let snapshot = fixture.store.read_only_snapshot().unwrap();
+        assert_eq!(snapshot.snapshot().unwrap().contacts().len(), 1);
+        fixture
+            .store
+            .record_local_contact_revocation(
+                &revocation_bytes(
+                    &fixture.local_key,
+                    fixture.local_profile.document().profile_did.as_str(),
+                    &remote.document().profile_did,
+                    NOW + 200,
+                ),
+                &fixture.local_profile,
+                NOW + 200,
+            )
+            .unwrap();
+        assert_eq!(snapshot.snapshot().unwrap().contacts().len(), 1);
+        let next = fixture.store.read_only_snapshot().unwrap();
+        assert!(next.snapshot().unwrap().contacts().is_empty());
+        assert_eq!(next.snapshot().unwrap().removed().len(), 1);
+        let path = fixture.store.state_path().unwrap();
+        write_protected_principal_root_object(
+            &fixture.data_root,
+            &fixture.principal_id,
+            &fixture.localhost_root,
+            &fixture.store.state_object_uri(),
+            &path,
+            b"{}",
+        )
+        .unwrap();
+        assert_eq!(next.snapshot().unwrap().removed().len(), 1);
+        assert!(fixture.store.read_only_snapshot().is_err());
     }
 
     /// Builds an accepted contact, then returns its signed head so a chain can

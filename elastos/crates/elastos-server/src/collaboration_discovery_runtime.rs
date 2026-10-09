@@ -882,16 +882,28 @@ impl CollaborationDiscoveryService {
         profile: &VerifiedCollaborationProfileDocument,
         now: u64,
     ) -> anyhow::Result<CollaborationDiscoveryStatus> {
+        self.require_profile_store_match(store, profile)?;
+        let snapshot = store.read_only_snapshot()?;
+        self.read_only_status_from_snapshot(&snapshot, profile, now)
+    }
+    pub(crate) fn read_only_status_from_snapshot(
+        &self,
+        snapshot: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+        profile: &VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) -> anyhow::Result<CollaborationDiscoveryStatus> {
+        let store = snapshot.store();
         let profile_did = self.require_profile_store_match(store, profile)?;
-        let enabled = store.discovery_enabled()?;
-        let stored_current = self.stored_published_local_advertisement(store, now)?;
+        let enabled = snapshot.discovery_enabled()?;
+        let stored_current =
+            self.cached_published_advertisement(snapshot.published_local_advertisement(now)?, now)?;
         let states = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("discovery client state lock is poisoned"))?;
         let mut state = states.get(profile_did).cloned().unwrap_or_default();
         normalize_client_state_for_status(&mut state, enabled, stored_current.as_ref(), now);
-        project_discovery_status(&state, enabled, store)
+        project_discovery_status(&state, enabled, snapshot.pending_incoming_requests()?)
     }
 
     /// Leaves this principal's Discovery as a finished relay pass would: on,
@@ -1395,7 +1407,14 @@ impl CollaborationDiscoveryService {
         store: &CollaborationContactStore,
         now: u64,
     ) -> anyhow::Result<Option<CachedAdvertisement>> {
-        let Some(envelope_bytes) = store.published_local_advertisement(now)? else {
+        self.cached_published_advertisement(store.published_local_advertisement(now)?, now)
+    }
+    fn cached_published_advertisement(
+        &self,
+        envelope_bytes: Option<Vec<u8>>,
+        now: u64,
+    ) -> anyhow::Result<Option<CachedAdvertisement>> {
+        let Some(envelope_bytes) = envelope_bytes else {
             return Ok(None);
         };
         let verified = verify_collaboration_discovery_advertisement(
@@ -1623,7 +1642,7 @@ impl CollaborationDiscoveryService {
             .map_err(|_| anyhow::anyhow!("discovery client state lock is poisoned"))?;
         let state = client_state_mut(&mut states, store.local_profile_did())?;
         normalize_client_state_for_status(state, enabled, stored_current.as_ref(), now);
-        project_discovery_status(state, enabled, store)
+        project_discovery_status(state, enabled, store.pending_incoming_requests()?)
     }
 
     async fn invoke_bootstrap(
@@ -1734,7 +1753,7 @@ fn normalize_client_state_for_status(
 fn project_discovery_status(
     state: &DiscoveryClientState,
     enabled: bool,
-    store: &CollaborationContactStore,
+    incoming_requests: Vec<PendingIncomingContactRequest>,
 ) -> anyhow::Result<CollaborationDiscoveryStatus> {
     let visible_people = if state.current_advertisement.is_some() {
         state
@@ -1762,7 +1781,7 @@ fn project_discovery_status(
             .map(|current| current.verified.message().envelope().payload.expires_at),
         remote_visibility_may_remain_until: state.remote_visibility_may_remain_until,
         visible_people,
-        incoming_requests: store.pending_incoming_requests()?,
+        incoming_requests,
     })
 }
 

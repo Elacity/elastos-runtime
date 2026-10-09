@@ -250,8 +250,9 @@ pub(crate) fn load_profile_authority(
     principal_id: &str,
     localhost_root: &str,
 ) -> anyhow::Result<Option<VerifiedCollaborationProfileDocument>> {
-    load_bundle_state(data_dir, principal_id, localhost_root)
-        .map(|state| state.map(|state| state.verified))
+    load_authority_bundle(data_dir, principal_id, localhost_root)?
+        .map(|bundle| verify_signed_profile_document(&bundle.signed_profile))
+        .transpose()
 }
 
 pub(crate) fn update_profile_authority(
@@ -1033,11 +1034,11 @@ struct LoadedBundleState {
     verified: VerifiedCollaborationProfileDocument,
 }
 
-fn load_bundle_state(
+fn load_authority_bundle(
     data_dir: &Path,
     principal_id: &str,
     localhost_root: &str,
-) -> anyhow::Result<Option<LoadedBundleState>> {
+) -> anyhow::Result<Option<CollaborationProfileAuthorityBundle>> {
     let path = profile_authority_path(data_dir, localhost_root)?;
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -1062,6 +1063,17 @@ fn load_bundle_state(
         &path,
     )?;
     let bundle = decode_profile_authority_bundle(&bytes)?;
+    Ok(Some(bundle))
+}
+
+fn load_bundle_state(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+) -> anyhow::Result<Option<LoadedBundleState>> {
+    let Some(bundle) = load_authority_bundle(data_dir, principal_id, localhost_root)? else {
+        return Ok(None);
+    };
     let verified = verify_signed_profile_document(&bundle.signed_profile)?;
     let signing_key = SigningKey::from_bytes(&decode_profile_signing_seed(
         &bundle.profile_signing_seed_hex,

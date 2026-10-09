@@ -920,6 +920,15 @@ pub(super) fn load_configured_contact_authority_for_context(
     let Some(profile) = load_profile_authority_for_context(data_dir, context)? else {
         return Ok(None);
     };
+    configured_contact_authority_from_profile(data_dir, context, discovery_service, profile)
+        .map(Some)
+}
+pub(super) fn configured_contact_authority_from_profile(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    discovery_service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+) -> anyhow::Result<ConfiguredContactAuthority> {
     let local_device_did = crate::collaboration_profile_authority::load_existing_device_did(
         data_dir,
     )?
@@ -934,7 +943,7 @@ pub(super) fn load_configured_contact_authority_for_context(
             &local_device_did,
         )?,
     );
-    Ok(Some(ConfiguredContactAuthority { profile, store }))
+    Ok(ConfiguredContactAuthority { profile, store })
 }
 
 pub(super) fn load_profile_authority_for_context(
