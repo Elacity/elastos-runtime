@@ -3611,7 +3611,7 @@ mod tests {
             assert!(core.authorize_history_message(&bytes, now).is_ok());
             // A still-pending live envelope also owns its identity.
             assert!(core
-                .history_projection_candidates(&[bytes.clone()], now)
+                .history_projection_candidates(std::slice::from_ref(&bytes), now)
                 .is_err());
             conflicts.push(bytes);
         }
