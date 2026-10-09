@@ -1050,18 +1050,14 @@ fn load_authority_bundle(
     if !metadata.is_file() {
         anyhow::bail!("profile authority bundle must be a regular file");
     }
-    let protection =
-        crate::auth::load_principal_root_protection(data_dir, principal_id, localhost_root)?;
-    if protection.is_none() {
-        anyhow::bail!("protected principal root is required for profile authority");
-    }
-    let bytes = crate::auth::read_principal_root_object(
+    let bytes = crate::auth::read_protected_principal_root_object(
         data_dir,
         principal_id,
         localhost_root,
         &profile_authority_object_uri(localhost_root),
         &path,
-    )?;
+    )?
+    .ok_or_else(|| anyhow!("protected principal root is required for profile authority"))?;
     let bundle = decode_profile_authority_bundle(&bytes)?;
     Ok(Some(bundle))
 }

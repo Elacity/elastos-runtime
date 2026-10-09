@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::auth::{
-    load_principal_root_protection, read_principal_root_object,
+    load_principal_root_protection, read_protected_principal_root_object,
     write_protected_principal_root_object,
 };
 use crate::collaboration_core::{
@@ -1629,17 +1629,15 @@ impl CollaborationContactStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         }
-        if !self.has_principal_root_protection()? {
-            anyhow::bail!("contact store state requires principal-root protection");
-        }
-        let bytes = match read_principal_root_object(
+        let bytes = match read_protected_principal_root_object(
             &self.data_root,
             &self.principal_id,
             &self.localhost_root,
             &self.state_object_uri(),
             &path,
         ) {
-            Ok(bytes) => bytes,
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => anyhow::bail!("contact store state requires principal-root protection"),
             Err(err) if is_missing_state_file(&err) => {
                 anyhow::bail!("contact store state disappeared during protected read: {err}")
             }

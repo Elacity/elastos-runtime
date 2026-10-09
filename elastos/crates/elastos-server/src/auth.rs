@@ -4377,6 +4377,35 @@ pub fn read_principal_root_object(
     read_principal_root_object_locked(data_dir, principal_id, localhost_root, object_uri, path)
 }
 
+/// Reads only under current principal-root protection. Missing protection
+/// returns None before object bytes are read; each call loads fresh authority.
+pub(crate) fn read_protected_principal_root_object(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
+    let _guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    let Some(protection) = load_principal_root_protection(data_dir, principal_id, localhost_root)?
+    else {
+        return Ok(None);
+    };
+    let bytes = read_principal_root_object_bytes(path)?;
+    decrypt_principal_root_object_bytes(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        &protection,
+        &bytes,
+    )
+    .map(Some)
+}
+
 // Caller holds principal_root_object_mutation_lock, including conditional writes.
 fn read_principal_root_object_locked(
     data_dir: &Path,
@@ -4390,9 +4419,27 @@ fn read_principal_root_object_locked(
     else {
         return Ok(bytes);
     };
-    let data_key = principal_root_data_key_from_protection(data_dir, &protection)?;
+    decrypt_principal_root_object_bytes(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        &protection,
+        &bytes,
+    )
+}
+
+fn decrypt_principal_root_object_bytes(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    protection: &PrincipalRootProtectionV1,
+    bytes: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let data_key = principal_root_data_key_from_protection(data_dir, protection)?;
     let envelope: PrincipalRootObjectEnvelopeV1 =
-        serde_json::from_slice(&bytes).with_context(|| {
+        serde_json::from_slice(bytes).with_context(|| {
             format!("{PROTECTED_PRINCIPAL_ROOT_OBJECT_NOT_ENCRYPTED}: {object_uri}")
         })?;
     validate_principal_root_object_envelope(
@@ -9117,6 +9164,107 @@ mod tests {
             .unwrap(),
             b"# Secret\n"
         );
+    }
+
+    #[test]
+    fn required_protected_read_refuses_plaintext_and_observes_each_current_protection() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        let principal = "person:local:required-protected-read";
+        let localhost_root = principal_localhost_root(principal);
+        let uri = format!("{localhost_root}/Documents/example.txt");
+        let path = rooted_localhost_fs_path(data, &uri).unwrap();
+        write_principal_root_object(data, principal, &localhost_root, &uri, &path, b"plain")
+            .unwrap();
+        let plain = std::fs::read(&path).unwrap();
+        assert!(read_protected_principal_root_object(
+            data,
+            principal,
+            &localhost_root,
+            &uri,
+            &path
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), plain);
+        assert_eq!(
+            read_principal_root_object(data, principal, &localhost_root, &uri, &path).unwrap(),
+            b"plain",
+            "the ordinary unprotected read keeps its existing behavior"
+        );
+
+        let protection = store_test_principal_root_protection(data, principal);
+        assert!(
+            read_protected_principal_root_object(data, principal, &localhost_root, &uri, &path)
+                .is_err(),
+            "current protection requires an encrypted object"
+        );
+        write_protected_principal_root_object(
+            data,
+            principal,
+            &localhost_root,
+            &uri,
+            &path,
+            b"protected",
+        )
+        .unwrap();
+        let encrypted = std::fs::read(&path).unwrap();
+        let auth_before = refresh_persisted_bytes(data);
+        for _ in 0..3 {
+            assert_eq!(
+                read_protected_principal_root_object(data, principal, &localhost_root, &uri, &path)
+                    .unwrap()
+                    .unwrap(),
+                b"protected"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), encrypted);
+        assert_eq!(refresh_persisted_bytes(data), auth_before);
+
+        // A new protected key for the same owner is current immediately. The
+        // reader cannot use the earlier key to accept old encrypted bytes.
+        let replacement = store_test_principal_root_protection(data, principal);
+        assert_ne!(replacement.data_key_id, protection.data_key_id);
+        assert!(read_protected_principal_root_object(
+            data,
+            principal,
+            &localhost_root,
+            &uri,
+            &path
+        )
+        .is_err());
+        mutate_auth_state(data, |state| {
+            state.principal_root_protections.clear();
+            Ok(())
+        })
+        .unwrap();
+        assert!(read_protected_principal_root_object(
+            data,
+            principal,
+            &localhost_root,
+            &uri,
+            &path
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), encrypted);
+        assert!(read_protected_principal_root_object(
+            data,
+            "person:local:foreign",
+            &localhost_root,
+            &uri,
+            &path,
+        )
+        .unwrap()
+        .is_none());
+        assert!(read_protected_principal_root_object(
+            data,
+            principal,
+            &localhost_root,
+            "localhost://Users/foreign/example.txt",
+            &path,
+        )
+        .is_err());
     }
 
     #[test]
