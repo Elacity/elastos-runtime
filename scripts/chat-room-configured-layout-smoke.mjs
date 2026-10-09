@@ -11,6 +11,7 @@ const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const browserRoot = join(repoRoot, "capsules/chat-room/browser");
 const homeClipboardClient = join(repoRoot, "capsules/home/browser/home-clipboard-client.js");
 const homeClipboardProtocol = join(repoRoot, "capsules/home/browser/home-clipboard-protocol.js");
+const homeLayoutRoot = join(repoRoot, "capsules/home-gui/browser");
 const homeNavigationClient = join(repoRoot, "capsules/home/browser/home-navigation-client.js");
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
@@ -71,6 +72,14 @@ function directConversation() {
   };
 }
 
+function historyMessage(seq, text, createdAt) {
+  return {
+    seq, sender: "Fixture Friend", sender_profile_verified: true,
+    from_current_session: false, kind: "text", body: text,
+    created_at: Math.floor(Date.parse(createdAt) / 1000),
+  };
+}
+
 function isDirectSwitchScenario(scenario) {
   return scenario === "direct-switch" || scenario.startsWith("direct-switch-hold-");
 }
@@ -126,6 +135,9 @@ function startServer(scenario) {
   const initialDirectRecovery = scenario.startsWith("direct-initial-401");
   const sharedRecovery = scenario === "shared-poll-401";
   const contactAcceptance = scenario.startsWith("contact-acceptance");
+  const historyScenario = scenario === "history-status-order-calendar";
+  const unreadScenario = scenario === "direct-unread" || scenario === "visible-read";
+  const retryScenario = scenario.startsWith("direct-retry");
   const holdBoundary = holdBoundaryForScenario(scenario);
   const holds = {
     "initial-conversations": holdBoundary === "initial-conversations"
@@ -140,6 +152,7 @@ function startServer(scenario) {
     "poll-messages": holdBoundary === "poll-messages"
       ? createHold("poll-messages")
       : null,
+    "retry": scenario === "direct-retry-held" ? createHold("retry") : null,
     "contact-request": scenario === "contact-acceptance-held-request"
       ? createHold("contact-request")
       : null,
@@ -160,10 +173,39 @@ function startServer(scenario) {
     contactRequests: 0,
     contactResponses: 0,
     authPosts: 0,
+    historyStatus: "searching",
+    historyPhase: 0,
+    pollCursors: [],
+    directUnread: false,
     requests: [],
+    reads: [],
+    communityUnread: false,
+    retryMode: "pending",
+    retryPosts: [],
+    sentAgain: null,
   };
   function pollView() {
     const poll = configuredPoll();
+    if (historyScenario) {
+      const details = {
+        searching: "Checking recent Community history from online participants.",
+        available: "Recent Community history is available from an online participant.",
+        unavailable: "Recent Community history is unavailable. Another participant must be online to catch up.",
+      };
+      poll.transport.history = { status: trace.historyStatus, detail: details[trace.historyStatus] };
+      poll.objects = trace.historyPhase < 2 ? [
+        historyMessage(1, "today arrived first", "2026-03-09T00:05:00-04:00"),
+        historyMessage(3, "yesterday same time second", "2026-03-08T12:00:00-04:00"),
+        historyMessage(2, "yesterday recovered later", "2026-03-08T12:00:00-04:00"),
+      ] : [
+        historyMessage(6, "fall today", "2026-11-01T12:00:00-05:00"),
+        historyMessage(5, "fall yesterday", "2026-10-31T12:00:00-04:00"),
+      ];
+      if (trace.historyPhase === 1) {
+        poll.objects.push(historyMessage(4, "older catch-up", "2026-03-07T12:00:00-05:00"));
+      }
+      poll.latest_seq = trace.historyPhase === 2 ? 6 : trace.historyPhase === 1 ? 4 : 3;
+    }
     if (contactAcceptance) {
       poll.participants.push({
         display_name: "Fixture Friend", profile_verified: true, device_label: "",
@@ -195,12 +237,14 @@ function startServer(scenario) {
         }).end();
         return;
       }
+      if (["/shell-capsule-layout.js", "/shell-form-factor.js"].includes(url.pathname)) {
+        const body = await readFile(join(homeLayoutRoot, url.pathname.slice(1)));
+        response.writeHead(200, { "content-type":"application/javascript", "content-length":body.length });
+        response.end(body); return;
+      }
       if (url.pathname === "/fixture") {
         const homeOrigin = `http://127.0.0.1:${server.address().port}`;
-        const chatSrc = isDirectSwitchScenario(scenario) || initialDirectRecovery
-          ? `/apps/chat-room/?conversation_id=direct%3Asha256%3Afixture-conversation${initialDirectRecovery ? `&home_origin=${encodeURIComponent(homeOrigin)}` : ""}#home_token=test-token`
-          : sharedRecovery ? `/apps/chat-room/?home_origin=${encodeURIComponent(homeOrigin)}#home_token=test-token`
-          : "/apps/chat-room/#home_token=test-token";
+        const chatSrc = `/apps/chat-room/?home_origin=${encodeURIComponent(homeOrigin)}${isDirectSwitchScenario(scenario) || initialDirectRecovery ? "&conversation_id=direct%3Asha256%3Afixture-conversation" : ""}#home_token=test-token`;
         const reconnectHost = initialDirectRecovery || sharedRecovery ? `<script>
           window.fixtureReconnects = 0;
           window.addEventListener("message", (event) => {
@@ -214,7 +258,10 @@ function startServer(scenario) {
                 route: "/apps/chat-room/?home_origin=" + encodeURIComponent(location.origin) + "#home_token=fresh-token" }, status: 0 }, "*");
           });
         </script>` : "";
-        const body = Buffer.from(`<!doctype html><style>html,body{height:100%;margin:0}iframe{border:0;height:100%;width:100%}</style><iframe title="Chat" sandbox="allow-forms allow-modals allow-pointer-lock allow-scripts" src="${chatSrc}"></iframe>${reconnectHost}`);
+        const body = Buffer.from(`<!doctype html><style>html,body{height:100%;margin:0}iframe{border:0;height:100%;width:100%}</style><iframe title="Chat" sandbox="allow-forms allow-modals allow-pointer-lock allow-scripts" src="${chatSrc}"></iframe>${reconnectHost}<script type="module">
+          import { bindCapsuleLayout } from "/shell-capsule-layout.js";
+          window.fixtureUnbindLayout = bindCapsuleLayout();
+        </script>`);
         response.writeHead(200, {
           "content-length": body.length,
           "content-type": "text/html; charset=utf-8",
@@ -291,6 +338,12 @@ function startServer(scenario) {
         );
       }
       if (url.pathname === "/api/apps/chat-room/poll") {
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        const input = JSON.parse(body);
+        if (historyScenario) trace.pollCursors.push(input.since);
+        trace.reads.push({ scope:"shared", markRead:input.mark_read });
+        if (input.mark_read === true) trace.communityUnread = false;
         trace.current.polls += 1;
         trace.current.pollBeforeReady ||= !trace.current.ready;
         trace.current.pollHeaders.push({
@@ -346,10 +399,13 @@ function startServer(scenario) {
           await hold.promise;
           trace.heldReleases.push(hold.label);
         }
-        return json(response, { conversations: [directConversation()] });
+        return json(response, { conversations: [{ ...directConversation(), unread: unreadScenario && trace.directUnread }],
+          ...(url.searchParams.get("community_status") === "true" ? { community_unread:trace.communityUnread } : {}) });
       }
       if (url.pathname === "/api/apps/chat-room/direct/conversations/direct%3Asha256%3Afixture-conversation/messages") {
         trace.directMessages += 1;
+        trace.reads.push({ scope:"direct", markRead:url.searchParams.get("mark_read") === "true" });
+        if (unreadScenario && url.searchParams.get("mark_read") === "true") trace.directUnread = false;
         if (initialDirectRecovery) {
           if (request.headers["x-elastos-home-token"] !== "fresh-token") {
             return json(response, { error: "Home session expired" }, 401);
@@ -367,6 +423,13 @@ function startServer(scenario) {
           await hold.promise;
           trace.heldReleases.push(hold.label);
         }
+        if (retryScenario) {
+          const outgoing = { message_id:"message:retry-original", request_id:"chat-message:original",
+            direction:"outgoing", text:"Original pending text", created_at:1_725_000_000,
+            delivery_state:trace.retryMode === "settled" ? "receipt_settled" : "pending" };
+          return json(response, { conversation_id:directConversation().conversation_id,
+            messages:[outgoing, ...(trace.sentAgain ? [trace.sentAgain] : [])] });
+        }
         return json(response, {
           conversation_id: directConversation().conversation_id,
           messages: [{
@@ -381,6 +444,24 @@ function startServer(scenario) {
       if (url.pathname === "/api/apps/chat-room/session/leave") {
         trace.leaves += 1;
         return json(response, { status: "disconnected" });
+      }
+      if (url.pathname === "/api/apps/chat-room/direct/messages/send" && retryScenario) {
+        let raw = ""; for await (const chunk of request) raw += chunk;
+        const input = JSON.parse(raw); trace.retryPosts.push(input);
+        assert(input.conversation_id === directConversation().conversation_id && input.text === "Original pending text",
+          "Retry replaced the stored message intent", input);
+        if (input.retry_existing) {
+          assert(input.request_id === "chat-message:original", "Retry minted a replacement request ID", input);
+          if (holds.retry) { holds.retry.reached = true; await holds.retry.promise; }
+          if (scenario === "direct-retry-terminal") return json(response, { code:"retry_expired", error:"expired" }, 410);
+          if (scenario === "direct-retry-unavailable") return json(response, { code:"retry_unavailable", error:"unavailable" }, 410);
+          trace.retryMode = "settled";
+          return json(response, { status:"receipt_settled" }, 200);
+        }
+        assert(input.request_id !== "chat-message:original", "Send again reused expired signed intent", input);
+        trace.sentAgain = { message_id:"message:retry-new", request_id:input.request_id,
+          direction:"outgoing", text:input.text, created_at:1_725_000_001, delivery_state:"pending" };
+        return json(response, { status:"pending" }, 202);
       }
       if (url.pathname.startsWith("/apps/chat-room/")) {
         if (url.pathname === "/apps/chat-room/") {
@@ -487,7 +568,7 @@ async function reopenOpaqueChat(page) {
     const frame = document.createElement("iframe");
     frame.title = "Chat";
     frame.setAttribute("sandbox", "allow-forms allow-modals allow-pointer-lock allow-scripts");
-    frame.src = "/apps/chat-room/#home_token=test-token";
+    frame.src = `/apps/chat-room/?home_origin=${encodeURIComponent(location.origin)}#home_token=test-token`;
     previous.replaceWith(frame);
   });
 }
@@ -536,38 +617,252 @@ async function runScenario(scenario) {
     executablePath: brave,
     headless: true,
     viewport: { width: 1280, height: 900 },
+    ...(scenario === "history-status-order-calendar" ? { timezoneId: "America/New_York" } : {}),
   });
   const page = context.pages()[0] || await context.newPage();
 
   try {
+    if (scenario === "history-status-order-calendar") {
+      await page.clock.setFixedTime("2026-03-09T04:30:00Z");
+    }
     await page.goto(url, { waitUntil: "domcontentloaded" });
     let frame = await chatFrame(page);
 
-    if (scenario === "shared-poll-401") {
-      await waitForConfiguredChatWithoutLegacyFlash(frame, "Shared recovery bootstrap");
-      const originalFrame = frame;
-      const timeOrigin = await frame.evaluate(() => performance.timeOrigin);
-      const draft = "Keep this Community draft after session loss";
+    if (scenario === "shell-layout-visibility") {
+      await frame.evaluate(() => {
+        window.fixtureLayouts = [];
+        window.addEventListener("message", event => {
+          if (event.source === parent && event.data?.type === "elastos:shell-layout") window.fixtureLayouts.push(event.data.layout);
+        });
+        parent.postMessage({ type:"elastos:shell-layout", request:true }, new URL(location.href).searchParams.get("home_origin"));
+      });
+      const visibility = async expected => frame.waitForFunction(expected => window.fixtureLayouts.at(-1)?.visible === expected, expected);
+      await visibility(true);
+      for (const style of ["visibility:hidden", "display:none", "opacity:0"]) {
+        await page.locator('iframe[title="Chat"]').evaluate((node, style) => { node.style.cssText = style; }, style);
+        await visibility(false);
+        await page.locator('iframe[title="Chat"]').evaluate(node => { node.style.cssText = ""; });
+        await visibility(true);
+      }
+      await page.locator('iframe[title="Chat"]').evaluate(node => { node.dataset.spaceVisible = "false"; });
+      await visibility(false);
+      await page.locator('iframe[title="Chat"]').evaluate(node => { node.dataset.spaceVisible = "true"; });
+      await visibility(true);
+      await page.evaluate(() => {
+        Object.defineProperty(document, "hidden", { configurable:true, value:true });
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await visibility(false);
+      await page.evaluate(() => { delete document.hidden; document.dispatchEvent(new Event("visibilitychange")); });
+      await visibility(true);
+      assert(trace.authPosts === 0, "presentation snapshot performed authority work");
+      return;
+    }
+
+    if (scenario === "history-status-order-calendar") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "history bootstrap");
+      const draft = "Keep this draft while recent history is checked";
       await frame.locator("#message-input").fill(draft);
-      assert(!(await frame.locator("#reconnect-button").isVisible()), "Reconnect appeared before session loss");
-      const starts = trace.cycles[0].starts;
-      trace.rejectSharedPoll = true;
-      await frame.locator("#reconnect-button").waitFor({ state: "visible", timeout: 15_000 });
-      assert(trace.pollErrors === 1, "Shared recovery did not admit one poll401", trace);
-      assert(await frame.locator("#reconnect-button").isEnabled(), "lost session offers a disabled Reconnect");
-      assert(await frame.locator("#send-button").isDisabled(), "lost Shared session still permits Send");
-      assert(await frame.locator("#message-input").isDisabled(), "lost Shared session still permits composing");
-      assert(await frame.locator("#message-input").inputValue() === draft, "Shared loss replaced the unsent draft");
-      await frame.locator("#error-text").waitFor({ state: "visible" });
-      assert((await frame.locator("#error-text").innerText()).trim(), "Shared loss has no visible explanation");
-      const polls = trace.cycles[0].polls;
-      await new Promise(resolveDelay => setTimeout(resolveDelay, 2200));
-      assert(trace.cycles[0].starts === starts && trace.cycles[0].polls === polls
-        && trace.authPosts === 0 && await page.evaluate(() => window.fixtureReconnects) === 0,
-      "Shared loss performed automatic recovery work", trace);
-      assert(await chatFrame(page) === originalFrame
-        && await frame.evaluate(() => performance.timeOrigin) === timeOrigin,
-      "Shared loss replaced its draft-owning document");
+      const historyStatus = async (status) => {
+        await frame.waitForFunction(expected =>
+          document.querySelector("#conversation-detail")?.dataset.historyStatus === expected, status);
+        assert(await frame.locator("#conversation-detail").isVisible(), "history status is hidden in shell mode");
+        assert(await frame.locator("#message-input").isEnabled() && await frame.locator("#send-button").isEnabled()
+          && !(await frame.locator("#reconnect-button").isVisible()), "history status changed live session controls");
+        assert(await frame.locator("#message-input").inputValue() === draft, "history status replaced the draft");
+      };
+      const messageOrder = async (expected) => frame.waitForFunction(order =>
+        [...document.querySelectorAll("#message-list [data-seq]")].map(node => Number(node.dataset.seq)).join(",")
+          === order.join(","), expected);
+      const dayFor = async (seq) => frame.evaluate(id => {
+        let node = document.querySelector(`#message-list [data-seq="${id}"]`)?.previousElementSibling;
+        while (node && !node.classList.contains("day-separator")) node = node.previousElementSibling;
+        return node?.textContent.trim();
+      }, seq);
+      await historyStatus("searching");
+      await messageOrder([2, 3, 1]);
+      assert(await dayFor(2) === "Yesterday" && await dayFor(1) === "Today",
+        "spring DST labels use elapsed hours instead of local calendar days");
+      trace.historyStatus = "available";
+      trace.historyPhase = 1;
+      await historyStatus("available");
+      await messageOrder([4, 2, 3, 1]);
+      await waitFor(() => trace.pollCursors.includes(4));
+      trace.historyStatus = "unavailable";
+      await historyStatus("unavailable");
+      assert((await frame.locator("#conversation-detail").innerText()).includes("Another participant must be online"),
+        "unavailable history does not explain how to catch up");
+      await page.setViewportSize({ width: 375, height: 900 });
+      await frame.waitForFunction(() => {
+        const detail = document.querySelector("#conversation-detail");
+        return innerWidth === 375 && detail && getComputedStyle(detail).whiteSpace === "normal"
+          && detail.scrollWidth <= detail.clientWidth + 1 && detail.scrollHeight <= detail.clientHeight + 1;
+      });
+      await historyStatus("unavailable");
+      await page.setViewportSize({ width: 1280, height: 900 });
+
+      await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').click();
+      await frame.waitForFunction(() => document.body.dataset.chatMode === "direct");
+      assert(await frame.locator("#conversation-detail").innerText() === "Direct message"
+        && await frame.locator("#conversation-detail").getAttribute("data-history-status") === null,
+      "Community history status leaked into a Direct conversation");
+      await clickSharedChoice(frame);
+      await historyStatus("unavailable");
+      await page.clock.setFixedTime("2026-11-02T04:30:00Z");
+      trace.historyPhase = 2;
+      trace.historyStatus = "available";
+      await historyStatus("available");
+      await messageOrder([4, 2, 3, 1, 5, 6]);
+      assert(await dayFor(5) === "Yesterday" && await dayFor(6) === "Today",
+        "fall DST labels use elapsed hours instead of local calendar days");
+      await waitFor(() => trace.pollCursors.includes(6));
+      assert(trace.cycles[0].starts === 1 && trace.authPosts === 0 && trace.cycles[0].sends === 0,
+        "history display performed session or send work", trace);
+      return;
+    }
+
+    if (scenario.startsWith("direct-retry")) {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "retry bootstrap");
+      await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').click();
+      const original = frame.locator('[data-direct-message-id="message:retry-original"]');
+      await original.locator('[data-direct-action="retry"]').waitFor({ state:"visible" });
+      assert((await original.innerText()).includes("Waiting for delivery"), "pending delivery copy is inaccurate");
+      const draft = "Keep my current draft while retrying a different message";
+      await frame.locator("#message-input").fill(draft);
+      await original.locator('[data-direct-action="retry"]').click();
+      await waitFor(() => trace.retryPosts.length === 1);
+      if (holds.retry) {
+        await frame.waitForFunction(() => document.querySelector('[data-direct-message-id="message:retry-original"]')?.textContent.includes("Sending"));
+        assert(await frame.locator("#send-button").isDisabled()
+          && await original.locator('[data-direct-action="retry"]').isDisabled(), "in-flight send controls permit duplicate intent");
+        await clickSharedChoice(frame);
+        await frame.locator("#message-input").fill("Different Community draft");
+        holds.retry.release();
+        await waitFor(() => trace.retryMode === "settled");
+        await new Promise(resolveDelay => setTimeout(resolveDelay, 1200));
+        assert(await frame.locator("#message-input").inputValue() === "Different Community draft"
+          && (await frame.locator("#error-text").innerText()) === "", "stale Retry changed the new selection");
+        await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').click();
+      }
+      if (["direct-retry-terminal", "direct-retry-unavailable"].includes(scenario)) {
+        await original.locator('[data-direct-action="send-again"]').waitFor({ state:"visible" });
+        const text = await original.innerText();
+        assert(text.includes("Delivery is unconfirmed") && text.includes(scenario === "direct-retry-terminal" ? "24-hour" : "unavailable"),
+          "terminal refusal lacks honest recovery explanation", text);
+        assert(await frame.locator("#message-input").inputValue() === draft, "terminal refusal changed the composer");
+        await original.locator('[data-direct-action="send-again"]').click();
+        await frame.locator('[data-direct-message-id="message:retry-new"]').waitFor({ state:"visible" });
+        assert(trace.retryPosts.length === 2 && trace.retryPosts[1].retry_existing === false
+          && trace.retryPosts[1].request_id !== trace.retryPosts[0].request_id,
+          "explicit Send again did not create one fresh intent", trace.retryPosts);
+        assert(await original.count() === 1 && await frame.locator("#message-input").inputValue() === draft,
+          "Send again replaced the original record or current draft");
+      } else {
+        await frame.waitForFunction(() => document.querySelector('[data-direct-message-id="message:retry-original"]')?.textContent.includes("Sent"));
+        assert(await original.locator('[data-direct-action]').count() === 0, "settled receipt retains Retry");
+        assert(await frame.locator("#message-input").inputValue() === draft, "Retry cleared the current draft");
+        assert(trace.retryPosts.length === 1 && trace.retryPosts[0].retry_existing === true, "Retry sent another fresh intent");
+      }
+      return;
+    }
+
+    if (scenario === "visible-read") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "visibility bootstrap");
+      const shellFrame = page.locator('iframe[title="Chat"]');
+      const sharedDot = frame.locator('[data-conversation-choice="shared"] .conversation-unread-dot');
+      const hide = async (style) => {
+        await shellFrame.evaluate((node, style) => { node.style.cssText = style; }, style);
+        const count = trace.reads.length;
+        await waitFor(() => trace.reads.length >= count + 3);
+        assert(trace.reads.slice(-2).every(read => read.markRead === false), "hidden Chat marked a conversation read", trace.reads.slice(-3));
+      };
+      const restore = async () => {
+        await shellFrame.evaluate(node => { node.style.cssText = ""; node.dataset.spaceVisible = "true"; });
+        await waitFor(() => trace.reads.at(-1)?.markRead === true);
+      };
+      for (const style of ["visibility:hidden", "display:none", "opacity:0"]) {
+        await hide(style);
+        trace.communityUnread = true;
+        await sharedDot.waitFor({ state:"attached" });
+        assert(trace.communityUnread, "background Community poll erased unread truth");
+        await restore();
+        await waitFor(() => !trace.communityUnread);
+        await sharedDot.waitFor({ state:"detached" });
+      }
+      await shellFrame.evaluate(node => { node.dataset.spaceVisible = "false"; });
+      await hide("");
+      trace.communityUnread = true;
+      await sharedDot.waitFor({ state:"attached" });
+      // Sibling and wrong-origin messages cannot override Home's hidden decision.
+      await page.evaluate(() => {
+        const frame = document.querySelector('iframe[title="Chat"]');
+        const sibling = document.createElement("iframe"); document.body.appendChild(sibling);
+        sibling.contentWindow.eval(`parent.document.querySelector('iframe[title="Chat"]').contentWindow.postMessage({type:'elastos:shell-layout',layout:{visible:true}}, '*')`);
+        sibling.remove();
+        window.fixtureUnbindLayout();
+      });
+      await frame.evaluate(() => {
+        window.dispatchEvent(new MessageEvent("message", { source:parent, origin:"https://foreign.example",
+          data:{ type:"elastos:shell-layout", layout:{visible:true} } }));
+      });
+      const count = trace.reads.length;
+      await waitFor(() => trace.reads.length >= count + 2);
+      assert(trace.reads.slice(-2).every(read => !read.markRead), "forged sibling changed read visibility");
+      await page.evaluate(async () => {
+        const { bindCapsuleLayout } = await import("/shell-capsule-layout.js");
+        window.fixtureUnbindLayout = bindCapsuleLayout();
+      });
+      await restore();
+      await page.evaluate(() => {
+        window.fixtureParentHidden = true;
+        Object.defineProperty(document, "hidden", { configurable:true, get:() => window.fixtureParentHidden });
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      const hiddenCount = trace.reads.length;
+      await waitFor(() => trace.reads.length >= hiddenCount + 2);
+      assert(trace.reads.slice(-2).every(read => !read.markRead), "parent visibilitychange kept read acknowledgements enabled");
+      await page.evaluate(() => { delete document.hidden; document.dispatchEvent(new Event("visibilitychange")); });
+      await restore();
+      trace.directUnread = true;
+      await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').click();
+      await waitFor(() => !trace.directUnread);
+      await hide("visibility:hidden");
+      trace.directUnread = true;
+      const countDirect = trace.directMessages;
+      await waitFor(() => trace.directMessages >= countDirect + 2);
+      assert(trace.directUnread, "hidden selected Direct erased unread truth");
+      await restore();
+      await waitFor(() => !trace.directUnread);
+      assert(trace.authPosts === 0 && trace.cycles[0].starts === 1, "visibility update performed authority work");
+      return;
+    }
+
+    if (scenario === "direct-unread") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "unread bootstrap");
+      const draft = "Keep this Community draft while reading a Direct message";
+      await frame.locator("#message-input").fill(draft);
+      const choice = frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]');
+      assert(await choice.locator(".conversation-unread-dot").count() === 0, "read conversation already has an unread dot");
+      trace.directUnread = true;
+      await frame.waitForFunction(() => {
+        const choice = document.querySelector('[data-conversation-choice="direct:sha256:fixture-conversation"]');
+        return choice?.classList.contains("unread") && !!choice.querySelector(".conversation-unread-dot")
+          && choice.querySelector(".conversation-choice-detail")?.textContent === "New message";
+      });
+      assert(trace.directMessages === 0, "unread refresh opened the conversation before the person chose it");
+      await choice.click();
+      await frame.waitForFunction(() => document.body.dataset.chatMode === "direct"
+        && document.querySelector("#message-list")?.textContent.includes("hello from direct"));
+      assert(!trace.directUnread, "opening Direct did not use the existing conversation read path");
+      await clickSharedChoice(frame);
+      await frame.waitForFunction(() => {
+        const choice = document.querySelector('[data-conversation-choice="direct:sha256:fixture-conversation"]');
+        return !!choice && !choice.classList.contains("unread") && !choice.querySelector(".conversation-unread-dot");
+      });
+      assert(await frame.locator("#message-input").inputValue() === draft, "opening unread Direct replaced the Shared draft");
+      trace.directUnread = true;
+      await choice.locator(".conversation-unread-dot").waitFor({ state: "visible" });
+      assert((await choice.innerText()).includes("New message"), "a later message did not restore the unread state");
       return;
     }
 
@@ -1044,6 +1339,14 @@ async function main() {
     "shared-poll-401",
     "contact-acceptance",
     "contact-acceptance-held-request",
+    "history-status-order-calendar",
+    "direct-unread",
+    "shell-layout-visibility",
+    "visible-read",
+    "direct-retry",
+    "direct-retry-held",
+    "direct-retry-terminal",
+    "direct-retry-unavailable",
   ];
   for (const scenario of scenarios) {
     await runScenario(scenario);

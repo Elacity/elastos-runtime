@@ -21,9 +21,10 @@ mod direct;
 use direct::{
     apply_direct_messages, encode_path_segment, pending_direct_request_id,
     remove_unavailable_conversation, requested_conversation_decision, selected_conversation,
-    should_clear_polled_transient_error, valid_direct_send_response, DirectConversationList,
-    DirectMessageDirection, DirectMessageList, DirectSendInput, DirectSendResponse, DirectUiState,
-    PendingDirectSend, RequestedConversationDecision, DIRECT_API_BASE,
+    should_clear_polled_transient_error, terminal_retry_detail, valid_direct_send_response,
+    DirectConversationList, DirectDeliveryState, DirectMessageDirection, DirectMessageList,
+    DirectSendFailure, DirectSendInput, DirectSendResponse, DirectUiState, PendingDirectSend,
+    RequestedConversationDecision, DIRECT_API_BASE,
 };
 
 const BROWSER_SESSION_API_BASE: &str = "/api/browser/session";
@@ -88,6 +89,7 @@ struct AppState {
     display_name: String,
     status_badge: String,
     status_detail: String,
+    history: Option<RoomHistoryView>,
     error_text: Option<String>,
     error_transient: bool,
     browser_access_allowed: bool,
@@ -121,6 +123,11 @@ struct AppState {
     /// another one is open. Sending the restored draft again reuses the
     /// request ID, so Runtime treats it as the same message.
     held_direct_sends: BTreeMap<String, PendingDirectSend>,
+    community_unread: bool,
+    /// Action state is ephemeral. Runtime owns signed intent and delivery truth.
+    direct_in_flight: BTreeMap<String, String>,
+    direct_retry_terminal: BTreeMap<String, String>,
+    direct_send_again: BTreeMap<String, PendingDirectSend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +153,7 @@ struct App {
     config: AppConfig,
     current_home_token: RefCell<Option<String>>,
     home_parent_origin: Option<String>,
+    shell_visible: Cell<bool>,
     picker_document_nonce: String,
     picker_request: RefCell<Option<LibraryPickerRequest>>,
     /// Counts card openings, so a late action response only updates the card
@@ -411,6 +419,14 @@ struct RoomTransportView {
     available: bool,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    history: Option<RoomHistoryView>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct RoomHistoryView {
+    status: String,
+    detail: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
@@ -474,6 +490,7 @@ struct BrowserSessionRequestInput<'a> {
 #[derive(Debug, Serialize)]
 struct RoomPollInput {
     since: u64,
+    mark_read: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -558,6 +575,7 @@ pub fn start() -> Result<(), JsValue> {
         current_home_token: RefCell::new(config.home_token.clone()),
         config,
         home_parent_origin: extract_query_param(&window.location().href()?, "home_origin"),
+        shell_visible: Cell::new(false),
         picker_document_nonce: new_chat_message_request_id()
             .map_err(|error| JsValue::from_str(&error))?,
         picker_request: RefCell::new(None),
@@ -633,6 +651,18 @@ pub fn start() -> Result<(), JsValue> {
 impl App {
     fn is_shell_mode(&self) -> bool {
         self.config.access_mode == AccessMode::Shell
+    }
+
+    fn can_mark_read(&self, conversation_id: Option<&str>) -> bool {
+        !self.document.hidden()
+            && (!self.is_shell_mode() || self.shell_visible.get())
+            && self
+                .state
+                .borrow()
+                .direct
+                .selected_conversation_id
+                .as_deref()
+                == conversation_id
     }
 
     fn default_status_badge(&self) -> String {
@@ -845,7 +875,7 @@ impl App {
         let guard = current_selection_guard(&self.state.borrow());
         let request_token = self.home_token();
         let response: Result<DirectConversationList, u16> = direct_get_json(
-            &format!("{DIRECT_API_BASE}/conversations"),
+            &format!("{DIRECT_API_BASE}/conversations?community_status=true"),
             &self.home_token_headers(),
         )
         .await;
@@ -862,7 +892,9 @@ impl App {
             return Err(500);
         }
         let mut state = self.state.borrow_mut();
-        if state.direct.conversations == response.conversations {
+        let unread_changed = state.community_unread != response.community_unread.unwrap_or(false);
+        state.community_unread = response.community_unread.unwrap_or(false);
+        if state.direct.conversations == response.conversations && !unread_changed {
             return Ok(false);
         }
         state.direct.conversations = response.conversations;
@@ -895,7 +927,7 @@ impl App {
         let conversation_id = guard.selected_conversation_id.clone().ok_or(403u16)?;
         let request_token = self.home_token();
         let conversations_result: Result<DirectConversationList, u16> = direct_get_json(
-            &format!("{DIRECT_API_BASE}/conversations"),
+            &format!("{DIRECT_API_BASE}/conversations?community_status=true"),
             &self.home_token_headers(),
         )
         .await;
@@ -918,8 +950,9 @@ impl App {
         }
         let messages_result: Result<DirectMessageList, u16> = direct_get_json(
             &format!(
-                "{DIRECT_API_BASE}/conversations/{}/messages",
-                encode_path_segment(&conversation_id)
+                "{DIRECT_API_BASE}/conversations/{}/messages?retry_details=true&mark_read={}",
+                encode_path_segment(&conversation_id),
+                self.can_mark_read(Some(&conversation_id))
             ),
             &self.home_token_headers(),
         )
@@ -930,14 +963,19 @@ impl App {
         let response = messages_result.inspect_err(|&status| {
             self.handle_direct_authority_loss(status);
         })?;
-        if response
-            .messages
-            .iter()
-            .any(|message| message.message_id.trim().is_empty() || message.text.trim().is_empty())
-        {
+        if response.messages.iter().any(|message| {
+            message.message_id.trim().is_empty()
+                || message.text.trim().is_empty()
+                || message.request_id.as_deref().is_some_and(|id| {
+                    id.trim().is_empty() || message.direction != DirectMessageDirection::Outgoing
+                })
+        }) {
             return Err(500);
         }
         let mut state = self.state.borrow_mut();
+        let unread_changed =
+            state.community_unread != conversations.community_unread.unwrap_or(false);
+        state.community_unread = conversations.community_unread.unwrap_or(false);
         let Some(result) = apply_direct_refresh_if_current(
             &mut state,
             guard,
@@ -950,7 +988,7 @@ impl App {
         if result.is_ok() {
             self.publish_home_navigation(guard);
         }
-        result
+        result.map(|changed| changed || unread_changed)
     }
 
     fn publish_home_navigation(&self, guard: &SelectionGuard) {
@@ -981,6 +1019,54 @@ impl App {
     }
 
     fn bind_events(self: &Rc<Self>) -> Result<(), JsValue> {
+        if self.is_shell_mode() {
+            let app = Rc::clone(self);
+            let layout =
+                Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+                    let Some(origin) = admitted_home_origin(app.home_parent_origin.as_deref())
+                    else {
+                        return;
+                    };
+                    let Some(window) = window() else { return };
+                    let Ok(Some(parent)) = window.parent() else {
+                        return;
+                    };
+                    let source = Reflect::get(event.as_ref(), &JsValue::from_str("source"))
+                        .unwrap_or(JsValue::NULL);
+                    if event.origin() != origin || !JsObject::is(&source, parent.as_ref()) {
+                        return;
+                    }
+                    let data = event.data();
+                    if js_string_field(&data, "type").as_deref() != Some("elastos:shell-layout") {
+                        return;
+                    }
+                    let visible = Reflect::get(&data, &JsValue::from_str("layout"))
+                        .and_then(|layout| Reflect::get(&layout, &JsValue::from_str("visible")))
+                        .ok()
+                        .and_then(|value| value.as_bool());
+                    if let Some(visible) = visible {
+                        app.shell_visible.set(visible);
+                    }
+                }));
+            window()
+                .ok_or_else(|| JsValue::from_str("window unavailable"))?
+                .add_event_listener_with_callback("message", layout.as_ref().unchecked_ref())?;
+            layout.forget();
+            // WASM initialization can finish after the iframe load message.
+            // Request the same presentation snapshot once the listener exists.
+            if let (Some(window), Some(origin)) = (
+                window(),
+                admitted_home_origin(self.home_parent_origin.as_deref()),
+            ) {
+                if let Ok(Some(parent)) = window.parent() {
+                    if let Ok(request) =
+                        js_sys::JSON::parse(r#"{"type":"elastos:shell-layout","request":true}"#)
+                    {
+                        let _ = parent.post_message(&request, origin);
+                    }
+                }
+            }
+        }
         if let Some(gateway_ui) = &self.gateway_ui {
             let browser_access_app = Rc::clone(self);
             let browser_access_submit =
@@ -1395,6 +1481,30 @@ impl App {
             else {
                 return;
             };
+            if let Some(button) = target.closest("[data-direct-action]").ok().flatten() {
+                event.prevent_default();
+                let Some(request_id) = button.get_attribute("data-request-id") else {
+                    return;
+                };
+                let Some(action) = button.get_attribute("data-direct-action") else {
+                    return;
+                };
+                if !matches!(action.as_str(), "retry" | "send-again") {
+                    return;
+                }
+                let app = Rc::clone(&link_app);
+                spawn_local(async move {
+                    app.clear_error();
+                    if let Err(error) = app
+                        .retry_direct_message(&request_id, action == "send-again")
+                        .await
+                    {
+                        app.set_error(Some(error));
+                    }
+                    let _ = app.render();
+                });
+                return;
+            }
             if let Some(button) = target.closest("[data-open-attachment]").ok().flatten() {
                 let Some(attachment_id) = button.get_attribute("data-open-attachment") else {
                     return;
@@ -1703,7 +1813,10 @@ impl App {
             let headers = app.room_request_headers();
             let result = api_post_session_json(
                 &app.room_api_url("/poll"),
-                &RoomPollInput { since: 0 },
+                &RoomPollInput {
+                    since: 0,
+                    mark_read: app.can_mark_read(None),
+                },
                 &headers,
             )
             .await;
@@ -1767,6 +1880,7 @@ impl App {
         state.force_message_follow = true;
         state.display_name.clear();
         state.latest_seq = 0;
+        state.history = None;
         state.objects.clear();
         state.participants.clear();
         state.active_sessions.clear();
@@ -2367,11 +2481,24 @@ impl App {
             .selected_conversation_id
             .clone()
             .ok_or_else(|| "Choose a conversation first.".to_string())?;
-        if selected_conversation(&self.state.borrow().direct.conversations, &conversation_id)
-            .is_none()
-        {
+        let selected =
+            selected_conversation(&self.state.borrow().direct.conversations, &conversation_id)
+                .cloned();
+        let Some(selected) = selected else {
             self.return_to_conversation_selector(Some(&conversation_id));
             return Err("That conversation is no longer available.".to_string());
+        };
+        if selected.removed {
+            return Ok(());
+        }
+        if self
+            .state
+            .borrow()
+            .direct_in_flight
+            .values()
+            .any(|id| id == &conversation_id)
+        {
+            return Ok(());
         }
         let text = self.message_input.value().trim().to_string();
         if text.is_empty() {
@@ -2392,25 +2519,33 @@ impl App {
             request_id: &request_id,
             conversation_id: &conversation_id,
             text: &text,
+            retry_existing: false,
         };
+        self.state
+            .borrow_mut()
+            .direct_in_flight
+            .insert(request_id.clone(), conversation_id.clone());
+        let _ = self.render();
         let request_token = self.home_token();
-        let response_result: Result<(u16, DirectSendResponse), u16> = direct_post_json(
-            &format!("{DIRECT_API_BASE}/messages/send"),
-            &payload,
-            &self.home_token_headers(),
-        )
-        .await;
+        let response_result: Result<(u16, DirectSendResponse), DirectSendFailure> =
+            direct_post_json(
+                &format!("{DIRECT_API_BASE}/messages/send"),
+                &payload,
+                &self.home_token_headers(),
+            )
+            .await;
+        self.state.borrow_mut().direct_in_flight.remove(&request_id);
         if self.home_token() != request_token || self.state.borrow().reconnect_needed {
             return Ok(());
         }
         let (http_status, response) = match response_result {
             Ok(response) => response,
             Err(_) if !self.selection_guard_is_current(&selection_guard) => return Ok(()),
-            Err(401) => {
+            Err(error) if error.status == 401 => {
                 self.handle_direct_authority_loss(401);
                 return Ok(());
             }
-            Err(403) => {
+            Err(error) if error.status == 403 => {
                 self.return_to_conversation_selector(Some(&conversation_id));
                 return Err("That conversation is no longer available.".to_string());
             }
@@ -2453,6 +2588,138 @@ impl App {
                 .await;
         }
         Ok(())
+    }
+
+    async fn retry_direct_message(
+        &self,
+        original_request_id: &str,
+        send_again: bool,
+    ) -> Result<(), String> {
+        let (intent, guard) = {
+            let mut state = self.state.borrow_mut();
+            if state.reconnect_needed || state.reconnecting {
+                return Ok(());
+            }
+            let Some(conversation_id) = state.direct.selected_conversation_id.clone() else {
+                return Ok(());
+            };
+            if selected_conversation(&state.direct.conversations, &conversation_id)
+                .is_none_or(|conversation| conversation.removed)
+                || state
+                    .direct_in_flight
+                    .values()
+                    .any(|id| id == &conversation_id)
+            {
+                return Ok(());
+            }
+            let Some(message) = state
+                .direct
+                .messages
+                .iter()
+                .find(|message| {
+                    message.request_id.as_deref() == Some(original_request_id)
+                        && message.direction == DirectMessageDirection::Outgoing
+                        && matches!(
+                            message.delivery_state,
+                            DirectDeliveryState::Pending | DirectDeliveryState::Expired
+                        )
+                })
+                .cloned()
+            else {
+                return Ok(());
+            };
+            let terminal = message.delivery_state == DirectDeliveryState::Expired
+                || state
+                    .direct_retry_terminal
+                    .contains_key(original_request_id);
+            if terminal != send_again {
+                return Ok(());
+            }
+            let intent = if send_again {
+                if let Some(intent) = state.direct_send_again.get(original_request_id) {
+                    intent.clone()
+                } else {
+                    let intent = PendingDirectSend {
+                        request_id: new_chat_message_request_id()?,
+                        conversation_id: conversation_id.clone(),
+                        text: message.text,
+                    };
+                    state
+                        .direct_send_again
+                        .insert(original_request_id.to_string(), intent.clone());
+                    intent
+                }
+            } else {
+                PendingDirectSend {
+                    request_id: original_request_id.to_string(),
+                    conversation_id: conversation_id.clone(),
+                    text: message.text,
+                }
+            };
+            state
+                .direct_in_flight
+                .insert(intent.request_id.clone(), conversation_id);
+            (intent, current_selection_guard(&state))
+        };
+        let _ = self.render();
+        let token = self.home_token();
+        let result: Result<(u16, DirectSendResponse), DirectSendFailure> = direct_post_json(
+            &format!("{DIRECT_API_BASE}/messages/send"),
+            &DirectSendInput {
+                request_id: &intent.request_id,
+                conversation_id: &intent.conversation_id,
+                text: &intent.text,
+                retry_existing: !send_again,
+            },
+            &self.home_token_headers(),
+        )
+        .await;
+        self.state
+            .borrow_mut()
+            .direct_in_flight
+            .remove(&intent.request_id);
+        if self.home_token() != token
+            || !self.selection_guard_is_current(&guard)
+            || self.state.borrow().reconnect_needed
+        {
+            return Ok(());
+        }
+        match result {
+            Ok((status, response)) if valid_direct_send_response(status, response.status) => {
+                if send_again {
+                    self.state
+                        .borrow_mut()
+                        .direct_send_again
+                        .remove(original_request_id);
+                }
+                self.state
+                    .borrow_mut()
+                    .direct_retry_terminal
+                    .remove(original_request_id);
+                let _ = self.refresh_direct_messages_for_guard(&guard).await;
+                Ok(())
+            }
+            Err(error) if error.status == 401 => {
+                self.handle_direct_authority_loss(401);
+                Ok(())
+            }
+            Err(error) if error.status == 403 => {
+                self.return_to_conversation_selector(Some(&intent.conversation_id));
+                Err("That conversation is no longer available.".to_string())
+            }
+            Err(error) if error.status == 410 => {
+                if let Some(detail) = terminal_retry_detail(error.code.as_deref()) {
+                    self.state
+                        .borrow_mut()
+                        .direct_retry_terminal
+                        .insert(original_request_id.to_string(), detail.to_string());
+                    Ok(())
+                } else {
+                    Err("Message could not be retried. Try again.".to_string())
+                }
+            }
+            _ => Err("Message could not be retried. Try again.".to_string()),
+        }
     }
 
     async fn send_library_attachment(
@@ -3057,6 +3324,7 @@ impl App {
                         let state = self.state.borrow();
                         state.latest_seq
                     },
+                    mark_read: self.can_mark_read(None),
                 },
                 &headers,
             )
@@ -3356,7 +3624,11 @@ impl App {
         }
         set_hidden(&self.chat_card, !show_chat_surface)?;
         set_hidden(&self.conversation_selector, !self.is_shell_mode())?;
-        self.render_conversation_selector(&state.direct)?;
+        self.render_conversation_selector(
+            &state.direct,
+            state.history.as_ref(),
+            state.community_unread,
+        )?;
         set_hidden(&self.presence_card, direct_mode)?;
         set_hidden(&self.participant_toggle, direct_mode || !session_active)?;
         set_hidden(&self.participant_close, direct_mode || !session_active)?;
@@ -3411,10 +3683,23 @@ impl App {
                 .set_attribute("aria-label", ATTACH_LABEL)?;
         }
         self.send_button.set_disabled(if direct_mode {
-            !direct_send_enabled || state.reconnect_needed || state.reconnecting
+            !direct_send_enabled
+                || state.reconnect_needed
+                || state.reconnecting
+                || state
+                    .direct_in_flight
+                    .values()
+                    .any(|id| Some(id.as_str()) == state.direct.selected_conversation_id.as_deref())
         } else {
             !controls.enable_text_send
         });
+        let sending = direct_mode
+            && state
+                .direct_in_flight
+                .values()
+                .any(|id| Some(id.as_str()) == state.direct.selected_conversation_id.as_deref());
+        self.send_button
+            .set_text_content(Some(if sending { "Sending" } else { "Send" }));
         for button in &self.emoji_buttons {
             button.set_disabled(if direct_mode {
                 !direct_send_enabled
@@ -3428,7 +3713,7 @@ impl App {
             self.browser_access_list.set_inner_html("");
             self.room_policy_list.set_inner_html("");
             self.node_list.set_inner_html("");
-            self.render_direct_messages(&state.direct)?;
+            self.render_direct_messages(&state)?;
         } else {
             self.render_participants(
                 &state.participants,
@@ -3436,7 +3721,11 @@ impl App {
             )?;
             self.render_browser_access_requests(&state.pending_requests)?;
             self.render_room_access(&state)?;
-            self.render_objects(&state.objects, &state.attachment_urls)?;
+            self.render_objects(
+                &state.objects,
+                &state.attachment_urls,
+                state.collaboration_configured,
+            )?;
         }
         restore_scroll_position(&self.participant_list, previous_participant_scroll_top);
         if force_message_follow || follow_messages {
@@ -3449,7 +3738,12 @@ impl App {
         Ok(())
     }
 
-    fn render_conversation_selector(&self, direct: &DirectUiState) -> Result<(), JsValue> {
+    fn render_conversation_selector(
+        &self,
+        direct: &DirectUiState,
+        history: Option<&RoomHistoryView>,
+        community_unread: bool,
+    ) -> Result<(), JsValue> {
         self.conversation_selector.set_inner_html("");
         let shared = self.document.create_element("button")?;
         shared.set_attribute("type", "button")?;
@@ -3475,6 +3769,17 @@ impl App {
             "Community",
             "Shared room",
         )?;
+        if community_unread {
+            shared.set_class_name(if direct.selected_conversation_id.is_none() {
+                "conversation-choice active unread"
+            } else {
+                "conversation-choice unread"
+            });
+            let dot = self.document.create_element("span")?;
+            dot.set_class_name("conversation-unread-dot");
+            dot.set_attribute("aria-label", "Unread")?;
+            shared.append_child(&dot)?;
+        }
         self.conversation_selector.append_child(&shared)?;
 
         for conversation in &direct.conversations {
@@ -3485,9 +3790,10 @@ impl App {
             let selected = direct.selected_conversation_id.as_deref()
                 == Some(conversation.conversation_id.as_str());
             button.set_attribute("aria-current", if selected { "true" } else { "false" })?;
-            let unread = conversation.unread && !selected;
+            let unread = conversation.unread;
             button.set_class_name(match (selected, unread) {
-                (true, _) => "conversation-choice active",
+                (true, true) => "conversation-choice active unread",
+                (true, false) => "conversation-choice active",
                 (false, true) => "conversation-choice unread",
                 (false, false) => "conversation-choice",
             });
@@ -3534,10 +3840,33 @@ impl App {
         self.conversation_avatar.set_text_content(Some(&avatar));
         self.conversation_title.set_text_content(Some(&title));
         self.conversation_detail.set_text_content(Some(detail));
+        if let Some(history) = history.filter(|history| {
+            selected.is_none()
+                && matches!(
+                    history.status.as_str(),
+                    "searching" | "available" | "unavailable"
+                )
+                && !history.detail.trim().is_empty()
+        }) {
+            self.conversation_detail
+                .set_text_content(Some(&format!("{detail} · {}", history.detail.trim())));
+            self.conversation_detail
+                .set_attribute("data-history-status", &history.status)?;
+            self.conversation_detail
+                .style()
+                .set_property("white-space", "normal")?;
+        } else {
+            self.conversation_detail
+                .remove_attribute("data-history-status")?;
+            self.conversation_detail
+                .style()
+                .remove_property("white-space")?;
+        }
         Ok(())
     }
 
-    fn render_direct_messages(&self, direct: &DirectUiState) -> Result<(), JsValue> {
+    fn render_direct_messages(&self, state: &AppState) -> Result<(), JsValue> {
+        let direct = &state.direct;
         self.message_list.set_inner_html("");
         let Some(conversation_id) = direct.selected_conversation_id.as_deref() else {
             return Ok(());
@@ -3558,6 +3887,7 @@ impl App {
             self.append_day_separator_if_new(&mut last_day, message.created_at)?;
             let outgoing = message.direction == DirectMessageDirection::Outgoing;
             let item = self.document.create_element("li")?;
+            item.set_attribute("data-direct-message-id", &message.message_id)?;
             item.set_class_name(if outgoing {
                 "message self-message"
             } else {
@@ -3575,7 +3905,15 @@ impl App {
             detail.set_text_content(Some(&format!(
                 "{} · {}",
                 format_time(message.created_at),
-                message.delivery_state.label()
+                if message
+                    .request_id
+                    .as_ref()
+                    .is_some_and(|id| state.direct_in_flight.contains_key(id))
+                {
+                    "Sending"
+                } else {
+                    message.delivery_state.label()
+                }
             )));
             meta.append_child(&sender)?;
             meta.append_child(&detail)?;
@@ -3584,6 +3922,62 @@ impl App {
             body.set_text_content(Some(&message.text));
             item.append_child(&meta)?;
             item.append_child(&body)?;
+            if outgoing
+                && matches!(
+                    message.delivery_state,
+                    DirectDeliveryState::Pending | DirectDeliveryState::Expired
+                )
+            {
+                if let Some(request_id) = message
+                    .request_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                {
+                    let terminal = state
+                        .direct_retry_terminal
+                        .get(request_id)
+                        .map(String::as_str)
+                        .or_else(|| {
+                            (message.delivery_state == DirectDeliveryState::Expired)
+                                .then(|| terminal_retry_detail(Some("retry_expired")).unwrap())
+                        });
+                    if let Some(detail) = terminal {
+                        let note = self.document.create_element("p")?;
+                        note.set_class_name("message-meta");
+                        note.set_text_content(Some(detail));
+                        item.append_child(&note)?;
+                    }
+                    let action = self
+                        .document
+                        .create_element("button")?
+                        .dyn_into::<HtmlButtonElement>()?;
+                    action.set_type("button");
+                    action.set_attribute(
+                        "data-direct-action",
+                        if terminal.is_some() {
+                            "send-again"
+                        } else {
+                            "retry"
+                        },
+                    )?;
+                    action.set_attribute("data-request-id", request_id)?;
+                    action.set_text_content(Some(if terminal.is_some() {
+                        "Send again"
+                    } else {
+                        "Retry"
+                    }));
+                    action.set_disabled(
+                        conversation.removed
+                            || state.reconnect_needed
+                            || state.reconnecting
+                            || state
+                                .direct_in_flight
+                                .values()
+                                .any(|id| id == conversation_id),
+                    );
+                    item.append_child(&action)?;
+                }
+            }
             self.message_list.append_child(&item)?;
         }
         Ok(())
@@ -3934,6 +4328,7 @@ impl App {
         &self,
         objects: &[ConversationObjectView],
         attachment_urls: &BTreeMap<String, String>,
+        configured: bool,
     ) -> Result<(), JsValue> {
         self.message_list.set_inner_html("");
         if objects.is_empty() {
@@ -3948,7 +4343,7 @@ impl App {
         }
 
         let mut last_day = None;
-        for object in objects {
+        for object in shared_objects_in_display_order(objects, configured) {
             self.append_day_separator_if_new(&mut last_day, object.created_at)?;
             let item = self.document.create_element("li")?;
             item.set_attribute("data-seq", &object.seq.to_string())?;
@@ -4405,6 +4800,7 @@ fn apply_session_loss(state: &mut AppState, shell_mode: bool, detail: &str) {
     state.show_access_controls = false;
     state.force_message_follow = true;
     state.latest_seq = 0;
+    state.history = None;
     state.objects.clear();
     state.participants.clear();
     state.active_sessions.clear();
@@ -4431,9 +4827,11 @@ fn apply_active_poll_state(
     let was_session_active = state.session_active;
     let previous_display_name = state.display_name.clone();
     let previous_latest_seq = state.latest_seq;
+    let previous_object_count = state.objects.len();
     let previous_participants = state.participants.clone();
     let previous_status_badge = state.status_badge.clone();
     let previous_status_detail = state.status_detail.clone();
+    let previous_history = state.history.clone();
     let previous_collaboration_configured = state.collaboration_configured;
     state.collaboration_configured = poll.transport.configured;
     if !was_session_active
@@ -4448,7 +4846,8 @@ fn apply_active_poll_state(
     state.display_name = poll.display_name.clone();
     state.status_badge = "Live".to_string();
     state.status_detail = transport_summary;
-    state.latest_seq = poll.latest_seq;
+    state.history = poll.transport.history;
+    state.latest_seq = state.latest_seq.max(poll.latest_seq);
     state.objects.extend(poll.objects);
     state.participants = poll.participants;
     dedupe_objects(&mut state.objects);
@@ -4469,9 +4868,11 @@ fn apply_active_poll_state(
         || was_session_active != state.session_active
         || previous_display_name != state.display_name
         || previous_latest_seq != state.latest_seq
+        || previous_object_count != state.objects.len()
         || previous_participants != state.participants
         || previous_status_badge != state.status_badge
         || previous_status_detail != state.status_detail;
+    let changed = changed || previous_history != state.history;
     (attachments_to_cache, changed)
 }
 
@@ -4646,6 +5047,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         display_name: String::new(),
         status_badge: default_status_badge_for_mode(config.access_mode),
         status_detail: default_status_detail_for_mode(config.access_mode),
+        history: None,
         error_transient: false,
         browser_access_allowed: false,
         browser_access_block_reason: None,
@@ -4666,6 +5068,10 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         composer_revision: 0,
         composer_edits: 0,
         held_direct_sends: BTreeMap::new(),
+        community_unread: false,
+        direct_in_flight: BTreeMap::new(),
+        direct_retry_terminal: BTreeMap::new(),
+        direct_send_again: BTreeMap::new(),
         error_text: None,
     }
 }
@@ -4746,10 +5152,10 @@ mod tests {
         documents_attachment_message, extract_fragment_param, extract_query_param,
         format_chat_message_request_id, note_composer_edit, object_sender_name, participant_detail,
         participant_shown_name, pending_chat_request_id, render_projection,
-        resolve_conversation_choice, room_send_error_text, selection_guard_matches, settle_sent_draft,
-        shell_summary_allows_session, switch_composer_draft, AccessMode, AppConfig, AppState,
-        AttachmentView, ConversationObjectKind, ConversationObjectView, ParticipantView,
-        PendingChatSend, RenderProjection, RoomPollView, RoomTransportView,
+        resolve_conversation_choice, room_send_error_text, selection_guard_matches,
+        settle_sent_draft, shell_summary_allows_session, switch_composer_draft, AccessMode,
+        AppConfig, AppState, AttachmentView, ConversationObjectKind, ConversationObjectView,
+        ParticipantView, PendingChatSend, RenderProjection, RoomPollView, RoomTransportView,
         ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
     };
 
@@ -4908,6 +5314,70 @@ mod tests {
             participants: vec![],
             objects: vec![],
             transport: RoomTransportView::default(),
+        }
+    }
+
+    #[test]
+    fn recovered_history_changes_display_order_without_rewinding_poll_cursor() {
+        let object = |seq, created_at| ConversationObjectView {
+            seq,
+            created_at,
+            sender: "Peer".into(),
+            sender_ref: None,
+            sender_profile_verified: Some(true),
+            from_current_session: false,
+            kind: ConversationObjectKind::Text,
+            body: Some(format!("message {seq}")),
+            emoji: None,
+            link: None,
+            attachment: None,
+        };
+        let mut state = AppState::default();
+        let mut poll = shared_poll(9);
+        poll.transport.configured = true;
+        poll.objects = vec![object(1, 200), object(9, 300)];
+        apply_active_poll_state(&mut state, poll);
+        let mut catch_up = shared_poll(11);
+        catch_up.transport.configured = true;
+        catch_up.objects = vec![object(11, 100), object(10, 100)];
+        apply_active_poll_state(&mut state, catch_up);
+        let order = |state: &AppState| {
+            super::shared_objects_in_display_order(&state.objects, true)
+                .into_iter()
+                .map(|object| object.seq)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&state), vec![10, 11, 1, 9]);
+        assert_eq!(state.latest_seq, 11);
+
+        // A response already in flight carries an older cursor and a newly
+        // recovered object. It renders that object and keeps the newer cursor.
+        let mut late = shared_poll(8);
+        late.transport.configured = true;
+        late.objects = vec![object(2, 150)];
+        assert!(apply_active_poll_state(&mut state, late.clone()).1);
+        assert_eq!(state.latest_seq, 11);
+        assert_eq!(order(&state), vec![10, 11, 2, 1, 9]);
+        assert!(!apply_active_poll_state(&mut state, late).1);
+        assert_eq!(state.objects.len(), 5);
+    }
+
+    #[test]
+    fn history_status_changes_keep_the_live_session_active() {
+        let mut state = AppState::default();
+        for status in ["searching", "available", "unavailable"] {
+            let mut poll = shared_poll(0);
+            poll.transport.configured = true;
+            poll.transport.available = true;
+            poll.transport.history = Some(super::RoomHistoryView {
+                status: status.into(),
+                detail: format!("History {status}."),
+            });
+            assert!(apply_active_poll_state(&mut state, poll).1);
+            assert_eq!(state.history.as_ref().unwrap().status, status);
+            assert!(state.session_active);
+            assert!(!state.reconnect_needed);
+            assert_eq!(state.status_badge, "Live");
         }
     }
 
@@ -5494,6 +5964,7 @@ mod tests {
                 configured: true,
                 available: true,
                 status: None,
+                history: None,
             },
         };
 
@@ -5877,6 +6348,17 @@ fn dedupe_objects(objects: &mut Vec<ConversationObjectView>) {
     objects.dedup_by_key(|object| object.seq);
 }
 
+fn shared_objects_in_display_order(
+    objects: &[ConversationObjectView],
+    configured: bool,
+) -> Vec<&ConversationObjectView> {
+    let mut ordered: Vec<_> = objects.iter().collect();
+    if configured {
+        ordered.sort_by_key(|object| (object.created_at, object.seq));
+    }
+    ordered
+}
+
 fn should_follow_scroll(element: &HtmlElement) -> bool {
     let gap = element.scroll_height() - element.client_height() - element.scroll_top();
     gap <= AUTO_SCROLL_THRESHOLD_PX
@@ -6243,10 +6725,16 @@ fn day_label(day: (u32, u32, u32), today: (u32, u32, u32), yesterday: (u32, u32,
 
 fn day_separator_text(timestamp_secs: u64) -> String {
     let now = (js_sys::Date::now() / 1000.0) as u64;
+    let yesterday = local_date(now);
+    yesterday.set_date(yesterday.get_date() - 1);
     match day_label(
         local_day(timestamp_secs),
         local_day(now),
-        local_day(now.saturating_sub(86_400)),
+        (
+            yesterday.get_full_year(),
+            yesterday.get_month(),
+            yesterday.get_date(),
+        ),
     ) {
         DayLabel::Today => "Today".to_string(),
         DayLabel::Yesterday => "Yesterday".to_string(),
@@ -6330,26 +6818,32 @@ async fn direct_post_json<TReq: Serialize, TResp: DeserializeOwned>(
     path: &str,
     body: &TReq,
     extra_headers: &[(&str, String)],
-) -> Result<(u16, TResp), u16> {
+) -> Result<(u16, TResp), DirectSendFailure> {
+    let failure = |status| DirectSendFailure { status, code: None };
     let mut request = Request::post(path).credentials(RequestCredentials::SameOrigin);
     for (name, value) in extra_headers {
         request = request.header(name, value);
     }
     let response = request
         .json(body)
-        .map_err(|_| 400u16)?
+        .map_err(|_| failure(400))?
         .send()
         .await
-        .map_err(|_| 0u16)?;
+        .map_err(|_| failure(0))?;
     let status = response.status();
     if status != 200 && status != 202 {
-        return Err(response.status());
+        let mut error = response
+            .json::<DirectSendFailure>()
+            .await
+            .unwrap_or_else(|_| failure(status));
+        error.status = status;
+        return Err(error);
     }
     response
         .json::<TResp>()
         .await
         .map(|body| (status, body))
-        .map_err(|_| 500)
+        .map_err(|_| failure(500))
 }
 
 async fn api_post_session_json<TReq: Serialize, TResp: DeserializeOwned>(
