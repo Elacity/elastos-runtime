@@ -333,54 +333,57 @@ async fn direct_api_auth_list_and_message_projection_are_bounded_and_redacted() 
         crate::auth::now_ts(),
     )
     .unwrap();
-    let revoked = fixture
-        .app
-        .clone()
-        .oneshot(direct_api_request(
-            Some(&fixture.chat_token),
+    let mut settled_retry = settled_send;
+    settled_retry["retry_existing"] = json!(true);
+    for (method, uri, body) in [
+        (
             "GET",
-            "/api/apps/chat-room/direct/conversations",
+            "/api/apps/chat-room/direct/conversations".to_string(),
             Body::empty(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
-    let revoked_messages = fixture
-        .app
-        .clone()
-        .oneshot(direct_api_request(
-            Some(&fixture.chat_token),
+        ),
+        (
             "GET",
-            &format!(
+            format!(
                 "/api/apps/chat-room/direct/conversations/{}/messages?retry_details=true&mark_read=false",
                 fixture.peer.conversation_id
             ),
             Body::empty(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(revoked_messages.status(), StatusCode::FORBIDDEN);
-    let revoked_messages = json_response(revoked_messages).await;
-    assert!(revoked_messages.get("messages").is_none());
-    assert_eq!(
-        direct_send(
-            &fixture,
-            json!({
-                "request_id": "revoked-fresh-send",
-                "conversation_id": fixture.peer.conversation_id,
-                "text": "new delivery"
-            })
-        )
-        .await
-        .0,
-        StatusCode::FORBIDDEN
-    );
-    let mut settled_retry = settled_send;
-    settled_retry["retry_existing"] = json!(true);
-    assert_eq!(
-        direct_send(&fixture, settled_retry).await.0,
-        StatusCode::FORBIDDEN
-    );
+        ),
+        (
+            "POST",
+            "/api/apps/chat-room/direct/messages/send".to_string(),
+            Body::from(
+                json!({
+                    "request_id": "revoked-fresh-send",
+                    "conversation_id": fixture.peer.conversation_id,
+                    "text": "new delivery"
+                })
+                .to_string(),
+            ),
+        ),
+        (
+            "POST",
+            "/api/apps/chat-room/direct/messages/send".to_string(),
+            Body::from(settled_retry.to_string()),
+        ),
+    ] {
+        let revoked = fixture
+            .app
+            .clone()
+            .oneshot(direct_api_request(
+                Some(&fixture.chat_token),
+                method,
+                &uri,
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        assert!(axum::body::to_bytes(revoked.into_body(), 8 * 1024)
+            .await
+            .unwrap()
+            .is_empty());
+    }
     // Runtime retains the person's signed delivery history and verified
     // receipt. The revoked Home session cannot read, send or retry it.
     assert_eq!(
