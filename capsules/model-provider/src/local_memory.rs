@@ -24,10 +24,13 @@ pub(crate) struct HostMemory {
 }
 
 impl HostMemory {
-    /// Fits when free memory covers `required`, or, under normal pressure,
-    /// when physical RAM does: macOS then compresses or evicts to make room.
+    /// The admission rule: if the free-memory estimate covers `required`,
+    /// admit, whatever the pressure. Otherwise admit only under normal kernel
+    /// pressure (macOS compresses or evicts to make room) and only when
+    /// `required` is at most 40% of physical RAM. Otherwise refuse.
     fn fits(&self, required: u64) -> bool {
-        required <= self.available || (self.pressure_normal && required <= self.total)
+        required <= self.available
+            || (self.pressure_normal && u128::from(required) * 10 <= u128::from(self.total) * 4)
     }
 }
 
@@ -561,21 +564,21 @@ mod tests {
     }
 
     #[test]
-    fn normal_pressure_admits_from_ram_when_free_estimate_is_low() {
-        let required = 4 * GIB;
+    fn normal_pressure_admits_up_to_40_percent_of_ram_when_estimate_is_low() {
         let host = |available, total, pressure_normal| HostMemory {
             total,
             available,
             pressure_normal,
         };
-        // Low conservative estimate, normal pressure, enough RAM: admitted.
-        assert!(host(2 * GIB, 24 * GIB, true).fits(required));
-        // Warning or critical pressure (or unknown): the estimate decides.
-        assert!(!host(2 * GIB, 24 * GIB, false).fits(required));
-        // RAM below the need is refused even under normal pressure.
-        assert!(!host(2 * GIB, 3 * GIB, true).fits(required));
-        // Enough free memory admits regardless of pressure.
-        assert!(host(5 * GIB, 24 * GIB, false).fits(required));
+        // 24 GiB Mac, low estimate, normal pressure: Qwen-1.5B's 4.6 GB need fits.
+        assert!(host(3 * GIB, 24 * GIB, true).fits(4_613_050_297));
+        // 8 GiB host: 40% is 3.2 GiB. A 3.04 GB need fits; a 4 GB need does not.
+        assert!(host(GIB, 8 * GIB, true).fits(3_040_000_000));
+        assert!(!host(GIB, 8 * GIB, true).fits(4_000_000_000));
+        // Warning, critical or unknown pressure with a low estimate: refused.
+        assert!(!host(3 * GIB, 24 * GIB, false).fits(4_613_050_297));
+        // An estimate that covers the need admits regardless of pressure.
+        assert!(host(5 * GIB, 8 * GIB, false).fits(4_000_000_000));
     }
 
     #[test]

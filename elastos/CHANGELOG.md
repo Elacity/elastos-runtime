@@ -29,7 +29,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   memory.current` (cgroup v1: `MemAvailable` only), or macOS free (minus
   speculative) + purgeable + file-backed pages, never inactive anonymous pages.
   When that estimate is short, macOS still admits if
-  `kern.memorystatus_vm_pressure_level` is normal and RAM covers the need.
+  `kern.memorystatus_vm_pressure_level` is normal and the need is at most 40%
+  of RAM.
   Refusal is `model_memory_unavailable`.
 - Local runs share one execution slot; an engine idle for 60 s is stopped and
   opening another model closes the previous engine. llama-server now gets
