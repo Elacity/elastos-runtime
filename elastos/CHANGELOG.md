@@ -6,6 +6,19 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Fixed
+
+- Getting a model on a slower connection no longer stops after about ten minutes
+  with "Storage capacity is unavailable". Home was shutting down its storage
+  service as idle while the model was still downloading.
+
+### Developer detail
+
+- `ipfs-provider` counts a successful private capacity check (run once per MiB of
+  model download) and staged-directory hash as Kubo use, refreshing
+  `ipfs-coords.json` `last_used` like bounded reads do, so the 600 s idle stop no
+  longer ends Kubo during a long model download.
+
 ## [0.8.0-alpha.11]
 
 Test-channel release. Signed releases show these notes in System before you update.
