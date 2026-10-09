@@ -6,6 +6,31 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Changed
+
+- A local model now starts only when the device has enough free memory for it.
+  Otherwise you see "Not enough free memory for this model. Close other apps or
+  choose a smaller model." instead of a model failure.
+- A local model stops after a minute without use to give its memory back, and
+  starts again on your next message. Only one local model runs at a time.
+
+### Fixed
+
+- Setting up Home on an ARM64 device without the CPU features local AI needs no
+  longer fails. Home installs without the local model engine, and Marketplace
+  shows "Local AI is not supported on this device."
+
+### Developer detail
+
+- `model-provider` admits a local engine right before spawn when free memory
+  (Linux `MemAvailable`, macOS free + inactive pages) covers GGUF weights once,
+  the f16 KV cache at the configured context, batch scratch, and headroom of
+  max(10% RAM, 1 GiB). Refusal is `model_memory_unavailable`.
+- Local runs share one execution slot; an engine idle for 60 s is stopped and
+  opening another model closes the previous engine. llama-server now gets
+  `--batch-size 128 --ubatch-size 128 --cache-ram 0` (all accepted by b10516).
+- `elastos setup` drops `llama-server` on an `UnsupportedHost` instead of aborting.
+
 ## [0.8.0-alpha.12]
 
 Test-channel release. Signed releases show these notes in System before you update.

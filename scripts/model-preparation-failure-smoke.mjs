@@ -52,7 +52,7 @@ for (const invalid of ["/private/provider?credential=secret", "__proto__", "cons
   assert.throws(() => operationRuntime({ ...unavailable, ...admitted, dispatch_unavailable_reason: invalid }, cid), /Invalid model response/);
 }
 assert.deepEqual(Object.fromEntries(Object.entries(DISPATCH_UNAVAILABLE_TEXT)), {
-  unsupported_host: "Keep this model on this device. To run it, use a supported device.",
+  unsupported_host: "Local AI is not supported on this device.",
   source_engine_required: "This source Home needs its local model engine. Install the engine through source setup, then Retry.",
 });
 const otherCid = `bafybei${"c".repeat(51)}e`;

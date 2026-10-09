@@ -217,7 +217,7 @@ try {
     phase = "admitted"; activationPending = app === "marketplace"; dispatchPending = true;
     await frame.getByText("Available on this device. Model service unavailable.", { exact: true }).waitFor();
     for (const [reason, explanation] of [
-      ["unsupported_host", "Keep this model on this device. To run it, use a supported device."],
+      ["unsupported_host", "Local AI is not supported on this device."],
       ["source_engine_required", "This source Home needs its local model engine. Install the engine through source setup, then Retry."],
     ]) {
       dispatchUnavailableReason = reason;

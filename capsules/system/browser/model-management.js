@@ -14,7 +14,7 @@
   });
   const failureText = p => FAILURE_TEXT[p.failure_class] || "Preparation failed.";
   const DISPATCH_UNAVAILABLE_TEXT = Object.freeze({
-    unsupported_host: "Keep this model on this device. To run it, use a supported device.",
+    unsupported_host: "Local AI is not supported on this device.",
     source_engine_required: "This source Home needs its local model engine. Install the engine through source setup, then Retry.",
   });
   // One phase per Runtime projection. The full view (System) and the compact
