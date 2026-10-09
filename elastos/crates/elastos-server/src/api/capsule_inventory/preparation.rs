@@ -128,11 +128,24 @@ struct PreparationInventory {
     retention_claims: Vec<RetentionClaim>,
     #[serde(default)]
     retirement: Option<ModelRetirement>,
-    /// The failed preparation whose staged bytes stay for the next Use. That
-    /// Use continues them when they hold its signed package, else removes them.
+    /// Staged bytes a failed preparation left for the next Use. That Use
+    /// continues them when they hold its signed package, else removes them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    kept_stage: Option<String>,
+    kept_stage: Option<KeptStage>,
 }
+
+/// A kept stage stays charged against the cache budget at its size on disk
+/// until a preparation takes it over, Cancel discards it, or startup expires it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct KeptStage {
+    operation_id: String,
+    bytes: u64,
+    kept_at: u64,
+}
+
+/// Startup removes a kept stage older than this.
+const KEPT_STAGE_SECONDS: u64 = 7 * 24 * 3600;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -402,14 +415,15 @@ impl PreparationInventory {
         ensure!(active <= 1, "multiple active preparations");
         if let Some(kept) = &self.kept_stage {
             ensure!(
-                self.records
-                    .iter()
-                    .any(|record| record.operation_id == *kept
-                        && record.admission_id == record.operation_id
-                        && matches!(
-                            record.state,
-                            PreparationState::Failed | PreparationState::Expired
-                        )),
+                kept.bytes <= MAX_PACKAGE_BYTES
+                    && self.records.iter().any(|record| {
+                        record.operation_id == kept.operation_id
+                            && record.admission_id == record.operation_id
+                            && matches!(
+                                record.state,
+                                PreparationState::Failed | PreparationState::Expired
+                            )
+                    }),
                 "kept stage has no failed owner"
             );
         }
@@ -656,14 +670,15 @@ fn reserve_at(
         })
         .map(|r| r.operation_id.clone());
     let initial_charge = if reuse.is_some() { 0 } else { full_charge };
-    let reserved_bytes = state
-        .records
-        .iter()
-        .try_fold(initial_charge, |total, record| {
-            total
-                .checked_add(record.reserved_bytes)
-                .context("preparation byte accounting overflow")
-        })?;
+    let reserved_bytes =
+        state
+            .records
+            .iter()
+            .try_fold(budget_charge(&state, initial_charge), |total, record| {
+                total
+                    .checked_add(record.reserved_bytes)
+                    .context("preparation byte accounting overflow")
+            })?;
     let unwritten = unwritten_charge(&inventory, &state, initial_charge)?;
     let capacity_pending =
         reserved_bytes > grant.max_cache_bytes || !inventory.space_fits(unwritten)?;
@@ -833,6 +848,17 @@ fn manage(
         changed = true;
     }
     let result = record.clone();
+    // Cancel on a failed attempt discards the stage it kept and its charge.
+    if cancel
+        && state
+            .kept_stage
+            .as_ref()
+            .is_some_and(|kept| kept.operation_id == operation_id)
+    {
+        inventory.remove_stage()?;
+        state.kept_stage = None;
+        changed = true;
+    }
     changed |= state.prune_retention();
     if changed {
         inventory.save(&state)?;
@@ -899,6 +925,18 @@ fn unwritten_charge(
         return Ok(charge);
     }
     Ok(charge.saturating_sub(inventory.stage_bytes()?))
+}
+
+/// Cache budget taken by a kept stage and a new preparation's `charge`
+/// together. A non-shared preparation takes the stage over (or removes it),
+/// so its own charge replaces the stage's.
+fn budget_charge(state: &PreparationInventory, charge: u64) -> u64 {
+    let kept = state.kept_stage.as_ref().map_or(0, |kept| kept.bytes);
+    if charge == 0 {
+        kept
+    } else {
+        kept.max(charge)
+    }
 }
 
 pub(in crate::api) type Revalidate = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
@@ -1073,12 +1111,18 @@ impl PreparationOwner {
         }
         let current = current.clone();
         if starting {
-            require_cache_budget(data_dir, &snapshot)?;
-            inventory.require_space(if current.admission_id == current.operation_id {
+            let owns_stage = current.admission_id == current.operation_id;
+            inventory.require_space(if owns_stage {
                 unwritten_charge(&inventory, &snapshot, staging_charge(current.total_bytes)?)?
             } else {
                 0
             })?;
+            if owns_stage {
+                // This preparation takes the kept stage over (or removes it);
+                // its own reservation now covers those bytes.
+                snapshot.kept_stage = None;
+            }
+            require_cache_budget(data_dir, &snapshot)?;
             inventory.save(&snapshot)?;
         }
         drop(inventory);
@@ -1308,7 +1352,9 @@ fn cache_budget_fits(
     let total = state
         .records
         .iter()
-        .try_fold(additional, |sum, r| sum.checked_add(r.reserved_bytes))
+        .try_fold(budget_charge(state, additional), |sum, r| {
+            sum.checked_add(r.reserved_bytes)
+        })
         .context("cache accounting overflow")?;
     Ok(total <= grant.max_cache_bytes)
 }
@@ -2361,21 +2407,13 @@ async fn resume_kept_stage(
         }
         _ => None,
     };
-    let inventory = Inventory::open(data_dir, false)?;
-    let mut state = inventory.load()?;
-    if let Some((_, index_bytes, completed_bytes)) = &resumed {
-        let record = state
-            .records
-            .iter_mut()
-            .find(|r| r.operation_id == id)
-            .context("preparation unavailable")?;
-        record.index_bytes = *index_bytes;
-        record.completed_bytes = *completed_bytes;
-    } else {
-        inventory.remove_stage()?;
+    match &resumed {
+        Some((_, index_bytes, completed_bytes)) => update_operation(data_dir, id, |record| {
+            record.index_bytes = *index_bytes;
+            record.completed_bytes = *completed_bytes;
+        })?,
+        None => Inventory::open(data_dir, false)?.remove_stage()?,
     }
-    state.kept_stage = None;
-    inventory.save(&state)?;
     Ok(resumed.map(|(resumed, _, _)| resumed))
 }
 
@@ -3055,6 +3093,47 @@ pub(in crate::api) async fn model_runtime_projection(
     projection
 }
 
+/// Startup removes a kept stage once it is older than `KEPT_STAGE_SECONDS`
+/// or its model is no longer offered by the current trusted catalogue. The
+/// caller holds the worker lock, so no preparation is taking it over.
+fn expire_kept_stage(data_dir: &Path, now: u64) -> anyhow::Result<()> {
+    let inventory = Inventory::open(data_dir, false)?;
+    let mut state = inventory.load()?;
+    let Some(kept) = &state.kept_stage else {
+        return Ok(());
+    };
+    let cid = &state
+        .records
+        .iter()
+        .find(|r| r.operation_id == kept.operation_id)
+        .context("kept stage owner unavailable")?
+        .package_cid;
+    let offered = || -> anyhow::Result<bool> {
+        let config: crate::setup::ComponentsManifest = serde_json::from_slice(
+            &super::read_model_catalog_file(data_dir, "components.json", 4 * 1024 * 1024)?,
+        )?;
+        let trust = config.model_catalog.context("model catalog unavailable")?;
+        Ok(super::verify_model_catalog(
+            &trust,
+            &super::read_model_catalog_file(
+                data_dir,
+                super::MODEL_CATALOG_FILE,
+                super::MAX_MODEL_CATALOG_BYTES,
+            )?,
+            now,
+        )?
+        .iter()
+        .any(|entry| entry.cid == *cid))
+    };
+    let expired = now.saturating_sub(kept.kept_at) >= KEPT_STAGE_SECONDS;
+    if expired || !offered().unwrap_or(false) {
+        inventory.remove_stage()?;
+        state.kept_stage = None;
+        inventory.save(&state)?;
+    }
+    Ok(())
+}
+
 /// Compose admitted offers for Runtime-owned model-provider Init. This function
 /// has no capsule route; public inference still uses the existing model grant.
 /// The caller retains the returned worker guard through provider spawn/Init.
@@ -3070,6 +3149,9 @@ pub async fn append_admitted_model_startup_offers(
         Ok(_) => {}
     }
     let worker = Inventory::open(data_dir, false)?.worker_lock()?;
+    if let Err(error) = expire_kept_stage(data_dir, now()?) {
+        tracing::warn!(?error, "kept model preparation stage was not expired");
+    }
     let retirement = Inventory::open(data_dir, false)?.load()?.retirement;
     if retirement
         .as_ref()
@@ -3408,8 +3490,13 @@ fn settle_failure(
     } else {
         let mut kept = None;
         if record.admission_id == id {
-            if keep_stage && !record.cancel_requested && inventory.stage_bytes()? > 0 {
-                kept = Some(id.to_owned());
+            let bytes = inventory.stage_bytes()?;
+            if keep_stage && !record.cancel_requested && bytes > 0 {
+                kept = Some(KeptStage {
+                    operation_id: id.to_owned(),
+                    bytes,
+                    kept_at: now()?,
+                });
             } else {
                 inventory.remove_stage()?;
             }
@@ -9430,6 +9517,140 @@ server.serve_forever()
         root.join("model-preparation/stage/weights.gguf")
     }
 
+    fn kept_stage_owner(root: &Path) -> Option<String> {
+        Inventory::open(root, false)
+            .unwrap()
+            .load()
+            .unwrap()
+            .kept_stage
+            .map(|kept| kept.operation_id)
+    }
+
+    fn set_cache_budget(root: &Path, bytes: u64) {
+        change_config(root, |config| {
+            config["model_catalog"]["local_use"]["max_cache_bytes"] = serde_json::json!(bytes)
+        });
+    }
+
+    /// An attempt whose weights stopped after their header, settled after a
+    /// read that failed in transit: its stage is kept for the next Use.
+    /// Returns the bytes the stage holds.
+    async fn kept_stage_fixture() -> (
+        tempfile::TempDir,
+        PreparationRecord,
+        Arc<elastos_runtime::provider::ProviderRegistry>,
+        u64,
+    ) {
+        let (root, record, backend, registry) = staged_fixture(now().unwrap(), false).await;
+        let path = stage_weights(root.path());
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(8);
+        std::fs::write(&path, bytes).unwrap();
+        settle_failure(root.path(), &record.operation_id, true, true).unwrap();
+        assert_eq!(
+            kept_stage_owner(root.path()),
+            Some(record.operation_id.clone())
+        );
+        let on_disk = backend
+            .files
+            .iter()
+            .map(|(path, bytes)| {
+                if path == "weights.gguf" {
+                    8
+                } else {
+                    bytes.len() as u64
+                }
+            })
+            .sum();
+        (root, record, registry, on_disk)
+    }
+
+    #[tokio::test]
+    async fn model_preparation_kept_stage_stays_charged_until_a_preparation_takes_it_over() {
+        let (root, record, _registry, on_disk) = kept_stage_fixture().await;
+        let state = Inventory::open(root.path(), false).unwrap().load().unwrap();
+        assert_eq!(state.kept_stage.as_ref().unwrap().bytes, on_disk);
+        assert_eq!(state.records[0].reserved_bytes, 0);
+        set_cache_budget(root.path(), on_disk - 1);
+        assert!(
+            require_cache_budget(root.path(), &state).is_err(),
+            "the kept bytes still count against the cache budget"
+        );
+        set_cache_budget(root.path(), on_disk);
+        require_cache_budget(root.path(), &state).unwrap();
+        // The next Use's own charge covers the stage it takes over.
+        let charge = preparation_charge(record.total_bytes).unwrap();
+        set_cache_budget(root.path(), charge);
+        assert!(cache_budget_fits(root.path(), &state, charge).unwrap());
+    }
+
+    #[tokio::test]
+    async fn model_preparation_cancel_on_a_failed_attempt_discards_its_kept_stage() {
+        let (root, record, registry, on_disk) = kept_stage_fixture().await;
+        let owner = PreparationOwner::default();
+        let reply = owner
+            .invoke(
+                root.path(),
+                Some(registry),
+                caller(&context(), &method("cancel")),
+                "discard-kept",
+                &serde_json::json!({"operation_id": record.operation_id}),
+                Arc::new(|| Ok(())),
+            )
+            .unwrap();
+        assert_eq!(reply["state"], "failed");
+        assert!(owner.worker.lock().unwrap().is_none());
+        assert!(!root.path().join("model-preparation/stage").exists());
+        assert_eq!(kept_stage_owner(root.path()), None);
+        set_cache_budget(root.path(), on_disk - 1);
+        require_cache_budget(
+            root.path(),
+            &Inventory::open(root.path(), false).unwrap().load().unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_preparation_startup_removes_an_old_or_no_longer_offered_kept_stage() {
+        for case in ["recent", "seven_days_old", "not_offered"] {
+            let (root, record, _registry, _) = kept_stage_fixture().await;
+            match case {
+                "seven_days_old" => {
+                    let inventory = Inventory::open(root.path(), false).unwrap();
+                    let mut state = inventory.load().unwrap();
+                    state.kept_stage.as_mut().unwrap().kept_at -= KEPT_STAGE_SECONDS;
+                    inventory.save(&state).unwrap();
+                }
+                "not_offered" => {
+                    let (mut next, _) = package_fixture(b"GGUF\x03\0\0\0fixture".to_vec());
+                    next["entries"][0]["cid"] = serde_json::json!(
+                        "bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm"
+                    );
+                    write_preparation_catalog(root.path(), &next);
+                }
+                _ => {}
+            }
+            let registry = elastos_runtime::provider::ProviderRegistry::new();
+            let mut config = crate::api::model_provider_bridge_config(root.path()).unwrap();
+            drop(
+                append_admitted_model_startup_offers(root.path(), &registry, &mut config)
+                    .await
+                    .unwrap(),
+            );
+            let kept = case == "recent";
+            assert_eq!(
+                root.path().join("model-preparation/stage").exists(),
+                kept,
+                "{case}"
+            );
+            assert_eq!(
+                kept_stage_owner(root.path()),
+                kept.then(|| record.operation_id.clone()),
+                "{case}"
+            );
+        }
+    }
+
     fn assert_deadline_unchanged(before: &PreparationRecord, after: &PreparationRecord) {
         assert_eq!(after.created_at, before.created_at);
         assert_eq!(after.expires_at, before.expires_at);
@@ -9493,11 +9714,7 @@ server.serve_forever()
         // The interrupted stage stays for the next Use, which re-hashes it.
         assert!(root.path().join("model-preparation/stage").exists());
         assert_eq!(
-            Inventory::open(root.path(), false)
-                .unwrap()
-                .load()
-                .unwrap()
-                .kept_stage,
+            kept_stage_owner(root.path()),
             Some(record.operation_id.clone())
         );
         assert!(Inventory::open(root.path(), false)
@@ -10683,11 +10900,7 @@ server.serve_forever()
         }
 
         fn kept_stage(&self) -> Option<String> {
-            Inventory::open(self.root.path(), false)
-                .unwrap()
-                .load()
-                .unwrap()
-                .kept_stage
+            kept_stage_owner(self.root.path())
         }
 
         fn index_reads(&self) -> usize {

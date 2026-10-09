@@ -11,6 +11,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - A model download that stops because the network failed, or because Home
   restarted, now continues from where it stopped the next time you press Use,
   instead of starting over. Progress starts at the part already downloaded.
+  Cancel on the stopped download discards the part already downloaded; Home
+  also discards it after 7 days, or when the model is no longer offered.
 
 ### Fixed
 
@@ -45,7 +47,11 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   record is bumped before fsync. The per-file SHA-256 and package CID checks are
   unchanged, and any mismatch removes the stage. Reopened files keep the stage
   checks: owner-only 0600, one link, no symlinks. Free-space checks for the next
-  preparation count the kept bytes already on disk.
+  preparation count the kept bytes already on disk. The kept stage stays
+  charged against the cache budget at its size on disk until the next
+  non-shared preparation takes it over (its own charge replaces the stage's),
+  Cancel on the failed attempt removes it, or model-provider startup removes
+  it after 7 days or when the current trusted catalogue no longer offers it.
 
 ## [0.8.0-alpha.12]
 
