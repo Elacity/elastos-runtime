@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 function fail(message) {
@@ -73,7 +73,46 @@ function emit(value) {
   console.log(JSON.stringify(value));
 }
 
-function main() {
+let stopping = false;
+let activeCopy = null;
+let forceTimer = null;
+function stopCopy() {
+  stopping = true;
+  if (activeCopy && !forceTimer) {
+    activeCopy.kill("SIGTERM");
+    forceTimer = setTimeout(() => activeCopy?.kill("SIGKILL"), 1000);
+  }
+}
+process.on("SIGTERM", stopCopy);
+process.on("SIGINT", stopCopy);
+if (process.env.ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF === "1") {
+  process.stdin.once("end", stopCopy);
+  process.stdin.once("error", stopCopy);
+  process.stdin.resume();
+}
+
+async function copyRootfs(rootfs, partial) {
+  if (stopping) throw new Error("rootfs pool refill stopped");
+  await new Promise((resolve, reject) => {
+    const child = spawn("cp", ["--reflink=auto", "--sparse=always", rootfs, partial], {
+      stdio: ["ignore", "ignore", "inherit"],
+    });
+    activeCopy = child;
+    const timeout = setTimeout(stopCopy,
+      Number(process.env.ELASTOS_BROWSER_VM_ROOTFS_COPY_TIMEOUT_MS || "900000"));
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      clearTimeout(timeout);
+      clearTimeout(forceTimer);
+      forceTimer = null;
+      activeCopy = null;
+      if (stopping || code !== 0) reject(new Error(`rootfs pool cp stopped: ${signal || code}`));
+      else resolve();
+    });
+  });
+}
+
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   const dataDir = args.dataDir || defaultDataDir();
   validateAbsolute("--data-dir", dataDir);
@@ -101,19 +140,13 @@ function main() {
       rootfs,
       partial,
     });
-    const result = spawnSync("cp", ["--reflink=auto", "--sparse=always", rootfs, partial], {
-      stdio: "pipe",
-      encoding: "utf8",
-      timeout: Number(process.env.ELASTOS_BROWSER_VM_ROOTFS_COPY_TIMEOUT_MS || "900000"),
-    });
-    if (result.error || result.status !== 0) {
-      try {
-        fs.rmSync(partial, { force: true });
-      } catch {}
-      fail(result.error?.message || result.stderr || result.stdout || `cp exited ${result.status}`);
+    try {
+      await copyRootfs(rootfs, partial);
+      fs.chmodSync(partial, 0o600);
+      fs.renameSync(partial, ready);
+    } finally {
+      fs.rmSync(partial, { force: true });
     }
-    fs.chmodSync(partial, 0o600);
-    fs.renameSync(partial, ready);
     created.push(ready);
     emit({
       schema: "elastos.browser.vm-rootfs-pool.event/v1",
@@ -135,4 +168,10 @@ function main() {
   });
 }
 
-main();
+main().catch((error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+}).finally(() => {
+  // Release the lifetime reader once all copies have been reaped.
+  if (process.env.ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF === "1") process.stdin.destroy();
+});

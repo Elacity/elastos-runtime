@@ -85,6 +85,9 @@ const backButton = document.querySelector("#browser-back");
 const forwardButton = document.querySelector("#browser-forward");
 const refreshButton = document.querySelector("#browser-refresh");
 const profileResetButton = document.querySelector("#browser-profile-reset");
+const profileResetConfirmation = document.querySelector("#browser-profile-reset-confirmation");
+const profileResetCancel = document.querySelector("#browser-profile-reset-cancel");
+const profileResetCommit = document.querySelector("#browser-profile-reset-commit");
 const settingsButton = document.querySelector("#browser-settings");
 const settingsPanel = document.querySelector("#browser-settings-panel");
 const settingsCloseButton = document.querySelector("#browser-settings-close");
@@ -146,6 +149,7 @@ function setSettingsOpen(open) {
     return;
   }
   settingsPanel.hidden = !open;
+  if (!open) profileResetConfirmation.hidden = true;
   settingsButton.setAttribute("aria-expanded", open ? "true" : "false");
 }
 
@@ -386,6 +390,7 @@ function setLoading(loading) {
   if (profileResetButton) {
     profileResetButton.disabled = loading;
   }
+  if (profileResetCommit) profileResetCommit.disabled = loading;
   renderEmpty.hidden = true;
   refreshButton.disabled = loading || !currentPage;
   updateNavState();
@@ -2481,9 +2486,6 @@ async function resetBrowserProfile() {
     showStatus("Browser profile reset requires a Browser launch token.", { sticky: true });
     return;
   }
-  if (!window.confirm("Reset Browser cookies, local storage, history, and cache for this account?")) {
-    return;
-  }
   const activePage = currentPage;
   const activeGeneration = currentPageGeneration;
   const activeOwner = runtimePageOwner(activePage, activeGeneration);
@@ -2534,6 +2536,18 @@ async function resetBrowserProfile() {
 }
 
 profileResetButton?.addEventListener("click", () => {
+  profileResetConfirmation.hidden = false;
+  profileResetCancel.focus({ preventScroll: true });
+});
+
+profileResetCancel?.addEventListener("click", () => {
+  profileResetConfirmation.hidden = true;
+  profileResetButton.focus({ preventScroll: true });
+});
+
+profileResetCommit?.addEventListener("click", () => {
+  if (profileResetConfirmation.hidden || profileResetCommit.disabled) return;
+  profileResetConfirmation.hidden = true;
   resetBrowserProfile().catch((error) => {
     showStatus(friendlyOpenError(error), { sticky: true });
   });

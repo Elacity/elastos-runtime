@@ -10,6 +10,7 @@ use serde_json::json;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,7 +80,10 @@ fn run(stdout: &mut dyn Write) -> Result<(), String> {
         buffer_bytes: config.buffer_bytes,
     })?;
 
-    let mut child = Command::new(&config.browser_program)
+    let owned_helpers =
+        std::env::var("ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF").as_deref() == Ok("1");
+    let mut command = Command::new(&config.browser_program);
+    command
         .args(expand_args(
             &config.browser_args,
             &url,
@@ -91,7 +95,11 @@ fn run(stdout: &mut dyn Write) -> Result<(), String> {
         .env("https_proxy", &proxy_url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if owned_helpers {
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|err| format!("native browser launch failed: {err}"))?;
 
@@ -113,16 +121,93 @@ fn run(stdout: &mut dyn Write) -> Result<(), String> {
 
     if config.startup_grace_ms > 0 {
         thread::sleep(Duration::from_millis(config.startup_grace_ms));
-        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+        if owned_helpers && browser_child_exited(child.id())? {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let status = child.wait().map_err(|err| err.to_string())?;
             return Err(format!("native browser exited during startup: {status}"));
+        }
+        if !owned_helpers {
+            if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+                return Err(format!("native browser exited during startup: {status}"));
+            }
         }
     }
 
-    let status = child.wait().map_err(|err| err.to_string())?;
+    let child = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    if owned_helpers {
+        let owned = std::sync::Arc::clone(&child);
+        thread::spawn(move || {
+            use std::io::Read;
+            let mut bytes = [0u8; 64];
+            loop {
+                match io::stdin().read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            if let Some(child) = owned.lock().unwrap().as_mut() {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGTERM);
+                }
+            }
+            thread::sleep(Duration::from_secs(12));
+            if let Some(child) = owned.lock().unwrap().as_mut() {
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+            }
+        });
+    }
+    let status = loop {
+        let mut guard = child.lock().map_err(|err| err.to_string())?;
+        let owned = guard.as_mut().unwrap();
+        if !owned_helpers {
+            let status = owned.wait().map_err(|err| err.to_string())?;
+            guard.take();
+            break status;
+        }
+        // Runtime's supervision pattern keeps the direct child unreaped until
+        // the last group signal, so an exited leader still reserves its group ID.
+        if browser_child_exited(owned.id())? {
+            unsafe {
+                libc::kill(-(owned.id() as i32), libc::SIGKILL);
+            }
+            let status = owned.wait().map_err(|err| err.to_string())?;
+            guard.take();
+            break status;
+        }
+        drop(guard);
+        thread::sleep(Duration::from_millis(20));
+    };
     if status.success() {
         Ok(())
     } else {
         Err(format!("native browser exited with status {status}"))
+    }
+}
+
+fn browser_child_exited(pid: u32) -> Result<bool, String> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } == 0
+        {
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error.to_string());
+        }
     }
 }
 

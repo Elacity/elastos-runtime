@@ -1085,7 +1085,7 @@ async fn close(page: &ServedPage) -> Result<Value> {
         &page.owner.generation,
     )
     .await?;
-    commit_browser_terminal_cleanup(&page.gateway, &cleanup.engine_cleanup, None, None)
+    commit_browser_terminal_cleanup(&page.gateway, &cleanup.engine_cleanup, None, Some(&receipt))
         .await
         .map_err(anyhow::Error::msg)?;
     release_browser_page_for_principal(

@@ -406,6 +406,31 @@ fn validate_relay_ipc(endpoint: &RelayIpcEndpoint) -> Result<(), String> {
     Ok(())
 }
 
+// Native helpers use the same Runtime ownership pipe as VM helpers. Their
+// stdin is a lifetime channel; the transient supervisor owns only a reader.
+fn configure_helper_stdin(command: &mut Command) -> Result<(), String> {
+    let Some(reader) = elastos_common::process_lifetime::inherited_parent_reader()
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    command
+        .stdin(Stdio::from(reader))
+        .env("ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF", "1");
+    if command
+        .get_program()
+        .to_string_lossy()
+        .ends_with("browser-native-proxy-engine")
+        || command
+            .get_program()
+            .to_string_lossy()
+            .ends_with("browser-stream-bridge")
+    {
+        command.process_group(0);
+    }
+    Ok(())
+}
+
 fn spawn_stream_bridge(
     stream_bridge: Option<&StreamBridgeConfig>,
     request: &LaunchRequest,
@@ -414,14 +439,15 @@ fn spawn_stream_bridge(
         return Ok(None);
     };
     let bridge_config = stream_bridge_env_config(stream_bridge, request)?;
-    let mut child = Command::new(&stream_bridge.program)
+    let mut command = Command::new(&stream_bridge.program);
+    command
         .args(&stream_bridge.args)
         .env("ELASTOS_BROWSER_STREAM_BRIDGE_CONFIG", bridge_config)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| err.to_string())?;
+        .stderr(Stdio::null());
+    configure_helper_stdin(&mut command)?;
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
     wait_for_stream_bridge(
         &mut child,
         &request.adapter_ipc.path,
@@ -498,16 +524,8 @@ fn spawn_engine(config: &SupervisorConfig, request: &LaunchRequest) -> Result<u3
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    unsafe {
-        command.pre_exec(|| {
-            if libc::unshare(libc::CLONE_NEWNET) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            bring_loopback_up()?;
-            Ok(())
-        });
-    }
-
+    isolate_engine_network(&mut command)?;
+    configure_helper_stdin(&mut command)?;
     let mut child = command.spawn().map_err(|err| err.to_string())?;
     if config.startup_grace_ms > 0 {
         std::thread::sleep(Duration::from_millis(config.startup_grace_ms));
@@ -522,12 +540,34 @@ fn spawn_engine(config: &SupervisorConfig, request: &LaunchRequest) -> Result<u3
     Ok(child.id())
 }
 
+/// The engine runs in its own network namespace; only Linux has one.
+#[cfg(target_os = "linux")]
+fn isolate_engine_network(command: &mut Command) -> Result<(), String> {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::unshare(libc::CLONE_NEWNET) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            bring_loopback_up()?;
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn isolate_engine_network(_command: &mut Command) -> Result<(), String> {
+    Err("the browser engine supervisor runs engines only on Linux".to_string())
+}
+
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct LinuxIfReq {
     name: [libc::c_char; libc::IFNAMSIZ],
     data: [u8; 24],
 }
 
+#[cfg(target_os = "linux")]
 impl LinuxIfReq {
     fn loopback_up() -> Self {
         let mut req = Self {
@@ -553,6 +593,7 @@ impl LinuxIfReq {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn bring_loopback_up() -> std::io::Result<()> {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -777,6 +818,7 @@ mod tests {
             .contains("runtime_stream_path"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn loopback_ifreq_sets_only_loopback_name_and_up_flag() {
         let req = LinuxIfReq::loopback_up();
@@ -838,5 +880,56 @@ mod tests {
         let result = supervisor_result(&config, &request, 42, None);
         assert_eq!(result["display_session"]["audio"], false);
         assert_eq!(result["display_session"]["video"], false);
+    }
+}
+
+#[cfg(test)]
+mod helper_lifetime_tests {
+    use super::*;
+    use elastos_common::process_lifetime::ParentLifetime;
+    use std::io::{BufRead, BufReader};
+    use std::time::Instant;
+
+    #[test]
+    fn native_helper_stdin_closes_with_its_owner() {
+        let owner = ParentLifetime::new().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "helper_lifetime_tests::stdin_helper_fixture",
+            ])
+            .stdout(Stdio::piped());
+        owner.configure(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert!(output.by_ref().any(|line| line.unwrap() == "helper ready"));
+        drop(owner);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("native helper survived ownership EOF");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for native_helper_stdin_closes_with_its_owner"]
+    fn stdin_helper_fixture() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'helper ready\\n'; IFS= read -r line; exit 0"]);
+        configure_helper_stdin(&mut command).unwrap();
+        assert!(command.get_envs().any(|(name, value)| name
+            == "ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF"
+            && value == Some(std::ffi::OsStr::new("1"))));
+        assert!(command.status().unwrap().success());
     }
 }

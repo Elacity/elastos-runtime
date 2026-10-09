@@ -70,6 +70,28 @@ test("pre-effect profile placement keeps the Runtime transfer sentence", () => {
   assert.equal(friendlyOpenError(error), message);
 });
 
+test("interrupted profile setup gives reset guidance after terminal cleanup", () => {
+  for (const state of ["terminal_pre_effect_failure", "terminal_post_effect_cleanup"]) {
+    const error = openError(state);
+    error.payload.code = "profile_recovery_required";
+    assert.equal(
+      friendlyOpenError(error),
+      "Browser profile setup was interrupted. In Settings, select Reset profile to start again. Reset clears this account's Browser data.",
+    );
+  }
+});
+
+test("profile recovery guidance keeps pending or acquired ownership visible", () => {
+  for (const error of [
+    openError("cleanup_pending"),
+    openError("terminal_post_effect_cleanup", { page_acquired: true, vm_acquired: true }),
+    new Error("profile_recovery_required"),
+  ]) {
+    error.payload = { ...error.payload, code: "profile_recovery_required" };
+    assert.doesNotMatch(friendlyOpenError(error), /select Reset profile/);
+  }
+});
+
 test("pre-effect viewer ingress capacity keeps the Runtime capacity sentence", () => {
   const message = "Runtime viewer ingress capacity unavailable";
   const error = openError("terminal_pre_effect_failure");

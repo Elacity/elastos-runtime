@@ -37,6 +37,7 @@ const children = new Set();
 const servers = new Set();
 const cleanupFns = [];
 let exiting = false;
+let guestControlSocket = null;
 let launchSucceeded = false;
 const launchedAtMs = Date.now();
 
@@ -610,7 +611,8 @@ function refillMinFreeBytes() {
   return configured * 1024 * 1024;
 }
 
-function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, sessionDir, scriptPath }) {
+async function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, sessionDir, scriptPath, timeoutMs }) {
+  if (timeoutMs <= 0) return;
   const targetCount = Number(process.env[ROOTFS_POOL_REFILL_COUNT_ENV] || "2");
   if (!Number.isInteger(targetCount) || targetCount < 1) {
     return;
@@ -644,13 +646,30 @@ function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, sessionDir, s
     "--count",
     String(targetCount),
   ], {
-    detached: true,
-    stdio: ["ignore", logFd, logFd],
-    env: { ...process.env, ELASTOS_BROWSER_VM_DATA_DIR: dataDir },
+    stdio: ["pipe", logFd, logFd],
+    env: { ...process.env, ELASTOS_BROWSER_VM_DATA_DIR: dataDir, ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF: "1" },
   });
-  child.unref();
   fs.closeSync(logFd);
   logPhase(`prepared rootfs pool refill started pid=${child.pid} target=${targetCount} log=${logPath}`);
+  await new Promise((resolve) => {
+    let forceTimer;
+    const timeout = setTimeout(() => {
+      // The refill reaps cp and removes its partial before it exits.
+      child.kill("SIGTERM");
+      forceTimer = setTimeout(() => child.kill("SIGKILL"), 3000);
+    }, timeoutMs);
+    const done = () => {
+      clearTimeout(timeout);
+      clearTimeout(forceTimer);
+      child.stdin.destroy();
+      resolve();
+    };
+    child.once("error", (error) => { logPhase(`prepared rootfs pool refill failed: ${error.message}`); done(); });
+    child.once("close", (code) => {
+      if (code !== 0) logPhase(`prepared rootfs pool refill stopped: exit ${code} log=${logPath}`);
+      done();
+    });
+  });
 }
 
 function refillPreparedRootfsPoolSync({ dataDir, poolDir, rootfs, sessionDir, scriptPath }) {
@@ -1026,9 +1045,25 @@ function rewriteResult(result, launch, sessionDir, controlSocketPath) {
   };
 }
 
+let deferredRootfsPoolRefill = null;
+
 async function cleanupAndExit(signal = null) {
   if (exiting) return;
   exiting = true;
+  const cleanupStartedAt = Date.now();
+  if (guestControlSocket && children.size > 0) {
+    try {
+      const result = await httpJsonUnix(guestControlSocket, "/shutdown", {
+        method: "POST", body: {},
+        timeoutMs: Number(process.env.ELASTOS_BROWSER_VM_GUEST_SHUTDOWN_TIMEOUT_MS || "25000"),
+      });
+      if (result.ok !== true || result.profile_disk_flushed !== true || result.profile_disk_unmounted !== true) {
+        throw new Error("guest profile disk flush was unproved");
+      }
+    } catch (error) {
+      logPhase(`guest clean shutdown failed: ${error.message}`);
+    }
+  }
   for (const { server, socketPath } of Array.from(servers)) {
     try {
       server.close();
@@ -1044,6 +1079,30 @@ async function cleanupAndExit(signal = null) {
       child.kill("SIGTERM");
     } catch {}
   }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  await Promise.all(Array.from(children).map((child) => new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    child.once("exit", resolve);
+    try { child.kill("SIGKILL"); } catch { resolve(); }
+  })));
+  // VM teardown finishes before the refill starts. The launcher owns and waits
+  // for this copy separately from the children that shutdown terminates.
+  if (deferredRootfsPoolRefill) {
+    const refill = deferredRootfsPoolRefill;
+    deferredRootfsPoolRefill = null;
+    try {
+      // Reserve five seconds of the service grace for cancelling/reaping a
+      // slow copy and removing its partial image.
+      const timeoutMs = Math.min(
+        Number(process.env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_TIMEOUT_MS || "15000"),
+        Math.max(0, Number(process.env.ELASTOS_BROWSER_VM_LAUNCHER_SHUTDOWN_TIMEOUT_MS || "30000")
+          - 5000 - (Date.now() - cleanupStartedAt)),
+      );
+      await maybeRefillPreparedRootfsPool({ ...refill, timeoutMs });
+    } catch (error) {
+      logPhase(`prepared rootfs pool refill failed: ${error.message}`);
+    }
+  }
   if (globalThis.__elastosBrowserVmSessionDir) {
     discardLaunchRootfs(path.join(globalThis.__elastosBrowserVmSessionDir, "rootfs.ext4"));
   }
@@ -1052,12 +1111,6 @@ async function cleanupAndExit(signal = null) {
       fs.rmSync(globalThis.__elastosBrowserVmSessionDir || "", { recursive: true, force: true });
     } catch {}
   }
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  await Promise.all(Array.from(children).map((child) => new Promise((resolve) => {
-    if (child.exitCode !== null || child.signalCode !== null) return resolve();
-    child.once("exit", resolve);
-    try { child.kill("SIGKILL"); } catch { resolve(); }
-  })));
   for (const cleanup of cleanupFns.reverse()) {
     try { cleanup(); } catch {}
   }
@@ -1113,7 +1166,6 @@ async function main() {
   await startUnixToTcpBridge(controlSocketPath, network.guestIp, 19092);
   const rootfsPrep = prepareLaunchRootfs({ rootfs, launchRootfs, dataDir, sessionDir, scriptPath });
   logPhase(`prepared rootfs via ${rootfsPrep.mode} in ${rootfsPrep.elapsed_ms}ms`);
-  let deferredRootfsPoolRefill = null;
   if (rootfsPrep.mode === "prepared_pool") {
     deferredRootfsPoolRefill = {
       dataDir,
@@ -1150,6 +1202,7 @@ async function main() {
       crosvmLog: vm.crosvmLog,
     });
     logPhase("guest control ready");
+    guestControlSocket = controlSocketPath;
 
     logPhase("opening Browser page");
     let opened;
@@ -1180,11 +1233,6 @@ async function main() {
   } finally {
     if (vmExited) {
       discardLaunchRootfs(launchRootfs);
-    }
-    if (deferredRootfsPoolRefill && vmExited) {
-      maybeRefillPreparedRootfsPool(deferredRootfsPoolRefill);
-    } else if (deferredRootfsPoolRefill) {
-      logPhase("prepared rootfs pool refill skipped: VM did not exit cleanly");
     }
   }
 }

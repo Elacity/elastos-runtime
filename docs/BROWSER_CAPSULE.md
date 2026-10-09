@@ -311,6 +311,15 @@ receipts prove the tested contracts and identify their test engine build; they
 provide no product-engine acceptance. The production media path is Selkies in
 the Linux guest, bound to Runtime signaling, audio/video and input routes.
 
+Runtime owns Browser helper lifetime through a pipe with one writer. Local Exit,
+guest network proxy and stream bridge helpers receive the reader on stdin with
+`ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF=1`. EOF starts their cleanup after Runtime
+stop or crash. VM launchers forward the verified reader identified by
+`ELASTOS_UPDATE_PARENT_PIPE` across short-lived launch commands. The shared
+`elastos-common::process_lifetime` module verifies that descriptor's identity.
+Helpers remove only the socket inode they bound. Runtime retains Engine and
+profile ownership until exact cleanup proves that native writers have stopped.
+
 ### Display Session ABI
 
 The real Browser surface negotiates an explicit display session:
