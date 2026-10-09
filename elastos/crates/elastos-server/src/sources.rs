@@ -617,8 +617,14 @@ pub async fn fetch_source_file(
     let mut displayed = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut checked = 0;
     let mut progress = |received: u64, total: u64| -> anyhow::Result<()> {
-        if received == 0 || received == total || received.saturating_sub(checked) >= 16 * 1024 * 1024 {
-            crate::install_transaction::require_controller_update_space(parent, total.saturating_sub(received))?;
+        if received == 0
+            || received == total
+            || received.saturating_sub(checked) >= 16 * 1024 * 1024
+        {
+            crate::install_transaction::require_controller_update_space(
+                parent,
+                total.saturating_sub(received),
+            )?;
             checked = received;
         }
         if received == 0
