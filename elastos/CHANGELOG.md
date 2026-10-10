@@ -6,15 +6,19 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Developer detail
+
+- The local pre-push gate now runs the CI behaviour suite before Cargo work.
+  CI, `just test-behaviour` and the gate share `scripts/test-behaviour.sh`,
+  so a failing Node test stops the push locally and names the test. Run
+  `just test-behaviour-inputs` once to install the pinned Playwright inputs.
+
 ## [0.8.0-alpha.13]
 
 Test-channel release. Signed releases show these notes in System before you update.
 
-### Added
-
-- Marketplace offers a second local model, Qwen2.5 1.5B Instruct (1.1 GB,
-  Apache-2.0), for noticeably better answers than SmolLM2. It needs about 3 GB
-  of free memory.
+If your Home is on 0.8.0-alpha.10 or older, update it once from Terminal with
+`elastos update`; the System page in those releases cannot install this one.
 
 ### Changed
 
@@ -30,11 +34,28 @@ Test-channel release. Signed releases show these notes in System before you upda
   starts again on your next message. Only one local model runs at a time.
 - When the model list is updated, a model already on this device says "Model
   list updated. Press Use to keep using this model." Use keeps the files; nothing
-  downloads again. This release updates the list, so press Use once for SmolLM2.
+  downloads again.
 - Marketplace shows a model's own description from the signed model list.
 
 ### Fixed
 
+- An update made by an older version could leave out the release's signed model
+  list, after which Home, Undo and later updates stopped with "Installed release
+  inputs require repair". Home, Update and Undo now fetch the release's own
+  signed model list from your trusted source and continue. Without a connection,
+  Home still starts and Local AI says the list could not be fetched; Update and
+  Undo say so and change nothing.
+- Update and Undo now carry the signed model list with the release's other
+  files, in Terminal and in System, so a release with a new model list installs
+  cleanly and Undo puts back the previous list.
+- An Undo that stopped halfway could leave one component from the other release,
+  after which Update, Undo and `elastos setup` refused to continue. Home, Update
+  and Undo now put back this release's signed copy, and `elastos update` does so
+  even when no newer release exists. Replacing a component folder no longer
+  removes the old one first.
+- `elastos setup` fetched the newest release's components by name, so setting up
+  an older release failed. It now fetches that release's own files by their
+  signed IDs.
 - A brief network stall no longer stops a model download. Home tries a part
   that timed out up to three more times before it stops.
 - After about 64 model downloads, retries or cancels, Home could no longer get
@@ -45,11 +66,16 @@ Test-channel release. Signed releases show these notes in System before you upda
 
 ### Developer detail
 
-- Signed model catalogue 3 is pinned in `components.json` (head
-  `bafkreid5lc25ap4v3qw576uw3z3zdsbsfhqnnt5uwfdkawju4ejrtin7z4`): SmolLM2-135M
-  unchanged plus Qwen2.5-1.5B-Instruct Q4_K_M (package
-  `bafybeievyi6xp5b62qkuh65ywkd72medhx6uxrmik2fhnr3aameeqnxvwe`, built
-  reproducibly locally and on the seed, pinned there) (#84).
+- Home start, `elastos update`, System update and Undo first repair the installed
+  release from its signed components: a missing or wrong-head pinned model
+  catalogue is fetched by CID over Carrier and checked for CID and publisher
+  signature; a component with the wrong bytes is re-fetched by CID. Both update
+  paths install the target's catalogue as journaled support. Setup fetches
+  components and the catalogue by the release's signed CID instead of by name.
+  The catalogue pin stays at alpha.11's head
+  (`bafkreihmcsvldwwa5ttbgw5yfrs62kiv3natqhfj3tkg3yzemsd73runr4`) so alpha.11 and
+  alpha.12 updaters, which do not install catalogues, can update to this release
+  (#113).
 - `model-provider` admits a local engine right before spawn when free memory
   covers GGUF weights once, the f16 KV cache at the configured context, batch
   scratch and headroom of max(10% RAM, 1 GiB). Free memory is Linux

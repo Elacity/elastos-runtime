@@ -96,17 +96,11 @@ jobs:
         timeout-minutes: 5
         env:
           DEBUG: pw:install
-        run: |
-          npm install --prefix "${RUNNER_TEMP}/behaviour-browser" --no-save --package-lock=false playwright@1.60.0
-          npm install --prefix "${RUNNER_TEMP}/behaviour-core" --no-save --package-lock=false playwright-core@1.59.1
-          "${RUNNER_TEMP}/behaviour-browser/node_modules/.bin/playwright" install chromium --with-deps --only-shell
+        run: ./scripts/test-behaviour.sh inputs
       - name: JavaScript behavior tests
-        env:
-          NODE_PATH: ${{ runner.temp }}/behaviour-browser/node_modules
-          BROWSER_OPERATOR_PLAYWRIGHT_CORE: ${{ runner.temp }}/behaviour-core/node_modules/playwright-core
         run: |
           python3 scripts/browser-vm-linux-network.test.py
-          node --test --test-timeout=60000 elastos/esp/projections.test.mjs scripts/*.test.mjs scripts/build/*.test.mjs scripts/lib/*.test.mjs capsules/*/browser/*.test.mjs capsules/*/browser/src/*.test.mjs scripts/home-fixture-contracts-smoke.mjs scripts/documents-save-conflict-smoke.mjs scripts/gba-save-conflict-smoke.mjs
+          ./scripts/test-behaviour.sh
 
   # One input for every ARM consumer. PRs restore their develop base's cache;
   # only a develop push can save a verified recipe result in this namespace.
