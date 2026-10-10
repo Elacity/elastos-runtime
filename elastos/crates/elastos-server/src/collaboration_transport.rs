@@ -1,6 +1,10 @@
 //! Bounded Runtime driver for one durable collaboration core and Carrier subscription.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use crate::collaboration_carrier::{CollaborationCarrierSendOutcome, JoinedCollaborationNetwork};
 use crate::collaboration_core::{CollaborationCore, CollaborationTransportIngestion};
@@ -8,7 +12,13 @@ use crate::collaboration_core::{CollaborationCore, CollaborationTransportIngesti
 pub(crate) struct CollaborationTransportDriver {
     core: Arc<CollaborationCore>,
     network: JoinedCollaborationNetwork,
+    last_outgoing_attempt: Mutex<HashMap<String, Instant>>,
 }
+
+const SHARED_FAST_RETRY_WINDOW_SECS: u64 = 3;
+const SHARED_CUSTODY_FAST_RETRY: Duration = Duration::from_millis(500);
+const SHARED_CUSTODY_RETRY: Duration = Duration::from_secs(5);
+const MAX_CUSTODY_RETRIES_PER_CYCLE: usize = 4;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CollaborationOutgoingRetrySummary {
@@ -35,7 +45,11 @@ pub(crate) enum CollaborationIncomingOnceOutcome {
 
 impl CollaborationTransportDriver {
     pub(crate) fn new(core: Arc<CollaborationCore>, network: JoinedCollaborationNetwork) -> Self {
-        Self { core, network }
+        Self {
+            core,
+            network,
+            last_outgoing_attempt: Mutex::new(HashMap::new()),
+        }
     }
 
     pub(crate) async fn has_remote_peers(&self) -> anyhow::Result<bool> {
@@ -53,9 +67,54 @@ impl CollaborationTransportDriver {
         if !self.core.community_membership().joined() {
             return Ok(CollaborationOutgoingRetrySummary::default());
         }
-        let pending = self.core.pending_outgoing(now)?;
+        let mut pending = self.core.pending_outgoing(now)?;
+        let attempted_at = Instant::now();
+        let selected = {
+            let mut attempts = self
+                .last_outgoing_attempt
+                .lock()
+                .map_err(|_| anyhow::anyhow!("collaboration retry schedule lock poisoned"))?;
+            // Only the freshly verified, unexpired durable candidates retain a
+            // schedule entry. This is cadence state, not message authority.
+            let live: HashSet<&str> = pending
+                .iter()
+                .map(|outgoing| outgoing.envelope_sha256())
+                .collect();
+            attempts.retain(|hash, _| live.contains(hash.as_str()));
+            drop(live);
+            pending.sort_by_key(|outgoing| attempts.get(outgoing.envelope_sha256()).copied());
+            let mut custody_retries = 0;
+            pending
+                .into_iter()
+                .filter(|outgoing| {
+                    if outgoing.remote_acceptance_recorded() {
+                        // A receipt proves one Home has custody, not that every
+                        // connected Home received the Shared original.
+                        // Original wall-clock age selects the fast window;
+                        // elapsed retry intervals use a monotonic clock.
+                        let interval = if now.saturating_sub(outgoing.created_at())
+                            < SHARED_FAST_RETRY_WINDOW_SECS
+                        {
+                            SHARED_CUSTODY_FAST_RETRY
+                        } else {
+                            SHARED_CUSTODY_RETRY
+                        };
+                        if attempts
+                            .get(outgoing.envelope_sha256())
+                            .is_some_and(|last| attempted_at.duration_since(*last) < interval)
+                            || custody_retries >= MAX_CUSTODY_RETRIES_PER_CYCLE
+                        {
+                            return false;
+                        }
+                        custody_retries += 1;
+                    }
+                    attempts.insert(outgoing.envelope_sha256().to_string(), attempted_at);
+                    true
+                })
+                .collect::<Vec<_>>()
+        };
         let mut summary = CollaborationOutgoingRetrySummary::default();
-        for outgoing in pending {
+        for outgoing in selected {
             self.core.community_membership().require_joined()?;
             summary.attempted += 1;
             let frame = self
@@ -558,6 +617,93 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn custody_retries_are_fair_bounded_and_use_monotonic_intervals() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let (recipient_key, _) = generate_keypair();
+        let mut originals = HashSet::new();
+        for index in 0..9 {
+            let outgoing = prepare_outgoing(
+                &core,
+                &format!("custody-budget-{index}"),
+                serde_json::json!({"content":format!("message {index}")}),
+            );
+            core.acknowledge_outgoing_product_projection(outgoing.envelope_sha256())
+                .unwrap();
+            core.record_remote_acceptance(
+                &remote_receipt(&fixture, &outgoing, recipient_key.clone()),
+                NOW + 1,
+            )
+            .unwrap();
+            originals.insert(outgoing.envelope_sha256().to_string());
+        }
+        let state_path =
+            std::fs::read_dir(fixture.data_root.join("collaboration/default-conversation"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
+                .join("state-v1.json");
+        let before = std::fs::read(&state_path).unwrap();
+        let carrier = FakeCarrier::new();
+        let driver = fixture.driver(core.clone(), carrier.clone()).await;
+        let mut seen = HashSet::new();
+        for expected in [4, 4, 1] {
+            carrier.push((0..expected).map(|_| send_remote()));
+            assert_eq!(
+                driver.retry_outgoing_once(NOW + 3).await.unwrap().attempted,
+                expected
+            );
+        }
+        for request in carrier.requests() {
+            if request["op"] == "gossip_send" {
+                let wire = request["message"].as_str().unwrap().as_bytes();
+                let verified =
+                    crate::collaboration_protocol::verify_collaboration_transport_frame(wire)
+                        .unwrap();
+                seen.insert(collaboration_message_envelope_sha256(
+                    verified.envelope_bytes(),
+                ));
+            }
+        }
+        assert_eq!(seen, originals, "a deferred original cannot starve");
+        assert_eq!(driver.last_outgoing_attempt.lock().unwrap().len(), 9);
+        assert_eq!(
+            driver
+                .retry_outgoing_once(NOW + 100)
+                .await
+                .unwrap()
+                .attempted,
+            0,
+            "wall-clock movement cannot bypass the monotonic interval"
+        );
+        tokio::time::advance(Duration::from_millis(4999)).await;
+        assert_eq!(
+            driver.retry_outgoing_once(NOW + 7).await.unwrap().attempted,
+            0
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for expected in [4, 4, 1] {
+            carrier.push((0..expected).map(|_| send_remote()));
+            assert_eq!(
+                driver.retry_outgoing_once(NOW + 8).await.unwrap().attempted,
+                expected
+            );
+        }
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        assert_eq!(
+            driver
+                .retry_outgoing_once(NOW + TTL)
+                .await
+                .unwrap()
+                .attempted,
+            0
+        );
+        assert!(driver.last_outgoing_attempt.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn outgoing_observations_never_replace_verified_remote_acceptance() {
         let fixture = Fixture::new();
@@ -599,7 +745,7 @@ mod tests {
                 ..CollaborationIncomingOnceSummary::default()
             })
         );
-        assert_eq!(core.pending_outgoing(NOW + 1).unwrap().len(), 2);
+        assert_eq!(core.pending_outgoing(NOW + 1).unwrap().len(), 3);
         assert_eq!(
             request_ops(&carrier),
             [
@@ -684,8 +830,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn emitted_receipts_round_trip_through_carrier_and_settle_once_after_ack_retry() {
+    #[tokio::test(start_paused = true)]
+    async fn bootstrap_custody_does_not_stop_shared_fanout_and_receipts_replay_once() {
         use crate::collaboration_product::{
             chat_message_request_binding, CollaborationChatProductPort,
         };
@@ -708,6 +854,18 @@ mod tests {
         );
         let sender_port = CollaborationChatProductPort::new(sender.clone()).unwrap();
         let recipient_port = CollaborationChatProductPort::new(recipient.clone()).unwrap();
+        let bootstrap_root = fixture._temp.path().join("bootstrap-data");
+        std::fs::create_dir(&bootstrap_root).unwrap();
+        let bootstrap = Arc::new(
+            CollaborationCore::new(
+                &bootstrap_root,
+                generate_keypair().0,
+                fixture.profile.clone(),
+                fixture.grant.clone(),
+                OPERATION_CAPSULE,
+            )
+            .unwrap(),
+        );
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -747,6 +905,11 @@ mod tests {
         let recipient_driver = fixture
             .driver(recipient.clone(), recipient_carrier.clone())
             .await;
+        let bootstrap_carrier = FakeCarrier::new();
+        let bootstrap_driver = fixture
+            .driver(bootstrap.clone(), bootstrap_carrier.clone())
+            .await;
+        bootstrap_carrier.observe_durable_incoming_before_send(bootstrap.clone());
         recipient_carrier.observe_durable_incoming_before_send(recipient.clone());
         let emitted_frames = |carrier: &FakeCarrier| {
             carrier
@@ -766,10 +929,57 @@ mod tests {
                 .attempted,
             1
         );
-        let message_frames = emitted_frames(&sender_carrier);
+        let mut message_frames = emitted_frames(&sender_carrier);
         assert_eq!(message_frames.len(), 1);
-        recipient_carrier.push([
+        // The first broadcast reaches only the bootstrap. Its signed custody
+        // receipt must not stop fanout to the intended peer that missed it.
+        bootstrap_carrier.push([
             peek(0, 1, vec![frame(&message_frames[0])]),
+            send_remote(),
+            ack(0, 1, true),
+        ]);
+        assert_eq!(
+            bootstrap_driver.process_incoming_once(now).await.unwrap(),
+            summary(0, 1)
+        );
+        let bootstrap_receipts = emitted_frames(&bootstrap_carrier);
+        let bootstrap_receipt =
+            verify_collaboration_transport_frame(&bootstrap_receipts[0]).unwrap();
+        assert_eq!(
+            bootstrap_receipt.source_endpoint_did(),
+            bootstrap.local_device_did()
+        );
+        sender_carrier.push([
+            peek(0, 1, vec![frame(&bootstrap_receipts[0])]),
+            ack(0, 1, true),
+        ]);
+        sender_driver.process_incoming_once(now).await.unwrap();
+        let retry = sender.pending_outgoing(now).unwrap();
+        assert_eq!(retry.len(), 1);
+        assert!(retry[0].remote_acceptance_recorded());
+        assert_eq!(
+            sender_driver
+                .retry_outgoing_once(now)
+                .await
+                .unwrap()
+                .attempted,
+            0
+        );
+        tokio::time::advance(SHARED_CUSTODY_FAST_RETRY).await;
+        sender_carrier.push([send_remote()]);
+        assert_eq!(
+            sender_driver
+                .retry_outgoing_once(now + 1)
+                .await
+                .unwrap()
+                .attempted,
+            1
+        );
+        message_frames = emitted_frames(&sender_carrier);
+        assert_eq!(message_frames.len(), 2);
+        assert_eq!(message_frames[0], message_frames[1]);
+        recipient_carrier.push([
+            peek(0, 1, vec![frame(&message_frames[1])]),
             send_remote(),
             FakeReply::Error("ack failed"),
             peek(0, 1, vec![frame(&message_frames[0])]),
@@ -805,15 +1015,15 @@ mod tests {
         assert_eq!(receipt.source_endpoint_did(), recipient.local_device_did());
         sender_carrier.push([
             peek(
-                0,
-                3,
+                1,
+                4,
                 vec![
                     frame(receipt.envelope_bytes()),
                     frame(&receipt_frames[0]),
                     frame(&receipt_frames[1]),
                 ],
             ),
-            ack(0, 3, true),
+            ack(1, 4, true),
         ]);
         assert_eq!(
             sender_driver.process_incoming_once(now).await.unwrap(),
@@ -823,13 +1033,26 @@ mod tests {
                 ..CollaborationIncomingOnceSummary::default()
             })
         );
-        assert!(sender.pending_outgoing(now).unwrap().is_empty());
+        assert_eq!(sender.pending_outgoing(now).unwrap().len(), 1);
         assert_eq!(sender.summary().unwrap().remotely_accepted_outgoing, 1);
         assert_eq!(
             sender_driver.retry_outgoing_once(now).await.unwrap(),
             CollaborationOutgoingRetrySummary::default()
         );
         assert_eq!(emitted_frames(&sender_carrier), message_frames);
+        assert_eq!(
+            sender_driver
+                .retry_outgoing_once(now + TTL)
+                .await
+                .unwrap()
+                .attempted,
+            0
+        );
+        assert!(sender_driver
+            .last_outgoing_attempt
+            .lock()
+            .unwrap()
+            .is_empty());
 
         let session = crate::room_service::start_local_runtime_session(
             &recipient_root,

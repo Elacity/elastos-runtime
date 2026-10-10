@@ -83,6 +83,8 @@ pub(crate) struct CollaborationCoreSummary {
 pub(crate) struct DurableOutgoingMessage {
     envelope_bytes: Vec<u8>,
     envelope_sha256: String,
+    created_at: u64,
+    remote_acceptance_recorded: bool,
 }
 
 pub(crate) struct PendingOutgoingProductProjection {
@@ -102,6 +104,14 @@ impl DurableOutgoingMessage {
 
     pub(crate) fn envelope_sha256(&self) -> &str {
         &self.envelope_sha256
+    }
+
+    pub(crate) fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    pub(crate) fn remote_acceptance_recorded(&self) -> bool {
+        self.remote_acceptance_recorded
     }
 }
 
@@ -935,16 +945,19 @@ impl CollaborationCore {
             .outgoing
             .iter()
             .filter_map(|entry| {
-                if entry.local_product_projection == OutgoingProductProjectionState::Complete
-                    && entry.remote_acceptance_receipts.is_empty()
-                {
+                if entry.local_product_projection == OutgoingProductProjectionState::Complete {
                     Some((entry, self.verify_outgoing_record(entry)))
                 } else {
                     None
                 }
             })
             .filter_map(|(entry, verified)| match verified {
-                Ok(verified) if verified.envelope().payload.expires_at > now => {
+                Ok(verified)
+                    if verified.envelope().payload.expires_at > now
+                        && (entry.remote_acceptance_receipts.is_empty()
+                            || verified.envelope().payload.payload_type
+                                == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE) =>
+                {
                     if verified.envelope().payload.created_at
                         <= now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
                     {
@@ -2015,6 +2028,8 @@ fn outgoing_handle(
     DurableOutgoingMessage {
         envelope_bytes: entry.envelope.as_bytes().to_vec(),
         envelope_sha256: verified.envelope_sha256().to_string(),
+        created_at: verified.envelope().payload.created_at,
+        remote_acceptance_recorded: !entry.remote_acceptance_receipts.is_empty(),
     }
 }
 
@@ -2733,7 +2748,10 @@ mod tests {
         for _ in 0..2 {
             anyhow::ensure!(core.pending_outgoing_product_projections(NOW)?.is_empty());
         }
-        anyhow::ensure!(core.pending_outgoing(NOW)?.is_empty());
+        anyhow::ensure!(core
+            .pending_outgoing(NOW)?
+            .iter()
+            .all(DurableOutgoingMessage::remote_acceptance_recorded));
         for _ in 0..2 {
             anyhow::ensure!(core.pending_product_handoffs()?.is_empty());
         }
@@ -4047,6 +4065,55 @@ mod tests {
     }
 
     #[test]
+    fn custody_settles_presence_while_shared_chat_retries_its_original_lifetime() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let chat = prepare(
+            &core,
+            "shared-custody",
+            serde_json::json!({"content":"retained original"}),
+            NOW,
+            TTL,
+        )
+        .unwrap();
+        let presence_type = "elastos.chat.presence/v1";
+        let presence_payload = serde_json::json!({"online":true});
+        let presence = core
+            .prepare_outgoing(
+                operation(
+                    &core,
+                    "presence-custody",
+                    presence_type,
+                    &presence_payload,
+                    45,
+                ),
+                SERVICE,
+                presence_type,
+                presence_payload,
+                NOW,
+                45,
+            )
+            .unwrap();
+        let recipient = generate_keypair().0;
+        for outgoing in [&chat, &presence] {
+            complete_projection(&core, outgoing);
+            core.record_remote_acceptance(
+                &remote_receipt(&fixture, outgoing, recipient.clone(), NOW + 1),
+                NOW + 1,
+            )
+            .unwrap();
+        }
+        let before = fs::read(core.state_path()).unwrap();
+        let retry = fixture.core().pending_outgoing(NOW + 1).unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].envelope_bytes(), chat.envelope_bytes());
+        assert!(retry[0].remote_acceptance_recorded());
+        assert_eq!(retry[0].created_at(), NOW);
+        assert!(core.pending_outgoing(NOW + TTL).unwrap().is_empty());
+        assert_eq!(fs::read(core.state_path()).unwrap(), before);
+    }
+
+    #[test]
     fn self_echo_remote_acceptance_and_recipient_replay_are_fail_closed() {
         let fixture = Fixture::new();
         let core = fixture.core();
@@ -4084,7 +4151,11 @@ mod tests {
         let receipt = remote_receipt(&fixture, &outgoing, recipient_key.clone(), NOW + 1);
         core.record_remote_acceptance(&receipt, NOW + 1).unwrap();
         core.record_remote_acceptance(&receipt, NOW + 1).unwrap();
-        assert!(core.pending_outgoing(NOW + 1).unwrap().is_empty());
+        let retry = core.pending_outgoing(NOW + 1).unwrap();
+        assert_eq!(retry.len(), 1);
+        assert!(retry[0].remote_acceptance_recorded());
+        assert_eq!(retry[0].envelope_bytes(), outgoing.envelope_bytes());
+        assert!(core.pending_outgoing(NOW + TTL).unwrap().is_empty());
 
         let conflicting = remote_receipt(&fixture, &outgoing, recipient_key, NOW + 2);
         assert!(core

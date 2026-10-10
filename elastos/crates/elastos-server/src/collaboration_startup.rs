@@ -35,7 +35,7 @@ pub const COLLABORATION_STARTUP_CONFIG_SCHEMA: &str =
 pub(crate) const MAX_STARTUP_CONFIG_BYTES: usize = 3 * 1024 * 1024;
 const COLLABORATION_WORKER_CADENCE: Duration = Duration::from_secs(5);
 const COLLABORATION_LIVE_CADENCE: Duration = Duration::from_millis(500);
-const COLLABORATION_BOOTSTRAP_CADENCE: Duration = Duration::from_secs(30);
+const COLLABORATION_BOOTSTRAP_CADENCE: Duration = Duration::from_secs(1);
 const COLLABORATION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNTIME_OWNED_PRESENCE_CADENCE: Duration = Duration::from_secs(15);
 const MAX_COLLABORATION_DIAGNOSTIC_CHARS: usize = 160;
@@ -2579,10 +2579,10 @@ mod tests {
         ));
         tokio::task::yield_now().await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::time::advance(Duration::from_millis(999)).await;
         tokio::task::yield_now().await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(count.load(Ordering::SeqCst), 2);
         shutdown.send(true).unwrap();
