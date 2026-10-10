@@ -242,7 +242,8 @@ operator pins one. Re-pinning `model_catalog.head_cid` binds only new
 preparation records. An admitted package keeps its bytes and its original
 receipt, while readiness follows the current head: startup composition and
 dispatch readiness cover only records bound to the current head, so the
-package reports admitted and not ready until one explicit authorized same-CID
+package reports admitted and not ready, with `dispatch_unavailable_reason`
+`catalog_updated`, until one explicit authorized same-CID
 Use under the new pin creates an alias record that reuses the admitted bytes
 without another payload fetch.
 
@@ -341,9 +342,10 @@ Dispatch readiness describes the current binding; an actual run proves
 inference.
 
 When admitted content cannot run, the same projection can report a fixed
-`dispatch_unavailable_reason`: `unsupported_host` or `source_engine_required`.
-Runtime derives this current fact from its host profile and engine acquisition
-policy. The UI explains the next action while retaining the admitted content.
+`dispatch_unavailable_reason`: `unsupported_host`, `source_engine_required` or
+`catalog_updated`. Runtime derives this current fact from its host profile,
+engine acquisition policy and catalogue head binding. The UI explains the next
+action while retaining the admitted content.
 Other failures keep the general service-unavailable state. The projection
 stores no failure cause and exposes no provider error text or host path.
 

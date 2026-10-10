@@ -4,7 +4,9 @@ import { createHash, createPublicKey, verify } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildSmolEntry, canonical, contentManifest, download, fileRecord, ownedDirectory, produceCatalogPayload, rawCid, signedCatalog, SMOL_FIXTURE, verifyInstalledKubo } from "./ci-model-package.mjs";
+import { buildEntry, canonical, contentManifest, download, fileRecord, loadFixture, ownedDirectory, producePackage, rawCid, signedCatalog, SMOL_FIXTURE, verifyInstalledKubo, writeCatalogPayload } from "./ci-model-package.mjs";
+
+const QWEN_FIXTURE = loadFixture(new URL("./pinned-qwen2.5-1.5b-fixture.json", import.meta.url));
 
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 function temporary(t) {
@@ -28,27 +30,44 @@ test("pinned inputs refuse missing, replaced and linked bytes", t => {
   assert.throws(() => fileRecord(linked, "input", pin), /symlink/);
 });
 
-test("Smol producer refuses absent or truncated model before writing a package", t => {
+test("producer refuses absent or truncated model before writing a package", t => {
   const root = temporary(t), packageDir = join(root, "package");
-  assert.throws(() => buildSmolEntry(root, packageDir), /ENOENT/);
+  assert.throws(() => buildEntry(root, packageDir, null, SMOL_FIXTURE), /ENOENT/);
   writeFileSync(join(root, SMOL_FIXTURE.model.name), "GGUF");
-  assert.throws(() => buildSmolEntry(root, packageDir), /pinned size/);
+  assert.throws(() => buildEntry(root, packageDir, null, SMOL_FIXTURE), /pinned size/);
   assert.throws(() => readFileSync(join(packageDir, "capsule.json")), /ENOENT/);
 });
 
-test("fixture fetch selects its declared immutable provenance and licensing", () => {
-  const manifest = SMOL_FIXTURE.capsule_manifest, model = manifest.model_content;
-  assert.equal(manifest.role, "content");
-  assert.deepEqual(manifest.projections, ["content"]);
-  assert.match(model.provenance.base_revision, /^[0-9a-f]{40}$/);
-  assert.match(model.provenance.quantized_revision, /^[0-9a-f]{40}$/);
-  const url = new URL(SMOL_FIXTURE.model.url);
-  assert.equal(url.origin, "https://huggingface.co");
-  assert.equal(url.pathname, `/${model.provenance.quantized_repository}/resolve/${model.provenance.quantized_revision}/${SMOL_FIXTURE.model.name}`);
-  assert.equal(model.license.spdx_id, "Apache-2.0");
-  assert.equal(model.license.path, SMOL_FIXTURE.license.name);
-  assert.equal(model.provenance.base_license.path, "LICENSE.base");
-  assert.equal(model.provenance.base_license.spdx_id, model.license.spdx_id);
+for (const fixture of [SMOL_FIXTURE, QWEN_FIXTURE]) {
+  test(`${fixture.id} fixture fetch selects its declared immutable provenance and licensing`, () => {
+    const manifest = fixture.capsule_manifest, model = manifest.model_content;
+    assert.equal(manifest.role, "content");
+    assert.deepEqual(manifest.projections, ["content"]);
+    assert.equal(model.license.spdx_id, "Apache-2.0");
+    assert.equal(model.license.path, fixture.license.name);
+    assert.equal(model.provenance.base_license.path, "LICENSE.base");
+    assert.equal(model.provenance.base_license.spdx_id, model.license.spdx_id);
+  });
+}
+
+test("fixture loading refuses escaping names, injected text, unpinned weights and a title Runtime would not show", t => {
+  const root = temporary(t), path = join(root, "fixture.json");
+  const refused = (mutate, message) => {
+    const fixture = structuredClone(QWEN_FIXTURE);
+    mutate(fixture);
+    writeFileSync(path, JSON.stringify(fixture));
+    assert.throws(() => loadFixture(path), message);
+  };
+  const provenance = f => f.capsule_manifest.model_content.provenance;
+  refused(f => { f.model.name = "../../outside.gguf"; f.model.url = f.model.url.replace(/[^/]+$/, f.model.name); }, /one plain \.gguf file name/);
+  refused(f => { f.license.name = "../LICENSE"; }, /package LICENSE file/);
+  refused(f => { provenance(f).quantized_repository = "Qwen/Qwen2.5\nSigned by someone else."; }, /owner\/name identifiers/);
+  refused(f => { provenance(f).base_repository = "Qwen/../../etc"; }, /owner\/name identifiers/);
+  refused(f => { f.model.url = f.model.url.replace(/resolve\/[0-9a-f]+\//, "resolve/main/"); }, /pinned quantized repository revision/);
+  refused(f => { f.license.url = "https://example.com/LICENSE"; }, /pinned revision or apache\.org/);
+  refused(f => { provenance(f).quantized_revision = "91cad511"; }, /full commit hashes/);
+  refused(f => { f.capsule_manifest.description = "one\nline"; }, /one bounded line/);
+  refused(f => { f.display_name = "Qwen 1.5B"; }, /display_name/);
 });
 
 function decodeBase(bytes, alphabet, bits) {
@@ -145,24 +164,48 @@ for (const [name, mutate, message] of [
   });
 }
 
-test("production payload is deterministic for fixed inputs and names the publisher", t => {
+test("production packages are deterministic and combine into one ordered payload", t => {
   const root = temporary(t), inputs = join(root, "inputs"), weights = Buffer.from("GGUF fake weights"), license = Buffer.from("Apache-2.0 text\n");
   mkdirSync(inputs);
   writeFileSync(join(inputs, "fake.gguf"), weights);
   writeFileSync(join(inputs, "LICENSE"), license);
-  const fixture = { ...SMOL_FIXTURE, model: { name: "fake.gguf", size: weights.length, sha256: sha(weights) }, license: { name: "LICENSE", size: license.length, sha256: sha(license) } };
+  const pins = { model: { name: "fake.gguf", size: weights.length, sha256: sha(weights) }, license: { name: "LICENSE", size: license.length, sha256: sha(license) } };
+  const smol = { ...SMOL_FIXTURE, ...pins }, qwen = { ...QWEN_FIXTURE, ...pins };
   const publisher = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe";
-  // Stand-in for Kubo: the CID is a function of the package's closure index.
-  const add = dir => rawCid(readFileSync(join(dir, "_elastos_object.json")));
-  const runs = ["a", "b"].map(name => produceCatalogPayload({ inputs, output: join(root, name), publisher, add, fixture, publishedAt: 1700000000 }));
+  // Stand-in for Kubo: each fixture's real package CID.
+  const add = cid => () => cid;
+  const QWEN_CID = "bafybeievyi6xp5b62qkuh65ywkd72medhx6uxrmik2fhnr3aameeqnxvwe", SMOL_CID = "bafybeiew3vuq32fvuz2kmps7lmgl4rxpvwsvklxykx4covogbrkhgy5qky";
+  const runs = ["a", "b"].map(name => producePackage({ inputs, output: join(root, name), publisher, add: add(QWEN_CID), fixture: qwen }));
   assert.equal(runs[0].cid, runs[1].cid);
-  assert.deepEqual(readFileSync(join(root, "a/payload.json")), readFileSync(join(root, "b/payload.json")));
-  const { payload } = runs[0];
+  assert.deepEqual(readFileSync(join(root, "a/entry.json")), readFileSync(join(root, "b/entry.json")));
+  // Provenance names this fixture's own quantization and repositories.
+  const provenance = readFileSync(join(runs[0].packageDir, "PROVENANCE.md"), "utf8");
+  assert.match(provenance, new RegExp(publisher));
+  assert.match(provenance, /Q4_K_M weights: Qwen\/Qwen2\.5-1\.5B-Instruct-GGUF at 91cad51170dc346986eccefdc2dd33a9da36ead9\./);
+  assert.doesNotMatch(provenance, /Q8_0|SmolLM2/);
+  assert.throws(() => producePackage({ inputs, output: join(root, "a"), publisher, add: add(QWEN_CID), fixture: qwen }), /EEXIST/);
+
+  const first = producePackage({ inputs, output: join(root, "smol"), publisher, add: add(SMOL_CID), fixture: smol }).entry;
+  mkdirSync(join(root, "catalog"));
+  const payload = writeCatalogPayload({ output: join(root, "catalog"), publisher, entries: [first, runs[0].entry], publishedAt: 1700000000 });
+  assert.deepEqual(JSON.parse(readFileSync(join(root, "catalog/payload.json"))), payload);
   assert.equal(payload.schema, "elastos.model.catalog/v1");
-  assert.equal(payload.entries.length, 1);
+  assert.deepEqual(payload.entries.map(entry => entry.capsule_manifest.name), [SMOL_FIXTURE.capsule_manifest.name, QWEN_FIXTURE.capsule_manifest.name]);
   assert(!("expires_at" in payload));
-  assert.match(readFileSync(join(runs[0].packageDir, "PROVENANCE.md"), "utf8"), new RegExp(publisher));
-  assert.throws(() => produceCatalogPayload({ inputs, output: join(root, "a"), publisher, add, fixture }), /EEXIST/);
+  assert.throws(() => writeCatalogPayload({ output: join(root, "catalog"), publisher, entries: [first], publishedAt: 1 }), /EEXIST/);
+  for (const entries of [[], [first, first], Array.from({ length: 9 }, (_, index) => ({ ...first, cid: `c${index}` }))]) {
+    assert.throws(() => writeCatalogPayload({ output: join(root, `refused-${entries.length}`), publisher, entries, publishedAt: 1 }), /1 to 8|unique/);
+  }
+  // The signer's own check refuses what it would refuse at signing time,
+  // before any payload is written.
+  mkdirSync(join(root, "refused"));
+  for (const [entry, message] of [
+    [{ ...first, cid: rawCid(Buffer.from("raw leaf, not a package closure")) }, /DAG-PB/],
+    [{ ...first, object_manifest: { ...first.object_manifest, content_digest: `sha256:${"0".repeat(64)}` } }, /digest mismatch/],
+  ]) {
+    assert.throws(() => writeCatalogPayload({ output: join(root, "refused"), publisher, entries: [entry, runs[0].entry], publishedAt: 1 }), message);
+    assert.throws(() => readFileSync(join(root, "refused/payload.json")), /ENOENT/);
+  }
 });
 
 test("download refuses a pre-placed symlink partial and leaves its target untouched", async t => {
