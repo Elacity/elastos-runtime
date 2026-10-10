@@ -2091,7 +2091,7 @@ async function waitForRuntimeOpen(response, { engineLabel, exitLabel }) {
   while (Date.now() - startedAt < BROWSER_OPEN_POLL_TIMEOUT_MS) {
     const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     showStatus(
-      `Browser is preparing ${engineLabel} with ${exitLabel} (${elapsedSeconds}s). Wait, or close Browser to cancel.`,
+      `Browser is preparing ${engineLabel} with ${exitLabel} (${elapsedSeconds}s). Wait for preparation to finish, then close Browser if needed.`,
       { sticky: true },
     );
     await wait(BROWSER_OPEN_POLL_INTERVAL_MS);
