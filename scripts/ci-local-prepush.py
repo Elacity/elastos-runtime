@@ -116,7 +116,7 @@ def current_develop(root, commit):
         return develop
     # An older base is safe when the merge is clean and develop changed none
     # of the candidate's files since the merge base; PR CI tests the merge.
-    merges = subprocess.run(["git", "merge-tree", "--write-tree", "--quiet", develop, commit],
+    merges = subprocess.run(["git", "merge-tree", "--write-tree", develop, commit],
                             cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     base = subprocess.run(["git", "merge-base", develop, commit], cwd=root,
                           capture_output=True, text=True).stdout.strip()
