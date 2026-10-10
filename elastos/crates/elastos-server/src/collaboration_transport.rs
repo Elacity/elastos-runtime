@@ -31,6 +31,9 @@ const SHARED_CUSTODY_RETRY: Duration = Duration::from_secs(5);
 const MAX_CUSTODY_RETRIES_PER_CYCLE: usize = 4;
 pub(crate) const SHARED_PROVIDER: &str = "collaboration.shared";
 const SHARED_OP: &str = "deliver";
+const MAX_SHARED_DELIVERY_BYTES: usize = MAX_COLLABORATION_TRANSPORT_FRAME_BYTES * 6 + 2048;
+// The Shared JSON payload bound plus Carrier's result envelope and newline.
+pub(crate) const MAX_SHARED_CARRIER_REPLY_BYTES: usize = MAX_SHARED_DELIVERY_BYTES + 64;
 const HOME_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
@@ -86,7 +89,7 @@ impl Provider for SharedHomeDelivery {
 
 impl SharedHomeDelivery {
     fn receive(&self, value: &serde_json::Value, now: u64) -> anyhow::Result<serde_json::Value> {
-        if serde_json::to_vec(value)?.len() > MAX_COLLABORATION_TRANSPORT_FRAME_BYTES * 6 + 2048 {
+        if serde_json::to_vec(value)?.len() > MAX_SHARED_DELIVERY_BYTES {
             anyhow::bail!("Shared delivery exceeds its byte bound");
         }
         let mut value = value.clone();
@@ -235,9 +238,7 @@ impl SharedHomeDelivery {
                 if let Some(object) = response.as_object_mut() {
                     object.remove("_runtime_transfer");
                 }
-                if serde_json::to_vec(&response)?.len()
-                    > MAX_COLLABORATION_TRANSPORT_FRAME_BYTES * 6 + 2048
-                {
+                if serde_json::to_vec(&response)?.len() > MAX_SHARED_DELIVERY_BYTES {
                     anyhow::bail!("Shared receipt exceeds its byte bound");
                 }
                 let response: SharedDeliveryResponse = serde_json::from_value(response)?;

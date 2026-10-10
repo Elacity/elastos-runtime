@@ -8473,13 +8473,18 @@ impl CarrierClient {
             && invocation.transfer == ProviderTransfer::Json
         {
             Some(crate::collaboration_history::MAX_HISTORY_CARRIER_REPLY_BYTES as u64)
+        } else if invocation.target == crate::collaboration_transport::SHARED_PROVIDER
+            && invocation.op == "deliver"
+            && invocation.transfer == ProviderTransfer::Json
+        {
+            Some(crate::collaboration_transport::MAX_SHARED_CARRIER_REPLY_BYTES as u64)
         } else if bounded {
             Some(CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES)
         } else {
             None
         };
         if let Some(limit) = reply_bound {
-            // Refuse an oversized read reply before buffering it. Other
+            // Refuse an oversized bounded reply before buffering it. Other
             // provider operations keep their existing response contract.
             let mut limited = (&mut reader).take(limit);
             limited
@@ -12388,16 +12393,14 @@ pub(crate) mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn private_history_carrier_read_authenticates_source_and_bounds_the_wire_reply() {
-        use crate::collaboration_history::{HISTORY_PROVIDER, MAX_HISTORY_CARRIER_REPLY_BYTES};
+    async fn assert_private_carrier_reply_bound(target: &str, operation: &str, limit: usize) {
         let fixture = peer_did_route_fixture(181, 182).await;
         let size = Arc::new(std::sync::atomic::AtomicUsize::new(32));
         let requests = Arc::new(StdMutex::new(Vec::new()));
         fixture
             ._remote_registry
             .register_runtime_provider_target(
-                HISTORY_PROVIDER,
+                target,
                 Arc::new(HistoryWireProbe {
                     bytes: size.clone(),
                     requests: requests.clone(),
@@ -12407,14 +12410,14 @@ pub(crate) mod tests {
             .unwrap();
         assert!(fixture
             ._remote_registry
-            .send_raw(HISTORY_PROVIDER, &serde_json::json!({"op":"read"}))
+            .send_raw(target, &serde_json::json!({"op":operation}))
             .await
             .is_err());
         let invocation = ProviderInvocation {
-            source: HISTORY_PROVIDER.into(),
-            target: HISTORY_PROVIDER.into(),
-            op: "read".into(),
-            request: serde_json::json!({"op":"read"}),
+            source: target.into(),
+            target: target.into(),
+            op: operation.into(),
+            request: serde_json::json!({"op":operation}),
             transfer: ProviderTransfer::Json,
             range: None,
             progress: None,
@@ -12423,11 +12426,13 @@ pub(crate) mod tests {
                 timeout_ms: Some(5_000),
             }),
         };
-        let response = fixture
-            .local_registry
-            .invoke_provider(invocation.clone())
-            .await
-            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture.local_registry.invoke_provider(invocation.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(response["body"], "x".repeat(32));
         let mut request = requests.lock().unwrap()[0].clone();
         assert_eq!(
@@ -12436,10 +12441,7 @@ pub(crate) mod tests {
         );
         // The receiving Runtime owns this metadata; wire callers supply null.
         request["_runtime_invocation"]["carrier"] = serde_json::Value::Null;
-        size.store(
-            MAX_HISTORY_CARRIER_REPLY_BYTES + 1,
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        size.store(limit + 1, std::sync::atomic::Ordering::SeqCst);
         let client = CarrierClient::connect_known_endpoint(
             &fixture.local_node.endpoint,
             fixture.remote_addr.clone(),
@@ -12447,17 +12449,37 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let error = client
-            .invoke_provider(&invocation, request)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains(&format!("exceeds {MAX_HISTORY_CARRIER_REPLY_BYTES} bytes")),
-            "{error}"
-        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.invoke_provider(&invocation, request),
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(&format!("exceeds {limit} bytes")), "{error}");
         shutdown_test_carrier_node(fixture.remote_node).await;
         shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn private_history_carrier_read_authenticates_source_and_bounds_the_wire_reply() {
+        assert_private_carrier_reply_bound(
+            crate::collaboration_history::HISTORY_PROVIDER,
+            "read",
+            crate::collaboration_history::MAX_HISTORY_CARRIER_REPLY_BYTES,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn private_shared_carrier_delivery_authenticates_source_and_bounds_the_wire_reply() {
+        assert_private_carrier_reply_bound(
+            crate::collaboration_transport::SHARED_PROVIDER,
+            "deliver",
+            crate::collaboration_transport::MAX_SHARED_CARRIER_REPLY_BYTES,
+        )
+        .await;
     }
 
     fn peer_did_invocation(peer_did: &str) -> ProviderInvocation {
