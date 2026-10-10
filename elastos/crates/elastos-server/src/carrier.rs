@@ -8380,6 +8380,15 @@ impl CarrierClient {
         self.fetch_bytes(msg, "content fetch", cid, max_bytes).await
     }
 
+    pub(crate) async fn fetch_content_bounded(
+        &self,
+        cid: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let msg = serde_json::json!({"op": "content_fetch", "cid": cid});
+        self.fetch_bytes(msg, "content fetch", cid, max_bytes).await
+    }
+
     /// Sends `msg` and reads its length-prefixed reply. Every phase is
     /// bounded, none by total time: the request and each body read get
     /// `DOWNLOAD_IDLE_TIMEOUT`, and the source gets `DOWNLOAD_HEADER_WAIT` to
@@ -8603,10 +8612,15 @@ const DOWNLOAD_HEADER_WAIT: Duration = Duration::from_secs(if cfg!(test) { 3 } e
 pub(crate) const MAX_DOWNLOAD_BYTES: usize = 200 * 1024 * 1024;
 
 /// Fetches the signed CID when present, else the release name, then closes.
-async fn fetch_and_close(client: CarrierClient, cid: Option<&str>, path: &str) -> Result<Vec<u8>> {
+async fn fetch_and_close(
+    client: CarrierClient,
+    cid: Option<&str>,
+    path: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
     let result = match cid {
-        Some(cid) => client.fetch_content(cid, None).await,
-        None => client.fetch_file(path).await,
+        Some(cid) => client.fetch_content_bounded(cid, max_bytes).await,
+        None => client.fetch_file_bounded(path, max_bytes).await,
     };
     client.close().await;
     result
@@ -8618,6 +8632,7 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
     path: &str,
     connect_timeout_secs: u64,
     bind_addr: Option<std::net::SocketAddr>,
+    max_bytes: usize,
 ) -> Result<Vec<u8>> {
     let node_id = source_transport_endpoint_id(source)?;
     let mut errors = Vec::new();
@@ -8626,7 +8641,7 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
             .await
         {
-            Ok(client) => match fetch_and_close(client, cid, path).await {
+            Ok(client) => match fetch_and_close(client, cid, path, max_bytes).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => errors.push(format!("ticket[{index}] fetch of {path} failed: {err}")),
             },
@@ -8639,7 +8654,7 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
             .await
         {
-            Ok(client) => match fetch_and_close(client, cid, path).await {
+            Ok(client) => match fetch_and_close(client, cid, path, max_bytes).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => errors.push(format!("relay[{index}] fetch of {path} failed: {err}")),
             },
@@ -8651,7 +8666,7 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         node_id.ok_or_else(|| anyhow::anyhow!("trusted source has no usable Carrier node id"))?;
     let addrs = source_carrier_addrs(source);
     match CarrierClient::connect_bound(&node_id, &addrs, connect_timeout_secs, bind_addr).await {
-        Ok(client) => match fetch_and_close(client, cid, path).await {
+        Ok(client) => match fetch_and_close(client, cid, path, max_bytes).await {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
                 errors.push(format!("direct fetch of {path} failed: {err}"));
@@ -10883,7 +10898,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(
-            fetch_and_close(client, None, "artifact").await.unwrap(),
+            fetch_and_close(client, None, "artifact", MAX_DOWNLOAD_BYTES)
+                .await
+                .unwrap(),
             b"fixture"
         );
         assert!(!runtime.is_closed());
@@ -10999,7 +11016,7 @@ pub(crate) mod tests {
         let client = CarrierClient::connect_owned_endpoint(endpoint, address, 5)
             .await
             .unwrap();
-        let result = fetch_and_close(client, None, "artifact").await;
+        let result = fetch_and_close(client, None, "artifact", MAX_DOWNLOAD_BYTES).await;
         let closed_before_return = observer.is_closed();
         observer.close().await;
         let remote_close = tokio::time::timeout(Duration::from_secs(5), serving)

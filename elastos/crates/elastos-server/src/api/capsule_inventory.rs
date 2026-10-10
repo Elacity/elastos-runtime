@@ -430,7 +430,9 @@ pub(crate) mod tests {
             serde_json::json!(format!("sha256:{:x}", digest.finalize()));
     }
 
-    fn sign_model_catalog(payload: &Value) -> (crate::setup::ModelCatalogConfig, Vec<u8>) {
+    pub(crate) fn sign_model_catalog(
+        payload: &Value,
+    ) -> (crate::setup::ModelCatalogConfig, Vec<u8>) {
         let key = elastos_runtime::signature::SigningKey::from_bytes(&[7; 32]);
         let (signature, signer_did) = crate::crypto::domain_separated_sign(
             &key,

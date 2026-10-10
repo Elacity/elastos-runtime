@@ -18,7 +18,13 @@ fn scratch(tx: &InstallTransaction, index: usize, candidate: bool) -> PathBuf {
     ))
 }
 
+/// The signed model catalogue is the one top-level file a release's support may replace.
+const MODEL_CATALOG: &str = "model-catalog.json";
+
 pub(crate) fn validate_support_path(path: &Path) -> anyhow::Result<()> {
+    if path == Path::new(MODEL_CATALOG) {
+        return Ok(());
+    }
     let mut parts = path.components();
     anyhow::ensure!(matches!(parts.next(), Some(std::path::Component::Normal(name)) if ["bin", "capsules", "libexec", "tools"].iter().any(|allowed| name == *allowed))
         && parts.all(|part| matches!(part, std::path::Component::Normal(name) if !name.to_string_lossy().starts_with(".elastos."))), "unsafe release support path");
@@ -29,7 +35,9 @@ pub(super) fn validate_entries(tx: &InstallTransaction, entries: &[Entry]) -> an
     for (index, entry) in entries.iter().enumerate() {
         let path = &entry.path;
         validate_support_path(path)?;
-        if path.components().count() == 1 && (entry.original.is_some() || entry.candidate.is_none())
+        if path.components().count() == 1
+            && path != Path::new(MODEL_CATALOG)
+            && (entry.original.is_some() || entry.candidate.is_none())
             || tx
                 .destinations
                 .values()
@@ -169,7 +177,9 @@ pub(super) fn prepare(tx: &InstallTransaction, paths: &[(PathBuf, PathBuf)]) -> 
     for (relative, source) in paths {
         validate_support_path(relative)?;
         anyhow::ensure!(
-            relative.components().count() > 1 || source.is_dir(),
+            relative.components().count() > 1
+                || relative == Path::new(MODEL_CATALOG)
+                || source.is_dir(),
             "new support root must be a directory"
         );
         journal.support.push(Entry {
