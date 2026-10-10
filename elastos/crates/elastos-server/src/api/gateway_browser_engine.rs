@@ -62,6 +62,9 @@ where
         .iter()
         .filter(|adapter| adapter.supports(display_mode, guarantee_level))
         .filter(|adapter| requested_adapter.is_none_or(|id| adapter.id == id))
+        .filter(|adapter| {
+            requested_adapter.is_some() || adapter.backing_substrate != "remote_operator_vm"
+        })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|adapter| !adapter.default);
     let mut readiness_budget = std::time::Duration::from_secs(12);
@@ -212,7 +215,7 @@ fn browser_engine_config_uses_runtime_image(
             &format!("bin/{launcher}"),
         )
         && path_matches(&env["ELASTOS_BROWSER_VM_DATA_DIR"], "")
-        && [
+        && ([
             ("ELASTOS_BROWSER_VM_ROOTFS", "browser-vm/rootfs.ext4"),
             (
                 "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST",
@@ -227,6 +230,24 @@ fn browser_engine_config_uses_runtime_image(
         ]
         .iter()
         .all(|(key, path)| env[*key].is_null() || path_matches(&env[*key], path))
+            || [
+                ("ELASTOS_BROWSER_VM_ROOTFS", "rootfs.ext4"),
+                (
+                    "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST",
+                    "browser-vm-rootfs-manifest.json",
+                ),
+                ("ELASTOS_BROWSER_VM_KERNEL", "vmlinux"),
+                (
+                    if platform.starts_with("darwin-") {
+                        "ELASTOS_BROWSER_VM_INITRAMFS"
+                    } else {
+                        "ELASTOS_BROWSER_VM_INITRD"
+                    },
+                    "initrd",
+                ),
+            ]
+            .iter()
+            .all(|(key, file)| path_matches(&env[*key], &format!("browser-vm/image-set/{file}"))))
 }
 
 pub(in crate::api::gateway) async fn browser_engine_summary(
@@ -692,6 +713,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn image_acquisition_admits_the_complete_release_image_set() {
+        let data = FsPath::new("/runtime-test");
+        for platform in ["darwin-arm64", "linux-arm64", "linux-amd64"] {
+            let mut config = image_config(data, platform);
+            let env = &mut config["adapters"][0]["supervisor"]["env"];
+            for (key, file) in [
+                ("ELASTOS_BROWSER_VM_ROOTFS", "rootfs.ext4"),
+                (
+                    "ELASTOS_BROWSER_VM_ROOTFS_MANIFEST",
+                    "browser-vm-rootfs-manifest.json",
+                ),
+                ("ELASTOS_BROWSER_VM_KERNEL", "vmlinux"),
+                (
+                    if platform.starts_with("darwin-") {
+                        "ELASTOS_BROWSER_VM_INITRAMFS"
+                    } else {
+                        "ELASTOS_BROWSER_VM_INITRD"
+                    },
+                    "initrd",
+                ),
+            ] {
+                env[key] = json!(data.join("browser-vm/image-set").join(file));
+            }
+            assert!(browser_engine_config_uses_runtime_image(
+                &config, data, "local", platform
+            ));
+            config["adapters"][0]["supervisor"]["env"]["ELASTOS_BROWSER_VM_KERNEL"] =
+                json!("/manual/kernel");
+            assert!(!browser_engine_config_uses_runtime_image(
+                &config, data, "local", platform
+            ));
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn image_acquisition_finishes_before_local_readiness_budget_starts() {
         let dir = tempfile::tempdir().unwrap();
@@ -738,7 +794,7 @@ mod tests {
                     image_adapter("remote", "remote_operator_vm", true),
                     image_adapter("local", "local_microvm", false),
                 ],
-                None,
+                Some("remote"),
                 "remote",
             ),
             (
@@ -806,11 +862,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_acquisition_failure_allows_only_an_unrequested_ready_alternative() {
+    async fn image_acquisition_failure_keeps_remote_execution_explicit() {
         let dir = tempfile::tempdir().unwrap();
         write_image_config(dir.path());
         for (requested, expected) in [
-            (None, Ok("remote".into())),
+            (
+                None,
+                Err(BrowserCompatibilityError::EngineNotReady {
+                    reason: BrowserEngineReadinessReason::PreparationRequired,
+                }),
+            ),
             (
                 Some("local"),
                 Err(BrowserCompatibilityError::EngineNotReady {
@@ -841,13 +902,31 @@ mod tests {
             )
             .await;
             assert_eq!(result, expected);
-            let expected_calls = if requested.is_some() {
-                vec!["status", "prepare"]
-            } else {
-                vec!["status", "prepare", "readiness"]
-            };
-            assert_eq!(*calls.lock().unwrap(), expected_calls);
+            assert_eq!(*calls.lock().unwrap(), ["status", "prepare"]);
         }
+    }
+
+    #[tokio::test]
+    async fn remote_default_waits_for_explicit_owner_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, calls) = image_registry(
+            "capsule-provider",
+            vec![image_adapter("remote", "remote_operator_vm", true)],
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let result = resolve_browser_engine_adapter_with_preparation(
+            &registry,
+            dir.path(),
+            "person:test",
+            None,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::MechanismMicrovm,
+            || async { panic!("remote Engine acquired a local image") },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*calls.lock().unwrap(), ["status"]);
     }
 
     #[test]

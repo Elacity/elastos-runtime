@@ -426,66 +426,6 @@
         }
       }
     },
-    "browser-engine-supervisor": {
-      "install_path": "bin/browser-engine-supervisor",
-      "description": "Linux Browser Engine supervisor helper that launches native engines with Runtime-only network handoff",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-engine-supervisor-linux-amd64",
-          "install_path": "bin/browser-engine-supervisor"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-engine-supervisor-linux-arm64",
-          "install_path": "bin/browser-engine-supervisor"
-        }
-      }
-    },
-    "browser-native-proxy-engine": {
-      "install_path": "bin/browser-native-proxy-engine",
-      "description": "Native Chromium/CEF browser wrapper with loopback proxy and Runtime Exit relay networking",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-native-proxy-engine-linux-amd64",
-          "install_path": "bin/browser-native-proxy-engine"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-native-proxy-engine-linux-arm64",
-          "install_path": "bin/browser-native-proxy-engine"
-        }
-      }
-    },
-    "browser-stream-bridge": {
-      "install_path": "bin/browser-stream-bridge",
-      "description": "Linux Browser Engine Unix stream bridge for Runtime-owned byte transport",
-      "platforms": {
-        "linux-amd64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-stream-bridge-linux-amd64",
-          "install_path": "bin/browser-stream-bridge"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "browser-stream-bridge-linux-arm64",
-          "install_path": "bin/browser-stream-bridge"
-        }
-      }
-    },
     "browser-local-exit": {
       "install_path": "bin/browser-local-exit",
       "description": "Browser local Exit relay that dials allowlisted public TCP targets behind Runtime-owned Browser streams",
@@ -1372,9 +1312,17 @@
       }
     },
     "crosvm": {
-      "install_path": "bin/crosvm",
-      "description": "crosvm VM monitor required for capsule microVM execution",
-      "platforms": {}
+      "version": "0.1.0-2ac141082d17",
+      "description": "Browser Linux VM monitor from the signed release",
+      "platforms": {
+        "linux-arm64": {
+          "strategy": "source-build",
+          "release_path": "crosvm-linux-arm64.tar.gz",
+          "extract_path": "crosvm-2ac141082d171e76a39cdabf98f6e48a377a126b",
+          "install_path": "libexec/browser/crosvm/0.1.0-2ac141082d17/linux-arm64",
+          "binary_path": "bin/crosvm"
+        }
+      }
     },
     "vmlinux": {
       "install_path": "bin/vmlinux",
@@ -1444,6 +1392,249 @@
           "binary_path": "llama-server"
         }
       }
+    },
+    "browser-vm-image": {
+      "install_path": "browser-vm/image-set",
+      "description": "Verified Browser local Engine image; installed when a local Engine is selected",
+      "size_mb": 900,
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "browser-vm-image",
+          "release_path": "browser-vm-image-arm64.tar.gz",
+          "install_path": "browser-vm/image-set",
+          "extract_path": "browser-vm-image"
+        },
+        "linux-arm64": {
+          "strategy": "browser-vm-image",
+          "release_path": "browser-vm-image-arm64.tar.gz",
+          "install_path": "browser-vm/image-set",
+          "extract_path": "browser-vm-image"
+        }
+      }
+    },
+    "browser-vm-engine-supervisor": {
+      "install_path": "bin/browser-vm-engine-supervisor",
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-host-node-launcher.sh",
+          "release_path": "browser-vm-engine-supervisor-darwin-arm64"
+        },
+        "linux-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-host-node-launcher.sh",
+          "release_path": "browser-vm-engine-supervisor-linux-arm64"
+        }
+      }
+    },
+    "browser-vm-engine-supervisor-module": {
+      "install_path": "bin/browser-vm-engine-supervisor.mjs",
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-vm-engine-supervisor.mjs",
+          "release_path": "browser-vm-engine-supervisor-module-darwin-arm64"
+        },
+        "linux-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-vm-engine-supervisor.mjs",
+          "release_path": "browser-vm-engine-supervisor-module-linux-arm64"
+        }
+      }
+    },
+    "browser-vm-control-service": {
+      "install_path": "bin/browser-vm-control-service",
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-host-node-launcher.sh",
+          "release_path": "browser-vm-control-service-darwin-arm64"
+        },
+        "linux-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-host-node-launcher.sh",
+          "release_path": "browser-vm-control-service-linux-arm64"
+        }
+      }
+    },
+    "browser-vm-control-service-module": {
+      "install_path": "bin/browser-vm-control-service.mjs",
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-vm-control-service.mjs",
+          "release_path": "browser-vm-control-service-module-darwin-arm64"
+        },
+        "linux-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-vm-control-service.mjs",
+          "release_path": "browser-vm-control-service-module-linux-arm64"
+        }
+      }
+    },
+    "browser-vm-artifact-preflight": {
+      "install_path": "scripts/browser-vm-artifact-preflight.sh",
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-vm-artifact-preflight.sh",
+          "release_path": "browser-vm-artifact-preflight-darwin-arm64"
+        },
+        "linux-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-vm-artifact-preflight.sh",
+          "release_path": "browser-vm-artifact-preflight-linux-arm64"
+        }
+      }
+    },
+    "browser-selkies-control-service": {
+      "install_path": "scripts/browser-selkies-control-service.mjs",
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-selkies-control-service.mjs",
+          "release_path": "browser-selkies-control-service-darwin-arm64"
+        }
+      }
+    },
+    "browser-vm-local-crosvm-launcher": {
+      "install_path": "bin/browser-vm-local-crosvm-launcher",
+      "platforms": {
+        "linux-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-host-node-launcher.sh",
+          "release_path": "browser-vm-local-crosvm-launcher-linux-arm64"
+        }
+      }
+    },
+    "browser-vm-local-crosvm-launcher-module": {
+      "install_path": "bin/browser-vm-local-crosvm-launcher.mjs",
+      "platforms": {
+        "linux-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-vm-local-crosvm-launcher.mjs",
+          "release_path": "browser-vm-local-crosvm-launcher-module-linux-arm64"
+        }
+      }
+    },
+    "browser-vm-prepare-rootfs-pool": {
+      "install_path": "bin/browser-vm-prepare-rootfs-pool",
+      "platforms": {
+        "linux-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-host-node-launcher.sh",
+          "release_path": "browser-vm-prepare-rootfs-pool-linux-arm64"
+        }
+      }
+    },
+    "browser-vm-prepare-rootfs-pool-module": {
+      "install_path": "scripts/browser-vm-prepare-rootfs-pool.mjs",
+      "platforms": {
+        "linux-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-vm-prepare-rootfs-pool.mjs",
+          "release_path": "browser-vm-prepare-rootfs-pool-module-linux-arm64"
+        }
+      }
+    },
+    "browser-vm-linux-network": {
+      "install_path": "scripts/browser-vm-linux-network.py",
+      "platforms": {
+        "linux-arm64": {
+          "strategy": "source-build",
+          "source": "scripts/browser-vm-linux-network.py",
+          "release_path": "browser-vm-linux-network-linux-arm64"
+        }
+      }
+    },
+    "browser-vz-engine-supervisor": {
+      "install_path": "bin/browser-vz-engine-supervisor",
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "source-build",
+          "release_path": "browser-vz-engine-supervisor-darwin-arm64"
+        }
+      }
+    },
+    "turnserver": {
+      "version": "4.13.1",
+      "description": "Browser TURN relay from the signed release",
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "source-build",
+          "release_path": "turnserver-darwin-arm64.tar.gz",
+          "extract_path": "coturn-4.13.1",
+          "install_path": "libexec/browser/turnserver/4.13.1/darwin-arm64",
+          "binary_path": "bin/turnserver"
+        },
+        "linux-arm64": {
+          "strategy": "source-build",
+          "release_path": "turnserver-linux-arm64.tar.gz",
+          "extract_path": "coturn-4.13.1",
+          "install_path": "libexec/browser/turnserver/4.13.1/linux-arm64",
+          "binary_path": "bin/turnserver"
+        }
+      }
+    },
+    "node": {
+      "version": "24.21.0",
+      "description": "Browser host JavaScript runtime from the signed release",
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "source-build",
+          "release_path": "node-darwin-arm64.tar.gz",
+          "extract_path": "node-v24.21.0-darwin-arm64",
+          "install_path": "libexec/browser/node/24.21.0/darwin-arm64",
+          "binary_path": "bin/node"
+        },
+        "linux-arm64": {
+          "strategy": "source-build",
+          "release_path": "node-linux-arm64.tar.gz",
+          "extract_path": "node-v24.21.0-linux-arm64",
+          "install_path": "libexec/browser/node/24.21.0/linux-arm64",
+          "binary_path": "bin/node"
+        }
+      }
+    },
+    "python3": {
+      "version": "3.12.14",
+      "description": "Browser host Python runtime from the signed release",
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "source-build",
+          "release_path": "python3-darwin-arm64.tar.gz",
+          "extract_path": "python",
+          "install_path": "libexec/browser/python3/3.12.14/darwin-arm64",
+          "binary_path": "bin/python3.12"
+        },
+        "linux-arm64": {
+          "strategy": "source-build",
+          "release_path": "python3-linux-arm64.tar.gz",
+          "extract_path": "python",
+          "install_path": "libexec/browser/python3/3.12.14/linux-arm64",
+          "binary_path": "bin/python3.12"
+        }
+      }
+    },
+    "debugfs": {
+      "version": "1.47.3",
+      "description": "Browser ext4 inspection and profile tools from the signed release",
+      "platforms": {
+        "darwin-arm64": {
+          "strategy": "source-build",
+          "release_path": "debugfs-darwin-arm64.tar.gz",
+          "extract_path": "e2fsprogs-1.47.3",
+          "install_path": "libexec/browser/e2fsprogs/1.47.3/darwin-arm64",
+          "binary_path": "bin/debugfs"
+        },
+        "linux-arm64": {
+          "strategy": "source-build",
+          "release_path": "debugfs-linux-arm64.tar.gz",
+          "extract_path": "e2fsprogs-1.47.3",
+          "install_path": "libexec/browser/e2fsprogs/1.47.3/linux-arm64",
+          "binary_path": "bin/debugfs"
+        }
+      }
     }
   },
   "profiles": {
@@ -1464,9 +1655,6 @@
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
-        "browser-engine-supervisor",
-        "browser-native-proxy-engine",
-        "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
         "wallet-provider",
@@ -1510,9 +1698,6 @@
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
-        "browser-engine-supervisor",
-        "browser-native-proxy-engine",
-        "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
         "wallet-provider",
@@ -1590,9 +1775,6 @@
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
-        "browser-engine-supervisor",
-        "browser-native-proxy-engine",
-        "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
         "wallet-provider",
@@ -1638,9 +1820,6 @@
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
-        "browser-engine-supervisor",
-        "browser-native-proxy-engine",
-        "browser-stream-bridge",
         "browser-local-exit",
         "wallet-provider",
         "home-cli",
@@ -1687,9 +1866,6 @@
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
-        "browser-engine-supervisor",
-        "browser-native-proxy-engine",
-        "browser-stream-bridge",
         "browser-local-exit",
         "wallet-provider",
         "object-provider",
@@ -1735,6 +1911,28 @@
         "kubo",
         "cloudflared",
         "llama-server"
+      ]
+    },
+    "browser-host": {
+      "description": "Host helpers acquired when the Browser capsule opens",
+      "components": [
+        "node",
+        "browser-vm-engine-supervisor",
+        "browser-vm-engine-supervisor-module",
+        "browser-vm-control-service",
+        "browser-vm-control-service-module",
+        "browser-vm-artifact-preflight",
+        "browser-selkies-control-service",
+        "browser-vm-local-crosvm-launcher",
+        "browser-vm-local-crosvm-launcher-module",
+        "browser-vm-prepare-rootfs-pool",
+        "browser-vm-prepare-rootfs-pool-module",
+        "browser-vm-linux-network",
+        "browser-vz-engine-supervisor",
+        "turnserver",
+        "python3",
+        "debugfs",
+        "crosvm"
       ]
     }
   },

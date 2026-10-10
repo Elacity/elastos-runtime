@@ -202,7 +202,14 @@ fn aliases(platform: &str) -> Vec<(&'static str, &'static str)> {
     vec![
         ("browser-vm/rootfs.ext4", "rootfs.ext4"),
         ("browser-vm/browser-vm-rootfs-manifest.json", RECEIPT),
-        ("bin/vmlinux", "vmlinux"),
+        (
+            if platform == "darwin-arm64" {
+                "bin/vmlinux"
+            } else {
+                "browser-vm/vmlinux"
+            },
+            "vmlinux",
+        ),
         (
             if platform == "darwin-arm64" {
                 "bin/initrd"
@@ -282,18 +289,23 @@ fn verify_payload_with_cancel(
 
 pub(super) fn verify_legacy_or_missing_release(data: &Path, platform: &str) -> anyhow::Result<()> {
     guest_platform(platform)?;
-    let initrd = if platform == "darwin-arm64" {
-        "bin/initrd"
-    } else {
-        "browser-vm/initrd"
-    };
     // Existing source-home installations own these paths. Verify their bytes and
     // receipt in place; setup acquisition neither copies nor rewrites them.
+    let image_aliases = aliases(platform);
+    let mut kernel = data.join(image_aliases[2].0);
+    if platform.starts_with("linux-")
+        && matches!(fs::symlink_metadata(&kernel), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+    {
+        // Source Home staged the guest kernel here before release image aliases.
+        // The receipt must still bind its bytes; an existing Browser alias wins,
+        // including a broken or corrupt alias that requires repair.
+        kernel = data.join("bin/vmlinux");
+    }
     let paths = [
-        data.join("browser-vm").join(RECEIPT),
-        data.join("browser-vm/rootfs.ext4"),
-        data.join("bin/vmlinux"),
-        data.join(initrd),
+        data.join(image_aliases[1].0),
+        data.join(image_aliases[0].0),
+        kernel,
+        data.join(image_aliases[3].0),
     ];
     verify_cached_payload(&paths, platform, "legacy", || verify_payload_paths(&paths, platform))
         .map_err(|err| anyhow::anyhow!("Browser image release package metadata is unavailable and the installed image set requires preparation ({err}); install a release with browser-vm-image metadata or select an approved remote Engine"))
@@ -480,8 +492,24 @@ pub(super) async fn install_via_carrier(
     let temporary = tempfile::tempfile_in(parent)?;
     let mut download = tokio::fs::File::from_std(temporary);
     let mut checkpoint = 0;
+    let mut displayed = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut progress = |received: u64, total: u64| -> anyhow::Result<()> {
         check_cancelled(Some(&cancellation.0))?;
+        if received == 0
+            || received == total
+            || displayed.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            eprint!(
+                "\rBrowser image: {} / {} MiB ({}%)",
+                received / (1024 * 1024),
+                total / (1024 * 1024),
+                received.saturating_mul(100) / total.max(1)
+            );
+            if received == total {
+                eprintln!();
+            }
+            displayed = std::time::Instant::now();
+        }
         if received == 0
             || received == total
             || received.saturating_sub(checkpoint) >= 16 * 1024 * 1024
@@ -734,6 +762,10 @@ mod tests {
     fn fixture(rootfs: &[u8]) -> Vec<(String, Vec<u8>)> {
         let mut receipt = json!({
             "schema":"elastos.browser.vm-rootfs-build/v1", "ok":true, "target_platform":"linux-arm64",
+            "inputs_sha256":"c".repeat(64),
+            "recipe_options":{"target_platform":"linux-arm64", "rootfs_size":"8192M",
+                "debian_suite":"bookworm", "debian_mirror":"https://deb.debian.org/debian",
+                "cdp_timeout_ms":"20000"},
             "size":rootfs.len(), "sha256":sha(rootfs),
             "kernel":{"size":6,"sha256":sha(b"kernel")},
             "initrd":{"size":6,"sha256":sha(b"initrd")},
@@ -1011,11 +1043,21 @@ mod tests {
         assert!(!runtime.is_closed());
         assert_eq!(runtime.bound_sockets(), vec![bind_addr]);
         assert!(std::net::UdpSocket::bind(bind_addr).is_err());
-        let expected_entries = if platform == "darwin-arm64" { 4 } else { 5 };
+        let mut expected_entries = BTreeSet::from([
+            "image-set".to_string(),
+            ".browser-image-install.lock".to_string(),
+        ]);
+        expected_entries.extend(aliases(&platform).into_iter().filter_map(|(alias, _)| {
+            Path::new(alias)
+                .strip_prefix("browser-vm")
+                .ok()
+                .map(|name| name.to_string_lossy().into_owned())
+        }));
         assert_eq!(
             fs::read_dir(target.path().join("browser-vm"))
                 .unwrap()
-                .count(),
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<BTreeSet<_>>(),
             expected_entries,
             "download and failed stages leave only the installed set, aliases and lock"
         );
@@ -1102,6 +1144,24 @@ mod tests {
             assert!(install_archive(temp.path(), &bytes, &info, "darwin-arm64").is_err());
             assert!(!temp.path().join(INSTALL_PATH).exists());
         }
+    }
+
+    #[test]
+    fn browser_image_linux_keeps_capsule_kernel_owned_separately() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("bin")).unwrap();
+        fs::write(temp.path().join("bin/vmlinux"), b"capsule kernel").unwrap();
+        let (bytes, info) = archive(&fixture(b"image"));
+        install_archive(temp.path(), &bytes, &info, "linux-arm64").unwrap();
+        verify_installed(temp.path(), &info, "linux-arm64").unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("bin/vmlinux")).unwrap(),
+            b"capsule kernel"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("browser-vm/image-set/vmlinux")).unwrap(),
+            b"kernel"
+        );
     }
 
     #[test]
@@ -1284,6 +1344,52 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("browser-vm-image metadata"));
         assert!(!fresh.exists());
+    }
+
+    #[test]
+    fn browser_image_manual_aliases_verify_the_guest_kernel_on_each_host() {
+        for platform in ["darwin-arm64", "linux-arm64", "linux-amd64"] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path();
+            let source = data.join("source");
+            fs::create_dir_all(data.join("browser-vm")).unwrap();
+            fs::create_dir_all(data.join("bin")).unwrap();
+            fs::create_dir(&source).unwrap();
+            let mut files = fixture(b"manual-image");
+            let mut receipt: Value = serde_json::from_slice(&files[0].1).unwrap();
+            receipt["target_platform"] = json!(guest_platform(platform).unwrap());
+            files[0].1 = serde_json::to_vec(&receipt).unwrap();
+            for (name, bytes) in &files {
+                fs::write(source.join(name), bytes).unwrap();
+            }
+            for (alias, file) in aliases(platform) {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(source.join(file), data.join(alias)).unwrap();
+            }
+            if platform.starts_with("linux-") {
+                // The capsule VM kernel is a separate artifact from the Browser guest.
+                fs::write(data.join("bin/vmlinux"), b"capsule-kernel").unwrap();
+            }
+            verify_legacy_or_missing_release(data, platform).unwrap();
+            if platform.starts_with("linux-") {
+                fs::remove_file(data.join("browser-vm/vmlinux")).unwrap();
+                fs::write(data.join("bin/vmlinux"), b"kernel").unwrap();
+                verify_legacy_or_missing_release(data, platform).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(
+                    source.join("missing-kernel"),
+                    data.join("browser-vm/vmlinux"),
+                )
+                .unwrap();
+                assert!(verify_legacy_or_missing_release(data, platform).is_err());
+                fs::remove_file(data.join("browser-vm/vmlinux")).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(source.join("vmlinux"), data.join("browser-vm/vmlinux"))
+                    .unwrap();
+            }
+            fs::write(source.join("vmlinux"), b"mutated").unwrap();
+            assert!(verify_legacy_or_missing_release(data, platform).is_err());
+        }
     }
 
     #[tokio::test]

@@ -26,7 +26,7 @@ pub(crate) fn validate_support_path(path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     let mut parts = path.components();
-    anyhow::ensure!(matches!(parts.next(), Some(std::path::Component::Normal(name)) if ["bin", "capsules", "libexec", "tools"].iter().any(|allowed| name == *allowed))
+    anyhow::ensure!(matches!(parts.next(), Some(std::path::Component::Normal(name)) if ["bin", "capsules", "libexec", "tools", "scripts"].iter().any(|allowed| name == *allowed))
         && parts.all(|part| matches!(part, std::path::Component::Normal(name) if !name.to_string_lossy().starts_with(".elastos."))), "unsafe release support path");
     Ok(())
 }

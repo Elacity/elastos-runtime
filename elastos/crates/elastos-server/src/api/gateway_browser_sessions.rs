@@ -418,6 +418,110 @@ struct BrowserReapedPageTombstone {
     reaped_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile_durability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_proof: Option<BrowserEngineTerminalProof>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BrowserEngineTerminalProof {
+    generation: String,
+    engine_route_provider: String,
+    engine_provider: String,
+    engine_protocol_version: String,
+    engine_adapter: String,
+    engine: String,
+    stream_id: String,
+    provider_binding_sha256: String,
+    transport_scoped: bool,
+    effects: BTreeMap<String, bool>,
+}
+
+const BROWSER_TERMINAL_BASE_EFFECTS: &[&str] = &[
+    "page_absent",
+    "child_absent",
+    "vm_absent",
+    "route_absent",
+    "socket_absent",
+];
+const BROWSER_TERMINAL_TRANSPORT_EFFECTS: &[&str] = &[
+    "transport_session_absent",
+    "turn_process_absent",
+    "turn_listener_absent",
+    "turn_relay_ports_absent",
+    "ordinary_vsock_bridge_absent",
+    "media_vsock_bridge_absent",
+    "bootstrap_vsock_bridge_absent",
+    "hibernation_state_absent",
+];
+
+fn browser_engine_terminal_proof(
+    cleanup: &BrowserEngineCleanup,
+    receipt: &serde_json::Value,
+) -> Result<BrowserEngineTerminalProof, String> {
+    super::gateway_browser::browser_terminal_close_receipt(cleanup, receipt.clone())?;
+    let transport_scoped = cleanup
+        .provider_cleanup
+        .get("transport_authority")
+        .is_some();
+    let effects = BROWSER_TERMINAL_BASE_EFFECTS
+        .iter()
+        .chain(
+            BROWSER_TERMINAL_TRANSPORT_EFFECTS
+                .iter()
+                .filter(|_| transport_scoped),
+        )
+        .map(|key| {
+            (
+                key.to_string(),
+                receipt["effects"][*key].as_bool() == Some(true),
+            )
+        })
+        .collect();
+    Ok(BrowserEngineTerminalProof {
+        generation: cleanup.generation.clone(),
+        engine_route_provider: cleanup.engine_route_provider.clone(),
+        engine_provider: cleanup.engine_provider.clone(),
+        engine_protocol_version: cleanup.engine_protocol_version.clone(),
+        engine_adapter: cleanup.engine_adapter.clone(),
+        engine: cleanup.engine.clone(),
+        stream_id: cleanup.stream_id.clone(),
+        provider_binding_sha256: browser_launch_generation_hash_label(
+            &cleanup.provider_cleanup.to_string(),
+        ),
+        transport_scoped,
+        effects,
+    })
+}
+
+fn browser_engine_terminal_proof_is_safe(proof: &BrowserEngineTerminalProof) -> bool {
+    let effects = BROWSER_TERMINAL_BASE_EFFECTS.iter().chain(
+        BROWSER_TERMINAL_TRANSPORT_EFFECTS
+            .iter()
+            .filter(|_| proof.transport_scoped),
+    );
+    [
+        &proof.generation,
+        &proof.engine_route_provider,
+        &proof.engine_adapter,
+        &proof.engine,
+    ]
+    .iter()
+    .all(|id| id.len() <= 512 && is_safe_runtime_id(id))
+        && proof.engine_provider == BROWSER_ENGINE_PROVIDER_ID
+        && proof.engine_protocol_version == BROWSER_ENGINE_PROTOCOL_VERSION
+        && (proof.stream_id.is_empty()
+            || (proof.stream_id.len() <= 512 && is_safe_runtime_id(&proof.stream_id)))
+        && proof
+            .provider_binding_sha256
+            .strip_prefix("sha256:")
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        && proof.effects.len() == effects.clone().count()
+        && effects
+            .into_iter()
+            .all(|key| proof.effects.get(*key) == Some(&true))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2420,8 +2524,14 @@ pub(in crate::api::gateway) async fn record_browser_reaped_page_tombstone(
     data_dir: &Path,
     cleanup: &BrowserEngineCleanup,
     terminal_owner_launch_id: Option<&str>,
-    profile_durability: Option<&str>,
+    terminal_receipt: Option<&serde_json::Value>,
 ) -> Result<(), String> {
+    let mut terminal_proof = terminal_receipt
+        .map(|receipt| browser_engine_terminal_proof(cleanup, receipt))
+        .transpose()?;
+    let profile_durability = terminal_receipt
+        .and_then(|receipt| receipt.get("profile_durability"))
+        .and_then(serde_json::Value::as_str);
     let now_unix_ms = browser_now_unix_ms()?;
     let mut owner_launch_ids = vec![cleanup.owner_launch_id.clone()];
     if let Some(owner_launch_id) = terminal_owner_launch_id {
@@ -2431,6 +2541,34 @@ pub(in crate::api::gateway) async fn record_browser_reaped_page_tombstone(
     owner_launch_ids.dedup();
     let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
     let _registry = registry.lock().await;
+    if terminal_proof.is_none() {
+        terminal_proof = load_fresh_browser_reaped_page_tombstones(data_dir, now_unix_ms)?
+            .into_iter()
+            .find(|record| {
+                record.cleanup_id == cleanup.cleanup_id
+                    && record.page_id == cleanup.page_id
+                    && record.principal_id == cleanup.principal_id
+            })
+            .and_then(|record| record.terminal_proof)
+            .filter(|proof| {
+                proof.generation == cleanup.generation
+                    && proof.engine_route_provider == cleanup.engine_route_provider
+                    && proof.engine_provider == cleanup.engine_provider
+                    && proof.engine_protocol_version == cleanup.engine_protocol_version
+                    && proof.engine_adapter == cleanup.engine_adapter
+                    && proof.engine == cleanup.engine
+                    && proof.stream_id == cleanup.stream_id
+                    && proof.provider_binding_sha256
+                        == browser_launch_generation_hash_label(
+                            &cleanup.provider_cleanup.to_string(),
+                        )
+            });
+        if terminal_proof.is_none() {
+            return Err(
+                "Browser terminal retirement requires its exact durable cleanup proof".to_string(),
+            );
+        }
+    }
     persist_browser_reaped_page_tombstone(
         data_dir,
         BrowserReapedPageTombstone {
@@ -2445,6 +2583,7 @@ pub(in crate::api::gateway) async fn record_browser_reaped_page_tombstone(
             profile_durability: profile_durability
                 .filter(|value| matches!(*value, "failed" | "unknown" | "proved"))
                 .map(str::to_string),
+            terminal_proof,
         },
         now_unix_ms,
     )
@@ -2912,6 +3051,10 @@ fn browser_reaped_page_tombstone_is_safe(
             .profile_durability
             .as_deref()
             .is_none_or(|value| matches!(value, "failed" | "unknown" | "proved"))
+        && tombstone
+            .terminal_proof
+            .as_ref()
+            .is_none_or(browser_engine_terminal_proof_is_safe)
 }
 
 fn browser_reaped_page_tombstone_is_expired(
@@ -2958,6 +3101,10 @@ fn browser_reaped_page_tombstone_has_same_binding(
         && left.principal_id == right.principal_id
         && left.browser_instance == right.browser_instance
         && left.terminal_kind == right.terminal_kind
+        && match (&left.terminal_proof, &right.terminal_proof) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
 }
 
 fn persist_browser_reaped_page_tombstone(
@@ -2987,6 +3134,8 @@ fn persist_browser_reaped_page_tombstone(
         }
         if owner_launch_ids == previous.owner_launch_ids
             && previous.profile_durability == tombstone.profile_durability
+            && (tombstone.terminal_proof.is_none()
+                || previous.terminal_proof == tombstone.terminal_proof)
         {
             return Ok(());
         }
@@ -2994,6 +3143,9 @@ fn persist_browser_reaped_page_tombstone(
         expanded.owner_launch_ids = owner_launch_ids;
         if expanded.profile_durability.is_none() {
             expanded.profile_durability = tombstone.profile_durability.clone();
+        }
+        if expanded.terminal_proof.is_none() {
+            expanded.terminal_proof = tombstone.terminal_proof.clone();
         }
         return write_browser_json_atomic(
             data_dir,
@@ -5181,6 +5333,116 @@ mod tests {
             .remove(&scope);
     }
 
+    #[tokio::test]
+    async fn durable_terminal_proof_retains_binding_and_all_transport_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = test_session_record(
+            "terminal-proof",
+            Some("page:terminal"),
+            BrowserSessionState::Active,
+            Instant::now(),
+            Instant::now(),
+        );
+        let mut cleanup = browser_engine_cleanup(&record).unwrap();
+        cleanup.engine_provider = BROWSER_ENGINE_PROVIDER_ID.to_string();
+        cleanup.transport_authority = Some(serde_json::json!({"fixture": true}));
+        cleanup.provider_cleanup["transport_authority"] =
+            cleanup.transport_authority.clone().unwrap();
+        let effects: BTreeMap<String, bool> = BROWSER_TERMINAL_BASE_EFFECTS
+            .iter()
+            .chain(BROWSER_TERMINAL_TRANSPORT_EFFECTS)
+            .map(|key| (key.to_string(), true))
+            .collect();
+        let receipt = serde_json::json!({
+            "schema": BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+            "page_id": cleanup.page_id, "generation": cleanup.generation,
+            "binding": cleanup.provider_cleanup, "terminal": true,
+            "effects": effects, "profile_durability": "proved",
+        });
+        for effect in BROWSER_TERMINAL_BASE_EFFECTS
+            .iter()
+            .chain(BROWSER_TERMINAL_TRANSPORT_EFFECTS)
+        {
+            let mut pending = receipt.clone();
+            pending["effects"][*effect] = serde_json::json!(false);
+            assert!(record_browser_reaped_page_tombstone(
+                dir.path(),
+                &cleanup,
+                None,
+                Some(&pending)
+            )
+            .await
+            .is_err());
+        }
+        assert!(
+            record_browser_reaped_page_tombstone(dir.path(), &cleanup, None, None)
+                .await
+                .is_err()
+        );
+        // An interrupted older Runtime can retain a terminal marker without
+        // full effect evidence. It needs a fresh receipt before owner release.
+        persist_browser_reaped_page_tombstone(
+            dir.path(),
+            BrowserReapedPageTombstone {
+                schema: BROWSER_REAPED_PAGE_TOMBSTONE_SCHEMA.to_string(),
+                page_id: cleanup.page_id.clone(),
+                cleanup_id: cleanup.cleanup_id.clone(),
+                principal_id: cleanup.principal_id.clone(),
+                owner_launch_ids: vec![cleanup.owner_launch_id.clone()],
+                browser_instance: cleanup.browser_instance.clone(),
+                terminal_kind: "already_absent".to_string(),
+                reaped_at_unix_ms: browser_now_unix_ms().unwrap(),
+                profile_durability: Some("unknown".to_string()),
+                terminal_proof: None,
+            },
+            browser_now_unix_ms().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            record_browser_reaped_page_tombstone(dir.path(), &cleanup, None, None)
+                .await
+                .is_err()
+        );
+        record_browser_reaped_page_tombstone(dir.path(), &cleanup, None, Some(&receipt))
+            .await
+            .unwrap();
+        let stored =
+            load_fresh_browser_reaped_page_tombstones(dir.path(), browser_now_unix_ms().unwrap())
+                .unwrap();
+        let proof = stored[0].terminal_proof.as_ref().unwrap();
+        assert_eq!(proof.effects.len(), 13);
+        assert_eq!(proof.generation, cleanup.generation);
+        assert_eq!(proof.engine_route_provider, cleanup.engine_route_provider);
+        assert_eq!(
+            proof.provider_binding_sha256,
+            browser_launch_generation_hash_label(&cleanup.provider_cleanup.to_string())
+        );
+        // Fresh cleanup evidence upgrades terminal ownership while the earlier
+        // unknown flush status remains conservative across retirement replay.
+        assert_eq!(stored[0].profile_durability.as_deref(), Some("unknown"));
+        record_browser_reaped_page_tombstone(dir.path(), &cleanup, None, None)
+            .await
+            .unwrap();
+        for change in ["generation", "provider"] {
+            let mut changed = cleanup.clone();
+            if change == "generation" {
+                changed.generation = "sha256:replacement".to_string();
+            } else {
+                changed.engine_route_provider = "replacement-provider".to_string();
+            }
+            assert!(
+                record_browser_reaped_page_tombstone(dir.path(), &changed, None, None)
+                    .await
+                    .is_err()
+            );
+        }
+        let replayed =
+            load_fresh_browser_reaped_page_tombstones(dir.path(), browser_now_unix_ms().unwrap())
+                .unwrap();
+        assert_eq!(replayed[0].terminal_proof, stored[0].terminal_proof);
+        assert_eq!(replayed[0].profile_durability, stored[0].profile_durability);
+    }
+
     #[test]
     fn durable_reaped_page_tombstones_are_exact_bounded_retained_and_expire() {
         let dir = tempfile::tempdir().unwrap();
@@ -5199,6 +5461,7 @@ mod tests {
                     terminal_kind: "already_absent".to_string(),
                     reaped_at_unix_ms: now_unix_ms,
                     profile_durability: None,
+                    terminal_proof: None,
                 },
                 now_unix_ms,
             )

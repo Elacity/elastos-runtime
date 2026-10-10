@@ -4,6 +4,20 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+// The adapter owns the writer; transient launchers pass only the reader on.
+fn configure_helper_owner(command: &mut Command) -> std::io::Result<()> {
+    use elastos_common::process_lifetime::ParentLifetime;
+    use std::sync::OnceLock;
+    if ParentLifetime::configure_inherited(command)? {
+        return Ok(());
+    }
+    static OWNER: OnceLock<std::io::Result<ParentLifetime>> = OnceLock::new();
+    match OWNER.get_or_init(ParentLifetime::new) {
+        Ok(owner) => owner.configure(command),
+        Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+    }
+}
+
 const MAX_BROWSER_ENGINE_LAUNCH_REQUEST_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -115,6 +129,8 @@ pub(super) fn run_supervisor_launch(
     if transport.is_none() {
         command.env("ELASTOS_BROWSER_ENGINE_REQUEST", &serialized);
     }
+    configure_helper_owner(&mut command)
+        .map_err(|err| SupervisorLaunchError::process(err.to_string()))?;
     let mut child = command
         .spawn()
         .map_err(|err| SupervisorLaunchError::process(err.to_string()))?;
@@ -203,15 +219,16 @@ fn kill_and_reap(child: &mut std::process::Child) {
 }
 
 pub(super) fn run_supervisor_prewarm(supervisor: &EngineSupervisorConfig) -> Result<Value, String> {
-    let mut child = Command::new(&supervisor.program)
+    let mut command = Command::new(&supervisor.program);
+    command
         .args(&supervisor.args)
         .envs(&supervisor.env)
         .env("ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| err.to_string())?;
+        .stderr(Stdio::piped());
+    configure_helper_owner(&mut command).map_err(|err| err.to_string())?;
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
     let deadline = Instant::now() + Duration::from_millis(supervisor.timeout_ms.min(30_000));
     let status = loop {
         match child.try_wait() {

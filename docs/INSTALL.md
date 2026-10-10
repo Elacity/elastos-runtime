@@ -169,11 +169,25 @@ The installer detects Linux `aarch64`:
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-Native Home and chat run without KVM, crosvm, a guest kernel, Kubo, or `sudo`.
-Linux/crosvm Browser has a separate host network setup path that requires
-administrator access. The installed host adapter determines the launch-time
-privileges. The default Home profile omits `crosvm` and `vmlinux`. This release
-publishes them for no platform, so microVM capsules are not available in it.
+Home and chat use the ordinary user account. Browser uses the local Engine's
+virtual machine. When the signed release supplies Browser support, setup obtains
+its matching helpers and verified image before Home starts. The image streams to
+disk with progress; a transfer stops after 30 seconds without data. Runtime keeps
+the committed Browser profile separate from the image during reopen and updates.
+
+On Linux, the installer offers one administrator step to grant this user KVM
+access and prepare the confined Browser network device. It explains the changes
+and asks before applying them. Runtime then uses the ordinary user's access to
+launch and close the Engine. A machine without virtualization receives a plain
+Browser message. The host setup can be removed with:
+
+```sh
+sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user "$(id -un)"
+```
+
+For a piped or unattended install, follow the host setup command printed by the
+installer before opening Browser. The [Browser host setup](BROWSER_VM_TARGET.md)
+describes the installed adapter and its removal boundary.
 
 The [Browser VM target](BROWSER_VM_TARGET.md) documents the target contract and
 maintenance boundary. [Scripts](../scripts/README.md) maps the executable proof

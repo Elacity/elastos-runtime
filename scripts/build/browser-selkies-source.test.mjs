@@ -113,6 +113,21 @@ test('builder rejects changed source before Cargo or guest network work', () => 
     cpSync(root, join(repo, 'third-party/selkies'), { recursive: true });
     cpSync(helper, join(build, 'prepare-browser-selkies.py'));
     cpSync(builderPath, join(build, 'build-browser-vm-rootfs.sh'));
+    const inputsPath = fileURLToPath(new URL('../browser-vm-image-inputs.py', import.meta.url));
+    const declared = spawnSync('python3', ['-c', `import importlib.util,json; s=importlib.util.spec_from_file_location('inputs', ${JSON.stringify(inputsPath)}); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(json.dumps(m.REQUIRED_FILES))`],
+      { encoding: 'utf8', timeout: 5000 });
+    assert.equal(declared.status, 0, declared.stderr);
+    cpSync(inputsPath, join(repo, 'scripts/browser-vm-image-inputs.py'));
+    const sourceRoot = fileURLToPath(new URL('../../', import.meta.url));
+    for (const name of JSON.parse(declared.stdout)) {
+      mkdirSync(join(repo, name, '..'), { recursive: true });
+      cpSync(join(sourceRoot, name), join(repo, name));
+    }
+    for (const args of [['init', '-q', repo], ['-C', repo, 'add', '.']]) {
+      const result = spawnSync('git', args, { encoding: 'utf8', timeout: 5000 });
+      assert.equal(result.status, 0, result.stderr);
+    }
+
     writeFileSync(join(repo, 'third-party/selkies/upstream/setup.cfg'), 'changed source');
     const bin = join(repo, 'bin');
     mkdirSync(bin);

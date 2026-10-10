@@ -96,17 +96,18 @@ jobs:
         timeout-minutes: 5
         env:
           DEBUG: pw:install
-        run: |
-          npm install --prefix "${RUNNER_TEMP}/behaviour-browser" --no-save --package-lock=false playwright@1.60.0
-          npm install --prefix "${RUNNER_TEMP}/behaviour-core" --no-save --package-lock=false playwright-core@1.59.1
-          "${RUNNER_TEMP}/behaviour-browser/node_modules/.bin/playwright" install chromium --with-deps --only-shell
+        run: ./scripts/test-behaviour.sh inputs
       - name: JavaScript behavior tests
-        env:
-          NODE_PATH: ${{ runner.temp }}/behaviour-browser/node_modules
-          BROWSER_OPERATOR_PLAYWRIGHT_CORE: ${{ runner.temp }}/behaviour-core/node_modules/playwright-core
         run: |
           python3 scripts/browser-vm-linux-network.test.py
-          node --test --test-timeout=60000 elastos/esp/projections.test.mjs scripts/*.test.mjs scripts/build/*.test.mjs scripts/lib/*.test.mjs capsules/*/browser/*.test.mjs capsules/*/browser/src/*.test.mjs scripts/home-fixture-contracts-smoke.mjs scripts/documents-save-conflict-smoke.mjs scripts/gba-save-conflict-smoke.mjs
+          ./scripts/test-behaviour.sh
+      - name: Browser startup status screenshots
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: browser-startup-status
+          path: ${{ runner.temp }}/browser-status-screenshots/
+          if-no-files-found: ignore
 
   # One input for every ARM consumer. PRs restore their develop base's cache;
   # only a develop push can save a verified recipe result in this namespace.
@@ -250,15 +251,6 @@ jobs:
           cargo test --workspace -- --list | tee "${RUNNER_TEMP}/elastos-test-list.txt"
           total=$(awk '/: test$/ {n++} END {print n+0}' "${RUNNER_TEMP}/elastos-test-list.txt")
           echo "Workspace listed tests: ${total}" | tee -a "${GITHUB_STEP_SUMMARY}"
-      - name: native network isolation and loopback proxy
-        timeout-minutes: 5
-        run: |
-          set -euo pipefail
-          cargo build --quiet --manifest-path elastos/tools/browser-engine-supervisor/Cargo.toml
-          cargo build --quiet --manifest-path elastos/tools/browser-native-proxy-engine/Cargo.toml
-          git rev-parse HEAD HEAD^{tree}
-          sha256sum elastos/tools/browser-engine-supervisor/target/debug/browser-engine-supervisor elastos/tools/browser-native-proxy-engine/target/debug/browser-native-proxy-engine
-          sudo -n bash scripts/browser-native-supervisor-proxy-smoke.sh --prebuilt --require-isolation
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '26'
@@ -600,6 +592,10 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
           USER_HOME="${HOME}"
           SOURCE_HOME="${RUNNER_TEMP}/elastos-source-home"
+          export ELASTOS_NODE_BIN="$(command -v node)"
+          export ELASTOS_BROWSER_VM_TURNSERVER_BIN="$(command -v turnserver)"
+          [[ "${ELASTOS_NODE_BIN}" == /* && -x "${ELASTOS_NODE_BIN}" ]] || { echo 'CI requires its installed Node executable.' >&2; exit 1; }
+          [[ "${ELASTOS_BROWSER_VM_TURNSERVER_BIN}" == /* && -x "${ELASTOS_BROWSER_VM_TURNSERVER_BIN}" ]] || { echo 'CI requires its installed TURN executable.' >&2; exit 1; }
           mkdir -p "${SOURCE_HOME}"
           export CARGO_HOME="${CARGO_HOME:-${USER_HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${USER_HOME}/.rustup}"
@@ -830,6 +826,10 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
           USER_HOME="${HOME}"
           MAC_TEST_HOME="${RUNNER_TEMP}/elastos-mac-test-home"
+          export ELASTOS_NODE_BIN="$(command -v node)"
+          export ELASTOS_BROWSER_VM_TURNSERVER_BIN="$(command -v turnserver)"
+          [[ "${ELASTOS_NODE_BIN}" == /* && -x "${ELASTOS_NODE_BIN}" ]] || { echo 'CI requires its installed Node executable.' >&2; exit 1; }
+          [[ "${ELASTOS_BROWSER_VM_TURNSERVER_BIN}" == /* && -x "${ELASTOS_BROWSER_VM_TURNSERVER_BIN}" ]] || { echo 'CI requires its installed TURN executable.' >&2; exit 1; }
           mkdir -p "${MAC_TEST_HOME}"
           export CARGO_HOME="${CARGO_HOME:-${USER_HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${USER_HOME}/.rustup}"

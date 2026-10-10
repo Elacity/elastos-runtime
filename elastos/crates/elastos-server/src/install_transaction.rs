@@ -1912,6 +1912,19 @@ pub(crate) mod tests {
         })
     }
 
+    #[test]
+    fn browser_script_support_paths_keep_the_release_journal_boundary() {
+        validate_support_path(Path::new("scripts/browser-vm-linux-network.py")).unwrap();
+        for path in [
+            "scripts/../config/owner.json",
+            "scripts/.elastos.update-status",
+            "/scripts/helper",
+            "config/owner.json",
+        ] {
+            assert!(validate_support_path(Path::new(path)).is_err());
+        }
+    }
+
     /// Writes a version script and holds a writable descriptor to it for 100 ms;
     /// Linux refuses exec meanwhile, like a fork that inherited our writer.
     #[cfg(target_os = "linux")]

@@ -68,7 +68,7 @@ function generate(dataDir, platform, name, controlSocket) {
 }
 
 const allDefaults = new Set();
-for (const platform of ["darwin-arm64", "linux-amd64", "linux-arm64"]) {
+for (const platform of ["darwin-arm64", "linux-arm64"]) {
   // Homes can have long paths with spaces and the same final data-dir name.
   const homeRoot = path.join(tmpDir, "Long Home ".repeat(16), "Library", "Application Support");
   const dataDir = path.join(homeRoot, "one", "elastos");
@@ -95,7 +95,7 @@ NODE
 rejected_output="$tmp_dir/rejected.out"
 if "$node_bin" scripts/browser-source-home-config.mjs \
   --data-dir "$tmp_dir/rejected-data" \
-  --platform linux-amd64 \
+  --platform linux-arm64 \
   --out-dir "$tmp_dir/rejected-config" \
   --engine-mode hosted-proof >"$rejected_output" 2>&1; then
   cat "$rejected_output"
@@ -117,7 +117,7 @@ ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS="60000" \
 ELASTOS_BROWSER_VM_TURNSERVER_BIN="/tmp/elastos-test-turnserver" \
   "$node_bin" scripts/browser-source-home-config.mjs \
     --data-dir "$tmp_dir/vm-data" \
-    --platform linux-amd64 \
+    --platform linux-arm64 \
     --out-dir "$tmp_dir/vm-config" \
     --vm-control-socket "$tmp_dir/vm-control.sock" >/dev/null
 
@@ -151,7 +151,7 @@ ELASTOS_BROWSER_VZ_TURN_ADVERTISED_HOST="192.168.65.1" \
 ELASTOS_BROWSER_VZ_TURN_RELAY_HOST="192.168.65.1" \
 "$node_bin" scripts/browser-source-home-config.mjs \
   --data-dir "$tmp_dir/linux-remote-vz-data" \
-  --platform linux-amd64 \
+  --platform linux-arm64 \
   --out-dir "$tmp_dir/linux-remote-vz-config" \
   --vm-control-launcher "$tmp_dir/browser-vm-remote-vz-launcher" >/dev/null
 
@@ -316,8 +316,8 @@ if (!adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR?.endsWith("/vm
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE !== "pool-required") {
   throw new Error("Linux source-home Browser config must require prepared rootfs pool copies");
 }
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT !== "2") {
-  throw new Error("Linux source-home Browser config must request prepared rootfs pool refill after launch");
+if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT !== "1") {
+  throw new Error("Linux source-home Browser config must keep one prepared rootfs spare for bounded update capacity");
 }
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT !== vmAdapterPath.replace(/\/vm-config\/browser-engine-adapter\.json$/, "/vm-data/bin/browser-vm-prepare-rootfs-pool")) {
   throw new Error("Linux source-home Browser config must point at the rootfs pool refill wrapper");
@@ -451,7 +451,7 @@ if (Object.prototype.hasOwnProperty.call(macAdapter?.supervisor?.env || {}, "ELA
 }
 assertNoRemoteVzLocalTurnEnv(macAdapter?.supervisor?.env, "Remote VZ source-home Browser config");
 const linuxRemoteAdapter = linuxRemoteVmAdapter.adapters?.[0];
-if (linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_PLATFORM !== "linux-amd64") {
+if (linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_PLATFORM !== "linux-arm64") {
   throw new Error("Linux remote VZ source-home Browser config must preserve the local host platform");
 }
 if (linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER !== linuxRemoteVmAdapterPath.replace(/\/linux-remote-vz-config\/browser-engine-adapter\.json$/, "/browser-vm-remote-vz-launcher")) {

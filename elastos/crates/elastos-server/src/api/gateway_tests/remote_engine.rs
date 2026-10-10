@@ -128,7 +128,7 @@ impl Provider for RemoteEngineFixture {
     }
 }
 
-fn config(root: &std::path::Path) {
+pub(super) fn config(root: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(root.join("config")).unwrap();
     let path = root.join("config/browser-vz-vsock-transport.json");

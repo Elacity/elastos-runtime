@@ -209,20 +209,26 @@ operator-approved supervisor command. Runtime sends the supervisor a typed
 `runtime_net_only`, `direct_network=false`, and `wallet_injection=false`.
 Without that proof, native launch fails closed.
 Every configured adapter must also declare supported `display_modes`.
-`webrtc_remote_display` and `native_surface` are separate capabilities; neither
-is inferred from adapter kind and neither is used as a fallback for the other.
+The product adapter declares `webrtc_remote_display`. Retained test adapters can
+declare `native_surface`; each mode has an explicit contract and its own proof.
 
-The Linux helper lives at `elastos/tools/browser-engine-supervisor`. It reads
-operator config from `ELASTOS_BROWSER_ENGINE_SUPERVISOR_CONFIG`, validates the
-Runtime request, starts the configured engine with `linux_new_netns`, passes only
-the selected IPC path/stream/URL/relay environment plus explicit operator env to
-the child, brings loopback up inside the new namespace for local browser proxy
-use, and returns the typed supervisor result. It does not expose wallet, chain,
-filesystem, DNS, or raw network authority to the Browser UI.
+The product Engine executes Chromium and Selkies inside a per-launch Linux VM.
+Host-native Chromium namespace launchers and Playwright collectors are test
+instrumentation. Normal release and setup supply the VM Engine closure. The
+adapter's `test-engine` build feature enables the retained proof engines only
+for isolated tests; production configuration accepts `chromium_microvm`.
 
 ## Cross-Platform VM Browser Target
 
-The aligned product target is a per-launch Browser VM:
+The Browser has one Engine: Chromium, Selkies and the Runtime network wrapper
+inside a per-launch Linux guest. One immutable ARM64 image set supplies both
+Apple Silicon Mac through Apple Virtualization and Linux ARM64 through
+crosvm/KVM. Hosts that cannot execute that guest, including Linux x86-64, use an
+explicitly approved remote Engine through the same Runtime contracts. Each host
+adapter has its own qualification; the guest bytes and recipe input identity are
+shared.
+
+The product path is:
 
 ```text
 Browser UI capsule
@@ -249,7 +255,7 @@ Browser routes.
 The same Browser app and Browser Engine Adapter config shape is used on Linux
 and macOS. The substrate below the VM supervisor differs:
 
-- Linux product substrate: crosvm/KVM with `bin/crosvm`, `bin/vmlinux`, and a
+- Linux ARM64 product substrate: crosvm/KVM with the admitted crosvm helper, the image-set kernel, and a
   Browser VM rootfs containing Chromium, the Browser control service, and the
   Runtime/Exit bridge.
 - macOS product substrate: Apple Virtualization.framework, reusing the proven
@@ -269,12 +275,11 @@ piece; it is not a Browser UI feature and not a direct-network escape hatch.
 `scripts/build/stage-browser-vm-target.sh` assembles that guest contract from
 explicit binaries and runs `scripts/browser-vm-target-preflight.sh`; it does
 not install Chromium or claim a bootable target without real guest artifacts.
-Gateway hosts without `/dev/kvm` are valid: they must point
-`ELASTOS_BROWSER_VM_CONTROL_SOCKET` at a local Runtime-facing Browser VM control
-socket backed by an operator VM provider instead of pretending local crosvm is
-available.
+Gateway hosts without compatible virtualization select an approved remote Engine
+through Runtime's Services controls. Carrier transports the selected Engine's
+control and media below the same principal and lifecycle authority.
 
-The byte-transport helper lives at `elastos/tools/browser-stream-bridge`. It
+The test-only byte-transport helper lives at `elastos/tools/browser-stream-bridge`. It
 reads `ELASTOS_BROWSER_STREAM_BRIDGE_CONFIG`, binds the private
 `adapter_ipc_path` Unix socket for the engine side, connects to a Runtime-owned
 `runtime_stream_path` Unix socket, and forwards bytes between them. It is not an
@@ -295,175 +300,24 @@ receive only `adapter_ipc.runtime_stream_path`; the runtime stream client sends
 the typed Exit relay-open handshake, and Gateway forwards only that bounded
 first line to the private `relay_ipc` socket before relaying bytes.
 
-The first native browser wrapper lives at
-`elastos/tools/browser-native-proxy-engine`. It is meant to be launched by
-`browser-engine-supervisor` inside `linux_new_netns`. The wrapper starts a loopback
-HTTP proxy for the real Chromium/CEF process, receives
-`ELASTOS_BROWSER_ENGINE_RELAY_IPC` from the supervisor, and opens each browser
-`CONNECT` or absolute-form HTTP request by sending a typed
-`elastos.exit.relay-open/v1` handshake to the Runtime Exit relay Unix socket.
-This preserves normal browser semantics while keeping all public egress behind
-Runtime Exit policy. `scripts/browser-native-proxy-engine-smoke.sh` exercises the
-actual wrapper binary with a fake browser process and fake Runtime Exit relay.
-Real Chromium/CEF operator config must pass the wrapper-provided proxy to the
-engine, for example `--proxy-server={proxy_url}`.
+The guest uses `elastos/tools/browser-native-proxy-engine` as its network
+wrapper. Its loopback proxy forwards Chromium destination streams through the
+guest Runtime relay and selected Exit. The wrapper source remains a guest build
+input. Runtime delivers the guest wrapper with the shared VM Engine.
 
-Native Browser installs should generate the three matching operator configs with
-`scripts/browser-native-operator-config.mjs` instead of hand-editing nested JSON:
+The retained native/hosted and Playwright smokes are isolated test tools. Their
+receipts prove the tested contracts and identify their test engine build; they
+provide no product-engine acceptance. The production media path is Selkies in
+the Linux guest, bound to Runtime signaling, audio/video and input routes.
 
-```bash
-node scripts/browser-native-operator-config.mjs \
-  --out-dir "$ELASTOS_DATA_DIR/config" \
-  --browser-program /usr/bin/chromium \
-  --supervisor-bin /opt/elastos/bin/browser-engine-supervisor \
-  --proxy-engine-bin /opt/elastos/bin/browser-native-proxy-engine
-```
-
-The script writes `browser-engine-adapter.json`, `exit-provider.json`, and
-`browser-local-exit.json`. It binds all three to the same private Runtime Exit
-relay socket, keeps Browser display on `native_surface`, configures the real
-browser with `--proxy-server={proxy_url}`, and keeps private target access off
-unless the operator explicitly requests it. This is a configuration proof, not a
-fallback path; the browser still fails closed if any binary, socket, namespace,
-or provider contract is unavailable.
-
-Native media capability is fail-closed. The config generator now defaults
-`display_capabilities.audio=false` and `display_capabilities.video=false`; an
-operator must opt in with `--native-audio` and `--native-video` only after the
-actual native adapter has a real host audio/compositor path. The namespace/proxy
-smokes intentionally keep both false because they use fake browser processes and
-only prove network isolation plus Runtime Exit IPC.
-
-On a target Linux/Jetson host, run
-`scripts/browser-native-target-preflight.sh` with an explicit browser binary
-before calling native Browser support proven. The preflight builds the helper
-binaries, writes the config bundle, validates the generated config against the
-actual `exit-provider` and `browser-engine-adapter` capsules, and then requires
-`scripts/browser-native-host-capability.mjs` plus the host-gated
-supervisor/proxy namespace proof to pass without a skip. The host capability
-probe checks the actual target for a Chromium/CEF-compatible browser binary,
-host compositor/display, host audio service, and Linux network namespace
-support. It does not install software, launch a product browser UI, or use
-Docker.
-When the goal is product media readiness, run the same preflight with
-`--native-audio --native-video --require-native-media`; this fails closed unless
-the generated native supervisor config explicitly declares both media
-capabilities and the target proof reports
-`native_audio_proven=true` and `native_video_proven=true`. That still does not
-replace a real native compositor/audio manual UX pass, but it prevents the
-target host from being marked media-ready by a fake network-isolation proof or
-by declaration-only config.
-
-The first server-side Exit daemon lives at `elastos/tools/browser-local-exit`.
-It reads `ELASTOS_BROWSER_LOCAL_EXIT_CONFIG`, listens on a private Unix socket,
-accepts only typed `elastos.exit.relay-open/v1` Runtime handshakes, dials only
-operator-approved TCP/TLS targets, and blocks private resolved IPs unless the
-operator explicitly sets `allow_private_targets`. The approved target policy can
-be a narrow host allowlist for dapp proofing or `"*"` for public-web browsing,
-and it must be constrainable by scheme and port:
-
-```json
-{
-  "allowed_hosts": ["glidefinance.io", "*.whatismyip.com"],
-  "allowed_schemes": ["tcp", "tls"],
-  "allowed_ports": [80, 443],
-  "address_family": "prefer_ipv4"
-}
-```
-
-The helper's lifetime is bound to the Runtime that launched it. The Runtime
-spawns it with a piped stdin it holds open and sets
-`ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF=1`; the helper watches that pipe and
-reaps itself the moment it reaches EOF. `HostHelperProcess::drop` covers only
-graceful shutdown, and SIGKILL, an abort on panic, and the installed-binary
-supersession watch's `std::process::exit` all skip it — without the pipe each of
-those stranded a helper at PPID=1 holding the relay socket, one per launch.
-Teardown is scoped by inode identity to the socket the helper actually bound, so
-a stranded helper can never unlink a successor's relay socket at the same path.
-For the same reason the Runtime refuses to replace a relay socket that a live
-helper is still serving, instead of silently taking the path from it. Launches
-that run the helper directly leave `ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF` unset
-and keep their existing lifetime. `scripts/browser-local-exit-orphan-cleanup-smoke.sh`
-is the regression proof.
-
-`address_family` is an Exit routing policy, not a browser fallback. Supported
-values are `system`, `prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, and
-`ipv6_only`; the default is `prefer_ipv4` because some public sites apply
-different abuse policy to IPv4 and IPv6 cloud routes. The Browser capsule still
-receives only Runtime/Exit receipts, never DNS results or raw sockets.
-
-When the default server Exit is rejected by a public site, the operator may
-configure an approved upstream HTTP CONNECT Exit. This is still Runtime-mediated:
-capsules do not receive the proxy URL, proxy credentials, raw sockets, or raw
-browser networking. Generate the config instead of editing JSON by hand:
-
-```bash
-node scripts/browser-native-operator-config.mjs \
-  --out-dir "$ELASTOS_DATA_DIR/config" \
-  --browser-program /usr/bin/chromium \
-  --supervisor-bin /opt/elastos/bin/browser-engine-supervisor \
-  --proxy-engine-bin /opt/elastos/bin/browser-native-proxy-engine \
-  --address-family prefer_ipv4 \
-  --upstream-http-proxy http://approved-exit.example:8080
-```
-
-If the proxy requires authorization, provide the header from operator secrets,
-not from the repository:
-
-```bash
-BROWSER_SMOKE_UPSTREAM_HTTP_PROXY=http://approved-exit.example:8080 \
-BROWSER_SMOKE_UPSTREAM_PROXY_AUTHORIZATION="$PROXY_AUTHORIZATION" \
-scripts/browser-youtube-acceptance-smoke.sh
-```
-
-YouTube/media is not considered complete until this exact smoke, or
-`scripts/browser-native-youtube-smoke.sh`, passes with decoded video and audio
-bytes. In other words, the acceptance evidence must include decoded video and
-audio bytes, not just a loaded YouTube URL. The pass condition is
-`decoded video and audio bytes`.
-
-This helper is the only place in the current Browser path that performs DNS or
-TCP dial-out. Browser capsules, Browser Engine Adapter, and
-`browser-stream-bridge` and `browser-native-proxy-engine` still receive no host
-public network authority; the native proxy wrapper has only loopback browser
-proxy traffic and private Runtime Exit IPC.
-
-The current diagnostic instrumentation lives at
-`elastos/tools/browser-playwright-engine`. It is a server-side Playwright
-Chromium helper launched through the same Browser Engine Adapter supervisor
-contract. Playwright is diagnostic/test infrastructure, not the product browser
-runtime. The helper renders operator-allowlisted pages, routes Chromium traffic
-through the Runtime proxy and `browser-local-exit`, and returns typed page
-diagnostics plus WebRTC proof metadata through the Browser contract:
-
-```text
-Browser UI
-  -> /api/apps/browser/open
-  -> Browser Engine Adapter
-  -> engine supervisor
-  -> elastos.browser.display-session/v1
-  -> /api/apps/browser/pages/:page_id/webrtc
-  -> /api/apps/browser/pages/:page_id/input
-  -> /api/apps/browser/pages/:page_id/diagnostics
-```
-
-This proof is enough to test public-web page rendering inside ElastOS, including
-Glide and exit-IP diagnostics through the configured server Exit. The current
-proof includes actual URL/title round-tripping, viewer resize continuity,
-long-polled WebRTC proof media, wheel, click, paste, and basic keyboard input. It is not a
-general-purpose browser experience because product readiness requires the
-browser engine's real compositor/audio/video surface, not diagnostic collectors.
-The Browser open route now requires the engine to return an explicit
-`elastos.browser.display-session/v1` matching the requested display mode. The
-remaining browser-engine work is: WebRTC remote-display for hosted Home, native
-surface adapters for launcher and mobile hosts, OS/process-level direct-network
-denial proof, DNS/HTTP leak tests against the engine, richer input fidelity, and
-the wallet signing request flow through Runtime approval.
-
-`adapter_ipc` is private Runtime/adapter plumbing, not app-visible authority.
-When a stream backend is explicitly configured with an `elastos.adapter-ipc/v1`
-descriptor, Runtime passes the descriptor to the internal Browser Engine Adapter
-and strips it from the Browser UI response.
+Runtime owns Browser helper lifetime through a pipe with one writer. Local Exit,
+guest network proxy and stream bridge helpers receive the reader on stdin with
+`ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF=1`. EOF starts their cleanup after Runtime
+stop or crash. VM launchers forward the verified reader identified by
+`ELASTOS_UPDATE_PARENT_PIPE` across short-lived launch commands. The shared
+`elastos-common::process_lifetime` module verifies that descriptor's identity.
+Helpers remove only the socket inode they bound. Runtime retains Engine and
+profile ownership until exact cleanup proves that native writers have stopped.
 
 ### Display Session ABI
 
@@ -490,8 +344,8 @@ The real Browser surface negotiates an explicit display session:
 }
 ```
 
-For hosted Home and source-home VM launches, `webrtc_remote_display` is the
-product target. For local launcher/mobile hosts, `native_surface` is the product target.
+The production VM Engine returns `webrtc_remote_display` for local and remote
+viewers. Retained native adapter experiments use `native_surface` in test-only builds.
 Each Browser Engine Adapter must declare its supported display modes in operator
 config. Runtime passes exactly the requested mode to the adapter, and the
 adapter must return the same mode in `display_session`; mismatches fail closed.
@@ -557,7 +411,7 @@ engine display_session.initial_offer
 Browser UI supports both roles without fallback. The display session declares
 the role; the UI follows that one role and fails closed on mismatched signaling.
 
-The first hosted sender is implemented in `browser-playwright-engine`: it uses
+The test-only hosted sender is implemented in `browser-playwright-engine`: it uses
 Playwright Chromium behind a loopback Runtime HTTP CONNECT proxy, and that proxy
 opens target TCP streams only through `browser-local-exit`. Normal browsing does
 not use Playwright request interception or `route.fulfill`; Chromium owns TLS,
@@ -906,7 +760,7 @@ cache. Hosted operators may override the profile root with
 data root's `browser-profiles` directory, and source runs derive the root from
 `XDG_DATA_HOME`/`HOME`.
 
-## Source-Home Mac/Linux Browser Config
+## Source-Home VM and Remote Browser Config
 
 `scripts/setup-source-home.sh` writes explicit Browser provider config on both
 Linux and Mac through `scripts/browser-source-home-config.mjs`; source-home
@@ -1098,34 +952,20 @@ external wallet, lives behind the wallet provider. Mode B, where external dapps
 connect to ElastOS as a wallet, must route every request through runtime approval
 and audit.
 
-## Platform Adapter Plan
+## Host adapters and remote viewers
 
-One Browser/Net/Exit ABI should sit above multiple engine adapters.
+The production Browser has one VM Engine behind the Browser/Net/Exit ABI.
 
-| Platform | First realistic adapter | Notes |
+| Host | Engine placement | Boundary |
 |---|---|---|
-| Linux x86_64 | CEF/Chromium or Chromium-in-microVM | Best first proof for modern dapps. Must deny ambient network at OS/process level and allow only Runtime Net proxy or IPC. |
-| Jetson aarch64 | CEF/Chromium if packaging is proven, otherwise WPE WebKit for embedded proof | Jetson is a Linux target but Chromium/CEF packaging and GPU acceleration need explicit proof. |
-| Windows | WebView2 or CEF | WebView2 has good native availability; CEF gives closer parity with Linux/macOS. Network denial still needs host policy, not just request interception. |
-| macOS | CEF first if parity matters; WKWebView only for constrained adapter work | WKWebView is useful, but custom scheme handling is not enough for a full arbitrary-web network boundary. |
-| Android | Android WebView or GeckoView adapter | Mobile needs a native host adapter. It must present a stable secure origin for passkeys and route browser network through the Runtime Net provider. |
-| Server/headless | WebRTC remote-display adapter plus server-side Exit relay | Product path for hosted Home. Must expose video/audio/input through an explicit display session and no direct network. |
+| Apple Silicon Mac | Linux ARM64 guest through Apple Virtualization | Per-launch guest, Runtime-owned vsock streams and lifecycle. |
+| Jetson ARM64 Linux | The same Linux ARM64 guest through crosvm/KVM | Per-launch guest, Runtime-owned network device and authorized Exit. |
+| Linux x86-64 or a host without compatible virtualization | Approved remote Engine | Runtime authenticates the selected Engine and carries its control/media through Carrier. |
+| Other viewers | Approved remote Engine, after viewer qualification | The same WebRTC, principal, origin and lifecycle contracts. |
 
-The hosted product path should follow proven remote-desktop/browser-isolation
-systems rather than stretching CDP screencast. The first candidate is a
-Selkies/GStreamer-style adapter: Chromium runs in an isolated Linux session,
-networking is forced through the Runtime Exit proxy, and the display adapter
-captures the compositor plus PulseAudio/PipeWire audio into one WebRTC session
-that reports `display_backend=selkies_gstreamer_webrtc`,
-`backend_class=product_compositor`, `audio=true`, and `video=true`. Selkies is
-not the Browser ABI. Other proven remote-browser stacks can be evaluated behind
-the generic `hosted_remote_browser` adapter kind when they return the same
-product-compositor receipt with explicit `display_backend`, audio/video support,
-Runtime-scoped signaling, and `direct_network=false`. KasmVNC, Guacamole/noVNC,
-and AppStream/DCV-style systems prove adjacent deployment models, but
-VNC/RDP-style remoting is lower priority for ElastOS unless the quality gate
-beats the Selkies path. Cloudflare-style browser isolation proves the product
-category, but its service-trust model is not the ElastOS trust boundary.
+An x86-64 guest can use the same recipe after its target qualification. Native
+WebView, CEF and Playwright experiments retain test-only ownership. Device
+support follows installed evidence for the stated host adapter and viewer.
 
 ## Native Desktop Shell And Packaging
 
@@ -1192,144 +1032,27 @@ Servo and full WASM/WASI browser engines are research paths. They fit the
 long-term capsule ideal, but they are not the shortest route to a working,
 modern, wallet-capable browser.
 
-## Implementation Sequence
+## Delivery and verification order
 
-1. **Contract first**
-   - Define Browser/Net/Exit manifest capabilities.
-   - Add fail-closed runtime routes for `elastos://net/*`.
-   - Add `net-provider` as the Runtime-owned Browser/Net boundary. It validates
-     requests, blocks LAN/private targets by default, and returns an explicit
-     `exit_unavailable` handoff instead of touching host networking itself.
-   - Add `exit-provider` as the internal egress contract behind Net. It validates
-     stream and HTTP-fetch requests, blocks LAN/private targets by default, and
-     refuses direct host networking until a real backend is configured.
-   - Allow the first constrained `http_fetch` backend only through explicit
-     operator config (`ELASTOS_EXIT_PROVIDER_CONFIG`) with host allowlists,
-     body-size limits, and private-target access off by default.
-   - Route Browser HTTP and stream requests as
-     `Browser -> Net validation -> Runtime-owned Exit handoff`. Browser never
-     calls `elastos://exit/*` directly.
-   - Allow `stream_relay` backends to reserve typed stream-session receipts.
-     Byte transport is not attached until the Browser Engine Adapter can bind a
-     real IPC/vsock/WebSocket stream to that receipt.
-   - Add `browser-stream-bridge` as the first local byte-transport helper:
-     engine-side Unix socket in, Runtime-owned Unix stream socket out, no TCP,
-     DNS, HTTP, wallet, chain, or filesystem authority outside the configured
-     socket paths.
-   - Add `browser-local-exit` as the first server-side Exit relay: Runtime
-     sends typed relay-open handshakes to a private Unix socket, and the helper
-     dials only operator-allowlisted public targets.
-   - Allocate the private Runtime stream socket path inside the gateway before
-     Browser Engine launch, not in operator-visible UI or ordinary capsule
-     state.
-   - Keep the current `browser` shell labeled as Runtime Browser proof only, and
-     make its visible address-bar request use `/api/apps/browser/open`. Runtime
-     owns the internal `elastos://net/stream -> elastos://exit/open_stream ->
-     elastos://browser-engine/launch` sequence. HTTP-fetch stays a constrained
-     diagnostic/compatibility operation.
+Runtime admits the signed Engine image and its matching host helpers, then
+prepares the owner's Engine and Exit selection through normal setup. Mac Apple
+Virtualization and Linux ARM64 crosvm run the same guest. Other hosts select an
+approved remote Engine through Runtime and Carrier. The guest input hash permits
+reuse while its recipe, locked dependencies and build options remain identical.
 
-2. **Server/headless WebRTC proof**
-   - Launch Playwright Chromium only through the Browser Engine Adapter
-     supervisor contract.
-   - Render operator-allowlisted pages through `browser-local-exit`.
-   - Return a WebRTC display session with Runtime-scoped signaling; image
-     polling is not a product display path.
-   - Return `elastos.browser.display-session/v1`; Runtime rejects mismatched
-     display modes.
-   - The product Browser control service exposes account/chain discovery
-     through a constrained Runtime-mediated EIP-1193 bridge and routes
-     `personal_sign`, `eth_sign`, and EIP-712 typed-data signing into
-     Wallet/Inbox approval before resolving the page promise with the completed
-     signature. The Playwright proof is diagnostic and must not be cited as
-     typed-data product coverage unless it implements the same route.
-   - Route managed `eth_sendTransaction` through `chain-provider`
-     `prepare_transaction`, Wallet/Inbox approval, managed Wallet signing, and
-     `chain-provider` `broadcast_transaction` before returning the transaction
-     hash to the page.
-   - Route external EVM `eth_sendTransaction` through connector handoff and
-     completion so MetaMask/WalletConnect approval capsules return only a
-     transaction hash to the page. Keep
-     `scripts/wallet-connector-transaction-smoke.mjs` green so connector UI
-     changes cannot regress known-chain add/switch handling, external
-     `eth_sendTransaction`, or transaction-hash-only Runtime completion.
+The first installed journey covers Home sign-in, a decoded WebRTC page,
+navigate/type/scroll/click/reload, Close and profile reopen. Repeat that journey
+after a normal update. Runtime owns the separate mutable profile and process
+lifecycle; the Engine owns execution, rendering and website TLS. Exit owns the
+authorized destination streams. The guest network boundary confines all website
+traffic to that Runtime route.
 
-3. **Hosted Home product display**
-   - Replace the Playwright/CDP screencast proof with a compositor-backed
-     `webrtc_remote_display` adapter, preferably Selkies/GStreamer-style for
-     the first hosted proof.
-   - Send browser video over WebRTC and keep input Runtime-mediated
-     (`datachannel` first, `runtime_route` only for explicit diagnostics).
-   - Capture audio from the same isolated browser session and expose it only
-     inside the same Runtime display session contract, with
-     `backend_class=product_compositor`; reject proof-surface audio.
-  - Use `scripts/browser-hosted-product-operator-config.mjs` to generate the
-    hosted product adapter config. The default declares
-    `kind=selkies_gstreamer` and `display_modes=["webrtc_remote_display"]`;
-    KasmVNC/BrowserBox-style spikes use `kind=hosted_remote_browser` with an
-    explicit `display_backend` while keeping the same product-compositor gate.
-    The provided
-     `scripts/browser-hosted-product-supervisor.mjs` is a strict bridge to an
-     operator-run compositor control service: it posts the typed launch request
-     to the configured Unix control socket, validates that the service returns a
-     real `product_compositor` WebRTC session with `audio=true`, and otherwise
-     fails closed. It does not synthesize media, proxy a static frame, or
-     downgrade to the Playwright proof.
-   - The launch result must include a page-scoped `control_socket_path` when
-     the hosted target is per-launch. Adapter-level `supervisor.control_socket_path`
-     is accepted only for legacy diagnostics; product Browser operations must
-     route through the page-scoped control socket registered at launch.
-   - Keep `scripts/browser-hosted-product-display-smoke.sh` as the product
-     display gate. Current Playwright/CDP config should fail this gate; a real
-     hosted adapter must pass with `audio=true`, `video=true`,
-     `backend_class=product_compositor`, and `direct_network=false`.
-   - Run `scripts/browser-hosted-product-target-preflight.sh` on the target host
-     before advertising hosted Browser support. It generates the adapter config
-     and runs the product-display gate against the configured compositor control
-     socket; if the socket is absent or returns anything other than a real
-     audio-capable product compositor session, the preflight fails.
-   - Fail closed when the remote-display adapter is unavailable; do not
-     downgrade to diagnostic frames.
-
-4. **Linux/Jetson proof**
-   - Build a native or microVM Chromium/CEF adapter.
-   - Use `browser-native-proxy-engine` as the first native wrapper: Chromium/CEF
-     talks to a loopback proxy inside its sandbox, and that proxy opens
-     Runtime Exit relay streams over private Unix IPC.
-   - Keep `scripts/browser-native-proxy-engine-smoke.sh` green so the wrapper's
-     HTTP proxy path cannot regress before the host-gated namespace proof runs.
-   - Keep `scripts/browser-native-supervisor-proxy-smoke.sh` as the host-gated
-     proof that the wrapper runs through `browser-engine-supervisor`, direct
-     TCP/DNS fail inside `linux_new_netns`, and the browser still reaches content
-     through Runtime Exit relay IPC.
-   - Return `native_surface` from the Linux supervisor for local launcher/mobile
-     hosts.
-  - Do not claim `native_surface` audio/video unless the operator config
-     explicitly declares real native media capability and the target preflight
-     reports `native_audio_proven=true` and `native_video_proven=true`; fake
-     namespace/proxy smokes must keep audio/video false.
-   - Deny direct outbound network at the host boundary.
-   - Allow only Runtime Net/Exit proxy IPC or vsock.
-   - Prove DNS and HTTP(S) go through Runtime Net/Exit provider policy.
-   - Run `scripts/browser-native-supervisor-smoke.sh` on a host that permits
-     `CLONE_NEWNET`; it must prove direct TCP, DNS, and HTTP fail inside the
-     engine process while Runtime Unix stream-bridge traffic still works.
-
-5. **Wallet dapp proof**
-   - Inject only a Runtime-mediated EIP-1193 bridge.
-   - Open a real dapp such as Glide.
-   - Show wallet requests in Wallet/Inbox.
-   - Approve/reject through the wallet provider.
-   - Prove no raw wallet RPC, node RPC, private key, or connector SDK reaches
-    the page.
-
-6. **Cross-platform adapters**
-   - Add Windows and macOS adapters behind the same ABI.
-   - Add Android adapter only after host-auth, passkey origin, and app network
-     policy are explicit.
-
-7. **R&D**
-   - Evaluate Servo, WPE WebKit, and WASM/component browser engines as future
-     engines that can implement the same ABI.
+Wallet follows the installed journeys on both target machines. Its origin-bound
+EIP-1193 bridge sends requests to Runtime and Wallet/Inbox for explicit approval.
+Broader media, recovery, device and workload qualification retains its complete
+acceptance criteria in the owning Browser issues. Playwright and the retired
+host-native namespace tools remain test fixtures behind the adapter's explicit
+`test-engine` feature.
 
 ## Verification Matrix
 
@@ -1339,9 +1062,8 @@ Before calling the browser capsule real:
   open any off-box destination.
 - A test proves browser DNS does not bypass the Runtime Net provider.
 - A test proves browser HTTP(S) streams use the selected exit provider.
-- A host-gated native supervisor smoke proves direct TCP, DNS, and HTTP are
-  unavailable inside the native engine network namespace while Runtime IPC still
-  works.
+- A target VM proof confirms that the guest sends website TCP, DNS and HTTP
+  through Runtime Net/Exit, with the host adapter enforcing the guest boundary.
 - A test proves LAN/private IPs are blocked by default.
 - A test proves wallet injection is origin-bound and request-scoped.
 - A test proves dapp wallet requests appear in Wallet/Inbox before any
@@ -1355,8 +1077,8 @@ Before calling the browser capsule real:
   encrypted provider-owned storage contract with Recovery Kit coverage, or the
   product explicitly marks Browser VM profile disks excluded from protected
   storage and Recovery Kit claims.
-- A test proves the visible browser surface is WebRTC/native, not image polling,
-  when the user expects normal web behavior.
+- A test proves the visible Browser surface receives decoded WebRTC media and
+  continuous input under the selected Engine contract.
 - A test proves product Browser launch fails closed when the selected display
   session is unavailable.
 - Manual smoke covers Linux x86_64, Jetson aarch64, Windows, macOS, and Android

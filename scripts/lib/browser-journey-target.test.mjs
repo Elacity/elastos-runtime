@@ -71,7 +71,7 @@ test("profile binding uses accepted Runtime principal, lifecycle profile and act
   const binding = browserJourneyProfileBinding(config, summary, pageId, "http://localhost:8090/apps/browser/", token);
   assert.equal(binding.principal_sha256, hash(principal)); assert.equal(binding.runtime_signer_sha256, hash("did:key:runtime123"));
   assert.equal(binding.profile_key_hash, summary.sessions.lifecycle.sessions[0].profile_key_hash);
-  assert.equal(binding.engine_id, "", "Automatic keeps its actual empty Runtime selection");
+  assert.equal(binding.engine_id, "", "Local VM keeps its actual empty Runtime selection");
   assert.ok(!JSON.stringify(binding).includes(principal)); assert.ok(!JSON.stringify(binding).includes(token));
   for (const change of [s => { s.principal_id = "other-principal"; }, s => { s.sessions.lifecycle.sessions[0].profile_key_hash = short("other"); },
     s => { s.sessions.lifecycle.sessions[0].phase = "RETIRING"; }, s => { s.sessions.lifecycle.sessions.push(s.sessions.lifecycle.sessions[0]); },

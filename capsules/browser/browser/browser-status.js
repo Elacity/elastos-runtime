@@ -72,7 +72,7 @@ export function friendlyOpenError(error) {
       case "artifact_invalid":
         return "Browser Engine files need repair. Prepare this Engine or choose another approved Engine.";
       case "host_unsupported":
-        return "The selected Engine needs a compatible host. Choose another approved Engine.";
+        return "Browser virtualization is unavailable on the selected host. Use a host with Apple Virtualization or KVM, or choose another approved Engine.";
       case "readiness_unsupported":
         return "Browser Engine needs an update to report readiness. Update it or choose another approved Engine.";
       case "control_unavailable":
@@ -93,6 +93,14 @@ export function friendlyOpenError(error) {
       case "engine_unavailable":
         return "Browser Engine is unavailable. Choose an available approved Engine.";
     }
+  }
+  if (
+    error?.payload?.code === "profile_recovery_required" &&
+    ["terminal_pre_effect_failure", "terminal_post_effect_cleanup"].includes(outcome?.state) &&
+    outcome.effects.page_acquired === false &&
+    outcome.effects.vm_acquired === false
+  ) {
+    return "Browser profile setup was interrupted. In Settings, select Reset profile to start again. Reset clears this account's Browser data.";
   }
   if (outcome?.state === "terminal_pre_effect_failure") {
     if (error.status === 403) {

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import runpy
+import shutil
 import signal
 import subprocess
 import sys
@@ -326,6 +327,75 @@ def validate_release_builds_are_hermetic(source):
 
 
 class ReleasePolicyTests(unittest.TestCase):
+    def test_source_home_callers_bind_executable_tools_before_isolating_home(self):
+        for job in sorted(SOURCE_HOME_CACHE_JOBS):
+            setup, = [step for step in steps(job) if step.startswith("name: source-home into isolated")]
+            shell = textwrap.dedent(setup.split("        run: |\n", 1)[1])
+            prefix = shell.split("scripts/setup-source-home.sh", 1)[0]
+            for missing in (None, "node", "turnserver"):
+                with self.subTest(job=job, missing=missing), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    tools = root / "tools"
+                    tools.mkdir()
+                    for tool in ("mkdir", "install"):
+                        (tools / tool).symlink_to(shutil.which(tool))
+                    for tool in ("node", "turnserver", "ffmpeg", "ffprobe"):
+                        if tool != missing:
+                            (tools / tool).write_text("#!/bin/bash\nexit 0\n")
+                            (tools / tool).chmod(0o700)
+                    cargo = root / "cargo/bin/cargo"
+                    cargo.parent.mkdir(parents=True)
+                    cargo.write_text('#!/bin/bash\necho \'{"packages":[{"name":"elastos-server","version":"1.2.3"}]}\'\n')
+                    cargo.chmod(0o700)
+                    # This runner prefix executes the actual workflow without building Home.
+                    # Resolving tools happens while the runner still owns the original HOME/PATH.
+                    environment = {**os.environ, "HOME": str(root / "user"), "PATH": str(tools),
+                                   "CARGO_HOME": str(cargo.parent.parent), "RUSTUP_HOME": str(root / "rustup"),
+                                   "RUNNER_TEMP": str(root / "run"), "GITHUB_ENV": str(root / "github-env")}
+                    result = subprocess.run(["/bin/bash", "-c", prefix +
+                        '\nprintf "%s\\n" "$ELASTOS_NODE_BIN" "$ELASTOS_BROWSER_VM_TURNSERVER_BIN"\n'],
+                        env=environment, capture_output=True, text=True, timeout=10)
+                    if missing:
+                        self.assertNotEqual(result.returncode, 0, result.stdout)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.splitlines(), [str(tools / "node"), str(tools / "turnserver")])
+
+    def test_source_home_resolvers_accept_managed_or_explicit_tools_and_refuse_path_only(self):
+        source = (WORKFLOW.parents[2] / "scripts/setup-source-home.sh").read_text()
+        definitions = "\n".join(re.search(rf"(?ms)^{name}\(\) \{{.*?^\}}$", source)[0]
+                                for name in ("find_node", "find_turnserver", "find_vz_turn_program"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tools, managed = root / "tools", root / "data/bin"
+            tools.mkdir()
+            managed.mkdir(parents=True)
+            for parent in (tools, managed):
+                for name in ("node", "turnserver"):
+                    (parent / name).write_text("#!/bin/bash\nexit 0\n")
+                    (parent / name).chmod(0o700)
+            environment = {**os.environ, "PATH": str(tools), "DATA_DIR": str(managed.parent)}
+            for name in ("ELASTOS_NODE_BIN", "ELASTOS_BROWSER_VM_TURNSERVER_BIN",
+                         "ELASTOS_TURNSERVER_BIN", "ELASTOS_BROWSER_VM_TURN_PROGRAM"):
+                environment.pop(name, None)
+            cases = [("managed", {}, managed),
+                     ("explicit", {"ELASTOS_NODE_BIN": str(tools / "node"),
+                                   "ELASTOS_BROWSER_VM_TURNSERVER_BIN": str(tools / "turnserver")}, tools),
+                     ("path only", {"DATA_DIR": str(root / "empty")}, None),
+                     ("relative explicit", {"ELASTOS_NODE_BIN": "node",
+                                            "ELASTOS_BROWSER_VM_TURNSERVER_BIN": "turnserver"}, None)]
+            for label, overrides, expected in cases:
+                for resolver, tool in (("find_node", "node"), ("find_turnserver", "turnserver"),
+                                       ("find_vz_turn_program", "turnserver")):
+                    with self.subTest(case=label, resolver=resolver):
+                        result = subprocess.run(["/bin/bash", "-c", definitions + "\n" + resolver],
+                            env={**environment, **overrides}, capture_output=True, text=True, timeout=10)
+                        if expected is None:
+                            self.assertNotEqual(result.returncode, 0, result.stdout)
+                        else:
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(result.stdout.strip(), str(expected / tool))
+
     def test_every_ci_action_has_a_full_commit_pin(self):
         for action, pin in re.findall(r'uses: ([\w/-]+)@([^\s]+)', SOURCE):
             self.assertRegex(pin, r'^[0-9a-f]{40}$', action)
@@ -447,7 +517,10 @@ class ReleasePolicyTests(unittest.TestCase):
                     env = {**os.environ, "PATH": str(root / "shims") + os.pathsep + os.environ["PATH"],
                            "RUNNER_TEMP": str(root), "RELEASE_ROOT": str(release),
                            "CARGO_HOME": str(root / "cargo-home"), "RUSTUP_HOME": str(root / "rustup-home"),
-                           "INSTALL_VERSION": "1.2.3", "UPDATE_VERSION": "1.2.4", "BUILD_CALLS": str(calls)}
+                           "INSTALL_VERSION": "1.2.3", "UPDATE_VERSION": "1.2.4", "BUILD_CALLS": str(calls),
+                           "BROWSER_IMAGE_CID": "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                           "BROWSER_IMAGE_SHA256": "ab" * 32, "BROWSER_IMAGE_SIZE": "1024",
+                           "RELEASE_PLATFORM": "aarch64-darwin" if job == "mac" else "aarch64-linux"}
                     result = subprocess.run(["bash", "-c", script], cwd=root, env=env,
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode == 0, existing is None, result.stderr)
@@ -457,9 +530,17 @@ class ReleasePolicyTests(unittest.TestCase):
                     else:
                         built = [json.loads(line) for line in calls.read_text().splitlines()]
                         self.assertEqual(len(built), 2)
+                        for flag, value in [("--browser-vm-image-cid", env["BROWSER_IMAGE_CID"]),
+                                            ("--browser-vm-image-sha256", env["BROWSER_IMAGE_SHA256"]),
+                                            ("--browser-vm-image-size", env["BROWSER_IMAGE_SIZE"])]:
+                            self.assertEqual(built[0]["args"][built[0]["args"].index(flag) + 1], value)
+                            self.assertNotIn(flag, built[1]["args"])
                         self.assertEqual({item['target'] for item in built}, {str(target)})
                         self.assertEqual({item['build'] for item in built}, {str(build_dir)})
-                        self.assertEqual(built[0]['args'], ['--version', '1.2.3', '--output', str(release / 'inputs/N')])
+                        self.assertEqual(built[0]['args'], ['--version', '1.2.3', '--output', str(release / 'inputs/N'),
+                                                          '--browser-vm-image-cid', env['BROWSER_IMAGE_CID'],
+                                                          '--browser-vm-image-sha256', env['BROWSER_IMAGE_SHA256'],
+                                                          '--browser-vm-image-size', env['BROWSER_IMAGE_SIZE']])
                         self.assertEqual(built[1]['args'], ['--version', '1.2.4', '--output', str(release / 'inputs/N1'),
                                                           '--reuse-support', str(release / 'inputs/N')])
                         self.assertFalse(target.exists() or target.is_symlink())

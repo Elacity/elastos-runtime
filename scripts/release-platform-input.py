@@ -6,6 +6,7 @@ import base64
 import copy
 from datetime import datetime, timezone
 import hashlib
+import gzip
 import importlib.util
 import json
 import os
@@ -34,6 +35,9 @@ spec = importlib.util.spec_from_file_location(
     "component_integrity", SCRIPT_ROOT / "components-release-integrity-check.py")
 integrity = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(integrity)
+spec = importlib.util.spec_from_file_location("browser_host_release", SCRIPT_ROOT / "browser-host-release.py")
+browser_host = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(browser_host)
 
 
 def run(*args):
@@ -60,6 +64,110 @@ def regular_file(root, relative):
     if not stat.S_ISREG(path.stat().st_mode):
         raise ValueError(f"artifact is not a regular file: {relative}")
     return path
+
+
+BROWSER_IMAGE = "browser-vm-image"
+BROWSER_IMAGE_INSTALL = "browser-vm/image-set"
+# Match the installer and elastos-common user-facing write reserve.
+BROWSER_IMAGE_RESERVE_BYTES = 2 * 1024**3
+
+
+def check_browser_image_archive(path, platform):
+    """Read the complete shared ARM64 image without extracting or booting it."""
+    if platform not in ("darwin-arm64", "linux-arm64"):
+        raise ValueError("This host uses a remote Browser Engine; the shared guest is ARM64")
+    records, receipt = {}, None
+    files = {"rootfs.ext4", "vmlinux", "initrd", "browser-vm-rootfs-manifest.json"}
+    with gzip.open(path, "rb") as compressed, tarfile.open(fileobj=compressed, mode="r|") as archive:
+        for member in archive:
+            name = member.name.removeprefix(BROWSER_IMAGE + "/")
+            if (member.name != BROWSER_IMAGE + "/" + name or name not in files
+                    or name in records or not member.isfile() or member.size <= 0
+                    or member.size > 64 * 1024**3):
+                raise ValueError("Browser image archive requires exactly four regular image-set files")
+            value = hashlib.sha256()
+            with archive.extractfile(member) as source:
+                if name == "browser-vm-rootfs-manifest.json":
+                    if member.size > 1024**2:
+                        raise ValueError("Browser image receipt exceeds its metadata bound")
+                    receipt = json.load(source)
+                else:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        value.update(chunk)
+            records[name] = {"size": member.size, "sha256": value.hexdigest()}
+        # Tar ends before the gzip trailer; consume it to verify CRC/truncation.
+        while compressed.read(1024 * 1024):
+            pass
+    guest = "linux-arm64"
+    if (set(records) != files or not isinstance(receipt, dict)
+            or receipt.get("schema") != "elastos.browser.vm-rootfs-build/v1"
+            or receipt.get("ok") is not True or receipt.get("target_platform") != guest):
+        raise ValueError("Browser image set is incomplete or has the wrong guest platform")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("guest_inputs", Path(__file__).with_name("browser-vm-image-inputs.py"))
+    inputs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(inputs)
+    if receipt.get("inputs_sha256") != inputs.identity(options=receipt.get("recipe_options"))["sha256"]:
+        raise ValueError("Browser guest recipe input hash differs from the candidate")
+    for name, info in (("rootfs.ext4", receipt), ("vmlinux", receipt.get("kernel", {})),
+                       ("initrd", receipt.get("initrd", {}))):
+        if not isinstance(info, dict) or any(info.get(key) != records[name][key] for key in ("size", "sha256")):
+            raise ValueError("Browser image payload differs from its receipt: " + name)
+    preflight = receipt.get("preflight", {})
+    if not isinstance(preflight, dict) or preflight.get("ok") is not True or preflight.get("audio_default_ready") is not True:
+        raise ValueError("Browser image receipt requires passing media/audio preflight")
+
+
+def stage_browser_image(args):
+    template = json.loads((SOURCE_ROOT / "components.json").read_bytes())
+    platform = PLATFORMS[args.platform][0]
+    info = template.get("external", {}).get(BROWSER_IMAGE, {}).get("platforms", {}).get(platform)
+    if info is None:
+        if args.package or args.sha256:
+            raise ValueError("Browser image platform is absent from the source template")
+        args.output.write_text('{"external": {}}\n')
+        return
+    if not args.package or not re.fullmatch(r"[0-9a-f]{64}", args.sha256):
+        raise ValueError("Fresh support requires --browser-vm-image PATH and --browser-vm-image-sha256 lowercase HEX; build the image outside CI")
+    package = Path(args.package)
+    # Reject aliases and special files before reading operator input.
+    source = regular_file(package.absolute().parent, package.name)
+    size = source.stat().st_size
+    if not 0 < size <= 64 * 1024**3:
+        raise ValueError("Browser image package exceeds its archive size bound")
+    usage = shutil.disk_usage(args.root)
+    if usage.free < size + BROWSER_IMAGE_RESERVE_BYTES:
+        raise ValueError("Browser image staging needs free disk space for its bytes plus 2 GiB kept free")
+    relative = info["release_path"]
+    if "/" in relative or "\\" in relative or not relative.endswith(".tar.gz"):
+        raise ValueError("Browser image release path must be a tar.gz filename")
+    destination = args.root / "artifacts" / relative
+    created = False
+    try:
+        with source.open("rb") as reader, destination.open("xb") as writer:
+            created = True
+            remaining = size
+            while remaining:
+                chunk = reader.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise ValueError("Browser image input changed during staging")
+                writer.write(chunk)
+                remaining -= len(chunk)
+            if reader.read(1):
+                raise ValueError("Browser image input changed during staging")
+        if destination.stat().st_size != size or digest(destination) != args.sha256:
+            raise ValueError("Browser image package SHA-256 differs from operator pin")
+        check_browser_image_archive(destination, platform)
+        descriptor = {"strategy": BROWSER_IMAGE, "release_path": relative,
+                      "install_path": BROWSER_IMAGE_INSTALL, "extract_path": BROWSER_IMAGE,
+                      "checksum": "sha256:" + args.sha256, "size": size}
+        args.output.write_text(json.dumps({"external": {BROWSER_IMAGE: {
+            "platforms": {platform: descriptor}}}}) + "\n")
+    except Exception:
+        # The surrounding preparation stage is owned and disposable.
+        if created:
+            destination.unlink(missing_ok=True)
+        raise
 
 
 def catalog_head_cid(data):
@@ -261,8 +369,9 @@ def canonical(value):
 
 def public_upstream_recipe(recipe):
     value = copy.deepcopy(recipe)
-    for source in [value["source"], *[item["source"] for item in value["license"]["files"]],
-                   *[item["source"] for item in value.get("notices", [])]]:
+    for source in [value["source"], *[item["source"] for item in value["license"]["files"] if "source" in item],
+                   *[item["source"] for item in value.get("notices", []) if "source" in item],
+                   *[dep["source"] for dep in value.get("build", {}).get("dependencies", [])]]:
         source.pop("path", None)
     return value
 
@@ -271,7 +380,15 @@ def check_upstream_archive(path, recipe, receipt, platform):
     root = recipe["root"]
     records, metadata, headers, seen = {}, {}, {}, set()
     metadata_names = {"capsule.json", "PROVENANCE.json", "_elastos_object.json"}
+    if recipe.get("build", {}).get("kind") == "python-standalone-v1":
+        metadata_names.add("PYTHON-BUILD.json")
     notices = {item["name"]: item for item in [*recipe["license"]["files"], *recipe.get("notices", [])]}
+    # The Python recipe preserves an upstream binary distribution and attaches
+    # its complete notices. Native source builds retain their source archives.
+    if "build" in recipe and recipe["build"]["kind"] != "python-standalone-v1":
+        for root_name, source in [(recipe["root"], recipe["source"]),
+                                  *[(d["root"], d["source"]) for d in recipe["build"]["dependencies"]]]:
+            notices["sources/" + root_name + ".tar.gz"] = {"source": source}
     total = 0
     with tarfile.open(path, "r|gz") as archive:
         for member in archive:
@@ -291,7 +408,7 @@ def check_upstream_archive(path, recipe, receipt, platform):
             if recipe["format"] == "raw" and short == recipe["entrypoint"]:
                 payload_algorithm, payload_expected = recipe["source"]["checksum"].split(":", 1)
                 payload_hash = hashlib.new(payload_algorithm, header)
-            if short in notices:
+            if short in notices and "source" in notices[short]:
                 algorithm, expected = notices[short]["source"]["checksum"].split(":", 1)
                 license_hash = hashlib.new(algorithm, header)
             captured = bytearray(header) if short in metadata_names else None
@@ -317,6 +434,35 @@ def check_upstream_archive(path, recipe, receipt, platform):
                 records[short] = {"path": short, "sha256": value.hexdigest(), "size": member.size}
     if not metadata_names <= set(metadata) or not set(notices) <= set(records):
         raise ValueError("upstream capsule metadata, licence or notice is missing")
+    if "payload_members" in recipe and set(records) != (
+            set(recipe["payload_members"]) | set(notices) | (metadata_names - {"_elastos_object.json"})):
+        raise ValueError("Node runtime capsule differs from its selected executable and notices")
+    if recipe.get("build", {}).get("kind") == "crosvm-static-v1" and not {
+            "sources/cargo-vendor.tar.gz", "sources/linux-uapi.tar.gz", "sources/Cargo.lock"} <= set(records):
+        raise ValueError("crosvm capsule requires its retained Cargo and Linux UAPI sources")
+    if "PYTHON-BUILD.json" in metadata_names:
+        python = metadata["PYTHON-BUILD.json"]
+        triple = {"darwin-arm64": "aarch64-apple-darwin", "linux-arm64": "aarch64-unknown-linux-gnu",
+                  "linux-amd64": "x86_64-unknown-linux-gnu"}[recipe["platform"]]
+        if (not isinstance(python, dict) or python.get("target_triple") != triple
+                or python.get("python_version") != recipe["version"]):
+            raise ValueError("Python distribution metadata differs from its release recipe")
+        def required_notices(value):
+            if isinstance(value, dict):
+                for key, entry in value.items():
+                    if key in {"license_path", "license_paths"}:
+                        paths = [entry] if key == "license_path" else entry
+                        if not isinstance(paths, list) or not all(isinstance(p, str) and p.startswith("licenses/") for p in paths):
+                            raise ValueError("Python distribution has invalid licence paths")
+                        yield from paths
+                    else:
+                        yield from required_notices(entry)
+            elif isinstance(value, list):
+                for entry in value:
+                    yield from required_notices(entry)
+        required = set(required_notices(python))
+        if not required or not required <= set(records):
+            raise ValueError("Python distribution is missing a required licence notice")
     expected_capsule = {"schema": "elastos.capsule/v1", "name": recipe["component"],
         "version": recipe["version"], "role": "content", "type": "data", "projections": ["content"],
         "entrypoint": recipe["entrypoint"]}
@@ -325,11 +471,16 @@ def check_upstream_archive(path, recipe, receipt, platform):
     if metadata["capsule.json"] != expected_capsule or receipt.get("capsule_manifest") != expected_capsule:
         raise ValueError("upstream content capsule contract differs from its recipe")
     source_record = lambda source: {key: value for key, value in source.items() if key != "path"}
+    def notice_record(item):
+        source = source_record(item.get("source", recipe["source"]))
+        if "from_archive" in item:
+            source = dict(source, archive_member=root + "/" + item["from_archive"])
+        return {"name": item["name"], "source": source}
     expected_provenance = {"schema": "elastos.release-upstream-input/v1", "component": recipe["component"],
         "platform": recipe["platform"], "license": recipe["license"]["spdx_id"],
         "recipe_sha256": hashlib.sha256(canonical(public_upstream_recipe(recipe))).hexdigest(),
         "upstream": source_record(recipe["source"]),
-        "notices": [{"name": item["name"], "source": source_record(item["source"])}
+        "notices": [notice_record(item)
                     for item in [*recipe["license"]["files"], *recipe.get("notices", [])]]}
     if metadata["PROVENANCE.json"] != expected_provenance:
         raise ValueError("upstream capsule provenance differs from its reviewed recipe")
@@ -432,6 +583,12 @@ def check_contents(root, platform, omissions):
     if errors:
         raise ValueError("; ".join(errors))
     upstream_recipes = admit_upstream_inputs(root, platform, manifest, template)
+    browser_role = template.get("profiles", {}).get("browser-host", {}).get("components", [])
+    native_handoff = [name for name in browser_role
+                      if setup_platform in template["external"][name].get("platforms", {})
+                      and "source" not in template["external"][name]["platforms"][setup_platform]]
+    browser_scripts = (browser_host.script_sources(template, setup_platform, native_handoff)
+                       if browser_role else {})
     referenced = {f"elastos-{platform}"}
     for name, component in manifest["external"].items():
         contract = lambda value: {k: v for k, v in value.items() if k not in ("platforms", "capsule_metadata")}
@@ -472,7 +629,8 @@ def check_contents(root, platform, omissions):
                     raise ValueError(f"{name}: provider metadata includes an unselected platform")
             if info is None or not info.get("release_path"):
                 continue
-            if any(key in info for key in ("cid", "url", "strategy")):
+            image_strategy = name == BROWSER_IMAGE and info.get("strategy") == BROWSER_IMAGE and entry is component
+            if any(key in info for key in ("cid", "url")) or ("strategy" in info and not image_strategy):
                 raise ValueError(f"{name}: prepared local descriptor contains a transport or build strategy")
             relative = info["release_path"]
             referenced.add(relative)
@@ -483,6 +641,11 @@ def check_contents(root, platform, omissions):
                 expected_install = (original or {}).get("install_path", component.get("install_path"))
             if info.get("install_path", entry.get("install_path")) != expected_install:
                 raise ValueError(f"{name}: prepared install path differs from source contract")
+            if name == BROWSER_IMAGE:
+                if not image_strategy or info.get("extract_path") != BROWSER_IMAGE or expected_install != BROWSER_IMAGE_INSTALL:
+                    raise ValueError("Browser image descriptor requires its atomic image-set contract")
+                check_browser_image_archive(path, setup_platform)
+                continue
             if name in upstream_recipes:
                 continue  # Complete archive admission above includes the extracted native payload.
             if info.get("extract_path"):
@@ -490,6 +653,10 @@ def check_contents(root, platform, omissions):
                               home_cli_platform=platform if name == "home-cli" and not is_provider_metadata else None,
                               media_platform=platform if name == "media-tools" else None,
                               engine_platform=platform if name == "llama-server" and platform == "aarch64-linux" else None)
+            elif name in browser_scripts and not is_metadata:
+                original = regular_file(SOURCE_ROOT, browser_scripts[name])
+                if path.read_bytes() != original.read_bytes() or not path.stat().st_mode & 0o111:
+                    raise ValueError(f"{name}: Browser helper differs from reviewed executable source")
             elif info.get("install_path", entry.get("install_path", "")).startswith("bin/"):
                 check_binary(path, platform)
             elif expected_install and expected_install.startswith("capsules/"):
@@ -1212,6 +1379,12 @@ def signing_input(stage, cids_path, stamps_path, channel, output,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    browser = commands.add_parser("stage-browser-image", help="admit an operator-built, hash-pinned local image package")
+    browser.add_argument("--root", type=Path, required=True)
+    browser.add_argument("--platform", choices=PLATFORMS, required=True)
+    browser.add_argument("--package", default="")
+    browser.add_argument("--sha256", default="")
+    browser.add_argument("--output", type=Path, required=True)
     create = commands.add_parser("record")
     create.add_argument("--reuse-support", action="store_true")
     for name in ("root", "omissions-json"):
@@ -1251,7 +1424,9 @@ def main():
                              help="admit exactly this one native input instead of all release platforms")
     args = parser.parse_args()
     try:
-        if args.command == "record":
+        if args.command == "stage-browser-image":
+            stage_browser_image(args)
+        elif args.command == "record":
             record(args)
         elif args.command == "copy-support":
             copy_support(args)
@@ -1271,7 +1446,7 @@ def main():
         else:
             receipts = validate_inputs(args.input, args.version, args.preview_platform)
             print(f"Verified source and local bytes for {len(receipts)} platform inputs; publication and installed acceptance remain separate.")
-    except (ValueError, OSError, KeyError, TypeError, tarfile.TarError, subprocess.CalledProcessError) as exc:
+    except (ValueError, OSError, EOFError, KeyError, TypeError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"Error: {exc}\n")
 
 

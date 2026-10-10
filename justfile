@@ -76,17 +76,14 @@ test:
     just test-capsules || failed=1
     exit "$failed"
 
-# Capsule units and script behavior fixtures. Browser fixtures use the explicit
-# Playwright/Chromium inputs installed by CI; NODE_PATH and
-# BROWSER_OPERATOR_PLAYWRIGHT_CORE select the unchanged pinned packages.
+# Capsule units and script behavior fixtures, as CI and the pre-push gate run
+# them; offline, after `just test-behaviour-inputs` installed the pinned
+# Playwright/Chromium inputs once.
 test-behaviour:
-    node --test --test-timeout=60000 elastos/esp/projections.test.mjs scripts/*.test.mjs scripts/build/*.test.mjs scripts/lib/*.test.mjs capsules/*/browser/*.test.mjs capsules/*/browser/src/*.test.mjs scripts/home-fixture-contracts-smoke.mjs scripts/documents-save-conflict-smoke.mjs scripts/gba-save-conflict-smoke.mjs
+    ./scripts/test-behaviour.sh
 
-# Disposable Linux fixture; host namespace privileges belong to this test.
-test-native-browser-isolation:
-    cargo build --quiet --manifest-path elastos/tools/browser-engine-supervisor/Cargo.toml
-    cargo build --quiet --manifest-path elastos/tools/browser-native-proxy-engine/Cargo.toml
-    sudo -n bash scripts/browser-native-supervisor-proxy-smoke.sh --prebuilt --require-isolation
+test-behaviour-inputs:
+    ./scripts/test-behaviour.sh inputs
 
 # Check a clean candidate against current develop before each push.
 ci-local-prepush:
@@ -141,6 +138,7 @@ ci-source-home-linux arch='arm64':
         export PATH=/usr/local/cargo/bin:\$PATH RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/home/ci/.cargo && \
         cd /w && git init -q && git add -A && git -c user.email=ci@local -c user.name=ci commit -qm ci-replica && \
         export ELASTOS_COLLABORATION_STARTUP_MODE=isolated && \
+        export ELASTOS_NODE_BIN=/usr/bin/node ELASTOS_BROWSER_VM_TURNSERVER_BIN=/usr/bin/turnserver && \
         SOURCE_HOME=/home/ci/rtemp/elastos-source-home && mkdir -p \$SOURCE_HOME && \
         export HOME=\$SOURCE_HOME XDG_DATA_HOME=\$SOURCE_HOME/.local/share && \
         SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR=/usr/bin scripts/setup-source-home.sh && \

@@ -107,9 +107,6 @@ SUPPORT_BINARY_ASSETS=(
     net-provider
     exit-provider
     browser-engine-adapter
-    browser-engine-supervisor
-    browser-native-proxy-engine
-    browser-stream-bridge
     browser-local-exit
     webspace-provider
     object-provider
@@ -856,6 +853,17 @@ build_supported_direct_assets() {
     staged="${stage_dir}/${release_path}"
     cp "$archive" "$staged" || return
     updates_json=$(record_direct_asset "$updates_json" home-cli "$staged" "capsules/home-cli" "$release_path" home-cli) || return
+
+    if [[ "$setup_platform" == darwin-arm64 ]] && jq -e '.external["browser-vz-engine-supervisor"]' components.json >/dev/null; then
+        # The source Home and release use the same native supervisor and entitlement.
+        if [[ "$SKIP_BUILD" != true ]]; then
+            (cd elastos && cargo build --locked --release -p elastos-vz --bin browser-vz-engine-supervisor) >&2 || return
+        fi
+        staged="$stage_dir/browser-vz-engine-supervisor-darwin-arm64"
+        cp "${CARGO_TARGET_DIR:-elastos/target}/release/browser-vz-engine-supervisor" "$staged" || return
+        scripts/dev/sign-elastos-vz/sign.sh "$staged" >&2 || return
+        updates_json=$(record_direct_asset "$updates_json" browser-vz-engine-supervisor "$staged" bin/browser-vz-engine-supervisor browser-vz-engine-supervisor-darwin-arm64) || return
+    fi
 
     stamp_direct_assets "$setup_platform" "$updates_json"
 }

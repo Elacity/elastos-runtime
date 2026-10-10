@@ -8,8 +8,27 @@ pub async fn run_publish_release(
     crate::publish::run_publish_release(options).await
 }
 
-pub fn run_source(cmd: crate::sources::SourceCommand) -> anyhow::Result<()> {
-    crate::sources::run_source_command(cmd, crate::publish::source_discovery_uri)
+pub async fn run_source(cmd: crate::sources::SourceCommand) -> anyhow::Result<()> {
+    match cmd {
+        crate::sources::SourceCommand::FetchFile {
+            source,
+            cid,
+            sha256,
+            size,
+            output,
+        } => {
+            elastos_server::sources::fetch_source_file(
+                &crate::sources::default_data_dir(),
+                &source,
+                &cid,
+                &sha256,
+                size,
+                &output,
+            )
+            .await
+        }
+        other => crate::sources::run_source_command(other, crate::publish::source_discovery_uri),
+    }
 }
 
 pub fn run_version(current_version: &str) {

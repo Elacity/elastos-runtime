@@ -1374,7 +1374,9 @@ mod tests {
         .contains("invalid home launch token payload"));
 
         let mut future = valid_envelope.clone();
-        future.payload.iat = now_ts().saturating_add(61);
+        // Signing and verification can cross a second under suite load.
+        // Keep this fixture well beyond the 60-second clock allowance.
+        future.payload.iat = now_ts().saturating_add(3600);
         future.payload.exp = future
             .payload
             .iat

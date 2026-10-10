@@ -548,6 +548,8 @@ struct ProviderIo {
 pub struct ProviderBridge {
     io: Arc<Mutex<ProviderIo>>,
     child: Mutex<Option<Child>>,
+    #[cfg(unix)]
+    helper_owner: Mutex<Option<elastos_common::process_lifetime::ParentLifetime>>,
     /// True once a shutdown attempt has completed (child reaped, or the
     /// protocol shutdown was delivered on a childless bridge). Later
     /// shutdown() calls are idempotent no-ops.
@@ -778,6 +780,7 @@ impl ProviderBridge {
             INIT_TIMEOUT,
             SHUTDOWN_TIMEOUT,
             std::process::Stdio::inherit(),
+            false,
         )
         .await?;
         let pid = bridge
@@ -883,6 +886,7 @@ impl ProviderBridge {
             INIT_TIMEOUT,
             SHUTDOWN_TIMEOUT,
             std::process::Stdio::null(),
+            false,
         )
         .await?;
         let pid = bridge
@@ -1215,6 +1219,23 @@ impl ProviderBridge {
             init_timeout,
             shutdown_timeout,
             std::process::Stdio::inherit(),
+            false,
+        )
+        .await
+    }
+
+    /// Runtime owns helper lifetime even while the provider is busy launching.
+    pub async fn spawn_with_owned_helpers(
+        binary_path: &Path,
+        config: ProviderConfig,
+    ) -> Result<Self, BridgeError> {
+        Self::spawn_command(
+            Command::new(binary_path),
+            config,
+            INIT_TIMEOUT,
+            SHUTDOWN_TIMEOUT,
+            std::process::Stdio::inherit(),
+            true,
         )
         .await
     }
@@ -1225,7 +1246,21 @@ impl ProviderBridge {
         init_timeout: std::time::Duration,
         shutdown_timeout: std::time::Duration,
         stderr: std::process::Stdio,
+        own_helpers: bool,
     ) -> Result<Self, BridgeError> {
+        #[cfg(unix)]
+        let helper_owner = if own_helpers {
+            let owner = elastos_common::process_lifetime::ParentLifetime::new()
+                .map_err(BridgeError::Spawn)?;
+            owner
+                .configure(command.as_std_mut())
+                .map_err(BridgeError::Spawn)?;
+            Some(owner)
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let _ = own_helpers;
         let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1261,6 +1296,8 @@ impl ProviderBridge {
                 reader: Box::new(tokio::io::BufReader::new(stdout)),
             })),
             child: Mutex::new(Some(child)),
+            #[cfg(unix)]
+            helper_owner: Mutex::new(helper_owner),
             shutdown_completed: std::sync::atomic::AtomicBool::new(false),
             shutdown_timeout,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1330,6 +1367,8 @@ impl ProviderBridge {
                 reader: Box::new(reader),
             })),
             child: Mutex::new(None),
+            #[cfg(unix)]
+            helper_owner: Mutex::new(None),
             shutdown_completed: std::sync::atomic::AtomicBool::new(false),
             shutdown_timeout: SHUTDOWN_TIMEOUT,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1501,6 +1540,8 @@ impl ProviderBridge {
 
     /// Gracefully shut down the provider.
     pub async fn shutdown(&self) -> Result<(), BridgeError> {
+        #[cfg(unix)]
+        self.helper_owner.lock().await.take();
         let mut child_guard = self.child.lock().await;
         let Some(child) = child_guard.as_mut() else {
             if self

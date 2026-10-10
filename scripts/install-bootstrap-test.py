@@ -550,7 +550,7 @@ def changed_paths(before, after):
 
 
 class CompletionTests(unittest.TestCase):
-    def run_completion(self, setup_exit=0, home_exit=0, install_only="false", terminal=False):
+    def run_completion(self, setup_exit=0, home_exit=0, install_only="false", terminal=False, system="Linux"):
         with tempfile.TemporaryDirectory(prefix="installer-completion-") as directory:
             root = Path(directory)
             # Spaces catch accidental reliance on PATH or unquoted install paths.
@@ -570,7 +570,14 @@ class CompletionTests(unittest.TestCase):
             script = root / "completion.sh"
             script.write_text(command)
             calls = root / "calls"
+            mocks = root / "mocks"
+            mocks.mkdir()
+            uname = mocks / "uname"
+            uname.write_text('#!/bin/sh\nprintf "%s\\n" "$MOCK_SYSTEM"\n')
+            uname.chmod(0o755)
             env = dict(os.environ, INSTALL_DIR=str(install_dir), INSTALL_ONLY=install_only,
+                       DATA_DIR=str(root / "data"), MOCK_SYSTEM=system,
+                       PATH=str(mocks) + os.pathsep + os.environ["PATH"],
                        CALLS=str(calls), SETUP_EXIT=str(setup_exit), HOME_EXIT=str(home_exit))
             argv = [OPTIONS.bash, "--noprofile", "--norc", str(script)]
             if terminal:
@@ -608,11 +615,13 @@ class CompletionTests(unittest.TestCase):
             return status, calls.read_text().splitlines() if calls.exists() else [], output
 
     def test_headless_setup_does_not_consume_script_pipe_or_open_renderer(self):
-        status, calls, output = self.run_completion()
-        self.assertEqual((status, calls), (0, ["setup"]))
-        self.assertIn("Home is installed", output)
-        self.assertIn("installed\\ runtime/elastos", output)
-        self.assertIn("home --browser", output)
+        for system in ("Linux", "Darwin"):
+            with self.subTest(system=system):
+                status, calls, output = self.run_completion(system=system)
+                self.assertEqual((status, calls), (0, ["setup"]), output)
+                self.assertIn("Home is installed", output)
+                self.assertIn("installed\\ runtime/elastos", output)
+                self.assertIn("home --browser", output)
 
     def test_setup_failure_stops_before_home_and_success_message(self):
         status, calls, output = self.run_completion(setup_exit=23)
@@ -1141,6 +1150,70 @@ class InstallationTests(unittest.TestCase):
 
 
 class DataPathTests(unittest.TestCase):
+    def test_browser_host_step_is_installer_only_and_handles_decline_or_unavailable_host(self):
+        function = SOURCE.split("prepare_browser_linux_host() {", 1)[1].split("\nfinish_install()", 1)[0]
+        function = "prepare_browser_linux_host() {" + function
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / 'scripts').mkdir()
+            (root / 'scripts/browser-vm-linux-network.py').write_text('inert signed-helper fixture')
+            device, terminal = root / 'kvm', root / 'terminal'
+            function = function.replace('/dev/kvm', str(device)).replace('/dev/tty', str(terminal))
+            function = function.replace('/usr/bin/python3', 'fixture_python')
+            script = function + '''
+DATA_DIR="$1" SYSTEM="$2" READY="$3" ROOT_RESULT="$4"
+uname() { printf '%s\\n' "$SYSTEM"; }
+fixture_python() { [[ "$READY" == yes ]]; }
+sudo() { printf 'ROOT_STEP:%s\\n' "$*"; [[ "$ROOT_RESULT" != 0 ]] || READY=yes; return "$ROOT_RESULT"; }
+prepare_browser_linux_host
+'''
+            for case, system, ready, device_present, terminal_present, root_result in [
+                ('mac', 'Darwin', 'no', True, True, 0),
+                ('unavailable', 'Linux', 'no', False, True, 0),
+                ('ready', 'Linux', 'yes', True, True, 0),
+                ('headless', 'Linux', 'no', True, False, 0),
+                ('setup', 'Linux', 'no', True, True, 0),
+                ('declined', 'Linux', 'no', True, True, 1),
+            ]:
+                for path, present in [(device, device_present), (terminal, terminal_present)]:
+                    path.unlink(missing_ok=True)
+                    if present:
+                        path.touch()
+                result = shell(script, root, system, ready, root_result)
+                with self.subTest(case=case):
+                    self.assertEqual(result.returncode, root_result if case == 'declined' else 0, result.stderr)
+                    self.assertEqual('ROOT_STEP:' in result.stdout, case in ('setup', 'declined'))
+                    if case == 'setup':
+                        self.assertIn('setup --user ', result.stdout)
+                        self.assertIn('remove --user ', result.stdout)
+                    if case == 'headless':
+                        self.assertIn('Run from a terminal', result.stdout)
+                    if case == 'unavailable':
+                        self.assertIn('virtualization is unavailable', result.stdout)
+
+    def test_browser_setup_resumes_after_installer_host_access_and_home_survives_browser_failure(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            runtime = root / 'elastos'
+            runtime.write_text("#!/bin/bash\n" +
+                               'printf "SETUP:%s\\n" "$*" >> "$CALLS"\n' +
+                               '[[ -f "$HOST_READY" ]] || exit 0\n' +
+                               'exit "${BROWSER_SETUP_RESULT:-0}"\n')
+            runtime.chmod(0o755)
+            script = HELPERS + """
+INSTALL_DIR="$1" INSTALL_ONLY=false DATA_DIR="$1/data"
+export CALLS="$1/calls" HOST_READY="$1/host-ready" BROWSER_SETUP_RESULT="$2"
+prepare_browser_linux_host() { touch "$HOST_READY"; BROWSER_LINUX_HOST_READY=true; printf 'HOST_READY\\n' >> "$CALLS"; }
+show_ready() { printf 'HOME_READY\\n' >> "$CALLS"; }
+finish_install
+"""
+            for browser_result in [0, 7]:
+                calls, ready = root / 'calls', root / 'host-ready'
+                calls.unlink(missing_ok=True); ready.unlink(missing_ok=True)
+                result = shell(script, root, browser_result)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls.read_text().splitlines(), ['SETUP:setup', 'HOST_READY', 'SETUP:setup', 'HOME_READY'])
+
     def test_three_platform_release_keys(self):
         for system, machine, expected in [("Linux", "x86_64", "x86_64-linux"),
                                           ("Linux", "aarch64", "aarch64-linux"),

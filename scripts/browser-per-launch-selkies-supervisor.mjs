@@ -5,6 +5,7 @@ import http from "node:http";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
+import { parentPipeFd, forwardedParentPipeEnv } from "./browser-vm-control-service.mjs";
 import { fileURLToPath } from "node:url";
 
 const REQUEST_ENV = "ELASTOS_BROWSER_ENGINE_REQUEST";
@@ -339,11 +340,11 @@ async function main() {
   const target = spawn(targetScript, targetArgs, {
     cwd: repoRoot,
     detached: true,
-    stdio: ["ignore", stdoutFd, stderrFd],
-    env: {
+    stdio: ["ignore", stdoutFd, stderrFd, parentPipeFd(true)],
+    env: forwardedParentPipeEnv({
       ...process.env,
       ELASTOS_BROWSER_DUMP_DIAGNOSTICS_ON_TERM: "1",
-    },
+    }),
   });
   target.unref();
 

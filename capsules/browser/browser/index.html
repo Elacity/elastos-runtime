@@ -66,9 +66,9 @@
         </div>
         <label class="browser-settings-label" for="browser-engine">Browser engine</label>
         <select id="browser-engine" class="browser-select" aria-label="Browser engine" title="Browser engine">
-          <option value="">Automatic</option>
+          <option value="">Local VM</option>
         </select>
-        <p id="browser-engine-summary" class="browser-settings-hint">Use the best Browser Engine available.</p>
+        <p id="browser-engine-summary" class="browser-settings-hint">Select this device’s VM Engine or an approved remote Engine.</p>
         <label class="browser-settings-label browser-settings-label-spaced" for="browser-exit">Exit node</label>
         <select id="browser-exit" class="browser-exit-select" aria-label="Browser exit node" title="Browser exit node">
           <option value="">This device</option>
@@ -77,6 +77,13 @@
         <button id="browser-profile-reset" class="browser-settings-action browser-settings-danger" type="button" aria-label="Reset Browser profile" title="Reset Browser profile">
           Reset profile
         </button>
+        <section id="browser-profile-reset-confirmation" class="browser-settings-confirm" role="alertdialog" aria-labelledby="browser-profile-reset-question" hidden>
+          <p id="browser-profile-reset-question">Reset Browser cookies, local storage, history, and cache for this account?</p>
+          <div class="browser-settings-confirm-row">
+            <button id="browser-profile-reset-cancel" class="browser-settings-action" type="button">Cancel</button>
+            <button id="browser-profile-reset-commit" class="browser-settings-action browser-settings-confirm-commit" type="button">Reset profile</button>
+          </div>
+        </section>
       </section>
 
       <section class="browser-stage" aria-label="Web page">
@@ -100,7 +107,7 @@
           ></video>
         </div>
         <div id="browser-metrics" class="browser-metrics" hidden></div>
-        <div id="browser-status" class="browser-status" role="status"></div>
+        <div id="browser-status" class="browser-status" role="status" data-visible="true">Browser is checking its Engine. Wait, or reopen Browser from Home to retry.</div>
       </section>
     </main>
 
