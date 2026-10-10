@@ -489,6 +489,7 @@ button:disabled {
   /* Narrow stopgap — full mobile campaign later. */
   .people-shell {
     grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   .people-sidebar {
@@ -529,4 +530,53 @@ button:disabled {
     grid-column: 1 / -1;
     justify-self: start;
   }
+}
+
+/* Phone stage: the sections are the shared push drawer, so People opens on
+   content with the drawer toggle leading the page title. */
+:root[data-el-form-factor="phone"] .people-shell {
+  display: block;
+  /* Shows at the pushed-aside view's rounded corners: the drawer's fill. */
+  background: linear-gradient(var(--el-inset), var(--el-inset)) var(--el-bg);
+}
+
+:root[data-el-form-factor="phone"] .people-sidebar {
+  flex-direction: column;
+  padding: calc(12px + env(safe-area-inset-top, 0px)) 12px calc(16px + env(safe-area-inset-bottom, 0px));
+  border: 0;
+  background: linear-gradient(var(--el-inset), var(--el-inset)) var(--el-bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+:root[data-el-form-factor="phone"] .people-sidebar-item {
+  width: 100%;
+  margin: 0;
+  font-size: 16px;
+}
+
+:root[data-el-form-factor="phone"] .people-main {
+  height: 100%;
+}
+
+:root[data-el-form-factor="phone"] .people-page-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 0 12px -8px;
+}
+
+:root[data-el-form-factor="phone"] .people-page-head .people-page-title {
+  margin: 0;
+}
+
+/* Phone stage: every control is a full touch target. Person rows already
+   stand above 48 px (38 px avatar plus padding). */
+:root[data-el-form-factor="phone"] button,
+:root[data-el-form-factor="phone"] .profile-form input {
+  min-height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] .profile-form input {
+  font-size: 16px; /* below 16 px iOS Safari zooms the page on focus */
 }

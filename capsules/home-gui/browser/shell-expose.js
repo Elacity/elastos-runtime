@@ -14,6 +14,7 @@ import {
 } from "./shell-core.js?v=home-20260813a";
 import {
   browserWindowEntries,
+  closeWindow,
   focusWindow,
   sortWindowEntriesByZOrder,
 } from "./shell-windows.js?v=home-20260813a";
@@ -1120,13 +1121,20 @@ function settleSpacesShelfForMeasure() {
 
 /** Match Space thumb aspect to the live viewport so scaled fullscreen apps
  *  fill the card (no letterbox bar). Prefer fitting the strip to full width. */
+const MISSION_PORTRAIT_THUMB_MIN_W = 64;
+
 function syncMissionSpaceMetrics(spaceCount = 0) {
   const stageW = Math.max(window.innerWidth || 1, 1);
   const stageH = Math.max(window.innerHeight || 1, 1);
   const aspect = stageW / stageH;
   // Aim ~102px preview height; widen the card so aspect matches the display.
   const previewH = 102;
-  let thumbW = Math.round(Math.min(240, Math.max(160, previewH * aspect)));
+  // Portrait stages (phone) size the thumb by height: the landscape width
+  // floor would make a 160 px-wide portrait thumb ~350 px tall.
+  let thumbW =
+    aspect < 1
+      ? Math.round(Math.max(MISSION_PORTRAIT_THUMB_MIN_W, previewH * aspect))
+      : Math.round(Math.min(240, Math.max(160, previewH * aspect)));
   // Shrink thumbs so Spaces (+ add) use the full display width before scrolling.
   const slots = Math.max(1, spaceCount);
   const gap = 18;
@@ -1277,6 +1285,7 @@ function restoreThumbWindow(node, style) {
     node.style.setProperty("--mission-thumb-scale", style.thumbScale);
   } else {
     node.style.removeProperty("--mission-thumb-scale");
+    node.style.removeProperty("--expose-card-scale");
   }
   node.style.visibility = "";
   node.classList.remove("expose-card", "expose-card-active", "mission-thumb-card", "mission-dragging");
@@ -1327,6 +1336,7 @@ function reparentOrphanWindows() {
     node.style.removeProperty("--mission-thumb-src-w");
     node.style.removeProperty("--mission-thumb-src-h");
     node.style.removeProperty("--mission-thumb-scale");
+    node.style.removeProperty("--expose-card-scale");
   }
 }
 
@@ -1359,12 +1369,17 @@ function layoutMissionFloor() {
     if (isDesktopSpace(selectedSpaceId)) {
       if (title) title.textContent = `No windows on ${spaceLabel(selectedSpaceId)}`;
       if (hint) {
-        hint.textContent =
-          "Drag a window onto the Spaces bar to make a fullscreen Space, or tap + for a new Desktop. Click a Space above to open it.";
+        hint.textContent = coarsePointerShell()
+          ? "Tap + for a new Desktop, or tap a Space above to open it."
+          : "Drag a window onto the Spaces bar to make a fullscreen Space, or tap + for a new Desktop. Click a Space above to open it.";
       }
     } else {
       if (title) title.textContent = spaceLabel(selectedSpaceId);
-      if (hint) hint.textContent = "Click the Space above or press Enter to open it.";
+      if (hint) {
+        hint.textContent = coarsePointerShell()
+          ? "Tap the Space above to open it."
+          : "Click the Space above or press Enter to open it.";
+      }
     }
     layoutThumbWindows(buildStageRing());
     return;
@@ -1575,21 +1590,47 @@ function cardSourceRect(node) {
   };
 }
 
+function coarsePointerShell() {
+  return document.body.dataset.pointer === "coarse";
+}
+
+// Caption = app icon + name so a card reads at a glance; on touch shells a
+// close button rides the card as well, since the scaled-down title bar's own
+// Close is no longer a target. Both counter the card's scale via
+// --expose-card-scale so they stay legible at any grid size.
 function mountExposeCaption(entry, wasMinimized) {
-  const existing = entry.node.querySelector(".expose-caption");
-  if (existing) {
-    existing.remove();
-  }
+  clearExposeCaption(entry.node);
   const caption = document.createElement("div");
   caption.className = "expose-caption";
   caption.setAttribute("aria-hidden", "true");
   const title = entry.title || entry.targetId || entry.id;
-  caption.textContent = wasMinimized ? `${title} · Min` : title;
+  const icon = document.createElement("span");
+  icon.className = "expose-caption-icon";
+  mountGlyph(icon, entry.targetId || entry.id);
+  const label = document.createElement("span");
+  label.className = "expose-caption-label";
+  label.textContent = wasMinimized ? `${title} · Min` : title;
+  caption.append(icon, label);
   entry.node.appendChild(caption);
+  if (coarsePointerShell()) {
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "expose-close";
+    close.setAttribute("aria-label", `Close ${title}`);
+    entry.node.appendChild(close);
+  }
 }
 
 function clearExposeCaption(node) {
   node.querySelector(".expose-caption")?.remove();
+  node.querySelector(".expose-close")?.remove();
+}
+
+function closeExposeCard(windowId) {
+  closeWindow(windowId);
+  if (active) {
+    layoutMissionFloor();
+  }
 }
 
 function layoutExposeGrid(entries) {
@@ -1681,6 +1722,7 @@ function layoutExposeGrid(entries) {
       node.style.transition = "transform 220ms cubic-bezier(0.2, 0, 0, 1)";
     }
     node.style.transform = gridTransform;
+    node.style.setProperty("--expose-card-scale", String(scale));
     mountExposeCaption(entry, wasMinimized);
   });
   syncActiveCard();
@@ -2125,6 +2167,14 @@ export function bindExpose() {
         return;
       }
       if (event.target.closest(".mission-spaces-bar") || event.target.closest(".mission-spaces-shelf")) {
+        return;
+      }
+      const closeButton = event.target.closest(".expose-close");
+      const closeCard = closeButton?.closest(".window[data-expose]");
+      if (closeCard?.dataset.expose) {
+        event.preventDefault();
+        event.stopPropagation();
+        closeExposeCard(closeCard.dataset.expose);
         return;
       }
       const card = event.target.closest(".window[data-expose]");

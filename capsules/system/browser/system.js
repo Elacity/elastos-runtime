@@ -311,6 +311,10 @@ function configureSettingsTabs() {
     document.querySelector(".settings-sidebar")?.classList.remove("active");
   });
   document.querySelector(".sidebar-toggle")?.addEventListener("click", () => {
+    // On the phone stage the shared push drawer (elastos-drawer.js) owns it.
+    if (document.documentElement.getAttribute("data-el-form-factor") === "phone") {
+      return;
+    }
     document.querySelector(".settings-sidebar")?.classList.toggle("active");
   });
 }

@@ -105,6 +105,9 @@
     type="button"
     aria-label="Search"
     title="Search (Cmd+Space)"
+    aria-haspopup="dialog"
+    aria-expanded="false"
+    aria-controls="spotlight"
   ></button>
   <button
     id="toolbar-mission-control"
@@ -131,18 +134,19 @@
     id="clock"
     class="toolbar-clock"
     type="button"
-    aria-haspopup="true"
+    aria-haspopup="dialog"
     aria-expanded="false"
     aria-controls="notification-center"
     aria-label="Clock. Open notification history"
     title="Notification history"
-  >--:--</button>
+  ><span class="toolbar-clock-date"></span> <span class="toolbar-clock-time">--:--</span></button>
 </header>
 
 <aside
   id="notification-center"
   class="notification-center"
-  role="group"
+  role="dialog"
+  aria-modal="false"
   aria-label="Notification history"
   tabindex="-1"
   aria-hidden="true"
@@ -175,12 +179,14 @@
   <p id="notification-center-empty" class="notification-center-empty" hidden>
     No recent notifications on this device
   </p>
+  <button id="notification-center-handle" class="sheet-handle" type="button" aria-label="Close"></button>
 </aside>
 
 <aside
   id="control-centre"
   class="control-centre"
-  role="group"
+  role="dialog"
+  aria-modal="false"
   aria-label="Status"
   tabindex="-1"
   aria-hidden="true"
@@ -296,6 +302,7 @@
       <span class="control-centre-row-detail">Open</span>
     </button>
   </div>
+  <button id="control-centre-handle" class="sheet-handle" type="button" aria-label="Close"></button>
 </aside>
 
 <!-- Assistant Space: the room the Shelf morph reveals. Home GUI owns the place
@@ -478,6 +485,7 @@
       aria-label="Search results"
       hidden
     ></div>
+    <button id="spotlight-handle" class="sheet-handle" type="button" aria-label="Close"></button>
   </div>
 </section>
 
@@ -532,6 +540,22 @@
       aria-multiselectable="false"
       tabindex="0"
     ></section>
+    <nav id="phone-home" class="phone-home" aria-label="Home screen">
+      <div id="phone-home-pages" class="phone-home-pages"></div>
+      <div
+        id="phone-home-dots"
+        class="phone-home-dots"
+        role="slider"
+        tabindex="0"
+        aria-label="Home screen page"
+        aria-valuemin="1"
+        aria-valuemax="1"
+        aria-valuenow="1"
+      ></div>
+      <div class="phone-home-editbar">
+        <button id="phone-home-done" class="phone-home-done" type="button">Done</button>
+      </div>
+    </nav>
   </section>
 </main>
 
@@ -602,6 +626,13 @@
     </div>
   </div>
 </footer>
+
+<!-- Phone only: the Dock tucks under an open window; this handle brings it back
+     and the scrim dismisses the peek (shell-phone-dock.js). -->
+<button id="phone-dock-handle" class="phone-dock-handle" type="button" aria-label="Show Dock" hidden>
+  <span class="phone-dock-handle-bar" aria-hidden="true"></span>
+</button>
+<button id="phone-dock-scrim" class="phone-dock-scrim" type="button" aria-label="Hide Dock" tabindex="-1"></button>
 
 <div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" inert hidden></div>
 
@@ -738,6 +769,23 @@
       <span class="launcher-card-title"></span>
     </span>
   </button>
+</template>
+
+<template id="phone-home-item-template">
+  <button class="phone-home-app" type="button">
+    <span class="app-glyph phone-home-icon" aria-hidden="true"></span>
+    <span class="phone-home-title"></span>
+  </button>
+</template>
+
+<template id="phone-home-assistant-page-template">
+  <section class="phone-home-page phone-home-assistant-page" aria-label="Assistant">
+    <button class="phone-home-assistant-open" type="button">
+      <span class="app-glyph phone-home-assistant-icon" aria-hidden="true"></span>
+      <span class="phone-home-assistant-title">Assistant</span>
+      <span class="phone-home-assistant-hint">Ask on this machine</span>
+    </button>
+  </section>
 </template>
 
 <template id="window-error-template">

@@ -86,6 +86,31 @@ import {
 } from "./shell-motion.js?v=home-20260813a";
 import { inboxRailAvailable, showInboxRail } from "./shell-inbox-rail.js?v=home-20260813a";
 import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260813a";
+import { syncPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
+import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
+import {
+  PHONE_ASSISTANT_TARGET,
+  PHONE_DOCK_SLOTS,
+  fitPhoneHomePages,
+  movePhoneDockTarget,
+  movePhoneHomeTarget,
+  phoneDockTargetIds,
+  phoneHomePages,
+  removePhoneHomeTarget,
+} from "./shell-phone-home.js?v=home-20260813a";
+import {
+  bindPhoneHomePager,
+  phoneHomePerPage,
+  renderPhoneHomePages,
+} from "./shell-phone-home-pager.js?v=home-20260813a";
+import {
+  bindPhoneHomeEdit,
+  enterPhoneHomeEdit,
+  exitPhoneHomeEdit,
+  isPhoneHomeDragging,
+  isPhoneHomeEditing,
+} from "./shell-phone-home-edit.js?v=home-20260813a";
+import { agentStageId, announceStage, setActiveStage } from "./shell-stages.js?v=home-20260813a";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -142,6 +167,97 @@ export function renderDesktop(summary) {
   syncDesktopIconsVisibility();
   updateDesktopSelectionState();
   syncDesktopFirstRunHint();
+  renderPhoneHome(summary);
+}
+
+function shelfPins(summary) {
+  return shellState.shellLayoutState.taskbar.filter((targetId) => Boolean(targetById(summary, targetId)));
+}
+
+// The Home grid as last rendered, page by page: what an edit-mode drop edits.
+let phoneHomePageIds = [[]];
+
+// Rendered at every size; only the phone stylesheet shows it. A drag in
+// flight owns the grid until it lands.
+function renderPhoneHome(summary) {
+  const template = document.querySelector("#phone-home-item-template");
+  if (!template || !summary || isPhoneHomeDragging()) {
+    return;
+  }
+  const pages = fitPhoneHomePages(
+    phoneHomePages(allVisibleTargets(summary), phoneDockIds(summary), shellState.shellLayoutState.homePages),
+    phoneHomePerPage(),
+  );
+  phoneHomePageIds = pages.map((page) => page.map((app) => app.target));
+  renderPhoneHomePages(pages, {
+    buildTile: (app) => {
+      const button = template.content.firstElementChild.cloneNode(true);
+      button.dataset.target = app.target;
+      button.setAttribute("aria-label", `Open ${app.title}`);
+      mountGlyph(button.querySelector(".phone-home-icon"), app.target);
+      button.querySelector(".phone-home-title").textContent = app.title;
+      attachTargetIconInteractions(button, app.target, "home");
+      return button;
+    },
+    buildAgentPage: () => phoneHomeAgentPage(summary),
+  });
+}
+
+// Left of page 1: the doorway to the Agent Space, which is far left of the
+// Space ring on every size.
+function phoneHomeAgentPage(summary) {
+  const template = document.querySelector("#phone-home-assistant-page-template");
+  if (!template || !targetById(summary, PHONE_ASSISTANT_TARGET)) {
+    return null;
+  }
+  const page = template.content.firstElementChild.cloneNode(true);
+  mountGlyph(page.querySelector(".phone-home-assistant-icon"), PHONE_ASSISTANT_TARGET);
+  page.querySelector(".phone-home-assistant-open").addEventListener("click", openPhoneHomeAgent);
+  return page;
+}
+
+function openPhoneHomeAgent() {
+  setActiveStage(agentStageId());
+}
+
+function phoneDockIds(summary) {
+  return phoneDockTargetIds(allVisibleTargets(summary), shelfPins(summary), shellState.shellLayoutState.homeDock);
+}
+
+function phoneDockHasRoom() {
+  return phoneDockIds(shellState.currentSummary).length < PHONE_DOCK_SLOTS;
+}
+
+/* One edit-mode drop, written to the phone's own arrangement (homeDock and
+   homePages, from the Dock and the grid as shown); the desktop Shelf never
+   moves. */
+function dropOnPhoneHome({ targetId, to }) {
+  const summary = shellState.currentSummary;
+  if (!summary) {
+    return;
+  }
+  const layout = shellState.shellLayoutState;
+  const dock = phoneDockIds(summary);
+  if (to.kind === "dock") {
+    const nextDock = movePhoneDockTarget(dock, targetId, to.index);
+    if (!nextDock) {
+      restorePhoneHome();
+      return;
+    }
+    layout.homeDock = nextDock;
+    layout.homePages = removePhoneHomeTarget(phoneHomePageIds, targetId);
+  } else {
+    layout.homeDock = dock.filter((id) => id !== targetId);
+    layout.homePages = movePhoneHomeTarget(phoneHomePageIds, targetId, to.page, to.index, phoneHomePerPage());
+  }
+  commitTaskbarLayoutChange();
+}
+
+function restorePhoneHome() {
+  if (shellState.currentSummary) {
+    renderTaskbar(shellState.currentSummary);
+    renderPhoneHome(shellState.currentSummary);
+  }
 }
 
 /* First-contact teaching (session-only): after the desktop stopped carrying
@@ -536,14 +652,17 @@ export function renderTaskbar(summary) {
 function renderTaskbarEntries(summary) {
   taskbarTargets.replaceChildren();
   const pinnedIds = new Set(shellState.shellLayoutState.taskbar);
+  // The phone Dock is the phone's own row; running apps are in the switcher.
+  const phone = isPhone();
   const notificationCounts = notificationCountsBySourceApp(summary);
   let separatorInserted = false;
-  for (const targetId of visibleTaskbarTargets(summary)) {
+  for (const targetId of phone ? phoneDockIds(summary) : visibleTaskbarTargets(summary)) {
     const app = targetById(summary, targetId);
     if (!app) {
       continue;
     }
     if (
+      !phone &&
       !pinnedIds.has(targetId) &&
       !separatorInserted &&
       taskbarTargets.childElementCount > 0
@@ -557,6 +676,7 @@ function renderTaskbarEntries(summary) {
     const entry = taskbarItemTemplate.content.firstElementChild.cloneNode(true);
     const button = entry.querySelector(".taskbar-item");
     const openCount = browserWindowCount(app.target);
+    entry.dataset.phoneDock = phone ? "slot" : "off";
     button.dataset.target = app.target;
     button.dataset.label = app.title;
     mountGlyph(button.querySelector(".taskbar-item-icon"), app.target);
@@ -592,6 +712,8 @@ function appendTaskbarTrash(summary) {
   const entryId = desktopObjectEntryId(trashObject);
   const entry = taskbarItemTemplate.content.firstElementChild.cloneNode(true);
   const button = entry.querySelector(".taskbar-item");
+  // On the phone the Bin is a Library place, not a Dock tile.
+  entry.dataset.phoneDock = "off";
   const empty = trashObject.metadata?.empty !== false;
   button.dataset.label = "Bin";
   button.setAttribute("aria-label", empty ? "Bin. Empty." : "Bin. Contains items.");
@@ -634,6 +756,8 @@ export function updateTaskbarState() {
   for (const button of taskbarTargets.querySelectorAll(".taskbar-item[data-target]")) {
     updateTaskbarButton(button, button.dataset.target);
   }
+  // Every window open/close/focus lands here; the phone Dock tucks or returns.
+  syncPhoneDock();
 }
 
 function commitTaskbarLayoutChange() {
@@ -642,6 +766,7 @@ function commitTaskbarLayoutChange() {
     return;
   }
   renderTaskbar(shellState.currentSummary);
+  renderPhoneHome(shellState.currentSummary);
   refreshLauncherIfVisible();
 }
 
@@ -1218,6 +1343,10 @@ function beginTargetDrag(event, targetId, source, sourceElement) {
     return;
   }
   if (sourceElement.classList.contains("editing")) {
+    return;
+  }
+  // The phone Dock rearranges in the Home edit mode (shell-phone-home-edit.js).
+  if (source === "taskbar" && isPhone()) {
     return;
   }
   clearSlowClickRename();
@@ -1900,7 +2029,10 @@ export function openDesktopContextMenu(clientX, clientY, target) {
     document.activeElement && document.activeElement !== document.body
       ? document.activeElement
       : null;
-  renderContextMenu(target);
+  // On the phone the menu is a bottom sheet the thumb reaches, not a popup
+  // under a finger that hides it; CSS places the sheet.
+  const sheet = isPhone();
+  renderContextMenu(target, { sheet });
   closeOtherShellPopovers("context-menu");
   // Clear inert before measuring so geometry is valid.
   prepareSurfaceOpen(desktopContextMenu);
@@ -1912,12 +2044,17 @@ export function openDesktopContextMenu(clientX, clientY, target) {
     (window.performance ? window.performance.now() : Date.now()) +
     CONTEXT_MENU_IGNORE_OUTSIDE_MS;
 
-  const menuRect = desktopContextMenu.getBoundingClientRect();
-  const left = clamp(clientX, 12, window.innerWidth - menuRect.width - 12);
-  const top = clamp(clientY, 42, window.innerHeight - menuRect.height - 12);
-
-  desktopContextMenu.style.left = `${left}px`;
-  desktopContextMenu.style.top = `${top}px`;
+  desktopContextMenu.classList.toggle("context-menu-sheet", sheet);
+  if (sheet) {
+    desktopContextMenu.style.removeProperty("left");
+    desktopContextMenu.style.removeProperty("top");
+  } else {
+    const menuRect = desktopContextMenu.getBoundingClientRect();
+    const left = clamp(clientX, 12, window.innerWidth - menuRect.width - 12);
+    const top = clamp(clientY, 42, window.innerHeight - menuRect.height - 12);
+    desktopContextMenu.style.left = `${left}px`;
+    desktopContextMenu.style.top = `${top}px`;
+  }
   setOverlayOpen(desktopContextMenu, true, {
     invoker: shellState.contextMenuInvoker,
     focusEl: contextMenuFocusables()[0],
@@ -1977,8 +2114,18 @@ function handleContextMenuKeydown(event) {
   }
 }
 
-function renderContextMenu(target) {
+function renderContextMenu(target, { sheet = false } = {}) {
   desktopContextMenu.replaceChildren();
+  const title = target.kind === "target" ? targetTitle(shellState.currentSummary, target.targetId) : "";
+  desktopContextMenu.setAttribute("aria-label", title ? `${title} actions` : "Home actions");
+  // A sheet sits away from the pressed icon, so it names what it acts on.
+  if (sheet && title) {
+    const heading = document.createElement("div");
+    heading.className = "context-menu-title";
+    heading.setAttribute("aria-hidden", "true");
+    heading.textContent = title;
+    desktopContextMenu.appendChild(heading);
+  }
   for (const item of contextMenuItems(target)) {
     if (item.kind === "divider") {
       const divider = document.createElement("div");
@@ -2026,6 +2173,13 @@ function contextMenuItems(target) {
       { action: "open-desktop-group", label: `Open ${count} Items` },
       { kind: "divider" },
       { action: "clear-desktop-selection", label: "Deselect All" },
+    ];
+  }
+  // The phone Home is the app grid; desktop files live in Library there.
+  if (isPhone()) {
+    return [
+      { action: "edit-home-screen", label: "Edit Home Screen" },
+      { action: "change-wallpaper", label: "Change Wallpaper…" },
     ];
   }
   const iconsVisible = shellState.shellLayoutState.desktopIconsVisible !== false;
@@ -2111,8 +2265,18 @@ function targetContextMenuItems(target) {
   if (target.source === "desktop" || target.source === "launcher") {
     items.push(desktopPinMenuItem(target.targetId));
   }
-  items.push(taskbarPinMenuItem(target.targetId));
+  const onPhoneHome = target.source === "home" || (target.source === "taskbar" && isPhone());
+  if (!onPhoneHome) {
+    items.push(taskbarPinMenuItem(target.targetId));
+  } else if (phoneDockIds(shellState.currentSummary).includes(target.targetId)) {
+    items.push({ action: "remove-phone-dock", label: "Remove from Dock" });
+  } else if (phoneDockHasRoom()) {
+    items.push({ action: "add-phone-dock", label: "Add to Dock" });
+  }
   appendTargetGroupManagementItems(items, openWindows);
+  if (onPhoneHome) {
+    items.push({ kind: "divider" }, { action: "edit-home-screen", label: "Edit Home Screen" });
+  }
   return items;
 }
 
@@ -2139,6 +2303,10 @@ export function handleContextAction(action) {
   }
   if (action === "change-wallpaper") {
     openTarget("system", { query: { settings: "personalization" } });
+    return;
+  }
+  if (action === "edit-home-screen") {
+    enterPhoneHomeEdit();
     return;
   }
   if (shellState.contextMenuTarget.kind === "desktop-object") {
@@ -2241,6 +2409,21 @@ export function handleContextAction(action) {
       rerenderShellLayout();
       refreshLauncherIfVisible();
     }
+    return;
+  }
+  if (action === "add-phone-dock") {
+    dropOnPhoneHome({
+      targetId: shellState.contextMenuTarget.targetId,
+      to: { kind: "dock", index: PHONE_DOCK_SLOTS },
+    });
+    return;
+  }
+  if (action === "remove-phone-dock") {
+    const lastPage = phoneHomePageIds.length - 1;
+    dropOnPhoneHome({
+      targetId: shellState.contextMenuTarget.targetId,
+      to: { kind: "grid", page: lastPage, index: phoneHomePageIds[lastPage].length },
+    });
     return;
   }
   if (action === "pin-taskbar") {
@@ -2836,6 +3019,31 @@ export function bindShellSurfaceDom(options = {}) {
   setupDock();
   syncDockAutoHide();
   bindDockAutoHideReveal();
+  let phoneLayout = isPhone();
+  bindPhoneHomePager({
+    openAgent: openPhoneHomeAgent,
+    editing: isPhoneHomeEditing,
+    resized: () => {
+      if (!shellState.currentSummary) {
+        return;
+      }
+      // Crossing into or out of the phone swaps the Dock's rows.
+      if (isPhone() !== phoneLayout) {
+        phoneLayout = isPhone();
+        exitPhoneHomeEdit();
+        renderTaskbar(shellState.currentSummary);
+      }
+      renderPhoneHome(shellState.currentSummary);
+    },
+  });
+  bindPhoneHomeEdit({
+    active: isPhone,
+    dockHasRoom: phoneDockHasRoom,
+    drop: dropOnPhoneHome,
+    restore: restorePhoneHome,
+    hideMenu: () => hideDesktopContextMenu(),
+    announce: announceStage,
+  });
 }
 
 /* ---- Dock auto-hide (host-persisted preference; see home:ui-preference) ----

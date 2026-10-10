@@ -1597,3 +1597,228 @@
         display: none;
       }
     }
+
+    /* Phone stage (Files on iPhone): one header block — a navigation row with
+       the current folder as its title, then Favorites as a sliding chip row —
+       so the list starts high. Back and Up cover touch navigation (iOS has no
+       Forward); the full path collapses to its current folder; opening Search
+       gives the field the navigation row. Controls meet the 44 px target, rows
+       are 48 px, and the field is 16 px so iOS does not zoom on focus. */
+    :root[data-el-form-factor="phone"] {
+      --library-phone-bar: 52px;
+      --library-phone-chips: calc(var(--el-touch-target) + 8px);
+      --library-phone-row: 48px;
+    }
+
+    /* The sidebar precedes main in the DOM, so the chip row is laid under the
+       navigation row and main reserves its height; both rows are one line. */
+    :root[data-el-form-factor="phone"] .shell {
+      position: relative;
+      display: block;
+      overflow: hidden;
+    }
+
+    :root[data-el-form-factor="phone"] .sidebar {
+      position: absolute;
+      z-index: 2;
+      top: var(--library-phone-bar);
+      left: 0;
+      right: 0;
+      height: var(--library-phone-chips);
+      box-sizing: border-box;
+      overflow: visible;
+      padding: 0 0 8px;
+      border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+      background: var(--sidebar-bg);
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
+    }
+
+    :root[data-el-form-factor="phone"] .window-sidebar-title,
+    :root[data-el-form-factor="phone"] #forward-button,
+    :root[data-el-form-factor="phone"] .path-seperator,
+    :root[data-el-form-factor="phone"] .crumb:not(.crumb-current) {
+      display: none;
+    }
+
+    :root[data-el-form-factor="phone"] .places {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      overscroll-behavior-x: contain;
+      scroll-snap-type: x proximity;
+      scroll-padding-inline: max(12px, env(safe-area-inset-left, 0px));
+      scrollbar-width: none;
+      padding: 0 max(12px, env(safe-area-inset-right, 0px)) 0 max(12px, env(safe-area-inset-left, 0px));
+    }
+
+    :root[data-el-form-factor="phone"] .places::-webkit-scrollbar {
+      display: none;
+    }
+
+    :root[data-el-form-factor="phone"] .place {
+      flex: 0 0 auto;
+      width: auto;
+      min-height: var(--el-touch-target);
+      padding: 0 14px 0 12px;
+      scroll-snap-align: start;
+      background: var(--el-inset);
+      font-size: 15px;
+    }
+
+    :root[data-el-form-factor="phone"] .place[data-active="true"] {
+      background: color-mix(in srgb, var(--accent) 16%, transparent);
+      color: var(--accent);
+    }
+
+    :root[data-el-form-factor="phone"] .place-label {
+      max-width: 160px;
+    }
+
+    :root[data-el-form-factor="phone"] .toolbar {
+      display: flex;
+      flex-wrap: nowrap;
+      gap: 0;
+      box-sizing: border-box;
+      height: var(--library-phone-bar);
+      min-height: 0;
+      margin-bottom: var(--library-phone-chips);
+      padding: 4px max(4px, env(safe-area-inset-right, 0px)) 4px max(4px, env(safe-area-inset-left, 0px));
+      border-bottom: 0;
+      background: var(--sidebar-bg);
+    }
+
+    :root[data-el-form-factor="phone"] .toolbar-left,
+    :root[data-el-form-factor="phone"] .toolbar-right {
+      flex-wrap: nowrap;
+      gap: 0;
+    }
+
+    :root[data-el-form-factor="phone"] .toolbar-right {
+      flex: 0 0 auto;
+    }
+
+    :root[data-el-form-factor="phone"] .navbar-btn {
+      flex: 0 0 auto;
+      width: var(--el-touch-target);
+      height: var(--el-touch-target);
+      margin: 0;
+    }
+
+    :root[data-el-form-factor="phone"] .navbar-btn img,
+    :root[data-el-form-factor="phone"] .navbar-btn .inline-icon {
+      width: 20px;
+      height: 20px;
+    }
+
+    :root[data-el-form-factor="phone"] .pathbar {
+      order: 0;
+      flex: 1 1 auto;
+      width: auto;
+      min-width: 0;
+      min-height: 0;
+      padding: 0 4px;
+      border: 0;
+      background: transparent;
+    }
+
+    :root[data-el-form-factor="phone"] .breadcrumbs {
+      height: var(--el-touch-target);
+    }
+
+    :root[data-el-form-factor="phone"] .crumb {
+      max-width: 100%;
+      padding: 0 4px;
+      font-size: 17px;
+      line-height: var(--el-touch-target);
+    }
+
+    :root[data-el-form-factor="phone"] .toolbar-search {
+      flex: 0 0 auto;
+    }
+
+    /* Each segment is a full 44 px target with its pill painted inside the
+       padding; drop-shadow follows the painted pill where box-shadow would
+       ring the whole target. */
+    :root[data-el-form-factor="phone"] .window-navbar-layout-toggle {
+      margin: 0;
+      padding: 0;
+      gap: 0;
+      border-radius: 12px;
+    }
+
+    :root[data-el-form-factor="phone"] .layout-toggle-segment {
+      width: var(--el-touch-target);
+      height: var(--el-touch-target);
+      padding: 4px;
+      border-radius: 12px;
+      background-clip: content-box;
+    }
+
+    :root[data-el-form-factor="phone"] .layout-toggle-segment-active {
+      box-shadow: none;
+      filter: drop-shadow(0 1px 2px rgb(0 0 0 / 0.24));
+    }
+
+    :root[data-el-form-factor="phone"] .shell[data-search-open="true"] .toolbar-left,
+    :root[data-el-form-factor="phone"] .shell[data-search-open="true"] .window-navbar-layout-toggle {
+      display: none;
+    }
+
+    :root[data-el-form-factor="phone"] .shell[data-search-open="true"] .toolbar-right,
+    :root[data-el-form-factor="phone"] .shell[data-search-open="true"] .toolbar-search {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+
+    :root[data-el-form-factor="phone"] .toolbar-search.open .search {
+      flex: 1 1 auto;
+      width: auto;
+      min-width: 0;
+      height: 36px;
+      padding: 0 12px;
+      border-radius: 10px;
+      font-size: 16px;
+    }
+
+    :root[data-el-form-factor="phone"] .explore-table-headers {
+      display: none;
+    }
+
+    :root[data-el-form-factor="phone"] .content[data-view="list"] .item {
+      grid-template-rows: var(--library-phone-row);
+      height: var(--library-phone-row);
+      padding-left: max(8px, env(safe-area-inset-left, 0px));
+    }
+
+    :root[data-el-form-factor="phone"] .content[data-view="list"] .item-name {
+      height: var(--library-phone-row);
+      padding-right: 12px;
+      font-size: 16px;
+      line-height: var(--library-phone-row);
+    }
+
+    /* Status (loading, uploads, errors) has no room in the navigation row;
+       it floats above the footer as a pill instead. */
+    :root[data-el-form-factor="phone"] #status-text {
+      position: fixed;
+      z-index: 3;
+      left: 50%;
+      bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+      max-width: calc(100% - 32px);
+      transform: translateX(-50%);
+      padding: 8px 14px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: var(--el-surface-raised);
+      box-shadow: var(--el-shadow-2);
+      color: var(--ink);
+      font-size: 13px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      pointer-events: none;
+    }
+
+    :root[data-el-form-factor="phone"] .statusbar {
+      padding-bottom: max(14px, env(safe-area-inset-bottom, 0px));
+    }

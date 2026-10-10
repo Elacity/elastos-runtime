@@ -20,6 +20,7 @@ import {
   prepareSurfaceOpen,
 } from "./shell-motion.js?v=home-20260813a";
 import { showWalletRail } from "./shell-wallet-rail.js?v=home-20260813a";
+import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20260813a";
 
 const MAX_ENTRIES = 50;
 const WEEKDAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
@@ -372,6 +373,12 @@ export function bindNotificationCenter() {
   clearButton?.addEventListener("click", () => {
     saveHistory([]);
     renderNotificationCenter();
+  });
+  bindSheetHandle(document.querySelector("#notification-center-handle"), {
+    sheet: panel,
+    direction: SHEET_DRAG_UP,
+    close: () => hideNotificationCenter(),
+    tapCloses: true,
   });
   renderNcTimeChrome();
 }

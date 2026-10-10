@@ -40,6 +40,7 @@ import {
   homeClipboardTargetSupported,
 } from "./home-clipboard-host.js?v=home-20260726a";
 import { loadOrCreateHomeBrowserContextId } from "./home-browser-context.js?v=home-20260805a";
+import { bindKeyboardInsetRelay } from "./home-keyboard-inset.js?v=home-20260924a";
 import { createHomeLinkStatus } from "./home-link-status.js?v=home-20260924a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
@@ -1482,6 +1483,7 @@ function registerHomeServiceWorker() {
 }
 
 applyActiveShellBootHint();
+bindKeyboardInsetRelay({ post: postToActiveShell, frame: activeShellFrame });
 const homeLink = createHomeLinkStatus({
   post: postToActiveShell,
   retry: () => requestShellSummaryRefresh({ reason: "reconnect", delay: 0 }),
