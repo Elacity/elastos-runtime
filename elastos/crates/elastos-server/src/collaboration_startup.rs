@@ -1501,7 +1501,39 @@ mod tests {
             first
         );
 
-        wait_for_requests(&carrier, 4).await;
+        let presence = service_presence_port
+            .prepare_presence(
+                presence_request_binding(
+                    "startup-presence-request",
+                    "runtime-principal",
+                    &person_profile,
+                )
+                .unwrap(),
+                &person_profile,
+                now,
+            )
+            .unwrap();
+        let presence_frame = String::from_utf8(
+            service_port
+                .test_core()
+                .prepare_transport_frame(presence.test_envelope_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let operations = request_ops(&carrier);
+                if ["gossip_send", "gossip_peek", "gossip_ack"]
+                    .iter()
+                    .all(|required| operations.iter().any(|op| op == required))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         service.shutdown().await.unwrap();
         let requests = carrier.requests();
         let operations = request_ops(&carrier);
@@ -1516,6 +1548,17 @@ mod tests {
         for operation in ["gossip_send", "gossip_peek", "gossip_ack"] {
             assert!(operations.iter().any(|op| op == operation));
         }
+        assert!(requests
+            .iter()
+            .filter(|request| request["op"] == "gossip_send")
+            .all(|request| request["message"].as_str() == Some(presence_frame.as_str())));
+        let core = service_port.test_core();
+        let peers = service_presence_port.history_participants(now).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].endpoint_did, core.local_device_did());
+        assert!(core.pending_outgoing(now).unwrap().iter().any(|message| {
+            message.shared_chat() && message.envelope_sha256() == first.envelope_sha256()
+        }));
         let consumers: std::collections::HashSet<_> = requests
             .iter()
             .filter(|request| matches!(request["op"].as_str(), Some("gossip_peek" | "gossip_ack")))
