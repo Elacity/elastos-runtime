@@ -1021,22 +1021,30 @@ mod tests {
             .sender_profile_for_test()
             .unwrap();
         let kind = crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE;
-        ac.prepare_profile_outgoing(
-            operation(&profile, "local-metadata", kind, &serde_json::json!({}), 45),
-            &profile,
-            kind,
-            serde_json::json!({}),
-            NOW,
-            45,
-        )
-        .unwrap();
+        let metadata = ac
+            .prepare_profile_outgoing(
+                operation(&profile, "local-metadata", kind, &serde_json::json!({}), 45),
+                &profile,
+                kind,
+                serde_json::json!({}),
+                NOW,
+                45,
+            )
+            .unwrap();
+        ac.acknowledge_outgoing_product_projection(metadata.envelope_sha256())
+            .unwrap();
+        assert!(ac
+            .pending_outgoing(NOW)
+            .unwrap()
+            .iter()
+            .any(|message| message.envelope_sha256() == metadata.envelope_sha256()));
         let outgoing = prepare_outgoing(&ac, "Chat", serde_json::json!({"content":"direct"}));
         ac.acknowledge_outgoing_product_projection(outgoing.envelope_sha256())
             .unwrap();
         let carrier = FakeCarrier::new();
         carrier.blocked_metadata.store(true, Ordering::SeqCst);
         let (driver, plane) =
-            home_driver(&a, ac.clone(), carrier, &b, bc.clone(), true, false).await;
+            home_driver(&a, ac.clone(), carrier.clone(), &b, bc.clone(), true, false).await;
         let driver = Arc::new(driver);
         for count in [1, 2] {
             let running = driver.clone();
@@ -1049,6 +1057,15 @@ mod tests {
                 );
                 tokio::task::yield_now().await;
             }
+            assert_eq!(
+                carrier
+                    .requests()
+                    .iter()
+                    .filter(|request| request["op"] == "gossip_send")
+                    .count(),
+                count,
+                "each direct attempt starts while its metadata send is blocked"
+            );
             assert!(
                 !cycle.is_finished(),
                 "metadata must still be pending at direct dispatch"
@@ -1285,12 +1302,17 @@ mod tests {
         let core = fixture.core();
         let (sender, _) = generate_keypair();
         let source = crate::crypto::encode_signing_key_did(&sender);
-        let backlog = crate::collaboration_core::MAX_PENDING_INCOMING_PER_SENDER;
-        for i in 0..=backlog {
+        let receive_limit =
+            crate::collaboration_rate_limit::COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW;
+        let mut held_hash = None;
+        for i in 0..=receive_limit {
             let (_, message) = remote_message(&fixture, sender.clone(), &format!("held-{i}"));
+            if i == receive_limit {
+                held_hash = Some(collaboration_message_envelope_sha256(&message));
+            }
             let wire = sign_collaboration_transport_frame(&sender, &message).unwrap();
             let accepted = core.accept_home_chat(&wire, &source, NOW);
-            assert_eq!(accepted.is_ok(), i < backlog);
+            assert_eq!(accepted.is_ok(), i < receive_limit);
         }
         for handoff in core.pending_product_handoffs().unwrap() {
             core.acknowledge_product_handoff(
@@ -1298,6 +1320,7 @@ mod tests {
             )
             .unwrap();
         }
+        assert!(core.pending_product_handoffs().unwrap().is_empty());
         let carrier = FakeCarrier::new();
         let driver = fixture.driver(core.clone(), carrier.clone()).await;
         carrier.push([serde_json::json!({"status":"ok","data":{"messages":[],"scanned":0,"limit":32,"cursor":0,"next_cursor":0}}), serde_json::json!({"status":"ok","data":{"cursor":0,"next_cursor":0,"advanced":false}})]);
@@ -1310,7 +1333,12 @@ mod tests {
         assert!(
             matches!(result, CollaborationIncomingOnceOutcome::Acknowledged(summary) if summary.incoming_acceptances == 1 && summary.acceptance_receipt_broadcasts == 0)
         );
-        assert_eq!(core.pending_product_handoffs().unwrap().len(), 1);
+        let handoffs = core.pending_product_handoffs().unwrap();
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(
+            handoffs[0].authorized_message().message().envelope_sha256(),
+            held_hash.unwrap()
+        );
         assert!(carrier
             .requests()
             .iter()
