@@ -305,8 +305,9 @@ def touched_workspaces(root, paths, lease):
         if folder.exists():
             raise GateError("removed Rust package manifest left its directory behind: " +
                             folder.relative_to(root).as_posix())
-    broad = bool(removed) or any(path in {"rust-toolchain.toml", ".cargo/config.toml"} for path in paths)
-    runtime_input = broad or any(path in {"elastos/Cargo.toml", "elastos/Cargo.lock"}
+    configuration_change = any(path in {"rust-toolchain.toml", ".cargo/config.toml"} for path in paths)
+    broad = bool(removed) or configuration_change
+    runtime_input = configuration_change or any(path in {"elastos/Cargo.toml", "elastos/Cargo.lock"}
                                  or path.startswith(("elastos/.cargo/", "elastos/wit/", "elastos/config/")) for path in paths)
     input_owners = external_input_owners(root, runtime_packages, paths)
     seeds = set(input_owners)
@@ -369,7 +370,9 @@ def touched_workspaces(root, paths, lease):
         if workspace not in checked:
             continue
         relative = workspace.relative_to(root).as_posix()
-        workspace_change = broad or (workspace == runtime and runtime_input) or any(path in {
+        # Removal checks all remaining workspaces for dangling references.
+        # Unit evidence still belongs to changed inputs and their owners.
+        workspace_change = configuration_change or (workspace == runtime and runtime_input) or any(path in {
             relative + "/Cargo.toml", relative + "/Cargo.lock", relative + "/.cargo/config.toml",
         } for path in paths)
         selected = []

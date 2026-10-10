@@ -703,18 +703,25 @@ class PrepushTests(unittest.TestCase):
     def test_whole_package_removal_checks_every_workspace(self):
         self.git("rm", "-rq", "capsules/wallet-provider")
         self.commit()
-        result = self.invoke()
+        result = self.invoke(extra={"PREPUSH_EMPTY_PACKAGE": "chain-provider"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         checked = {Path(c["cwd"]).relative_to(self.root).as_posix() for c in self.commands()
                    if c["tool"] == "cargo" and c["args"][0] == "check"}
         self.assertEqual(checked, {"elastos", "capsules/chain-provider", "capsules/chat-room-ui",
                                    "capsules/protected-content-protect-provider",
                                    "capsules/protected-content-decrypt-provider", "capsules/custody-provider"})
+        self.assertFalse(any(c["args"][:3] == ["test", "-p", "chain-provider"]
+                             for c in self.commands()))
         self.log.unlink()
         dangling = json.dumps({"capsules/chain-provider": ["capsules/wallet-provider"]})
         result = self.invoke(extra={"PREPUSH_GRAPH": dangling})
         self.assert_stopped(result, "command failed: cargo")
         self.assertIn("capsules/wallet-provider", result.stderr)
+        self.log.unlink()
+        self.write("capsules/chain-provider/src/lib.rs", "// changed provider\n")
+        self.commit()
+        self.assert_stopped(self.invoke(extra={"PREPUSH_EMPTY_PACKAGE": "chain-provider"}),
+                            "chain-provider has zero unit tests")
 
     def test_busy_lease_refuses_and_retains_the_same_inode(self):
         lock = self.root / ".git/local-ai-heavy-build.lock"
