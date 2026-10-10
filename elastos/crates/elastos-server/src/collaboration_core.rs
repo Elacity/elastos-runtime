@@ -2703,7 +2703,7 @@ mod tests {
 
     #[test]
     fn entered_home_delivery_and_receipt_writes_finish_before_leave() {
-        use std::sync::{mpsc, TryLockError};
+        use std::sync::{mpsc, Arc, TryLockError};
         use std::time::{Duration, Instant};
 
         for settlement in [false, true] {

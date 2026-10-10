@@ -547,6 +547,7 @@ mod tests {
             Arc::new(Self {
                 requests: Mutex::new(Vec::new()),
                 replies: Mutex::new(VecDeque::new()),
+                blocked_metadata: AtomicBool::new(false),
             })
         }
         fn push(&self, replies: impl IntoIterator<Item = serde_json::Value>) {
