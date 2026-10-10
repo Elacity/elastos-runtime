@@ -171,6 +171,11 @@ class PrepushTests(unittest.TestCase):
                     tree = subprocess.check_output(["git", "-C", remote, "rev-parse", old + "^{tree}"], text=True).strip()
                     commit = subprocess.check_output(["git", "-C", remote, "commit-tree", tree, "-p", old, "-m", "base advanced"], text=True).strip()
                     subprocess.run(["git", "-C", remote, "update-ref", "refs/heads/develop", commit], check=True)
+                for dependencies in json.loads(os.environ.get("PREPUSH_GRAPH", "{}")).values():
+                    for dependency in dependencies:
+                        folder = dependency if isinstance(dependency, str) else dependency["path"]
+                        if not (root / folder).exists():
+                            sys.exit("failed to load manifest for dependency " + folder)
                 if os.environ.get("PREPUSH_FAIL"):
                     sys.exit(1)
             elif args[0] == "build":
@@ -693,7 +698,23 @@ class PrepushTests(unittest.TestCase):
         self.assertTrue(any(c["args"][:3] == ["test", "-p", "wallet-provider"] for c in self.commands()))
         (self.root / "capsules/wallet-provider/Cargo.toml").unlink()
         self.commit()
-        self.assert_stopped(self.invoke(), "removed Rust package")
+        self.assert_stopped(self.invoke(), "removed Rust package manifest left its directory behind")
+
+    def test_whole_package_removal_checks_every_workspace(self):
+        self.git("rm", "-rq", "capsules/wallet-provider")
+        self.commit()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        checked = {Path(c["cwd"]).relative_to(self.root).as_posix() for c in self.commands()
+                   if c["tool"] == "cargo" and c["args"][0] == "check"}
+        self.assertEqual(checked, {"elastos", "capsules/chain-provider", "capsules/chat-room-ui",
+                                   "capsules/protected-content-protect-provider",
+                                   "capsules/protected-content-decrypt-provider", "capsules/custody-provider"})
+        self.log.unlink()
+        dangling = json.dumps({"capsules/chain-provider": ["capsules/wallet-provider"]})
+        result = self.invoke(extra={"PREPUSH_GRAPH": dangling})
+        self.assert_stopped(result, "command failed: cargo")
+        self.assertIn("capsules/wallet-provider", result.stderr)
 
     def test_busy_lease_refuses_and_retains_the_same_inode(self):
         lock = self.root / ".git/local-ai-heavy-build.lock"

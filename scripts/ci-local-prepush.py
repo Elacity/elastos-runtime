@@ -296,7 +296,16 @@ def touched_workspaces(root, paths, lease):
     manifests = {root / path for path in paths_from_git(root, "ls-files", "-z", "*Cargo.toml")}
     discoverable = {manifest for manifest in manifests
                     if not {"templates", "fixtures"}.intersection(manifest.relative_to(root).parts)}
-    broad = any(path in {"rust-toolchain.toml", ".cargo/config.toml"} for path in paths)
+    # A whole removed package (manifest and directory gone) is accepted; every
+    # workspace is checked so a remaining reference to it fails the gate.
+    removed = {(root / path).parent for path in paths
+               if path.endswith("/Cargo.toml") and not (root / path).exists()
+               and not {"templates", "fixtures"}.intersection(Path(path).parts)}
+    for folder in removed:
+        if folder.exists():
+            raise GateError("removed Rust package manifest left its directory behind: " +
+                            folder.relative_to(root).as_posix())
+    broad = bool(removed) or any(path in {"rust-toolchain.toml", ".cargo/config.toml"} for path in paths)
     runtime_input = broad or any(path in {"elastos/Cargo.toml", "elastos/Cargo.lock"}
                                  or path.startswith(("elastos/.cargo/", "elastos/wit/", "elastos/config/")) for path in paths)
     input_owners = external_input_owners(root, runtime_packages, paths)
@@ -312,8 +321,8 @@ def touched_workspaces(root, paths, lease):
     for path in paths:
         if path.endswith("/Cargo.toml") and {"templates", "fixtures"}.intersection(Path(path).parts):
             continue
-        if path.endswith("/Cargo.toml") and not (root / path).exists():
-            raise GateError("removed Rust package needs an explicit acceptance plan: " + path)
+        if any((root / path).is_relative_to(folder) for folder in removed):
+            continue
         manifest = next((parent / "Cargo.toml" for parent in (root / path).parents
                          if parent / "Cargo.toml" in manifests), None)
         if manifest:
