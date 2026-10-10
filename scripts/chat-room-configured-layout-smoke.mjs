@@ -161,6 +161,7 @@ function startServer(scenario) {
     cycles: [],
     current: null,
     directConversations: 0,
+    directListUnavailable: scenario === "direct-list-unavailable",
     directMessages: 0,
     freshDirectRequests: 0,
     heldBoundary: holdBoundary,
@@ -379,6 +380,9 @@ function startServer(scenario) {
       }
       if (url.pathname === "/api/apps/chat-room/direct/conversations") {
         trace.directConversations += 1;
+        if (trace.directListUnavailable) {
+          return json(response, { error: "direct messaging is unavailable on this Home", code: "direct_service_unavailable" }, 503);
+        }
         if (initialDirectRecovery) {
           if (request.headers["x-elastos-home-token"] !== "fresh-token") {
             return json(response, { error: "Home session expired" }, 401);
@@ -628,6 +632,31 @@ async function runScenario(scenario) {
     await page.goto(url, { waitUntil: "domcontentloaded" });
     let frame = await chatFrame(page);
 
+    if (scenario === "direct-list-unavailable") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "unavailable Direct list");
+      const error = frame.locator("#error-text");
+      const detail = "Direct conversations are temporarily unavailable.";
+      await error.waitFor({ state: "visible" });
+      assert(await error.innerText() === detail, "initial Direct list failure is silent");
+      const draft = "Keep this Community draft through Direct list recovery";
+      await frame.locator("#message-input").fill(draft);
+      await waitFor(() => trace.directConversations >= 3);
+      assert(await error.isVisible() && await error.innerText() === detail,
+        "successful Community refresh cleared a current Direct list failure");
+      assert(await frame.locator("#message-input").inputValue() === draft, "failed list read changed the draft");
+      trace.directListUnavailable = false;
+      await error.waitFor({ state: "hidden" });
+      await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').waitFor({ state: "visible" });
+      assert(await frame.locator("#message-input").inputValue() === draft, "recovered list read changed the draft");
+      trace.directListUnavailable = true;
+      await error.waitFor({ state: "visible" });
+      assert(await error.innerText() === detail, "later Direct list failure is silent");
+      trace.directListUnavailable = false;
+      await error.waitFor({ state: "hidden" });
+      assert(await frame.locator("#message-input").inputValue() === draft, "second recovery changed the draft");
+      return;
+    }
+
     if (scenario === "shell-layout-visibility") {
       await frame.evaluate(() => {
         window.fixtureLayouts = [];
@@ -726,7 +755,7 @@ async function runScenario(scenario) {
       await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').click();
       const original = frame.locator('[data-direct-message-id="message:retry-original"]');
       await original.locator('[data-direct-action="retry"]').waitFor({ state:"visible" });
-      assert((await original.innerText()).includes("Waiting for delivery"), "pending delivery copy is inaccurate");
+      assert((await original.innerText()).includes("Sending"), "pending delivery copy is inaccurate");
       const draft = "Keep my current draft while retrying a different message";
       await frame.locator("#message-input").fill(draft);
       await original.locator('[data-direct-action="retry"]').click();
@@ -1329,6 +1358,7 @@ async function main() {
     "single-conversation",
     "session-failure",
     "summary-failure",
+    "direct-list-unavailable",
     "direct-switch",
     "direct-switch-hold-initial-conversations",
     "direct-switch-hold-bootstrap-messages",

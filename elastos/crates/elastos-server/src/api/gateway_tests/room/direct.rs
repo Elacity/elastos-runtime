@@ -626,7 +626,19 @@ async fn direct_api_pending_retry_settles_the_same_durable_envelope() {
 async fn direct_api_authority_configuration_and_corruption_fail_closed() {
     let fixture = direct_api_route_fixture().await;
 
-    let missing_service = gateway_router(test_state(fixture.dir.path()))
+    let unconfigured = gateway_router(test_state(fixture.dir.path()));
+    let invalid_authority = unconfigured
+        .clone()
+        .oneshot(direct_api_request(
+            Some(&fixture.wrong_capsule_token),
+            "GET",
+            "/api/apps/chat-room/direct/conversations",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_authority.status(), StatusCode::UNAUTHORIZED);
+    let missing_service = unconfigured
         .oneshot(direct_api_request(
             Some(&fixture.chat_token),
             "GET",
@@ -635,7 +647,14 @@ async fn direct_api_authority_configuration_and_corruption_fail_closed() {
         ))
         .await
         .unwrap();
-    assert_eq!(missing_service.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(missing_service.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_response(missing_service).await,
+        json!({
+            "error": "direct messaging is unavailable on this Home",
+            "code": "direct_service_unavailable"
+        })
+    );
 
     let empty = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_name(empty.path(), Some("Setup Name"));

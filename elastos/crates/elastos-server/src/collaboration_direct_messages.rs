@@ -164,6 +164,7 @@ pub(crate) enum DirectApiError {
     RetryExpired,
     RetryUnavailable,
     Authority,
+    ServiceUnavailable,
     Internal,
 }
 
@@ -176,6 +177,7 @@ impl std::fmt::Display for DirectApiError {
             Self::RetryExpired => "the direct message delivery window has ended",
             Self::RetryUnavailable => "the original direct message is no longer available to retry",
             Self::Authority => "direct message authority is unavailable",
+            Self::ServiceUnavailable => "direct messaging is unavailable on this Home",
             Self::Internal => "direct message operation failed",
         })
     }

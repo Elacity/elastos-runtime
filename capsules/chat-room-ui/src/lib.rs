@@ -768,9 +768,12 @@ impl App {
             let state = self.state.borrow();
             current_selection_guard(&state)
         });
-        let had_transient_error = {
+        let polled_transient_error = {
             let state = self.state.borrow();
-            state.error_text.is_some() && state.error_transient
+            state
+                .error_transient
+                .then(|| state.error_text.clone())
+                .flatten()
         };
         match self
             .poll_once_for_guard(shared_selection_guard.as_ref())
@@ -779,6 +782,7 @@ impl App {
             Ok(changed) => {
                 let mut shell_summary_changed = false;
                 let mut direct_conversations_changed = false;
+                let mut refresh_failed = false;
                 if self.is_shell_mode() {
                     if shared_selection_guard
                         .as_ref()
@@ -789,7 +793,13 @@ impl App {
                     match self.refresh_direct_conversations().await {
                         Ok(changed) => direct_conversations_changed = changed,
                         Err(401) => return,
-                        Err(_) => {}
+                        Err(_) => {
+                            self.set_transient_error(Some(
+                                "Direct conversations are temporarily unavailable.".to_string(),
+                            ));
+                            direct_conversations_changed = true;
+                            refresh_failed = true;
+                        }
                     }
                     match self
                         .refresh_shell_summary_for_guard(
@@ -807,6 +817,7 @@ impl App {
                             {
                                 self.set_transient_error(Some(err));
                                 shell_summary_changed = true;
+                                refresh_failed = true;
                             }
                         }
                     }
@@ -817,11 +828,24 @@ impl App {
                 {
                     return;
                 }
-                if had_transient_error {
-                    self.clear_error();
-                }
+                let cleared_transient_error = {
+                    let mut state = self.state.borrow_mut();
+                    if !refresh_failed
+                        && should_clear_polled_transient_error(
+                            polled_transient_error.as_deref(),
+                            state.error_text.as_deref(),
+                            state.error_transient,
+                        )
+                    {
+                        state.error_text = None;
+                        state.error_transient = false;
+                        true
+                    } else {
+                        false
+                    }
+                };
                 if changed
-                    || had_transient_error
+                    || cleared_transient_error
                     || shell_summary_changed
                     || direct_conversations_changed
                 {
@@ -2028,6 +2052,11 @@ impl App {
             }
             if app.state.borrow().selection_generation != bootstrap_generation {
                 return;
+            }
+            if matches!(direct_result, Err(status) if status != 401) {
+                app.set_transient_error(Some(
+                    "Direct conversations are temporarily unavailable.".to_string(),
+                ));
             }
             if let Some(conversation_id) = requested_direct {
                 let decision = requested_conversation_decision(

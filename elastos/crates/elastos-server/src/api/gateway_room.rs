@@ -62,12 +62,16 @@ fn direct_api_error_response(
         DirectApiError::IntentConflict => StatusCode::CONFLICT,
         DirectApiError::RetryExpired | DirectApiError::RetryUnavailable => StatusCode::GONE,
         DirectApiError::Authority => StatusCode::UNAUTHORIZED,
+        DirectApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         DirectApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let mut body = serde_json::json!({"error": error.to_string()});
     match error {
         DirectApiError::RetryExpired => body["code"] = serde_json::json!("retry_expired"),
         DirectApiError::RetryUnavailable => body["code"] = serde_json::json!("retry_unavailable"),
+        DirectApiError::ServiceUnavailable => {
+            body["code"] = serde_json::json!("direct_service_unavailable")
+        }
         _ => {}
     }
     (status, Json(body)).into_response()
@@ -277,7 +281,7 @@ fn direct_authority(
     let service = state
         .collaboration_discovery_service
         .clone()
-        .ok_or(DirectApiError::Internal)?;
+        .ok_or(DirectApiError::ServiceUnavailable)?;
     let authority = super::gateway_home_system::load_configured_contact_authority_for_context(
         &state.data_dir,
         &context,
