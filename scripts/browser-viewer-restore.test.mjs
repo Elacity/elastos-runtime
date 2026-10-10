@@ -312,14 +312,41 @@ test('a restore callback cannot change a later owner failure policy', async () =
 });
 
 for (const owned of [true, false]) for (const requestedUrl of ['', 'https://requested.invalid/']) test(
-  `actual startup selects ${owned ? 'restore' : requestedUrl ? 'fresh open' : 'address entry'} from Runtime ownership with ${requestedUrl ? 'a launch URL' : 'an empty route'}`, async () => {
+  `actual startup selects ${owned ? 'restore' : 'fresh open'} from Runtime ownership with ${requestedUrl ? 'a launch URL' : 'an empty route'}`, async () => {
   const h = harness(), value = summary(), opens = [];
   if (!owned) value.sessions.recoverable_page = null;
   Object.assign(h.state, { params: new URLSearchParams(requestedUrl ? { url: requestedUrl } : {}), DEFAULT_URL: 'https://default.invalid/', addressInput: {},
     fetchBrowserSummary: async () => value, requestRuntimeOpen: async url => opens.push(url),
     isAuthoritySessionError: () => false, friendlyOpenError: error => error.message });
   await vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
-  assert.deepEqual(opens, owned || !requestedUrl ? [] : [requestedUrl]);
+  assert.deepEqual(opens, owned ? [] : [requestedUrl || 'https://default.invalid/']);
+});
+
+test('fresh Dock startup shows a persistent status while Engine checks are pending', async () => {
+  const h = harness(), pending = deferred(), opens = [], value = summary();
+  value.sessions.recoverable_page = null;
+  Object.assign(h.state, { params: new URLSearchParams(), DEFAULT_URL: 'https://default.invalid/', addressInput: {},
+    fetchBrowserSummary: () => pending.promise, requestRuntimeOpen: async url => opens.push(url),
+    isAuthoritySessionError: () => false, friendlyOpenError: error => error.message });
+  const startup = vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
+  assert.deepEqual(opens, []);
+  assert.ok(h.calls.some(row => row[0] === 'status-message' && /checking its Engine.*retry/.test(row[1])));
+  pending.resolve(value);
+  await startup;
+  assert.deepEqual(opens, ['https://default.invalid/']);
+});
+
+test('fresh Dock startup keeps preparation failures visible and enables retry controls', async () => {
+  for (const message of ['Engine files need repair. Prepare this Engine.', 'Virtualization is unavailable. Choose another Engine.']) {
+    const h = harness(), value = summary();
+    value.sessions.recoverable_page = null;
+    Object.assign(h.state, { params: new URLSearchParams(), DEFAULT_URL: 'https://default.invalid/', addressInput: {},
+      fetchBrowserSummary: async () => value, requestRuntimeOpen: async () => { throw new Error(message); },
+      isAuthoritySessionError: () => false, friendlyOpenError: error => error.message });
+    await vm.runInContext(source.slice(source.lastIndexOf('const requestedStartupUrl =')), h.state);
+    assert.deepEqual(h.calls.at(-2), ['loading', false]);
+    assert.deepEqual(h.calls.at(-1), ['status-message', message]);
+  }
 });
 
 test('summary authority failure reaches startup renewal without a replacement open', async () => {

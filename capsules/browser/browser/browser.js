@@ -2091,7 +2091,7 @@ async function waitForRuntimeOpen(response, { engineLabel, exitLabel }) {
   while (Date.now() - startedAt < BROWSER_OPEN_POLL_TIMEOUT_MS) {
     const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     showStatus(
-      `Opening ${engineLabel} with ${exitLabel}... ${elapsedSeconds}s`,
+      `Browser is preparing ${engineLabel} with ${exitLabel} (${elapsedSeconds}s). Wait, or close Browser to cancel.`,
       { sticky: true },
     );
     await wait(BROWSER_OPEN_POLL_INTERVAL_MS);
@@ -2747,14 +2747,11 @@ const requestedStartupUrl = params.get("url");
 const initialUrl = requestedStartupUrl || DEFAULT_URL;
 addressInput.value = initialUrl;
 setLoading(true);
+showStatus("Browser is checking its Engine. Wait, or reopen Browser from Home to retry.", { sticky: true });
 fetchBrowserSummary({ remoteServices: false })
   .then(async (summary) => {
     if (await restoreRuntimePageViewer(summary)) return;
-    if (!requestedStartupUrl) {
-      setLoading(false);
-      return;
-    }
-    return requestRuntimeOpen(requestedStartupUrl, { history: "replace" });
+    return requestRuntimeOpen(initialUrl, { history: "replace" });
   })
   .catch((error) => {
     if (unloadCleanupStarted || homeWindowCloseInFlight || homeWindowTerminalCloseConfirmed) return;

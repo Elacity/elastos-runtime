@@ -101,6 +101,13 @@ jobs:
         run: |
           python3 scripts/browser-vm-linux-network.test.py
           ./scripts/test-behaviour.sh
+      - name: Browser startup status screenshots
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: browser-startup-status
+          path: ${{ runner.temp }}/browser-status-screenshots/
+          if-no-files-found: ignore
 
   # One input for every ARM consumer. PRs restore their develop base's cache;
   # only a develop push can save a verified recipe result in this namespace.
