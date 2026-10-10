@@ -9181,6 +9181,17 @@ mod tests {
         let path = rooted_localhost_fs_path(data, &uri).unwrap();
         write_principal_root_object(data, principal, &localhost_root, &uri, &path, b"plain")
             .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for directory in path.parent().unwrap().ancestors() {
+                if !directory.starts_with(data) {
+                    break;
+                }
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+        }
         let plain = std::fs::read(&path).unwrap();
         assert!(read_protected_principal_root_object(
             data,
