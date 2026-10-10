@@ -335,6 +335,7 @@ def assert_setup_order():
         main.index("install_content_publish_backend\n"),
         stamps[1],
         main.index("install_app_capsules\n"),
+        main.index("install_browser_runtime_helpers\n"),
         main.index("stamp_source_home_capsule_artifacts_manifest\n"),
         main.index('python3 "${ROOT}/scripts/components-release-integrity-check.py"'),
     ]

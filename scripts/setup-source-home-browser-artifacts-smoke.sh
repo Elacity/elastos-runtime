@@ -234,15 +234,85 @@ with tempfile.TemporaryDirectory(prefix="browser-image-ownership-") as temp:
     functions = re.sub(r'^SOURCE_HOME_BINARY_NAMES_JSON=.*\n', '', functions, flags=re.M)
     definitions = root / "setup-functions.sh"
     definitions.write_text(functions)
-    installed = source / "managed-runtimes/full-helper-install/data"
     before = {rel: sha(source / rel) for rel in ["browser-vm/rootfs.ext4", "browser-vm/initrd",
                                                 "bin/vmlinux", "browser-vm/browser-vm-rootfs-manifest.json"]}
-    shell = 'source "$DEFINITIONS"\nROOT="$SOURCE"\nDATA_DIR="$DEST"\nPLATFORM=linux-arm64\nNODE_BIN="$NODE"\ninstall_browser_runtime_helpers\n'
-    p = subprocess.run(["bash", "-c", shell], env={**env, "DEFINITIONS": str(definitions),
-                       "SOURCE": str(repo), "DEST": str(installed), "NODE": shutil.which("node"),
-                       "ELASTOS_NODE_BIN": shutil.which("node")},
-                       capture_output=True, text=True, timeout=30)
-    assert p.returncode == 0, (p.stdout, p.stderr)
+    shell = '''source "$DEFINITIONS"
+ROOT="$SOURCE"
+DATA_DIR="$DEST"
+PLATFORM="$TEST_PLATFORM"
+NODE_BIN="$NODE"
+uname() { if [ "$1" = "-s" ]; then printf '%s\\n' "$TEST_OS"; else command uname "$@"; fi; }
+cargo_built_binary_path() { printf '%s\\n' "$VZ"; }
+sign_browser_vz_supervisor() { :; }
+install_browser_runtime_helpers
+'''
+    for platform in ["linux-arm64", "linux-amd64", "darwin-arm64"]:
+        installed = root / platform / "managed-runtimes" / ("helpers-" + platform) / "data"
+        installed.mkdir(parents=True)
+        manifest = json.loads((repo / "components.json").read_text())
+        manifest["profiles"]["source-home"] = {"components": []}
+        (installed / "components.json").write_text(json.dumps(manifest))
+        vz = root / "fixture-vz-supervisor"
+        vz.write_bytes(b"fixture signed VZ supervisor")
+        vz.chmod(0o755)
+        test_env = {**env, "DEFINITIONS": str(definitions), "SOURCE": str(repo),
+                    "DEST": str(installed), "NODE": shutil.which("node"),
+                    "ELASTOS_NODE_BIN": shutil.which("node"), "TEST_PLATFORM": platform,
+                    "TEST_OS": "Darwin" if platform == "darwin-arm64" else "Linux", "VZ": str(vz)}
+        p = subprocess.run(["bash", "-c", shell], env=test_env,
+                           capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, (platform, p.stdout, p.stderr)
+        stamped = json.loads((installed / "components.json").read_text())
+        supported = []
+        for name in manifest["profiles"]["browser-host"]["components"]:
+            info = stamped["external"][name]["platforms"].get(platform)
+            if info is None or ("source" not in info and name != "browser-vz-engine-supervisor"):
+                continue
+            path = installed / info.get("install_path", stamped["external"][name].get("install_path"))
+            assert info["checksum"] == "sha256:" + sha(path), name
+            assert info["size"] == path.stat().st_size and name in stamped["profiles"]["source-home"]["components"]
+            supported.append(name)
+        verify_env = {**env, "ELASTOS_DATA_DIR": str(installed), "ELASTOS_SETUP_PLATFORM": platform}
+        verify = [str(repo / "scripts/installed-provider-verify.sh")]
+        p = subprocess.run(verify, env=verify_env, capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, (platform, p.stdout, p.stderr)
+        if supported:
+            p = subprocess.run(verify + ["--require-verified", *supported], env=verify_env,
+                               capture_output=True, text=True, timeout=30)
+            assert p.returncode == 0, (platform, p.stdout, p.stderr)
+            alias = "macos-arm64" if platform == "darwin-arm64" else "aarch64-linux"
+            p = subprocess.run(verify + ["--require-verified", *supported],
+                               env={**verify_env, "ELASTOS_SETUP_PLATFORM": alias},
+                               capture_output=True, text=True, timeout=30)
+            assert p.returncode == 0, (platform, p.stdout, p.stderr)
+        wildcard = installed / "scripts/wildcard-fixture"
+        wildcard.write_bytes(b"verified wildcard helper")
+        stamped["external"]["wildcard-fixture"] = {"install_path": "scripts/wildcard-fixture",
+            "platforms": {"*": {"checksum": "sha256:" + sha(wildcard)}}}
+        (installed / "components.json").write_text(json.dumps(stamped))
+        p = subprocess.run(verify + ["--require-verified", "wildcard-fixture"], env=verify_env,
+                           capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, (platform, p.stdout, p.stderr)
+        unsupported = "browser-vm-linux-network" if platform == "darwin-arm64" else "browser-selkies-control-service"
+        p = subprocess.run(verify + ["--require-verified", unsupported], env=verify_env,
+                           capture_output=True, text=True, timeout=30)
+        assert p.returncode != 0 and "platform entry" in p.stderr, (platform, p.stderr)
+        if platform != "linux-amd64":
+            component = stamped["external"]["browser-vm-engine-supervisor"]["platforms"][platform]
+            checksum = component.pop("checksum")
+            (installed / "components.json").write_text(json.dumps(stamped))
+            p = subprocess.run(verify, env=verify_env, capture_output=True, text=True, timeout=30)
+            assert p.returncode != 0 and "missing checksum" in p.stderr, (platform, p.stderr)
+            component["checksum"] = checksum
+            (installed / "components.json").write_text(json.dumps(stamped))
+            for relative in ["bin/browser-vm-engine-supervisor", "bin/browser-vm-engine-supervisor.mjs"]:
+                helper = installed / relative
+                original = helper.read_bytes()
+                helper.write_bytes(original + b"\\nchanged fixture bytes\\n")
+                p = subprocess.run(verify, env=verify_env, capture_output=True, text=True, timeout=30)
+                assert p.returncode != 0 and "checksum mismatch" in p.stderr, (platform, p.stderr)
+                helper.write_bytes(original)
+        checks.append(platform + " installed helper pins, host/alias/wildcard selection and tamper rejection")
     assert all(sha(source / rel) == digest for rel,digest in before.items())
     assert (installed / "browser-vm/browser-vm-rootfs-manifest.json").is_file()
     assert not list(source.glob("**/*.before-*"))

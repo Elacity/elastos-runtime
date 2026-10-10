@@ -890,6 +890,32 @@ EOF
     "${ROOT}/scripts/setup-source-home-browser-artifacts.sh" \
         --data-dir "${DATA_DIR}" \
         --platform "${PLATFORM}"
+    python3 - "${DATA_DIR}" "${PLATFORM}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import stat
+import sys
+
+data_dir, platform = Path(sys.argv[1]), sys.argv[2]
+manifest_path = data_dir / "components.json"
+manifest = json.loads(manifest_path.read_text())
+selected = manifest["profiles"]["source-home"]["components"]
+for name in manifest["profiles"]["browser-host"]["components"]:
+    component = manifest["external"][name]
+    info = component["platforms"].get(platform)
+    if info is None or ("source" not in info and name != "browser-vz-engine-supervisor"):
+        continue
+    relative = info.get("install_path", component.get("install_path"))
+    path = data_dir / relative
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise SystemExit(f"Browser helper {name} must be an installed regular file")
+    content = path.read_bytes()
+    info.update(checksum="sha256:" + hashlib.sha256(content).hexdigest(), size=len(content))
+    if name not in selected:
+        selected.append(name)
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+PY
     # Guest images are build outputs. Setup consumes the verified set and keeps
     # its bytes and receipt intact; guest changes go through the image builder.
 }
@@ -1480,6 +1506,7 @@ install_app_capsules
 for retired_provider in "${RETIRED_SOURCE_HOME_PROVIDER_BINARIES[@]}"; do
     rm -f "${DATA_DIR}/bin/${retired_provider}"
 done
+install_browser_runtime_helpers
 stamp_source_home_capsule_artifacts_manifest
 python3 "${ROOT}/scripts/components-release-integrity-check.py" \
     --manifest "${DATA_DIR}/components.json" \
@@ -1487,7 +1514,6 @@ python3 "${ROOT}/scripts/components-release-integrity-check.py" \
     --profile source-home \
     --source-root "${ROOT}" \
     --source-home-data-dir "${DATA_DIR}"
-install_browser_runtime_helpers
 start_browser_runtime_turn
 install_browser_source_home_config
 install_collaboration_startup_config
