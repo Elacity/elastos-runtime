@@ -8552,7 +8552,10 @@ pub(crate) mod tests {
                         request["op"], "content_fetch",
                         "signed input fetched by name"
                     );
-                    assert!(request.get("path").is_none(), "signed input fetched by name");
+                    assert!(
+                        request.get("path").is_none(),
+                        "signed input fetched by name"
+                    );
                     request["path"] = names[request["cid"].as_str().unwrap()].clone().into();
                     assert!(
                         crate::install_transaction::InstallationGuard::acquire(&writer_parent)
