@@ -87,7 +87,7 @@ class KuboCacheTests(unittest.TestCase):
 
 
 class AptRetryTests(unittest.TestCase):
-    def run_install(self, corrupt=False, bad_download=False):
+    def run_install(self, corrupt=False, bad_download=False, update_failures=0):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             archives, etc, shims = root / 'archives', root / 'etc', root / 'shims'
@@ -103,7 +103,13 @@ class AptRetryTests(unittest.TestCase):
                 'dpkg-deb': "print('fixture\\n1\\nall')",
                 'apt-cache': "print('SHA256: ' + os.environ['FIXTURE_SHA256'])",
                 'timeout': "os.execvp(args[2], args[2:])",
+                'sleep': 'pass',
                 'apt-get': '''
+if 'update' in args:
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    failed = sum(c['command'] == 'apt-get' and 'update' in c['args'] for c in calls) - 1
+    if failed < int(os.environ['FIXTURE_UPDATE_FAILURES']):
+        sys.exit(100)
 if '--download-only' in args:
     pathlib.Path(os.environ['FIXTURE_ARCHIVES'], 'fixture_1_all.deb').write_bytes(
         b'bad download' if os.environ['FIXTURE_BAD_DOWNLOAD'] == '1' else b'inert Ubuntu package')
@@ -123,6 +129,7 @@ if '--download-only' in args:
                      'CI_APT_PACKAGES': 'coturn e2fsprogs ffmpeg musl-tools nasm pkg-config',
                      'FIXTURE_LOG': str(root / 'log'), 'FIXTURE_SHA256': hashlib.sha256(payload).hexdigest(),
                      'FIXTURE_BAD_DOWNLOAD': '1' if bad_download else '0',
+                     'FIXTURE_UPDATE_FAILURES': str(update_failures),
                      'FIXTURE_ARCHIVES': str(archives), 'GITHUB_OUTPUT': str(root / 'output')})
             events = [json.loads(line) for line in (root / 'log').read_text().splitlines()]
             output = (root / 'output').read_text() if (root / 'output').exists() else ''
@@ -145,6 +152,18 @@ if '--download-only' in args:
         result, _, output = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(output, 'changed=false\n')
+
+    def test_mirror_hiccup_recovers_with_backoff(self):
+        result, events, output = self.run_install(update_failures=2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([e['args'] for e in events if e['command'] == 'sleep'], [['15'], ['30']])
+        self.assertEqual(output, 'changed=false\n')
+
+    def test_persistent_mirror_failure_stops_after_three_attempts(self):
+        result, events, output = self.run_install(update_failures=3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(sum('update' in e['args'] for e in events if e['command'] == 'apt-get'), 3)
+        self.assertEqual(output, '')
 
 
 if __name__ == '__main__':

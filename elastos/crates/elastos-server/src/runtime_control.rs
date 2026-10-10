@@ -568,11 +568,21 @@ fn sync_managed_runtime_child_components_manifest(
         serde_json::from_slice(&manifest_bytes).map_err(|error| {
             anyhow::anyhow!("managed home runtime requires a valid parent manifest: {error}")
         })?;
-    crate::setup::install_signed_model_catalog(
+    // Home starts without a catalogue its source could not provide; Local AI
+    // reports it unavailable, and no earlier copy outlives the parent's pin.
+    if let Err(error) = crate::setup::install_signed_model_catalog(
         &child_data_dir,
         &verified_manifest,
         &parent_manifest,
-    )?;
+    ) {
+        match std::fs::remove_file(child_data_dir.join("model-catalog.json")) {
+            Err(remove) if remove.kind() != std::io::ErrorKind::NotFound => {
+                return Err(remove.into())
+            }
+            _ => {}
+        }
+        eprintln!("Local AI model catalogue unavailable: {error:#}");
+    }
     for (name, parent_binary) in verified_binaries {
         std::fs::copy(parent_binary, child_bin_dir.join(name))?;
     }
@@ -1883,41 +1893,31 @@ mod tests {
     }
 
     #[test]
-    fn subordinate_managed_runtime_rejects_missing_signed_model_catalog_snapshot() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
-        write_managed_runtime_parent_support_artifacts(tmp.path());
-        pin_parent_model_catalog_head(
-            tmp.path(),
-            &crate::setup::catalog_head_cid(b"absent").unwrap(),
-        );
+    fn subordinate_managed_runtime_starts_without_a_missing_or_mismatched_catalogue() {
+        for case in ["missing", "mismatched"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
+            write_managed_runtime_parent_support_artifacts(tmp.path());
+            // A copy from the release before stays only while its pin does.
+            write_parent_signed_model_catalog(tmp.path(), b"catalog-a");
+            sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap();
+            let child_catalog = managed_runtime_child_data_dir(&home).join("model-catalog.json");
+            assert!(child_catalog.exists());
+            if case == "missing" {
+                std::fs::remove_file(tmp.path().join("model-catalog.json")).unwrap();
+            }
+            pin_parent_model_catalog_head(
+                tmp.path(),
+                &crate::setup::catalog_head_cid(b"catalog-b").unwrap(),
+            );
 
-        let error = sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap_err();
+            sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap();
 
-        assert!(error.to_string().contains("model-catalog.json"));
-        assert!(error.to_string().contains("missing"));
-        assert!(!managed_runtime_child_data_dir(&home)
-            .join("model-catalog.json")
-            .exists());
-    }
-
-    #[test]
-    fn subordinate_managed_runtime_rejects_mismatched_signed_model_catalog_snapshot() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = managed_runtime_child_home_dir(tmp.path(), RUNTIME_KIND_MANAGED_HOME);
-        write_managed_runtime_parent_support_artifacts(tmp.path());
-        std::fs::write(tmp.path().join("model-catalog.json"), b"catalog-a").unwrap();
-        pin_parent_model_catalog_head(
-            tmp.path(),
-            &crate::setup::catalog_head_cid(b"catalog-b").unwrap(),
-        );
-
-        let error = sync_managed_runtime_child_components_manifest(tmp.path(), &home).unwrap_err();
-
-        assert!(error.to_string().contains("does not match the pinned"));
-        assert!(!managed_runtime_child_data_dir(&home)
-            .join("model-catalog.json")
-            .exists());
+            assert!(!child_catalog.exists(), "{case}");
+            assert!(managed_runtime_child_data_dir(&home)
+                .join("components.json")
+                .exists());
+        }
     }
 
     #[test]

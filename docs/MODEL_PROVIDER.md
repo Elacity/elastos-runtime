@@ -62,6 +62,15 @@ workspace, and other runs retain their separate access rules. Hosted credentials
 stay in the owning Runtime's secret store; local model artifacts stay in their
 owning boundaries.
 
+A local engine is admitted right before it starts: free memory must cover the
+model weights, its KV cache at the configured context, batch scratch and
+headroom of max(10% of RAM, 1 GiB); otherwise the run fails with
+`model_memory_unavailable` before anything is spawned. Each Runtime runs one
+local engine at a time, stops it after 60 s without requests and starts it
+again on the next request. One Runtime per OS account (the installer's layout)
+is the exclusivity boundary; two Runtimes of different accounts each admit
+against the memory that is free when they start.
+
 The owning Runtime DID signs the service offer, which names the admitted
 provider capability and contains only bounded capability and policy facts. The
 provider identity remains an internal execution binding. Hosted URLs and

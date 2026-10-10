@@ -211,7 +211,7 @@ impl Inventory {
             let name = entry?.file_name();
             if name == "stage" {
                 ensure!(
-                    state.records.iter().any(|r| r.active()),
+                    state.records.iter().any(|r| r.active()) || state.kept_stage.is_some(),
                     "unowned preparation stage"
                 );
             } else if let Some(id) = name.to_str().and_then(|n| n.strip_prefix("admitted-")) {
@@ -398,6 +398,15 @@ impl Inventory {
         self.directory(c"stage")
     }
 
+    /// Bytes held by the stage, zero when there is none.
+    pub(super) fn stage_bytes(&self) -> anyhow::Result<u64> {
+        match self.stage(false) {
+            Ok(stage) => stage.tree_bytes(&mut 300),
+            Err(err) if missing(&err) => Ok(0),
+            Err(err) => Err(err),
+        }
+    }
+
     fn directory(&self, name: &CStr) -> anyhow::Result<Stage> {
         let dir = open_at(&self.dir, name, libc::O_RDONLY | libc::O_DIRECTORY)?;
         let path = self
@@ -561,6 +570,25 @@ impl Stage {
         Ok(file)
     }
 
+    /// Reopen a file an earlier preparation left in this stage, for reading
+    /// and appending. `None` when it was never created. The same ownership,
+    /// mode and link checks as a new file apply, and a symlink is refused.
+    pub(super) fn open_partial(&self, path: &str) -> anyhow::Result<Option<File>> {
+        let (dir, name) = match self.parent(path, false) {
+            Ok(parent) => parent,
+            Err(err) if missing(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let file = match open_at(&dir, &name, libc::O_RDWR | libc::O_APPEND) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        check_file(&file.metadata()?, super::MAX_PACKAGE_BYTES)?;
+        self.check()?;
+        Ok(Some(file))
+    }
+
     pub(super) fn read_index(&self) -> anyhow::Result<Vec<u8>> {
         self.check()?;
         let mut file = open_at(&self.dir, c"_elastos_object.json", libc::O_RDONLY)?;
@@ -669,6 +697,21 @@ impl Stage {
             }
         }
         Ok(())
+    }
+
+    fn tree_bytes(&self, budget: &mut usize) -> anyhow::Result<u64> {
+        let mut total = 0u64;
+        for (name, meta) in self.children()? {
+            *budget = budget.checked_sub(1).context("stage tree bound exceeded")?;
+            let bytes = if meta.is_dir() {
+                self.child(&name)?.tree_bytes(budget)?
+            } else {
+                check_file(&meta, super::MAX_PACKAGE_BYTES)?;
+                meta.len()
+            };
+            total = total.checked_add(bytes).context("stage size overflow")?;
+        }
+        Ok(total)
     }
 
     fn remove_contents(&self) -> anyhow::Result<()> {

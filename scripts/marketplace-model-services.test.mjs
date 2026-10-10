@@ -135,3 +135,13 @@ test("invalid or unavailable model catalog verification clears publisher cards",
     else assert.match(context.state.appLoadError, /verification is unavailable/);
   }
 });
+
+test("a signed model shows its own description and never Runtime's generic capsule text", () => {
+  const context = publisherFixture();
+  const model = { name: "fixture", source: "signed-model-catalog", role: "content", cid: `bafybei${"a".repeat(52)}`, content_size_bytes: 1024 };
+  for (const [description, expected] of [
+    ["Larger model for better answers.", "Larger model for better answers."],
+    ["Capsule metadata available through Runtime.", "Language model for Assistant."],
+    [undefined, "Language model for Assistant."],
+  ]) assert.equal(context.capsuleToApp({ ...model, description }, new Map(), []).description, expected);
+});

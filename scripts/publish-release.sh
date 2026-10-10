@@ -592,10 +592,16 @@ copy_clean_capsule_tree() {
     local dest="$2"
     mkdir -p "$dest"
     if [[ -n "${RELEASE_PREPARE_SOURCE_COMMIT:-}" ]]; then
-        local prefix
+        local prefix archive status
         prefix=$(git -C "$src" rev-parse --show-prefix) || return
-        git archive "${RELEASE_PREPARE_SOURCE_COMMIT}:${prefix%/}" | tar -xf - -C "$dest"
-        return
+        # macOS bsdtar stops reading at the end-of-archive marker, so a pipe can
+        # SIGPIPE git archive while it writes padding (exit 141 under pipefail).
+        archive=$(mktemp "${TMPDIR:-/tmp}/capsule-tree.XXXXXX") || return
+        git archive -o "$archive" "${RELEASE_PREPARE_SOURCE_COMMIT}:${prefix%/}" &&
+            tar -xf "$archive" -C "$dest"
+        status=$?
+        rm -f "$archive"
+        return "$status"
     fi
     tar \
         --exclude='./target' \

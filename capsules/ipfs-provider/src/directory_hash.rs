@@ -1791,6 +1791,88 @@ mod tests {
     }
 
     #[test]
+    fn preparation_capacity_checks_keep_kubo_from_the_idle_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("actual-repo");
+        fs::create_dir(&repo).unwrap();
+        fs::set_permissions(&repo, fs::Permissions::from_mode(0o700)).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        for name in ["blocks", "datastore"] {
+            fs::create_dir(repo.join(name)).unwrap();
+        }
+        let stat = serde_json::json!({"RepoPath":repo,"RepoSize":0}).to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut provider = ready_provider(root.path(), port);
+        let mut kubo = Command::new("sleep").arg("60").spawn().unwrap();
+        crate::write_coord_file(
+            root.path(),
+            &crate::CoordFile {
+                kubo_pid: kubo.id(),
+                api_port: port,
+                gateway_port: 0,
+                started_at: 1,
+                last_used: crate::now_unix_secs(),
+            },
+        );
+        // One check every 500 ms, as a download does per window, for three idle limits.
+        let checks = 6 * crate::IDLE_TIMEOUT_SECS;
+        let server = std::thread::spawn(move || {
+            for _ in 0..checks {
+                for body in [
+                    br#"{"Version":"0.40.1"}"#.to_vec(),
+                    serde_json::json!({"Key":"Datastore.Spec","Value":capacity_datastore_spec()})
+                        .to_string()
+                        .into_bytes(),
+                    stat.clone().into_bytes(),
+                ] {
+                    let mut socket = accept_fixture(&listener);
+                    headers(&mut socket);
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    socket.write_all(&body).unwrap();
+                }
+            }
+        });
+        crate::spawn_idle_watcher(
+            root.path().to_path_buf(),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+            crate::HostRole::User,
+        );
+        let capacity = r#"{"op":"runtime_check_capacity","required_bytes":1}"#;
+        for _ in 0..checks {
+            let response = provider.handle(crate::parse_request(capacity).unwrap());
+            assert_eq!(serde_json::to_value(response).unwrap()["status"], "ok");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        server.join().unwrap();
+        let kept = kubo.try_wait().unwrap().is_none();
+        // Without use, the existing idle stop still ends the daemon.
+        let deadline = Instant::now() + Duration::from_secs(crate::IDLE_TIMEOUT_SECS + 3);
+        let stopped = loop {
+            if kubo.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if !stopped {
+            let _ = kubo.kill();
+            kubo.wait().unwrap();
+        }
+        assert!(kept, "idle stop ended kubo during capacity checks");
+        assert!(stopped, "idle stop no longer ends unused kubo");
+        assert!(crate::read_coord_file(root.path()).is_none());
+    }
+
+    #[test]
     fn private_capacity_deadline_closes_repo_stat_socket() {
         let root = tempfile::tempdir().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

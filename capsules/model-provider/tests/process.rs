@@ -28,6 +28,10 @@ struct ProviderProcess {
 impl ProviderProcess {
     fn start() -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_model-provider"))
+            .env(
+                "ELASTOS_MODEL_PROVIDER_TEST_FREE_MEMORY",
+                (8_u64 << 30).to_string(),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

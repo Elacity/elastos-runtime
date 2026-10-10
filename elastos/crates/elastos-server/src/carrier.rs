@@ -2685,7 +2685,7 @@ impl CarrierAvailabilityProvider {
     }
 
     #[cfg(test)]
-    fn with_discovery_wait(mut self, wait: Duration) -> Self {
+    pub(crate) fn with_discovery_wait(mut self, wait: Duration) -> Self {
         self.discovery_wait = wait;
         self
     }
@@ -4024,6 +4024,9 @@ impl CarrierAvailabilityProvider {
         let deadline = tokio::time::Instant::now() + self.discovery_wait;
         let mut tried = HashSet::new();
         let mut errors = Vec::new();
+        // Every holder failed in transit (deadline, connect, lost stream) and
+        // none refused or answered badly: the caller may try the read again.
+        let mut only_transit_failures = true;
         loop {
             let (messages, self_did) = {
                 let state = self.state.lock().await;
@@ -4097,6 +4100,7 @@ impl CarrierAvailabilityProvider {
                             "Carrier availability fetch from holder failed"
                         );
                         let mut final_err = err.to_string();
+                        let mut in_transit = carrier_read_failed_in_transit(&err);
                         if let Some(data_dir) = self.data_dir.as_deref() {
                             match refresh_trusted_source_replica_ticket(
                                 data_dir,
@@ -4144,6 +4148,9 @@ impl CarrierAvailabilityProvider {
                                                 "Carrier availability fetch after bootstrap refresh failed"
                                             );
                                             final_err = retry_err.to_string();
+                                            // Any refusal for this holder keeps it permanent.
+                                            in_transit &=
+                                                carrier_read_failed_in_transit(&retry_err);
                                         }
                                     }
                                 }
@@ -4151,12 +4158,14 @@ impl CarrierAvailabilityProvider {
                                     final_err = format!(
                                         "{final_err}; trusted-source bootstrap refresh rejected"
                                     );
+                                    in_transit = false;
                                 }
                                 TrustedSourceBootstrapRefresh::Current
                                 | TrustedSourceBootstrapRefresh::NotConfigured => {}
                             }
                         }
                         self.record_peer_reputation(&replica.node_did, false).await;
+                        only_transit_failures &= in_transit;
                         errors.push(final_err);
                         continue;
                     }
@@ -4175,7 +4184,11 @@ impl CarrierAvailabilityProvider {
         }
 
         Ok(carrier_availability_error(
-            "carrier_fetch_failed",
+            if only_transit_failures {
+                CARRIER_FETCH_IN_TRANSIT_CODE
+            } else {
+                "carrier_fetch_failed"
+            },
             format!("Carrier content fetch failed: {}", errors.join(" | ")),
         ))
     }
@@ -4253,6 +4266,19 @@ impl BoundedContentRead {
     }
 }
 
+/// The availability error code for a read that every holder failed only in
+/// transit; Content reports it as a typed I/O error the caller may repeat.
+pub(crate) const CARRIER_FETCH_IN_TRANSIT_CODE: &str = "carrier_fetch_in_transit";
+
+/// A holder read failed on the way (answer deadline, connect failure, lost
+/// stream), not because the holder refused it or answered badly.
+fn carrier_read_failed_in_transit(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<ProviderError>(),
+        Some(ProviderError::Io(_))
+    )
+}
+
 /// The announcement's verified signer is the peer the ticket must reach. The
 /// invoker rejects a ticket whose endpoint is another key before connecting,
 /// so a holder is credited only for bytes its own authenticated peer served.
@@ -4296,7 +4322,11 @@ async fn fetch_content_via_carrier_provider_invocation(
             }),
         })
         .await
-        .map_err(|err| anyhow::anyhow!("Carrier provider invocation failed: {err}"))?;
+        // Keep the typed cause so availability can tell transit from refusal.
+        .map_err(|err| {
+            let message = format!("Carrier provider invocation failed: {err}");
+            anyhow::Error::new(err).context(message)
+        })?;
 
     if response.get("status").and_then(|status| status.as_str()) == Some("error") {
         let message = response
@@ -7802,6 +7832,10 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                 }
 
                 let mut errors = Vec::new();
+                // An effect-free bounded read whose every endpoint failed only
+                // in transit reports a typed I/O error, so its caller may repeat it.
+                let bounded = bounded_content_fetch(invocation, &request);
+                let mut transit_kind = Some(std::io::ErrorKind::ConnectionAborted);
                 for (index, endpoint) in endpoints.into_iter().enumerate() {
                     let peer = endpoint.id;
                     match self
@@ -7815,7 +7849,7 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                             // yields to the next one. Every other operation keeps its
                             // open-ended answer: cutting it could discard a receipt for
                             // an effect that is still running on the peer.
-                            let result = if bounded_content_fetch(invocation, &request) {
+                            let result = if bounded {
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(timeout_secs),
                                     invoke,
@@ -7828,6 +7862,8 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                                         errors.push(format!(
                                             "ticket[{index}] response deadline of {timeout_secs}s passed"
                                         ));
+                                        transit_kind =
+                                            transit_kind.map(|_| std::io::ErrorKind::TimedOut);
                                         continue;
                                     }
                                 }
@@ -7839,6 +7875,9 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                                 Err(err) => {
                                     self.forget_peer(peer).await;
                                     errors.push(carrier_provider_public_invoke_error(index, &err));
+                                    if err.downcast_ref::<CarrierTransportFailure>().is_none() {
+                                        transit_kind = None;
+                                    }
                                     // A lost create reply may hide accepted work. A later
                                     // endpoint's refusal cannot settle that first attempt.
                                     if invocation.target == "model"
@@ -7853,10 +7892,11 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                     }
                 }
 
-                Err(ProviderError::Provider(format!(
-                    "Carrier provider invocation failed: {}",
-                    errors.join(" | ")
-                )))
+                let message = format!("Carrier provider invocation failed: {}", errors.join(" | "));
+                Err(match transit_kind.filter(|_| bounded) {
+                    Some(kind) => ProviderError::Io(std::io::Error::new(kind, message)),
+                    None => ProviderError::Provider(message),
+                })
             }
             ProviderCarrierRoute::PeerDid { peer_did, .. } => {
                 let public_key = did_to_public_key(peer_did).ok_or_else(|| {
@@ -8086,6 +8126,39 @@ impl std::fmt::Display for CarrierProviderDecision {
     }
 }
 
+/// Marks a Carrier stream that could not be opened, written or read to its
+/// end: a failure in transit, not an answer from the peer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CarrierTransportFailure;
+
+impl std::fmt::Display for CarrierTransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Carrier stream failed in transit")
+    }
+}
+
+/// A failed read of a Carrier answer is in transit only when the stream broke
+/// (reset, lost connection, early end); an answer that is not valid UTF-8 or
+/// otherwise unreadable is the peer's bad answer and stays permanent.
+fn carrier_answer_read_error(error: std::io::Error) -> anyhow::Error {
+    use std::io::ErrorKind;
+    let broke = matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::NotConnected
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::TimedOut
+    );
+    let error = anyhow::Error::new(error);
+    if broke {
+        error.context(CarrierTransportFailure)
+    } else {
+        error
+    }
+}
+
 impl std::error::Error for CarrierProviderDecision {}
 
 fn carrier_provider_invoke_result(response: serde_json::Value) -> Result<serde_json::Value> {
@@ -8275,26 +8348,16 @@ impl CarrierClient {
     }
 
     pub async fn fetch_file(&self, path: &str) -> Result<Vec<u8>> {
-        self.fetch_file_bounded(path, 200 * 1024 * 1024).await
+        self.fetch_file_bounded(path, MAX_DOWNLOAD_BYTES).await
     }
 
     pub(crate) async fn fetch_file_bounded(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
-        let (mut send, mut recv) = self.conn.open_bi().await?;
         let msg = serde_json::json!({"op":"file","path":path});
-        let mut bytes = serde_json::to_vec(&msg)?;
-        bytes.push(b'\n');
-        send.write_all(&bytes).await?;
-        send.finish()?;
-        read_carrier_len_prefixed_bytes(
-            &mut recv,
-            &format!("trusted source file fetch for {path}"),
-            max_bytes,
-        )
-        .await
+        let operation = format!("trusted source file fetch for {path}");
+        self.fetch_bytes(msg, &operation, path, max_bytes).await
     }
 
     pub async fn fetch_content(&self, cid: &str, path: Option<&str>) -> Result<Vec<u8>> {
-        let (mut send, mut recv) = self.conn.open_bi().await?;
         let mut msg = serde_json::json!({
             "op": "content_fetch",
             "cid": cid,
@@ -8302,11 +8365,85 @@ impl CarrierClient {
         if let Some(path) = path.filter(|path| !path.is_empty()) {
             msg["path"] = serde_json::Value::String(path.to_string());
         }
+        self.fetch_bytes(msg, "content fetch", cid, MAX_DOWNLOAD_BYTES)
+            .await
+    }
+
+    pub(crate) async fn fetch_content_bounded(
+        &self,
+        cid: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let msg = serde_json::json!({"op": "content_fetch", "cid": cid});
+        self.fetch_bytes(msg, "content fetch", cid, max_bytes).await
+    }
+
+    /// Sends `msg` and reads its length-prefixed reply. Every phase is
+    /// bounded, none by total time: the request and each body read get
+    /// `DOWNLOAD_IDLE_TIMEOUT`, and the source gets `DOWNLOAD_HEADER_WAIT` to
+    /// prepare the file before its length header. A source that trickles one
+    /// byte just inside the idle deadline is still bounded by `max_bytes`.
+    async fn fetch_bytes(
+        &self,
+        msg: serde_json::Value,
+        operation: &str,
+        name: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let idle = DOWNLOAD_IDLE_TIMEOUT;
+        let stalled =
+            |_| anyhow::anyhow!("no data for {} s while downloading {name}", idle.as_secs());
+        let (mut send, mut recv) = tokio::time::timeout(idle, self.conn.open_bi())
+            .await
+            .map_err(stalled)??;
         let mut bytes = serde_json::to_vec(&msg)?;
         bytes.push(b'\n');
-        send.write_all(&bytes).await?;
+        tokio::time::timeout(idle, send.write_all(&bytes))
+            .await
+            .map_err(stalled)??;
         send.finish()?;
-        read_carrier_len_prefixed_bytes(&mut recv, "content fetch", 200 * 1024 * 1024).await
+        let mut len_buf = [0u8; 8];
+        tokio::time::timeout(DOWNLOAD_HEADER_WAIT, recv.read_exact(&mut len_buf))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "trusted source did not start sending {name} within {} s",
+                    DOWNLOAD_HEADER_WAIT.as_secs()
+                )
+            })??;
+        let len = u64::from_be_bytes(len_buf);
+        if len_buf[0] == b'{' {
+            let mut error_bytes = len_buf.to_vec();
+            let tail = tokio::time::timeout(idle, recv.read_to_end(16 * 1024))
+                .await
+                .map_err(stalled)??;
+            error_bytes.extend_from_slice(&tail);
+            if let Ok(text) = String::from_utf8(error_bytes) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+                    if json["ok"].as_bool() == Some(false) {
+                        let msg = json["error"]
+                            .as_str()
+                            .unwrap_or("Carrier returned an unknown error");
+                        anyhow::bail!("{operation} failed: {msg}");
+                    }
+                }
+            }
+            anyhow::bail!("{operation} returned invalid byte reply ({len} bytes declared)");
+        }
+        anyhow::ensure!(
+            len <= max_bytes as u64,
+            "{operation} exceeds its {max_bytes}-byte bound ({len} bytes declared)"
+        );
+        let mut content = vec![0u8; len as usize];
+        let mut filled = 0;
+        while filled < content.len() {
+            let read = tokio::time::timeout(idle, recv.read(&mut content[filled..]))
+                .await
+                .map_err(stalled)??;
+            filled += read
+                .ok_or_else(|| anyhow::anyhow!("{operation} ended early ({filled}/{len} bytes)"))?;
+        }
+        Ok(content)
     }
 
     pub async fn invoke_provider(
@@ -8315,12 +8452,14 @@ impl CarrierClient {
         request: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let bounded = request.get("bounded_read") == Some(&serde_json::Value::Bool(true));
-        let (mut send, recv) = self.conn.open_bi().await?;
+        let (mut send, recv) = self.conn.open_bi().await.context(CarrierTransportFailure)?;
         let msg = carrier_provider_invoke_message(invocation, request);
         let mut bytes = serde_json::to_vec(&msg)?;
         bytes.push(b'\n');
-        send.write_all(&bytes).await?;
-        send.finish()?;
+        send.write_all(&bytes)
+            .await
+            .context(CarrierTransportFailure)?;
+        send.finish().context(CarrierTransportFailure)?;
 
         let mut reader = BufReader::new(recv);
         let mut line = String::new();
@@ -8328,13 +8467,19 @@ impl CarrierClient {
             // A bounded read holds at most 64 KiB of base64 plus its envelope;
             // a holder that sends more is refused before it is buffered.
             let mut limited = (&mut reader).take(CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES);
-            limited.read_line(&mut line).await?;
+            limited
+                .read_line(&mut line)
+                .await
+                .map_err(carrier_answer_read_error)?;
             anyhow::ensure!(
                 line.ends_with('\n'),
                 "bounded Carrier provider response exceeds {CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES} bytes"
             );
         } else {
-            reader.read_line(&mut line).await?;
+            reader
+                .read_line(&mut line)
+                .await
+                .map_err(carrier_answer_read_error)?;
         }
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         carrier_provider_invoke_result(response)
@@ -8432,75 +8577,32 @@ impl CarrierClient {
     }
 }
 
-async fn read_carrier_len_prefixed_bytes(
-    recv: &mut iroh::endpoint::RecvStream,
-    operation: &str,
-    max_bytes: usize,
-) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 8];
-    recv.read_exact(&mut len_buf).await?;
-    let len = u64::from_be_bytes(len_buf);
-    if len_buf[0] == b'{' {
-        let mut error_bytes = len_buf.to_vec();
-        let tail = recv.read_to_end(16 * 1024).await?;
-        error_bytes.extend_from_slice(&tail);
-        if let Ok(text) = String::from_utf8(error_bytes) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-                if json["ok"].as_bool() == Some(false) {
-                    let msg = json["error"]
-                        .as_str()
-                        .unwrap_or("Carrier returned an unknown error");
-                    anyhow::bail!("{operation} failed: {msg}");
-                }
-            }
-        }
-        anyhow::bail!("{operation} returned invalid byte reply ({len} bytes declared)");
-    }
-    anyhow::ensure!(
-        len <= max_bytes as u64,
-        "{operation} exceeds its {max_bytes}-byte bound ({len} bytes declared)"
-    );
-    let mut content = vec![0u8; len as usize];
-    recv.read_exact(&mut content).await?;
-    Ok(content)
-}
+/// A download fails only when no bytes arrive for this long, never on total
+/// time, so a slow but steady link finishes. Unit tests use a short deadline.
+pub(crate) const DOWNLOAD_IDLE_TIMEOUT: Duration =
+    Duration::from_secs(if cfg!(test) { 1 } else { 30 });
 
-/// Fetches the signed CID when present, else the release name.
-async fn fetch_with_timeout(
+/// How long a trusted source may prepare a held file (an IPFS `cat` of the
+/// signed CID) before it sends the length header. Measured on the public
+/// seed (8 Oct 2026): at most 1.6 s for 92 MB; bound = max(60 s, 4x worst).
+const DOWNLOAD_HEADER_WAIT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 60 });
+
+/// Size ceiling for a release download whose signed size is not known.
+pub(crate) const MAX_DOWNLOAD_BYTES: usize = 200 * 1024 * 1024;
+
+/// Fetches the signed CID when present, else the release name, then closes.
+async fn fetch_and_close(
     client: CarrierClient,
     cid: Option<&str>,
     path: &str,
-    timeout_secs: u64,
+    max_bytes: usize,
 ) -> Result<Vec<u8>> {
-    let fetch = async {
-        match cid {
-            Some(cid) => client.fetch_content(cid, None).await,
-            None => client.fetch_file(path).await,
-        }
+    let result = match cid {
+        Some(cid) => client.fetch_content_bounded(cid, max_bytes).await,
+        None => client.fetch_file_bounded(path, max_bytes).await,
     };
-    let result = tokio::time::timeout(Duration::from_secs(timeout_secs), fetch)
-        .await
-        .map_err(|_| anyhow::anyhow!("file fetch timed out after {}s", timeout_secs))
-        .and_then(|result| result);
     client.close().await;
     result
-}
-
-pub async fn fetch_file_from_trusted_source(
-    source: &TrustedSource,
-    path: &str,
-    connect_timeout_secs: u64,
-    fetch_timeout_secs: u64,
-) -> Result<Vec<u8>> {
-    fetch_file_from_trusted_source_bound(
-        source,
-        None,
-        path,
-        connect_timeout_secs,
-        fetch_timeout_secs,
-        None,
-    )
-    .await
 }
 
 pub(crate) async fn fetch_file_from_trusted_source_bound(
@@ -8508,8 +8610,8 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
     cid: Option<&str>,
     path: &str,
     connect_timeout_secs: u64,
-    fetch_timeout_secs: u64,
     bind_addr: Option<std::net::SocketAddr>,
+    max_bytes: usize,
 ) -> Result<Vec<u8>> {
     let node_id = source_transport_endpoint_id(source)?;
     let mut errors = Vec::new();
@@ -8518,9 +8620,9 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
             .await
         {
-            Ok(client) => match fetch_with_timeout(client, cid, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_and_close(client, cid, path, max_bytes).await {
                 Ok(bytes) => return Ok(bytes),
-                Err(err) => errors.push(format!("ticket[{index}] fetch failed: {err}")),
+                Err(err) => errors.push(format!("ticket[{index}] fetch of {path} failed: {err}")),
             },
             Err(err) => errors.push(format!("ticket[{index}] connect failed: {err:#}")),
         }
@@ -8531,9 +8633,9 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         match CarrierClient::connect_endpoint_addr_bound(endpoint, connect_timeout_secs, bind_addr)
             .await
         {
-            Ok(client) => match fetch_with_timeout(client, cid, path, fetch_timeout_secs).await {
+            Ok(client) => match fetch_and_close(client, cid, path, max_bytes).await {
                 Ok(bytes) => return Ok(bytes),
-                Err(err) => errors.push(format!("relay[{index}] fetch failed: {err}")),
+                Err(err) => errors.push(format!("relay[{index}] fetch of {path} failed: {err}")),
             },
             Err(err) => errors.push(format!("relay[{index}] connect failed: {err}")),
         }
@@ -8543,10 +8645,10 @@ pub(crate) async fn fetch_file_from_trusted_source_bound(
         node_id.ok_or_else(|| anyhow::anyhow!("trusted source has no usable Carrier node id"))?;
     let addrs = source_carrier_addrs(source);
     match CarrierClient::connect_bound(&node_id, &addrs, connect_timeout_secs, bind_addr).await {
-        Ok(client) => match fetch_with_timeout(client, cid, path, fetch_timeout_secs).await {
+        Ok(client) => match fetch_and_close(client, cid, path, max_bytes).await {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
-                errors.push(format!("direct fetch failed: {err}"));
+                errors.push(format!("direct fetch of {path} failed: {err}"));
                 Err(anyhow::anyhow!(
                     "trusted source Carrier fetch failed: {}",
                     errors.join(" | ")
@@ -9157,6 +9259,8 @@ pub(crate) mod tests {
         fail_ensure: bool,
         /// Connect tickets whose `ensure` always fails (a dead peer).
         fail_tickets: Vec<String>,
+        /// Connect tickets whose bounded fetch fails in transit.
+        transit_tickets: StdMutex<Vec<String>>,
         reject_admission: bool,
         omit_admission_receipt: bool,
     }
@@ -9187,6 +9291,18 @@ pub(crate) mod tests {
             if invocation.transfer == ProviderTransfer::Stream {
                 if self.fail_tickets.iter().any(|dead| dead == ticket) {
                     return Err(ProviderError::Provider("mock remote fetch failed".into()));
+                }
+                if self
+                    .transit_tickets
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|slow| slow == ticket)
+                {
+                    return Err(ProviderError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "mock answer deadline passed",
+                    )));
                 }
                 return Ok(serde_json::json!({
                     "status": "ok",
@@ -10761,7 +10877,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(
-            fetch_with_timeout(client, None, "artifact", 5)
+            fetch_and_close(client, None, "artifact", MAX_DOWNLOAD_BYTES)
                 .await
                 .unwrap(),
             b"fixture"
@@ -10870,7 +10986,8 @@ pub(crate) mod tests {
                         .unwrap();
                     send.finish().unwrap();
                 }
-                "timeout" => {}
+                // The header arrives, then the body stalls.
+                "timeout" => send.write_all(&7u64.to_be_bytes()).await.unwrap(),
                 _ => unreachable!(),
             }
             conn.closed().await
@@ -10878,7 +10995,7 @@ pub(crate) mod tests {
         let client = CarrierClient::connect_owned_endpoint(endpoint, address, 5)
             .await
             .unwrap();
-        let result = fetch_with_timeout(client, None, "artifact", 1).await;
+        let result = fetch_and_close(client, None, "artifact", MAX_DOWNLOAD_BYTES).await;
         let closed_before_return = observer.is_closed();
         observer.close().await;
         let remote_close = tokio::time::timeout(Duration::from_secs(5), serving)
@@ -10902,7 +11019,7 @@ pub(crate) mod tests {
             ),
             "timeout" => assert_eq!(
                 result.unwrap_err().to_string(),
-                "file fetch timed out after 1s"
+                "no data for 1 s while downloading artifact"
             ),
             _ => unreachable!(),
         }
@@ -10921,6 +11038,109 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn carrier_client_owned_fetch_timeout_closes_endpoint() {
         carrier_client_fetch_cleanup_case("timeout").await;
+    }
+
+    /// Serves one fetch whose length header comes after `header_delay`, then
+    /// 5 chunks `gap` apart, and fetches it through `fetch_content` (with a
+    /// CID) or `fetch_file`. Unit tests use a 1 s idle deadline and a 3 s
+    /// header wait.
+    async fn carrier_fetch_slowly(
+        cid: Option<&str>,
+        header_delay: Duration,
+        gap: Duration,
+    ) -> Result<Vec<u8>> {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let server_endpoint = server.clone();
+        let expected_cid = cid.map(str::to_string);
+        let serving = tokio::spawn(async move {
+            let conn = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, recv) = conn.accept_bi().await.unwrap();
+            let mut reader = BufReader::new(recv);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let request = serde_json::from_str::<serde_json::Value>(&request).unwrap();
+            match expected_cid {
+                Some(cid) => {
+                    assert_eq!(request["op"], "content_fetch");
+                    assert_eq!(request["cid"], cid);
+                    assert!(request.get("path").is_none());
+                }
+                None => assert_eq!(request["path"], "artifact"),
+            }
+            tokio::time::sleep(header_delay).await;
+            send.write_all(&10u64.to_be_bytes()).await.unwrap();
+            for chunk in [b"fi", b"xt", b"ur", b"e-", b"ok"] {
+                send.write_all(chunk).await.unwrap();
+                tokio::time::sleep(gap).await;
+            }
+            let _ = send.finish();
+            conn.closed().await
+        });
+        let client = CarrierClient::connect_owned_endpoint(endpoint, address, 5)
+            .await
+            .unwrap();
+        let result = match cid {
+            Some(cid) => client.fetch_content(cid, None).await,
+            None => client.fetch_file("artifact").await,
+        };
+        client.close().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+        server.close().await;
+        result
+    }
+
+    #[tokio::test]
+    async fn carrier_fetch_with_steady_progress_outlives_idle_deadline() {
+        // 5 chunks 400 ms apart: 2 s in total, twice the 1 s idle deadline.
+        for cid in [None, Some("bafy-fixture")] {
+            let bytes = carrier_fetch_slowly(cid, Duration::ZERO, Duration::from_millis(400))
+                .await
+                .unwrap();
+            assert_eq!(bytes, b"fixture-ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_fetch_that_stalls_fails_after_idle_deadline() {
+        for (cid, name) in [(None, "artifact"), (Some("bafy-fixture"), "bafy-fixture")] {
+            let started = std::time::Instant::now();
+            let err = carrier_fetch_slowly(cid, Duration::ZERO, Duration::from_secs(3))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("no data for 1 s while downloading {name}")
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_fetch_waits_for_source_preparation_within_header_bound() {
+        // The source prepares the file for 2 s (past the 1 s idle deadline).
+        let bytes =
+            carrier_fetch_slowly(Some("bafy-fixture"), Duration::from_secs(2), Duration::ZERO)
+                .await
+                .unwrap();
+        assert_eq!(bytes, b"fixture-ok");
+        // Preparation past the 3 s header bound fails.
+        let err =
+            carrier_fetch_slowly(Some("bafy-fixture"), Duration::from_secs(4), Duration::ZERO)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "trusted source did not start sending bafy-fixture within 3 s"
+        );
     }
 
     #[tokio::test]
@@ -11131,11 +11351,39 @@ pub(crate) mod tests {
         panic!("carrier test endpoint never published a direct address");
     }
 
+    /// How a fixture holder answers reads.
+    #[derive(Default)]
+    pub(crate) struct HolderBehavior {
+        /// Fixed wait before every answer, standing in for one network round trip.
+        pub(crate) delay: Duration,
+        /// Answer reads one at a time, the delay included, like a provider
+        /// bridge that serializes its requests.
+        pub(crate) serialized: bool,
+        /// Range starts whose first read stalls past the 5 s answer budget.
+        pub(crate) stall_once: std::collections::BTreeSet<u64>,
+        /// Range starts whose every read stalls past the answer budget.
+        pub(crate) stall_always: std::collections::BTreeSet<u64>,
+        /// While it holds a value below `u64::MAX`, every read of a range
+        /// starting at or after that offset stalls past the answer budget.
+        pub(crate) stall_from: Option<Arc<std::sync::atomic::AtomicU64>>,
+        /// Range starts whose every read the holder refuses.
+        pub(crate) refuse_always: std::collections::BTreeSet<u64>,
+        /// Range starts answered with one byte more than asked.
+        pub(crate) oversize: std::collections::BTreeSet<u64>,
+    }
+
     /// A holder's local IPFS backend for one synthetic closure. It answers only
     /// bounded reads with the Runtime receipts a real ipfs-provider returns.
     pub(crate) struct BoundedClosureBackend {
         pub(crate) files: std::collections::BTreeMap<String, Vec<u8>>,
         pub(crate) requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+        pub(crate) delay: Duration,
+        pub(crate) serial: Option<tokio::sync::Mutex<()>>,
+        pub(crate) stall_once: StdMutex<std::collections::BTreeSet<u64>>,
+        pub(crate) stall_always: std::collections::BTreeSet<u64>,
+        pub(crate) stall_from: Option<Arc<std::sync::atomic::AtomicU64>>,
+        pub(crate) refuse_always: std::collections::BTreeSet<u64>,
+        pub(crate) oversize: std::collections::BTreeSet<u64>,
     }
 
     #[async_trait::async_trait]
@@ -11156,7 +11404,32 @@ pub(crate) mod tests {
             &self,
             request: &serde_json::Value,
         ) -> std::result::Result<serde_json::Value, ProviderError> {
-            self.requests.lock().unwrap().push(request.clone());
+            let _turn = match &self.serial {
+                Some(serial) => Some(serial.lock().await),
+                None => None,
+            };
+            let mut logged = request.clone();
+            logged["_fixture_served_at_ms"] = serde_json::json!(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                as u64);
+            self.requests.lock().unwrap().push(logged);
+            tokio::time::sleep(self.delay).await;
+            let start = request["_runtime_invocation"]["range"]["start"].as_u64();
+            let stalls = start.is_some_and(|start| {
+                self.stall_always.contains(&start)
+                    || self.stall_from.as_ref().is_some_and(|from| {
+                        start >= from.load(std::sync::atomic::Ordering::Acquire)
+                    })
+                    || self.stall_once.lock().unwrap().remove(&start)
+            });
+            if stalls {
+                tokio::time::sleep(Duration::from_secs(7)).await;
+            }
+            if start.is_some_and(|start| self.refuse_always.contains(&start)) {
+                return Err(ProviderError::Provider("fixture holder read failed".into()));
+            }
             if request["op"] != "cat" || request["bounded_read"] != true {
                 return Ok(serde_json::json!({"status":"error","code":"unbounded",
                     "message":"fixture holder serves bounded reads only"}));
@@ -11182,8 +11455,9 @@ pub(crate) mod tests {
                     return Ok(serde_json::json!({"status":"error","code":"range",
                         "message":"fixture range exceeds the file"}));
                 }
+                let extra = usize::from(self.oversize.contains(&(start as u64)));
                 (
-                    file[start..=end].to_vec(),
+                    file[start..=end + extra].to_vec(),
                     serde_json::json!({"_runtime_applied_range":{
                         "schema":"elastos.provider.applied-range/v1", "cid":request["cid"],
                         "path":path, "start":start, "end":end
@@ -11315,6 +11589,16 @@ pub(crate) mod tests {
         files: std::collections::BTreeMap<String, Vec<u8>>,
         requests: Arc<StdMutex<Vec<serde_json::Value>>>,
     ) -> HolderRuntime {
+        start_slow_content_holder_runtime(seed, files, requests, HolderBehavior::default()).await
+    }
+
+    /// As `start_content_holder_runtime`, answering reads as `behavior` says.
+    pub(crate) async fn start_slow_content_holder_runtime(
+        seed: u8,
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+        requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+        behavior: HolderBehavior,
+    ) -> HolderRuntime {
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(ProviderRegistry::new());
         registry
@@ -11328,7 +11612,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
         registry
-            .register_sub_provider("ipfs", Arc::new(BoundedClosureBackend { files, requests }))
+            .register_sub_provider(
+                "ipfs",
+                Arc::new(BoundedClosureBackend {
+                    files,
+                    requests,
+                    delay: behavior.delay,
+                    serial: behavior.serialized.then(|| tokio::sync::Mutex::new(())),
+                    stall_once: StdMutex::new(behavior.stall_once),
+                    stall_always: behavior.stall_always,
+                    stall_from: behavior.stall_from,
+                    refuse_always: behavior.refuse_always,
+                    oversize: behavior.oversize,
+                }),
+            )
             .await
             .unwrap();
         let (sk, did) = elastos_identity::derive_did(&[seed; 32]);
@@ -13199,6 +13496,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -13257,6 +13555,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -13313,6 +13612,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -13394,6 +13694,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: true,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: false,
             omit_admission_receipt: false,
         });
@@ -13458,6 +13759,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: false,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: true,
             omit_admission_receipt: false,
         });
@@ -13516,6 +13818,7 @@ pub(crate) mod tests {
             requests: Mutex::new(Vec::new()),
             fail_ensure: false,
             fail_tickets: Vec::new(),
+            transit_tickets: Default::default(),
             reject_admission: false,
             omit_admission_receipt: true,
         });
@@ -15849,6 +16152,131 @@ pub(crate) mod tests {
             source.head_cid,
             "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
         );
+    }
+
+    /// A holder read is in transit only when every attempt for it failed on
+    /// the network path: a refusal on the announced ticket stays permanent even
+    /// when the refreshed ticket then misses its deadline.
+    #[tokio::test]
+    async fn test_carrier_availability_refusal_then_refreshed_ticket_timeout_stays_permanent() {
+        for (seed, refused_first, expected) in [
+            (120u8, true, "carrier_fetch_failed"),
+            (124u8, false, CARRIER_FETCH_IN_TRANSIT_CODE),
+        ] {
+            let (local_sk, local_did) = elastos_identity::derive_did(&[seed; 32]);
+            let holder_seed = [seed + 1; 32];
+            let (_remote_sk, _holder_did, stale_ticket, live_ticket) =
+                holder_tickets_for_secret(holder_seed);
+            let public = iroh::SecretKey::from_bytes(
+                &elastos_identity::derive_did(&holder_seed).0.to_bytes(),
+            )
+            .public();
+            let (gateway, _server) = serve_publisher_bootstrap(publisher_bootstrap_document(
+                &live_ticket,
+                &public.to_string(),
+                "publisher",
+                "elastos.carrier.bootstrap/v1",
+            ))
+            .await;
+            let (provider, invoker, _registry, _data_dir, cid) =
+                availability_provider_with_trusted_source(
+                    stale_ticket.clone(),
+                    public.to_string(),
+                    "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string(),
+                    gateway,
+                    local_sk,
+                    local_did,
+                    if refused_first {
+                        vec![stale_ticket.clone()]
+                    } else {
+                        vec![]
+                    },
+                )
+                .await;
+            let mut transit = vec![live_ticket.clone()];
+            if !refused_first {
+                transit.push(stale_ticket.clone());
+            }
+            *invoker.transit_tickets.lock().unwrap() = transit;
+            let response = provider
+                .send_raw(&serde_json::json!({
+                    "op": "fetch",
+                    "cid": cid,
+                    "path": "weights.gguf",
+                    "bounded_read": true,
+                    "range": {"start": 0, "end": 3},
+                    "transfer": "stream"
+                }))
+                .await
+                .unwrap();
+            assert_eq!(response["code"], expected, "{response}");
+            let requests = invoker.requests.lock().await;
+            for ticket in [&stale_ticket, &live_ticket] {
+                assert!(
+                    requests.iter().any(|request| request["ticket"] == *ticket),
+                    "{requests:?}"
+                );
+            }
+        }
+    }
+
+    /// An answer that is not valid UTF-8 is the holder's bad answer, not a
+    /// failure in transit, so its bounded read is not repeated.
+    #[tokio::test]
+    async fn test_carrier_invalid_utf8_answer_is_not_a_transit_failure() {
+        let bind = |_| async {
+            Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .clear_ip_transports()
+                .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+                .alpns(vec![CARRIER_ALPN.to_vec()])
+                .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+                .unwrap()
+                .bind()
+                .await
+                .unwrap()
+        };
+        let holder = bind(()).await;
+        let consumer = bind(()).await;
+        let address = wait_for_direct_endpoint_addr(&holder).await;
+        let answering = holder.clone();
+        let served = tokio::spawn(async move {
+            let conn = answering.accept().await.unwrap().await.unwrap();
+            let (mut send, recv) = conn.accept_bi().await.unwrap();
+            let mut request = String::new();
+            BufReader::new(recv).read_line(&mut request).await.unwrap();
+            send.write_all(b"\xff\xfe not utf-8\n").await.unwrap();
+            send.finish().unwrap();
+            conn.closed().await;
+        });
+        let invoker = CarrierProviderInvoker::with_carrier_endpoint(consumer.clone());
+        let request = serde_json::json!({"op":"fetch", "cid":"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "path":"weights.gguf", "bounded_read":true, "range":{"start":0,"end":3}});
+        let route = ProviderCarrierRoute::ConnectTicket {
+            connect_ticket: encode_ticket_for(address),
+            peer_did: None,
+            timeout_ms: Some(5_000),
+        };
+        let invocation = ProviderInvocation {
+            source: "carrier-availability".into(),
+            target: "content".into(),
+            op: "fetch".into(),
+            request: request.clone(),
+            transfer: ProviderTransfer::Stream,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(route.clone()),
+        };
+        let error = invoker
+            .invoke_carrier_provider(&route, &invocation, request)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ProviderError::Provider(_)),
+            "an unreadable answer is permanent: {error:?}"
+        );
+        served.abort();
+        holder.close().await;
+        consumer.close().await;
     }
 
     #[tokio::test]

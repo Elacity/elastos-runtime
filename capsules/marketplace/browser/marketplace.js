@@ -441,7 +441,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       name: publicTitle(capsule),
       developer: String(model ? capsule.publisher_did : capsule.author || "").trim(),
       category: appCategory(capsule, role),
-      description: model ? "Language model for Assistant." : publicDescription(capsule),
+      description: model ? modelDescription(capsule) : publicDescription(capsule),
       version: String(capsule.version || ""),
       installed,
       launchable,
@@ -463,6 +463,13 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       size: model ? `${capsule.content_size_bytes.toLocaleString()} bytes` : capsule.cid ? "Published app" : "Local app",
       sourceSummary: capsule.cid ? "SmartWeb" : "Local",
     };
+  }
+
+  // A signed catalogue entry may carry its own one-line description; without
+  // one, Runtime's generic capsule text is replaced by the model's purpose.
+  function modelDescription(capsule) {
+    const description = String(capsule.description || "").trim();
+    return description && !/\bruntime\b/i.test(description) ? description : "Language model for Assistant.";
   }
 
   function appCategory(capsule, role) {
@@ -763,7 +770,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     const shared = state.sharedModels.filter(matches);
     const access = state.modelAccess.filter(matches);
     const localStatus = state.appLoading ? "Loading verified models…" : state.appLoadError
-      || (state.modelCatalogState === "unavailable" ? "The model catalog could not be verified." : "");
+      || (state.modelCatalogState === "unavailable" ? "The signed model list could not be fetched or verified. Connect to the internet and try again." : "");
     const unavailable = state.remoteAvailability.filter(service => service.status !== "reachable").length;
     els.storeSections.innerHTML = `${modelsSettingsChrome()}
       <section class="store-section"><h2 class="store-section-title">On this Home</h2>

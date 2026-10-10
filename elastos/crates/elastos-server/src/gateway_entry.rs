@@ -15,7 +15,7 @@ pub async fn run_gateway(
 }
 
 pub async fn run_browser_home() -> anyhow::Result<()> {
-    elastos_server::update_controller::enter_browser_home()?;
+    elastos_server::update_controller::enter_browser_home().await?;
     elastos_server::gateway_cmd::run_gateway_direct_with_ready(
         format!(
             "localhost:{}",

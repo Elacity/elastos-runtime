@@ -564,7 +564,7 @@ fn first_start_without_controller_authority(data: &Path) -> Result<bool> {
 }
 
 /// Used by the existing Home browser entry. Source Homes keep their current launcher.
-pub fn enter_browser_home() -> Result<()> {
+pub async fn enter_browser_home() -> Result<()> {
     if std::env::var(HOST_ENV).as_deref() == Ok("1") {
         return Ok(());
     }
@@ -578,6 +578,9 @@ pub fn enter_browser_home() -> Result<()> {
     }
     let data = fs::canonicalize(data)?;
     let binary = fs::canonicalize(current)?;
+    if !crate::install_transaction::InstallTransaction::has_pending_recovery(&binary) {
+        repair_installed_support(&data, &binary, &source).await?;
+    }
     let Some(ControllerBootstrap {
         directory,
         lease,
@@ -641,6 +644,57 @@ pub fn enter_browser_home() -> Result<()> {
         libc::close(inherited);
     }
     Err(error.into())
+}
+
+/// An older updater or an interrupted Undo can leave this release's support
+/// incomplete. Components are repaired before Home starts; the model catalogue is
+/// Local AI's, so Home starts without it when the source is unreachable. The
+/// installation writer owns the repair.
+async fn repair_installed_support(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+) -> Result<()> {
+    let _writer = crate::install_transaction::InstallationGuard::acquire(
+        binary
+            .parent()
+            .context("installed Runtime parent missing")?,
+    )?;
+    crate::setup::repair_installed_support(
+        data,
+        binary,
+        source,
+        false,
+        crate::setup::CatalogueRepair::Optional,
+        crate::setup::FirstPartyCarrierContext::Runtime,
+    )
+    .await
+}
+
+/// System Update and Undo admit the installed release only after repairing its own
+/// support: the catalogue, now required, and any component an older updater or an
+/// interrupted Undo left behind. Returns the admitted Runtime digest.
+async fn admit_for_update(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+    fetch: &crate::update::FetchFn,
+) -> Result<String> {
+    let writer = crate::install_transaction::InstallationGuard::acquire(
+        binary
+            .parent()
+            .context("installed Runtime parent missing")?,
+    )?;
+    crate::setup::repair_installed_support(
+        data,
+        binary,
+        source,
+        false,
+        crate::setup::CatalogueRepair::Required(fetch),
+        crate::setup::FirstPartyCarrierContext::Runtime,
+    )
+    .await?;
+    Ok(crate::installed_release::load_or_migrate(data, binary, source, &writer)?.binary_sha256)
 }
 
 pub async fn run(receipt_path: PathBuf) -> Result<()> {
@@ -1114,21 +1168,6 @@ impl Controller {
                 && request.current_version == source.installed_version,
             "Update choice changed. Check the update again."
         );
-        let writer = crate::install_transaction::InstallationGuard::acquire(
-            self.receipt
-                .binary
-                .parent()
-                .context("installed Runtime parent missing")?,
-        )?;
-        self.previous_binary_sha256 = crate::installed_release::load_or_migrate(
-            &self.receipt.data_dir,
-            &self.receipt.binary,
-            &source,
-            &writer,
-        )?
-        .binary_sha256;
-        drop(writer);
-        self.previous_version = source.installed_version.clone();
         let client = Arc::new(
             crate::carrier::CarrierClient::connect_trusted_source(&source, 15)
                 .await
@@ -1156,6 +1195,14 @@ impl Controller {
             })
         });
         let result = async {
+            self.previous_binary_sha256 = admit_for_update(
+                &self.receipt.data_dir,
+                &self.receipt.binary,
+                &source,
+                &fetch,
+            )
+            .await?;
+            self.previous_version = source.installed_version.clone();
             let data_dir = self.receipt.data_dir.clone();
             crate::update::run_restarting_update(&data_dir, &fetch, request.head_cid, self).await
         }

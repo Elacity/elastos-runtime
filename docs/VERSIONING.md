@@ -154,6 +154,21 @@ the version by the contract change (see Meaning) and update the changelog first;
 `scripts/publish-release.sh` checks the version format with
 [`scripts/check-versioning.sh`](../scripts/check-versioning.sh).
 
+A new model catalogue is produced, signed and pinned before release preparation, with the same key.
+`components.json` carries no `model_catalog` until then: the release refuses a pin without `model-catalog.json`.
+(1) Prepare the pinned Kubo with `scripts/seed-kubo-cache.sh CACHE KUBO_DATA PLATFORM`. For each model, run
+`node scripts/ci-model-package.mjs produce FIXTURE OUT DID KUBO_DATA` with its pinned fixture (`scripts/pinned-smollm2-fixture.json`,
+`scripts/pinned-qwen2.5-1.5b-fixture.json`); it downloads and checks the pinned weights, builds `OUT/package`, prints its CID and
+byte size and writes `OUT/entry.json`. Then `node scripts/ci-model-package.mjs catalog CAT DID OUT1/entry.json OUT2/entry.json`
+writes the unsigned `CAT/payload.json` with the entries in that order (1 to 8), after the signer's own catalogue check accepts it.
+(2) Sign: `release-signer.py --policy POLICY --input-root DIR --model-catalog CAT/payload.json --output-root NEW_DIR`.
+The policy approves the payload by `model_catalog_sha256`; the operator types the DID. The signer refuses a payload the Runtime would refuse,
+writes `model-catalog.json` and prints its CID.
+(3) Pin each `OUT/package` in the seed's Kubo with `ipfs add` and the `KUBO_ADD_FLAGS` from `scripts/ci-model-package.mjs`; each printed CID must equal its package CID.
+(4) Put `model-catalog.json` at the repository root and add `model_catalog` to `components.json`: `head_cid` (the signer's CID),
+`publisher_dids` (the signing DID) and `local_use` (`max_cache_bytes` 8 GiB, `max_model_memory_bytes` 4 GiB).
+Keep that head stable across releases: a new head means every admitted model needs Use again.
+
 1. **Build.** Run the `Release package` workflow
    ([`.github/workflows/release-package.yml`](../.github/workflows/release-package.yml))
    with the source commit, the install version N and the update version N+1.
@@ -167,7 +182,9 @@ the version by the contract change (see Meaning) and update the changelog first;
    `scripts/release-publish.sh prepare RUN_ID VERSION`. It checks that the run
    succeeded and that its source is on `develop` (merge an open pull request
    first), downloads and verifies all three platform artifacts, and passes one
-   `--platform-input PLATFORM=DIR` per platform. For a Mac-only preview, run
+   `--platform-input PLATFORM=DIR` per platform. Prepare also requires successful
+   CI at that exact source commit, from a `develop` push or `develop` merge group,
+   with every required job completed successfully. For a Mac-only preview, run
    `scripts/release-publish.sh prepare RUN_ID VERSION aarch64-darwin`. The Mac
    coordinator requires `aarch64-darwin` in every selection; only a single
    platform uses `--preview-platform`. Prepare checks out the exact source as
@@ -181,14 +198,21 @@ the version by the contract change (see Meaning) and update the changelog first;
 4. **Import.** `scripts/release-publish.sh seed VERSION SIGNED_DIR` prints the
    seed sequence for the seed's installed Runtime: copy the signed installer
    and manifests, rebuild the rest from the selected CI artifacts, verify every
-   hash, stop the service, run the preflight, import, and start the service. An import run
-   while the service is stopped ends with the known gossip error
-   `No running runtime found` after the commit, and the sequence accepts only
-   that error.
+   hash, stop the service, run the preflight, import, and start the service.
+   The import sends no gossip. Older seed Runtimes still print `No running
+   runtime found` after the commit; that is expected, and the sequence accepts
+   only that error.
 5. **Pin for CI.** Run `python3 scripts/update-hop-compare.py pin-previous-release`
    and merge the updated `scripts/update-hop-previous-release.json` into `develop`.
    It checks the signed head and release the seed now serves. Every pull
    request's CI update journey then starts from this release.
+
+The seed only answers requests. It serves three Carrier ops: `release_head`
+(the signed head), `content_fetch` (any object by CID, from its Kubo pins) and
+`file` (a file by name, for older Homes and for parts without a CID). It keeps
+every published release pinned, so Undo and older Homes keep working. It does
+not push or notify anything. How Homes check and install is in
+[INSTALL.md](INSTALL.md#how-updates-reach-your-home).
 
 Upgrading the seed Runtime itself is rare. Run the workflow with
 `seed_package` set, then `scripts/release-publish.sh seed-upgrade RUN_ID` prints

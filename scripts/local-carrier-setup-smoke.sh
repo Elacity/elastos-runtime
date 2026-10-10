@@ -11,12 +11,12 @@ ELASTOS_ROOT="${REPO_ROOT}/elastos"
 if [[ -n "${CARGO_TARGET_DIR:-}" && "$CARGO_TARGET_DIR" != /* ]]; then
     export CARGO_TARGET_DIR="${REPO_ROOT}/${CARGO_TARGET_DIR}"
 fi
-ELASTOS_BIN="${CARGO_TARGET_DIR:-${ELASTOS_ROOT}/target}/debug/elastos"
-
 cargo_release_binary() {
     local workspace="$1" name="$2"
     printf '%s/release/%s\n' "${CARGO_TARGET_DIR:-${REPO_ROOT}/${workspace}/target}" "$name"
 }
+
+ELASTOS_BIN="$(cargo_release_binary elastos elastos)"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     echo "local-carrier-setup-smoke currently supports Linux only." >&2
@@ -123,7 +123,7 @@ trap cleanup EXIT
 echo "[local-carrier-setup] test root: ${TEST_ROOT}"
 echo "[local-carrier-setup] building current binary and first-party Home core assets"
 
-(cd "${ELASTOS_ROOT}" && cargo build -p elastos-server)
+(cd "${ELASTOS_ROOT}" && cargo build --locked --release -p elastos-server)
 (cd "${REPO_ROOT}/elastos/capsules/shell" && cargo build --release)
 (cd "${REPO_ROOT}/elastos/capsules/localhost-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/did-provider" && cargo build --release)
@@ -525,6 +525,10 @@ DATA_DIR="${XDG_DATA_HOME}/elastos"
 [[ ! -e "$DATA_DIR" && ! -L "$DATA_DIR" ]]
 mkdir -p "${DATA_DIR}/bin"
 cp "${PUBLISHER_DATA_DIR}/components.json" "${DATA_DIR}/components.json"
+# A source setup reads the pinned signed model catalogue beside its manifest.
+if [[ -f "${REPO_ROOT}/model-catalog.json" ]]; then
+    install -m 600 "${REPO_ROOT}/model-catalog.json" "${DATA_DIR}/model-catalog.json"
+fi
 install -m 700 "$(cargo_release_binary elastos localhost-provider)" \
     "${DATA_DIR}/bin/localhost-provider"
 [[ ! -e "${DATA_DIR}/bin/kubo" && ! -e "${DATA_DIR}/capsules/kubo" ]]
