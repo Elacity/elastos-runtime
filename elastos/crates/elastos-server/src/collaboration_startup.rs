@@ -266,7 +266,7 @@ pub async fn start_collaboration_runtime_service(
     let history_service = CollaborationHistoryService::new(
         product_port.clone(),
         presence_port.clone(),
-        provider_registry,
+        provider_registry.clone(),
         data_root.to_path_buf(),
     )
     .await?;
@@ -275,7 +275,9 @@ pub async fn start_collaboration_runtime_service(
         tracing::info!("collaboration ready for {registered} Profile(s)");
     }
     let joined = join_collaboration_network(carrier, &profile).await?;
-    let driver = CollaborationTransportDriver::new(core, joined);
+    let driver = CollaborationTransportDriver::new(core, joined)
+        .with_home_delivery(presence_port.clone(), provider_registry)
+        .await?;
     let (shutdown, shutdown_rx) = watch::channel(false);
     let discovery_shutdown_rx = shutdown_rx.clone();
     let presence_shutdown_rx = shutdown_rx.clone();
@@ -1214,6 +1216,16 @@ mod tests {
         })
     }
 
+    fn accept_shared(
+        core: &CollaborationCore,
+        authority: &DefaultConversationDeviceAuthority,
+        envelope: &[u8],
+        now: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let frame = authority.prepare_transport_frame(envelope)?;
+        core.accept_home_chat(&frame, &authority.local_device_did(), now)
+    }
+
     fn peek(cursor: u64, next_cursor: u64, messages: Vec<serde_json::Value>) -> FakeReply {
         let scanned = messages.len();
         FakeReply::Value(serde_json::json!({
@@ -1714,11 +1726,8 @@ mod tests {
             .await
             .unwrap();
         let driver = CollaborationTransportDriver::new(core.clone(), joined);
-        carrier.push([
-            peek(0, 1, vec![gossip_frame(&remote, incoming.envelope_bytes())]),
-            send_remote(),
-            ack(0, 1, true),
-        ]);
+        accept_shared(&core, &remote, incoming.envelope_bytes(), NOW + 1).unwrap();
+        carrier.push([peek(0, 0, Vec::new()), ack(0, 0, false)]);
 
         run_collaboration_worker_cycle(&driver, &product_port, temp.path(), NOW + 1).await;
         assert_eq!(core.summary().unwrap().pending_product_handoffs, 0);
@@ -1901,7 +1910,7 @@ mod tests {
         );
         assert!(!request_ops(&carrier).iter().any(|op| op == "gossip_send"));
 
-        carrier.push([send_remote(), peek(0, 0, Vec::new()), ack(0, 0, false)]);
+        carrier.push([peek(0, 0, Vec::new()), ack(0, 0, false)]);
         run_collaboration_worker_cycle(&driver, &product_port, temp.path(), NOW + 1).await;
         assert!(core
             .pending_outgoing_product_projections(NOW + 1)
@@ -1913,7 +1922,7 @@ mod tests {
                 .iter()
                 .filter(|op| op.as_str() == "gossip_send")
                 .count(),
-            1
+            0
         );
         assert_eq!(
             product_port
@@ -1941,7 +1950,7 @@ mod tests {
             .unwrap();
         let restart_driver =
             CollaborationTransportDriver::new(restarted_core.clone(), restart_joined);
-        restart_carrier.push([send_remote(), peek(0, 0, Vec::new()), ack(0, 0, false)]);
+        restart_carrier.push([peek(0, 0, Vec::new()), ack(0, 0, false)]);
         run_collaboration_worker_cycle(&restart_driver, &restarted_port, temp.path(), NOW + 2)
             .await;
         assert_eq!(
@@ -1957,7 +1966,7 @@ mod tests {
                 .iter()
                 .filter(|op| op.as_str() == "gossip_send")
                 .count(),
-            1
+            0
         );
     }
 
@@ -2014,11 +2023,8 @@ mod tests {
             .await
             .unwrap();
         let driver = CollaborationTransportDriver::new(core.clone(), joined);
-        carrier.push([
-            peek(0, 1, vec![gossip_frame(&remote, incoming.envelope_bytes())]),
-            send_remote(),
-            ack(0, 1, true),
-        ]);
+        accept_shared(&core, &remote, incoming.envelope_bytes(), NOW + 1).unwrap();
+        carrier.push([peek(0, 0, Vec::new()), ack(0, 0, false)]);
         run_collaboration_worker_cycle(&driver, &product_port, temp.path(), NOW + 1).await;
         assert_eq!(core.summary().unwrap().pending_product_handoffs, 1);
 
@@ -2347,7 +2353,6 @@ mod tests {
         let carrier = FakeCarrier::new([
             FakeReply::JoinEcho,
             send_remote(),
-            send_remote(),
             peek(0, 0, Vec::new()),
             ack(0, 0, false),
         ]);
@@ -2374,7 +2379,7 @@ mod tests {
                 .iter()
                 .filter(|request| request["op"] == "gossip_send")
                 .count(),
-            2
+            1
         );
         assert!(chat
             .retained_history(now)
@@ -2437,21 +2442,23 @@ mod tests {
             );
             let chat = CollaborationChatProductPort::new(core.clone()).unwrap();
             let presence = CollaborationPresenceProductPort::new(core.clone()).unwrap();
-            if blocked_outgoing {
-                chat.prepare_message(
-                    chat_message_request_binding(
-                        "blocked-outgoing",
-                        "principal",
-                        "local waiting",
+            let local_metadata = if blocked_outgoing {
+                let prepared = presence
+                    .prepare_presence(
+                        presence_request_binding("blocked-presence", "principal", &local_profile)
+                            .unwrap(),
                         &local_profile,
+                        now,
                     )
-                    .unwrap(),
-                    "local waiting",
-                    &local_profile,
-                    now,
+                    .unwrap();
+                presence.project_prepared_presence(&prepared, now).unwrap();
+                Some(
+                    core.prepare_transport_frame(prepared.test_envelope_bytes())
+                        .unwrap(),
                 )
-                .unwrap();
-            }
+            } else {
+                None
+            };
             let (remote_key, _) = generate_keypair();
             let remote_profile = profile_for_endpoint(&remote_key, "Remote");
             let remote =
@@ -2471,28 +2478,32 @@ mod tests {
             let joined = join_collaboration_network(carrier.clone(), &profile)
                 .await
                 .unwrap();
-            if blocked_outgoing {
-                // Bind the blocked send to this exact local message so an
-                // earlier receipt send cannot consume its pending response.
-                let pending = core.pending_outgoing_product_projections(now).unwrap();
-                let frame = core
-                    .prepare_transport_frame(pending[0].outgoing().envelope_bytes())
-                    .unwrap();
-                *carrier.pending_message.lock().unwrap() = Some(String::from_utf8(frame).unwrap());
-                carrier.push_for("gossip_send", [send_remote()]);
+            accept_shared(&core, &remote, incoming.envelope_bytes(), now).unwrap();
+            if let Some(metadata) = local_metadata {
+                *carrier.pending_message.lock().unwrap() =
+                    Some(String::from_utf8(metadata).unwrap());
+                carrier.push_for("gossip_peek", [peek(0, 0, Vec::new())]);
+                carrier.push_for("gossip_ack", [ack(0, 0, false)]);
             } else {
+                let announcement = remote
+                    .prepare_profile_outgoing(
+                        &remote_profile,
+                        SERVICE,
+                        "elastos.chat.presence/v1",
+                        serde_json::json!({}),
+                        now,
+                        45,
+                    )
+                    .unwrap();
                 carrier.push_for("gossip_send", [FakeReply::Pending]);
-            }
-            carrier.push_for(
-                "gossip_peek",
-                [peek(
-                    0,
-                    1,
-                    vec![gossip_frame(&remote, incoming.envelope_bytes())],
-                )],
-            );
-            if blocked_outgoing {
-                carrier.push_for("gossip_ack", [ack(0, 1, true)]);
+                carrier.push_for(
+                    "gossip_peek",
+                    [peek(
+                        0,
+                        1,
+                        vec![gossip_frame(&remote, announcement.envelope_bytes())],
+                    )],
+                );
             }
             let driver = CollaborationTransportDriver::new(core.clone(), joined);
             let session = crate::room_service::start_local_runtime_session(
@@ -2534,14 +2545,17 @@ mod tests {
             assert!(!worker.is_finished());
             assert_eq!(*carrier.pending_ops.lock().unwrap(), ["gossip_send"]);
             assert_eq!(core.summary().unwrap().pending_product_handoffs, 0);
-            assert_eq!(core.summary().unwrap().replay_tombstones, 1);
+            assert_eq!(
+                core.summary().unwrap().replay_tombstones,
+                if blocked_outgoing { 1 } else { 2 }
+            );
             let requests = carrier.requests();
             assert_eq!(
                 requests
                     .iter()
                     .filter(|request| request["op"] == "gossip_send")
                     .count(),
-                if blocked_outgoing { 2 } else { 1 }
+                1
             );
             shutdown.send(true).unwrap();
             tokio::time::timeout(Duration::from_millis(500), worker)
@@ -2823,37 +2837,24 @@ mod tests {
         assert_eq!(request_ops(&carrier), ["gossip_join_exact", "gossip_peek"]);
 
         core.inject_write_fault(WriteFault::BeforeWrite);
-        carrier.push([peek(
-            0,
-            1,
-            vec![gossip_frame(&remote_authority, incoming.envelope_bytes())],
-        )]);
-        run_collaboration_worker_cycle(&driver, &product_port, temp.path(), NOW + 1).await;
+        assert!(
+            accept_shared(&core, &remote_authority, incoming.envelope_bytes(), NOW + 1).is_err()
+        );
         assert!(core.pending_outgoing(NOW + 1).unwrap().is_empty());
         assert_eq!(core.summary().unwrap().pending_product_handoffs, 0);
 
-        carrier.push([
-            peek(
-                0,
-                1,
-                vec![gossip_frame(&remote_authority, incoming.envelope_bytes())],
-            ),
-            send_remote(),
-            FakeReply::Error("ack failed"),
-        ]);
+        let receipt =
+            accept_shared(&core, &remote_authority, incoming.envelope_bytes(), NOW + 1).unwrap();
+        carrier.push([peek(0, 0, Vec::new()), FakeReply::Error("ack failed")]);
         run_collaboration_worker_cycle(&driver, &product_port, temp.path(), NOW + 1).await;
         assert_eq!(core.summary().unwrap().pending_product_handoffs, 1);
         assert!(core.pending_outgoing(NOW + 1).unwrap().is_empty());
 
-        carrier.push([
-            peek(
-                0,
-                1,
-                vec![gossip_frame(&remote_authority, incoming.envelope_bytes())],
-            ),
-            send_remote(),
-            ack(0, 1, true),
-        ]);
+        assert_eq!(
+            accept_shared(&core, &remote_authority, incoming.envelope_bytes(), NOW + 1).unwrap(),
+            receipt,
+        );
+        carrier.push([peek(0, 0, Vec::new()), ack(0, 0, false)]);
         run_collaboration_worker_cycle(&driver, &product_port, temp.path(), NOW + 1).await;
         assert_eq!(core.summary().unwrap().pending_product_handoffs, 1);
 

@@ -21,7 +21,7 @@ use crate::collaboration_core::{
 use crate::collaboration_product::{CHAT_INTERFACE, CHAT_ROOM_CAPSULE, CHAT_SERVICE};
 use crate::esp_binding::{esp_request_binding, EspRequestBinding};
 
-const PRESENCE_PAYLOAD_TYPE: &str = "elastos.chat.presence/v1";
+pub(crate) const PRESENCE_PAYLOAD_TYPE: &str = "elastos.chat.presence/v1";
 const PRESENCE_RESOURCE: &str = "elastos://chat/presence";
 const PRESENCE_TTL_SECS: u64 = 45;
 const PRESENCE_STATE_SCHEMA: &str = "elastos.chat.presence-state/v1";
@@ -243,6 +243,9 @@ impl CollaborationPresenceProductPort {
                 .core
                 .authorize_stored_product_message(record.envelope.as_bytes())?;
             if let Ok(endpoint) = authorized.sender_profile().sole_endpoint_did() {
+                if self.core.is_bootstrap_endpoint(endpoint) {
+                    continue;
+                }
                 peers.push(HistoryParticipant {
                     endpoint_did: endpoint.to_string(),
                     presence_envelope: record.envelope,
@@ -262,6 +265,13 @@ impl CollaborationPresenceProductPort {
         source_endpoint_did: &str,
         now: u64,
     ) -> anyhow::Result<()> {
+        if self.core.is_bootstrap_endpoint(source_endpoint_did)
+            || self
+                .core
+                .is_bootstrap_endpoint(&self.core.local_device_did())
+        {
+            anyhow::bail!("Community bootstrap endpoints carry discovery metadata only");
+        }
         let presence = self.read_model.verify_envelope(envelope_bytes)?;
         if presence.expires_at <= now
             || presence.issued_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)

@@ -270,7 +270,23 @@ impl JoinedCollaborationNetwork {
         Ok(())
     }
 
-    pub async fn send(&self, frame: &[u8]) -> anyhow::Result<CollaborationCarrierSendOutcome> {
+    pub(crate) async fn send_metadata(
+        &self,
+        core: &crate::collaboration_core::CollaborationCore,
+        frame: &[u8],
+        original: Option<&[u8]>,
+    ) -> anyhow::Result<CollaborationCarrierSendOutcome> {
+        let allowed = match original {
+            Some(original) => core.allows_gossip_receipt(frame, original)?,
+            None => core.allows_gossip_frame(frame)?,
+        };
+        if !allowed {
+            anyhow::bail!("Shared Chat originals and receipts use direct Home delivery");
+        }
+        self.send_frame(frame).await
+    }
+
+    async fn send_frame(&self, frame: &[u8]) -> anyhow::Result<CollaborationCarrierSendOutcome> {
         let message =
             std::str::from_utf8(frame).context("collaboration Carrier frame is not UTF-8")?;
         if frame.len() > MAX_COLLABORATION_TRANSPORT_FRAME_BYTES {
@@ -1037,20 +1053,20 @@ mod tests {
         let envelope = br#"{"frame":"ok"}"#;
 
         assert_eq!(
-            joined.send(envelope).await.unwrap(),
+            joined.send_frame(envelope).await.unwrap(),
             CollaborationCarrierSendOutcome::RemoteBroadcast { peer_count: 2 }
         );
         assert_eq!(
-            joined.send(envelope).await.unwrap(),
+            joined.send_frame(envelope).await.unwrap(),
             CollaborationCarrierSendOutcome::LocalOnlyBuffered
         );
         let request_count = carrier.requests().len();
         assert!(joined
-            .send(&vec![b'x'; MAX_COLLABORATION_TRANSPORT_FRAME_BYTES + 1])
+            .send_frame(&vec![b'x'; MAX_COLLABORATION_TRANSPORT_FRAME_BYTES + 1])
             .await
             .is_err());
         assert_eq!(carrier.requests().len(), request_count);
-        assert!(joined.send(envelope).await.is_err());
+        assert!(joined.send_frame(envelope).await.is_err());
 
         for request in &carrier.requests()[1..3] {
             assert_eq!(request["op"], "gossip_send");

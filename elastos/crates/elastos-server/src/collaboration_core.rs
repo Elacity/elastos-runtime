@@ -84,7 +84,8 @@ pub(crate) struct DurableOutgoingMessage {
     envelope_bytes: Vec<u8>,
     envelope_sha256: String,
     created_at: u64,
-    remote_acceptance_recorded: bool,
+    shared_chat: bool,
+    accepted_endpoints: Vec<String>,
 }
 
 pub(crate) struct PendingOutgoingProductProjection {
@@ -98,6 +99,16 @@ impl PendingOutgoingProductProjection {
 }
 
 impl DurableOutgoingMessage {
+    pub(crate) fn shared_chat(&self) -> bool {
+        self.shared_chat
+    }
+
+    pub(crate) fn accepted_by(&self, endpoint: &str) -> bool {
+        self.accepted_endpoints
+            .iter()
+            .any(|accepted| accepted == endpoint)
+    }
+
     pub(crate) fn envelope_bytes(&self) -> &[u8] {
         &self.envelope_bytes
     }
@@ -110,8 +121,9 @@ impl DurableOutgoingMessage {
         self.created_at
     }
 
+    #[cfg(test)]
     pub(crate) fn remote_acceptance_recorded(&self) -> bool {
-        self.remote_acceptance_recorded
+        !self.accepted_endpoints.is_empty()
     }
 }
 
@@ -517,6 +529,126 @@ impl CollaborationCore {
 
     pub(crate) fn local_device_did(&self) -> String {
         self.authority.local_device_did()
+    }
+
+    pub(crate) fn is_bootstrap_endpoint(&self, endpoint: &str) -> bool {
+        let Some(key) = crate::carrier::did_to_public_key(endpoint) else {
+            return true;
+        };
+        self.authority
+            .profile()
+            .profile()
+            .bootstrap_peers
+            .iter()
+            .any(|peer| peer.node_id == key.to_string())
+    }
+
+    /// Gossip carries Presence metadata. Shared originals and their receipts
+    /// belong to an authenticated Home-to-Home provider exchange.
+    pub(crate) fn allows_gossip_frame(&self, frame: &[u8]) -> anyhow::Result<bool> {
+        let Ok(frame) = verify_collaboration_transport_frame(frame) else {
+            return Ok(false);
+        };
+        match collaboration_transport_frame_kind(frame.envelope_bytes()) {
+            Ok(CollaborationTransportFrameKind::Message) => {
+                let Ok(message) = self.authorize_stored_product_message(frame.envelope_bytes())
+                else {
+                    return Ok(false);
+                };
+                Ok(message.message().envelope().payload.payload_type
+                    == crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE)
+            }
+            Ok(CollaborationTransportFrameKind::AcceptanceReceipt) => {
+                let Ok(receipt) = verify_stored_acceptance_receipt_envelope(frame.envelope_bytes())
+                else {
+                    return Ok(false);
+                };
+                let state = self.load_state()?.unwrap_or_else(|| self.empty_state());
+                let hash = &receipt.envelope().payload.message_envelope_sha256;
+                let Some(outgoing) = state.outgoing.iter().find(|entry| {
+                    collaboration_message_envelope_sha256(entry.envelope.as_bytes()) == *hash
+                }) else {
+                    return Ok(false);
+                };
+                Ok(self
+                    .verify_outgoing_record(outgoing)?
+                    .envelope()
+                    .payload
+                    .payload_type
+                    == crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(crate) fn allows_gossip_receipt(
+        &self,
+        receipt_frame: &[u8],
+        original_frame: &[u8],
+    ) -> anyhow::Result<bool> {
+        let original = verify_collaboration_transport_frame(original_frame)?;
+        let message = self.authorize_stored_product_message(original.envelope_bytes())?;
+        if message.message().envelope().payload.payload_type
+            != crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE
+        {
+            return Ok(false);
+        }
+        let receipt = verify_collaboration_transport_frame(receipt_frame)?;
+        crate::collaboration_protocol::verify_stored_collaboration_acceptance_receipt(
+            receipt.envelope_bytes(),
+            message.message(),
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn accept_home_chat(
+        &self,
+        frame: &[u8],
+        source: &str,
+        now: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.community_membership.require_joined()?;
+        if self.is_bootstrap_endpoint(source)
+            || self.is_bootstrap_endpoint(&self.local_device_did())
+        {
+            anyhow::bail!("Community bootstrap endpoints carry discovery metadata only");
+        }
+        let verified = verify_collaboration_transport_frame(frame)?;
+        if verified.source_endpoint_did() != source
+            || self
+                .authorize_stored_product_message(verified.envelope_bytes())?
+                .message()
+                .envelope()
+                .payload
+                .payload_type
+                != COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE
+        {
+            anyhow::bail!("Shared delivery does not match its authenticated Home source");
+        }
+        match self.ingest_transport_frame(frame, now) {
+            Ok(CollaborationTransportIngestion::Incoming(accepted)) => {
+                Ok(accepted.acceptance_receipt_bytes().to_vec())
+            }
+            _ => anyhow::bail!("Shared delivery was refused"),
+        }
+    }
+
+    pub(crate) fn record_home_chat_acceptance(
+        &self,
+        receipt: &[u8],
+        message_hash: &str,
+        endpoint: &str,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        self.community_membership.require_joined()?;
+        let verified = verify_stored_acceptance_receipt_envelope(receipt)?;
+        if self.is_bootstrap_endpoint(endpoint)
+            || verified.accepting_endpoint_did() != endpoint
+            || verified.envelope().payload.message_envelope_sha256 != message_hash
+        {
+            anyhow::bail!("Shared acceptance does not name the selected Home");
+        }
+        self.record_remote_acceptance(receipt, now)
     }
 
     pub(crate) fn prepare_transport_frame(&self, envelope_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -1050,6 +1182,11 @@ impl CollaborationCore {
                 })
                 .context("acceptance receipt does not match a persisted outgoing message")?;
             let verified_message = self.verify_outgoing_record(entry)?;
+            if verified_message.envelope().payload.payload_type
+                == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE
+            {
+                self.community_membership.require_joined()?;
+            }
             verify_collaboration_acceptance_receipt(receipt_bytes, &verified_message, now)?;
 
             for existing in &entry.remote_acceptance_receipts {
@@ -1109,6 +1246,11 @@ impl CollaborationCore {
         }
 
         self.with_mutation(Some(now), |state| {
+            if incoming.message().envelope().payload.payload_type
+                == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE
+            {
+                self.community_membership.require_joined()?;
+            }
             if let Some(existing) =
                 self.exact_incoming_replay(state, envelope_bytes, &envelope_hash, now)?
             {
@@ -2029,7 +2171,17 @@ fn outgoing_handle(
         envelope_bytes: entry.envelope.as_bytes().to_vec(),
         envelope_sha256: verified.envelope_sha256().to_string(),
         created_at: verified.envelope().payload.created_at,
-        remote_acceptance_recorded: !entry.remote_acceptance_receipts.is_empty(),
+        shared_chat: verified.envelope().payload.payload_type
+            == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE,
+        accepted_endpoints: entry
+            .remote_acceptance_receipts
+            .iter()
+            .filter_map(|bytes| {
+                verify_stored_acceptance_receipt_envelope(bytes.as_bytes())
+                    .ok()
+                    .map(|receipt| receipt.accepting_endpoint_did().to_string())
+            })
+            .collect(),
     }
 }
 
@@ -2547,6 +2699,108 @@ mod tests {
             .outgoing
             .iter()
             .all(|record| record.operation.request_id != "refused-while-left"));
+    }
+
+    #[test]
+    fn entered_home_delivery_and_receipt_writes_finish_before_leave() {
+        use std::sync::{mpsc, TryLockError};
+        use std::time::{Duration, Instant};
+
+        for settlement in [false, true] {
+            let fixture = Fixture::new();
+            let core = Arc::new(fixture.core());
+            let outgoing = prepare(
+                &core,
+                "local",
+                serde_json::json!({"body":"local"}),
+                NOW,
+                TTL,
+            )
+            .unwrap();
+            complete_projection(&core, &outgoing);
+            let (remote_key, _) = generate_keypair();
+            let remote = fixture.authority(remote_key.clone());
+            let remote_did = remote.local_device_did();
+            let bytes = if settlement {
+                remote_receipt(&fixture, &outgoing, remote_key.clone(), NOW + 1)
+            } else {
+                remote_transport_message(&fixture, remote_key.clone(), NOW).1
+            };
+            let file = lock_owner_only_file(&core.lock_path()).unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let admission = core.clone();
+            let bytes_copy = bytes.clone();
+            let endpoint = remote_did.clone();
+            let hash = outgoing.envelope_sha256().to_string();
+            let write = std::thread::spawn(move || {
+                let result = if settlement {
+                    admission.record_home_chat_acceptance(&bytes_copy, &hash, &endpoint, NOW + 1)
+                } else {
+                    admission
+                        .accept_home_chat(&bytes_copy, &endpoint, NOW + 1)
+                        .map(|_| ())
+                };
+                done_tx.send(result).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match core.mutation_mutex.try_lock() {
+                    Err(TryLockError::WouldBlock) => break,
+                    Err(error) => panic!("mutation lock failed: {error}"),
+                    Ok(guard) => drop(guard),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Home admission did not enter Core"
+                );
+                std::thread::yield_now();
+            }
+            let (left_tx, left_rx) = mpsc::channel();
+            let leaving = core.clone();
+            let leave = std::thread::spawn(move || {
+                left_tx.send(leaving.set_community_joined(false)).unwrap();
+            });
+            assert!(matches!(
+                left_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(core.community_membership().joined());
+            drop(file);
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            left_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            write.join().unwrap();
+            leave.join().unwrap();
+            let committed = fs::read(core.state_path()).unwrap();
+            let retry = if settlement {
+                core.record_home_chat_acceptance(
+                    &bytes,
+                    outgoing.envelope_sha256(),
+                    &remote_did,
+                    NOW + 1,
+                )
+            } else {
+                core.accept_home_chat(&bytes, &remote_did, NOW + 1)
+                    .map(|_| ())
+            };
+            assert!(retry.is_err());
+            // The inner durable boundary also refuses an operation whose outer
+            // Home admission already ran before Leave.
+            let inner = if settlement {
+                core.record_remote_acceptance(&bytes, NOW + 2)
+            } else {
+                let (_, fresh) = remote_message(&fixture, remote_key, NOW + 2);
+                core.accept_incoming(&fresh, &remote_did, NOW + 2)
+                    .map(|_| ())
+            };
+            assert!(inner.is_err());
+            assert_eq!(fs::read(core.state_path()).unwrap(), committed);
+        }
     }
 
     fn complete_projection(core: &CollaborationCore, outgoing: &DurableOutgoingMessage) {

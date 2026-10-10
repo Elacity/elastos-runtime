@@ -642,6 +642,7 @@ const RESERVED_RUNTIME_PROVIDER_TARGETS: &[&str] = &[
     "custody",
     "protected-content-decrypt",
     "collaboration.history",
+    "collaboration.shared",
 ];
 
 /// Registry of providers
@@ -4565,6 +4566,7 @@ mod tests {
             "custody",
             "protected-content-decrypt",
             "collaboration.history",
+            "collaboration.shared",
         ] {
             registry
                 .register_runtime_provider_target(target, Arc::new(RawMockProvider))
@@ -4598,6 +4600,7 @@ mod tests {
             "custody",
             "protected-content-decrypt",
             "collaboration.history",
+            "collaboration.shared",
         ] {
             let protected = registry
                 .invoke_provider(ProviderInvocation {
@@ -4658,6 +4661,7 @@ mod tests {
             "custody",
             "protected-content-decrypt",
             "collaboration.history",
+            "collaboration.shared",
         ] {
             registry
                 .register_runtime_provider_target(target, Arc::new(RawMockProvider))
