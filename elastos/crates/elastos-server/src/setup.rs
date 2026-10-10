@@ -674,7 +674,6 @@ async fn admit_installed_setup_metadata(
                     client
                         .fetch_content_bounded(
                             &cid,
-                            None,
                             crate::collaboration_startup::MAX_STARTUP_CONFIG_BYTES,
                         )
                         .await

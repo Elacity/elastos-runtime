@@ -8360,16 +8360,6 @@ impl CarrierClient {
     }
 
     pub async fn fetch_content(&self, cid: &str, path: Option<&str>) -> Result<Vec<u8>> {
-        self.fetch_content_bounded(cid, path, MAX_DOWNLOAD_BYTES)
-            .await
-    }
-
-    pub(crate) async fn fetch_content_bounded(
-        &self,
-        cid: &str,
-        path: Option<&str>,
-        max_bytes: usize,
-    ) -> Result<Vec<u8>> {
         let mut msg = serde_json::json!({
             "op": "content_fetch",
             "cid": cid,
@@ -8377,7 +8367,8 @@ impl CarrierClient {
         if let Some(path) = path.filter(|path| !path.is_empty()) {
             msg["path"] = serde_json::Value::String(path.to_string());
         }
-        self.fetch_bytes(msg, "content fetch", cid, max_bytes).await
+        self.fetch_bytes(msg, "content fetch", cid, MAX_DOWNLOAD_BYTES)
+            .await
     }
 
     pub(crate) async fn fetch_content_bounded(
