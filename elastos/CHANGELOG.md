@@ -6,6 +6,34 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+## [0.8.0-alpha.14]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- Marketplace offers a second local model, Qwen2.5 1.5B Instruct (1.1 GB,
+  Apache-2.0), for noticeably better answers than SmolLM2. It needs about 3 GB
+  of free memory.
+
+### Changed
+
+- This release updates the model list. If SmolLM2 is already on this device,
+  press Use once; it keeps the downloaded files.
+- If this Home is on 0.8.0-alpha.12 or older, Update here stops with "The update
+  could not start" and keeps your current release. Run the installer again
+  instead (`curl -fsSL https://elastos.elacitylabs.com/install.sh | bash`); it
+  keeps your identity and data.
+
+### Developer detail
+
+- Signed model catalogue 3 is pinned in `components.json` (head
+  `bafkreid5lc25ap4v3qw576uw3z3zdsbsfhqnnt5uwfdkawju4ejrtin7z4`): SmolLM2-135M
+  unchanged plus Qwen2.5-1.5B-Instruct Q4_K_M (package
+  `bafybeievyi6xp5b62qkuh65ywkd72medhx6uxrmik2fhnr3aameeqnxvwe`, reproducible,
+  pinned on the seed). alpha.13's updaters install the new catalogue; alpha.12
+  and older System updaters cannot (#84, #113).
+
 ## [0.8.0-alpha.13]
 
 Test-channel release. Signed releases show these notes in System before you update.
