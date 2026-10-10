@@ -17,6 +17,7 @@ use std::process::Command;
 mod browser_vm_image;
 #[cfg(unix)]
 mod local_model_engine_receipt;
+mod progress;
 
 const DEFAULT_SETUP_PROFILE: &str = "home";
 const CACHED_CID_FILE: &str = ".elastos-cid";
@@ -378,34 +379,65 @@ async fn run_with_data_dir(
         return Ok(());
     }
 
-    println!("Components to install:");
+    let mut pending_count = 0usize;
+    let mut pending_bytes = 0u64;
     for name in &components {
         let comp = &manifest.external[name];
         let platform_info = resolve_platform_info(comp, &platform);
-        let status = match effective_component_install_state_for_name(
-            &manifest,
-            &data_dir,
-            name,
-            comp,
-            platform_info,
-            &platform,
-        ) {
-            InstallState::Installed => " [already installed]",
-            InstallState::Stale(_) => " [stale: will refresh]",
-            InstallState::Missing => "",
-        };
-        let size = comp
-            .size_mb
-            .map(|s| format!(" (~{} MB)", s))
-            .unwrap_or_default();
-        println!("  - {}{}{}", name, size, status);
+        let binary_install_state =
+            component_install_state_for_name(&manifest, &data_dir, name, comp, platform_info);
+        if !skipped_before_install(comp, platform_info, &binary_install_state)
+            && !matches!(
+                effective_component_install_state_for_name(
+                    &manifest,
+                    &data_dir,
+                    name,
+                    comp,
+                    platform_info,
+                    &platform,
+                ),
+                InstallState::Installed
+            )
+        {
+            pending_count += 1;
+            pending_bytes = pending_bytes.saturating_add(
+                pending_signed_size(
+                    comp,
+                    platform_info,
+                    &binary_install_state,
+                    capsule_metadata_install_state_for_name(&data_dir, name, comp, &platform)
+                        .as_ref(),
+                    &platform,
+                )
+                .unwrap_or(0),
+            );
+        }
     }
+    let size = if pending_bytes > 0 {
+        format!(" ({})", progress::format_size(pending_bytes))
+    } else {
+        String::new()
+    };
+    println!(
+        "Components: {} selected, {} to install{}",
+        components.len(),
+        pending_count,
+        size
+    );
     println!();
 
+    let mode = progress::OutputMode::detect();
+    let name_width = components
+        .iter()
+        .map(|name| name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(progress::NAME_WIDTH_LIMIT);
+    let setup_started = std::time::Instant::now();
     let mut installed_count = 0u32;
     let mut skipped_count = 0u32;
 
-    for name in &components {
+    for (index, name) in components.iter().enumerate() {
         let comp = &manifest.external[name];
         let platform_info = resolve_platform_info(comp, &platform);
 
@@ -413,6 +445,20 @@ async fn run_with_data_dir(
             component_install_state_for_name(&manifest, &data_dir, name, comp, platform_info);
         let metadata_install_state =
             capsule_metadata_install_state_for_name(&data_dir, name, comp, &platform);
+        let line = progress::ComponentProgress::new(
+            mode,
+            index + 1,
+            components.len(),
+            name,
+            name_width,
+            pending_signed_size(
+                comp,
+                platform_info,
+                &binary_install_state,
+                metadata_install_state.as_ref(),
+                &platform,
+            ),
+        );
         match effective_component_install_state_for_name(
             &manifest,
             &data_dir,
@@ -423,14 +469,19 @@ async fn run_with_data_dir(
         ) {
             InstallState::Installed => {
                 if let Some(platform_info) = platform_info {
-                    ensure_bundle_executable_link(&data_dir, name, platform_info)?;
+                    if let Err(error) =
+                        ensure_bundle_executable_link(&data_dir, name, platform_info)
+                    {
+                        line.failed();
+                        return Err(error);
+                    }
                 }
-                println!("[skip] {} — already installed", name);
+                line.note("already installed");
                 skipped_count += 1;
                 continue;
             }
             InstallState::Stale(reason) => {
-                println!("[refresh] {} — {}", name, reason);
+                line.refreshing(&reason);
             }
             InstallState::Missing => {}
         }
@@ -439,10 +490,7 @@ async fn run_with_data_dir(
         let platform_info = match platform_info {
             Some(info) => info,
             None => {
-                println!(
-                    "[skip] {} — not available for {} in this release",
-                    name, platform
-                );
+                line.note(&format!("skipped: not available for {platform}"));
                 skipped_count += 1;
                 continue;
             }
@@ -453,7 +501,7 @@ async fn run_with_data_dir(
                 .note
                 .as_deref()
                 .unwrap_or("Source build required");
-            println!("[skip] {} — {}", name, note);
+            line.note(&format!("skipped: {note}"));
             skipped_count += 1;
             continue;
         }
@@ -464,7 +512,7 @@ async fn run_with_data_dir(
             let source = match &platform_info.source {
                 Some(s) => PathBuf::from(s),
                 None => {
-                    println!("[skip] {} — local-copy strategy but no source path", name);
+                    line.note("skipped: local-copy strategy but no source path");
                     skipped_count += 1;
                     continue;
                 }
@@ -474,35 +522,37 @@ async fn run_with_data_dir(
                     .note
                     .as_deref()
                     .unwrap_or("Local source file not found");
-                println!(
-                    "[skip] {} — {} (expected: {})",
-                    name,
+                line.note(&format!(
+                    "skipped: {} (expected: {})",
                     note,
                     source.display()
-                );
+                ));
                 skipped_count += 1;
                 continue;
             }
             let install_path = match resolve_install_path(comp, Some(platform_info)) {
                 Some(p) => p,
                 None => {
-                    println!("[skip] {} — no install_path configured", name);
+                    line.note("skipped: no install_path configured");
                     skipped_count += 1;
                     continue;
                 }
             };
             let dest = data_dir.join(install_path);
-            println!("[install] {} — copying from {}", name, source.display());
-            atomic_copy_file(&source, &dest)?;
-            set_local_copy_permissions(&source, &dest);
-            write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)?;
-            println!("  Installed: {}", dest.display());
+            let copied = atomic_copy_file(&source, &dest).and_then(|()| {
+                set_local_copy_permissions(&source, &dest);
+                write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)
+            });
+            if let Err(error) = copied {
+                line.failed();
+                return Err(error);
+            }
             changed = true;
         } else if !matches!(binary_install_state, InstallState::Installed) {
             let resolved_url = match resolve_component_download_url(platform_info) {
                 Some(url) => url,
                 None => {
-                    println!("[skip] {} — no download URL or CID for {}", name, platform);
+                    line.note(&format!("skipped: no download URL or CID for {platform}"));
                     skipped_count += 1;
                     continue;
                 }
@@ -511,24 +561,26 @@ async fn run_with_data_dir(
             let install_path = match resolve_install_path(comp, Some(platform_info)) {
                 Some(p) => p,
                 None => {
-                    println!("[skip] {} — no install_path configured", name);
+                    line.note("skipped: no install_path configured");
                     skipped_count += 1;
                     continue;
                 }
             };
             let dest = data_dir.join(install_path);
-            println!("[install] {} ...", name);
-            download_component(
-                &data_dir,
-                name,
-                &resolved_url,
-                platform_info,
-                &dest,
-                &ipfs_gateways,
-                FirstPartyCarrierContext::Setup,
-            )
+            line.track(async {
+                download_component(
+                    &data_dir,
+                    name,
+                    &resolved_url,
+                    platform_info,
+                    &dest,
+                    &ipfs_gateways,
+                    FirstPartyCarrierContext::Setup,
+                )
+                .await?;
+                write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)
+            })
             .await?;
-            write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)?;
             changed = true;
         }
 
@@ -536,21 +588,23 @@ async fn run_with_data_dir(
             metadata_install_state,
             Some(InstallState::Missing | InstallState::Stale(_))
         ) {
-            ensure_component_capsule_metadata(
+            line.track(ensure_component_capsule_metadata(
                 &data_dir,
                 name,
                 comp,
                 &platform,
                 &ipfs_gateways,
                 FirstPartyCarrierContext::Setup,
-            )
+            ))
             .await?;
             changed = true;
         }
 
         if changed {
+            line.done();
             installed_count += 1;
         } else {
+            line.note("already installed");
             skipped_count += 1;
         }
     }
@@ -573,11 +627,75 @@ async fn run_with_data_dir(
         );
     }
     println!(
-        "Done. {} installed, {} skipped.",
-        installed_count, skipped_count
+        "Done. {} installed, {} skipped in {}.",
+        installed_count,
+        skipped_count,
+        progress::format_elapsed(setup_started.elapsed())
     );
 
     Ok(())
+}
+
+/// True when the component loop in `run` skips this component before any
+/// effect. Keep in step with that loop's skip branches.
+fn skipped_before_install(
+    component: &Component,
+    platform_info: Option<&PlatformInfo>,
+    binary: &InstallState,
+) -> bool {
+    let Some(info) = platform_info else {
+        return true;
+    };
+    if info.strategy.as_deref() == Some("source-build") {
+        return true;
+    }
+    if matches!(binary, InstallState::Installed) {
+        return false;
+    }
+    let source_ready = if info.strategy.as_deref() == Some("local-copy") {
+        info.source
+            .as_deref()
+            .is_some_and(|source| Path::new(source).is_file())
+    } else {
+        resolve_component_download_url(info).is_some()
+    };
+    !source_ready || resolve_install_path(component, Some(info)).is_none()
+}
+
+/// Signed bytes setup fetches for a component in its current state: the
+/// artifact when it is not installed, plus capsule metadata when that is
+/// missing or stale. `None` when a fetched artifact has no signed size.
+fn pending_signed_size(
+    component: &Component,
+    platform_info: Option<&PlatformInfo>,
+    binary: &InstallState,
+    metadata: Option<&InstallState>,
+    platform: &str,
+) -> Option<u64> {
+    let mut sizes = Vec::new();
+    if !matches!(binary, InstallState::Installed) {
+        sizes.push(platform_info.and_then(|info| info.size));
+    }
+    if matches!(
+        metadata,
+        Some(InstallState::Missing | InstallState::Stale(_))
+    ) {
+        sizes.push(
+            component
+                .capsule_metadata
+                .as_ref()
+                .and_then(|metadata| {
+                    resolve_component_capsule_metadata_platform_info(metadata, platform)
+                })
+                .and_then(|info| info.size),
+        );
+    }
+    if sizes.is_empty() {
+        return None;
+    }
+    sizes
+        .into_iter()
+        .try_fold(0u64, |total, size| Some(total.saturating_add(size?)))
 }
 
 // ── Manifest loading ────────────────────────────────────────────────
@@ -1271,7 +1389,9 @@ async fn ensure_component_capsule_metadata(
         anyhow::anyhow!("provider capsule metadata '{name}' has no Carrier/content release path")
     })?;
     let dest = data_dir.join(install_path);
-    println!("[install] {} capsule metadata ...", name);
+    if !progress::reporting() {
+        println!("[install] {} capsule metadata ...", name);
+    }
     download_component(
         data_dir,
         name,
@@ -3147,17 +3267,32 @@ async fn prepare_selected_component_prerequisites(
             ) {
                 let url = resolve_component_download_url(info)
                     .ok_or_else(|| anyhow::anyhow!("Home media-tools release path is missing"))?;
-                download_component(
-                    data_dir,
+                println!("Prerequisite for media-provider:");
+                println!();
+                let line = progress::ComponentProgress::new(
+                    progress::OutputMode::detect(),
+                    1,
+                    1,
                     name,
-                    &url,
-                    info,
-                    &dest,
-                    ipfs_gateways,
-                    FirstPartyCarrierContext::Setup,
-                )
+                    name.chars().count(),
+                    info.size,
+                );
+                line.track(async {
+                    download_component(
+                        data_dir,
+                        name,
+                        &url,
+                        info,
+                        &dest,
+                        ipfs_gateways,
+                        FirstPartyCarrierContext::Setup,
+                    )
+                    .await?;
+                    write_cache_metadata(manifest, Some(info), platform, name, &dest)
+                })
                 .await?;
-                write_cache_metadata(manifest, Some(info), platform, name, &dest)?;
+                line.done();
+                println!();
             }
             managed_tools = dest.join("bin");
             &managed_tools
@@ -3957,11 +4092,13 @@ async fn download_component(
             .filter(|cid| !cid.is_empty())
             .map(resolve_cid_display_url)
             .unwrap_or_else(|| format!("elastos://artifact/{}", release_path));
-        println!("  Resolving {} from {}...", name, elastos_url);
-        println!(
-            "  Trying {} via trusted source over Carrier...",
-            elastos_url
-        );
+        if !progress::reporting() {
+            println!("  Resolving {} from {}...", name, elastos_url);
+            println!(
+                "  Trying {} via trusted source over Carrier...",
+                elastos_url
+            );
+        }
         match install_first_party_component_via_carrier(
             data_dir,
             name,
@@ -3973,7 +4110,9 @@ async fn download_component(
         {
             Ok(()) => {
                 ensure_bundle_executable_link(data_dir, name, platform_info)?;
-                println!("  Installed: {}", dest.display());
+                if !progress::reporting() {
+                    println!("  Installed: {}", dest.display());
+                }
                 return Ok(());
             }
             Err(err) => {
@@ -4010,12 +4149,17 @@ async fn download_component(
         fs::create_dir_all(parent)?;
     }
     let client = crate::update::download_http_client()?;
-    println!("  Resolving {} from {}...", name, elastos_url);
+    let reporting = progress::reporting();
+    if !reporting {
+        println!("  Resolving {} from {}...", name, elastos_url);
+    }
     let mut last_err = String::new();
     let mut response = None;
     for gw in ipfs_gateways {
         let gw_url = format!("{}/ipfs/{}", gw.transport_base.trim_end_matches('/'), cid);
-        println!("  Trying {} via {}...", elastos_url, gw.description);
+        if !reporting {
+            println!("  Trying {} via {}...", elastos_url, gw.description);
+        }
         match client.get(&gw_url).send().await {
             Ok(r) if r.status().is_success() => {
                 response = Some(r);
@@ -4071,7 +4215,9 @@ async fn download_component(
 
     ensure_bundle_executable_link(data_dir, name, platform_info)?;
 
-    println!("  Installed: {}", dest.display());
+    if !reporting {
+        println!("  Installed: {}", dest.display());
+    }
     Ok(())
 }
 
@@ -4188,7 +4334,9 @@ fn verify_checksum(name: &str, data: &[u8], platform_info: &PlatformInfo) -> any
                 actual
             );
         }
-        println!("  Checksum verified (sha512)");
+        if !progress::reporting() {
+            println!("  Checksum verified (sha512)");
+        }
     } else if expected.starts_with("sha256:") {
         let actual = format!("sha256:{}", hex::encode(sha2::Sha256::digest(data)));
         if actual != *expected {
@@ -4199,7 +4347,9 @@ fn verify_checksum(name: &str, data: &[u8], platform_info: &PlatformInfo) -> any
                 actual
             );
         }
-        println!("  Checksum verified (sha256)");
+        if !progress::reporting() {
+            println!("  Checksum verified (sha256)");
+        }
     } else {
         anyhow::bail!(
             "Unknown checksum format for {}: {}. Expected sha256:... or sha512:...",
@@ -4769,6 +4919,61 @@ pub(crate) mod tests {
     // tokio Mutex so the async prerequisite test can hold the guard across
     // its await without blocking the runtime; sync tests use blocking_lock.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn pending_count_leaves_out_the_components_the_loop_skips() {
+        let temp = tempfile::tempdir().unwrap();
+        let present = temp.path().join("vmlinux");
+        fs::write(&present, b"kernel").unwrap();
+        let component = |install_path: Option<&str>, info: serde_json::Value| {
+            let mut value = serde_json::json!({ "platforms": { "p": info } });
+            if let Some(path) = install_path {
+                value["install_path"] = serde_json::json!(path);
+            }
+            serde_json::from_value::<Component>(value).unwrap()
+        };
+        let skipped = |component: &Component, binary: InstallState| {
+            skipped_before_install(component, resolve_platform_info(component, "p"), &binary)
+        };
+        let download = component(Some("bin/a"), serde_json::json!({ "release_path": "a" }));
+        assert!(!skipped(&download, InstallState::Missing));
+        assert!(skipped(
+            &component(None, serde_json::json!({ "release_path": "a" })),
+            InstallState::Missing
+        ));
+        assert!(skipped(
+            &component(Some("bin/a"), serde_json::json!({})),
+            InstallState::Missing
+        ));
+        assert!(skipped(
+            &component(
+                Some("bin/a"),
+                serde_json::json!({ "release_path": "a", "strategy": "source-build" })
+            ),
+            InstallState::Missing
+        ));
+        let local = |source: &Path| {
+            component(
+                Some("vmlinux"),
+                serde_json::json!({ "strategy": "local-copy", "source": source.display().to_string() }),
+            )
+        };
+        assert!(!skipped(&local(&present), InstallState::Missing));
+        assert!(skipped(
+            &local(&temp.path().join("missing")),
+            InstallState::Missing
+        ));
+        assert!(skipped_before_install(
+            &download,
+            None,
+            &InstallState::Missing
+        ));
+        // An installed binary still reaches the capsule metadata step.
+        assert!(!skipped(
+            &component(Some("bin/a"), serde_json::json!({})),
+            InstallState::Installed
+        ));
+    }
 
     #[test]
     fn unsupported_model_host_skips_engine_without_aborting_setup() {

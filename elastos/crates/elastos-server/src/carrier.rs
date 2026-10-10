@@ -8435,13 +8435,27 @@ impl CarrierClient {
             "{operation} exceeds its {max_bytes}-byte bound ({len} bytes declared)"
         );
         let mut content = vec![0u8; len as usize];
+        // Only a scoped caller (setup's progress line) is told how far the
+        // body has come, at most once per `REPLY_PROGRESS_CHUNK` bytes. The
+        // read itself is unchanged, so the idle rule above still decides.
+        let progress = REPLY_PROGRESS.try_with(std::sync::Arc::clone).ok();
+        if let Some(progress) = &progress {
+            progress(0, len);
+        }
         let mut filled = 0;
+        let mut reported = 0;
         while filled < content.len() {
             let read = tokio::time::timeout(idle, recv.read(&mut content[filled..]))
                 .await
                 .map_err(stalled)??;
             filled += read
                 .ok_or_else(|| anyhow::anyhow!("{operation} ended early ({filled}/{len} bytes)"))?;
+            if let Some(progress) = &progress {
+                if filled == content.len() || filled - reported >= REPLY_PROGRESS_CHUNK {
+                    reported = filled;
+                    progress(filled as u64, len);
+                }
+            }
         }
         Ok(content)
     }
@@ -8575,6 +8589,23 @@ impl CarrierClient {
             .transpose()?
             .ok_or_else(|| anyhow::anyhow!("Carrier gossip pull response missing messages"))
     }
+}
+
+/// Receives `(bytes_read, bytes_declared)` for each byte reply read inside
+/// [`with_reply_progress`]. Replies read outside a scope report nothing.
+pub(crate) type ReplyProgress = std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+tokio::task_local! {
+    static REPLY_PROGRESS: ReplyProgress;
+}
+
+const REPLY_PROGRESS_CHUNK: usize = 64 * 1024;
+
+pub(crate) async fn with_reply_progress<F: std::future::Future>(
+    progress: ReplyProgress,
+    future: F,
+) -> F::Output {
+    REPLY_PROGRESS.scope(progress, future).await
 }
 
 /// A download fails only when no bytes arrive for this long, never on total
@@ -10440,6 +10471,82 @@ pub(crate) mod tests {
         assert_eq!(endpoint.bound_sockets(), vec![bind_addr]);
         releasing.await.unwrap();
         endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn reply_progress_reports_chunks_inside_its_scope_only() {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let payload: Vec<u8> = (0..200_000u32).map(|index| index as u8).collect();
+        let served = payload.clone();
+        let server_endpoint = server.clone();
+        let serving = tokio::spawn(async move {
+            // Two complete replies, then one that declares more than the bound.
+            for declared in [served.len() as u64, served.len() as u64, 1u64 << 20] {
+                let conn = server_endpoint.accept().await.unwrap().await.unwrap();
+                let (mut send, recv) = conn.accept_bi().await.unwrap();
+                let mut request = String::new();
+                BufReader::new(recv).read_line(&mut request).await.unwrap();
+                send.write_all(&declared.to_be_bytes()).await.unwrap();
+                if declared == served.len() as u64 {
+                    send.write_all(&served).await.unwrap();
+                }
+                send.finish().unwrap();
+                conn.closed().await;
+            }
+        });
+        let reports = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = Arc::clone(&reports);
+        let sink: ReplyProgress =
+            Arc::new(move |read, declared| recorded.lock().unwrap().push((read, declared)));
+        let fetch = |max_bytes| {
+            let address = address.clone();
+            async move {
+                let client = CarrierClient::connect_endpoint_addr(address, 5)
+                    .await
+                    .unwrap();
+                let result = client.fetch_file_bounded("artifact", max_bytes).await;
+                client.close().await;
+                result
+            }
+        };
+
+        let bytes = with_reply_progress(Arc::clone(&sink), fetch(1 << 21))
+            .await
+            .unwrap();
+        assert_eq!(bytes, payload);
+        let len = payload.len() as u64;
+        let seen = reports.lock().unwrap().clone();
+        assert_eq!(seen.first(), Some(&(0, len)));
+        assert_eq!(seen.last(), Some(&(len, len)));
+        assert!(seen.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        // Reports are spaced at least one chunk apart, so they stay few.
+        assert!(seen.len() >= 2, "{seen:?}");
+        assert!(seen.len() <= 1 + payload.len().div_ceil(REPLY_PROGRESS_CHUNK));
+        assert!(seen[1..seen.len() - 1]
+            .windows(2)
+            .all(|pair| pair[1].0 - pair[0].0 >= REPLY_PROGRESS_CHUNK as u64));
+
+        reports.lock().unwrap().clear();
+        assert_eq!(fetch(1 << 21).await.unwrap(), payload);
+        assert!(reports.lock().unwrap().is_empty());
+
+        let error = with_reply_progress(sink, fetch(1 << 19)).await.unwrap_err();
+        assert!(error.to_string().contains("byte bound"), "{error}");
+        assert!(reports.lock().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap();
+        server.close().await;
     }
 
     #[tokio::test]
