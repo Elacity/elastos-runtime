@@ -186,6 +186,10 @@ require_mounts_clean() {
 selkies_source_dir="$(mktemp -d "$out_dir/selkies-source.XXXXXX")"
 trap 'cleanup_mounts; rm -rf "$selkies_source_dir"' EXIT
 python3 "$repo_root/scripts/build/prepare-browser-selkies.py" --out-dir "$selkies_source_dir/source"
+require_cmd gpgv
+debian_keyring="/usr/share/keyrings/debian-archive-keyring.gpg"
+[[ -r "$debian_keyring" && -s "$debian_keyring" ]] || \
+  die "Install the verified Debian archive keyring before building the Browser guest"
 
 echo "[browser-vm-rootfs] target: $target_platform"
 echo "[browser-vm-rootfs] output: $out_dir"
@@ -210,6 +214,8 @@ as_root rm -rf "$rootfs_dir" "$target_dir" "$initrd_dir" "$rootfs_image" "$kerne
   "$out_dir/browser-vm-rootfs-manifest.json" "$out_dir/node" "$out_dir/chromium"
 as_root mkdir -p "$rootfs_dir"
 as_root "$debootstrap_bin" \
+  --force-check-gpg \
+  --keyring="$debian_keyring" \
   --arch="$deb_arch" \
   --variant=minbase \
   --include=ca-certificates,debian-archive-keyring \
