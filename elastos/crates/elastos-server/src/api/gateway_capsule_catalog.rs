@@ -56,6 +56,11 @@ async fn caller_capsule_catalog_summary(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
 ) -> CapsuleCatalogResponse {
+    // Home may have started offline without its pinned catalogue; Local AI's
+    // read retries it, and otherwise reports it unavailable.
+    if let Err(error) = crate::setup::retry_model_catalog(&state.data_dir).await {
+        tracing::debug!("model catalogue unavailable: {error:#}");
+    }
     #[cfg(unix)]
     {
         // Catalog trust may be revoked while the provider is answering. Rebuild
@@ -626,7 +631,13 @@ async fn dispatch_capsule_affordance(
                 if operation.is_some() && projection["preparation"].is_object() {
                     output = projection["preparation"].clone();
                 }
-                for field in ["admitted", "kept", "dispatch_ready", "offer_id"] {
+                for field in [
+                    "admitted",
+                    "kept",
+                    "dispatch_ready",
+                    "dispatch_unavailable_reason",
+                    "offer_id",
+                ] {
                     output[field] = projection[field].clone();
                 }
                 Ok(output)

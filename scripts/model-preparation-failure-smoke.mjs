@@ -9,8 +9,8 @@ for (const capsule of ["system", "marketplace"]) {
 }
 const context = { window: {} };
 vm.runInNewContext(source.replace("window.ElastosModelManagement = {",
-  "window.testFailure = { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT }; window.ElastosModelManagement = {"), context);
-const { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT } = context.window.testFailure;
+  "window.testFailure = { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT, DISPATCH_UNAVAILABLE_TEXT }; window.ElastosModelManagement = {"), context);
+const { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT, DISPATCH_UNAVAILABLE_TEXT } = context.window.testFailure;
 const cid = `bafybei${"a".repeat(52)}`;
 const preparation = { operation_id: "fixture", cid, state: "failed", total_bytes: 1024,
   completed_bytes: 512, cancel_requested: false, admitted: false, activation_pending: false };
@@ -37,6 +37,23 @@ for (const invalid of ["/private/provider?credential=secret", "__proto__", "cons
   preparation.failure_class = invalid;
   assert.throws(() => parseRuntime(runtime, cid), /Invalid model response/);
 }
+preparation.failure_class = null;
+const admitted = { ...preparation, state: "admitted", admitted: true, failure_class: null, activation_pending: true };
+const unavailable = { ...runtime, admitted: true, preparation: admitted };
+for (const reason of ["unsupported_host", "source_engine_required", "catalog_updated"]) {
+  const value = { ...unavailable, dispatch_unavailable_reason: reason };
+  assert.equal(parseRuntime(value, cid).dispatch_unavailable_reason, reason);
+  assert.equal(operationRuntime({ ...value, ...admitted }, cid).dispatch_unavailable_reason, reason);
+  assert.throws(() => parseRuntime({ ...value, dispatch_ready: true, offer_id: `model:${"b".repeat(64)}` }, cid), /Invalid model response/);
+  assert.throws(() => parseRuntime({ ...runtime, dispatch_unavailable_reason: reason }, cid), /Invalid model response/);
+}
+for (const invalid of ["/private/provider?credential=secret", "__proto__", "constructor", ["unsupported_host"], { toString: () => "unsupported_host" }, {}, 7]) {
+  assert.throws(() => parseRuntime({ ...unavailable, dispatch_unavailable_reason: invalid }, cid), /Invalid model response/);
+  assert.throws(() => operationRuntime({ ...unavailable, ...admitted, dispatch_unavailable_reason: invalid }, cid), /Invalid model response/);
+}
+assert.deepEqual(Object.keys(DISPATCH_UNAVAILABLE_TEXT).sort(), ["catalog_updated", "source_engine_required", "unsupported_host"],
+  "every Runtime dispatch_unavailable_reason class has copy");
+assert.equal(DISPATCH_UNAVAILABLE_TEXT.unsupported_host, "Local AI is not supported on this device.");
 const otherCid = `bafybei${"c".repeat(51)}e`;
 const catalogRow = (id, title) => ({
   name: title, title, role: "content", source: "signed-model-catalog", installed: false, launchable: false,
@@ -99,12 +116,13 @@ class FixtureNode {
   contains() { return false; }
   focus() {}
 }
-let nextTimer = 0, statusCalls = 0, settled = false;
+let nextTimer = 0, statusCalls = 0, settled = false, catalogUpdated = false;
 const timers = new Map();
 const fixtureRoot = new FixtureNode("section");
 const fixtureRuntime = () => ({
-  admitted: settled, kept: false, dispatch_ready: settled,
-  offer_id: settled ? `model:${"b".repeat(64)}` : null,
+  admitted: settled, kept: false, dispatch_ready: settled && !catalogUpdated,
+  dispatch_unavailable_reason: catalogUpdated ? "catalog_updated" : null,
+  offer_id: settled && !catalogUpdated ? `model:${"b".repeat(64)}` : null,
   preparation: { operation_id: "long-preparation", cid, state: settled ? "admitted" : "preparing",
     total_bytes: 1024, completed_bytes: settled ? 1024 : statusCalls,
     cancel_requested: false, admitted: settled, activation_pending: false },
@@ -162,6 +180,18 @@ assert.equal(timers.size, 0, "hidden controller releases timers");
 control.setVisible(true);
 await new Promise(setImmediate);
 assert.equal(pendingPolls().length, 1);
+// An admission bound to an earlier catalogue head reads as a list update whose
+// next action is the Use button, not as a broken model service.
+settled = true; catalogUpdated = true;
+await control.refresh();
+const useButton = (function find(node) {
+  if (node.dataset?.modelControl === "use") return node;
+  for (const child of node.children || []) { const hit = find(child); if (hit) return hit; }
+  return null;
+})(fixtureRoot);
+assert.equal(useButton?.textContent, "Use");
+assert.match(visibleText(fixtureRoot), /Model list updated\. Press Use to keep using this model\./);
+assert.doesNotMatch(visibleText(fixtureRoot), /Model service unavailable/);
 control.destroy();
 assert.equal(timers.size, 0, "destroyed controller releases timers");
 console.log("PASS long model preparation: 131 bounded status reads, terminal render, hide and destroy cleanup");

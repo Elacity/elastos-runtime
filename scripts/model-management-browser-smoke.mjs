@@ -14,6 +14,7 @@ let phase = "unprepared";
 let kept = false;
 let activationPending = false;
 let dispatchPending = false;
+let dispatchUnavailableReason = null;
 let failure = false;
 let delayStatus = null;
 let delayUse = null;
@@ -35,6 +36,7 @@ function preparation() {
 }
 function runtime() {
   return { admitted: phase === "admitted", kept, dispatch_ready: phase === "admitted" && !dispatchPending,
+    dispatch_unavailable_reason: dispatchUnavailableReason,
     offer_id: malformedRuntime ? "wrong" : phase === "admitted" && !dispatchPending ? `model:${"b".repeat(64)}` : null, preparation: preparation() };
 }
 function catalog() {
@@ -98,7 +100,8 @@ const server = createServer(async (req, res) => {
         phase = "reclaimed"; kept = false;
       }
       const readiness = runtime();
-      const facts = { admitted: readiness.admitted, kept: readiness.kept, dispatch_ready: readiness.dispatch_ready, offer_id: readiness.offer_id };
+      const facts = { admitted: readiness.admitted, kept: readiness.kept, dispatch_ready: readiness.dispatch_ready,
+        dispatch_unavailable_reason: readiness.dispatch_unavailable_reason, offer_id: readiness.offer_id };
       const output = method.operation === "retention" ? { cid, ...facts } : { ...preparation(), ...facts };
       if (method.operation === "retention" && mismatchRetention) {
         output.kept = !input.input.keep;
@@ -135,6 +138,7 @@ try {
       ? { absent: "Not on this device yet", reclaimed: "Removed from this device" }
       : { absent: "Ready to prepare", reclaimed: "Model removed from local cache." };
     phase = "unprepared"; kept = false; failure = false; calls.length = 0;
+    dispatchUnavailableReason = null;
     selectedCid = cid; executable = true; trust = "verified"; protectReclaim = false;
     const page = await browser.newPage({ viewport: { width: 1100, height: 800 } });
     activePage = page;
@@ -212,6 +216,18 @@ try {
     await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
     phase = "admitted"; activationPending = app === "marketplace"; dispatchPending = true;
     await frame.getByText("Available on this device. Model service unavailable.", { exact: true }).waitFor();
+    for (const [reason, explanation] of [
+      ["unsupported_host", "Local AI is not supported on this device."],
+      ["source_engine_required", "This source Home needs its local model engine. Install the engine through source setup, then Retry."],
+    ]) {
+      dispatchUnavailableReason = reason;
+      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await frame.getByText(explanation, { exact: true }).waitFor();
+      assert.equal(await frame.getByRole("button", { name: "Retry", exact: true }).count(), 1);
+      assert.equal(await frame.getByRole("button", { name: "Open in Assistant", exact: true }).count(), 0);
+      if (app === "system") assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isChecked(), true);
+    }
+    dispatchUnavailableReason = null;
     const activationUses = calls.filter(c => c.method === "content.use").length;
     assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 0, "admitted content is not cancellable");
     activationPending = false; dispatchPending = false;

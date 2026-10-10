@@ -6,6 +6,199 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+## [0.8.0-alpha.14]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- Marketplace offers a second local model, Qwen2.5 1.5B Instruct (1.1 GB,
+  Apache-2.0), for noticeably better answers than SmolLM2. It needs about 3 GB
+  of free memory.
+
+### Changed
+
+- This release updates the model list. If SmolLM2 is already on this device,
+  press Use once; it keeps the downloaded files.
+- If this Home is on 0.8.0-alpha.12 or older, Update here stops with "The update
+  could not start" and keeps your current release. Run the installer again
+  instead (`curl -fsSL https://elastos.elacitylabs.com/install.sh | bash`); it
+  keeps your identity and data.
+
+### Developer detail
+
+- Signed model catalogue 3 is pinned in `components.json` (head
+  `bafkreid5lc25ap4v3qw576uw3z3zdsbsfhqnnt5uwfdkawju4ejrtin7z4`): SmolLM2-135M
+  unchanged plus Qwen2.5-1.5B-Instruct Q4_K_M (package
+  `bafybeievyi6xp5b62qkuh65ywkd72medhx6uxrmik2fhnr3aameeqnxvwe`, reproducible,
+  pinned on the seed). alpha.13's updaters install the new catalogue; alpha.12
+  and older System updaters cannot (#84, #113).
+
+## [0.8.0-alpha.13]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+If your Home is on 0.8.0-alpha.10 or older, update it once from Terminal with
+`elastos update`; the System page in those releases cannot install this one.
+
+### Changed
+
+- A model download that stops because the network failed, or because Home
+  restarted, now continues from where it stopped the next time you press Use,
+  instead of starting over. Cancel on the stopped download discards the part
+  already downloaded; Home also discards it after 7 days, or when the model is no
+  longer offered.
+- A local model now starts only when the device has enough free memory for it.
+  Otherwise you see "Not enough free memory for this model. Close other apps or
+  choose a smaller model." instead of a model failure.
+- A local model stops after a minute without use to give its memory back, and
+  starts again on your next message. Only one local model runs at a time.
+- When the model list is updated, a model already on this device says "Model
+  list updated. Press Use to keep using this model." Use keeps the files; nothing
+  downloads again.
+- Marketplace shows a model's own description from the signed model list.
+
+### Fixed
+
+- An update made by an older version could leave out the release's signed model
+  list, after which Home, Undo and later updates stopped with "Installed release
+  inputs require repair". Home, Update and Undo now fetch the release's own
+  signed model list from your trusted source and continue. Without a connection,
+  Home still starts and Local AI says the list could not be fetched; Update and
+  Undo say so and change nothing.
+- Update and Undo now carry the signed model list with the release's other
+  files, in Terminal and in System, so a release with a new model list installs
+  cleanly and Undo puts back the previous list.
+- An Undo that stopped halfway could leave one component from the other release,
+  after which Update, Undo and `elastos setup` refused to continue. Home, Update
+  and Undo now put back this release's signed copy, and `elastos update` does so
+  even when no newer release exists. Replacing a component folder no longer
+  removes the old one first.
+- `elastos setup` fetched the newest release's components by name, so setting up
+  an older release failed. It now fetches that release's own files by their
+  signed IDs.
+- A brief network stall no longer stops a model download. Home tries a part
+  that timed out up to three more times before it stops.
+- After about 64 model downloads, retries or cancels, Home could no longer get
+  any model. Old finished attempts no longer use up that limit.
+- Setting up Home on an ARM64 device without the CPU features local AI needs no
+  longer fails. Home installs without the local model engine, and Marketplace
+  shows "Local AI is not supported on this device."
+
+### Developer detail
+
+- Home start, `elastos update`, System update and Undo first repair the installed
+  release from its signed components: a missing or wrong-head pinned model
+  catalogue is fetched by CID over Carrier and checked for CID and publisher
+  signature; a component with the wrong bytes is re-fetched by CID. Both update
+  paths install the target's catalogue as journaled support. Setup fetches
+  components and the catalogue by the release's signed CID instead of by name.
+  The catalogue pin stays at alpha.11's head
+  (`bafkreihmcsvldwwa5ttbgw5yfrs62kiv3natqhfj3tkg3yzemsd73runr4`) so alpha.11 and
+  alpha.12 updaters, which do not install catalogues, can update to this release
+  (#113).
+- `model-provider` admits a local engine right before spawn when free memory
+  covers GGUF weights once, the f16 KV cache at the configured context, batch
+  scratch and headroom of max(10% RAM, 1 GiB). Free memory is Linux
+  `MemAvailable` capped by every cgroup v2 ancestor's `memory.max -
+  memory.current` (cgroup v1: `MemAvailable` only), or macOS free (minus
+  speculative) + purgeable + file-backed pages. When that estimate is short,
+  macOS still admits if `kern.memorystatus_vm_pressure_level` is normal and the
+  need is at most 40% of RAM. Refusal is `model_memory_unavailable` (#98).
+- Local runs share one execution slot; an engine idle for 60 s is stopped and
+  opening another model closes the previous engine. llama-server gets
+  `--batch-size 128 --ubatch-size 128 --cache-ram 0`. `elastos setup` drops
+  `llama-server` on an `UnsupportedHost` instead of aborting.
+- A model part read that every holder failed only in transit (answer deadline,
+  connect failure, lost stream; `carrier_fetch_in_transit`, mapped to
+  `ProviderError::Io`) is repeated up to 3 times after 0.5, 1 and 2 s in the same
+  in-flight slot, after the same per-part checks as a first read. Refusals,
+  malformed or oversized answers and integrity, authority or capacity failures
+  are never repeated. The seed's `ipfs-provider` bridge serializes requests, so
+  one slow read there runs every queued read's 5 s budget out together.
+- Download resume: `settle_failure` keeps the stage (`kept_stage`) after an
+  in-transit read failure, a stopping Home, a passed deadline or restart
+  reconciliation, and removes it on cancel and on any refusal, integrity,
+  authority, policy or storage failure. The next Use adopts it only if its
+  `_elastos_object.json` equals the signed `object_manifest`, re-hashes complete
+  files, truncates a partial file to a 64 KiB boundary and fetches only the
+  remaining parts; per-file SHA-256 and package CID checks are unchanged. A kept
+  stage stays charged against the cache budget until adopted, cancelled, or
+  removed at startup after 7 days or when no longer offered.
+- The 64-record preparation cap bounds live work only: `reserve_at` prunes
+  ownerless Failed, Expired or Cancelled records settled at least an hour ago
+  (`settled_at`) before refusing; expiry is saved before any refusal.
+- `ci-model-package.mjs produce FIXTURE OUT DID KUBO_DATA` builds one package from
+  a pinned, validated fixture; `catalog CAT DID ENTRY...` writes an unsigned
+  payload only after `release-signer.py`'s own catalogue check accepts it.
+- The model projection reports `dispatch_unavailable_reason: "catalog_updated"`
+  only for an admission bound to an earlier head whose package the current
+  trusted catalogue still offers under a current local-use grant.
+
+## [0.8.0-alpha.12]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Changed
+
+- Models download several times faster: Home now fetches up to eight parts at
+  once instead of one after another.
+
+### Fixed
+
+- Getting a model on a slower connection no longer stops after about ten minutes
+  with "Storage capacity is unavailable". Home was shutting down its storage
+  service as idle while the model was still downloading.
+
+### Developer detail
+
+- Model preparation keeps up to 8 part reads in flight across the package; each
+  part's authority and capacity checks run in package order just before its read,
+  results arriving after a revocation are discarded, and per-file SHA-256 and the
+  package CID check are unchanged. Real installs spent ~200-600 ms per part on
+  round trips while the seed's own read takes ~2.5 ms (#84).
+- `ipfs-provider` counts a successful private capacity check (run once per MiB of
+  model download) and staged-directory hash as Kubo use, refreshing
+  `ipfs-coords.json` `last_used` like bounded reads do, so the 600 s idle stop no
+  longer ends Kubo during a long model download (#97).
+
+## [0.8.0-alpha.11]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- Marketplace offers a local AI model, SmolLM2 135M (145 MB, Apache-2.0). Press
+  Get and Assistant can answer with it on this device; the AI engine downloads
+  the first time a model needs it. Answers from this small model are basic; larger
+  models follow.
+
+### Changed
+
+- Models download several times faster: after the first piece, a Home reads the
+  rest straight from the Homes that hold it.
+
+### Developer detail
+
+- The first production model catalogue is signed offline with the maintainer key
+  (`release-signer.py --model-catalog`, policy field `model_catalog_sha256`) and
+  pinned in `components.json` (`model_catalog`, head
+  `bafkreihmcsvldwwa5ttbgw5yfrs62kiv3natqhfj3tkg3yzemsd73runr4`); the package
+  `bafybeiew3vuq32fvuz2kmps7lmgl4rxpvwsvklxykx4covogbrkhgy5qky` is built by
+  `ci-model-package.mjs produce` and pinned on the seed (#84).
+- CI proves Marketplace Get and an Assistant reply on Mac, Linux x86-64 and
+  ARM64; on x86-64 the package lives only on a separate holder Home, so Get
+  crosses Carrier (#150).
+- Model preparation tries the local store only until its first miss, then reads
+  remaining parts from Carrier holders with unchanged per-file SHA-256 and
+  package CID checks (145 MB: 332 s to 42 s locally).
+- CI retries apt with backoff and cancels a pull-request run at its first failed
+  job (#194).
+- `publish-release` no longer sends a release gossip announcement that no Home
+  received. Seeds on an older Runtime still print the old announcement error after
+  the commit (#174). INSTALL.md describes how updates reach a Home, and
+  VERSIONING.md describes the seed's role.
+
 ## [0.8.0-alpha.10]
 
 Test-channel release. Signed releases show these notes in System before you update.

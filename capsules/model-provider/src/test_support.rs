@@ -79,6 +79,48 @@ pub(crate) fn sha256_file(path: &Path) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// GGUF metadata with llama geometry and no tensors.
+pub(crate) fn fake_gguf(
+    layers: u32,
+    embedding: u32,
+    heads: u32,
+    kv_heads: u32,
+    feed_forward: u32,
+    vocabulary: u64,
+) -> Vec<u8> {
+    fn string(out: &mut Vec<u8>, value: &str) {
+        out.extend((value.len() as u64).to_le_bytes());
+        out.extend(value.as_bytes());
+    }
+    let numbers = [
+        ("llama.block_count", layers),
+        ("llama.embedding_length", embedding),
+        ("llama.attention.head_count", heads),
+        ("llama.attention.head_count_kv", kv_heads),
+        ("llama.feed_forward_length", feed_forward),
+    ];
+    let mut out = b"GGUF".to_vec();
+    out.extend(3_u32.to_le_bytes());
+    out.extend(0_u64.to_le_bytes());
+    out.extend((numbers.len() as u64 + 2).to_le_bytes());
+    string(&mut out, "general.architecture");
+    out.extend(8_u32.to_le_bytes());
+    string(&mut out, "llama");
+    for (key, value) in numbers {
+        string(&mut out, key);
+        out.extend(4_u32.to_le_bytes());
+        out.extend(value.to_le_bytes());
+    }
+    string(&mut out, "tokenizer.ggml.tokens");
+    out.extend(9_u32.to_le_bytes());
+    out.extend(8_u32.to_le_bytes());
+    out.extend(vocabulary.to_le_bytes());
+    for _ in 0..vocabulary {
+        string(&mut out, "t");
+    }
+    out
+}
+
 #[cfg(unix)]
 pub(crate) fn write_fake_llama_server(root: &Path, mode: &str) -> (PathBuf, PathBuf, PathBuf) {
     let engine = root.join("bin/fake-llama-server");
@@ -115,7 +157,7 @@ def arg(name):
 model_path = pathlib.Path(arg('-m'))
 port = int(arg('--port'))
 alias = arg('--alias')
-mode = model_path.read_text(encoding='utf-8').strip()
+mode = model_path.with_suffix('.mode').read_text(encoding='utf-8').strip()
 events = model_path.with_suffix('.events')
 unresponsive = model_path.with_suffix('.unresponsive')
 wrong_alias = model_path.with_suffix('.wrong-alias')
@@ -265,7 +307,9 @@ server.serve_forever()
     )
     .unwrap();
     assert!(writer.wait().unwrap().success());
-    std::fs::write(&model, mode.as_bytes()).unwrap();
+    // SmolLM2-135M geometry, so memory admission sees a real profile.
+    std::fs::write(&model, fake_gguf(30, 576, 9, 3, 1536, 1)).unwrap();
+    std::fs::write(model.with_extension("mode"), mode.as_bytes()).unwrap();
     std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::set_permissions(&model, std::fs::Permissions::from_mode(0o600)).unwrap();
     (engine, model, events)

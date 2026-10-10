@@ -2,6 +2,8 @@
 # Ubuntu's signed indexes and package hashes own authentication, including cache hits.
 set -euo pipefail
 
+# A mirror hiccup should not fail a long job: three bounded attempts with
+# growing pauses (15s, then 30s) give a flaky mirror time to recover.
 retry() {
     local attempt
     for attempt in 1 2 3; do
@@ -9,7 +11,7 @@ retry() {
             return 0
         fi
         echo "apt attempt ${attempt}/3 failed: $*" >&2
-        if [[ "$attempt" != 3 ]]; then sleep 5; fi
+        if [[ "$attempt" != 3 ]]; then sleep $((attempt * 15)); fi
     done
     return 1
 }

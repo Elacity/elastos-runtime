@@ -14,6 +14,7 @@ const tree = 'b'.repeat(40);
 const ciRun = { id: 456, html_url: 'https://github.com/Elacity/elastos-runtime/actions/runs/456',
   head_sha: commit, head_branch: 'develop', event: 'push', path: '.github/workflows/ci.yml',
   status: 'completed', conclusion: 'success' };
+const queueRun = { ...ciRun, event: 'merge_group', head_branch: `gh-readonly-queue/develop/pr-1-${commit}` };
 const requiredJobs = ['test-elastos', 'source-home-macos'];
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 
@@ -33,7 +34,7 @@ function fixture(t, changes = {}) {
   cpSync(join(source, 'release-publish.sh'), join(repo, 'scripts/release-publish.sh'));
   const config = { root, repo, commit, tree, artifacts: {}, ciRuns: [ciRun], requiredJobs,
     ciJobs: requiredJobs.map(name => ({ name, status: 'completed', conclusion: 'success' })), ...changes };
-  for (const [index, platform] of platforms.entries()) {
+  for (const [index, platform] of (changes.ciOnly ? [] : platforms.entries())) {
     const input = join(root, platform, 'inputs');
     mkdirSync(input, { recursive: true });
     for (const [name, version] of [['N', '1.2.3'], ['N1', '1.2.4']]) {
@@ -75,7 +76,7 @@ if (command === 'gh') {
   if (c.failCiApi && endpoint.includes(c.failCiApi)) process.exit(94);
   let payload;
   if (endpoint.includes('/workflows/ci.yml/runs?')) {
-    if (!endpoint.includes('head_sha=' + c.commit) || !endpoint.includes('branch=develop') || !endpoint.includes('event=push')) process.exit(93);
+    if (!endpoint.includes('head_sha=' + c.commit) || endpoint.includes('branch=') || endpoint.includes('event=')) process.exit(93);
     payload = { workflow_runs: c.ciRuns };
   } else if (endpoint.endsWith('/branches/develop/protection')) payload = { required_status_checks: { contexts: c.requiredJobs } };
   else if (endpoint.includes('/runs/456/jobs?')) payload = { jobs: c.ciJobs };
@@ -90,7 +91,7 @@ if (command === 'gh') {
     const prefix = Object.keys(c.artifacts).find(p => args.at(-1).includes('^' + p + '-'));
     const a = c.artifacts[prefix];
     console.log(a.id + ' ' + a.digest + ' ' + prefix + '-' + c.commit + '-1');
-  } else if (endpoint.includes('/compare/')) console.log('ahead');
+  } else if (endpoint.includes('/compare/')) console.log(c.compareStatus || 'ahead');
   else if (endpoint.endsWith('/git/ref/heads/develop')) console.log(c.commit);
   else console.log('.github/workflows/release-package.yml success');
 } else if (command === 'git') {
@@ -130,11 +131,15 @@ fs.writeFileSync(output + '/signing-input.json', JSON.stringify({ source: { comm
     RELEASE_SEED_UNIT: 'fixture.service', RELEASE_SEED_STAGE: join(root, 'stage'),
     RELEASE_SEED_RUNTIME: '/fixture/elastos', VERIFY_LOG: join(root, 'verify.jsonl'),
     ARGUMENT_LOG: join(root, 'arguments.json') };
+  const ciScript = join(repo, 'scripts/checked-ci-fixture.sh');
+  writeFileSync(ciScript, readFileSync(join(repo, 'scripts/release-publish.sh'), 'utf8')
+    .split('\npublication_record() {')[0] + '\nchecked_ci "$1"\n');
   return { root, env, script: join(repo, 'scripts/release-publish.sh'),
     prepare(version = '1.2.3', selected = [], extraEnv = {}) {
       return spawnSync('bash', [this.script, 'prepare', '123', version, ...selected],
         { encoding: 'utf8', env: { ...env, ...extraEnv } });
     },
+    checkedCi() { return spawnSync('bash', [ciScript, commit], { encoding: 'utf8', env }); },
     args() { return JSON.parse(readFileSync(env.ARGUMENT_LOG)); } };
 }
 
@@ -155,18 +160,44 @@ for (const selected of [[], ['aarch64-darwin', 'x86_64-linux'], ['aarch64-darwin
   });
 }
 
+test('prepare accepts an exact source develop queue run and retains consumer receipts', t => {
+  const f = fixture(t, { ciRuns: [queueRun] });
+  const result = f.prepare();
+  assert.equal(result.status, 0, result.stderr);
+  const record = JSON.parse(readFileSync(join(f.root, 'work/1.2.3/run.json')));
+  assert.deepEqual(record.ci_run, { id: ciRun.id, url: ciRun.html_url });
+  const verified = readFileSync(f.env.VERIFY_LOG, 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(verified.length, platforms.length);
+  assert.ok(verified.every(receipt => receipt.source.commit === commit && receipt.source.tree === tree));
+});
+
+for (const [label, ciRuns] of [
+  ['queue after develop push', [{ ...ciRun, id: 400 }, queueRun]],
+  ['develop push after queue', [{ ...queueRun, id: 400 }, ciRun]],
+  ['develop push with newer unrelated event', [ciRun, { ...queueRun, id: 999, event: 'pull_request_target' }]],
+  ['queue with newer wrong-branch push', [queueRun, { ...ciRun, id: 999, head_branch: 'main' }]],
+]) {
+  test(`exact source CI guard accepts ${label}`, t => {
+    const f = fixture(t, { ciRuns, ciOnly: true });
+    const result = f.checkedCi();
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { id: ciRun.id, url: ciRun.html_url });
+  });
+}
+
 for (const [label, changes, error] of [
-  ['failed CI', { ciRuns: [{ ...ciRun, conclusion: 'failure' }] }, /successful develop push CI run/],
-  ['no CI run', { ciRuns: [] }, /successful develop push CI run/],
+  ['failed CI', { ciRuns: [{ ...ciRun, conclusion: 'failure' }] }, /successful develop CI run/],
+  ['no CI run', { ciRuns: [] }, /successful develop CI run/],
   ['skipped required job', { ciJobs: [{ name: 'test-elastos', status: 'completed', conclusion: 'skipped' },
     { name: 'source-home-macos', status: 'completed', conclusion: 'success' }] }, /test-elastos: skipped/],
   ['failed required job', { ciJobs: [{ name: 'test-elastos', status: 'completed', conclusion: 'failure' },
     { name: 'source-home-macos', status: 'completed', conclusion: 'success' }] }, /test-elastos: failure/],
   ['missing required job', { ciJobs: [{ name: 'test-elastos', status: 'completed', conclusion: 'success' }] }, /source-home-macos: missing/],
-  ['wrong source CI', { ciRuns: [{ ...ciRun, head_sha: 'c'.repeat(40) }] }, /successful develop push CI run/],
-  ['PR CI', { ciRuns: [{ ...ciRun, event: 'pull_request' }] }, /successful develop push CI run/],
-  ['wrong branch CI', { ciRuns: [{ ...ciRun, head_branch: 'main' }] }, /successful develop push CI run/],
-  ['incomplete CI', { ciRuns: [{ ...ciRun, status: 'in_progress' }] }, /successful develop push CI run/],
+  ['wrong source CI', { ciRuns: [{ ...ciRun, head_sha: 'c'.repeat(40) }] }, /successful develop CI run/],
+  ['PR CI', { ciRuns: [{ ...ciRun, event: 'pull_request' }] }, /successful develop CI run/],
+  ['wrong branch CI', { ciRuns: [{ ...ciRun, head_branch: 'main' }] }, /successful develop CI run/],
+  ['incomplete CI', { ciRuns: [{ ...ciRun, status: 'in_progress' }] }, /successful develop CI run/],
+  ['empty required jobs', { requiredJobs: [] }, /cannot read develop required jobs/],
   ['unreadable branch protection', { failCiApi: '/branches/develop/protection' }, /cannot read develop required jobs/],
   ['unreadable CI jobs', { failCiApi: '/runs/456/jobs?' }, /cannot read develop CI jobs/],
 ]) {
@@ -180,6 +211,46 @@ for (const [label, changes, error] of [
     assert.equal(calls.some(c => c.command === 'git' || c.command === 'scp'), false);
   });
 }
+
+for (const [label, changes, error] of [
+  ['wrong SHA', { ciRuns: [{ ...queueRun, head_sha: 'c'.repeat(40) }] }, /successful develop CI run/],
+  ['wrong queue branch', { ciRuns: [{ ...queueRun, head_branch: 'gh-readonly-queue/main/pr-1' }] }, /successful develop CI run/],
+  ['queue branch prefix collision', { ciRuns: [{ ...queueRun, head_branch: 'gh-readonly-queue/develop-other/pr-1' }] }, /successful develop CI run/],
+  ['plain develop branch', { ciRuns: [{ ...queueRun, head_branch: 'develop' }] }, /successful develop CI run/],
+  ['wrong workflow', { ciRuns: [{ ...queueRun, path: '.github/workflows/other.yml' }] }, /successful develop CI run/],
+  ['fork PR event', { ciRuns: [{ ...queueRun, event: 'pull_request' }] }, /successful develop CI run/],
+  ['fork target event', { ciRuns: [{ ...queueRun, event: 'pull_request_target' }] }, /successful develop CI run/],
+  ['dispatch event', { ciRuns: [{ ...queueRun, event: 'workflow_dispatch' }] }, /successful develop CI run/],
+  ['failed run', { ciRuns: [{ ...queueRun, conclusion: 'failure' }] }, /successful develop CI run/],
+  ['incomplete run', { ciRuns: [{ ...queueRun, status: 'in_progress' }] }, /successful develop CI run/],
+  ['skipped job', { ciRuns: [queueRun], ciJobs: [{ name: 'test-elastos', status: 'completed', conclusion: 'skipped' },
+    { name: 'source-home-macos', status: 'completed', conclusion: 'success' }] }, /test-elastos: skipped/],
+  ['failed job', { ciRuns: [queueRun], ciJobs: [{ name: 'test-elastos', status: 'completed', conclusion: 'failure' },
+    { name: 'source-home-macos', status: 'completed', conclusion: 'success' }] }, /test-elastos: failure/],
+  ['missing job', { ciRuns: [queueRun], ciJobs: [{ name: 'test-elastos', status: 'completed', conclusion: 'success' }] }, /source-home-macos: missing/],
+  ['incomplete job', { ciRuns: [queueRun], ciJobs: [{ name: 'test-elastos', status: 'in_progress', conclusion: null },
+    { name: 'source-home-macos', status: 'completed', conclusion: 'success' }] }, /test-elastos: in_progress/],
+  ['failed duplicate job', { ciRuns: [queueRun], ciJobs: [...requiredJobs.map(name => ({ name, status: 'completed', conclusion: 'success' })),
+    { name: 'test-elastos', status: 'completed', conclusion: 'failure' }] }, /test-elastos: failure/],
+]) {
+  test(`exact source CI guard refuses queue CI with ${label}`, t => {
+    const f = fixture(t, { ...changes, ciOnly: true });
+    const result = f.checkedCi();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, error);
+    assert.throws(() => f.args(), { code: 'ENOENT' });
+    const calls = readFileSync(join(f.root, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(calls.some(c => c.command === 'git' || c.command === 'scp'), false);
+  });
+}
+
+test('prepare refuses an exact queue source outside develop before unsigned preparation', t => {
+  const f = fixture(t, { ciRuns: [queueRun], compareStatus: 'behind' });
+  const result = f.prepare();
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /source .* is not on develop/);
+  assert.throws(() => f.args(), { code: 'ENOENT' });
+});
 
 test('policy prints the prepared source, package run and develop CI run', t => {
   const f = fixture(t);

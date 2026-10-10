@@ -51,16 +51,19 @@ checked_artifact() {
     echo "${found% *} $commit"
 }
 
-# Bind the package source to a successful develop push and its required jobs.
+# Bind the package source to successful CI on develop or its merge queue.
 checked_ci() {
     local commit="$1" ci required jobs refused
-    ci=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$commit&branch=develop&event=push&per_page=100" \
-        --paginate | jq -s "[.[].workflow_runs[] | select(.head_sha == \"$commit\"
-        and .path == \".github/workflows/ci.yml\" and .event == \"push\" and .head_branch == \"develop\"
-        and .status == \"completed\" and .conclusion == \"success\")] | sort_by(.id)
-        | last | if . == null then empty else {id, url: .html_url} end") || die "cannot read develop CI runs for $commit"
-    [[ -n "$ci" ]] || die "source $commit needs a completed successful develop push CI run"
-    required=$(gh api "repos/$REPO/branches/develop/protection" --jq .required_status_checks.contexts) \
+    ci=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$commit&per_page=100" \
+        --paginate | jq -s --arg commit "$commit" '[.[].workflow_runs[] | select(.head_sha == $commit
+        and .path == ".github/workflows/ci.yml"
+        and ((.event == "push" and .head_branch == "develop")
+          or (.event == "merge_group" and ((.head_branch // "") | startswith("gh-readonly-queue/develop/"))))
+        and .status == "completed" and .conclusion == "success")] | sort_by(.id)
+        | last | if . == null then empty else {id, url: .html_url} end') || die "cannot read develop CI runs for $commit"
+    [[ -n "$ci" ]] || die "source $commit needs a completed successful develop CI run (push or merge group)"
+    required=$(gh api "repos/$REPO/branches/develop/protection" --jq \
+        '.required_status_checks.contexts | if type == "array" and length > 0 then . else error("required CI jobs missing") end') \
         || die "cannot read develop required jobs"
     jobs=$(gh api "repos/$REPO/actions/runs/$(jq -r .id <<< "$ci")/jobs?filter=latest&per_page=100" \
         --paginate | jq -s '[.[].jobs[] | {name, status, conclusion}]') || die "cannot read develop CI jobs"
@@ -240,7 +243,7 @@ sudo -v; [ -x $RELEASE_SEED_RUNTIME ]; [ -x $RELEASE_SEED_DATA/bin/ipfs-provider
 sudo systemctl stop $RELEASE_SEED_UNIT
 trap 'sudo systemctl start $RELEASE_SEED_UNIT' EXIT  # the seed is never left down
 publish --preflight-only
-# Import ends with a known gossip error after commit while the service is stopped.
+# Seeds on a Runtime older than the announcement removal still end with the old announcement error after commit; remove this once the seed runs a newer Runtime (#174).
 publish 2>&1 | tee import.log || grep -q 'committed; retry publication to announce its head: No running runtime found' import.log
 trap - EXIT; sudo systemctl start $RELEASE_SEED_UNIT
 EOF
