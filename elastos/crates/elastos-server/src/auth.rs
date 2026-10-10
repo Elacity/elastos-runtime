@@ -9169,6 +9169,11 @@ mod tests {
     #[test]
     fn required_protected_read_refuses_plaintext_and_observes_each_current_protection() {
         let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let data = root.path();
         let principal = "person:local:required-protected-read";
         let localhost_root = principal_localhost_root(principal);

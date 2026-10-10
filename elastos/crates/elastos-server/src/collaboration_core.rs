@@ -2299,6 +2299,11 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let data_root = temp.path().join("data");
             fs::create_dir(&data_root).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&data_root, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             let (profile_signer, _) = generate_keypair();
             let grant_bytes =
                 canonical_default_conversation_grant_bytes(&DefaultConversationGrant {
