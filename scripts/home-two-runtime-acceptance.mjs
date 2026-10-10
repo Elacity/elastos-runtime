@@ -754,6 +754,8 @@ async function openSharedConversation(side) {
 }
 
 async function openParticipantCard(side, chatFrame, peerName, expectedAction) {
+  assertOk(/^contact:[a-f0-9]{24}$/.test(side.communityPeerRef || ""),
+    `${side.prefix}: fresh Community sender reference is required`);
   if (!(await chatFrame.locator("#participant-list").isVisible())) {
     await chatFrame.locator("#participant-toggle").click();
   }
@@ -761,32 +763,50 @@ async function openParticipantCard(side, chatFrame, peerName, expectedAction) {
   let nextRefresh = 0;
   await poll(`${side.prefix}: Community Profile for ${peerName}`, 120_000, 1_000, async () => {
     const shouldOpen = !opened || Date.now() >= nextRefresh;
-    const result = await chatFrame.evaluate(({ name, action, shouldOpen }) => {
+    const result = await chatFrame.evaluate(({ name, participantRef, action, shouldOpen }) => {
       const peers = [...document.querySelectorAll("#participant-list [data-participant-ref]")]
-        .filter((node) => node.querySelector(".participant-name")?.textContent?.trim() === name);
+        .filter((node) => node.dataset.participantRef === participantRef);
+      const participantName = peers[0]?.querySelector(".participant-name")?.textContent?.trim() || "";
       const actionButton = document.querySelector("#participant-card-action");
       const pending = actionButton?.hidden === false && actionButton.disabled === true;
-      if (peers.length === 1 && shouldOpen && !pending) {
+      if (peers.length === 1 && participantName === name && shouldOpen && !pending) {
         peers[0].click();
       }
       const card = document.querySelector("#participant-card");
       const button = document.querySelector("#participant-card-action");
       return {
         count: peers.length,
-        opened: peers.length === 1 && shouldOpen && !pending,
+        participantName,
+        opened: peers.length === 1 && participantName === name && shouldOpen && !pending,
         name: document.querySelector("#participant-card-name")?.textContent?.trim() || "",
         action: button?.dataset?.cardAction || "",
         ready: card?.hidden === false && button?.hidden === false && !button?.disabled
+          && card?.dataset.participantRef === participantRef
           && button?.dataset?.cardAction === action,
       };
-    }, { name: peerName, action: expectedAction, shouldOpen });
+    }, { name: peerName, participantRef: side.communityPeerRef, action: expectedAction, shouldOpen });
     assertOk(result.count <= 1, `${side.prefix}: ambiguous Community Profile`, result);
     if (result.opened) {
       opened = true;
       nextRefresh = Date.now() + 5_000;
     }
-    return { done: result.count === 1 && result.name === peerName && result.ready, value: result };
+    return { done: result.count === 1 && result.participantName === peerName
+      && result.name === peerName && result.ready, value: result };
   });
+}
+
+async function communityMessageSenderRef(side, chatFrame, text, peerName) {
+  const evidence = await chatFrame.evaluate((needle) => {
+    const rows = [...document.querySelectorAll("#message-list .message-body")]
+      .filter((node) => node.textContent === needle).map((node) => node.closest(".message"));
+    const sender = rows[0]?.querySelector(".message-sender-link");
+    return { count: rows.length, self: rows[0]?.classList.contains("self-message"),
+      name: sender?.textContent?.trim() || "", participantRef: sender?.dataset.participantRef || "" };
+  }, text);
+  assertOk(evidence.count === 1 && evidence.self === false && evidence.name === peerName
+    && /^contact:[a-f0-9]{24}$/.test(evidence.participantRef),
+  `${side.prefix}: fresh Community message must bind its verified peer Profile`, evidence);
+  return evidence.participantRef;
 }
 
 async function requestCommunityContact(side, chatFrame, peopleFrame, peerName) {
@@ -1369,6 +1389,12 @@ async function main() {
     await waitForMessage(b, bCommunity, aCommunityMarker, 120_000);
     await sendMessage(b, bCommunity, bCommunityMarker);
     await waitForMessage(a, aCommunity, bCommunityMarker, 120_000);
+    [a.communityPeerRef, b.communityPeerRef] = await Promise.all([
+      communityMessageSenderRef(a, aCommunity, bCommunityMarker, SIDE_B.name),
+      communityMessageSenderRef(b, bCommunity, aCommunityMarker, SIDE_A.name),
+    ]);
+    assertDistinctProfileContactEvidence(a.communityPeerRef, b.communityPeerRef,
+      a.recoveryProfileDid, b.recoveryProfileDid);
 
     await runLeg(report, "exactly_one_contact_request", "A requests the Community Profile once", async () => {
       await assertPeopleHasNoDecisionActions(b, bPeople);

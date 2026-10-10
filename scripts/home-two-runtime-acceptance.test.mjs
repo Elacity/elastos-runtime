@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   chmodSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -10,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 
 import {
   REQUIRED_ACCEPTANCE_LEGS,
@@ -33,6 +35,44 @@ function writeOwnerOnlyJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
   chmodSync(path, 0o600);
 }
+
+test("Community Profile selection binds the fresh sender reference through same-name history", async () => {
+  const source = readFileSync(new URL("./home-two-runtime-acceptance.mjs", import.meta.url), "utf8");
+  const body = source.slice(source.indexOf("async function openParticipantCard("),
+    source.indexOf("async function communityMessageSenderRef("));
+  const expected = "contact:" + "a".repeat(24), historical = "contact:" + "b".repeat(24);
+  async function select(refs, peerRef = expected) {
+    const clicked = [], card = { hidden: true, dataset: {} };
+    const button = { hidden: false, disabled: false, dataset: { cardAction: "add-contact" } };
+    const participants = refs.map(([ref, name]) => ({
+      dataset: { participantRef: ref },
+      querySelector: () => ({ textContent: name }),
+      click() { clicked.push(ref); card.hidden = false; card.dataset.participantRef = ref; },
+    }));
+    const document = {
+      querySelectorAll: () => participants,
+      querySelector: selector => selector === "#participant-card" ? card
+        : selector === "#participant-card-name" ? { textContent: "Fixture Peer" } : button,
+    };
+    const open = runInNewContext(body + "\nopenParticipantCard", {
+      document, Date,
+      assertOk: (ok, message) => assert.ok(ok, message),
+      poll: async (_label, _timeout, _interval, check) => {
+        const result = await check();
+        assert.ok(result.done, "expected Profile was not ready");
+      },
+    });
+    const frame = { locator: () => ({ isVisible: async () => true }),
+      evaluate: async (callback, args) => callback(args) };
+    await open({ prefix: "A", communityPeerRef: peerRef }, frame, "Fixture Peer", "add-contact");
+    return clicked;
+  }
+  assert.deepEqual(await select([[historical, "Fixture Peer"], [expected, "Fixture Peer"]]), [expected]);
+  await assert.rejects(select([[expected, "Fixture Peer"], [expected, "Fixture Peer"]]), /ambiguous Community Profile/);
+  await assert.rejects(select([[historical, "Fixture Peer"]]), /expected Profile was not ready/);
+  await assert.rejects(select([[expected, "Wrong Name"]]), /expected Profile was not ready/);
+  await assert.rejects(select([[expected, "Fixture Peer"]], "did:key:foreign"), /fresh Community sender reference/);
+});
 
 function fixtureConfig(t) {
   const root = mkdtempSync(join(tmpdir(), "elastos-acceptance-fixture-"));
