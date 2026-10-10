@@ -45,6 +45,7 @@ def make_set(source, target="linux-arm64"):
     image = source / "browser-vm/rootfs.ext4"
     manifest = {"schema": "elastos.browser.vm-rootfs-build/v1", "ok": True,
                 "target_platform": target, "size": image.stat().st_size, "sha256": sha(image),
+                "inputs_sha256": "a" * 64, "recipe_options": {"rootfs_size": "4096M"},
                 "preflight": copy.deepcopy(preflight)}
     for name, rel in [("kernel", "bin/vmlinux"), ("initrd", "bin/initrd")]:
         p = source / rel
@@ -238,7 +239,8 @@ with tempfile.TemporaryDirectory(prefix="browser-image-ownership-") as temp:
                                                 "bin/vmlinux", "browser-vm/browser-vm-rootfs-manifest.json"]}
     shell = 'source "$DEFINITIONS"\nROOT="$SOURCE"\nDATA_DIR="$DEST"\nPLATFORM=linux-arm64\nNODE_BIN="$NODE"\ninstall_browser_runtime_helpers\n'
     p = subprocess.run(["bash", "-c", shell], env={**env, "DEFINITIONS": str(definitions),
-                       "SOURCE": str(repo), "DEST": str(installed), "NODE": shutil.which("node")},
+                       "SOURCE": str(repo), "DEST": str(installed), "NODE": shutil.which("node"),
+                       "ELASTOS_NODE_BIN": shutil.which("node")},
                        capture_output=True, text=True, timeout=30)
     assert p.returncode == 0, (p.stdout, p.stderr)
     assert all(sha(source / rel) == digest for rel,digest in before.items())

@@ -138,6 +138,7 @@ ci-source-home-linux arch='arm64':
         export PATH=/usr/local/cargo/bin:\$PATH RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/home/ci/.cargo && \
         cd /w && git init -q && git add -A && git -c user.email=ci@local -c user.name=ci commit -qm ci-replica && \
         export ELASTOS_COLLABORATION_STARTUP_MODE=isolated && \
+        export ELASTOS_NODE_BIN=/usr/bin/node ELASTOS_BROWSER_VM_TURNSERVER_BIN=/usr/bin/turnserver && \
         SOURCE_HOME=/home/ci/rtemp/elastos-source-home && mkdir -p \$SOURCE_HOME && \
         export HOME=\$SOURCE_HOME XDG_DATA_HOME=\$SOURCE_HOME/.local/share && \
         SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR=/usr/bin scripts/setup-source-home.sh && \

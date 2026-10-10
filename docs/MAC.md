@@ -38,6 +38,8 @@ cd "$HOME/Code/elastos-runtime"
 export MAC_TEST_HOME="$HOME/elastos-mac-test-home"
 export USER_HOME="$HOME"
 export SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR="$(dirname "$(command -v ffmpeg)")"
+export ELASTOS_NODE_BIN="$(command -v node)"
+export ELASTOS_BROWSER_VM_TURNSERVER_BIN="$(command -v turnserver)"
 
 HOME="$MAC_TEST_HOME" \
 CARGO_HOME="$USER_HOME/.cargo" \
