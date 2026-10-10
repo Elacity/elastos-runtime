@@ -167,15 +167,6 @@ impl Default for HeldFrames {
 }
 
 impl HeldFrames {
-    /// A smaller Home bound, so a test can fill it with few frames.
-    #[cfg(test)]
-    pub(crate) fn with_max_frames(max_frames: usize) -> Self {
-        Self {
-            max_frames,
-            ..Self::default()
-        }
-    }
-
     /// Keeps `held` for a later retry. When the Home's bound is full, the
     /// sender holding the most gives up its newest frame first, so a flood
     /// across many Profiles cannot push out a sender holding little.

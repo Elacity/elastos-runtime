@@ -1447,12 +1447,6 @@ impl CollaborationCore {
         self.held.restore(held);
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_held_frame_bound_for_test(mut self, max_frames: usize) -> Self {
-        self.held = HeldFrames::with_max_frames(max_frames);
-        self
-    }
-
     fn sender_backlog_full(
         &self,
         state: &CoreState,
