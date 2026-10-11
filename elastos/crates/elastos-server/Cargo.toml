@@ -88,9 +88,6 @@ base64 = "0.22"
 
 # Ed25519 signing (for provenance attestations)
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-# ed25519-dalek 3.x is used by Iroh and distributed-topic-tracker for transport
-# and DHT signing. Runtime identity remains on 2.x; the boundary is raw key bytes.
-ed25519-dalek3 = { package = "ed25519-dalek", version = "=3.0.0-rc.0" }
 
 # Directory helpers
 dirs = "5.0"
