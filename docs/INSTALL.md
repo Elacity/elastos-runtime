@@ -39,7 +39,17 @@ Browser VM work.
 
 The installer needs `curl` and a working `python3`; on a Mac without the
 Command Line Tools it stops first and asks you to run `xcode-select --install`.
-Setup and updates need outgoing UDP to port 4433 for Carrier.
+Setup and updates use Carrier, which connects Homes directly whenever it can:
+on the same Wi-Fi, or through both routers when hole punching works (UDP; port
+4433 to the publisher). When no direct path works, for example two Homes behind
+different home routers or a network that blocks UDP, Carrier goes through the
+publisher's relay at the installer's own address over HTTPS (port 443), and
+keeps trying a direct path. Your Home accepts only that relay, which the signed
+release pins as the publisher address; it refuses any other relay. The relay
+forwards end-to-end encrypted Carrier traffic between two Home keys and cannot
+read it or pose as either Home; it sees which Homes talk, their IP addresses and
+how much they send. You reach another Home by its DID alone, never by an
+address or ticket.
 
 The installer detects the platform (Linux `x86_64`/`aarch64` or
 macOS Apple silicon), verifies the signed release, installs Runtime, and
