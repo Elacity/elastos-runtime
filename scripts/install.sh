@@ -115,21 +115,23 @@ show_help() {
     echo -e "${BOLD}Options:${NC}"
     echo "  --maintainer-did DID Override maintainer DID trust anchor"
     echo "  --publisher-gateway URL  Bootstrap publisher URL (stamped for normal installs)"
-    echo "  --install-dir PATH    Binary install directory (default: ~/.local/bin)"
+    echo "  --install-dir PATH    Directory for the elastos command (default: ~/.local/bin)"
     echo "  --install-only        Install Runtime without setup or opening Home"
     echo "  --uninstall           Remove the Runtime and its components; keep your data"
     echo "  --remove-data         With --uninstall, also delete the data directory"
     echo "  --help                Show this help"
     echo ""
     echo -e "${BOLD}What gets installed:${NC}"
-    echo "  ~/.local/bin/elastos                     Runtime binary"
+    echo "  <data directory>/bin/elastos             Runtime binary"
+    echo "  ~/.local/bin/elastos                     The elastos command, a link to the Runtime"
+    echo "  Home's background service                systemd user unit or macOS LaunchAgent"
     echo "  Verified release metadata and the trusted Carrier source in the Runtime data directory"
     echo ""
     echo -e "${BOLD}After installation:${NC}"
     echo "  Runtime setup fetches signed metadata and Home components over Carrier."
-    echo "  Setup then opens Home in your browser."
-    echo "  Keep the terminal open while using Home; Ctrl+C stops it."
-    echo "  Without an interactive terminal, the installer prints the launch command."
+    echo "  Home then runs in the background as you and opens in your browser."
+    echo "  Open it again any time with: elastos home --browser"
+    echo "  If the background service cannot start, Home runs in the terminal instead."
     echo ""
     echo -e "${BOLD}Trust model:${NC}"
     echo "  All artifacts signed with Ed25519. install.sh is the explicit"
@@ -311,6 +313,82 @@ installer_data_dir() {
             ;;
         *) die "Unsupported OS: $(uname -s)" ;;
     esac
+}
+
+# The Runtime path this installation records; empty when none is recorded.
+recorded_runtime() {
+    local sources="$1/sources.json" path
+    [[ -f "$sources" ]] || return 0
+    path="$(json_get "$sources" \
+        '(lambda v: v if isinstance(v, str) else None)(d["sources"][0]["install_path"])' \
+        2>/dev/null || true)"
+    if [[ "$path" == /* && "$path" != *[[:cntrl:]]* ]]; then
+        printf '%s\n' "$path"
+    fi
+}
+
+# Home's background service: a systemd user unit on Linux, a LaunchAgent on macOS.
+# The Runtime writes and starts it (`elastos service install`); the installer
+# only stops and removes it, so an older or missing Runtime cannot block that.
+home_service_definition() {
+    case "$(uname -s)" in
+        Linux)
+            local config="${XDG_CONFIG_HOME:-}"
+            [[ "$config" == /* ]] || config="${HOME%/}/.config"
+            printf '%s\n' "${config%/}/systemd/user/elastos-home.service"
+            ;;
+        Darwin) printf '%s\n' "${HOME%/}/Library/LaunchAgents/org.elastos.home.plist" ;;
+    esac
+}
+
+# Stops the service before its files change. The service manager then does not
+# restart Home while the installer replaces it.
+stop_home_service() {
+    local definition
+    definition="$(home_service_definition)"
+    [[ -n "$definition" && -f "$definition" ]] || return 0
+    HOME_SERVICE_STOPPED=true
+    info "Stopping Home's background service..."
+    case "$(uname -s)" in
+        Linux) systemctl --user stop elastos-home.service >/dev/null 2>&1 || true ;;
+        Darwin) launchctl bootout "gui/$(id -u)/org.elastos.home" >/dev/null 2>&1 || true ;;
+    esac
+}
+
+remove_home_service() {
+    local definition
+    definition="$(home_service_definition)"
+    [[ -n "$definition" && -f "$definition" ]] || return 0
+    case "$(uname -s)" in
+        Linux)
+            systemctl --user disable --now elastos-home.service >/dev/null 2>&1 || true
+            rm -f -- "$definition"
+            systemctl --user daemon-reload >/dev/null 2>&1 || true
+            ;;
+        Darwin)
+            launchctl bootout "gui/$(id -u)/org.elastos.home" >/dev/null 2>&1 || true
+            rm -f -- "$definition"
+            ;;
+    esac
+    ok "Removed Home's background service"
+}
+
+# Points the elastos command at the installed Runtime in one rename, replacing
+# an older Runtime file or link at that path without following it.
+link_runtime_command() {
+    python3 - "$1" "$2" <<'PY_LINK'
+import os
+import sys
+
+target, link = sys.argv[1], sys.argv[2]
+temporary = os.path.join(os.path.dirname(link), ".elastos.link.%d" % os.getpid())
+try:
+    os.unlink(temporary)
+except FileNotFoundError:
+    pass
+os.symlink(target, temporary)
+os.replace(temporary, link)
+PY_LINK
 }
 
 detect_platform() {
@@ -572,8 +650,30 @@ def wait_for_descendants(children):
         time.sleep(0.1)
 
 
+def runtime_names(binary):
+    """The selected path and, for the elastos command, the Runtime it links to;
+    a process can run under either path."""
+    names = [binary]
+    if os.path.islink(binary):
+        target = os.readlink(binary)
+        if os.path.isabs(target) and os.path.basename(target) == "elastos":
+            names.append(target)
+    return names
+
+
+def matching_name(snapshot, names, prefixes=PREFIXES):
+    return next((name for name in names if matches_command(snapshot, name, prefixes)), None)
+
+
+def scanned_processes(names):
+    found = {}
+    for name in names:
+        found.update(selected_processes(name))
+    return found
+
+
 def stop_installation(data_dir, binary, scan_binary):
-    binary = os.path.abspath(binary)
+    names = runtime_names(os.path.abspath(binary))
     data_dir = Path(data_dir)
     records = []
     selected = {}
@@ -587,7 +687,7 @@ def stop_installation(data_dir, binary, scan_binary):
         pid = recorded[0]
         snapshot = process_snapshot(pid)
         if snapshot is not None:
-            if not matches_command(snapshot, binary):
+            if matching_name(snapshot, names) is None:
                 raise ValueError("Recorded Runtime is foreign or ambiguous; preserved its process and state")
             # ps lstart and this Python process use the same local timezone.
             # Its second precision rejects definite PID reuse; coordinates do
@@ -597,7 +697,7 @@ def stop_installation(data_dir, binary, scan_binary):
                 raise ValueError("Runtime process started after its ownership record; preserved its process and state")
             selected[pid] = snapshot
     if scan_binary:
-        for pid, snapshot in selected_processes(binary).items():
+        for pid, snapshot in scanned_processes(names).items():
             if pid not in selected:
                 raise ValueError("A process using this binary has no ownership record in the selected data directory; close it and retry")
             if selected[pid] != snapshot:
@@ -606,7 +706,7 @@ def stop_installation(data_dir, binary, scan_binary):
     # stops Home without the controller restarting it.
     controllers = {}
     for pid, snapshot in selected.items():
-        if matches_command(snapshot, binary, ("home",)):
+        if matching_name(snapshot, names, ("home",)) is not None:
             controller = home_controller(pid, data_dir)
             if controller is not None:
                 controllers[controller[0]] = controller[1:]
@@ -614,9 +714,9 @@ def stop_installation(data_dir, binary, scan_binary):
     for pid, (snapshot, command) in controllers.items():
         stop_owned_process(pid, snapshot, *command)
     for pid, snapshot in selected.items():
-        stop_owned_process(pid, snapshot, binary)
+        stop_owned_process(pid, snapshot, matching_name(snapshot, names))
     wait_for_descendants(children)
-    if scan_binary and selected_processes(binary):
+    if scan_binary and scanned_processes(names):
         raise ValueError("A new Runtime started during cleanup; preserved its state")
     for path, recorded in records:
         remove_dead_coords(path, recorded)
@@ -902,8 +1002,8 @@ show_ready() {
     echo ""
 }
 
-# Setup leaves the curl pipe unread. Browser Home runs in the controlling
-# terminal; non-interactive provisioning prints the command for a later launch.
+# Setup leaves the curl pipe unread. Home then runs as the user's background
+# service; when that cannot start, it runs in the controlling terminal as before.
 prepare_browser_linux_host() {
     BROWSER_LINUX_HOST_READY=false
     [[ "$(uname -s)" == Linux ]] || return 0
@@ -939,6 +1039,9 @@ finish_install() {
     local runtime_bin="${INSTALL_DIR}/elastos"
     if [[ "$INSTALL_ONLY" == true || "$INSTALL_ONLY" == 1 ]]; then
         info "Runtime installed: ${runtime_bin}"
+        if [[ "${HOME_SERVICE_STOPPED:-false}" == true ]]; then
+            info "Home's background service was stopped for this install. Start it with: $(runtime_command "$runtime_bin") home --browser"
+        fi
         return 0
     fi
     step 5 "Set up Home"
@@ -952,8 +1055,14 @@ finish_install() {
         "$runtime_bin" setup </dev/null || warn "Home is ready. Browser preparation needs repair with elastos setup."
     fi
     show_ready "$runtime_bin"
+    info "Starting Home in the background..."
+    # The Runtime explains in one line why its service could not start.
+    if "$runtime_bin" service install --open </dev/null; then
+        info "Home keeps running after this terminal closes and starts again when you log in."
+        return 0
+    fi
     if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
-        info "Opening Home..."
+        info "Opening Home in this terminal instead..."
         "$runtime_bin" home --browser </dev/tty || return $?
     else
         info "Home is installed. Open it from a terminal:"
@@ -1029,26 +1138,47 @@ def release_entries(data_dir):
     return entries
 
 
+def writer_lock(directory, held, created):
+    # The same lock as the Runtime's installation writer, beside its binary.
+    path = directory / ".elastos.install.lock"
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        created.append(path)
+    except FileExistsError:
+        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    held.append(descriptor)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise OSError("an install or update is running; retry after it finishes")
+    if lstat(directory / ".elastos.update-journal.json") is not None:
+        raise OSError("an install or update was interrupted; run install.sh again to restore it")
+
+
 def uninstall(home, mode, install_dir, data_dir, remove_data):
-    binary = install_dir / "elastos"
-    metadata = lstat(binary)
+    # The elastos command: a link to <data>/bin/elastos, or the Runtime itself
+    # in an installation from before the Runtime moved into the data directory.
+    command = install_dir / "elastos"
+    metadata = lstat(command)
     if metadata is not None and stat.S_ISDIR(metadata.st_mode):
-        raise OSError(f"{binary} is a directory, not the Runtime")
+        raise OSError(f"{command} is a directory, not the Runtime")
     has_data = data_root(home, data_dir)
     entries = release_entries(data_dir) if has_data else []
     if mode == "check":
         return
-    lock = install_dir / ".elastos.install.lock"
-    if install_dir.is_dir():
-        # The same lock as the Runtime's installation writer.
-        descriptor = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise OSError("an install or update is running; retry after it finishes")
-        if lstat(install_dir / ".elastos.update-journal.json") is not None:
-            raise OSError("an install or update was interrupted; run install.sh again to restore it")
-    binary.unlink(missing_ok=True)
+    held, created = [], []
+    writers = [install_dir] if install_dir.is_dir() else []
+    if any(path == data_dir / "bin" and is_dir for path, is_dir in entries):
+        writers.append(data_dir / "bin")
+    try:
+        for directory in writers:
+            writer_lock(directory, held, created)
+    except OSError:
+        # A refusal leaves no lock file this uninstall created.
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
+    command.unlink(missing_ok=True)
     # rmtree removes links inside a tree without following them.
     if has_data and remove_data:
         shutil.rmtree(data_dir)
@@ -1058,7 +1188,7 @@ def uninstall(home, mode, install_dir, data_dir, remove_data):
             shutil.rmtree(path)
         else:
             path.unlink()
-    lock.unlink(missing_ok=True)
+    (install_dir / ".elastos.install.lock").unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
@@ -1073,18 +1203,24 @@ PY_UNINSTALL
 # The data directory (identity, wallets, recovery material, user files) stays
 # unless removal is requested, so a later install continues with the same identity.
 uninstall_installation() {
-    local install_dir="$1" remove_data="$2" data_dir binary
+    local install_dir="$1" remove_data="$2" data_dir binary recorded
     [[ "$install_dir" == /* ]] || install_dir="${PWD}/${install_dir}"
     data_dir="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
-    binary="${install_dir}/elastos"
-    if [[ ! -e "$binary" && ! -L "$binary" && ! -e "$data_dir" && ! -L "$data_dir" ]]; then
+    binary="${data_dir}/bin/elastos"
+    if [[ ! -e "${install_dir}/elastos" && ! -L "${install_dir}/elastos" && ! -e "$data_dir" && ! -L "$data_dir" ]]; then
         ok "No ElastOS installation found"
         return 0
     fi
     command -v python3 &>/dev/null || die "Required tool not found: python3"
     uninstall_files check "$install_dir" "$data_dir" "$remove_data" \
         || die "Nothing was stopped or removed"
+    recorded="$(recorded_runtime "$data_dir")"
+    stop_home_service
     info "Stopping this installation's verified Runtime processes..."
+    if [[ -n "$recorded" && "$recorded" != "$binary" ]]; then
+        installer_runtime_control "$data_dir" "$recorded" true \
+            || die "Close this installation's Runtime and retry; nothing was removed"
+    fi
     installer_runtime_control "$data_dir" "$binary" true \
         || die "Close this installation's Runtime and retry; nothing was removed"
     if [[ "$remove_data" == true ]]; then
@@ -1093,6 +1229,7 @@ uninstall_installation() {
     fi
     uninstall_files remove "$install_dir" "$data_dir" "$remove_data" \
         || die "Uninstall did not finish; run it again after fixing the reason above"
+    remove_home_service
     ok "Removed the Runtime and its components"
     if [[ "$remove_data" == true ]]; then
         ok "Deleted the data directory"
@@ -1185,6 +1322,9 @@ fi
 ok "Tools: curl, python3 and SHA-256 are available"
 
 DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
+# The Runtime lives in the data directory; INSTALL_DIR holds the elastos command,
+# a link to it.
+RUNTIME_BIN="${DATA_DIR}/bin/elastos"
 PREVIOUS_VERSION="$(installed_version "$DATA_DIR")"
 EXISTING_INSTALL=false
 if [[ -n "$PREVIOUS_VERSION" ]]; then
@@ -1385,7 +1525,7 @@ PUBLISHER_GATEWAY="${PUBLISHER_GATEWAY}" \
 INSTALLED_VERSION="${RELEASE_VERSION}" \
 INSTALLED_HEAD_CID="${HEAD_CID}" \
 INSTALLED_CHANNEL="${RELEASE_CHANNEL}" \
-INSTALLED_BINARY_PATH="${INSTALL_DIR}/elastos" \
+INSTALLED_BINARY_PATH="${RUNTIME_BIN}" \
 SOURCE_CONNECT_TICKET="${SOURCE_CONNECT_TICKET}" \
 PUBLISHER_NODE_ID="${PUBLISHER_NODE_ID}" \
 IPNS_NAME="${IPNS_NAME}" \
@@ -1436,29 +1576,37 @@ PY
 
 # The writer refuses an older release, another channel, a pending Home
 # update and a concurrent writer before this installer stops Runtime.
+(umask 077; mkdir -p "${DATA_DIR}/bin")
 INSTALL_RELEASE=("${TMP_INSTALL_BIN}" install-release --data-dir "$DATA_DIR"
-    --binary "${INSTALL_DIR}/elastos" --candidate "${TMP_INSTALL_BIN}" "$SOURCES_PATH"
+    --binary "$RUNTIME_BIN" --link "${INSTALL_DIR}/elastos"
+    --candidate "${TMP_INSTALL_BIN}" "$SOURCES_PATH"
     "${INSTALL_SCRATCH}/release-head.json" "${INSTALL_SCRATCH}/release.json")
 step 4 "Install"
 "${INSTALL_RELEASE[@]}" --check || die "This installation was not changed"
 
+stop_home_service
 info "Stopping verified Runtime processes for this installation so the new version can be installed..."
-installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
-    || die "Close this installation's Runtime and retry; its existing files were preserved"
-if [[ "${EXISTING_INSTALL:-true}" == true ]]; then
-    info "Open Home again after installation to reconnect."
+# An installation from before 0.8 runs its Runtime from the elastos command path.
+RECORDED_BIN="$(recorded_runtime "$DATA_DIR")"
+if [[ -n "$RECORDED_BIN" && "$RECORDED_BIN" != "$RUNTIME_BIN" ]]; then
+    installer_runtime_control "$DATA_DIR" "$RECORDED_BIN" true \
+        || die "Close this installation's Runtime and retry; its existing files were preserved"
 fi
+installer_runtime_control "$DATA_DIR" "$RUNTIME_BIN" true \
+    || die "Close this installation's Runtime and retry; its existing files were preserved"
 
 # One journaled transaction replaces the Runtime, trusted sources and the
 # verified release pair; an interrupted run restores the previous set.
-info "Installing binary to $(display_path "${INSTALL_DIR}/elastos")..."
+info "Installing binary to $(display_path "$RUNTIME_BIN")..."
 "${INSTALL_RELEASE[@]}" || die "The previous installation was preserved"
-ok "Installed ElastOS ${RELEASE_VERSION} to $(display_path "${INSTALL_DIR}/elastos")"
+link_runtime_command "$RUNTIME_BIN" "${INSTALL_DIR}/elastos" \
+    || die "Could not link $(display_path "${INSTALL_DIR}/elastos") to the Runtime; run the installer again"
+ok "Installed ElastOS ${RELEASE_VERSION} to $(display_path "$RUNTIME_BIN")"
 
 PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
 info "Verifying and upgrading configured protected roots while Runtime is stopped..."
 # The receipt stays in the backup directory; the terminal gets one line.
-"${INSTALL_DIR}/elastos" principal-root-upgrade \
+"$RUNTIME_BIN" principal-root-upgrade \
     --data-dir "${DATA_DIR}" \
     --backup-dir "${PRINCIPAL_ROOT_BACKUP_DIR}" >/dev/null
 ok "Protected roots are ready"
