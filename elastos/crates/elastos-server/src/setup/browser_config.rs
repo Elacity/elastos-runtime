@@ -276,22 +276,15 @@ fn retire_host(data: &Path, manifest: &super::ComponentsManifest) -> anyhow::Res
     }
     let mut removed = false;
     for relative in paths {
-        if !parents_are_real_directories(data, &relative) {
-            println!(
+        // Never through a linked folder; a link itself is removed, its target never followed.
+        match elastos_common::owned_removal::remove_owned(data, &relative, None) {
+            Ok(found) => removed |= found,
+            Err(elastos_common::owned_removal::RemovalError::LinkedParent(_)) => println!(
                 "Kept {}: a folder on its path is a link, so removing it could reach files outside the data directory.",
                 relative.display()
-            );
-            continue;
-        }
-        let path = data.join(&relative);
-        // A link is removed itself; its target is never followed.
-        match path.symlink_metadata() {
-            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path)?,
-            Ok(_) => fs::remove_file(&path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            ),
             Err(error) => return Err(error.into()),
         }
-        removed = true;
     }
     if removed {
         println!("Removed the Browser host files an earlier release installed.");
@@ -300,28 +293,6 @@ fn retire_host(data: &Path, manifest: &super::ComponentsManifest) -> anyhow::Res
         println!("Browser is not available on this computer yet.");
     }
     Ok(())
-}
-
-/// True when the data directory and every folder from it down to `relative`'s
-/// parent are real directories, so a removal stays inside the data directory.
-fn parents_are_real_directories(data: &Path, relative: &Path) -> bool {
-    if !data.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
-        return false;
-    }
-    let mut current = data.to_path_buf();
-    for component in relative.parent().into_iter().flat_map(Path::components) {
-        let std::path::Component::Normal(part) = component else {
-            return false;
-        };
-        current.push(part);
-        match current.symlink_metadata() {
-            Ok(meta) if meta.is_dir() => {}
-            // A missing folder holds nothing to remove.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
-            _ => return false,
-        }
-    }
-    true
 }
 
 pub(super) fn configure(data: &Path, platform: &str, release_image: bool) -> anyhow::Result<()> {
@@ -863,13 +834,18 @@ mod tests {
     #[test]
     fn removal_never_goes_through_a_linked_data_directory() {
         use std::os::unix::fs::symlink;
+        let manifest: super::super::ComponentsManifest =
+            serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let (real, linked) = (temp.path().join("real"), temp.path().join("elastos"));
-        fs::create_dir_all(real.join("browser-vm")).unwrap();
+        let image = real.join(super::super::browser_vm_image::INSTALL_PATH);
+        fs::create_dir_all(&image).unwrap();
+        fs::write(image.join("rootfs.ext4"), b"owner data").unwrap();
         symlink(&real, &linked).unwrap();
-        let relative = Path::new("browser-vm/image-set");
-        assert!(parents_are_real_directories(&real, relative));
-        assert!(!parents_are_real_directories(&linked, relative));
+        retire_host(&linked, &manifest).unwrap();
+        assert_eq!(fs::read(image.join("rootfs.ext4")).unwrap(), b"owner data");
+        retire_host(&real, &manifest).unwrap();
+        assert!(!image.exists());
     }
 
     #[test]

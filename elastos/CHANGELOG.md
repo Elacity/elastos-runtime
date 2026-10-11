@@ -6,6 +6,14 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Developer detail
+
+- The source gate refuses a file deletion added to product code unless it
+  goes through the owned-removal helper of its language (exact path below an
+  owned folder, no link followed, optional device+inode check) or carries a
+  `removal-ok: <reason>` comment. Browser host retirement now uses the Rust
+  helper.
+
 ## [0.8.0-alpha.15]
 
 Test-channel release. Signed releases show these notes in System before you update.
