@@ -341,12 +341,33 @@ home_service_definition() {
     esac
 }
 
-# Stops the service before its files change. The service manager then does not
-# restart Home while the installer replaces it.
-stop_home_service() {
-    local definition
+# The definition and the manager's loaded copy run this installation's Runtime
+# ($1). Another data folder's service of this account is never stopped or removed.
+home_service_owned() {
+    local runtime="$1" definition needle loaded
     definition="$(home_service_definition)"
-    [[ -n "$definition" && -f "$definition" ]] || return 0
+    [[ -n "$definition" && -f "$definition" && ! -L "$definition" ]] || return 1
+    case "$(uname -s)" in
+        Linux)
+            needle="ExecStart=\"${runtime//[%]/%%}\" home --browser"
+            loaded="$(systemctl --user show --property=LoadState,ExecStart elastos-home.service 2>/dev/null || true)"
+            [[ "$loaded" != *LoadState=loaded* || "$loaded" == *"$runtime"* ]] || return 1
+            ;;
+        Darwin)
+            # Paths with XML special characters never match: such a service is left alone.
+            needle="<string>${runtime}</string>"
+            loaded="$(launchctl print "gui/$(id -u)/org.elastos.home" 2>/dev/null || true)"
+            [[ "$loaded" != *"program = "* || "$loaded" == *"$runtime"* ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    grep -qF -- "$needle" "$definition"
+}
+
+# Stops this installation's service before its files change, so the service
+# manager does not restart Home while the installer replaces it.
+stop_home_service() {
+    home_service_owned "$1" || return 0
     HOME_SERVICE_STOPPED=true
     info "Stopping Home's background service..."
     case "$(uname -s)" in
@@ -358,7 +379,11 @@ stop_home_service() {
 remove_home_service() {
     local definition
     definition="$(home_service_definition)"
-    [[ -n "$definition" && -f "$definition" ]] || return 0
+    [[ -n "$definition" && -e "$definition" ]] || return 0
+    if ! home_service_owned "$1"; then
+        info "Home's background service belongs to another ElastOS data folder; left it unchanged."
+        return 0
+    fi
     case "$(uname -s)" in
         Linux)
             systemctl --user disable --now elastos-home.service >/dev/null 2>&1 || true
@@ -1082,6 +1107,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import sys
 
 # What a release installs in the data directory: the Runtime writer's
@@ -1155,7 +1181,7 @@ def writer_lock(directory, held, created):
         raise OSError("an install or update was interrupted; run install.sh again to restore it")
 
 
-def uninstall(home, mode, install_dir, data_dir, remove_data):
+def uninstall(home, mode, install_dir, data_dir, remove_data, stop):
     # The elastos command: a link to <data>/bin/elastos, or the Runtime itself
     # in an installation from before the Runtime moved into the data directory.
     command = install_dir / "elastos"
@@ -1173,6 +1199,10 @@ def uninstall(home, mode, install_dir, data_dir, remove_data):
     try:
         for directory in writers:
             writer_lock(directory, held, created)
+        # Home stops only while both writer locks are held and no journal waits,
+        # so a refused uninstall never stops Home or interrupts an update.
+        if subprocess.run(stop).returncode:
+            raise OSError("close this installation's Runtime and retry; nothing was removed")
     except OSError:
         # A refusal leaves no lock file this uninstall created.
         for path in created:
@@ -1193,7 +1223,8 @@ def uninstall(home, mode, install_dir, data_dir, remove_data):
 
 if __name__ == "__main__":
     try:
-        uninstall(sys.argv[1], sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]), sys.argv[5] == "true")
+        uninstall(sys.argv[1], sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]), sys.argv[5] == "true",
+                  sys.argv[6:])
     except OSError as error:
         print("Uninstall stopped: " + str(error), file=sys.stderr)
         sys.exit(1)
@@ -1215,21 +1246,26 @@ uninstall_installation() {
     uninstall_files check "$install_dir" "$data_dir" "$remove_data" \
         || die "Nothing was stopped or removed"
     recorded="$(recorded_runtime "$data_dir")"
-    stop_home_service
-    info "Stopping this installation's verified Runtime processes..."
-    if [[ -n "$recorded" && "$recorded" != "$binary" ]]; then
-        installer_runtime_control "$data_dir" "$recorded" true \
-            || die "Close this installation's Runtime and retry; nothing was removed"
-    fi
-    installer_runtime_control "$data_dir" "$binary" true \
-        || die "Close this installation's Runtime and retry; nothing was removed"
     if [[ "$remove_data" == true ]]; then
         warn "Deleting $(display_path "$data_dir"): your identity, wallets, recovery material and files"
         warn "Only your Recovery Kit can restore this identity afterwards"
     fi
+    # The writer locks are held while this runs; see uninstall_files.
+    local stop_script
+    stop_script="$(declare -f info home_service_definition home_service_owned stop_home_service installer_runtime_control)
+$(cat <<'STOP_RUNTIME'
+    stop_home_service "$1" || exit 1
+    info "Stopping this installation's verified Runtime processes..."
+    if [[ -n "$2" && "$2" != "$1" ]]; then
+        installer_runtime_control "$3" "$2" true || exit 1
+    fi
+    installer_runtime_control "$3" "$1" true
+STOP_RUNTIME
+)"
     uninstall_files remove "$install_dir" "$data_dir" "$remove_data" \
+        "$BASH" -c "$stop_script" uninstall-stop "$binary" "$recorded" "$data_dir" \
         || die "Uninstall did not finish; run it again after fixing the reason above"
-    remove_home_service
+    remove_home_service "$binary"
     ok "Removed the Runtime and its components"
     if [[ "$remove_data" == true ]]; then
         ok "Deleted the data directory"
@@ -1576,6 +1612,11 @@ PY
 
 # The writer refuses an older release, another channel, a pending Home
 # update and a concurrent writer before this installer stops Runtime.
+# The Runtime directory must be a real directory inside the data directory; the
+# writer would otherwise follow a link to somewhere else.
+if [[ -L "${DATA_DIR}/bin" ]] || { [[ -e "${DATA_DIR}/bin" ]] && [[ ! -d "${DATA_DIR}/bin" ]]; }; then
+    die_exact "$(printf '%q' "${DATA_DIR}/bin") is a link or a file, not the Runtime directory; move it aside, then run the installer again"
+fi
 (umask 077; mkdir -p "${DATA_DIR}/bin")
 INSTALL_RELEASE=("${TMP_INSTALL_BIN}" install-release --data-dir "$DATA_DIR"
     --binary "$RUNTIME_BIN" --link "${INSTALL_DIR}/elastos"
@@ -1584,7 +1625,7 @@ INSTALL_RELEASE=("${TMP_INSTALL_BIN}" install-release --data-dir "$DATA_DIR"
 step 4 "Install"
 "${INSTALL_RELEASE[@]}" --check || die "This installation was not changed"
 
-stop_home_service
+stop_home_service "$RUNTIME_BIN"
 info "Stopping verified Runtime processes for this installation so the new version can be installed..."
 # An installation from before 0.8 runs its Runtime from the elastos command path.
 RECORDED_BIN="$(recorded_runtime "$DATA_DIR")"

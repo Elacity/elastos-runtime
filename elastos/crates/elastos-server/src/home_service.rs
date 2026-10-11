@@ -32,8 +32,15 @@ pub fn service_mode() -> bool {
 /// `elastos home --browser` starts it again.
 pub fn start_refused_by_pending_install() -> bool {
     std::env::current_exe().is_ok_and(|binary| {
-        crate::install_transaction::InstallTransaction::has_pending_recovery(&binary)
+        initial_start_refused(crate::update_controller::is_controller_host(), &binary)
     })
+}
+
+/// Only the service's own launcher steps aside. A Home that the update controller
+/// starts during an update or recovery runs while the journal exists and goes
+/// through the controller's journal authorization instead.
+fn initial_start_refused(controller_host: bool, binary: &Path) -> bool {
+    !controller_host && crate::install_transaction::InstallTransaction::has_pending_recovery(binary)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,6 +356,44 @@ impl<'a> Service<'a> {
         })
     }
 
+    /// The service manager has loaded a unit or agent under this name that runs
+    /// another installation's Runtime (another data folder of this account).
+    pub fn loaded_elsewhere(&self) -> bool {
+        let binary = self.spec.binary().display().to_string();
+        let target = launchd_target();
+        let (program, args): (&str, Vec<&OsStr>) = match self.spec.platform {
+            Platform::Linux => (
+                "systemctl",
+                vec![
+                    OsStr::new("--user"),
+                    OsStr::new("show"),
+                    OsStr::new("--property=LoadState,ExecStart"),
+                    OsStr::new(SYSTEMD_UNIT),
+                ],
+            ),
+            Platform::MacOs => ("launchctl", vec![OsStr::new("print"), OsStr::new(&target)]),
+        };
+        let Ok(output) = run(self.manager, program, &args) else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let names_a_program = match self.spec.platform {
+            Platform::Linux => text.lines().any(|line| line == "LoadState=loaded"),
+            Platform::MacOs => text
+                .lines()
+                .any(|line| line.trim().starts_with("program = ")),
+        };
+        names_a_program && !text.contains(&binary)
+    }
+
+    /// This installation owns the definition and the manager's loaded copy of it.
+    pub fn owned(&self) -> bool {
+        self.installed() && !self.loaded_elsewhere()
+    }
+
     pub fn state(&self) -> Result<State> {
         Ok(self.observe()?.0)
     }
@@ -435,7 +480,7 @@ impl<'a> Service<'a> {
     }
 
     pub fn running(&self) -> bool {
-        self.installed() && matches!(self.state(), Ok(State::Running))
+        self.owned() && matches!(self.state(), Ok(State::Running))
     }
 
     fn write_definition(&self) -> Result<()> {
@@ -535,8 +580,17 @@ impl<'a> Service<'a> {
     }
 
     /// Writes the definition, registers it with the user's service manager and
-    /// starts Home. On any failure the definition is removed again.
+    /// starts Home. On any failure the definition is removed again. A service of
+    /// another data folder of this account is refused and left untouched.
     pub fn install(&self) -> Result<()> {
+        let definition = self.spec.definition();
+        let foreign_file = fs::symlink_metadata(&definition).is_ok() && !self.installed();
+        if foreign_file || self.loaded_elsewhere() {
+            bail!(
+                "{} runs another ElastOS data folder's Home; uninstall that installation first",
+                definition.display()
+            );
+        }
         let result = self.write_definition().and_then(|()| self.register());
         if let Err(error) = result {
             let _ = self.remove();
@@ -733,8 +787,39 @@ pub struct UpdatePause {
     spec: Spec,
 }
 
+/// What a CLI update or recovery does with this data directory's service.
+#[derive(Debug, PartialEq, Eq)]
+enum PausePlan {
+    Leave,
+    StopThenStart,
+    /// The service stepped aside for a pending journal; start it once recovered.
+    StartAfter,
+}
+
+fn pause_plan(installed: bool, state: &State, pending: bool) -> PausePlan {
+    match (installed, state) {
+        (false, _) => PausePlan::Leave,
+        (true, State::Running) => PausePlan::StopThenStart,
+        (true, _) if pending => PausePlan::StartAfter,
+        _ => PausePlan::Leave,
+    }
+}
+
 impl UpdatePause {
-    pub fn begin(data_dir: &Path) -> Result<Option<Self>> {
+    /// Stops this installation's running service, or takes over the restart of a
+    /// service that stopped for the pending journal at `binary`. Dropping the
+    /// guard starts it, so declare it before the writer it outlives.
+    pub fn begin(data_dir: &Path, binary: &Path) -> Result<Option<Self>> {
+        Self::plan(data_dir, binary, true)
+    }
+
+    /// Recovery never stops a running Home (its controller may own the journal);
+    /// it only restarts a service that stepped aside for the journal.
+    pub fn after_recovery(data_dir: &Path, binary: &Path) -> Result<Option<Self>> {
+        Self::plan(data_dir, binary, false)
+    }
+
+    fn plan(data_dir: &Path, binary: &Path, stop_running: bool) -> Result<Option<Self>> {
         if service_mode() {
             return Ok(None);
         }
@@ -743,11 +828,22 @@ impl UpdatePause {
         };
         let spec = Spec::current(platform, data_dir)?;
         let service = Service::new(spec.clone(), &SystemManager);
-        if !service.running() {
-            return Ok(None);
+        let installed = service.owned();
+        let state = if installed {
+            service.state()?
+        } else {
+            State::Stopped
+        };
+        let pending = crate::install_transaction::InstallTransaction::has_pending_recovery(binary);
+        match pause_plan(installed, &state, pending) {
+            PausePlan::Leave => return Ok(None),
+            PausePlan::StopThenStart if !stop_running => return Ok(None),
+            PausePlan::StopThenStart => {
+                println!("  Stopping Home for the update...");
+                service.stop().context("stop Home before the update")?;
+            }
+            PausePlan::StartAfter => {}
         }
-        println!("  Stopping Home for the update...");
-        service.stop().context("stop Home before the update")?;
         Ok(Some(Self { spec }))
     }
 }
@@ -799,13 +895,13 @@ pub async fn run_service_command(command: ServiceCommand) -> Result<()> {
             }
         }
         ServiceCommand::Stop => {
-            if service.installed() {
+            if service.owned() {
                 service.stop()?;
             }
             println!("Home is stopped. Open it again with: elastos home --browser");
         }
         ServiceCommand::Status => {
-            if !service.installed() {
+            if !service.owned() {
                 println!("Home is not installed as a background service.");
             } else if let Some(url) = live_home_url(&data_dir).await {
                 println!("Home runs in the background: {url}");
@@ -913,7 +1009,7 @@ pub async fn running_home_url(data_dir: &Path) -> Result<Option<String>> {
         return Ok(None);
     };
     let service = Service::new(Spec::current(platform, data_dir)?, &SystemManager);
-    if !service.installed() {
+    if !service.owned() {
         return Ok(None);
     }
     let started = async {

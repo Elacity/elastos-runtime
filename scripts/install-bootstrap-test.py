@@ -520,6 +520,10 @@ class InstallerSandbox:
         self.respond("release-head.json", head)
         self.respond("release.json", release)
         mocks = self.root / "mocks"
+        # Service managers only record calls; a developer's real Home is never touched.
+        for manager in ("systemctl", "launchctl"):
+            (mocks / manager).write_text(
+                '#!/bin/sh\nprintf "%s %s\\n" "$(basename "$0")" "$*" >> "$FIXTURES/service-calls"\n')
         (mocks / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo "$MOCK_SYSTEM";; -m) echo "$MOCK_MACHINE";; esac\n')
         # Fixture URLs are https://test.invalid, so every request must carry the
         # HTTPS-only flags; a responses/<name>.redirect file names a redirect target.
@@ -1358,6 +1362,29 @@ class UninstallTests(unittest.TestCase):
             self.assertEqual(self.files(sandbox),
                              {"xdg-data/elastos/" + name: data for name, data in self.DATA.items()})
 
+    def test_uninstall_removes_only_this_data_folders_service(self):
+        did, head, release = installable_fixture()
+        for owner in ("this", "another"):
+            with self.subTest(owner=owner), InstallerSandbox(head, release, did) as sandbox:
+                self.installed(sandbox)
+                runtime = sandbox.runtime if owner == "this" else sandbox.home / "other-data/elastos/bin/elastos"
+                unit = sandbox.home / ".config/systemd/user/elastos-home.service"
+                unit.parent.mkdir(parents=True)
+                unit.write_text(f'[Service]\nExecStart="{runtime}" home --browser\n')
+                result, _ = sandbox.run("--uninstall")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                calls = (sandbox.root / "service-calls").read_text() if (sandbox.root / "service-calls").exists() else ""
+                if owner == "this":
+                    self.assertFalse(unit.exists())
+                    self.assertIn("systemctl --user stop elastos-home.service", calls)
+                    self.assertIn("systemctl --user disable --now elastos-home.service", calls)
+                else:
+                    # Another data folder of this account keeps its running Home.
+                    self.assertTrue(unit.exists())
+                    self.assertNotIn(" stop ", calls)
+                    self.assertNotIn("disable", calls)
+                    self.assertIn("belongs to another ElastOS data folder", result.stdout)
+
     def test_linked_data_root_or_release_entry_refuses_before_stopping_anything(self):
         did, head, release = installable_fixture()
         entries = {"data root": "", "release entry": "bin", "release entry parent": "browser-vm"}
@@ -1793,6 +1820,18 @@ class NativeProcessTests(unittest.TestCase):
         self.assertFalse(self.binary.exists())
         self.assertFalse((self.data / "components.json").exists())
         self.assertEqual((self.data / "identity/device.key").read_bytes(), b"device identity\n")
+
+    def test_uninstall_refused_by_a_running_writer_leaves_home_running(self):
+        # An update holds the writer lock: the uninstall stops nothing.
+        with open(self.binary.parent / ".elastos.install.lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            result = self.uninstall("false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("an install or update is running", result.stderr)
+        self.assertNotIn("Stopping this installation's verified Runtime processes", result.stdout)
+        self.assertIsNone(self.child.poll())
+        self.assertTrue(self.coords.exists())
+        self.assertTrue((self.data / "components.json").exists())
 
     def test_uninstall_with_a_foreign_record_stops_and_removes_nothing(self):
         foreign = subprocess.Popen(["/bin/sleep", "20"])

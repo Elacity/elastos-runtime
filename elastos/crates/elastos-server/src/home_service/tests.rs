@@ -262,3 +262,84 @@ fn linger_is_requested_once_and_a_refusal_is_one_sentence() {
     let notice = service.ensure_linger().unwrap();
     assert!(notice.contains("while you are logged in") && notice.contains("enable-linger"));
 }
+
+#[test]
+fn only_the_service_launcher_steps_aside_for_a_pending_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("bin/elastos");
+    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    assert!(!initial_start_refused(false, &binary));
+    fs::write(root.path().join("bin/.elastos.update-journal.json"), b"{}").unwrap();
+    // The service's own launch exits cleanly instead of restart-looping ...
+    assert!(initial_start_refused(false, &binary));
+    // ... while a Home the controller starts for an update or recovery proceeds
+    // to the controller's journal authorization.
+    assert!(!initial_start_refused(true, &binary));
+}
+
+#[test]
+fn updates_stop_a_running_service_and_recovery_restarts_one_that_stepped_aside() {
+    let failed = State::Failed(String::new());
+    // CLI update path: a running service is stopped and started afterwards.
+    assert_eq!(
+        pause_plan(true, &State::Running, false),
+        PausePlan::StopThenStart
+    );
+    assert_eq!(
+        pause_plan(true, &State::Running, true),
+        PausePlan::StopThenStart
+    );
+    // Recovery path: the service exited for the journal; its restart is kept.
+    assert_eq!(
+        pause_plan(true, &State::Stopped, true),
+        PausePlan::StartAfter
+    );
+    assert_eq!(pause_plan(true, &failed, true), PausePlan::StartAfter);
+    // A service the user stopped, or another installation's, is left alone.
+    assert_eq!(pause_plan(true, &State::Stopped, false), PausePlan::Leave);
+    assert_eq!(pause_plan(false, &State::Running, true), PausePlan::Leave);
+}
+
+#[test]
+fn a_second_data_folder_never_replaces_or_removes_the_first_homes_service() {
+    let root = tempfile::tempdir().unwrap();
+    for platform in [Platform::Linux, Platform::MacOs] {
+        let manager = FakeManager::new(vec![]);
+        let first = Service::new(spec(platform, root.path(), "first/elastos"), &manager);
+        first.write_definition().unwrap();
+        let before = fs::read(first.spec.definition()).unwrap();
+        let second = Service::new(spec(platform, root.path(), "second/elastos"), &manager);
+        let error = second.install().unwrap_err();
+        assert!(
+            error.to_string().contains("another ElastOS data folder"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(first.spec.definition()).unwrap(), before);
+        assert!(manager
+            .calls
+            .borrow()
+            .iter()
+            .all(|call| !call.contains("stop")
+                && !call.contains("disable")
+                && !call.contains("bootout")
+                && !call.contains("restart")));
+        fs::remove_file(first.spec.definition()).unwrap();
+    }
+}
+
+#[test]
+fn a_loaded_unit_of_another_data_folder_is_not_this_homes_service() {
+    let root = tempfile::tempdir().unwrap();
+    let other = "LoadState=loaded\nExecStart={ path=/other/elastos/bin/elastos ; argv[]=/other/elastos/bin/elastos home --browser }\n";
+    let manager = FakeManager::new(vec![("systemctl", "show", 0, other)]);
+    let service = Service::new(spec(Platform::Linux, root.path(), "mine/elastos"), &manager);
+    service.write_definition().unwrap();
+    assert!(service.installed() && service.loaded_elsewhere() && !service.owned());
+    assert!(service.install().is_err());
+    assert!(service.spec.definition().exists());
+
+    let mac = "\tprogram = /other/elastos/bin/elastos\n\tstate = running\n";
+    let manager = FakeManager::new(vec![("launchctl", "print", 0, mac)]);
+    let service = Service::new(spec(Platform::MacOs, root.path(), "mine/elastos"), &manager);
+    assert!(service.loaded_elsewhere());
+}

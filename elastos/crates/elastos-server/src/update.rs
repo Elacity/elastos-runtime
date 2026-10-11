@@ -441,6 +441,8 @@ pub fn recover_pending_installation(data_dir: &Path) -> anyhow::Result<()> {
         PathBuf::from(&source.install_path)
     };
     if InstallTransaction::has_pending_recovery(&binary) {
+        // Home's service stepped aside for this journal; start it once recovered.
+        let _home_service = crate::home_service::UpdatePause::after_recovery(data_dir, &binary)?;
         let transaction = InstallTransaction::acquire(data_dir, &binary)?;
         let _offline = crate::host_lock::acquire_host_process_lock(
             transaction.data_dir(),
@@ -486,6 +488,7 @@ pub fn install_release(
             "{} is a directory, not the elastos command; move it aside, then run the installer again; this installation was not changed.",
             link.display()
         );
+        require_runtime_directory(data_dir, binary)?;
     }
     // A refused path must not gain an installation lock, so compare before taking it.
     let legacy = match installed_source(data_dir) {
@@ -540,6 +543,10 @@ pub fn install_release(
     if check {
         return Ok(());
     }
+    if link.is_some() {
+        // Checked again under the writer lock, right before the first write.
+        require_runtime_directory(data_dir, binary)?;
+    }
     let _offline =
         crate::host_lock::acquire_host_process_lock(transaction.data_dir(), "update", "offline")?;
     transaction.prepare(&[
@@ -560,6 +567,26 @@ pub fn install_release(
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// The installer's Runtime directory is a real directory directly inside the data
+/// directory; a link there would make the writer install somewhere else.
+fn require_runtime_directory(data_dir: &Path, binary: &Path) -> anyhow::Result<()> {
+    let parent = binary.parent().context("Runtime directory missing")?;
+    let real = std::fs::symlink_metadata(parent)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+    let inside = parent.file_name() == Some(std::ffi::OsStr::new("bin"))
+        && parent
+            .parent()
+            .and_then(|root| std::fs::canonicalize(root).ok())
+            .is_some_and(|root| std::fs::canonicalize(data_dir).is_ok_and(|data| data == root));
+    anyhow::ensure!(
+        real && inside,
+        "{} must be a real directory inside {}; move it aside, then run the installer again; this installation was not changed.",
+        parent.display(),
+        data_dir.display()
+    );
     Ok(())
 }
 
@@ -1378,7 +1405,7 @@ async fn run_upgrade_with_restart(
         };
         // Home under its service stops before the swap and starts again when this
         // returns, after the transaction below releases the installation lock.
-        let _home_service = crate::home_service::UpdatePause::begin(data_dir)?;
+        let _home_service = crate::home_service::UpdatePause::begin(data_dir, &bin_path)?;
         let transaction = InstallTransaction::acquire(data_dir, &bin_path)?;
         transaction.recover()?;
         anyhow::ensure!(
@@ -4482,6 +4509,35 @@ mod tests {
             let later = candidate(candidates.path(), &binary, "0.7.3", 7);
             install(&data, &binary, &later).unwrap();
             assert_eq!(std::fs::read(&binary).unwrap(), runtime("0.7.3"));
+        }
+
+        #[tokio::test]
+        async fn installer_refuses_a_runtime_directory_linked_outside_the_data_folder() {
+            let (fixture, data, legacy) = migrated().await;
+            let outside = fixture.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("sentinel"), b"outside stays\n").unwrap();
+            std::os::unix::fs::symlink(&outside, data.join("bin")).unwrap();
+            let binary = data.join("bin/elastos");
+            let candidates = tempfile::tempdir().unwrap();
+            let next = candidate(candidates.path(), &binary, "0.7.2", 7);
+            let paths = next.each_ref().map(PathBuf::as_path);
+            let sources = std::fs::read(data.join("sources.json")).unwrap();
+            for check in [true, false] {
+                let error =
+                    install_release(&data, &binary, Some(&legacy), paths, check).unwrap_err();
+                assert!(
+                    error.to_string().contains("must be a real directory"),
+                    "{error:#}"
+                );
+                assert_eq!(std::fs::read(data.join("sources.json")).unwrap(), sources);
+                assert_eq!(
+                    std::fs::read_dir(&outside).unwrap().count(),
+                    1,
+                    "nothing is written through the link"
+                );
+                assert_eq!(std::fs::read(&legacy).unwrap(), runtime("0.7.1"));
+            }
         }
 
         #[tokio::test]
