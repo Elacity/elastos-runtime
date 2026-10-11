@@ -202,10 +202,7 @@ mod tests {
             .unwrap_err();
             if force {
                 // Past the version gate, the only failure left is the unreachable source.
-                assert!(
-                    error.to_string().contains("UDP port 4433"),
-                    "{error:#}"
-                );
+                assert!(error.to_string().contains("UDP port 4433"), "{error:#}");
             } else {
                 assert!(
                     error.to_string().contains("elastos update --force"),
