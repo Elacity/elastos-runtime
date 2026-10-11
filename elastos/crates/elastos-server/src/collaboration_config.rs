@@ -282,11 +282,7 @@ fn read_authority_key(path: &Path) -> anyhow::Result<SigningKey> {
     Ok(SigningKey::from_bytes(&key))
 }
 
-pub(crate) fn read_owner_only_file(
-    path: &Path,
-    max_bytes: usize,
-    label: &str,
-) -> anyhow::Result<Vec<u8>> {
+pub fn read_owner_only_file(path: &Path, max_bytes: usize, label: &str) -> anyhow::Result<Vec<u8>> {
     validate_owner_only_parent(path)?;
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("failed to inspect {label}"))?;

@@ -533,6 +533,7 @@ async fn import_publication_file(provider: &Path, file: &Path) -> anyhow::Result
 #[cfg(test)]
 async fn import_publication_raw_block(
     provider: &Path,
+    data_dir: &Path,
     name: &str,
     bytes: Vec<u8>,
 ) -> anyhow::Result<String> {
@@ -541,11 +542,47 @@ async fn import_publication_raw_block(
         "Raw publication block exceeds its bounded import size"
     );
     let status = publication_provider_request(provider, serde_json::json!({"op":"status"})).await?;
-    publication_raw_block_put(status, name, bytes).await
+    publication_raw_block_put(status, data_dir, name, bytes).await
+}
+
+/// The Authorization header for the Kubo API that `base` names. ipfs-provider
+/// keeps the API secret in the owner-only `ipfs-coords.json` of its data
+/// directory; it is read there and never travels over the provider wire, so
+/// provider callers do not receive raw Kubo authority.
+fn kubo_api_authorization(
+    data_dir: &Path,
+    base: &elastos_server::local_http::LoopbackHttpBaseUrl,
+) -> anyhow::Result<String> {
+    #[derive(serde::Deserialize)]
+    struct KuboCoordinates {
+        api_port: u16,
+        api_secret: String,
+    }
+    let bytes = elastos_server::collaboration_config::read_owner_only_file(
+        &data_dir.join("ipfs-coords.json"),
+        64 * 1024,
+        "Kubo API coordinates",
+    )?;
+    let coordinates: KuboCoordinates =
+        serde_json::from_slice(&bytes).context("Kubo API coordinates are invalid")?;
+    anyhow::ensure!(
+        coordinates.api_secret.len() == 64
+            && coordinates
+                .api_secret
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+        "Kubo API coordinates lack a valid API secret"
+    );
+    anyhow::ensure!(
+        base.join("/")?.port_or_known_default() == Some(coordinates.api_port),
+        "Kubo API coordinates name another endpoint"
+    );
+    Ok(format!("Bearer {}", coordinates.api_secret))
 }
 
 async fn publication_raw_block_put(
     status: serde_json::Value,
+    data_dir: &Path,
     name: &str,
     bytes: Vec<u8>,
 ) -> anyhow::Result<String> {
@@ -557,6 +594,7 @@ async fn publication_raw_block_put(
         .as_str()
         .context("Qualified Kubo API endpoint missing")?;
     let base = elastos_server::local_http::LoopbackHttpBaseUrl::parse(endpoint)?;
+    let authorization = kubo_api_authorization(data_dir, &base)?;
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(std::time::Duration::from_secs(60))
@@ -565,6 +603,7 @@ async fn publication_raw_block_put(
     let part = reqwest::multipart::Part::bytes(bytes).file_name(name.to_owned());
     let mut response = client
         .post(base.join("/api/v0/block/put")?)
+        .header(reqwest::header::AUTHORIZATION, authorization)
         .query(&[
             ("cid-codec", "raw"),
             ("mhtype", "sha2-256"),
@@ -636,6 +675,7 @@ struct PublicationProvider {
     child: tokio::process::Child,
     input: tokio::process::ChildStdin,
     output: tokio::io::BufReader<tokio::process::ChildStdout>,
+    data_dir: PathBuf,
 }
 
 impl PublicationProvider {
@@ -659,6 +699,7 @@ impl PublicationProvider {
             child,
             input,
             output,
+            data_dir: data_dir.to_path_buf(),
         };
         if let Err(error) = session
             .request(serde_json::json!({"op":"init","config":{}}))
@@ -709,7 +750,7 @@ impl PublicationProvider {
 
     async fn import_raw_block(&mut self, name: &str, bytes: Vec<u8>) -> anyhow::Result<String> {
         let status = self.request(serde_json::json!({"op":"status"})).await?;
-        publication_raw_block_put(status, name, bytes).await
+        publication_raw_block_put(status, &self.data_dir, name, bytes).await
     }
 
     async fn check_capacity(
@@ -726,6 +767,7 @@ impl PublicationProvider {
             .as_str()
             .context("Model repository API endpoint missing")?;
         let base = elastos_server::local_http::LoopbackHttpBaseUrl::parse(endpoint)?;
+        let authorization = kubo_api_authorization(data_dir, &base)?;
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_secs(10))
@@ -733,6 +775,7 @@ impl PublicationProvider {
             .build()?;
         let mut response = client
             .post(base.join("/api/v0/repo/stat")?)
+            .header(reqwest::header::AUTHORIZATION, authorization)
             .send()
             .await?
             .error_for_status()?;
@@ -2433,9 +2476,15 @@ import base64, hashlib, http.server, json, os, pathlib, sys, threading
 cid = 'b' + base64.b32encode(b'\x01\x55\x12\x20' + hashlib.sha256(b'public model provider fixture').digest()).decode().lower().rstrip('=')
 with open(__file__ + '.starts', 'a') as sink: sink.write(str(os.getpid()) + '\n')
 repo = pathlib.Path(__file__).parent / 'data' / 'ipfs-repo'
+secret = hashlib.sha256(b'publication fixture api secret').hexdigest()
 class API(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_POST(self):
+        if self.headers.get('Authorization') != 'Bearer ' + secret:
+            self.send_response(403)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
         path = str(repo) if __MODE__ != 'wrong-repo' else str(repo.parent / 'other-repo')
         value = {'RepoPath':path, 'RepoSize':0} if self.path == '/api/v0/repo/stat' else {'Key':cid}
         data = json.dumps(value).encode()
@@ -2445,6 +2494,10 @@ class API(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 server = http.server.HTTPServer(('127.0.0.1', 0), API)
 endpoint = 'http://127.0.0.1:' + str(server.server_port)
+coords = os.open(str(repo.parent / 'ipfs-coords.json'), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+os.write(coords, json.dumps({'kubo_pid':os.getpid(), 'api_port':server.server_port, 'gateway_port':0,
+    'started_at':1, 'last_used':1, 'api_secret':secret}).encode())
+os.close(coords)
 pathlib.Path(__file__ + '.api').write_text(endpoint + '/')
 worker = threading.Thread(target=server.serve_forever, daemon=True)
 worker.start()
@@ -2732,6 +2785,7 @@ finally:
                 std::time::Duration::from_secs(5),
                 super::import_publication_raw_block(
                     &provider,
+                    temp.path(),
                     "model-catalog.json",
                     b"public catalog".to_vec(),
                 ),
@@ -2758,6 +2812,7 @@ finally:
         let (endpoint, server) =
             raw_import_api_fixture(serde_json::json!({"Key":expected}), false).await;
         let temp = tempfile::tempdir().unwrap();
+        write_kubo_coordinates(temp.path(), &endpoint, FIXTURE_KUBO_SECRET, 0o600);
         let provider = import_provider_fixture(
             temp.path(),
             serde_json::json!({"status":"ok","data":{"api_endpoint":endpoint}}),
@@ -2765,7 +2820,12 @@ finally:
         );
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            super::import_publication_raw_block(&provider, "model-catalog.json", catalog.to_vec()),
+            super::import_publication_raw_block(
+                &provider,
+                temp.path(),
+                "model-catalog.json",
+                catalog.to_vec(),
+            ),
         )
         .await
         .unwrap();
@@ -2805,6 +2865,10 @@ finally:
                 name.eq_ignore_ascii_case("content-type").then_some(value)
             })
             .unwrap();
+        assert!(headers.lines().any(|line| line
+            .to_ascii_lowercase()
+            .starts_with("authorization: bearer ")
+            && line.ends_with(FIXTURE_KUBO_SECRET)));
         let boundary = content_type
             .split_once("boundary=")
             .unwrap()
@@ -2840,6 +2904,7 @@ finally:
         ] {
             let (endpoint, server) = raw_import_api_fixture(receipt.clone(), false).await;
             let temp = tempfile::tempdir().unwrap();
+            write_kubo_coordinates(temp.path(), &endpoint, FIXTURE_KUBO_SECRET, 0o600);
             let provider = import_provider_fixture(
                 temp.path(),
                 serde_json::json!({"status":"ok","data":{"api_endpoint":endpoint}}),
@@ -2849,6 +2914,7 @@ finally:
                 std::time::Duration::from_secs(5),
                 super::import_publication_raw_block(
                     &provider,
+                    temp.path(),
                     "model-catalog.json",
                     bytes.to_vec(),
                 ),
@@ -2873,6 +2939,7 @@ finally:
         let (endpoint, server) =
             raw_import_api_fixture(serde_json::json!({"redirect":"required"}), true).await;
         let temp = tempfile::tempdir().unwrap();
+        write_kubo_coordinates(temp.path(), &endpoint, FIXTURE_KUBO_SECRET, 0o600);
         let provider = import_provider_fixture(
             temp.path(),
             serde_json::json!({"status":"ok","data":{"api_endpoint":endpoint}}),
@@ -2882,6 +2949,7 @@ finally:
             std::time::Duration::from_secs(5),
             super::import_publication_raw_block(
                 &provider,
+                temp.path(),
                 "model-catalog.json",
                 b"public catalog".to_vec(),
             ),
@@ -2891,6 +2959,71 @@ finally:
         let (_, followed) = finish_raw_import_api(server).await;
         assert!(result.is_err());
         assert!(!followed, "raw import followed a loopback redirect");
+    }
+
+    const FIXTURE_KUBO_SECRET: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[cfg(unix)]
+    fn write_kubo_coordinates(data_dir: &Path, endpoint: &str, secret: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = data_dir.join("ipfs-coords.json");
+        let port = url::Url::parse(endpoint).unwrap().port().unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"kubo_pid":1,"api_port":port,
+                "gateway_port":0,"started_at":1,"last_used":1,"api_secret":secret}))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_publication_import_needs_private_coordinates_for_the_reported_api() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let other = "http://127.0.0.1:1";
+        for (coordinates, expected) in [
+            (None, "Kubo API coordinates"),
+            (
+                Some((endpoint.as_str(), FIXTURE_KUBO_SECRET, 0o644)),
+                "owner-only",
+            ),
+            (
+                Some((other, FIXTURE_KUBO_SECRET, 0o600)),
+                "another endpoint",
+            ),
+            (
+                Some((endpoint.as_str(), "short", 0o600)),
+                "valid API secret",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            if let Some((api, secret, mode)) = coordinates {
+                write_kubo_coordinates(temp.path(), api, secret, mode);
+            }
+            let provider = import_provider_fixture(
+                temp.path(),
+                serde_json::json!({"status":"ok","data":{"api_endpoint":endpoint}}),
+                0,
+            );
+            let error = super::import_publication_raw_block(
+                &provider,
+                temp.path(),
+                "model-catalog.json",
+                b"public catalog".to_vec(),
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "the Kubo API was contacted without its secret"
+            );
+        }
     }
 
     #[test]
