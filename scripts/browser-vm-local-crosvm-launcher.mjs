@@ -37,10 +37,11 @@ const children = new Set();
 const servers = new Set();
 const cleanupFns = [];
 const privateSessionInputs = new Map();
-let exiting = false;
-let guestControlSocket = null;
-let launchSucceeded = false;
-let profileShutdownCommitted = false;
+const lifecycle = {
+  children, servers, cleanupFns, privateSessionInputs,
+  exiting: false, guestControlSocket: null, launchSucceeded: false,
+  profileShutdownCommitted: false, deferredRootfsPoolRefill: null, sessionDir: null,
+};
 const launchedAtMs = Date.now();
 
 function logPhase(message) {
@@ -438,7 +439,7 @@ async function acquireLinuxNetwork(scriptPath) {
     child.once("error", reject);
     child.once("exit", () => {
       if (!settled) reject(new Error(errors.trim() || "Browser network lease ended before allocation"));
-      else if (!exiting) cleanupAndExit(null);
+      else if (!lifecycle.exiting) cleanupAndExit(null);
     });
   });
 }
@@ -569,14 +570,14 @@ function writePrivateSessionInput(file, text) {
   } finally { fs.closeSync(fd); }
 }
 
-function removePrivateSessionInputs() {
-  for (const [file, owned] of privateSessionInputs) {
+function removePrivateSessionInputs(inputs = privateSessionInputs) {
+  for (const [file, owned] of inputs) {
     try {
       const stat = fs.lstatSync(file);
       if (stat.isFile() && stat.dev === owned.dev && stat.ino === owned.ino) fs.unlinkSync(file);
     } catch (error) { if (error.code !== "ENOENT") logPhase("private session input cleanup failed"); }
   }
-  privateSessionInputs.clear();
+  inputs.clear();
 }
 
 async function startSessionTurnServer({ network, sessionDir, turn }) {
@@ -697,8 +698,8 @@ function readyRootfsFiles(poolDir, imageSha256) {
   }
 }
 
-function rootfsPoolRefillScript(dataDir, scriptPath) {
-  const configured = process.env[ROOTFS_POOL_REFILL_SCRIPT_ENV];
+function rootfsPoolRefillScript(dataDir, scriptPath, env = process.env) {
+  const configured = env[ROOTFS_POOL_REFILL_SCRIPT_ENV];
   const candidates = [
     configured,
     path.join(dataDir, "scripts/browser-vm-prepare-rootfs-pool.mjs"),
@@ -725,17 +726,17 @@ function availableBytesForPath(targetPath) {
   return Number(stats.bavail) * Number(stats.bsize);
 }
 
-function refillMinFreeBytes() {
-  const configured = Number(process.env[ROOTFS_POOL_REFILL_MIN_FREE_MIB_ENV] || "4096");
+function refillMinFreeBytes(env = process.env) {
+  const configured = Number(env[ROOTFS_POOL_REFILL_MIN_FREE_MIB_ENV] || "4096");
   if (!Number.isFinite(configured) || configured < 0) {
     return 4096 * 1024 * 1024;
   }
   return configured * 1024 * 1024;
 }
 
-async function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, imageSha256, sessionDir, scriptPath, timeoutMs }) {
+async function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, imageSha256, sessionDir, scriptPath, timeoutMs, env = process.env }) {
   if (timeoutMs <= 0) return;
-  const targetCount = Number(process.env[ROOTFS_POOL_REFILL_COUNT_ENV] || "2");
+  const targetCount = Number(env[ROOTFS_POOL_REFILL_COUNT_ENV] || "2");
   if (!Number.isInteger(targetCount) || targetCount < 1) {
     return;
   }
@@ -743,13 +744,13 @@ async function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, imageSh
   if (missingCount <= 0) {
     return;
   }
-  const refillScript = rootfsPoolRefillScript(dataDir, scriptPath);
+  const refillScript = rootfsPoolRefillScript(dataDir, scriptPath, env);
   if (!refillScript) {
     logPhase("prepared rootfs pool refill skipped: browser-vm-prepare-rootfs-pool.mjs not found");
     return;
   }
   const availableBytes = availableBytesForPath(poolDir);
-  const requiredBytes = (fs.statSync(rootfs).size * missingCount) + refillMinFreeBytes();
+  const requiredBytes = (fs.statSync(rootfs).size * missingCount) + refillMinFreeBytes(env);
   if (availableBytes !== null && availableBytes < requiredBytes) {
     logPhase(`prepared rootfs pool refill skipped: free space ${Math.floor(availableBytes / 1048576)}MiB below required ${Math.ceil(requiredBytes / 1048576)}MiB`);
     return;
@@ -769,7 +770,7 @@ async function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, imageSh
     String(targetCount),
   ], {
     stdio: ["pipe", logFd, logFd],
-    env: { ...process.env, ELASTOS_BROWSER_VM_DATA_DIR: dataDir, ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF: "1" },
+    env: { ...env, ELASTOS_BROWSER_VM_DATA_DIR: dataDir, ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF: "1" },
   });
   fs.closeSync(logFd);
   logPhase(`prepared rootfs pool refill started pid=${child.pid} target=${targetCount} log=${logPath}`);
@@ -1179,24 +1180,27 @@ function rewriteResult(result, launch, sessionDir, controlSocketPath) {
   };
 }
 
-let deferredRootfsPoolRefill = null;
-
-async function cleanupAndExit(signal = null) {
-  if (exiting) return;
-  exiting = true;
+async function cleanupAndExit(signal = null, owner = lifecycle, {
+  shutdownGuest = httpJsonUnix, log = logPhase, env = process.env,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  exit = (code) => process.exit(code),
+} = {}) {
+  const { children, servers, cleanupFns } = owner;
+  if (owner.exiting) return;
+  owner.exiting = true;
   const cleanupStartedAt = Date.now();
-  if (guestControlSocket && children.size > 0) {
+  if (owner.guestControlSocket && children.size > 0) {
     try {
-      const result = await httpJsonUnix(guestControlSocket, "/shutdown", {
+      const result = await shutdownGuest(owner.guestControlSocket, "/shutdown", {
         method: "POST", body: {},
-        timeoutMs: Number(process.env.ELASTOS_BROWSER_VM_GUEST_SHUTDOWN_TIMEOUT_MS || "25000"),
+        timeoutMs: Number(env.ELASTOS_BROWSER_VM_GUEST_SHUTDOWN_TIMEOUT_MS || "25000"),
       });
       if (result.ok !== true || result.profile_disk_flushed !== true || result.profile_disk_unmounted !== true) {
         throw new Error("guest profile disk flush was unproved");
       }
-      profileShutdownCommitted = true;
+      owner.profileShutdownCommitted = true;
     } catch (error) {
-      logPhase(`guest clean shutdown failed: ${error.message}`);
+      log(`guest clean shutdown failed: ${error.message}`);
     }
   }
   for (const { server, socketPath } of Array.from(servers)) {
@@ -1214,43 +1218,44 @@ async function cleanupAndExit(signal = null) {
       child.kill("SIGTERM");
     } catch {}
   }
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await sleep(500);
   await Promise.all(Array.from(children).map((child) => new Promise((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) return resolve();
     child.once("exit", resolve);
     try { child.kill("SIGKILL"); } catch { resolve(); }
   })));
-  removePrivateSessionInputs();
+  removePrivateSessionInputs(owner.privateSessionInputs);
   // VM teardown finishes before the refill starts. The launcher owns and waits
   // for this copy separately from the children that shutdown terminates.
-  if (deferredRootfsPoolRefill) {
-    const refill = deferredRootfsPoolRefill;
-    deferredRootfsPoolRefill = null;
+  if (owner.deferredRootfsPoolRefill) {
+    const refill = owner.deferredRootfsPoolRefill;
+    owner.deferredRootfsPoolRefill = null;
     try {
       // Reserve five seconds of the service grace for cancelling/reaping a
       // slow copy and removing its partial image.
       const timeoutMs = Math.min(
-        Number(process.env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_TIMEOUT_MS || "15000"),
-        Math.max(0, Number(process.env.ELASTOS_BROWSER_VM_LAUNCHER_SHUTDOWN_TIMEOUT_MS || "30000")
+        Number(env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_TIMEOUT_MS || "15000"),
+        Math.max(0, Number(env.ELASTOS_BROWSER_VM_LAUNCHER_SHUTDOWN_TIMEOUT_MS || "30000")
           - 5000 - (Date.now() - cleanupStartedAt)),
       );
-      await maybeRefillPreparedRootfsPool({ ...refill, timeoutMs });
+      await maybeRefillPreparedRootfsPool({ ...refill, timeoutMs, env });
     } catch (error) {
-      logPhase(`prepared rootfs pool refill failed: ${error.message}`);
+      log(`prepared rootfs pool refill failed: ${error.message}`);
     }
   }
-  if (globalThis.__elastosBrowserVmSessionDir) {
-    discardLaunchRootfs(path.join(globalThis.__elastosBrowserVmSessionDir, "rootfs.ext4"));
+  if (owner.sessionDir) {
+    discardLaunchRootfs(path.join(owner.sessionDir, "rootfs.ext4"));
   }
-  if (process.env[SESSION_KEEP_ENV] !== "1" && globalThis.__elastosBrowserVmSessionDir) {
+  if (env[SESSION_KEEP_ENV] !== "1" && owner.sessionDir) {
     try {
-      fs.rmSync(globalThis.__elastosBrowserVmSessionDir || "", { recursive: true, force: true });
+      // removal-ok: launcher session directory, after all owned VM children are reaped.
+      fs.rmSync(owner.sessionDir, { recursive: true, force: true });
     } catch {}
   }
   for (const cleanup of cleanupFns.reverse()) {
     try { cleanup(); } catch {}
   }
-  process.exit(launchSucceeded && profileShutdownCommitted ? 0 : 1);
+  exit(owner.launchSucceeded && owner.profileShutdownCommitted ? 0 : 1);
 }
 
 async function main() {
@@ -1262,7 +1267,7 @@ async function main() {
   validateAbsolutePath(root, ROOT_ENV);
   const suffix = sessionSuffix(launch.stream_id);
   const sessionDir = path.join(root, suffix);
-  globalThis.__elastosBrowserVmSessionDir = sessionDir;
+  lifecycle.sessionDir = sessionDir;
   fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
 
   const rootfs = process.env.ELASTOS_BROWSER_VM_ROOTFS || path.join(dataDir, "browser-vm/rootfs.ext4");
@@ -1286,7 +1291,7 @@ async function main() {
   const rootfsPrep = prepareLaunchRootfs({ rootfs, launchRootfs, dataDir, sessionDir, scriptPath });
   logPhase(`prepared rootfs via ${rootfsPrep.mode} in ${rootfsPrep.elapsed_ms}ms`);
   if (rootfsPrep.mode === "prepared_pool") {
-    deferredRootfsPoolRefill = {
+    lifecycle.deferredRootfsPoolRefill = {
       dataDir,
       poolDir: rootfsPrep.poolDir,
       rootfs,
@@ -1328,7 +1333,7 @@ async function main() {
       crosvmLog: vm.crosvmLog,
     });
     logPhase("guest control ready");
-    guestControlSocket = controlSocketPath;
+    lifecycle.guestControlSocket = controlSocketPath;
 
     logPhase("opening Browser page");
     let opened;
@@ -1349,7 +1354,7 @@ async function main() {
     }
     logPhase("Browser page open returned");
     const result = rewriteResult(opened, launch, sessionDir, controlSocketPath);
-    launchSucceeded = true;
+    lifecycle.launchSucceeded = true;
     process.stdout.write(`${JSON.stringify(result)}\n`);
 
     await new Promise((resolve) => {
@@ -1363,13 +1368,18 @@ async function main() {
   }
 }
 
-process.on("SIGTERM", () => cleanupAndExit("SIGTERM"));
-process.on("SIGINT", () => cleanupAndExit("SIGINT"));
-process.on("SIGHUP", () => cleanupAndExit("SIGHUP"));
+export { cleanupAndExit };
 
-main()
-  .then(() => cleanupAndExit(null))
-  .catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error));
-    cleanupAndExit(null);
-  });
+// Imports expose the same lifecycle implementation without starting a VM.
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.on("SIGTERM", () => cleanupAndExit("SIGTERM"));
+  process.on("SIGINT", () => cleanupAndExit("SIGINT"));
+  process.on("SIGHUP", () => cleanupAndExit("SIGHUP"));
+
+  main()
+    .then(() => cleanupAndExit(null))
+    .catch((error) => {
+      console.error(error instanceof Error ? error.message : String(error));
+      cleanupAndExit(null);
+    });
+}

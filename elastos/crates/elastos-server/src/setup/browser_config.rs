@@ -89,7 +89,7 @@ pub(super) fn local_vm_selected(data: &Path, platform: &str) -> anyhow::Result<b
     )
 }
 
-/// Home offers Browser on hosts with a selected local VM and usable virtualization.
+/// Home offers Browser for approved Mac Engines and qualified local Linux VMs.
 /// Image preparation remains on the ordinary Browser launch path.
 pub(super) fn home_browser_available(data: &Path, platform: &str) -> bool {
     home_browser_available_with_probe(
@@ -119,14 +119,21 @@ fn home_browser_available_with_probe(
     let Ok(Some(config)) = read_engine_selection(data, inline) else {
         return false;
     };
-    let launcher_name = "browser-vz-engine-supervisor";
     let selected = config["adapters"].as_array().is_some_and(|adapters| {
         adapters.iter().any(|adapter| {
+            let supervisor = &adapter["supervisor"];
+            let launcher = supervisor["env"]["ELASTOS_BROWSER_VM_CONTROL_LAUNCHER"]
+                .as_str()
+                .or_else(|| supervisor["program"].as_str());
             adapter["kind"] == "chromium_microvm"
-                && adapter["supervisor"]["env"]["ELASTOS_BROWSER_VM_CONTROL_LAUNCHER"]
-                    .as_str()
+                && launcher
                     .and_then(|launcher| Path::new(launcher).file_name())
-                    .is_some_and(|name| name == launcher_name)
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name == "browser-vz-engine-supervisor"
+                            || (platform == "darwin-arm64"
+                                && name.starts_with("browser-vm-remote-vz-launcher"))
+                    })
         })
     });
     selected && (platform == "darwin-arm64" || kvm_available())
@@ -313,7 +320,12 @@ fn retire_host(data: &Path, manifest: &super::ComponentsManifest) -> anyhow::Res
         super::atomic_write_file(&selection, b"{\"adapters\": []}\n")?;
     }
     // Exact release paths, relative to the data directory.
-    let mut paths = vec![PathBuf::from(super::browser_vm_image::INSTALL_PATH)];
+    let mut paths = vec![
+        PathBuf::from(super::browser_vm_image::INSTALL_PATH),
+        // Exact launcher paths retained by older release manifests.
+        PathBuf::from("bin/browser-vm-local-crosvm-launcher"),
+        PathBuf::from("bin/browser-vm-local-crosvm-launcher.mjs"),
+    ];
     if let Some(profile) = manifest.profiles.get("browser-host") {
         for name in &profile.components {
             let shared = manifest
@@ -588,12 +600,36 @@ mod tests {
                 "invalid",
                 "{}",
                 r#"{"adapters":[{"kind":"chromium_native"}]}"#,
-                r#"{"adapters":[{"kind":"chromium_microvm","supervisor":{"env":{"ELASTOS_BROWSER_VM_CONTROL_LAUNCHER":"/managed/browser-vm-remote-vz-launcher.py"}}}]}"#,
             ] {
                 assert!(!home_browser_available_with_probe(
                     temp.path(),
                     platform,
                     Some(invalid),
+                    || true
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn mac_remote_engine_keeps_browser_visible_without_local_virtualization() {
+        let temp = tempfile::tempdir().unwrap();
+        for supervisor in [
+            serde_json::json!({"env":{"ELASTOS_BROWSER_VM_CONTROL_LAUNCHER":"/managed/browser-vm-remote-vz-launcher.py"}}),
+            serde_json::json!({"program":"/managed/browser-vm-remote-vz-launcher"}),
+        ] {
+            let raw = serde_json::json!({"adapters":[{"kind":"chromium_microvm","supervisor":supervisor}]}).to_string();
+            assert!(home_browser_available_with_probe(
+                temp.path(),
+                "darwin-arm64",
+                Some(&raw),
+                || panic!("Mac remote Engine needs no local KVM")
+            ));
+            for platform in ["linux-amd64", "linux-arm64", "darwin-amd64"] {
+                assert!(!home_browser_available_with_probe(
+                    temp.path(),
+                    platform,
+                    Some(&raw),
                     || true
                 ));
             }
@@ -864,6 +900,7 @@ mod tests {
             "bin/browser-vm-control-service",
             "bin/browser-vm-control-service.mjs",
             "bin/browser-vm-local-crosvm-launcher",
+            "bin/browser-vm-local-crosvm-launcher.mjs",
             "browser-vm/image-set/rootfs.ext4",
             "libexec/browser/crosvm/0.1.0-2ac141082d17/linux-arm64/bin/crosvm",
         ];
@@ -968,9 +1005,15 @@ mod tests {
         let file = data.join("config/browser-engine-adapter.json");
         fs::write(&file, local).unwrap();
         assert!(local_vm_selected_with_override(data, "darwin-arm64", None).unwrap());
-        for platform in ["linux-arm64", "linux-amd64"] {
-            assert!(!local_vm_selected_with_override(data, platform, None).unwrap());
-            assert!(!local_vm_selected_with_override(data, platform, Some(local)).unwrap());
+        for (platform, selected) in [("linux-arm64", false), ("linux-amd64", true)] {
+            assert_eq!(
+                local_vm_selected_with_override(data, platform, None).unwrap(),
+                selected
+            );
+            assert_eq!(
+                local_vm_selected_with_override(data, platform, Some(local)).unwrap(),
+                selected
+            );
         }
         for inline in [
             r#"{"adapters":[]}"#,

@@ -914,26 +914,79 @@ import signal
 import stat
 
 root = Path(os.environ['DATA_DIR'])
-pid_file = root / 'runtime-turn/turnserver.pid'
-if not pid_file.exists():
+repair = 'Previous Browser TURN owner record requires repair before setup.'
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+def open_directory(path):
+    # Anchor every parent, including the Home data directory itself.
+    if not path.is_absolute() or '..' in path.parts:
+        raise SystemExit(repair)
+    fd = os.open('/', directory_flags)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, directory_flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+try:
+    root_fd = open_directory(root)
+    try:
+        turn_fd = os.open('runtime-turn', directory_flags, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+except FileNotFoundError:
     raise SystemExit(0)
-info = pid_file.lstat()
-if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
-    raise SystemExit('Previous Browser TURN owner record requires repair before setup.')
-try:
-    pid = int(pid_file.read_text().strip())
-    if pid <= 1:
-        raise ValueError()
-except ValueError:
-    raise SystemExit('Previous Browser TURN owner record requires repair before setup.')
-if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
-    raise SystemExit('Close the previous Browser TURN process before source-Home setup.')
-try:
-    fd = os.pidfd_open(pid)
-except ProcessLookupError:
-    pid_file.unlink()
-    raise SystemExit(0)
-try:
+except OSError:
+    raise SystemExit(repair)
+
+def remove_record(info):
+    try:
+        current = os.stat('turnserver.pid', dir_fd=turn_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+        raise SystemExit(repair)
+    # removal-ok: descriptor-relative PID removal after device/inode verification.
+    os.unlink('turnserver.pid', dir_fd=turn_fd)
+
+def retire_owner():
+    try:
+        record_fd = os.open('turnserver.pid', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=turn_fd)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise SystemExit(repair)
+    try:
+        info = os.fstat(record_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise SystemExit(repair)
+        raw = os.read(record_fd, 65)
+        try:
+            pid = int(raw.strip())
+            if pid <= 1 or len(raw) > 64:
+                raise ValueError()
+        except ValueError:
+            raise SystemExit(repair)
+        if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+            raise SystemExit('Close the previous Browser TURN process before source-Home setup.')
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            remove_record(info)
+            return
+        try:
+            retire_process(pid, fd)
+            remove_record(info)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(record_fd)
+
+def retire_process(pid, fd):
     process = Path('/proc') / str(pid)
     try:
         args = (process / 'cmdline').read_bytes().split(b'\0')
@@ -959,9 +1012,10 @@ try:
         if not select.select([fd], [], [], 4)[0]:
             raise SystemExit('Previous Browser TURN cleanup is pending. Close it and repeat setup.')
     # A stale PID belongs to another actor. Its process stays untouched.
-    pid_file.unlink()
+try:
+    retire_owner()
 finally:
-    os.close(fd)
+    os.close(turn_fd)
 PY
 }
 

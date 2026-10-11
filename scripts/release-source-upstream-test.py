@@ -513,6 +513,64 @@ class SourceUpstreamTests(unittest.TestCase):
         for relative in retired.values():
             self.assertTrue((self.data / relative).is_file())
 
+    def test_legacy_turn_retirement_preserves_records_under_linked_parents(self):
+        outside = self.root / 'outside-turn'
+        outside.mkdir()
+        record = outside / 'turnserver.pid'
+        record.write_text('99999999')
+        (self.data / 'runtime-turn').symlink_to(outside, target_is_directory=True)
+        failure = self.source_function('retire_legacy_browser_runtime_turn')
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn('requires repair', failure.stderr)
+        self.assertEqual(record.read_text(), '99999999')
+        (self.data / 'runtime-turn').unlink()
+        (self.data / 'runtime-turn').mkdir()
+        home_record = self.data / 'runtime-turn/turnserver.pid'
+        home_record.write_text('99999999')
+        linked = self.root / 'linked-parent'
+        linked.symlink_to(self.data.parent, target_is_directory=True)
+        failure = self.source_function('retire_legacy_browser_runtime_turn', {
+            'DATA_DIR': str(linked / self.data.name)})
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn('requires repair', failure.stderr)
+        self.assertEqual(home_record.read_text(), '99999999')
+
+    @unittest.skipUnless(sys.platform == 'linux' and hasattr(os, 'pidfd_open'), 'Linux pidfd ownership')
+    def test_legacy_turn_retirement_keeps_pid_record_replaced_during_shutdown(self):
+        directory = self.data / 'runtime-turn'
+        directory.mkdir()
+        (self.data / 'bin').mkdir()
+        (self.data / 'bin/turnserver').symlink_to(sys.executable)
+        config = directory / 'turnserver.conf'
+        record = directory / 'turnserver.pid'
+        program = textwrap.dedent('''\
+            import os, signal, sys, time
+            from pathlib import Path
+            record = Path(sys.argv[-1]).with_name('turnserver.pid')
+            def replace_record(*_):
+                replacement = record.with_suffix('.new')
+                replacement.write_text('replacement-owner')
+                os.replace(replacement, record)
+                sys.exit(0)
+            signal.signal(signal.SIGTERM, replace_record)
+            print('ready', flush=True)
+            time.sleep(30)
+        ''')
+        child = subprocess.Popen([sys.executable, '-c', program, '-c', str(config)], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), 'ready')
+            record.write_text(str(child.pid))
+            failure = self.source_function('retire_legacy_browser_runtime_turn')
+            child.wait(timeout=5)
+            self.assertNotEqual(failure.returncode, 0)
+            self.assertIn('requires repair', failure.stderr)
+            self.assertEqual(record.read_text(), 'replacement-owner')
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+            child.stdout.close()
+
     @unittest.skipUnless(sys.platform == 'linux' and hasattr(os, 'pidfd_open'), 'Linux pidfd ownership')
     def test_legacy_turn_retirement_stops_exact_owner_and_preserves_unrelated_pid(self):
         directory = self.data / 'runtime-turn'

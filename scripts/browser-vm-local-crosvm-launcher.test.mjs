@@ -129,8 +129,8 @@ test("private inputs are removed even when diagnostics are kept and a spawn fail
   assert.throws(() => api.writePrivateSessionInput(params, "overwrite"), /EEXIST/);
   // main's rejection path calls cleanupAndExit after a failed spawn.
   const cleanup = source.slice(source.indexOf("async function cleanupAndExit("), source.indexOf("async function main("));
-  assert.ok(cleanup.indexOf("removePrivateSessionInputs();") > cleanup.indexOf("await Promise.all(Array.from(children)"));
-  assert.ok(cleanup.indexOf("removePrivateSessionInputs();") < cleanup.indexOf("process.env[SESSION_KEEP_ENV]"));
+  assert.ok(cleanup.indexOf("removePrivateSessionInputs(owner.privateSessionInputs);") > cleanup.indexOf("await Promise.all(Array.from(children)"));
+  assert.ok(cleanup.indexOf("removePrivateSessionInputs(owner.privateSessionInputs);") < cleanup.indexOf("env[SESSION_KEEP_ENV]"));
   api.removePrivateSessionInputs();
   assert.equal(fs.existsSync(params), false);
   assert.equal(fs.existsSync(turn), false);
