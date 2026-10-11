@@ -346,7 +346,7 @@ async fn run_signed_publication(
 
     // Candidate files are read only through held descriptors. The separate
     // publication host executes its provider against this verified snapshot.
-    std::fs::create_dir_all(&data_dir)?;
+    elastos_server::data_root::create_private_dir_all(&data_dir)?;
     let data_dir = data_dir.canonicalize()?;
     let budget = publication_storage_budget(&publication)?;
     let mut preflight = PublicationProvider::start(&provider, &data_dir).await?;
