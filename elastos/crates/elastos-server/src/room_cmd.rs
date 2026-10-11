@@ -147,7 +147,7 @@ async fn run_show(data_dir: &Path, json: bool) -> anyhow::Result<()> {
     } else {
         println!("Hint:       Use authenticated People or Chat to manage room membership.");
         println!("Next:       elastos room pending");
-        println!("Open:       elastos room open --addr 0.0.0.0:8090");
+        println!("Open:       elastos room open");
     }
     Ok(())
 }

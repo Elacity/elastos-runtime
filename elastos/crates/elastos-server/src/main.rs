@@ -27,7 +27,7 @@ mod trust_cmd;
 mod webspace_cmd;
 
 use clap::{Parser, Subcommand};
-use security_cmd::{EmergencyCommand, TlsCommand};
+use security_cmd::EmergencyCommand;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,8 +115,8 @@ enum Commands {
     /// Start the runtime daemon with HTTP API
     #[command(hide = true)]
     Serve {
-        /// Address to bind to (use 0.0.0.0:3000 for LAN access)
-        #[arg(short, long, default_value = "0.0.0.0:3000")]
+        /// Address to bind to (loopback by default; another address only when you ask)
+        #[arg(short, long, default_value = "127.0.0.1:3000")]
         addr: String,
 
         /// Storage directory
@@ -289,10 +289,6 @@ enum Commands {
     #[command(subcommand, hide = true)]
     Content(content_cmd::ContentCommand),
 
-    /// TLS certificate management
-    #[command(subcommand, hide = true)]
-    Tls(TlsCommand),
-
     /// Legacy native P2P chat (#general gossip topic); developer smoke tests only
     #[command(hide = true)]
     Chat {
@@ -436,7 +432,7 @@ enum Commands {
     /// Start the public ElastOS edge for MyWebSite, publisher objects, and CID content
     #[command(hide = true)]
     Gateway {
-        /// Address to bind to (use 0.0.0.0 for public, or use --public)
+        /// Address to bind to; --public keeps this address and tunnels to it
         #[arg(short, long, default_value = "127.0.0.1:8090")]
         addr: String,
         /// Start a public tunnel via tunnel-provider capsule
@@ -739,8 +735,8 @@ pub(crate) enum NodeRoomCommand {
         /// Target ElastOS DID
         #[arg(long)]
         peer: String,
-        /// Address to bind the Chat gateway to
-        #[arg(short, long, default_value = "0.0.0.0:8090")]
+        /// Address to bind the Chat gateway to (loopback by default)
+        #[arg(short, long, default_value = "127.0.0.1:8090")]
         addr: String,
         /// Emit machine-readable JSON
         #[arg(long)]
@@ -1374,10 +1370,6 @@ async fn run() -> anyhow::Result<()> {
             return elastos_server::update_controller::run(receipt).await;
         }
 
-        Commands::Tls(tls_cmd) => {
-            security_cmd::run_tls(tls_cmd)?;
-        }
-
         Commands::Emergency(cmd) => {
             security_cmd::run_emergency(cmd)?;
         }
@@ -1924,7 +1916,6 @@ async fn serve_web_capsule(
         addr: addr.to_string(),
         capsule_dir: Some(serve_dir),
         data_dir,
-        tls_config: None,
         supervisor: None,
         ready_tx: None,
         attach_secret: None,
@@ -2302,6 +2293,43 @@ mod tests {
         .err()
         .expect("operator update accepted --force");
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn listening_commands_bind_loopback_unless_the_owner_names_an_address() {
+        let addr_of = |args: &[&str]| -> String {
+            match super::Cli::try_parse_from(args).unwrap().command {
+                Some(super::Commands::Serve { addr, .. }) => addr,
+                Some(super::Commands::Gateway { addr, .. }) => addr,
+                Some(super::Commands::Room(super::RoomCommand::Open { addr })) => addr,
+                Some(super::Commands::Node(super::NodeCommand::Room(
+                    super::NodeRoomCommand::Open { addr, .. },
+                ))) => addr,
+                _ => panic!("unexpected command for {args:?}"),
+            }
+        };
+        for args in [
+            &["elastos", "serve"][..],
+            &["elastos", "gateway"],
+            &["elastos", "gateway", "--public"],
+            &["elastos", "room", "open"],
+            &[
+                "elastos",
+                "node",
+                "room",
+                "open",
+                "--peer",
+                "did:key:fixture",
+            ],
+        ] {
+            let addr = addr_of(args);
+            let ip: std::net::SocketAddr = addr.parse().unwrap();
+            assert!(ip.ip().is_loopback(), "{args:?} binds {addr}");
+        }
+        assert_eq!(
+            addr_of(&["elastos", "serve", "--addr", "0.0.0.0:3000"]),
+            "0.0.0.0:3000"
+        );
     }
 
     #[test]

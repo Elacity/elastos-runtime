@@ -153,9 +153,7 @@ fn normalize_authority(value: &str) -> anyhow::Result<String> {
 }
 
 fn gateway_host_is_loopback(host: &str) -> bool {
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || matches!(host, "127.0.0.1" | "0.0.0.0" | "::1")
+    host == "localhost" || host.ends_with(".localhost") || matches!(host, "127.0.0.1" | "[::1]")
 }
 
 #[cfg(test)]
@@ -171,6 +169,32 @@ mod tests {
             );
         }
         headers
+    }
+
+    #[test]
+    fn unspecified_and_lan_hosts_are_not_loopback() {
+        for host in ["0.0.0.0:8090", "0:8090", "[::]:8090", "192.168.1.5:8090"] {
+            let origin = effective_gateway_origin(&headers(&[("host", host)])).unwrap();
+            assert!(origin.secure(), "{host} must not get a plain-HTTP origin");
+            assert!(effective_gateway_origin(&headers(&[
+                ("host", host),
+                ("origin", &format!("http://{host}")),
+            ]))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn ipv6_and_named_loopback_hosts_keep_plain_http() {
+        for host in [
+            "[::1]:8090",
+            "127.0.0.1:8090",
+            "LOCALHOST:8090",
+            "home.localhost:8090",
+        ] {
+            let origin = effective_gateway_origin(&headers(&[("host", host)])).unwrap();
+            assert!(!origin.secure(), "{host}");
+        }
     }
 
     #[test]

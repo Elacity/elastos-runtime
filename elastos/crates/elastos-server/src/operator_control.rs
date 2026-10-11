@@ -231,7 +231,7 @@ struct OperatorRoomOpenArgs {
 impl Default for OperatorRoomOpenArgs {
     fn default() -> Self {
         Self {
-            addr: "0.0.0.0:8090".to_string(),
+            addr: "127.0.0.1:8090".to_string(),
         }
     }
 }
@@ -391,7 +391,7 @@ pub fn load_operator_control(data_dir: &Path) -> Result<OperatorControlConfig> {
 }
 
 pub fn save_operator_control(data_dir: &Path, config: &OperatorControlConfig) -> Result<()> {
-    std::fs::create_dir_all(data_dir)?;
+    crate::data_root::create_private_dir_all(data_dir)?;
     let path = operator_control_path(data_dir);
     let data = serde_json::to_vec_pretty(config)?;
     std::fs::write(&path, data)?;
@@ -1873,6 +1873,13 @@ mod tests {
     use axum::{Json, Router};
     use elastos_runtime::signature::generate_keypair;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn remote_room_open_without_an_address_binds_loopback() {
+        let args = parse_operator_args::<OperatorRoomOpenArgs>(&serde_json::Value::Null).unwrap();
+        let addr: std::net::SocketAddr = args.addr.parse().unwrap();
+        assert!(addr.ip().is_loopback());
+    }
 
     #[tokio::test]
     async fn operator_carrier_drain_finishes_once_before_returning() {

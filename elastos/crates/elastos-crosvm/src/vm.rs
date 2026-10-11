@@ -99,7 +99,6 @@ impl RunningVm {
         }
 
         // Ensure socket directory exists and is writable.
-        // setcap binaries run with AT_SECURE which may restrict /tmp access.
         if let Some(parent) = self.socket_path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }

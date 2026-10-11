@@ -28,14 +28,12 @@ mod network;
 #[path = "network_stub.rs"]
 mod network;
 mod provider;
-mod proxy;
 mod rootfs;
 mod vm;
 
 pub use config::{CrosvmConfig, VmConfig};
 pub use network::NetworkConfig;
 pub use provider::CrosvmProvider;
-pub use proxy::TcpProxy;
 pub use vm::RunningVm;
 
 /// Check process access to the supported KVM API before admitting a local VM.

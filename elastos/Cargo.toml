@@ -10,7 +10,6 @@ members = [
     "crates/elastos-compute",
     "crates/elastos-crosvm",
     "crates/elastos-vz",
-    "crates/elastos-tls",
     "crates/elastos-identity",
     "crates/elastos-namespace",
     "crates/elastos-auth",
