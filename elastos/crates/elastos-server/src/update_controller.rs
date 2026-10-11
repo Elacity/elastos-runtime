@@ -86,6 +86,7 @@ const LAUNCH_ENVIRONMENT: &[&str] = &[
     "ELASTOS_BROWSER_MAX_ACTIVE_SESSIONS",
     "ELASTOS_BROWSER_MAX_SESSIONS_PER_PRINCIPAL",
     "ELASTOS_QUIET_RUNTIME_NOTICES",
+    "ELASTOS_SERVICE",
 ];
 
 fn allowed_launch_key(key: &std::ffi::OsStr) -> bool {
@@ -601,6 +602,26 @@ fn first_start_without_controller_authority(data: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// A Home started by an update controller; it never reopens or starts another Home.
+pub fn is_controller_host() -> bool {
+    std::env::var(HOST_ENV).as_deref() == Ok("1")
+}
+
+/// Whether a controller holds this installation's lease now. Never creates files.
+pub fn controller_active(data_dir: &Path) -> bool {
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(data_dir.join(DIRECTORY).join("controller.lock"))
+    else {
+        return false;
+    };
+    matches!(
+        FileLock::try_exclusive(file),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
+
 /// Used by the existing Home browser entry. Source Homes keep their current launcher.
 pub async fn enter_browser_home() -> Result<()> {
     if std::env::var(HOST_ENV).as_deref() == Ok("1") {
@@ -982,7 +1003,9 @@ impl Controller {
         })?;
         self.publish_ready_result()?;
         println!("Home: http://localhost:{BROWSER_HOME_PORT}/home/");
-        println!("Keep this terminal open. Press Ctrl+C to stop Home.");
+        if !crate::home_service::service_mode() {
+            println!("Keep this terminal open. Press Ctrl+C to stop Home.");
+        }
         Ok(())
     }
 
