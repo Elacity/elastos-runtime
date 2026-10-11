@@ -1406,7 +1406,7 @@ pub(in crate::api::gateway) fn load_existing_gateway_runtime_did(
         .filter(|did| !did.trim().is_empty())
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 struct GatewayRuntimeCoords {
     api_url: String,
     attach_secret: String,
@@ -1418,9 +1418,13 @@ struct GatewayAttachResponse {
 }
 
 fn load_home_runtime_coords(data_dir: &std::path::Path) -> Option<GatewayRuntimeCoords> {
-    let path = crate::runtime_control::home_runtime_coord_path(data_dir);
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let coords = crate::runtime_control::read_private_runtime_coords(
+        &crate::runtime_control::home_runtime_coord_path(data_dir),
+    )?;
+    Some(GatewayRuntimeCoords {
+        api_url: coords.api_url,
+        attach_secret: coords.attach_secret,
+    })
 }
 
 fn gateway_internal_error(err: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {

@@ -41,7 +41,11 @@ impl IdentityFiles {
 
     fn open_mode(data_dir: &Path, create: bool) -> anyhow::Result<Self> {
         if create {
-            std::fs::create_dir_all(data_dir)?;
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(data_dir)?;
         }
         let root = File::options()
             .read(true)

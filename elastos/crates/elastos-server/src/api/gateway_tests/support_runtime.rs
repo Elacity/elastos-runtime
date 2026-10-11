@@ -784,21 +784,19 @@ async fn start_fake_runtime_configured(
         axum::serve(listener, app).await.unwrap();
     });
     let api_url = format!("http://{}", addr);
-    let coords = json!({
+    let coords: crate::runtime_control::RuntimeCoords = serde_json::from_value(json!({
         "api_url": api_url,
-            "attach_secret": state.attach_secret,
-            "pid": std::process::id(),
-            "runtime_kind": crate::runtime_control::RUNTIME_KIND_OPERATOR,
-            "binary_sha256": "",
-            "policy_sha256": "",
-    });
-    let coords_json = serde_json::to_vec_pretty(&coords).unwrap();
-    std::fs::write(data_dir.join("runtime-coords.json"), &coords_json).unwrap();
-    std::fs::write(
-        crate::runtime_control::home_runtime_coord_path(data_dir),
-        coords_json,
-    )
+        "attach_secret": state.attach_secret,
+        "pid": std::process::id(),
+        "runtime_kind": crate::runtime_control::RUNTIME_KIND_OPERATOR,
+    }))
     .unwrap();
+    for path in [
+        data_dir.join("runtime-coords.json"),
+        crate::runtime_control::home_runtime_coord_path(data_dir),
+    ] {
+        crate::runtime_control::write_runtime_coords(&path, &coords).unwrap();
+    }
     FakeRuntimeHandle {
         _task: task,
         launch_requests,

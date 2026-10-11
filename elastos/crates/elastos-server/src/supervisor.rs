@@ -15,7 +15,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 use crate::carrier_service::CarrierServiceProvider;
-use crate::ownership;
 use crate::setup::{
     read_artifact_sha256_receipt, write_artifact_sha256_receipt, CapsuleEntry, ComponentsManifest,
     CACHED_ARTIFACT_SHA_FILE,
@@ -938,7 +937,6 @@ impl Supervisor {
 
         tokio::fs::write(dest.join(CACHED_CID_FILE), format!("{}\n", cid)).await?;
         write_artifact_sha256_receipt(dest, expected_sha256)?;
-        let _ = ownership::repair_path_recursive(dest);
 
         println!("  Extracted to {} (via content provider)", dest.display());
         Ok(())

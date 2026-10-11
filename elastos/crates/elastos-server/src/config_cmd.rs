@@ -21,7 +21,7 @@ pub fn run_config(cmd: crate::ConfigCommand) -> anyhow::Result<()> {
             let contents = if config_path.exists() {
                 std::fs::read_to_string(&config_path)?
             } else {
-                let _ = std::fs::create_dir_all(&data_dir);
+                let _ = elastos_server::data_root::create_private_dir_all(&data_dir);
                 String::new()
             };
             let updated = updated_config(&contents, &key, &value)?;

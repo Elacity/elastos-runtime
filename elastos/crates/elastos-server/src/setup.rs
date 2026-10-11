@@ -274,7 +274,7 @@ async fn run_with_data_dir(
     let _fresh = if list || _writer.is_some() {
         None
     } else {
-        fs::create_dir_all(&data_dir)?;
+        crate::data_root::create_private_dir_all(&data_dir)?;
         Some(crate::install_transaction::InstallationGuard::acquire(
             &fs::canonicalize(&data_dir)?,
         )?)
@@ -2691,7 +2691,7 @@ pub fn write_installed_manifest(
 ) -> anyhow::Result<Vec<String>> {
     let mut installed_manifest = manifest.clone();
     let stamped = stamp_installed_file_metadata(&mut installed_manifest, data_dir, platform)?;
-    fs::create_dir_all(data_dir)?;
+    crate::data_root::create_private_dir_all(data_dir)?;
     let manifest_bytes = serde_json::to_vec_pretty(&installed_manifest)?;
     atomic_write_file(&data_dir.join("components.json"), &manifest_bytes)?;
     Ok(stamped)
