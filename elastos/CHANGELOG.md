@@ -6,6 +6,19 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Added
+
+- System → Accounts → Signed-in devices lists the browsers where your account
+  is signed in. Sign out any one of them, or choose "Sign out everywhere else".
+  A signed-out browser stops working at once, also after Home restarts.
+- INSTALL.md explains how to restore your account on a new computer with your
+  Recovery Kit, and what the Kit does not bring back (such as your files).
+
+### Changed
+
+- A sign-in now lasts at most 30 days. Home still renews it while you use it;
+  after 30 days it asks for your passkey again.
+
 ## [0.8.0-alpha.15]
 
 Test-channel release. Signed releases show these notes in System before you update.

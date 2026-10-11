@@ -403,6 +403,14 @@ operators and root, and other software or OS users while a self-hosted Home is
 locked. An unlocked self-hosted Home trusts its owner and their host software.
 A stolen device or profile key requires a new identity.
 
+Each sign-in lasts at most 30 days. Home renews it while you use it, but never
+past 30 days from when you signed in; then Home asks for your passkey again.
+**System → Accounts → Signed-in devices** lists the browsers where your account
+is signed in, with when each signed in and was last active. **Sign out** ends
+one of them, and **Sign out everywhere else** ends all but the one you are
+using. A signed-out browser stops working at once, also after Home restarts.
+An admin sees only their own sign-ins there.
+
 Lost every passkey? Your Recovery Kit brings your account back on the same
 Home, even when guest accounts are off:
 
@@ -418,6 +426,32 @@ Home, even when guest accounts are off:
    passkey becomes the admin and the old passkey stops working. Any other Kit,
    an expired code or a used code changes nothing. After five wrong codes the
    code stops working; run the command again for a new one.
+
+### Restore on a new computer
+
+Your Recovery Kit also moves your account to a new computer:
+
+1. Install ElastOS on the new computer and open Home.
+2. On the first screen choose **Recover account**, then choose your Recovery
+   Kit file. If the Kit has a password, enter it.
+3. Create a passkey on this computer. Home restores your account and opens
+   your desktop.
+
+The Kit brings back:
+
+- your account;
+- your signed Profile, with the same name and Profile DID; contacts learn
+  about the new computer through your Profile;
+- your contacts list, when you had saved contacts;
+- the keys of the Wallet built into Home.
+
+The Kit does not bring back:
+
+- your files (Documents, Library and anything else stored in Home); keep your
+  own backup of them;
+- chat messages, apps you added, and settings;
+- passkeys and sign-ins: you create a new passkey on the new computer;
+- wallets in browser extensions such as MetaMask; they stay in the extension.
 
 ## Capability policy
 

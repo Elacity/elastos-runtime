@@ -127,6 +127,9 @@ export function inertSystemApiResponse(pathname) {
   if (pathname === "/api/auth/passkeys") {
     return { passkeys: [] };
   }
+  if (pathname === "/api/auth/sessions") {
+    return { schema: "elastos.auth.sessions/v1", max_age_secs: 30 * 24 * 60 * 60, sessions: [] };
+  }
   if (pathname === "/api/auth/recovery/status") {
     return {
       recovery_configured: true,

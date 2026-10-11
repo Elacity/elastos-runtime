@@ -4373,6 +4373,7 @@ mod tests {
                     issued_at: timestamp,
                     expires_at: timestamp + 3600,
                     apps: vec!["marketplace".into()],
+                    label: None,
                 },
             )
             .unwrap();
@@ -4573,6 +4574,7 @@ mod tests {
                     issued_at: timestamp,
                     expires_at: timestamp + 3600,
                     apps: vec!["marketplace".into()],
+                    label: None,
                 },
             )
             .unwrap();
@@ -8271,6 +8273,7 @@ server.serve_forever()
                 issued_at: now().unwrap(),
                 expires_at: now().unwrap() + 3600,
                 apps: vec!["marketplace".into()],
+                label: None,
             };
             crate::auth::store_session_grant(root.path(), grant.clone()).unwrap();
             let token =

@@ -7,8 +7,11 @@ import { applyRunEventsPage, terminalOutputText } from "../capsules/assistant/br
 import { publicJourneyFailure } from "./ci-installed-home-failure.mjs";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
-const [base, evidence, data, mode] = process.argv.slice(2);
+const [base, evidence, data, mode, restoreBase] = process.argv.slice(2);
 assert(!mode || mode === "--home-only", "supported installed journey mode required");
+// The Home-only journey also restores its Recovery Kit on a second fresh Home.
+assert.equal(Boolean(restoreBase), mode === "--home-only", "restore Home required exactly for the Home-only journey");
+const PROFILE_NAME = "CI journey";
 const fixture = JSON.parse(readFileSync(join(evidence, "package.json")));
 const cid = fixture.cid;
 // A holder Get reads the package over Carrier in 64 KiB bounded reads; a same-Home Get is local.
@@ -49,31 +52,194 @@ async function projection(frame, path) {
     return response.json();
   }, path);
 }
+const signedHome = () => document.body.dataset.homeStatus === "ready" && document.body.dataset.homeAuthority === "signed";
+async function virtualPasskey(target) {
+  const cdp = await target.context().newCDPSession(target);
+  await cdp.send("WebAuthn.enable");
+  const { authenticatorId } = await cdp.send("WebAuthn.addVirtualAuthenticator", { options: {
+    protocol: "ctap2", transport: "internal", hasResidentKey: true,
+    hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true,
+  } });
+  return { cdp, authenticatorId };
+}
+// The same passkey on another device. A passkey's counter only moves forward,
+// so the copy continues from the source's count.
+async function copyPasskey(from, to) {
+  const { credentials } = await from.cdp.send("WebAuthn.getCredentials", { authenticatorId: from.authenticatorId });
+  assert.equal(credentials.length, 1, "one Home passkey");
+  await to.cdp.send("WebAuthn.clearCredentials", { authenticatorId: to.authenticatorId });
+  for (const credential of credentials) {
+    await to.cdp.send("WebAuthn.addCredential", { authenticatorId: to.authenticatorId,
+      credential: { ...credential, signCount: credential.signCount + 1 } });
+  }
+}
+async function signInWithPasskey(target) {
+  const unlock = target.locator("#home-unlock-person:visible, #home-unlock-primary:visible").first();
+  await unlock.waitFor({ state: "visible", timeout: 60000 });
+  const verified = target.waitForResponse(response => new URL(response.url()).pathname === "/api/auth/passkey/authenticate/complete", { timeout: 60000 });
+  await unlock.click();
+  assert((await verified).ok(), "passkey sign-in");
+  await target.waitForFunction(signedHome, null, { timeout: 60000 });
+}
+// Reads Home the way Home does: renew the browser's sign-in, then the summary.
+async function homeSession(target) {
+  return target.evaluate(async () => {
+    const refreshed = await fetch("/api/auth/sessions/refresh", { method: "POST", credentials: "same-origin", signal: AbortSignal.timeout(30000) });
+    if (!refreshed.ok) return { status: refreshed.status };
+    const token = (await refreshed.json()).home_token;
+    const response = await fetch("/api/apps/home/summary", { headers: { "x-elastos-home-token": token }, signal: AbortSignal.timeout(30000) });
+    return { status: response.status, summary: response.ok ? await response.json() : null };
+  });
+}
+async function activeSystem(shell) {
+  const iframe = shell.locator('section.window.window-active[data-target="system"] iframe.window-frame');
+  await iframe.waitFor({ state: "visible", timeout: 30000 });
+  const frame = await (await iframe.elementHandle()).contentFrame();
+  await frame.waitForURL(url => url.pathname.startsWith("/apps/system/"));
+  return frame;
+}
+async function openSystem(shell) {
+  await shell.locator("#toolbar-home").click();
+  await shell.locator("#identity-menu-system").click();
+  return activeSystem(shell);
+}
+// Fresh install to finished setup: Profile and Recovery Kit, sign in again,
+// manage signed-in devices, then restore the Kit on a second fresh Home.
+async function accountJourney(passkey, shell) {
+  stage = "recovery_kit";
+  const sheet = shell.locator("#setup-sheet");
+  await sheet.waitFor({ state: "visible", timeout: 30000 });
+  const act = shell.locator("#setup-sheet-recovery");
+  const profilePending = (await act.textContent()).trim() === "Finish setup";
+  const downloaded = page.waitForEvent("download", { timeout: 120000 });
+  downloaded.catch(() => {});
+  await act.click();
+  if (profilePending) {
+    const system = await activeSystem(shell);
+    await system.locator("#recovery-profile-name").fill(PROFILE_NAME);
+    await system.locator("#recovery-download").click();
+  }
+  const download = await downloaded;
+  // The Kit holds secrets: keep it in memory only and delete the browser copy.
+  const kit = readFileSync(await download.path());
+  await download.delete();
+  const bundle = JSON.parse(kit);
+  assert.equal(bundle.schema, "elastos.full-recovery-bundle/v1");
+  const profileDid = bundle.people_identity?.profile_authority_bundle?.signed_profile?.payload?.profile_did;
+  assert.match(profileDid ?? "", /^did:key:z/, "Recovery Kit carries the signed Profile");
+  await sheet.waitFor({ state: "hidden", timeout: 30000 });
+  const saved = await homeSession(page);
+  assert.equal(saved.summary?.identity?.profile_readiness?.status, "ready");
+  assert.equal(saved.summary?.identity?.recovery_readiness?.status, "ready");
+  results.recovery_kit = "passed";
+
+  stage = "sign_in_again";
+  await shell.locator("#toolbar-home").click();
+  await shell.locator("#identity-menu-sign-out").click();
+  await signInWithPasskey(page);
+  await shell.locator("#desktop").waitFor({ state: "visible", timeout: 30000 });
+  const again = await homeSession(page);
+  assert.equal(again.summary?.authority?.signed_in, true);
+  assert.equal(again.summary?.identity?.profile?.display_name, PROFILE_NAME);
+  assert.equal(again.summary?.identity?.recovery_readiness?.status, "ready");
+  assert.equal(await sheet.isVisible(), false, "finished setup stays finished after signing in again");
+  results.sign_in_again = "passed";
+
+  stage = "signed_in_devices";
+  const phone = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  try {
+    const phonePage = await phone.newPage();
+    const phonePasskey = await virtualPasskey(phonePage);
+    await copyPasskey(passkey, phonePasskey);
+    assert((await phonePage.goto(`${base}/home/`, { waitUntil: "domcontentloaded" })).ok());
+    await signInWithPasskey(phonePage);
+    const system = await openSystem(shell);
+    const rows = system.locator("#session-list .session-row");
+    await rows.nth(1).waitFor({ timeout: 30000 });
+    assert.equal(await rows.count(), 2, "this computer and the phone");
+    assert.equal(await system.locator('#session-list .session-row[data-current="true"]').count(), 1);
+    assert.match(await rows.first().textContent(), /Chrome on /, "each sign-in names its browser");
+    await page.setViewportSize({ width: 390, height: 844 });
+    const signOut = system.locator("#session-list .session-revoke");
+    const others = system.locator("#session-revoke-others");
+    for (const target of [signOut, others]) {
+      await target.scrollIntoViewIfNeeded();
+      const box = await target.boundingBox();
+      assert(box && box.width >= 44 && box.height >= 44, "phone-sized controls are 44 px targets");
+    }
+    await page.screenshot({ path: join(evidence, "signed-in-devices-phone.png"), fullPage: true });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await signOut.click();
+    await rows.nth(1).waitFor({ state: "detached", timeout: 30000 });
+    assert.notEqual((await homeSession(phonePage)).status, 200, "a signed-out device stops working at once");
+    await phonePage.reload({ waitUntil: "domcontentloaded" });
+    await signInWithPasskey(phonePage);
+    await system.locator('.settings-sidebar-item[data-settings="account"]').click();
+    await rows.nth(1).waitFor({ timeout: 30000 });
+    await others.click();
+    await rows.nth(1).waitFor({ state: "detached", timeout: 30000 });
+    assert.equal(await others.isVisible(), false);
+    assert.notEqual((await homeSession(phonePage)).status, 200, "Sign out everywhere else ends the phone sign-in");
+    assert.equal((await homeSession(page)).status, 200, "this computer stays signed in");
+    await copyPasskey(phonePasskey, passkey);
+  } finally {
+    await phone.close();
+  }
+  results.signed_in_devices = "passed";
+
+  stage = "restore_on_new_computer";
+  const second = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  try {
+    const restored = await second.newPage();
+    await virtualPasskey(restored);
+    assert((await restored.goto(`${restoreBase}/home/`, { waitUntil: "domcontentloaded" })).ok(), "second Home responds");
+    await restored.locator("#home-enrollment-recover").check({ timeout: 60000 });
+    await restored.locator("#home-recovery-file").setInputFiles({ name: "recovery-kit.json", mimeType: "application/json", buffer: kit });
+    const primary = restored.locator("#home-unlock-primary");
+    await restored.waitForFunction(() => document.querySelector("#home-unlock-primary")?.textContent.trim() === "Continue with passkey", null, { timeout: 30000 });
+    const imported = restored.waitForResponse(response => new URL(response.url()).pathname === "/api/auth/recovery/full-import", { timeout: 120000 });
+    await primary.click();
+    const response = await imported;
+    assert(response.ok(), "Recovery Kit import");
+    const outcome = await response.json();
+    assert.equal(outcome.people_identity_restore?.status, "restored");
+    assert.equal(outcome.people_identity_restore?.profile_did, profileDid, "the second Home has the same Profile DID");
+    await restored.waitForFunction(signedHome, null, { timeout: 60000 });
+    const summary = (await homeSession(restored)).summary;
+    assert.equal(summary?.identity?.profile?.display_name, PROFILE_NAME);
+    assert.equal(summary?.identity?.profile_readiness?.status, "ready");
+    await restored.screenshot({ path: join(evidence, "restored-home.png"), fullPage: true });
+  } finally {
+    kit.fill(0);
+    await second.close();
+  }
+  results.restore_on_new_computer = "passed";
+}
 try {
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   page = await context.newPage();
-  const cdp = await context.newCDPSession(page);
-  await cdp.send("WebAuthn.enable");
-  await cdp.send("WebAuthn.addVirtualAuthenticator", { options: {
-    protocol: "ctap2", transport: "internal", hasResidentKey: true,
-    hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true,
-  } });
+  const passkey = await virtualPasskey(page);
   stage = "sign_in";
   assert((await page.goto(`${base}/home/`, { waitUntil: "domcontentloaded" })).ok(), "installed Home frontdoor responds successfully");
   await page.locator("#home-unlock-name").waitFor({ state: "visible", timeout: 60000 });
-  await page.locator("#home-unlock-name").fill("CI journey");
+  await page.locator("#home-unlock-name").fill(PROFILE_NAME);
   const completed = page.waitForResponse(response => response.url().endsWith("/api/auth/passkey/register/complete"));
   await page.locator("#home-unlock-primary").click();
   assert((await completed).ok(), "new isolated Home passkey registration");
-  await page.waitForFunction(() => document.body.dataset.homeStatus === "ready" && document.body.dataset.homeAuthority === "signed", null, { timeout: 60000 });
+  await page.waitForFunction(signedHome, null, { timeout: 60000 });
   const shell = page.frameLocator("#active-shell-frame");
   await shell.locator("#desktop").waitFor({ state: "visible", timeout: 30000 });
-  const setupReminder = shell.locator("#setup-sheet");
-  if (await setupReminder.isVisible()) {
-    await shell.locator("#setup-sheet-close").click();
-    await setupReminder.waitFor({ state: "hidden", timeout: 5000 });
+  if (mode === "--home-only") {
+    await accountJourney(passkey, shell);
+  } else {
+    const setupReminder = shell.locator("#setup-sheet");
+    if (await setupReminder.isVisible()) {
+      await shell.locator("#setup-sheet-close").click();
+      await setupReminder.waitFor({ state: "hidden", timeout: 5000 });
+    }
   }
+  stage = "journey";
   await page.screenshot({ path: join(evidence, "home-desktop.png"), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   await shell.locator("#desktop").waitFor({ state: "visible" });

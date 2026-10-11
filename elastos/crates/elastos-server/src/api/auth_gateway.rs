@@ -157,6 +157,30 @@ pub struct AuthRevokeResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AuthSessionListResponse {
+    pub schema: String,
+    pub max_age_secs: u64,
+    pub sessions: Vec<AuthSessionView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthSessionView {
+    pub session_id: String,
+    pub label: Option<String>,
+    pub created_at: u64,
+    pub last_used_at: u64,
+    pub expires_at: u64,
+    pub sign_in_again_by: u64,
+    pub current: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthSessionsRevokedResponse {
+    pub status: String,
+    pub revoked: usize,
+}
+
+#[derive(Debug, Serialize)]
 pub struct PasskeyStatusResponse {
     pub registered: bool,
     pub owner_setup_pending: bool,
@@ -630,7 +654,7 @@ pub async fn passkey_register_complete(
     }
     let local_first_owner = local_first_owner_registration(&headers, peer.map(|peer| peer.0));
     match passkey_register_complete_inner(&state, &headers, input, local_first_owner).await {
-        Ok(response) => passkey_verified_response(&headers, response),
+        Ok(response) => passkey_verified_response(&state, &headers, response),
         Err(err) => auth_error_response(err),
     }
 }
@@ -651,7 +675,7 @@ pub async fn passkey_authenticate_complete(
     Json(input): Json<PasskeyAuthenticateCompleteRequest>,
 ) -> Response {
     match passkey_authenticate_complete_inner(&state, &headers, input).await {
-        Ok(response) => passkey_verified_response(&headers, response),
+        Ok(response) => passkey_verified_response(&state, &headers, response),
         Err(err) => auth_error_response(err),
     }
 }
@@ -726,7 +750,7 @@ pub async fn owner_recovery_complete(
     Json(input): Json<OwnerRecoveryCompleteRequest>,
 ) -> Response {
     match owner_recovery_complete_inner(&state, &headers, input).await {
-        Ok(response) => passkey_verified_response(&headers, response),
+        Ok(response) => passkey_verified_response(&state, &headers, response),
         Err(err) => auth_error_response(err),
     }
 }
@@ -790,7 +814,7 @@ pub async fn revoke_session(
         Ok(actor) => actor,
         Err(err) => return auth_error_response(err),
     };
-    if target.session_id != context.session_id && !crate::auth::is_admin(&actor) {
+    if target.principal_id != actor.principal_id && !crate::auth::is_admin(&actor) {
         return auth_error_response(anyhow::anyhow!(
             "admin authority required to revoke another auth session"
         ));
@@ -864,6 +888,161 @@ fn sign_out_session_inner(
         status: "signed_out".to_string(),
         session_id: context.session_id,
     })
+}
+
+/// The caller's own sign-ins. Admins also see only their own here; guest
+/// management stays under passkeys.
+pub async fn list_sessions(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    match list_sessions_inner(&state, &headers) {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => auth_error_response(err),
+    }
+}
+
+fn list_sessions_inner(
+    state: &GatewayState,
+    headers: &HeaderMap,
+) -> anyhow::Result<AuthSessionListResponse> {
+    let context = require_auth_home_or_system_context(state, headers)?;
+    let actor = require_active_principal_for_context(state, &context)?;
+    let now = crate::auth::now_ts();
+    let auth_data_dir = super::gateway::home_launch_auth_data_dir(&state.data_dir);
+    let sessions =
+        crate::auth::list_active_principal_sessions(&auth_data_dir, &actor.principal_id, now)?
+            .into_iter()
+            .map(|stored| AuthSessionView {
+                current: stored.grant.session_id == context.session_id,
+                created_at: stored.grant.issued_at,
+                last_used_at: stored.last_used_at.unwrap_or(stored.grant.issued_at),
+                expires_at: stored.grant.expires_at,
+                sign_in_again_by: stored
+                    .grant
+                    .issued_at
+                    .saturating_add(crate::auth::AUTH_SESSION_MAX_AGE_SECS),
+                label: stored.grant.label,
+                session_id: stored.grant.session_id,
+            })
+            .collect();
+    Ok(AuthSessionListResponse {
+        schema: "elastos.auth.sessions/v1".to_string(),
+        max_age_secs: crate::auth::AUTH_SESSION_MAX_AGE_SECS,
+        sessions,
+    })
+}
+
+/// "Sign out everywhere else": revoke every other sign-in of the caller.
+pub async fn revoke_other_sessions(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    match revoke_other_sessions_inner(&state, &headers) {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => auth_error_response(err),
+    }
+}
+
+fn revoke_other_sessions_inner(
+    state: &GatewayState,
+    headers: &HeaderMap,
+) -> anyhow::Result<AuthSessionsRevokedResponse> {
+    let context = require_auth_home_or_system_context(state, headers)?;
+    let actor = require_active_principal_for_context(state, &context)?;
+    let now = crate::auth::now_ts();
+    let auth_data_dir = super::gateway::home_launch_auth_data_dir(&state.data_dir);
+    let revoked = crate::auth::revoke_other_principal_sessions(
+        &auth_data_dir,
+        &actor.principal_id,
+        &context.session_id,
+        now,
+    )?;
+    if auth_data_dir != state.data_dir {
+        let _ = crate::auth::revoke_other_principal_sessions(
+            &state.data_dir,
+            &actor.principal_id,
+            &context.session_id,
+            now,
+        );
+    }
+    let _ = crate::auth::append_audit_event(
+        &auth_data_dir,
+        audit_event(AuditEventInput {
+            event_type: "auth.session.revoked_others",
+            principal_id: Some(actor.principal_id),
+            proof_binding_id: context.proof_binding_id,
+            session_id: Some(context.session_id),
+            result: "ok",
+            reason: "signed out everywhere else",
+            occurred_at: now,
+            ..AuditEventInput::default()
+        }),
+    );
+    Ok(AuthSessionsRevokedResponse {
+        status: "revoked".to_string(),
+        revoked: revoked.len(),
+    })
+}
+
+/// Short place name for a sign-in, from the browser's User-Agent:
+/// "Chrome on macOS". None when the browser is not recognised.
+fn session_label_from_headers(headers: &HeaderMap) -> Option<String> {
+    let agent = headers.get(axum::http::header::USER_AGENT)?.to_str().ok()?;
+    session_label_from_user_agent(agent)
+}
+
+fn session_label_from_user_agent(agent: &str) -> Option<String> {
+    let browser = if agent.contains("Edg/") || agent.contains("EdgA/") || agent.contains("EdgiOS/")
+    {
+        Some("Edge")
+    } else if agent.contains("OPR/") {
+        Some("Opera")
+    } else if agent.contains("Firefox/") || agent.contains("FxiOS/") {
+        Some("Firefox")
+    } else if agent.contains("Chrome/") || agent.contains("CriOS/") || agent.contains("Chromium/")
+    {
+        Some("Chrome")
+    } else if agent.contains("Safari/") {
+        Some("Safari")
+    } else {
+        None
+    };
+    let system = if agent.contains("iPhone") {
+        Some("iPhone")
+    } else if agent.contains("iPad") {
+        Some("iPad")
+    } else if agent.contains("Android") {
+        Some("Android")
+    } else if agent.contains("CrOS") {
+        Some("ChromeOS")
+    } else if agent.contains("Windows") {
+        Some("Windows")
+    } else if agent.contains("Mac OS X") || agent.contains("Macintosh") {
+        Some("macOS")
+    } else if agent.contains("Linux") {
+        Some("Linux")
+    } else {
+        None
+    };
+    match (browser, system) {
+        (Some(browser), Some(system)) => Some(format!("{browser} on {system}")),
+        (Some(browser), None) => Some(browser.to_string()),
+        (None, Some(system)) => Some(format!("Browser on {system}")),
+        (None, None) => None,
+    }
+}
+
+/// Remember where a fresh sign-in happened. The sign-in already succeeded,
+/// so a failure here only leaves the place unnamed.
+fn label_new_session(state: &GatewayState, headers: &HeaderMap, session_id: &str) {
+    let Some(label) = session_label_from_headers(headers) else {
+        return;
+    };
+    if let Err(err) = crate::auth::set_session_label(&state.data_dir, session_id, &label) {
+        tracing::warn!("could not name the new sign-in: {err}");
+    }
+    let auth_data_dir = super::gateway::home_launch_auth_data_dir(&state.data_dir);
+    if auth_data_dir != state.data_dir {
+        let _ = crate::auth::set_session_label(&auth_data_dir, session_id, &label);
+    }
 }
 
 async fn passkey_list_inner(
@@ -2694,6 +2873,7 @@ async fn recovery_kit_import_inner(
                 HOME_CAPSULE_ID.to_string(),
                 super::gateway::SYSTEM_CAPSULE_ID.to_string(),
             ],
+            label: session_label_from_headers(headers),
         };
         #[cfg(test)]
         crate::auth::consume_recovery_reassignment_test_fault(
@@ -3097,8 +3277,9 @@ fn refresh_session_inner(
         principal_id: previous.principal_id.clone(),
         proof_binding_id: previous.proof_binding_id.clone(),
         issued_at: previous.issued_at,
-        expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
+        expires_at: crate::auth::session_refresh_expires_at(previous.issued_at, now)?,
         apps: previous.apps,
+        label: previous.label,
     };
     crate::auth::renew_session_grant_with_audit(
         &auth_data_dir,
@@ -4314,7 +4495,12 @@ fn passkey_proof_binding_id(credential: &StoredCredential) -> String {
     .id()
 }
 
-fn passkey_verified_response(headers: &HeaderMap, response: PasskeyVerifyResponse) -> Response {
+fn passkey_verified_response(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    response: PasskeyVerifyResponse,
+) -> Response {
+    label_new_session(state, headers, &response.session_id);
     let secure = super::gateway::request_uses_tls(headers);
     let cookie = home_session_cookie_header_for_token(headers, &response.home_token, secure);
     let mut http_response = Json(response).into_response();
@@ -8996,6 +9182,97 @@ mod tests {
         .expect("an open child token must survive host session renewal");
         assert!(!response.home_token.is_empty());
         assert!(!response.system_token.is_empty());
+    }
+
+    #[test]
+    fn refresh_never_extends_a_sign_in_past_the_maximum_age() {
+        let temp = tempfile::tempdir().unwrap();
+        let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        seed_test_passkey_principal(
+            &state,
+            &credential,
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        let grant = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey grant",
+        )
+        .unwrap();
+        let headers = home_token_headers(&grant.home_token);
+        let set_issued_at = |issued_at: u64| {
+            let mut auth = crate::auth::load_auth_state(temp.path()).unwrap();
+            let stored = auth
+                .sessions
+                .iter_mut()
+                .find(|stored| stored.grant.session_id == grant.session_id)
+                .unwrap();
+            stored.grant.issued_at = issued_at;
+            crate::auth::save_auth_state(temp.path(), &auth).unwrap();
+        };
+        let max_age = crate::auth::AUTH_SESSION_MAX_AGE_SECS;
+
+        // A minute before the maximum age, refresh stops at the maximum.
+        let started = crate::auth::now_ts() - max_age + 60;
+        set_issued_at(started);
+        let refreshed = refresh_session_inner(&state, &headers).unwrap();
+        assert_eq!(refreshed.expires_at, started + max_age);
+
+        // Renewal cannot store an expiry past the maximum either.
+        let stored = crate::auth::load_active_session_grant(
+            temp.path(),
+            &grant.session_id,
+            crate::auth::now_ts(),
+        )
+        .unwrap();
+        let mut stretched = stored.clone();
+        stretched.expires_at = started + max_age + 1;
+        assert!(crate::auth::renew_session_grant(temp.path(), stretched).is_err());
+
+        // Past the maximum age the user signs in again.
+        set_issued_at(crate::auth::now_ts() - max_age - 1);
+        let error = refresh_session_inner(&state, &headers).unwrap_err();
+        assert!(error.to_string().contains("sign in again"), "{error}");
+        assert_eq!(auth_error_response(error).status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn sign_in_labels_name_browser_and_system() {
+        for (agent, label) in [
+            (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                Some("Chrome on macOS"),
+            ),
+            (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+                Some("Edge on Windows"),
+            ),
+            (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+                Some("Safari on iPhone"),
+            ),
+            (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/130.0 Mobile/15E148 Safari/604.1",
+                Some("Chrome on iPhone"),
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36",
+                Some("Chrome on Android"),
+            ),
+            (
+                "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+                Some("Firefox on Linux"),
+            ),
+            ("curl/8.7.1", None),
+        ] {
+            assert_eq!(session_label_from_user_agent(agent).as_deref(), label, "{agent}");
+        }
     }
 
     #[test]

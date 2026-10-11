@@ -1742,6 +1742,7 @@ async fn test_full_recovery_bundle_returns_tokens_when_outcome_audit_needs_retry
         issued_at: now,
         expires_at: now + 12 * 60 * 60,
         apps: vec![SYSTEM_CAPSULE_ID.to_string()],
+        label: None,
     };
     crate::auth::store_session_grant(dir.path(), cross_session_grant.clone()).unwrap();
     let cross_session_token =

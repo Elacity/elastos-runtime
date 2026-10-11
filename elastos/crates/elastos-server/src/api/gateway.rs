@@ -587,6 +587,11 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/auth/btc/verify",
             post(super::auth_gateway::btc_verify),
         )
+        .route("/api/auth/sessions", get(super::auth_gateway::list_sessions))
+        .route(
+            "/api/auth/sessions/revoke-others",
+            post(super::auth_gateway::revoke_other_sessions),
+        )
         .route(
             "/api/auth/sessions/:session_id/revoke",
             post(super::auth_gateway::revoke_session),

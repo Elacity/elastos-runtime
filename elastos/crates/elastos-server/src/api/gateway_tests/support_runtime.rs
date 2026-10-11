@@ -555,6 +555,7 @@ fn passkey_authority_with_name_role_credential(
             PEOPLE_CAPSULE_ID.to_string(),
             SYSTEM_CAPSULE_ID.to_string(),
         ],
+        label: None,
     };
     crate::auth::store_session_grant(data_dir, grant.clone()).unwrap();
     TestPasskeyAuthority {
@@ -651,6 +652,7 @@ fn app_token_for_authority(
         issued_at: now,
         expires_at: now + 12 * 60 * 60,
         apps: vec![app.to_string()],
+        label: None,
     };
     crate::auth::store_session_grant(data_dir, grant.clone()).unwrap();
     issue_home_launch_token_for_auth_grant(data_dir, app, &grant).unwrap()
