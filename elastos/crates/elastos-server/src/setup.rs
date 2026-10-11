@@ -1075,10 +1075,6 @@ pub async fn ensure_browser_vm_image_for_local_engine(data_dir: &Path) -> anyhow
     ensure_browser_vm_image_in_context(data_dir, FirstPartyCarrierContext::Runtime).await
 }
 
-pub(crate) fn home_browser_available(data_dir: &Path) -> bool {
-    home_browser_available_for(data_dir, &detect_platform())
-}
-
 pub(crate) fn home_browser_available_for(data_dir: &Path, platform: &str) -> bool {
     browser_config::home_browser_available(data_dir, platform)
 }
