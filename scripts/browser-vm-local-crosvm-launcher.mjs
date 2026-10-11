@@ -36,6 +36,7 @@ const VM_ICE_ENV_KEYS = [
 const children = new Set();
 const servers = new Set();
 const cleanupFns = [];
+const privateSessionInputs = new Map();
 let exiting = false;
 let guestControlSocket = null;
 let launchSucceeded = false;
@@ -291,7 +292,7 @@ function sessionTurnServer(config, network) {
 }
 
 // Linux Browser media uses one session TURN server on the leased network slot.
-function linuxSessionTurn(network) {
+function linuxSessionTurn(network, nowMs = Date.now()) {
   const iceConfig = vmIceEnv(network);
   const turn = sessionTurnServer(iceConfig, network);
   if (!turn) {
@@ -301,7 +302,16 @@ function linuxSessionTurn(network) {
       turn.relay.min !== 49152 || turn.relay.max !== 49215) {
     throw new Error("Linux Browser setup permits local TURN on {turn_port} and relay ports 49152-49215. Use these ports in the Browser ICE configuration.");
   }
-  return { iceConfig, turn };
+  const expiresAt = Math.floor(nowMs / 1000) + 300;
+  const authSecret = crypto.randomBytes(32).toString("hex");
+  const username = `${expiresAt}:${crypto.randomBytes(16).toString("hex")}`;
+  const credential = crypto.createHmac("sha1", authSecret).update(username).digest("base64");
+  const entries = collectIceServerEntries(iceConfig).map(entry => ({ ...entry, username, credential }));
+  delete iceConfig.ELASTOS_BROWSER_VM_ICE_SERVER;
+  delete iceConfig.ELASTOS_BROWSER_VM_ICE_USERNAME;
+  delete iceConfig.ELASTOS_BROWSER_VM_ICE_CREDENTIAL;
+  iceConfig.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON = JSON.stringify(entries);
+  return { iceConfig, turn: { ...turn, username, credential, authSecret, expiresAt } };
 }
 
 function sessionSuffix(value) {
@@ -549,46 +559,49 @@ async function waitForTcpListener(host, port, child, logPath) {
   throw new Error(`session TURN server did not become visible on ${host}:${port}${source}\n${tailFile(logPath, 12 * 1024)}`);
 }
 
+function writePrivateSessionInput(file, text) {
+  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  try {
+    const stat = fs.fstatSync(fd);
+    privateSessionInputs.set(file, { dev: stat.dev, ino: stat.ino });
+    fs.writeFileSync(fd, text, "utf8");
+    fs.fsyncSync(fd);
+  } finally { fs.closeSync(fd); }
+}
+
+function removePrivateSessionInputs() {
+  for (const [file, owned] of privateSessionInputs) {
+    try {
+      const stat = fs.lstatSync(file);
+      if (stat.isFile() && stat.dev === owned.dev && stat.ino === owned.ino) fs.unlinkSync(file);
+    } catch (error) { if (error.code !== "ENOENT") logPhase("private session input cleanup failed"); }
+  }
+  privateSessionInputs.clear();
+}
+
 async function startSessionTurnServer({ network, sessionDir, turn }) {
   if (!turn) return null;
   const logPath = path.join(sessionDir, "turnserver.log");
   const pidPath = path.join(sessionDir, "turnserver.pid");
   const logFd = fs.openSync(logPath, "a");
-  const args = [
-    "-n",
-    "--listening-ip",
-    network.hostIp,
-    "--relay-ip",
-    network.hostIp,
-    "--listening-port",
-    String(turn.port),
-    "--min-port",
-    String(turn.relay.min),
-    "--max-port",
-    String(turn.relay.max),
-    "--fingerprint",
-    "--lt-cred-mech",
-    "--realm",
-    "elastos-browser-vm.local",
-    "--user",
-    `${turn.username}:${turn.credential}`,
-    "--no-cli",
-    "--no-tls",
-    "--no-dtls",
-    "--no-tcp-relay",
-    "--no-multicast-peers",
-    // The guest and viewer meet at this server's relay address. Every other
-    // peer, including loopback (denied by default) and private ranges, is not.
-    // coturn checks peer IPs only; the root network setup (whose receipt
-    // `check` verifies) drops relayed UDP to any port but the TURN ports.
-    `--allowed-peer-ip=${network.hostIp}`,
-    "--denied-peer-ip=0.0.0.0-255.255.255.255",
-    "--denied-peer-ip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-    "--no-software-attribute",
-    `--pidfile=${pidPath}`,
-    `--log-file=${logPath}`,
-    "--simple-log",
-  ];
+  const configPath = path.join(sessionDir, "turnserver.conf");
+  const remaining = turn.expiresAt - Math.floor(Date.now() / 1000);
+  if (!Number.isInteger(remaining) || remaining <= 0 || remaining > 300 || !/^[0-9a-f]{64}$/.test(turn.authSecret)) {
+    throw new Error("session TURN credentials have expired or are invalid");
+  }
+  const config = [
+    `listening-ip=${network.hostIp}`, `relay-ip=${network.hostIp}`,
+    `listening-port=${turn.port}`, `min-port=${turn.relay.min}`, `max-port=${turn.relay.max}`,
+    "fingerprint", "realm=elastos-browser-vm.local", "use-auth-secret",
+    `static-auth-secret=${turn.authSecret}`, `max-allocate-lifetime=${remaining}`,
+    `channel-lifetime=${remaining}`, `permission-lifetime=${remaining}`,
+    "no-cli", "no-tls", "no-dtls", "no-tcp-relay", "no-multicast-peers",
+    `allowed-peer-ip=${network.hostIp}`, "denied-peer-ip=0.0.0.0-255.255.255.255",
+    "denied-peer-ip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+    "no-software-attribute", `pidfile=${pidPath}`, `log-file=${logPath}`, "simple-log", "",
+  ].join("\n");
+  writePrivateSessionInput(configPath, config);
+  const args = ["-c", configPath];
   const child = spawnTracked(turnserverBin(), args, {
     stdio: ["ignore", logFd, logFd],
   });
@@ -885,6 +898,8 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
     "rootfstype=ext4",
     "rw",
     "init=/opt/elastos/bin/browser-vm-init",
+    "elastos.browser_width=1920",
+    "elastos.browser_height=1080",
     "random.trust_cpu=on",
     `elastos.browser_epoch=${Math.floor(Date.now() / 1000)}`,
     `elastos.browser_profile=${profile.profileKey}`,
@@ -899,6 +914,8 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
     "elastos.browser_control_port=19092",
     ...(iceConfigHex ? [`elastos.browser_ice_config_hex=${iceConfigHex}`] : []),
   ].join(" ");
+  const paramsPath = path.join(sessionDir, "boot-params.txt");
+  writePrivateSessionInput(paramsPath, bootArgs);
   const args = [
     "run",
     "--mem",
@@ -917,8 +934,8 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
     process.env.ELASTOS_BROWSER_VM_CROSVM_PIVOT_ROOT || "/tmp/elastos/crosvm-empty",
     "--initrd",
     initrd,
-    "-p",
-    bootArgs,
+    "--params-file",
+    paramsPath,
     kernel,
   ];
   fs.mkdirSync(process.env.ELASTOS_BROWSER_VM_CROSVM_PIVOT_ROOT || "/tmp/elastos/crosvm-empty", { recursive: true });
@@ -941,7 +958,8 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
 function tailFile(file, maxBytes = 24 * 1024) {
   try {
     const data = fs.readFileSync(file);
-    return data.subarray(Math.max(0, data.length - maxBytes)).toString("utf8");
+    return data.subarray(Math.max(0, data.length - maxBytes)).toString("utf8")
+      .replace(/elastos\.(?:token|browser_ice_config_hex)=[^\s]+/g, "elastos.private=[redacted]");
   } catch {
     return "";
   }
@@ -1202,6 +1220,7 @@ async function cleanupAndExit(signal = null) {
     child.once("exit", resolve);
     try { child.kill("SIGKILL"); } catch { resolve(); }
   })));
+  removePrivateSessionInputs();
   // VM teardown finishes before the refill starts. The launcher owns and waits
   // for this copy separately from the children that shutdown terminates.
   if (deferredRootfsPoolRefill) {
@@ -1258,17 +1277,12 @@ async function main() {
   const profile = prepareProfileDisk(request.profile, dataDir);
   cleanupFns.push(() => fs.closeSync(profile.lockFd));
   const network = await acquireLinuxNetwork(scriptPath);
-  const { iceConfig, turn } = linuxSessionTurn(network);
   const controlSocketPath = path.join(sessionDir, "control.sock");
   validateAbsolutePath(controlSocketPath, "control socket path");
   const launchRootfs = path.join(sessionDir, "rootfs.ext4");
 
   logPhase(`session dir ${sessionDir}`);
   logPhase(`preparing launch rootfs from ${rootfs} to ${launchRootfs}`);
-  await startSessionTurnServer({ network, sessionDir, turn });
-  logPhase(`allowed guest access to host media relay port ${turn.port} and range ${turn.relay.min}-${turn.relay.max}`);
-  await startTcpToUnixBridge(network.hostIp, 19091, launch.relay_ipc.path);
-  await startUnixToTcpBridge(controlSocketPath, network.guestIp, 19092);
   const rootfsPrep = prepareLaunchRootfs({ rootfs, launchRootfs, dataDir, sessionDir, scriptPath });
   logPhase(`prepared rootfs via ${rootfsPrep.mode} in ${rootfsPrep.elapsed_ms}ms`);
   if (rootfsPrep.mode === "prepared_pool") {
@@ -1282,6 +1296,12 @@ async function main() {
     };
     logPhase("prepared rootfs pool refill deferred until VM exit");
   }
+
+  const { iceConfig, turn } = linuxSessionTurn(network);
+  await startSessionTurnServer({ network, sessionDir, turn });
+  logPhase(`allowed guest access to host media relay port ${turn.port} and range ${turn.relay.min}-${turn.relay.max}`);
+  await startTcpToUnixBridge(network.hostIp, 19091, launch.relay_ipc.path);
+  await startUnixToTcpBridge(controlSocketPath, network.guestIp, 19092);
 
   const memoryMiB = process.env.ELASTOS_BROWSER_VM_MEMORY_MIB || (os.arch() === "arm64" ? "2048" : "3072");
   const vcpus = process.env.ELASTOS_BROWSER_VM_VCPUS || defaultVmVcpus();

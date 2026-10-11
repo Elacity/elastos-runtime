@@ -1645,21 +1645,8 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert_eq!(wallet["route"], "/apps/wallet/");
     assert_eq!(wallet["attach_kind"], "iframe");
     assert_eq!(wallet["target_kind"], "app");
-    let browser = targets.iter().find(|target| target["target"] == "browser");
-    if crate::setup::browser_available(&crate::setup::detect_platform()) {
-        let browser = browser.expect("browser target");
-        assert_eq!(browser["role"], "app");
-        assert_eq!(browser["title"], "Browser");
-        assert_eq!(browser["description"], "Browse websites from this device.");
-        assert_eq!(browser["route"], "/apps/browser/");
-        assert_eq!(browser["attach_kind"], "iframe");
-        assert_eq!(browser["target_kind"], "app");
-    } else {
-        assert!(
-            browser.is_none(),
-            "Browser is hidden on hosts without a local Engine"
-        );
-    }
+    // This Home has no qualified local Engine configuration.
+    assert!(targets.iter().all(|target| target["target"] != "browser"));
     assert!(targets
         .iter()
         .all(|target| target["target"] != "wallet-metamask"));
@@ -6684,6 +6671,21 @@ async fn test_home_launch_validates_shell_targets() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_browser_catalog_and_home_hide_unselected_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    write_test_browser_capsule(dir.path(), "browser", "app", "Browser fixture", None);
+    let catalog = serde_json::to_value(capsule_catalog_summary(dir.path())).unwrap();
+    let browser = catalog["capsules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|capsule| capsule["name"] == "browser")
+        .unwrap();
+    assert_eq!(browser["launchable"], false);
+    assert!(home_launch_target(dir.path(), "browser").is_none());
 }
 
 #[tokio::test]

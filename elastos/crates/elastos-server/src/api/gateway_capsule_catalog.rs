@@ -1252,7 +1252,7 @@ mod tests {
             "expected the first-party development capsule set to be visible"
         );
 
-        for platform in ["linux-arm64", "linux-amd64"] {
+        for platform in ["linux-arm64", "darwin-amd64"] {
             // Where Browser is unavailable it is absent, not merely unlaunchable.
             assert!(
                 !read_model::capsule_catalog_summary_for(data_dir.path(), platform)

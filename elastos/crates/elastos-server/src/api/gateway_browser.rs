@@ -459,6 +459,7 @@ pub(super) async fn browser_app_open(
                     input,
                     home_token,
                     request_origin,
+                    Some(&job),
                 )
                 .await
                 {
@@ -485,6 +486,7 @@ pub(super) async fn browser_app_open(
         input,
         home_token,
         request_origin,
+        None,
     )
     .await
     {
@@ -568,6 +570,7 @@ async fn execute_browser_open(
     input: BrowserOpenRequest,
     home_token: Option<String>,
     request_origin: Option<String>,
+    open_job: Option<&BrowserOpenJobHandle>,
 ) -> Result<serde_json::Value, BrowserOpenFailure> {
     let BrowserOpenRequest {
         url: requested_url,
@@ -727,6 +730,15 @@ async fn execute_browser_open(
             Ok(reservation) => reservation,
             Err((status, message)) => return Err(BrowserOpenFailure::text(status, message)),
         };
+    if let Some(job) = open_job {
+        if !bind_browser_open_job_generation(job, launch_reservation.generation()).await {
+            release_browser_launch(&launch_reservation).await;
+            return Err(BrowserOpenFailure::text(
+                StatusCode::CONFLICT,
+                "Browser startup ownership changed. Open Browser again.",
+            ));
+        }
+    }
     if let Err((status, message)) = append_browser_effect_audit_or_500(
         &state.data_dir,
         BrowserEffectAuditInput {
@@ -2612,10 +2624,11 @@ async fn finish_browser_launch_reconciliation_without_engine_effects(
     ) {
         tracing::warn!(%error, "Remote Engine terminal route retirement remains pending");
     }
-    release_browser_open_job_instance_for_owner(
+    release_browser_open_job_instance_for_generation(
         &state.data_dir,
         &reconciliation.principal_id,
         &reconciliation.owner_launch_id,
+        &reconciliation.generation,
     )
     .await;
     true
@@ -2650,10 +2663,11 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                     &reconciliation.principal_id,
                     &reconciliation.generation,
                 );
-                release_browser_open_job_instance_for_owner(
+                release_browser_open_job_instance_for_generation(
                     &state.data_dir,
                     &reconciliation.principal_id,
                     &reconciliation.owner_launch_id,
+                    &reconciliation.generation,
                 )
                 .await;
                 settled = true;
@@ -2774,12 +2788,6 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                             "Browser reconciled cleanup terminal receipt and release could not be committed"
                         );
                     } else {
-                        release_browser_open_job_instance_for_owner(
-                            &state.data_dir,
-                            &cleanup.principal_id,
-                            &cleanup.owner_launch_id,
-                        )
-                        .await;
                         settled = true;
                     }
                 } else {
@@ -2831,12 +2839,6 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
                 .await
                 .is_ok()
         {
-            release_browser_open_job_instance_for_owner(
-                &state.data_dir,
-                &cleanup.principal_id,
-                &cleanup.owner_launch_id,
-            )
-            .await;
             settled = true;
             continue;
         }
@@ -2868,12 +2870,6 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
                     "Browser terminal cleanup could not commit its receipt and owner release"
                 );
             } else {
-                release_browser_open_job_instance_for_owner(
-                    &state.data_dir,
-                    &cleanup.principal_id,
-                    &cleanup.owner_launch_id,
-                )
-                .await;
                 settled = true;
             }
         } else {
@@ -2944,7 +2940,15 @@ async fn commit_browser_terminal_cleanup(
         &cleanup.page_id,
         &cleanup.generation,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    release_browser_open_job_instance_for_generation(
+        &state.data_dir,
+        &cleanup.principal_id,
+        &cleanup.owner_launch_id,
+        &cleanup.generation,
+    )
+    .await;
+    Ok(())
 }
 
 async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanup) {
@@ -2954,10 +2958,11 @@ async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanu
         &page.engine_cleanup.page_id,
     ));
     let engine_cleanup = page.engine_cleanup;
-    forget_browser_open_job_for_owner(
+    retire_browser_open_job_for_page(
         &state.data_dir,
         &engine_cleanup.principal_id,
         &engine_cleanup.owner_launch_id,
+        &engine_cleanup.page_id,
     )
     .await;
     let engine_result = tokio::time::timeout(
@@ -3288,7 +3293,7 @@ async fn release_browser_page_and_stream_for_principal(
     let _ =
         release_browser_page_for_principal(&state.data_dir, page_id, principal_id, owner_launch_id)
             .await;
-    forget_browser_open_job_for_owner(&state.data_dir, principal_id, owner_launch_id).await;
+    retire_browser_open_job_for_page(&state.data_dir, principal_id, owner_launch_id, page_id).await;
     cleanup_result
 }
 

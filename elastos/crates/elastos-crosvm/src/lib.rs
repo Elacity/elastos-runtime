@@ -63,9 +63,15 @@ fn kvm_api_available(path: &std::path::Path) -> bool {
         return false;
     };
     // Linux UAPI: _IO(KVMIO, 0x00), where KVMIO is 0xAE. This read-only ioctl
-    // takes no third argument and returns the API version; it creates no VM.
+    // requires a zero third argument and returns the API version; it creates no VM.
     // Version 12 is the stable API required by KVM userspace implementations.
-    unsafe { libc::ioctl(device.as_raw_fd(), 0xAE00) == 12 }
+    unsafe {
+        libc::ioctl(
+            device.as_raw_fd(),
+            0xAE00,
+            std::ptr::null_mut::<libc::c_void>(),
+        ) == 12
+    }
 }
 
 #[cfg(test)]

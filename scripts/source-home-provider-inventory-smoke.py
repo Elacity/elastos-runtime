@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -288,7 +289,8 @@ def run_retained_provider_stamp_smoke(setup_text: str, components: dict) -> None
                "COMPONENTS_SRC": str(source), "COMPONENTS_DEST": str(installed),
                "DATA_DIR": str(data_dir), "SETUP_PLATFORM": "linux-amd64",
                "SOURCE_HOME_BINARY_NAMES_JSON": json.dumps(["model-provider"]),
-               "APP_CAPSULES_JSON": "[]", "SOURCE_HOME_KUBO_INSTALLED": "0"}
+               "APP_CAPSULES_JSON": "[]", "SOURCE_HOME_KUBO_INSTALLED": "0",
+               "SOURCE_HOME_LLAMA_INSTALLED": "0"}
 
         def stamp_once() -> subprocess.CompletedProcess[str]:
             return subprocess.run(
@@ -326,6 +328,50 @@ def run_retained_provider_stamp_smoke(setup_text: str, components: dict) -> None
         assert installed.read_bytes() == stripped_bytes
 
 
+def run_setup_stage_smoke(setup_text: str) -> None:
+    function = "prepare_source_home_setup() (" + setup_text.split(
+        "prepare_source_home_setup() (", 1
+    )[1].split("\n)\n", 1)[0] + "\n)\n"
+    main = setup_text.split('echo "[setup-source-home] repo:', 1)[1]
+    assert main.index("stamp_source_home_capsule_artifacts_manifest\n") < main.index(
+        "prepare_source_home_setup\n"
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        data = root / "data"
+        data.mkdir()
+        manifest = b'{"profiles":{"source-home":{"components":["browser","media-provider"]}},"pin":"installed-helper"}\n'
+        catalog = b'{"catalog":"reviewed-source"}\n'
+        (data / "components.json").write_bytes(manifest)
+        (root / "model-catalog.json").write_bytes(catalog)
+        runtime = root / "runtime"
+        runtime.write_text("""#!/usr/bin/env python3
+import os, pathlib, sys
+p = pathlib.Path(os.environ['ELASTOS_COMPONENTS_MANIFEST'])
+assert sys.argv[1:] == ['setup', '--profile', 'source-home', '--without', 'media-provider']
+assert p.read_bytes() == (pathlib.Path(os.environ['DATA_DIR']) / 'components.json').read_bytes()
+assert p.with_name('model-catalog.json').read_bytes() == (pathlib.Path(os.environ['ROOT']) / 'model-catalog.json').read_bytes()
+assert p.parent.stat().st_mode & 0o777 == 0o700
+assert p.stat().st_mode & 0o777 == 0o600
+sys.exit(int(os.environ['SETUP_RESULT']))
+""")
+        runtime.chmod(0o700)
+        for result_code in (0, 23):
+            script = (
+                "set -euo pipefail\n" + function
+                + "source_home_runtime_bin() { printf '%s\\n' "
+                + shlex.quote(str(runtime)) + "; }\nprepare_source_home_setup\n"
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], text=True, capture_output=True,
+                env={**os.environ, "ROOT": str(root), "DATA_DIR": str(data),
+                     "SETUP_RESULT": str(result_code)},
+            )
+            assert result.returncode == result_code, result.stderr
+            assert (data / "components.json").read_bytes() == manifest
+            assert not list(data.glob(".source-home-setup.*"))
+
+
 def main() -> None:
     setup_text = SETUP.read_text(encoding="utf-8")
     components = json.loads(COMPONENTS.read_text(encoding="utf-8"))
@@ -335,6 +381,7 @@ def main() -> None:
     assert_external_metadata(components)
     run_integrity_smoke(components)
     run_retained_provider_stamp_smoke(setup_text, components)
+    run_setup_stage_smoke(setup_text)
 
     print(
         json.dumps(

@@ -128,6 +128,16 @@ function readinessArtifactIdentity(dataDir, launcher) {
   }
 }
 
+export async function readinessWhileAccepting(isAccepting, probe) {
+  const unavailable = {
+    schema: "elastos.browser.engine-readiness/v1",
+    readiness: { state: "unavailable", reason: "control_unavailable" },
+  };
+  if (!isAccepting()) return unavailable;
+  const readiness = await probe();
+  return isAccepting() ? readiness : unavailable;
+}
+
 async function engineReadiness(config) {
   const unavailable = (reason) => ({
     schema: "elastos.browser.engine-readiness/v1",
@@ -916,14 +926,6 @@ function tcpBindAbsent(host, port) {
   });
 }
 
-function bindTcpExclusive(host, port) {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", (error) => reject(error));
-    server.listen({ host, port, exclusive: true }, () => resolve(server));
-  });
-}
-
 function bindUdpExclusive(host, port) {
   return new Promise((resolve, reject) => {
     const socket = dgram.createSocket({
@@ -935,22 +937,15 @@ function bindUdpExclusive(host, port) {
   });
 }
 
-async function turnListenerPortAbsent(turn) {
+export async function turnListenerPortAbsent(turn) {
   return tcpBindAbsent(turn.listen_host, turn.listen_port);
 }
 
-async function turnRelayPortsAbsent(turn) {
+export async function turnRelayPortsAbsent(turn) {
   const held = [];
   try {
     for (let port = turn.relay_port_min; port <= turn.relay_port_max; port += 1) {
-      let tcp;
       let udp;
-      try {
-        tcp = await bindTcpExclusive(turn.relay_host, port);
-      } catch {
-        return false;
-      }
-      held.push(tcp);
       try {
         udp = await bindUdpExclusive(turn.relay_host, port);
       } catch {
@@ -1046,7 +1041,7 @@ async function exactTransportCleanupEffects(binding, termination) {
   // Supervisor connects to those paths and proves its own bridges by session
   // absence plus a graceful or already-terminal owned launcher exit.
   // Native browser-vz-engine-supervisor owns TURN child cleanup.
-  // Port binds prove only listen and declared TCP/UDP relay absence.
+  // Port binds prove TCP control-listener and declared UDP relay absence.
   const probeTurnPorts =
     binding.transport_receipt.effects.turn_launch_owned === true;
   const turnListenerAbsent = probeTurnPorts
@@ -4682,7 +4677,9 @@ function main() {
     try {
       const url = new URL(req.url || "/", "http://browser-vm-control");
       if (req.method === "GET" && url.pathname === "/readiness") {
-        sendJson(200, await engineReadiness(config));
+        sendJson(200, await readinessWhileAccepting(
+          () => acceptingLaunches, () => engineReadiness(config),
+        ));
         return;
       }
       if (req.method === "GET" && url.pathname === "/status") {
@@ -4696,6 +4693,7 @@ function main() {
           uptime_ms: Math.max(0, Date.now() - serviceStartedAtMs),
           config_fingerprint: config.config_fingerprint || null,
           control_service: controlServiceIdentity,
+          accepting_launches: acceptingLaunches,
           active_pages: livePages,
           active_vms: activeVms.size,
           warm_vms: [...activeVms.values()].filter((record) => record.pages.size === 0).length,

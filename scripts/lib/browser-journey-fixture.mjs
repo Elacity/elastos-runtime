@@ -137,6 +137,7 @@ function fixturePage(page, run, media = false, qualification = false, profile = 
   <h1>Browser journey ${page}</h1>
   <label for="journey-input">Test text</label>
   <input id="journey-input" maxlength="96" autocomplete="off">
+  <button id="journey-click" type="button">Test click</button>
   <a id="journey-next" href="/nav?run=${run}${profile ? `&profile=${profile.mode}&marker=${profile.marker}` : ""}${fileProbe ? `&file=upload&sha256=${fileProbe.expected_sha256}` : ""}">Open navigation page</a>
   ${fileProbe ? '<label for="journey-file">Select the 64KiB test file from Library</label><input id="journey-file" type="file">' : ""}
   <div id="journey-motion" aria-label="Continuous test motion"></div>
@@ -166,7 +167,7 @@ function fixturePage(page, run, media = false, qualification = false, profile = 
   function report(type, profileStorage, fileInput) {
     if (sent >= ${qualification ? 8192 : MAX_EVENTS}) return;
     sent++;
-    const rect = input.getBoundingClientRect();
+    const rect = document.querySelector(type === 'button_ready' || type === 'click' ? '#journey-click' : '#journey-input').getBoundingClientRect();
     const event = { type, page, value: input.value, scroll_x: scrollX, scroll_y: scrollY,
       ...(type === "profile_storage" ? { profile_storage: profileStorage } : {}),
       ...(type === "file_input" ? { file_input: fileInput } : {}),
@@ -185,6 +186,7 @@ function fixturePage(page, run, media = false, qualification = false, profile = 
     }).catch(error => { document.querySelector('#journey-observation').textContent = error.message; });
   }
   input.addEventListener('input', () => report('input'));
+  document.querySelector('#journey-click').addEventListener('click', () => report('click'));
   let scrollPending = false;
   addEventListener('scroll', () => {
     if (scrollPending) return;
@@ -192,6 +194,7 @@ function fixturePage(page, run, media = false, qualification = false, profile = 
     requestAnimationFrame(() => { scrollPending = false; report('scroll'); });
   });
   report('load');
+  report('button_ready');
   ${profile ? `(${browserProfileStorageProbe.toString()})(${JSON.stringify(profile)}).then(value => report('profile_storage', value));` : ""}
   ${fileProbe ? `const fileInput = document.querySelector('#journey-file');
   let fileProbeStarted = false;
@@ -281,7 +284,7 @@ export function createBrowserJourneyFixture({ now = Date.now } = {}) {
       }
       const event = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       const rect = event?.input_rect;
-      if (!event || !["load", "input", "scroll", "audio", "profile_storage", "file_input"].includes(event.type) ||
+      if (!event || !["load", "button_ready", "click", "input", "scroll", "audio", "profile_storage", "file_input"].includes(event.type) ||
           !["main", "nav"].includes(event.page) || typeof event.value !== "string" ||
           event.value.length > 96 || !rect ||
           ![event.scroll_x, event.scroll_y, rect.x, rect.y, rect.width, rect.height]

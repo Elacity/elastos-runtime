@@ -428,7 +428,9 @@ fn list_launchable_browser_capsules_for(
         if ensure_wallet_connector_configured(data_dir, &manifest.name).is_err() {
             continue;
         }
-        if manifest.name == "browser" && !crate::setup::browser_available(platform) {
+        if manifest.name == "browser"
+            && !crate::setup::home_browser_available_for(data_dir, platform)
+        {
             continue;
         }
         let Ok(capsule) = resolve_browser_capsule(data_dir, &manifest.name) else {
@@ -1487,20 +1489,31 @@ mod tests {
     }
 
     #[test]
-    fn browser_is_launchable_only_on_hosts_with_a_local_engine() {
+    fn browser_is_launchable_only_with_a_selected_local_engine() {
         let data_dir = tempfile::tempdir().unwrap();
         write_test_browser_capsule(data_dir.path(), "browser", "Browser", "app");
-        for (platform, listed) in [
-            ("linux-amd64", false),
-            ("linux-arm64", false),
-            ("darwin-arm64", true),
-        ] {
-            let names: Vec<_> = list_launchable_browser_capsules_for(data_dir.path(), platform)
-                .into_iter()
-                .map(|capsule| capsule.name)
-                .collect();
-            assert_eq!(names.contains(&"browser".to_string()), listed, "{platform}");
+        let listed = |platform| {
+            list_launchable_browser_capsules_for(data_dir.path(), platform)
+                .iter()
+                .any(|capsule| capsule.name == "browser")
+        };
+        for platform in ["linux-amd64", "linux-arm64", "darwin-arm64", "darwin-amd64"] {
+            assert!(!listed(platform), "unconfigured {platform}");
         }
+        fs::create_dir_all(data_dir.path().join("config")).unwrap();
+        fs::write(
+            data_dir.path().join("config/browser-engine-adapter.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"adapters": [{"kind": "chromium_microvm",
+                "supervisor": {"env": {"ELASTOS_BROWSER_VM_CONTROL_LAUNCHER":
+                    data_dir.path().join("bin/browser-vz-engine-supervisor")}}}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(listed("darwin-arm64"));
+        assert!(!listed("darwin-amd64"));
+        assert!(!listed("linux-arm64"));
     }
 
     #[test]

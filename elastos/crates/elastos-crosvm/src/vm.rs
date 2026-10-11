@@ -1,6 +1,8 @@
 //! Running VM lifecycle management (crosvm)
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use elastos_common::{CapsuleManifest, CapsuleStatus, ElastosError, Result};
@@ -9,6 +11,64 @@ use nix::unistd::Pid;
 use tokio::process::{Child, Command};
 
 use crate::config::VmConfig;
+
+/// Owned private boot input. Remove only the inode this VM created.
+struct BootParams {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl BootParams {
+    fn create(directory: &Path, params: &str) -> std::io::Result<Self> {
+        if params.len() > 65536 || params.contains('\0') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid private kernel parameters",
+            ));
+        }
+        let path = directory.join(format!("boot-{}.params", uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        let metadata = file.metadata()?;
+        let owned = Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        file.write_all(params.as_bytes())?;
+        file.sync_all()?;
+        Ok(owned)
+    }
+}
+
+impl Drop for BootParams {
+    fn drop(&mut self) {
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
+            if metadata.is_file() && metadata.dev() == self.device && metadata.ino() == self.inode {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+fn redact_guest_console(line: &str) -> String {
+    line.split_whitespace()
+        .map(|word| {
+            if word.starts_with("elastos.token=") {
+                "elastos.token=[private]"
+            } else if word.starts_with("elastos.browser_ice_config_hex=") {
+                "elastos.browser_ice_config_hex=[private]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// A running crosvm VM instance
 pub struct RunningVm {
@@ -27,6 +87,9 @@ pub struct RunningVm {
     /// crosvm process handle
     process: Option<Child>,
 
+    /// Retained until the child exits, or this owner is dropped.
+    boot_params: Option<BootParams>,
+
     /// Process ID (for signal sending)
     pid: Option<u32>,
 
@@ -43,6 +106,7 @@ impl RunningVm {
             status: CapsuleStatus::Loading,
             socket_path,
             process: None,
+            boot_params: None,
             pid: None,
             crosvm_bin: None,
         }
@@ -106,7 +170,20 @@ impl RunningVm {
         let _ = tokio::fs::remove_file(&self.socket_path).await;
 
         // Build crosvm run command
-        let crosvm_args = self.config.to_crosvm_args();
+        let mut crosvm_args = self.config.to_crosvm_args();
+        let boot_params = BootParams::create(
+            self.socket_path.parent().unwrap_or_else(|| Path::new(".")),
+            &self.config.boot_args,
+        )
+        .map_err(|e| ElastosError::Compute(format!("private kernel parameter file failed: {e}")))?;
+        let kernel_index = crosvm_args.len() - 1;
+        crosvm_args.splice(
+            kernel_index..kernel_index,
+            [
+                "--params-file".into(),
+                boot_params.path.to_string_lossy().into_owned(),
+            ],
+        );
 
         tracing::info!(
             "Starting crosvm VM '{}': {} run --socket {} {}",
@@ -152,7 +229,7 @@ impl RunningVm {
                     let reader = tokio::io::BufReader::new(stdout);
                     let mut lines = reader.lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        tracing::info!(target: "vm_console", "{}", line);
+                        tracing::info!(target: "vm_console", "{}", redact_guest_console(&line));
                     }
                 });
             }
@@ -162,7 +239,7 @@ impl RunningVm {
                     let reader = tokio::io::BufReader::new(stderr);
                     let mut lines = reader.lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        tracing::warn!(target: "vm_console", "{}", line);
+                        tracing::warn!(target: "vm_console", "{}", redact_guest_console(&line));
                     }
                 });
             }
@@ -170,6 +247,7 @@ impl RunningVm {
 
         self.pid = child.id();
         self.process = Some(child);
+        self.boot_params = Some(boot_params);
         self.status = CapsuleStatus::Running;
         self.crosvm_bin = Some(crosvm_bin.to_path_buf());
 
@@ -241,6 +319,7 @@ impl RunningVm {
         }
 
         self.process = None;
+        self.boot_params = None;
         self.pid = None;
         self.status = CapsuleStatus::Stopped;
 
@@ -267,6 +346,7 @@ impl RunningVm {
         }
 
         self.process = None;
+        self.boot_params = None;
         self.pid = None;
         self.status = CapsuleStatus::Stopped;
 
@@ -282,13 +362,18 @@ impl RunningVm {
     /// Check if the VM is running
     /// Wait for the VM process to exit. Returns the exit status.
     pub async fn wait_for_exit(&mut self) -> Result<std::process::ExitStatus> {
-        match self.process.as_mut() {
+        let status = match self.process.as_mut() {
             Some(child) => child
                 .wait()
                 .await
-                .map_err(|e| ElastosError::Compute(format!("wait failed: {}", e))),
-            None => Err(ElastosError::Compute("no VM process to wait on".into())),
-        }
+                .map_err(|e| ElastosError::Compute(format!("wait failed: {}", e)))?,
+            None => return Err(ElastosError::Compute("no VM process to wait on".into())),
+        };
+        self.process = None;
+        self.pid = None;
+        self.boot_params = None;
+        self.status = CapsuleStatus::Stopped;
+        Ok(status)
     }
 
     pub fn is_running(&self) -> bool {
@@ -321,5 +406,50 @@ impl Drop for RunningVm {
         if let Some(ref network) = self.config.network {
             let _ = network.teardown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_boot_params_are_bounded_mode_600_and_owned_until_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let params =
+            "console=ttyS0 elastos.token=test-private-token elastos.browser_ice_config_hex=abcdef";
+        let owned = BootParams::create(directory.path(), params).unwrap();
+        let path = owned.path.clone();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), params);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(owned);
+        assert!(!path.exists());
+        assert!(BootParams::create(directory.path(), &"x".repeat(65537)).is_err());
+        assert!(BootParams::create(directory.path(), "x\0y").is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn private_boot_cleanup_preserves_a_replacement_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let owned = BootParams::create(directory.path(), "private").unwrap();
+        let path = owned.path.clone();
+        let original = directory.path().join("original");
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+        drop(owned);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "replacement");
+    }
+
+    #[test]
+    fn kernel_console_keeps_private_boot_values_out_of_logs() {
+        assert_eq!(
+            redact_guest_console("Kernel command line: console=ttyS0 elastos.token=test-private-token elastos.browser_ice_config_hex=abcdef"),
+            "Kernel command line: console=ttyS0 elastos.token=[private] elastos.browser_ice_config_hex=[private]"
+        );
     }
 }

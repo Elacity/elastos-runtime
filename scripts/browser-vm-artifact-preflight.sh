@@ -462,8 +462,9 @@ def verify_image_set():
         return "artifact_invalid" if pathlib.Path(rootfs).is_file() else "preparation_required"
     receipt = rootfs_contract["build_receipt"]
     default_initrd = "bin/initrd" if platform == "darwin-arm64" else "browser-vm/initrd"
-    initrd_key = "ELASTOS_BROWSER_VM_INITRAMFS" if platform == "darwin-arm64" else "ELASTOS_BROWSER_VM_INITRD"
-    initrd = os.environ.get(initrd_key) or str(pathlib.Path(data_dir) / default_initrd)
+    initrd = (os.environ.get("ELASTOS_BROWSER_VM_INITRAMFS")
+              or (os.environ.get("ELASTOS_BROWSER_VM_INITRD") if platform.startswith("linux-") else None)
+              or str(pathlib.Path(data_dir) / default_initrd))
     try:
         for name, artifact in [("kernel", kernel), ("initrd", initrd)]:
             entry = receipt.get(name)
@@ -531,9 +532,9 @@ if mode == "--host-readiness":
     host_id = {("Darwin", "arm64"): "darwin-arm64", ("Linux", "x86_64"): "linux-amd64",
                ("Linux", "aarch64"): "linux-arm64", ("Linux", "arm64"): "linux-arm64"}.get(
                    (host_platform.system(), host_platform.machine()))
-    if platform not in {"darwin-arm64", "linux-arm64"}:
+    if platform not in {"darwin-arm64", "linux-arm64", "linux-amd64"}:
         reason = "host_unsupported"
-        message = "This computer uses an approved remote Browser Engine. The local guest requires ARM64 virtualization."
+        message = "Browser local virtualization is unavailable on this computer. Use a qualified Engine host."
     elif platform != host_id:
         reason = "host_unsupported"
     elif platform.startswith("linux-") and not os.path.exists("/dev/kvm"):

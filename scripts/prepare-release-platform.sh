@@ -109,9 +109,6 @@ case "$(uname -s):$(uname -m)" in
     Darwin:arm64|Darwin:aarch64) PLATFORM=aarch64-darwin; SETUP_PLATFORM=darwin-arm64; TARGET=aarch64-apple-darwin ;;
     *) die "Native preparation supports Linux x86_64/ARM64 and macOS ARM64" ;;
 esac
-if [[ -n "$BROWSER_VM_IMAGE_SET" && "$SETUP_PLATFORM" == linux-amd64 ]]; then
-    die "This host uses a remote Browser Engine; ARM64 guest inputs belong to Mac/Jetson"
-fi
 if [[ -z "$REUSE_SUPPORT" && "$SETUP_PLATFORM" == linux-arm64 ]]; then
     [[ -n "${ELASTOS_LLAMA_ARM64_BUNDLE:-}" ]] || die "ELASTOS_LLAMA_ARM64_BUNDLE is required for Linux ARM64"
     python3 - "$ELASTOS_LLAMA_ARM64_BUNDLE" <<'PY'
@@ -131,7 +128,6 @@ if [[ -n "$REUSE_SUPPORT" && ( -n "$BROWSER_VM_IMAGE" || -n "$BROWSER_VM_IMAGE_S
 fi
 if [[ -n "$BROWSER_VM_IMAGE_CID" || -n "$BROWSER_VM_IMAGE_SIZE" ]]; then
     [[ -z "$BROWSER_VM_IMAGE" && -z "$BROWSER_VM_IMAGE_SET" && -n "$BROWSER_VM_IMAGE_CID" && -n "$BROWSER_VM_IMAGE_SIZE" ]] || die "Supply one complete CID image input"
-    [[ "$SETUP_PLATFORM" != linux-amd64 ]] || die "This host selects a remote Engine"
     python3 scripts/browser-image-cid-input.py "$BROWSER_VM_IMAGE_CID" "$BROWSER_VM_IMAGE_SHA256" "$BROWSER_VM_IMAGE_SIZE"
     [[ -n "${BROWSER_IMAGE_PUBLISHER_DID:-}" && -n "${BROWSER_IMAGE_PUBLISHER_NODE_ID:-}" ]] || die "CID image input requires an explicit trusted publisher DID and Carrier node ID"
 fi

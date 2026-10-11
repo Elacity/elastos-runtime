@@ -11,7 +11,7 @@ const hostReadiness = preflight.slice(preflight.indexOf('if mode == "--host-read
   preflight.indexOf("\nif launch_ready:"));
 const control = fs.readFileSync(new URL("./browser-vm-control-service.mjs", import.meta.url), "utf8");
 const readiness = control.slice(control.indexOf("let verifiedHostReadiness ="),
-  control.indexOf("const OPEN_REQUEST_ENV ="));
+  control.indexOf("const OPEN_REQUEST_ENV =")).replace(/^export /gm, "");
 const ready = { schema: "elastos.browser.engine-readiness/v1", readiness: { state: "ready" } };
 const unavailable = (reason = "preparation_required") => ({ ...ready, readiness: { state: "unavailable", reason } });
 const turnKey = "ELASTOS_BROWSER_VM_TURN_PROGRAM";

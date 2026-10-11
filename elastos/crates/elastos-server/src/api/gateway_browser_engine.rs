@@ -187,13 +187,10 @@ fn browser_engine_config_uses_runtime_image(
     adapter_id: &str,
     platform: &str,
 ) -> bool {
-    let launcher = if platform.starts_with("darwin-") {
-        "browser-vz-engine-supervisor"
-    } else if platform.starts_with("linux-") {
-        "browser-vm-local-crosvm-launcher"
-    } else {
+    if !matches!(platform, "darwin-arm64" | "linux-arm64" | "linux-amd64") {
         return false;
-    };
+    }
+    let launcher = "browser-vz-engine-supervisor";
     let Some(adapter) = config["adapters"].as_array().and_then(|adapters| {
         adapters
             .iter()
@@ -222,11 +219,7 @@ fn browser_engine_config_uses_runtime_image(
                 "browser-vm/browser-vm-rootfs-manifest.json",
             ),
             ("ELASTOS_BROWSER_VM_KERNEL", "bin/vmlinux"),
-            if platform.starts_with("darwin-") {
-                ("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd")
-            } else {
-                ("ELASTOS_BROWSER_VM_INITRD", "browser-vm/initrd")
-            },
+            ("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd"),
         ]
         .iter()
         .all(|(key, path)| env[*key].is_null() || path_matches(&env[*key], path))
@@ -237,14 +230,7 @@ fn browser_engine_config_uses_runtime_image(
                     "browser-vm-rootfs-manifest.json",
                 ),
                 ("ELASTOS_BROWSER_VM_KERNEL", "vmlinux"),
-                (
-                    if platform.starts_with("darwin-") {
-                        "ELASTOS_BROWSER_VM_INITRAMFS"
-                    } else {
-                        "ELASTOS_BROWSER_VM_INITRD"
-                    },
-                    "initrd",
-                ),
+                ("ELASTOS_BROWSER_VM_INITRAMFS", "initrd"),
             ]
             .iter()
             .all(|(key, file)| path_matches(&env[*key], &format!("browser-vm/image-set/{file}"))))
@@ -614,11 +600,8 @@ mod tests {
     }
 
     fn image_config(data: &FsPath, platform: &str) -> serde_json::Value {
-        let launcher = if platform.starts_with("darwin-") {
-            "browser-vz-engine-supervisor"
-        } else {
-            "browser-vm-local-crosvm-launcher"
-        };
+        let _ = platform;
+        let launcher = "browser-vz-engine-supervisor";
         json!({"adapters":[{"id":"local", "kind":"chromium_microvm", "supervisor":{
             "program":data.join("bin/browser-vm-engine-supervisor"), "env":{
                 "ELASTOS_BROWSER_VM_CONTROL_LAUNCHER":data.join("bin").join(launcher),
@@ -694,11 +677,7 @@ mod tests {
             assert!(browser_engine_config_uses_runtime_image(
                 &manual, data, "local", platform
             ));
-            let (key, path) = if platform.starts_with("darwin-") {
-                ("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd")
-            } else {
-                ("ELASTOS_BROWSER_VM_INITRD", "browser-vm/initrd")
-            };
+            let (key, path) = ("ELASTOS_BROWSER_VM_INITRAMFS", "bin/initrd");
             manual["adapters"][0]["supervisor"]["env"][key] = json!(data.join(path));
             assert!(browser_engine_config_uses_runtime_image(
                 &manual, data, "local", platform
@@ -726,14 +705,7 @@ mod tests {
                     "browser-vm-rootfs-manifest.json",
                 ),
                 ("ELASTOS_BROWSER_VM_KERNEL", "vmlinux"),
-                (
-                    if platform.starts_with("darwin-") {
-                        "ELASTOS_BROWSER_VM_INITRAMFS"
-                    } else {
-                        "ELASTOS_BROWSER_VM_INITRD"
-                    },
-                    "initrd",
-                ),
+                ("ELASTOS_BROWSER_VM_INITRAMFS", "initrd"),
             ] {
                 env[key] = json!(data.join("browser-vm/image-set").join(file));
             }

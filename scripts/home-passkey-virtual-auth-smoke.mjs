@@ -15,9 +15,10 @@ import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { browserOpenResponseEvidence } from "./lib/browser-open-failure.mjs";
 import { browserJourneyTargetConfig, readBrowserJourneyHealth, readBrowserJourneyReceipt,
-  browserJourneyEngineChoice, browserJourneyEngineRoute, browserJourneyFixtureUrl,
+  browserJourneyEngineChoice, browserJourneyEngineRoute, browserJourneyLocalVmRoute, browserJourneyFixtureUrl,
   browserJourneyProfileStorage, browserJourneyProfileBinding } from "./lib/browser-journey-target.mjs";
 import { installBrowserJourneyAudioProbe, controlledTonePresent } from "./lib/browser-journey-audio.mjs";
+import { browserJourneyFirstFrameProbe } from "./lib/browser-journey-timing.mjs";
 import { diagnoseBrowserJourneyRecovery } from "./lib/browser-journey-recovery.mjs";
 import { readBrowserPageStatus, isPageStatusTimeout } from "./lib/browser-journey-page-status.mjs";
 import { recoveredInputClickRect } from "./lib/browser-journey-recovered-input.mjs";
@@ -184,6 +185,7 @@ const BROWSER_OPERATOR_COORDS_PATH = process.env.HOME_VIRTUAL_AUTH_BROWSER_OPERA
 const CHECK_BROWSER_CONTROLLED_RECOVERY = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_RECOVERY === "1";
 const BROWSER_DEFER_SCROLL = process.env.HOME_VIRTUAL_AUTH_BROWSER_DEFER_SCROLL === "1";
 const CHECK_BROWSER_VIEWER_RELOAD = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_VIEWER_RELOAD === "1";
+const CHECK_BROWSER_PAGE_RELOAD = process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_PAGE_RELOAD === "1";
 const CHECK_BROWSER_RELOAD_CENSUS = process.env.HOME_VIRTUAL_AUTH_BROWSER_RELOAD_CENSUS === "1";
 const BROWSER_RELOAD_CENSUS_OUT = process.env.U9_RELOAD_CENSUS_OUT || "";
 const BROWSER_RELOAD_OBSERVE_MS = Number.parseInt(
@@ -194,6 +196,8 @@ const BROWSER_CONTROLLED_TURN_TEST_HOME = process.env.HOME_VIRTUAL_AUTH_BROWSER_
 const BROWSER_CONTROLLED_TURN_CONTROL_SOCKET =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_TURN_CONTROL_SOCKET || "";
 const REQUIRE_BROWSER_VZ_TRANSPORT = process.env.HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT === "1";
+const REQUIRE_BROWSER_VM_TRANSPORT = process.env.HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VM_TRANSPORT === "1";
+const browserHomeOpenTimes = new WeakMap();
 const BROWSER_JOURNEY_TARGET = CHECK_BROWSER_CONTROLLED_JOURNEY || process.env.HOME_VIRTUAL_AUTH_BROWSER_PROFILE_MODE ||
   process.env.HOME_VIRTUAL_AUTH_BROWSER_PROFILE_MARKER ? browserJourneyTargetConfig(process.env) : null;
 const CHECK_BROWSER_EMBEDDED_RECOVERY =
@@ -3282,6 +3286,21 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
       const decoded = await waitForJourneyEvidence(() => browserRemoteVideoMetrics(appFrame),
         value => value.decoded_frames > ready.decoded_frames && value.decoded_frames > 0,
         `${name} decoded WebRTC frame progress`, BROWSER_REMOTE_VIDEO_TIMEOUT_MS);
+      if (name === "main" && browserHomeOpenTimes.has(appFrame)) {
+        const opened = browserHomeOpenTimes.get(appFrame);
+        result.home_click_to_controlled_page_ms = Math.round(performance.now() - opened.monotonic);
+        const first = await appFrame.evaluate(() => window.__elastosBrowserFirstFrame);
+        assert(first?.presented_frames > 0 && first.width > 0 && first.height > 0 && first.observed_at >= opened.wall,
+          "Browser first-page timing requires its first presented WebRTC frame");
+        result.home_click_to_first_frame_ms = Math.round(first.observed_at - opened.wall);
+        result.first_frame = first;
+      }
+      if (REQUIRE_BROWSER_VM_TRANSPORT) {
+        const summary = await browserApi(appFrame, token,
+          `/api/apps/browser/summary?browser_instance=${encodeURIComponent(windowIdentity.instance)}`, { timeoutMs: 15_000 });
+        assert(summary.ok, "Controlled journey VM ownership summary is unavailable");
+        result.local_vm_route = browserJourneyLocalVmRoute(summary.body, status.page_id);
+      }
       const navigationStatus = await appFrame.locator("#browser-status").evaluate(node => ({
         visible: node.dataset.visible === "true",
         opening: /^Opening /.test(node.querySelector(".browser-status-message")?.textContent || ""),
@@ -3325,6 +3344,17 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
         "Engine page receives typed text");
       if (typed.length === 1) await stopInputObservation(false);
     }
+    const buttonReceipt = await waitForJourneyEvidence(readReceipt,
+      value => value.events.some(event => event.page === "nav" && event.type === "button_ready"),
+      "Engine page provides its test button");
+    const buttonRect = buttonReceipt.events.find(event => event.page === "nav" && event.type === "button_ready").input_rect;
+    const buttonPoint = await remoteVideoClickPositionForPagePoint(appFrame,
+      { x: buttonRect.x + buttonRect.width / 2, y: buttonRect.y + buttonRect.height / 2 });
+    assert(buttonPoint, "Controlled Browser button could not be mapped into the decoded video");
+    await appFrame.locator("#browser-remote-display").click({ position: { x: buttonPoint.x, y: buttonPoint.y } });
+    result.click = await waitForJourneyEvidence(readReceipt,
+      value => value.events.some(event => event.page === "nav" && event.type === "click" && event.value === text),
+      "Engine page receives its test button click");
     if (CHECK_BROWSER_CONTROLLED_INSPECTION) {
       markStage("browser:operator-inspection");
       const path = `/api/apps/browser/pages/${encodeURIComponent(current.page_id)}/inspect`;
@@ -3386,6 +3416,25 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
       const afterInput = await waitForJourneyEvidence(() => browserRemoteVideoMetrics(appFrame),
         value => value.decoded_frames > current.video.decoded.decoded_frames, "decoded frames after input");
       result.input = { text, receipt, video_after_input: afterInput };
+    }
+    if (CHECK_BROWSER_PAGE_RELOAD) {
+      markStage("browser:page-reload");
+      const sequence = (await readReceipt()).events.at(-1)?.sequence || 0;
+      const before = await browserRemoteVideoMetrics(appFrame);
+      await appFrame.locator("#browser-refresh").click();
+      const receipt = await waitForJourneyEvidence(readReceipt,
+        value => value.events.some(event => event.page === "nav" && event.type === "load" &&
+          event.sequence > sequence), "Engine page reload through Browser control");
+      const status = await browserApi(appFrame, token,
+        `/api/apps/browser/pages/${encodeURIComponent(current.page_id)}/status`);
+      assert(status.ok && status.body?.actual_url === current.url && status.body.direct_network === false,
+        "Browser page reload changed its page or Runtime network ownership", status);
+      const after = await waitForJourneyEvidence(() => browserRemoteVideoMetrics(appFrame),
+        value => value.decoded_frames > before.decoded_frames, "decoded WebRTC frames after page reload");
+      result.page_reload = { page_id: current.page_id, url: current.url,
+        load: receipt.events.find(event => event.page === "nav" && event.type === "load" && event.sequence > sequence),
+        video_before: before, video_after: after };
+      await checkProfileDocument("nav", current.page_id, sequence);
     }
     if (browserQualification) {
       result.qualification = await browserQualification.observe({ appFrame, pageId: current.page_id, readReceipt,
@@ -3490,9 +3539,10 @@ async function checkBrowserEmbeddedUiInput(page, baselineToken) {
     if (!/^\/api\/apps\/browser\/open(?:\/[^/]+)?$/.test(new URL(response.url()).pathname)) return;
     const evidence = await browserOpenResponseEvidence(response);
     const { body } = evidence;
-    if ((request.method() === "POST" && !response.ok()) ||
+    if ((["POST", "GET"].includes(request.method()) && !response.ok()) ||
       (body?.schema === "elastos.browser.open-status/v1" && body.status === "failed")) {
-      openFailures.push({ frame: request.frame(), open_id: body?.open_id || "",
+      const openId = body?.open_id || (request.method() === "GET" ? new URL(response.url()).pathname.split("/").at(-1) : "");
+      openFailures.push({ frame: request.frame(), open_id: openId,
         at: Date.now(), status: response.status(), ...evidence });
       if (openFailures.length > 8) openFailures.shift();
     }
@@ -3524,6 +3574,7 @@ async function checkBrowserEmbeddedUiInput(page, baselineToken) {
   page.on("response", captureWebrtcResponse);
   page.on("response", captureOpenFailure);
   markStage("browser:home-launch");
+  if (CHECK_BROWSER_CONTROLLED_JOURNEY) await page.addInitScript(browserJourneyFirstFrameProbe);
   let appFrame = null;
   let windowLocator = null;
   let windowIdentity = null;
@@ -4211,6 +4262,7 @@ async function openDesktopAppWindow(page, target, onFrame = null) {
   }
   if (target === "browser") {
     let handle;
+    let homeOpenStarted;
     if (CHECK_BROWSER_CONTROLLED_JOURNEY) {
       // Hidden leftovers stay unused. Home New Window creates the journey surface.
       await homeGuiFrame.locator("#identity-menu-show-desktop").evaluate(el => el.click()).catch(() => {});
@@ -4220,23 +4272,33 @@ async function openDesktopAppWindow(page, target, onFrame = null) {
           .map(frame => frame.getAttribute("src") || ""),
       );
       const shelf = homeGuiFrame.locator('#taskbar-targets [data-target="browser"]').first();
-      if (await shelf.count()) await shelf.click({ button: "right" });
-      else {
-        await homeGuiFrame.locator("#launcher-toggle").click();
-        await homeGuiFrame.locator('#launcher-grid [data-target="browser"]').first().click({ button: "right" });
+      if (priorSrcs.length === 0 && await shelf.count()) {
+        homeOpenStarted = { monotonic: performance.now(), wall: Date.now() };
+        await shelf.click();
+      } else {
+        if (await shelf.count()) await shelf.click({ button: "right" });
+        else {
+          await homeGuiFrame.locator("#launcher-toggle").click();
+          await homeGuiFrame.locator('#launcher-grid [data-target="browser"]').first().click({ button: "right" });
+        }
+        await homeGuiFrame.waitForFunction(() => {
+          const menu = document.querySelector("#desktop-context-menu");
+          return Boolean(menu && menu.hidden !== true &&
+            menu.querySelector('[data-context-action="open-target-new-window"], [data-context-action="open-target"]'));
+        }, null, { timeout: 5_000 }).catch(() => {
+          throw new Error("Home did not offer Browser Open or New Window");
+        });
+        const newWindow = homeGuiFrame.locator('#desktop-context-menu [data-context-action="open-target-new-window"]');
+        const ordinaryOpen = homeGuiFrame.locator('#desktop-context-menu [data-context-action="open-target"]');
+        if (await newWindow.count()) {
+          homeOpenStarted = { monotonic: performance.now(), wall: Date.now() };
+          await newWindow.click();
+        } else if (await ordinaryOpen.count()) {
+          homeOpenStarted = { monotonic: performance.now(), wall: Date.now() };
+          await ordinaryOpen.click();
+        }
+        else throw new Error("Home did not offer Browser Open or New Window");
       }
-      await homeGuiFrame.waitForFunction(() => {
-        const menu = document.querySelector("#desktop-context-menu");
-        return Boolean(menu && menu.hidden !== true &&
-          menu.querySelector('[data-context-action="open-target-new-window"], [data-context-action="open-target"]'));
-      }, null, { timeout: 5_000 }).catch(() => {
-        throw new Error("Home did not offer Browser Open or New Window");
-      });
-      const newWindow = homeGuiFrame.locator('#desktop-context-menu [data-context-action="open-target-new-window"]');
-      const ordinaryOpen = homeGuiFrame.locator('#desktop-context-menu [data-context-action="open-target"]');
-      if (await newWindow.count()) await newWindow.click();
-      else if (await ordinaryOpen.count()) await ordinaryOpen.click();
-      else throw new Error("Home did not offer Browser Open or New Window");
       await homeGuiFrame.waitForFunction(prior => {
         return [...document.querySelectorAll('section.window[data-target="browser"]:not(.hidden) iframe.window-frame')]
           .some(frame => {
@@ -4274,6 +4336,7 @@ async function openDesktopAppWindow(page, target, onFrame = null) {
     }
     const appFrame = handle ? await handle.contentFrame() : null;
     assert(appFrame, "Selected Home Browser window has no content frame");
+    if (homeOpenStarted !== undefined) browserHomeOpenTimes.set(appFrame, homeOpenStarted);
     if (onFrame) await onFrame(appFrame);
     const deadline = Date.now() + 20_000;
     while (Date.now() < deadline && !appFrame.url().includes("/apps/browser/")) await delay(100);

@@ -20,9 +20,18 @@ use elastos_common::{
     CapsuleManifest, CapsuleRole, CapsuleType, MicroVmConfig, Permissions, ResourceLimits,
     SCHEMA_V1,
 };
-use elastos_compute::{CapsuleHandle, ComputeProvider};
-use elastos_vz::{VmConfig, VzConfig, VzProvider};
+use elastos_compute::CapsuleHandle;
+#[cfg(not(target_os = "linux"))]
+use elastos_compute::ComputeProvider;
+#[cfg(not(target_os = "linux"))]
+use elastos_vz::VzProvider;
+use elastos_vz::{VmConfig, VzConfig};
+#[cfg(target_os = "linux")]
+#[path = "browser-vz-engine-supervisor/linux.rs"]
+mod linux;
 use hmac::{Hmac, Mac};
+#[cfg(target_os = "linux")]
+use linux::CrosvmBrowserProvider as VzProvider;
 use serde_json::{json, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -86,7 +95,7 @@ const VZ_AUTHORITY_BOOT_ARG_PREFIXES: [&str; 4] = [
 #[tokio::main]
 async fn main() {
     if std::env::args().nth(1).as_deref() == Some("--host-capabilities") {
-        let supported = elastos_vz::is_supported();
+        let supported = host_supported();
         let entitled = std::env::current_exe()
             .ok()
             .is_some_and(|path| verify_virtualization_entitlement(&path).is_ok());
@@ -105,6 +114,17 @@ async fn main() {
     if let Err(error) = run().await {
         emit_stderr_line(&error);
         process::exit(1);
+    }
+}
+
+fn host_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::host_supported()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        elastos_vz::is_supported()
     }
 }
 
@@ -681,10 +701,10 @@ async fn run() -> Result<(), String> {
         .ok_or_else(|| unbound_launch_error("Browser VM open request missing launch_request"))?;
     let transport = validate_launch_request(launch, request_from_stdin)?;
     let identity = VzLaunchIdentity::from_launch(launch);
-    if !elastos_vz::is_supported() {
+    if !host_supported() {
         return Err(did_not_act_settlement(
             &identity,
-            "browser-vz-engine-supervisor requires macOS arm64 with Apple Virtualization.framework",
+            "Browser requires Apple Virtualization on Mac, or KVM and vhost-vsock access on Linux",
         ));
     }
     trace_stage(
@@ -715,7 +735,12 @@ async fn run() -> Result<(), String> {
         ),
     );
     let manifest = browser_vm_manifest(paths.memory_mib, paths.vcpu_count);
-    let mut boot_args = "console=hvc0 reboot=k panic=1 root=/dev/vda rootfstype=ext4 rw init=/opt/elastos/bin/browser-vm-init random.trust_cpu=on".to_string();
+    let console = if cfg!(target_os = "linux") {
+        "ttyS0"
+    } else {
+        "hvc0"
+    };
+    let mut boot_args = format!("console={console} reboot=k panic=1 root=/dev/vda rootfstype=ext4 rw init=/opt/elastos/bin/browser-vm-init random.trust_cpu=on");
     if let Ok(override_args) = std::env::var("ELASTOS_BROWSER_VM_BOOT_ARGS") {
         if !override_args.trim().is_empty() {
             boot_args = override_args;
@@ -813,12 +838,15 @@ async fn run() -> Result<(), String> {
     );
 
     trace_stage("provider_init_start", "");
-    owner.provider = Some(Arc::new(post_effect_try!(VzProvider::new(
-        VzConfig::new()
-            .with_kernel_path(&owner.paths.kernel_path)
-            .with_state_dir(&owner.paths.state_dir)
-            .with_rootfs_cache_dir(&owner.paths.rootfs_cache_dir),
-    ))));
+    let provider_config = VzConfig::new()
+        .with_kernel_path(&owner.paths.kernel_path)
+        .with_state_dir(&owner.paths.state_dir)
+        .with_rootfs_cache_dir(&owner.paths.rootfs_cache_dir);
+    #[cfg(target_os = "linux")]
+    let provider_result = VzProvider::new(provider_config, owner.paths.socket_dir.clone());
+    #[cfg(not(target_os = "linux"))]
+    let provider_result = VzProvider::new(provider_config);
+    owner.provider = Some(Arc::new(post_effect_try!(provider_result)));
     let provider = Arc::clone(owner.provider.as_ref().expect("Browser VZ provider owner"));
     let init_provider = Arc::clone(&provider);
     post_effect_try!(
@@ -885,6 +913,24 @@ async fn run() -> Result<(), String> {
     );
     owner.handle = Some(post_effect_try!(loaded.into_handle()));
     let handle = owner.handle.as_ref().expect("Browser VZ VM owner").clone();
+    #[cfg(target_os = "linux")]
+    {
+        let mut locks = vec![post_effect_try!(owner
+            .profile_disk
+            .as_ref()
+            .expect("Browser profile owner")
+            ._lock
+            .file
+            .try_clone())];
+        if let Some(lock) = owner
+            .launch_rootfs
+            .as_ref()
+            .and_then(|rootfs| rootfs._lock.as_ref())
+        {
+            locks.push(post_effect_try!(lock.file.try_clone()));
+        }
+        post_effect_try!(provider.retain_writer_locks(&handle, locks));
+    }
     trace_stage("load_vm_done", "");
     trace_stage("start_vm_start", "");
     checkpoint!();
@@ -1022,16 +1068,7 @@ async fn run() -> Result<(), String> {
         &owner.transport,
         &guest_transport_receipt,
     ));
-    if let Some(display) = result
-        .get_mut("display_session")
-        .and_then(Value::as_object_mut)
-    {
-        display.remove("ice_servers");
-        display.insert(
-            "ice_connection_policy".to_string(),
-            json!("engine_relay_only"),
-        );
-    }
+    apply_engine_relay_policy(&mut result);
     trace_stage("open_guest_page_done", "");
 
     let readiness = post_effect_try!(serde_json::to_string(&result));
@@ -1084,6 +1121,20 @@ async fn run() -> Result<(), String> {
         .await;
     emit_stderr_line(&settlement);
     Ok(())
+}
+
+/// Both host adapters return the Runtime Engine relay contract.
+fn apply_engine_relay_policy(result: &mut Value) {
+    if let Some(display) = result
+        .get_mut("display_session")
+        .and_then(Value::as_object_mut)
+    {
+        display.remove("ice_servers");
+        display.insert(
+            "ice_connection_policy".to_string(),
+            json!("engine_relay_only"),
+        );
+    }
 }
 
 fn browser_vm_id(transport: &VzTransportLaunch) -> Result<String, String> {
@@ -2552,14 +2603,9 @@ fn preflight_turn_ports(transport: &VzTransportLaunch) -> Result<(), String> {
     let _listener =
         std::net::TcpListener::bind((bindings.listen_host.as_str(), bindings.listen_port))
             .map_err(|err| format!("Browser VZ TURN listen port is unavailable: {err}"))?;
-    let mut relay_tcp = Vec::new();
+    // TURN's TCP control listener carries UDP allocations; TCP relays are off.
     let mut relay_udp = Vec::new();
     for port in bindings.relay_min..=bindings.relay_max {
-        relay_tcp.push(
-            std::net::TcpListener::bind((bindings.relay_host.as_str(), port)).map_err(|err| {
-                format!("Browser VZ TURN relay TCP port {port} is unavailable: {err}")
-            })?,
-        );
         relay_udp.push(
             std::net::UdpSocket::bind((bindings.relay_host.as_str(), port)).map_err(|err| {
                 format!("Browser VZ TURN relay UDP port {port} is unavailable: {err}")
@@ -2614,14 +2660,8 @@ fn turn_relay_ports_absent(transport: &VzTransportLaunch) -> bool {
     let Ok(bindings) = turn_port_bindings(transport) else {
         return false;
     };
-    let mut tcp = Vec::new();
     let mut udp = Vec::new();
     for port in bindings.relay_min..=bindings.relay_max {
-        let Ok(tcp_listener) = std::net::TcpListener::bind((bindings.relay_host.as_str(), port))
-        else {
-            return false;
-        };
-        tcp.push(tcp_listener);
         let Ok(udp_socket) = std::net::UdpSocket::bind((bindings.relay_host.as_str(), port)) else {
             return false;
         };
@@ -2752,6 +2792,7 @@ struct LifetimeFileLock {
     file: File,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Drop for LifetimeFileLock {
     fn drop(&mut self) {
         let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
@@ -2788,7 +2829,10 @@ fn disk_lifetime_lock_path(disk_path: &Path) -> PathBuf {
 
 fn open_lifetime_lock(path: &Path, create: bool) -> Result<File, String> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true);
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW);
     if create {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -2796,6 +2840,10 @@ fn open_lifetime_lock(path: &Path, create: bool) -> Result<File, String> {
         options.create(true).mode(0o600);
     }
     let file = options.open(path).map_err(|err| err.to_string())?;
+    let metadata = file.metadata().map_err(|err| err.to_string())?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err("Browser lifetime lock requires a regular file with one link".into());
+    }
     if create {
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|err| err.to_string())?;
@@ -2911,6 +2959,9 @@ fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, St
             err
         )
     })?;
+    // Linux consumes the admitted guest's baked control service. The Mac
+    // overlay is separately shipped and remains part of that host's closure.
+    #[cfg(target_os = "macos")]
     overlay_guest_selkies_control_service(&launch_rootfs)?;
     overlay_guest_webrtc_send_diagnostic(&launch_rootfs)?;
     Ok(PreparedLaunchRootfs {
@@ -2919,6 +2970,7 @@ fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, St
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 const GUEST_SELKIES_CONTROL_SERVICE: &str = "/opt/elastos/bin/browser-selkies-control-service.mjs";
 const GUEST_GSTWEBRTC_APP: &str =
     "/usr/local/lib/python3.11/dist-packages/selkies_gstreamer/gstwebrtc_app.py";
@@ -2949,6 +3001,7 @@ fn find_debugfs_bin() -> Result<PathBuf, String> {
     Err("debugfs is required to overlay the guest Browser control service".to_string())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn host_selkies_control_service_path() -> Result<PathBuf, String> {
     if let Ok(explicit) = std::env::var("ELASTOS_BROWSER_SELKIES_CONTROL_SERVICE") {
         let path = PathBuf::from(explicit);
@@ -2972,6 +3025,7 @@ fn host_selkies_control_service_path() -> Result<PathBuf, String> {
     Err("Browser selkies control service source is missing".to_string())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn overlay_guest_selkies_control_service(rootfs: &Path) -> Result<(), String> {
     let source = host_selkies_control_service_path()?;
     let debugfs = find_debugfs_bin()?;
@@ -3168,9 +3222,26 @@ fn clone_or_copy_writable_rootfs(source: &Path, destination: &Path) -> std::io::
             .status(),
         Ok(status) if status.success()
     );
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let result = std::process::Command::new("/bin/cp")
+            .args(["--reflink=auto", "--sparse=always", "--"])
+            .arg(source)
+            .arg(destination)
+            .status()?;
+        if !result.success() {
+            let _ = fs::remove_file(destination);
+            return Err(std::io::Error::other(
+                "Browser sparse rootfs staging failed",
+            ));
+        }
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let cloned = false;
 
+    #[cfg(not(target_os = "linux"))]
     if !cloned {
         // A failed clone can leave a partial copy with the immutable seed mode.
         // Recreate the owned destination before the fallback opens it for writes.
@@ -3183,8 +3254,11 @@ fn clone_or_copy_writable_rootfs(source: &Path, destination: &Path) -> std::io::
     }
     // The seed can be immutable. Guest overlays and the writable VZ attachment
     // own only this launch's copy, including when cp preserves the seed mode.
-    fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
 }
 
 fn profile_disk_from_request(request: &Value) -> Result<(String, PathBuf), String> {
@@ -5028,6 +5102,22 @@ mod tests {
     }
 
     #[test]
+    fn linux_and_mac_launch_receipts_keep_engine_relay_authority_private() {
+        let mut result = json!({"display_session": {
+            "schema": "elastos.browser.display-session/v1", "mode": "webrtc_remote_display",
+            "offerer": "engine", "media_transport": "runtime_relay",
+            "ice_connection_policy": "runtime_launch_relay_only",
+            "ice_servers": [{"urls": ["turn:127.0.0.1:49186"], "username": "private", "credential": "private"}]
+        }});
+        apply_engine_relay_policy(&mut result);
+        let display = &result["display_session"];
+        assert_eq!(display["ice_connection_policy"], "engine_relay_only");
+        assert_eq!(display["media_transport"], "runtime_relay");
+        assert_eq!(display["offerer"], "engine");
+        assert!(display.get("ice_servers").is_none());
+    }
+
+    #[test]
     fn canonical_vz_launch_requires_complete_transport_before_effects() {
         let transport = transport_fixture('d');
         let launch = launch_for_transport(&transport);
@@ -5944,6 +6034,38 @@ mod tests {
             relays,
             "owned TURN relay port stayed occupied after release"
         );
+    }
+
+    #[test]
+    fn turn_port_proof_matches_udp_relays_and_tcp_control() {
+        let relay_tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let relay_port = relay_tcp.local_addr().unwrap().port();
+        let relay_udp = std::net::UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+        let control = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let control_port = control.local_addr().unwrap().port();
+        let mut transport = transport_fixture('p');
+        transport.authority["turn"]["listen_host"] = json!("127.0.0.1");
+        transport.authority["turn"]["listen_port"] = json!(control_port);
+        transport.authority["turn"]["relay_host"] = json!("127.0.0.1");
+        transport.authority["turn"]["relay_port_min"] = json!(relay_port);
+        transport.authority["turn"]["relay_port_max"] = json!(relay_port);
+        assert!(!turn_listener_port_absent(&transport));
+        assert!(!turn_relay_ports_absent(&transport));
+        drop(control);
+        assert!(preflight_turn_ports(&transport)
+            .unwrap_err()
+            .contains("relay UDP"));
+        drop(relay_udp);
+        // A TCP holder in the UDP-only relay range owns a different resource.
+        assert!(turn_relay_ports_absent(&transport));
+        assert!(turn_listener_port_absent(&transport));
+        assert!(preflight_turn_ports(&transport).is_ok());
+        let control = std::net::TcpListener::bind(("127.0.0.1", control_port)).unwrap();
+        assert!(!turn_listener_port_absent(&transport));
+        assert!(preflight_turn_ports(&transport)
+            .unwrap_err()
+            .contains("listen port"));
+        drop(control);
     }
 
     #[test]
@@ -7268,6 +7390,41 @@ mod tests {
             "disk inode should remain available to Virtualization.framework"
         );
         assert_eq!(unsafe { libc::flock(disk.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+
+    #[test]
+    fn lifetime_sidecar_rejects_symlink_and_hardlink_without_changing_target() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        fs::write(&original, b"preserve").unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = root.path().join("symlink");
+        std::os::unix::fs::symlink(&original, &link).unwrap();
+        assert!(open_lifetime_lock(&link, true).is_err());
+        let hardlink = root.path().join("hardlink");
+        fs::hard_link(&original, &hardlink).unwrap();
+        assert!(open_lifetime_lock(&hardlink, true).is_err());
+        assert_eq!(fs::metadata(&original).unwrap().mode() & 0o777, 0o644);
+        assert_eq!(fs::read(&original).unwrap(), b"preserve");
+        let owned = root.path().join("owned");
+        assert!(open_lifetime_lock(&owned, true).is_ok());
+        assert_eq!(fs::metadata(owned).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_rootfs_copy_preserves_holes_and_refuses_cp_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let seed = root.path().join("seed");
+        let source = File::create(&seed).unwrap();
+        source.set_len(16 * 1024 * 1024).unwrap();
+        let destination = root.path().join("copy");
+        clone_or_copy_writable_rootfs(&seed, &destination).unwrap();
+        let metadata = fs::metadata(&destination).unwrap();
+        assert_eq!(metadata.len(), 16 * 1024 * 1024);
+        assert!(metadata.blocks() * 512 < metadata.len());
+        assert!(clone_or_copy_writable_rootfs(root.path(), &destination).is_err());
+        assert!(!destination.exists());
     }
 
     #[test]

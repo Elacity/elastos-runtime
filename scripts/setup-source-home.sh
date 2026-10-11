@@ -827,12 +827,8 @@ install_browser_runtime_helpers() {
         "${DATA_DIR}/bin/browser-vm-remote-vz-launcher.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-vz-transport-bootstrap.mjs" \
         "${DATA_DIR}/scripts/browser-vm-vz-transport-bootstrap.mjs"
-    install -m 755 "${ROOT}/scripts/browser-vm-local-crosvm-launcher.mjs" \
-        "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-linux-network.py" \
         "${DATA_DIR}/scripts/browser-vm-linux-network.py"
-    install -m 755 "${ROOT}/scripts/browser-vm-prepare-rootfs-pool.mjs" \
-        "${DATA_DIR}/scripts/browser-vm-prepare-rootfs-pool.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-engine-preflight.sh" \
         "${DATA_DIR}/scripts/browser-vm-engine-preflight.sh"
     install -m 755 "${ROOT}/scripts/browser-vm-artifact-preflight.sh" \
@@ -857,20 +853,8 @@ set -euo pipefail
 exec "${NODE_BIN}" "${DATA_DIR}/bin/browser-vm-remote-vz-launcher.mjs" "\$@"
 EOF
     chmod 755 "${DATA_DIR}/bin/browser-vm-remote-vz-launcher"
-    cat > "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-exec "${NODE_BIN}" "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher.mjs" "\$@"
-EOF
-    chmod 755 "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher"
-    cat > "${DATA_DIR}/bin/browser-vm-prepare-rootfs-pool" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-exec "${NODE_BIN}" "${DATA_DIR}/scripts/browser-vm-prepare-rootfs-pool.mjs" "\$@"
-EOF
-    chmod 755 "${DATA_DIR}/bin/browser-vm-prepare-rootfs-pool"
 
-    if [[ "$(uname -s)" == "Darwin" ]]; then
+    if [[ "$PLATFORM" == darwin-arm64 || "$PLATFORM" == linux-* ]]; then
         local vz_supervisor="${DATA_DIR}/bin/browser-vz-engine-supervisor"
         local vz_release_bin
         local vz_debug_bin
@@ -883,7 +867,7 @@ EOF
             install -m 755 "${vz_debug_bin}" \
                 "${vz_supervisor}"
         fi
-        if [[ -x "${vz_supervisor}" ]]; then
+        if [[ "$PLATFORM" == darwin-arm64 && -x "${vz_supervisor}" ]]; then
             sign_browser_vz_supervisor "${vz_supervisor}"
         fi
     fi
@@ -911,13 +895,74 @@ for name in manifest["profiles"]["browser-host"]["components"]:
     if not stat.S_ISREG(path.lstat().st_mode):
         raise SystemExit(f"Browser helper {name} must be an installed regular file")
     content = path.read_bytes()
-    info.update(checksum="sha256:" + hashlib.sha256(content).hexdigest(), size=len(content))
+    info.update(checksum="sha256:" + hashlib.sha256(content).hexdigest(), size=len(content), strategy="prebuilt")
     if name not in selected:
         selected.append(name)
 manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 PY
     # Guest images are build outputs. Setup consumes the verified set and keeps
     # its bytes and receipt intact; guest changes go through the image builder.
+}
+
+retire_legacy_browser_runtime_turn() {
+    [[ "$PLATFORM" == linux-* ]] || return 0
+    DATA_DIR="$DATA_DIR" python3 - <<'PY'
+import os
+from pathlib import Path
+import select
+import signal
+import stat
+
+root = Path(os.environ['DATA_DIR'])
+pid_file = root / 'runtime-turn/turnserver.pid'
+if not pid_file.exists():
+    raise SystemExit(0)
+info = pid_file.lstat()
+if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+    raise SystemExit('Previous Browser TURN owner record requires repair before setup.')
+try:
+    pid = int(pid_file.read_text().strip())
+    if pid <= 1:
+        raise ValueError()
+except ValueError:
+    raise SystemExit('Previous Browser TURN owner record requires repair before setup.')
+if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+    raise SystemExit('Close the previous Browser TURN process before source-Home setup.')
+try:
+    fd = os.pidfd_open(pid)
+except ProcessLookupError:
+    pid_file.unlink()
+    raise SystemExit(0)
+try:
+    process = Path('/proc') / str(pid)
+    try:
+        args = (process / 'cmdline').read_bytes().split(b'\0')
+        owned = process.stat().st_uid == os.getuid()
+    except FileNotFoundError:
+        if not select.select([fd], [], [], 0)[0]:
+            raise SystemExit('Previous Browser TURN ownership requires repair before setup.')
+        owned = False
+        args = []
+    config = os.fsencode(root / 'runtime-turn/turnserver.conf')
+    configured = any(args[i:i+2] == [b'-c', config] for i in range(len(args))) or b'--config=' + config in args
+    if owned and configured:
+        try:
+            executable = (process / 'exe').resolve(strict=True)
+        except FileNotFoundError:
+            executable = None
+        if executable != (root / 'bin/turnserver').resolve() and not select.select([fd], [], [], 0)[0]:
+            raise SystemExit('Previous Browser TURN executable requires repair before setup.')
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # The exact pidfd owner has already completed cleanup.
+        if not select.select([fd], [], [], 4)[0]:
+            raise SystemExit('Previous Browser TURN cleanup is pending. Close it and repeat setup.')
+    # A stale PID belongs to another actor. Its process stays untouched.
+    pid_file.unlink()
+finally:
+    os.close(fd)
+PY
 }
 
 start_browser_runtime_turn() {
@@ -934,48 +979,16 @@ start_browser_runtime_turn() {
         echo "[setup-source-home] skip Browser runtime TURN relay: remote Browser VM control is preserved"
         return
     fi
-    if [[ "$PLATFORM" == "darwin-arm64" ]]; then
-        local vz_turn_program
-        vz_turn_program="$(find_vz_turn_program || true)"
-        if [[ -z "$vz_turn_program" ]]; then
-            echo "turnserver was not found; install coturn or set ELASTOS_BROWSER_VM_TURN_PROGRAM for launch-owned VZ TURN." >&2
+    if [[ "$PLATFORM" == "darwin-arm64" || "$PLATFORM" == linux-* ]]; then
+        local turn_program
+        turn_program="$(find_vz_turn_program || true)"
+        if [[ -z "$turn_program" ]]; then
+            echo "Browser requires its managed turnserver component." >&2
             exit 1
         fi
-        export ELASTOS_BROWSER_VM_TURN_PROGRAM="$vz_turn_program"
-        echo "[setup-source-home] configure launch-owned Browser VZ TURN"
-        return
+        export ELASTOS_BROWSER_VM_TURN_PROGRAM="$turn_program"
+        echo "[setup-source-home] configure launch-owned Browser TURN"
     fi
-    if [[ -n "${ELASTOS_BROWSER_VM_ICE_SERVER:-}" || -n "${ELASTOS_BROWSER_VM_ICE_SERVERS_JSON:-}" ]]; then
-        return
-    fi
-    local default_runtime_turn_env="${DATA_DIR}/runtime-turn/turn-credentials.env"
-    if [[ -n "${ELASTOS_BROWSER_RUNTIME_TURN_ENV:-}" && "${ELASTOS_BROWSER_RUNTIME_TURN_ENV}" != "${default_runtime_turn_env}" ]]; then
-        if [[ ! -f "${ELASTOS_BROWSER_RUNTIME_TURN_ENV}" ]]; then
-            echo "ELASTOS_BROWSER_RUNTIME_TURN_ENV does not exist: ${ELASTOS_BROWSER_RUNTIME_TURN_ENV}" >&2
-            exit 2
-        fi
-        echo "[setup-source-home] use existing Browser runtime TURN env: ${ELASTOS_BROWSER_RUNTIME_TURN_ENV}"
-        return
-    fi
-    if [[ "$PLATFORM" != linux-* && "$PLATFORM" != "darwin-arm64" ]]; then
-        return
-    fi
-    local turnserver_bin
-    turnserver_bin="$(find_turnserver || true)"
-    if [[ -z "$turnserver_bin" ]]; then
-        if [[ "$mode" == "1" ]]; then
-            echo "turnserver was not found; install coturn, set ELASTOS_BROWSER_VM_TURNSERVER_BIN, or set SETUP_SOURCE_HOME_RUNTIME_TURN=0 to skip Browser VM TURN setup." >&2
-            exit 1
-        fi
-        echo "[setup-source-home] skip Browser runtime TURN relay: turnserver not found"
-        return
-    fi
-    export ELASTOS_BROWSER_VM_TURNSERVER_BIN="$turnserver_bin"
-    echo "[setup-source-home] start Browser runtime TURN relay"
-    "${NODE_BIN}" "${ROOT}/scripts/browser-runtime-turn.mjs" \
-        --turnserver "$turnserver_bin" \
-        --data-dir "${DATA_DIR}"
-    export ELASTOS_BROWSER_RUNTIME_TURN_ENV="${DATA_DIR}/runtime-turn/turn-credentials.env"
 }
 
 existing_remote_browser_vm_config() {
@@ -1201,6 +1214,46 @@ for name in retained_providers:
     info.update(checksum=checksum, size=size, cid=cid)
     source_home_components.append(name)
 
+# A developer Home can retain the exact Browser packages previously admitted
+# into this data root. Runtime setup verifies their installed bytes/receipts
+# and initializes the same configuration used by ordinary installation.
+for name in ("node", "python3", "debugfs", "turnserver", "crosvm", "browser-vm-image"):
+    component = manifest.get("external", {}).get(name, {})
+    info = component.get("platforms", {}).get(platform)
+    prior_component = previous.get("external", {}).get(name, {})
+    prior = prior_component.get("platforms", {}).get(platform)
+    if not isinstance(info, dict) or not isinstance(prior, dict):
+        continue
+    relative = info.get("install_path", component.get("install_path"))
+    installed = data_dir / relative
+    if not installed.exists():
+        continue
+    if component.get("version") != prior_component.get("version") or any(
+        info.get(field) != prior.get(field)
+        for field in ("install_path", "release_path", "extract_path", "binary_path")
+    ):
+        raise SystemExit(f"{name} installed package belongs to different source inputs")
+    checksum, size = prior.get("checksum"), prior.get("size")
+    if (not isinstance(checksum, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", checksum)
+        or type(size) is not int or size <= 0
+        or prior.get("strategy") not in (None, "prebuilt", "browser-vm-image")):
+        raise SystemExit(f"{name} prior package lacks a verified artifact pin")
+    for field in ("checksum", "size", "cid"):
+        if info.get(field) not in (None, "", 0, prior.get(field)):
+            raise SystemExit(f"{name} source and installed {platform} pins conflict")
+    if name != "browser-vm-image":
+        marker = (installed / ".elastos-artifact-sha256").read_text().strip().removeprefix("sha256:")
+        if marker != checksum[7:]:
+            raise SystemExit(f"{name} installed archive receipt differs from its prior pin")
+        if prior.get("cid") and (installed / ".elastos-cid").read_text().strip() != prior["cid"]:
+            raise SystemExit(f"{name} installed CID receipt differs from its prior pin")
+    else:
+        if not isinstance(prior.get("cid"), str) or not prior["cid"]:
+            raise SystemExit("Browser image requires its admitted CID")
+    info.update({field: prior[field] for field in ("checksum", "size", "cid") if field in prior})
+    info["strategy"] = "browser-vm-image" if name == "browser-vm-image" else "prebuilt"
+    source_home_components.append(name)
+
 manifest.setdefault("profiles", {})["source-home"] = {
     "description": "Components built by setup-source-home.sh or retained with verified pins",
     "components": list(dict.fromkeys(source_home_components)),
@@ -1354,6 +1407,17 @@ prepare_media_provider_prerequisite() {
         --media-tools-dir "${SETUP_SOURCE_HOME_MEDIA_TOOLS_DIR}"
 }
 
+prepare_source_home_setup() (
+    # Runtime admits the source catalogue beside the final stamped manifest.
+    # The reviewed media pair was already prepared above with MustMatch trust.
+    setup_stage="$(mktemp -d "${DATA_DIR}/.source-home-setup.XXXXXX")"
+    trap 'rm -rf "${setup_stage}"' EXIT
+    install -m 600 "${DATA_DIR}/components.json" "${setup_stage}/components.json"
+    install -m 600 "${ROOT}/model-catalog.json" "${setup_stage}/model-catalog.json"
+    ELASTOS_COMPONENTS_MANIFEST="${setup_stage}/components.json" \
+        "$(source_home_runtime_bin)" setup --profile source-home --without media-provider
+)
+
 install_content_publish_backend() {
     local mode="${SETUP_SOURCE_HOME_INSTALL_KUBO:-auto}"
 
@@ -1426,8 +1490,8 @@ else
     "$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-server
 fi
 verify_collaboration_startup_config_input
-if [[ "$PLATFORM" == "darwin-arm64" ]]; then
-    echo "[setup-source-home] build Browser VZ engine supervisor"
+if [[ "$PLATFORM" == darwin-arm64 || "$PLATFORM" == linux-* ]]; then
+    echo "[setup-source-home] build Browser host engine supervisor"
     "$CARGO_BIN" build --locked --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-vz --bin browser-vz-engine-supervisor
 fi
 
@@ -1507,6 +1571,7 @@ for retired_provider in "${RETIRED_SOURCE_HOME_PROVIDER_BINARIES[@]}"; do
     rm -f "${DATA_DIR}/bin/${retired_provider}"
 done
 install_browser_runtime_helpers
+retire_legacy_browser_runtime_turn
 stamp_source_home_capsule_artifacts_manifest
 python3 "${ROOT}/scripts/components-release-integrity-check.py" \
     --manifest "${DATA_DIR}/components.json" \
@@ -1514,8 +1579,11 @@ python3 "${ROOT}/scripts/components-release-integrity-check.py" \
     --profile source-home \
     --source-root "${ROOT}" \
     --source-home-data-dir "${DATA_DIR}"
-start_browser_runtime_turn
-install_browser_source_home_config
+if [[ -n "${ELASTOS_BROWSER_VM_CONTROL_SOCKET:-}" || -n "${ELASTOS_BROWSER_VM_CONTROL_LAUNCHER:-}" ]]; then
+    start_browser_runtime_turn
+    install_browser_source_home_config
+fi
+prepare_source_home_setup
 install_collaboration_startup_config
 # On Linux cargo hardlinks target/release/elastos to its deps/ twin, and the
 # installer's artifact gate rejects any multi-link source (hardlink-swap

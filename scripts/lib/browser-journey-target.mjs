@@ -28,9 +28,10 @@ export function browserJourneyTargetConfig(env = {}) {
     assert(["write", "read"].includes(mode) && /^[A-Za-z0-9_-]{8,64}$/.test(marker),
       "Browser profile probe requires write/read mode and an 8..64 character safe marker");
     assert(env.HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_JOURNEY === "1" &&
-      env.HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT === "1" &&
+      (env.HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT === "1" ||
+        env.HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VM_TRANSPORT === "1") &&
       env.HOME_VIRTUAL_AUTH_BROWSER_PROFILE_RESET !== "1",
-    "Browser profile probe requires the controlled VZ journey with profile reset disabled");
+    "Browser profile probe requires the controlled VM journey with profile reset disabled");
   }
   return { origin, adminOrigin, engineId, allowRemote, ...(profile ? { profile: Object.freeze(profile) } : {}) };
 }
@@ -168,4 +169,16 @@ export function browserJourneyEngineRoute(summary, choice, pageId) {
   "Controlled Browser Runtime ownership used a different Engine or page");
   return { page_id: pageId, engine_id: choice.engineId, adapter_id: owner.engine_page.adapter,
     provider: owner.engine_page.provider };
+}
+
+export function browserJourneyLocalVmRoute(summary, pageId) {
+  const owner = summary?.sessions?.recoverable_page;
+  const choice = { engineId: owner?.service_selection?.engine_id, adapterId: owner?.engine_page?.adapter };
+  const route = browserJourneyEngineRoute(summary, choice, pageId);
+  const adapters = (summary.engine_adapter?.adapters || []).filter(adapter => adapter.id === route.adapter_id);
+  assert(adapters.length === 1 && adapters[0].engine === "chromium_microvm" &&
+    adapters[0].backing_substrate === "local_microvm" && adapters[0].direct_network === false &&
+    adapters[0].wallet_injection === false,
+  "Controlled journey requires Runtime's selected local VM Engine");
+  return route;
 }

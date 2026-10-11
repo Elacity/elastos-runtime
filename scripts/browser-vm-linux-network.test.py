@@ -50,8 +50,11 @@ class NetworkTest(unittest.TestCase):
         self.stack.enter_context(patch.object(network, 'boot_id', return_value='fixture-boot'))
         real_stat = network.os.stat
         self.stack.enter_context(patch.object(network.os, 'stat', side_effect=lambda p, **kw:
-            SimpleNamespace(st_mode=stat.S_IFCHR) if str(p) in ['/dev/kvm', '/dev/net/tun'] else real_stat(p, **kw)))
+            SimpleNamespace(st_mode=stat.S_IFCHR) if str(p) in ['/dev/kvm', '/dev/vhost-vsock', '/dev/net/tun'] else real_stat(p, **kw)))
         self.access = self.stack.enter_context(patch.object(network.os, 'access', return_value=True))
+        real_exists = Path.exists
+        self.stack.enter_context(patch.object(Path, 'exists', lambda p:
+            True if str(p) == '/dev/vhost-vsock' else real_exists(p)))
 
     def run_command(self, *args, **kwargs):
         self.calls.append(args)
@@ -275,6 +278,7 @@ class NetworkTest(unittest.TestCase):
         with patch.object(network, 'write_json') as receipt, patch.object(network.os, 'chown'), patch.object(network, 'trusted_path'):
             network.restore(user)
         self.assertIn(('setfacl', '-m', 'u:1001:rw', '/dev/kvm'), self.calls)
+        self.assertIn(('setfacl', '-m', 'u:1001:rw', '/dev/vhost-vsock'), self.calls)
         for n in self.pool:
             self.assertIn(('ip', 'addr', 'add', f"{n['hostIp']}/30", 'dev', n['tapName']), self.calls)
             self.assertIn(('ip', 'link', 'set', n['tapName'], 'up'), self.calls)
@@ -293,6 +297,19 @@ class NetworkTest(unittest.TestCase):
             network.restore(user)
         for n in self.pool:
             self.assertIn(('ip', 'tuntap', 'add', 'dev', n['tapName'], 'mode', 'tap', 'user', '1001'), self.calls)
+
+    def test_boot_restore_loads_vsock_before_restoring_user_access(self):
+        user = SimpleNamespace(pw_uid=self.uid, pw_gid=self.uid)
+        exists = Path.exists
+        with patch.object(Path, 'exists', lambda p:
+                False if str(p) == '/dev/vhost-vsock' else exists(p)), \
+                patch.object(network.shutil, 'which', return_value='/usr/sbin/modprobe'), \
+                patch.object(network, 'write_json'), patch.object(network.os, 'chown'), \
+                patch.object(network, 'trusted_path'):
+            network.restore(user)
+        module = self.calls.index(('modprobe', 'vhost_vsock'))
+        grant = self.calls.index(('setfacl', '-m', 'u:1001:rw', '/dev/vhost-vsock'))
+        self.assertLess(module, grant)
 
     def test_receipt_requires_root_ownership_and_protected_paths(self):
         for uid, mode in [(0, stat.S_IFREG | 0o644), (1001, stat.S_IFREG | 0o644),
@@ -313,7 +330,7 @@ class NetworkTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as output:
             network.main()
             configure.assert_not_called()
-            self.assertIn('KVM user ACL', output.getvalue())
+            self.assertIn('KVM and vhost-vsock user ACLs', output.getvalue())
             self.assertIn(self.pool[0]['tapName'], output.getvalue())
 
     def test_setup_and_removal_manage_only_the_account_state(self):
@@ -323,13 +340,19 @@ class NetworkTest(unittest.TestCase):
         udev_dir.mkdir()
         state_dir, helper = root / 'state', root / 'lib/network.py'
         user = SimpleNamespace(pw_uid=self.uid, pw_gid=self.uid, pw_name='elastos-agent')
+        legacy_rule = udev_dir / '70-elastos-browser-kvm-1001.rules'
+        legacy_rule.write_text('KERNEL=="kvm", RUN+="/usr/bin/setfacl -m u:1001:rw /dev/kvm"\n')
+        other_rule = udev_dir / '99-elastos-browser-kvm-1002.rules'
+        other_rule.write_text('other Home rule\n')
         def local_path(value):
             if str(value) == '/etc/systemd/system':
                 return unit_dir
             if str(value).startswith('/etc/udev/rules.d/'):
                 return udev_dir / Path(value).name
             return Path(value)
-        with patch.object(network, 'STATE', state_dir), patch.object(network, 'HELPER', helper), \
+        real_exists = Path.exists
+        with patch.object(Path, 'exists', lambda path: True if str(path) == '/dev/vhost-vsock' else real_exists(path)), \
+                patch.object(network, 'STATE', state_dir), patch.object(network, 'HELPER', helper), \
                 patch.object(network, 'Path', side_effect=local_path), patch.object(network, 'trusted_path'), \
                 patch.object(network.shutil, 'which', side_effect=lambda command: f'/usr/bin/{command}'), \
                 patch.object(network, 'restore') as restore, \
@@ -346,10 +369,17 @@ class NetworkTest(unittest.TestCase):
             self.assertIn('ExecStop=', unit.read_text())
             self.assertIn('ExecStopPost=', unit.read_text())
             self.assertIn('ExecReload=', unit.read_text())
-            self.assertIn('-m u:1001:rw /dev/kvm', next(udev_dir.iterdir()).read_text())
-            self.assertEqual(json.loads((state_dir / '1001.json').read_text()), {'previous_kvm_acl': None})
+            rule = udev_dir / '99-elastos-browser-kvm-1001.rules'
+            self.assertIn('-m u:1001:rw /dev/kvm', rule.read_text())
+            self.assertIn('-m u:1001:rw /dev/vhost-vsock', rule.read_text())
+            self.assertGreater(rule.name, '73-seat-late.rules')
+            self.assertFalse(legacy_rule.exists())
+            self.assertEqual(other_rule.read_text(), 'other Home rule\n')
+            self.assertEqual(json.loads((state_dir / '1001.json').read_text()), {'previous_kvm_acl': None, 'previous_vsock_acl': None})
+            self.assertNotIn(('modprobe', 'vhost_vsock'), self.calls)
             # Model setup failing after its state write but before unit write.
             unit.unlink()
+            legacy_rule.write_text('KERNEL=="kvm", RUN+="/usr/bin/setfacl -m u:1001:rw /dev/kvm"\n')
             def missing_unit(*args, **kwargs):
                 if args[:3] == ('systemctl', 'disable', '--now') and not kwargs.get('optional'):
                     raise RuntimeError('Unit file does not exist')
@@ -363,8 +393,9 @@ class NetworkTest(unittest.TestCase):
             with patch.object(network, 'run', side_effect=missing_unit), patch.object(Path, 'read_text', down_tap):
                 network.configure(user, remove=True)
             self.assertIn(('setfacl', '-x', 'u:1001', '/dev/kvm'), self.calls)
+            self.assertIn(('setfacl', '-x', 'u:1001', '/dev/vhost-vsock'), self.calls)
             self.assertFalse(unit.exists())
-            self.assertEqual(list(udev_dir.iterdir()), [])
+            self.assertEqual(list(udev_dir.iterdir()), [other_rule])
             self.assertEqual(list(state_dir.iterdir()), [])
             self.assertFalse(helper.exists())
             for n in self.pool:

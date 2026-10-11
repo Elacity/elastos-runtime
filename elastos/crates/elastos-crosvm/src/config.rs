@@ -337,11 +337,8 @@ impl VmConfig {
             args.push(pivot_root.to_string_lossy().into_owned());
         }
 
-        // Kernel boot parameters
-        if !self.boot_args.is_empty() {
-            args.push("-p".into());
-            args.push(self.boot_args.clone());
-        }
+        // RunningVm passes boot parameters through its private per-VM file.
+        // The public arguments contain only device and file descriptors.
 
         // Kernel image (positional, must be last)
         args.push(self.kernel_path.to_string_lossy().into_owned());
@@ -548,6 +545,8 @@ mod tests {
         assert!(args.contains(&"path=/path/to/rootfs.ext4,root=true".to_string()));
         assert!(args.contains(&"--pivot-root".to_string()));
         assert!(args.contains(&"/tmp/elastos/crosvm-empty".to_string()));
+        assert!(!args.contains(&"-p".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains("elastos.token=")));
         // Kernel path is last
         assert_eq!(args.last().unwrap(), "/path/to/vmlinux");
     }
@@ -598,6 +597,10 @@ mod tests {
         let config = config.with_session("test-token-123", "http://127.0.0.1:3000");
 
         assert!(config.boot_args.contains("elastos.token=test-token-123"));
+        assert!(!config
+            .to_crosvm_args()
+            .iter()
+            .any(|arg| arg.contains("test-token-123")));
         assert!(config
             .boot_args
             .contains("elastos.api=http://127.0.0.1:3000"));

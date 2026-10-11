@@ -68,7 +68,10 @@ ELASTOS_BROWSER_RUNTIME_TURN_ENV="$shared_turn_env" \
 ELASTOS_BROWSER_VZ_TURN_ADVERTISED_HOST="192.168.65.1" \
 ELASTOS_BROWSER_VZ_TURN_RELAY_HOST="192.168.65.1" \
 SETUP_SOURCE_HOME_CONFIG_ONLY=1 \
-  "$repo_root/scripts/setup-source-home.sh" >"$tmp_dir/setup-source-home.log"
+  "$repo_root/scripts/setup-source-home.sh" >"$tmp_dir/setup-source-home.log" || {
+    cat "$tmp_dir/setup-source-home.log" >&2
+    exit 1
+  }
 
 "$node_bin" - "$data_dir/config/browser-engine-adapter.json" "$data_dir" <<'NODE'
 const fs = require("node:fs");
@@ -135,9 +138,8 @@ if ((fs.statSync(process.argv[2]).mode & 0o077) !== 0) {
 NODE
 
 if [[ -e "$data_dir/runtime-turn/turn-credentials.env" ]]; then
-  echo "setup-source-home should use the explicit shared runtime TURN env instead of creating a local one" >&2
+  echo "Remote Engine selection owns TURN; this Home should preserve that selection" >&2
   exit 1
 fi
-grep -q "use existing Browser runtime TURN env" "$repo_root/scripts/setup-source-home.sh"
 
 printf '%s\n' '{"schema":"elastos.setup-source-home.browser-config-smoke/v1","ok":true}'

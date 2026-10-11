@@ -41,11 +41,17 @@ def identity(root=ROOT, source_ref=None, options=None):
             or any(not isinstance(value, str) or not value.strip() for value in options.values())
             or not options["cdp_timeout_ms"].isdigit() or int(options["cdp_timeout_ms"]) <= 0):
         raise ValueError("Guest recipe options are incomplete or invalid")
-    if options.get("target_platform") != "linux-arm64":
-        raise ValueError("The shared Browser guest requires linux-arm64")
+    if options.get("target_platform") not in ("linux-arm64", "linux-amd64"):
+        raise ValueError("Browser guest requires linux-arm64 or linux-amd64")
+    selected_inputs = tuple(name.replace("-lock.json", "-amd64-lock.json")
+                            if options["target_platform"] == "linux-amd64" and name.endswith("-lock.json")
+                            else name for name in INPUTS)
+    required_files = tuple(name.replace("-lock.json", "-amd64-lock.json")
+                           if options["target_platform"] == "linux-amd64" and name.endswith("-lock.json")
+                           else name for name in REQUIRED_FILES)
     command = (["git", "ls-tree", "-r", "--name-only", source_ref, "--"] if source_ref
                else ["git", "ls-files", "--"])
-    paths = subprocess.check_output(command + list(INPUTS), cwd=root, text=True).splitlines()
+    paths = subprocess.check_output(command + list(selected_inputs), cwd=root, text=True).splitlines()
     records = {}
     for name in sorted(paths):
         if "/tests/" in name or name.endswith(("-test.py", ".test.mjs")):
@@ -53,7 +59,7 @@ def identity(root=ROOT, source_ref=None, options=None):
         data = (subprocess.check_output(["git", "show", source_ref + ":" + name], cwd=root)
                 if source_ref else (root / name).read_bytes())
         records[name] = hashlib.sha256(data).hexdigest()
-    if any(name not in records for name in REQUIRED_FILES):
+    if any(name not in records for name in required_files):
         raise ValueError("Guest recipe inputs are incomplete")
     result = {"schema": "elastos.browser.vm-image-inputs/v1", "options": options, "files": records}
     encoded = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
@@ -67,7 +73,7 @@ def reusable(image, inputs):
     manifest = json.loads(receipt.read_bytes())
     if manifest.get("inputs_sha256") != inputs["sha256"]:
         return False
-    if manifest.get("ok") is not True or manifest.get("target_platform") != "linux-arm64":
+    if manifest.get("ok") is not True or manifest.get("target_platform") != inputs.get("options", DEFAULT_OPTIONS)["target_platform"]:
         raise ValueError("Matching guest inputs have an invalid build receipt")
     for name, record in (("rootfs.ext4", manifest), ("vmlinux", manifest["kernel"]),
                          ("initrd", manifest["initrd"])):

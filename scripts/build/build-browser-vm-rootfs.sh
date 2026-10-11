@@ -21,7 +21,7 @@ contract, then emits plain artifacts consumed by crosvm or Apple VZ:
 
 Options:
   --out-dir PATH              Build output directory
-  --target-platform PLATFORM  linux-arm64 (shared Mac/Jetson guest)
+  --target-platform PLATFORM  linux-arm64 (shared Mac/Jetson guest) or linux-amd64
   --rootfs-size SIZE          mke2fs image size (default: 4096M)
   --debian-suite SUITE        Debian suite (default: bookworm)
   --debian-mirror URL         Debian mirror (default: https://snapshot.debian.org/archive/debian/20261008T203843Z/)
@@ -75,7 +75,7 @@ done
 
 [[ -n "$out_dir" ]] || { usage >&2; exit 2; }
 
-python3 "$repo_root/scripts/build/browser-vm-debian.py" validate "$debian_suite" "$debian_mirror"
+python3 "$repo_root/scripts/build/browser-vm-debian.py" --target-platform "$target_platform" validate "$debian_suite" "$debian_mirror"
 
 image_inputs_args=(--target-platform "$target_platform" --rootfs-size "$rootfs_size"
   --debian-suite "$debian_suite" --debian-mirror "$debian_mirror" --image-dir "$out_dir")
@@ -226,10 +226,10 @@ as_root "$debootstrap_bin" \
 as_root mkdir -p "$rootfs_dir/opt"
 as_root cp -a "$selkies_source_dir/source" "$rootfs_dir/opt/selkies-build"
 # APT authenticates the frozen indexes with Debian archive keys.
-python3 "$repo_root/scripts/build/browser-vm-debian.py" sources | as_root tee "$rootfs_dir/etc/apt/sources.list" > /dev/null
+python3 "$repo_root/scripts/build/browser-vm-debian.py" --target-platform "$target_platform" sources | as_root tee "$rootfs_dir/etc/apt/sources.list" > /dev/null
 as_root rm -f "$rootfs_dir/etc/apt/sources.list.d/"*
-chromium_packages=$(python3 "$repo_root/scripts/build/browser-vm-debian.py" packages)
-python3 "$repo_root/scripts/build/browser-vm-debian.py" python-requirements | as_root tee "$rootfs_dir/opt/elastos-python-requirements.txt" > /dev/null
+chromium_packages=$(python3 "$repo_root/scripts/build/browser-vm-debian.py" --target-platform "$target_platform" packages)
+python3 "$repo_root/scripts/build/browser-vm-debian.py" --target-platform "$target_platform" python-requirements | as_root tee "$rootfs_dir/opt/elastos-python-requirements.txt" > /dev/null
 
 as_root mount -t proc proc "$rootfs_dir/proc"
 as_root mount -t sysfs sysfs "$rootfs_dir/sys"
@@ -320,7 +320,7 @@ printf '%s\n' "$@" > /opt/elastos-apt-packages
 apt-get install --download-only --no-install-recommends -y -qq "$@"
 SH
 # Verify the exact Chromium payloads before dpkg executes their contents.
-python3 "$repo_root/scripts/build/browser-vm-debian.py" verify-cache "$rootfs_dir/var/cache/apt/archives"
+python3 "$repo_root/scripts/build/browser-vm-debian.py" --target-platform "$target_platform" verify-cache "$rootfs_dir/var/cache/apt/archives"
 as_root chroot "$rootfs_dir" /usr/bin/env DEBIAN_FRONTEND=noninteractive /bin/sh <<'SH'
 set -eu
 xargs apt-get install --no-download --no-install-recommends -y -qq < /opt/elastos-apt-packages

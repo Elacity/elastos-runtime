@@ -61,6 +61,14 @@ pub(in crate::api::gateway) fn capsule_catalog_summary_for(
             capsule.launchable = false;
         }
     }
+    if !crate::setup::home_browser_available_for(data_dir, platform) {
+        for capsule in capsules
+            .iter_mut()
+            .filter(|capsule| capsule.name == "browser")
+        {
+            capsule.launchable = false;
+        }
+    }
     let model_catalog_state = match crate::api::capsule_inventory::model_catalog_entries(data_dir) {
         Ok(None) => "unconfigured",
         Ok(Some(entries))
