@@ -94,7 +94,8 @@ fn require_private_data_root_unix(data_dir: &Path) -> anyhow::Result<()> {
         }
         tracing::info!("Made the ElastOS data folder {shown} private (mode 0700)");
     }
-    remove_retired_local_ca(data_dir)
+    remove_retired_local_ca(&directory, data_dir);
+    Ok(())
 }
 
 /// Files of the local certificate authority that earlier releases created in
@@ -103,20 +104,27 @@ fn require_private_data_root_unix(data_dir: &Path) -> anyhow::Result<()> {
 #[cfg(unix)]
 const RETIRED_LOCAL_CA_FILES: &[&str] = &["ca.key", "ca.pem", "tls.key", "tls.pem", "tls.ips"];
 
+/// Removes each retired file by name inside the already-verified data root
+/// descriptor, so no path component is resolved again. unlinkat removes a
+/// link itself, never its target, and refuses directories. Failures are
+/// logged; they never stop startup.
 #[cfg(unix)]
-fn remove_retired_local_ca(data_dir: &Path) -> anyhow::Result<()> {
+fn remove_retired_local_ca(directory: &std::fs::File, data_dir: &Path) {
+    use std::os::fd::AsRawFd as _;
+
     for name in RETIRED_LOCAL_CA_FILES {
-        let path = data_dir.join(name);
-        match std::fs::symlink_metadata(&path) {
-            // unlink never follows a symlink, so a link is removed, not its target.
-            Ok(metadata) if !metadata.is_dir() => std::fs::remove_file(&path)
-                .map_err(|error| anyhow::anyhow!("cannot remove {}: {error}", path.display()))?,
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => anyhow::bail!("cannot inspect {}: {error}", path.display()),
+        let c_name = std::ffi::CString::new(*name).expect("static file name");
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), c_name.as_ptr(), 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    "could not remove the retired {} from {}: {error}",
+                    name,
+                    data_dir.display()
+                );
+            }
         }
     }
-    Ok(())
 }
 
 #[cfg(all(test, unix))]
