@@ -1385,6 +1385,23 @@ class UninstallTests(unittest.TestCase):
                     self.assertNotIn("disable", calls)
                     self.assertIn("belongs to another ElastOS data folder", result.stdout)
 
+    def test_install_and_uninstall_refuse_while_another_installation_changes_the_service(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            self.installed(sandbox)
+            unit = sandbox.home / ".config/systemd/user/elastos-home.service"
+            unit.parent.mkdir(parents=True)
+            unit.write_text(f'[Service]\nExecStart="{sandbox.runtime}" home --browser\n')
+            with open(unit.parent / ".elastos-home-service.lock", "w") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                before = sandbox.home_state()
+                result, _ = sandbox.run("--uninstall")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("changing Home's background service", result.stderr)
+                self.assertEqual(sandbox.home_state(), before)
+                calls = (sandbox.root / "service-calls").read_text()
+                self.assertNotIn(" stop ", calls)
+
     def test_linked_data_root_or_release_entry_refuses_before_stopping_anything(self):
         did, head, release = installable_fixture()
         entries = {"data root": "", "release entry": "bin", "release entry parent": "browser-vm"}

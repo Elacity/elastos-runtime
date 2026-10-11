@@ -431,6 +431,15 @@ fn verify_installed_binary_version_output(
 /// Restore an interrupted offline installation before opening release transport.
 /// Check-only callers retain their read-only behavior by omitting this hook.
 pub fn recover_pending_installation(data_dir: &Path) -> anyhow::Result<()> {
+    recover_pending_installation_with(data_dir, |binary| {
+        crate::home_service::UpdatePause::after_recovery(data_dir, binary)
+    })
+}
+
+fn recover_pending_installation_with<'a>(
+    data_dir: &Path,
+    home_service: impl FnOnce(&Path) -> anyhow::Result<Option<crate::home_service::UpdatePause<'a>>>,
+) -> anyhow::Result<()> {
     let sources = load_trusted_sources(data_dir)?;
     let Some(source) = sources.default_source() else {
         return Ok(());
@@ -441,8 +450,9 @@ pub fn recover_pending_installation(data_dir: &Path) -> anyhow::Result<()> {
         PathBuf::from(&source.install_path)
     };
     if InstallTransaction::has_pending_recovery(&binary) {
-        // Home's service stepped aside for this journal; start it once recovered.
-        let _home_service = crate::home_service::UpdatePause::after_recovery(data_dir, &binary)?;
+        // Home's service stepped aside for this journal; it starts once recovery
+        // has released the writer (dropped after the transaction below).
+        let _home_service = home_service(&binary)?;
         let transaction = InstallTransaction::acquire(data_dir, &binary)?;
         let _offline = crate::host_lock::acquire_host_process_lock(
             transaction.data_dir(),
@@ -482,14 +492,17 @@ pub fn install_release(
         .default_source()
         .context("installer trusted source is missing")?;
     crate::installed_release::admit_candidate(binary, source, &executable, &head, &release)?;
-    if let Some(link) = link {
-        anyhow::ensure!(
-            !std::fs::symlink_metadata(link).is_ok_and(|metadata| metadata.is_dir()),
-            "{} is a directory, not the elastos command; move it aside, then run the installer again; this installation was not changed.",
-            link.display()
-        );
-        require_runtime_directory(data_dir, binary)?;
-    }
+    let runtime_directory = match link {
+        Some(link) => {
+            anyhow::ensure!(
+                !std::fs::symlink_metadata(link).is_ok_and(|metadata| metadata.is_dir()),
+                "{} is a directory, not the elastos command; move it aside, then run the installer again; this installation was not changed.",
+                link.display()
+            );
+            Some(require_runtime_directory(data_dir, binary)?)
+        }
+        None => None,
+    };
     // A refused path must not gain an installation lock, so compare before taking it.
     let legacy = match installed_source(data_dir) {
         Some(current) => recorded_location(&current, binary, link)?,
@@ -502,6 +515,8 @@ pub fn install_release(
         .map(|legacy| recover_legacy_location(data_dir, legacy))
         .transpose()?;
     let mut transaction = InstallTransaction::acquire(data_dir, binary)?;
+    // The writer resolved the directory once; it must be the one checked above.
+    bound_runtime_directory(&transaction, runtime_directory)?;
     if transaction.restart_record_if_any()?.is_some()
         || crate::update_controller::has_queued_update(transaction.data_dir())?
     {
@@ -518,6 +533,7 @@ pub fn install_release(
         drop((offline, transaction));
         // Recovery keeps its journal's layout; the next writer selects the current one.
         transaction = InstallTransaction::acquire(data_dir, binary)?;
+        bound_runtime_directory(&transaction, runtime_directory)?;
     }
     if let Some(current) = installed_source(transaction.data_dir()) {
         recorded_location(&current, transaction.binary_path(), link)?;
@@ -543,12 +559,17 @@ pub fn install_release(
     if check {
         return Ok(());
     }
-    if link.is_some() {
-        // Checked again under the writer lock, right before the first write.
-        require_runtime_directory(data_dir, binary)?;
-    }
     let _offline =
         crate::host_lock::acquire_host_process_lock(transaction.data_dir(), "update", "offline")?;
+    // Again under both locks, right before the first write: the directory the
+    // writer resolved is still the real data/bin it was bound to.
+    bound_runtime_directory(&transaction, runtime_directory)?;
+    if runtime_directory.is_some() {
+        anyhow::ensure!(
+            Some(require_runtime_directory(data_dir, binary)?) == runtime_directory,
+            "the Runtime directory changed during installation; this installation was not changed."
+        );
+    }
     transaction.prepare(&[
         (ReleaseFile::RuntimeBinary, executable.as_slice()),
         (ReleaseFile::Sources, sources.as_slice()),
@@ -571,11 +592,15 @@ pub fn install_release(
 }
 
 /// The installer's Runtime directory is a real directory directly inside the data
-/// directory; a link there would make the writer install somewhere else.
-fn require_runtime_directory(data_dir: &Path, binary: &Path) -> anyhow::Result<()> {
+/// directory; a link there would make the writer install somewhere else. Returns
+/// its identity (device, inode), which the transaction is then bound to.
+fn require_runtime_directory(data_dir: &Path, binary: &Path) -> anyhow::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
     let parent = binary.parent().context("Runtime directory missing")?;
-    let real = std::fs::symlink_metadata(parent)
-        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+    let metadata = std::fs::symlink_metadata(parent).ok();
+    let real = metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
     let inside = parent.file_name() == Some(std::ffi::OsStr::new("bin"))
         && parent
             .parent()
@@ -586,6 +611,30 @@ fn require_runtime_directory(data_dir: &Path, binary: &Path) -> anyhow::Result<(
         "{} must be a real directory inside {}; move it aside, then run the installer again; this installation was not changed.",
         parent.display(),
         data_dir.display()
+    );
+    let metadata = metadata.unwrap();
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// The transaction's resolved Runtime directory is the validated one.
+fn bound_runtime_directory(
+    transaction: &InstallTransaction,
+    identity: Option<(u64, u64)>,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+    let parent = transaction
+        .binary_path()
+        .parent()
+        .context("Runtime directory missing")?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && (metadata.dev(), metadata.ino()) == identity,
+        "the Runtime directory changed during installation; this installation was not changed."
     );
     Ok(())
 }
@@ -4538,6 +4587,127 @@ mod tests {
                 );
                 assert_eq!(std::fs::read(&legacy).unwrap(), runtime("0.7.1"));
             }
+        }
+
+        #[tokio::test]
+        async fn a_runtime_directory_swapped_for_a_link_after_its_check_is_refused() {
+            let (fixture, data, _legacy) = migrated().await;
+            let binary = data.join("bin/elastos");
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            let checked = require_runtime_directory(&data, &binary).unwrap();
+            // Swapped after the check; the writer resolves the link once.
+            let outside = fixture.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::rename(data.join("bin"), fixture.path().join("moved-bin")).unwrap();
+            std::os::unix::fs::symlink(&outside, data.join("bin")).unwrap();
+            let transaction = InstallTransaction::acquire(&data, &binary).unwrap();
+            let error = bound_runtime_directory(&transaction, Some(checked)).unwrap_err();
+            assert!(
+                error.to_string().contains("Runtime directory changed"),
+                "{error:#}"
+            );
+            drop(transaction);
+            // Restoring a real directory with the same name is a different directory.
+            std::fs::remove_file(data.join("bin")).unwrap();
+            std::fs::create_dir(data.join("bin")).unwrap();
+            let restored = require_runtime_directory(&data, &binary).unwrap();
+            assert_ne!(restored, checked);
+        }
+
+        #[tokio::test]
+        async fn cli_recovery_starts_the_home_service_that_stepped_aside_after_releasing_the_writer(
+        ) {
+            use crate::home_service::{Manager, Platform, Spec, UpdatePause};
+            use std::os::unix::process::ExitStatusExt;
+
+            /// Stands in for systemctl: the unit is installed and stopped (it exited
+            /// for the pending journal); records each call with what it observed.
+            struct Recording {
+                binary: PathBuf,
+                writer: PathBuf,
+                calls: std::sync::Mutex<Vec<String>>,
+            }
+            impl Recording {
+                fn calls(&self) -> Vec<String> {
+                    self.calls
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                }
+            }
+            impl Manager for Recording {
+                fn run(
+                    &self,
+                    program: &str,
+                    args: &[&std::ffi::OsStr],
+                ) -> std::io::Result<std::process::Output> {
+                    let words: Vec<String> =
+                        args.iter().map(|a| a.to_string_lossy().into()).collect();
+                    let writer_free =
+                        crate::install_transaction::InstallationGuard::acquire(&self.writer)
+                            .is_ok();
+                    let call = format!(
+                        "{program} {} pending={} writer_free={writer_free}",
+                        words.join(" "),
+                        InstallTransaction::has_pending_recovery(&self.binary)
+                    );
+                    self.calls
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(call);
+                    let stdout = if words.get(1).map(String::as_str) == Some("show") {
+                        b"ActiveState=inactive\nSubState=dead\nNRestarts=0\nResult=success\n"
+                            .to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(std::process::Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout,
+                        stderr: Vec::new(),
+                    })
+                }
+            }
+
+            let (fixture, data, binary) = migrated().await;
+            let candidates = tempfile::tempdir().unwrap();
+            let interrupted = candidate(candidates.path(), &binary, "0.7.2", 7);
+            interrupt(&data, &binary, &interrupted, false);
+            assert!(InstallTransaction::has_pending_recovery(&binary));
+            let spec = Spec {
+                platform: Platform::Linux,
+                home: fixture.path().join("home"),
+                data_dir: data.clone(),
+                xdg_config_home: None,
+                xdg_data_home: None,
+                path: "/usr/bin:/bin".into(),
+                lang: None,
+            };
+            std::fs::create_dir_all(spec.definition().parent().unwrap()).unwrap();
+            std::fs::write(spec.definition(), spec.render().unwrap()).unwrap();
+            let manager = Recording {
+                binary: binary.clone(),
+                writer: std::fs::canonicalize(binary.parent().unwrap()).unwrap(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            };
+            recover_pending_installation_with(&data, |binary| {
+                UpdatePause::plan(spec.clone(), &manager, binary, false)
+            })
+            .unwrap();
+            assert!(!InstallTransaction::has_pending_recovery(&binary));
+            assert_eq!(std::fs::read(&binary).unwrap(), runtime("0.7.1"));
+            let calls = manager.calls();
+            assert!(
+                calls.contains(
+                    &"systemctl --user start elastos-home.service pending=false writer_free=true"
+                        .to_string()
+                ),
+                "{calls:#?}"
+            );
+            assert!(
+                !calls.iter().any(|call| call.contains(" stop ")),
+                "{calls:#?}"
+            );
         }
 
         #[tokio::test]

@@ -343,3 +343,28 @@ fn a_loaded_unit_of_another_data_folder_is_not_this_homes_service() {
     let service = Service::new(spec(Platform::MacOs, root.path(), "mine/elastos"), &manager);
     assert!(service.loaded_elsewhere());
 }
+
+#[test]
+fn a_service_change_in_progress_refuses_every_other_change() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = FakeManager::new(vec![]);
+    let service = Service::new(spec(Platform::Linux, root.path(), "mine/elastos"), &manager);
+    service.write_definition().unwrap();
+    let held = service.lock().unwrap();
+    for (name, result) in [
+        ("install", service.install()),
+        ("start", service.start()),
+        ("stop", service.stop()),
+        ("remove", service.remove()),
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("retry when it finishes"),
+            "{name}: {error:#}"
+        );
+    }
+    assert!(manager.calls.borrow().is_empty());
+    assert!(service.spec.definition().exists());
+    drop(held);
+    service.stop().unwrap();
+}

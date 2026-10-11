@@ -20,6 +20,8 @@ pub const LAUNCHD_LABEL: &str = "org.elastos.home";
 const READY_TIMEOUT: Duration = Duration::from_secs(150);
 /// Covers the gateway's 15 s drain plus its children; the unit stop timeout matches.
 const STOP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Beside the unit or agent; the installer uses the same name.
+pub const SERVICE_LOCK: &str = ".elastos-home-service.lock";
 
 /// True inside the service: no browser, no terminal text.
 pub fn service_mode() -> bool {
@@ -579,10 +581,38 @@ impl<'a> Service<'a> {
         }
     }
 
+    /// One lock beside the definition serializes every change to the shared
+    /// service name, from the ownership check to the last manager command. The
+    /// installer takes the same lock. A busy lock is refused, never waited for.
+    fn lock(&self) -> Result<crate::host_lock::FileLock> {
+        let definition = self.spec.definition();
+        let parent = definition
+            .parent()
+            .context("service definition parent missing")?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(parent)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(parent.join(SERVICE_LOCK))?;
+        crate::host_lock::FileLock::try_exclusive(file).map_err(|_| {
+            anyhow::anyhow!(
+                "another ElastOS installation is changing Home's background service; retry when it finishes"
+            )
+        })
+    }
+
     /// Writes the definition, registers it with the user's service manager and
     /// starts Home. On any failure the definition is removed again. A service of
     /// another data folder of this account is refused and left untouched.
     pub fn install(&self) -> Result<()> {
+        let _lock = self.lock()?;
         let definition = self.spec.definition();
         let foreign_file = fs::symlink_metadata(&definition).is_ok() && !self.installed();
         if foreign_file || self.loaded_elsewhere() {
@@ -593,13 +623,23 @@ impl<'a> Service<'a> {
         }
         let result = self.write_definition().and_then(|()| self.register());
         if let Err(error) = result {
-            let _ = self.remove();
+            let _ = self.remove_owned();
             return Err(error);
         }
         Ok(())
     }
 
+    /// Starts this data folder's service; another installation's is left alone.
     pub fn start(&self) -> Result<()> {
+        let _lock = self.lock()?;
+        anyhow::ensure!(
+            self.owned(),
+            "Home's background service belongs to another ElastOS data folder"
+        );
+        self.start_owned()
+    }
+
+    fn start_owned(&self) -> Result<()> {
         match self.spec.platform {
             Platform::Linux => {
                 // A failed start leaves a start-limit record that would refuse this one.
@@ -653,6 +693,14 @@ impl<'a> Service<'a> {
 
     /// Ordered stop: the controller stops Home and its children before it exits.
     pub fn stop(&self) -> Result<()> {
+        let _lock = self.lock()?;
+        if !self.owned() {
+            return Ok(());
+        }
+        self.stop_owned()
+    }
+
+    fn stop_owned(&self) -> Result<()> {
         match self.spec.platform {
             Platform::Linux => checked(
                 self.manager,
@@ -674,8 +722,16 @@ impl<'a> Service<'a> {
         }
     }
 
-    /// Stops and unregisters the service, then deletes its definition.
+    /// Stops and unregisters this data folder's service, then deletes its definition.
     pub fn remove(&self) -> Result<()> {
+        let _lock = self.lock()?;
+        if !self.installed() {
+            return Ok(());
+        }
+        self.remove_owned()
+    }
+
+    fn remove_owned(&self) -> Result<()> {
         let definition = self.spec.definition();
         match self.spec.platform {
             Platform::Linux => {
@@ -706,7 +762,7 @@ impl<'a> Service<'a> {
                 );
             }
             Platform::MacOs => {
-                self.stop()?;
+                self.stop_owned()?;
                 remove_file(&definition)?;
             }
         }
@@ -783,9 +839,12 @@ pub async fn live_home_url(data_dir: &Path) -> Option<String> {
 
 /// CLI updates replace the Runtime with the service stopped and start it again
 /// afterwards, also when the update fails and restores the previous release.
-pub struct UpdatePause {
+pub struct UpdatePause<'a> {
     spec: Spec,
+    manager: &'a (dyn Manager + Sync),
 }
+
+static SYSTEM_MANAGER: SystemManager = SystemManager;
 
 /// What a CLI update or recovery does with this data directory's service.
 #[derive(Debug, PartialEq, Eq)]
@@ -805,21 +864,21 @@ fn pause_plan(installed: bool, state: &State, pending: bool) -> PausePlan {
     }
 }
 
-impl UpdatePause {
+impl UpdatePause<'static> {
     /// Stops this installation's running service, or takes over the restart of a
     /// service that stopped for the pending journal at `binary`. Dropping the
     /// guard starts it, so declare it before the writer it outlives.
     pub fn begin(data_dir: &Path, binary: &Path) -> Result<Option<Self>> {
-        Self::plan(data_dir, binary, true)
+        Self::current(data_dir, binary, true)
     }
 
     /// Recovery never stops a running Home (its controller may own the journal);
     /// it only restarts a service that stepped aside for the journal.
     pub fn after_recovery(data_dir: &Path, binary: &Path) -> Result<Option<Self>> {
-        Self::plan(data_dir, binary, false)
+        Self::current(data_dir, binary, false)
     }
 
-    fn plan(data_dir: &Path, binary: &Path, stop_running: bool) -> Result<Option<Self>> {
+    fn current(data_dir: &Path, binary: &Path, stop_running: bool) -> Result<Option<Self>> {
         if service_mode() {
             return Ok(None);
         }
@@ -827,7 +886,23 @@ impl UpdatePause {
             return Ok(None);
         };
         let spec = Spec::current(platform, data_dir)?;
-        let service = Service::new(spec.clone(), &SystemManager);
+        Self::plan(spec, &SYSTEM_MANAGER, binary, stop_running)
+    }
+}
+
+impl<'a> UpdatePause<'a> {
+    pub(crate) fn plan(
+        spec: Spec,
+        manager: &'a (dyn Manager + Sync),
+        binary: &Path,
+        stop_running: bool,
+    ) -> Result<Option<Self>> {
+        if !spec.definition().exists() {
+            return Ok(None);
+        }
+        let service = Service::new(spec.clone(), manager);
+        // Held from the ownership check through the stop.
+        let _lock = service.lock()?;
         let installed = service.owned();
         let state = if installed {
             service.state()?
@@ -840,17 +915,19 @@ impl UpdatePause {
             PausePlan::StopThenStart if !stop_running => return Ok(None),
             PausePlan::StopThenStart => {
                 println!("  Stopping Home for the update...");
-                service.stop().context("stop Home before the update")?;
+                service
+                    .stop_owned()
+                    .context("stop Home before the update")?;
             }
             PausePlan::StartAfter => {}
         }
-        Ok(Some(Self { spec }))
+        Ok(Some(Self { spec, manager }))
     }
 }
 
-impl Drop for UpdatePause {
+impl Drop for UpdatePause<'_> {
     fn drop(&mut self) {
-        let service = Service::new(self.spec.clone(), &SystemManager);
+        let service = Service::new(self.spec.clone(), self.manager);
         match service.start() {
             Ok(()) => println!("  Home is starting again in the background."),
             Err(error) => eprintln!(

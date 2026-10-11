@@ -344,46 +344,60 @@ home_service_definition() {
 # The definition and the manager's loaded copy run this installation's Runtime
 # ($1). Another data folder's service of this account is never stopped or removed.
 home_service_owned() {
-    local runtime="$1" definition needle loaded
+    local runtime="$1" definition loaded
     definition="$(home_service_definition)"
     [[ -n "$definition" && -f "$definition" && ! -L "$definition" ]] || return 1
     case "$(uname -s)" in
         Linux)
-            needle="ExecStart=\"${runtime//[%]/%%}\" home --browser"
             loaded="$(systemctl --user show --property=LoadState,ExecStart elastos-home.service 2>/dev/null || true)"
             [[ "$loaded" != *LoadState=loaded* || "$loaded" == *"$runtime"* ]] || return 1
+            grep -qF -- "ExecStart=\"${runtime//[%]/%%}\" home --browser" "$definition"
             ;;
         Darwin)
-            # Paths with XML special characters never match: such a service is left alone.
-            needle="<string>${runtime}</string>"
             loaded="$(launchctl print "gui/$(id -u)/org.elastos.home" 2>/dev/null || true)"
-            [[ "$loaded" != *"program = "* || "$loaded" == *"$runtime"* ]] || return 1
+            [[ "$loaded" != *"program = "* || "$loaded" == *"program = $runtime"* ]] || return 1
+            # plutil decodes the property list, so XML-escaped paths compare exactly.
+            [[ "$(plutil -extract ProgramArguments.0 raw -o - "$definition" 2>/dev/null)" == "$runtime" ]]
             ;;
         *) return 1 ;;
     esac
-    grep -qF -- "$needle" "$definition"
 }
 
-# Stops this installation's service before its files change, so the service
-# manager does not restart Home while the installer replaces it.
-stop_home_service() {
+# Runs a command while holding the lock that serializes every change to Home's
+# background service; the Runtime takes the same lock. A busy lock is refused.
+with_home_service_lock() {
+    local definition
+    definition="$(home_service_definition)"
+    python3 - "$(dirname -- "$definition")/.elastos-home-service.lock" "$@" <<'PY_SERVICE_LOCK'
+import fcntl
+import os
+import subprocess
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+try:
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("Another ElastOS installation is changing Home's background service; retry when it finishes.",
+          file=sys.stderr)
+    sys.exit(75)
+sys.exit(subprocess.run(sys.argv[2:], stdin=subprocess.DEVNULL).returncode)
+PY_SERVICE_LOCK
+}
+
+# Under the service lock: check ownership again, then act.
+home_service_stop_owned() {
     home_service_owned "$1" || return 0
-    HOME_SERVICE_STOPPED=true
-    info "Stopping Home's background service..."
     case "$(uname -s)" in
         Linux) systemctl --user stop elastos-home.service >/dev/null 2>&1 || true ;;
         Darwin) launchctl bootout "gui/$(id -u)/org.elastos.home" >/dev/null 2>&1 || true ;;
     esac
 }
 
-remove_home_service() {
+home_service_remove_owned() {
     local definition
+    home_service_owned "$1" || return 0
     definition="$(home_service_definition)"
-    [[ -n "$definition" && -e "$definition" ]] || return 0
-    if ! home_service_owned "$1"; then
-        info "Home's background service belongs to another ElastOS data folder; left it unchanged."
-        return 0
-    fi
     case "$(uname -s)" in
         Linux)
             systemctl --user disable --now elastos-home.service >/dev/null 2>&1 || true
@@ -395,6 +409,32 @@ remove_home_service() {
             rm -f -- "$definition"
             ;;
     esac
+}
+
+# Stops this installation's service before its files change, so the service
+# manager does not restart Home while the installer replaces it. Fails only
+# when another installation is changing the service right now.
+stop_home_service() {
+    home_service_owned "$1" || return 0
+    HOME_SERVICE_STOPPED=true
+    info "Stopping Home's background service..."
+    with_home_service_lock "$BASH" -c "$(declare -f home_service_definition home_service_owned home_service_stop_owned)
+home_service_stop_owned \"\$1\"" service-stop "$1"
+}
+
+remove_home_service() {
+    local definition
+    definition="$(home_service_definition)"
+    [[ -n "$definition" && -e "$definition" ]] || return 0
+    if ! home_service_owned "$1"; then
+        info "Home's background service belongs to another ElastOS data folder; left it unchanged."
+        return 0
+    fi
+    if ! with_home_service_lock "$BASH" -c "$(declare -f home_service_definition home_service_owned home_service_remove_owned)
+home_service_remove_owned \"\$1\"" service-remove "$1"; then
+        warn "Home's background service was not removed; run the uninstall again"
+        return 0
+    fi
     ok "Removed Home's background service"
 }
 
@@ -1252,7 +1292,7 @@ uninstall_installation() {
     fi
     # The writer locks are held while this runs; see uninstall_files.
     local stop_script
-    stop_script="$(declare -f info home_service_definition home_service_owned stop_home_service installer_runtime_control)
+    stop_script="$(declare -f info home_service_definition home_service_owned with_home_service_lock home_service_stop_owned stop_home_service installer_runtime_control)
 $(cat <<'STOP_RUNTIME'
     stop_home_service "$1" || exit 1
     info "Stopping this installation's verified Runtime processes..."
@@ -1625,7 +1665,7 @@ INSTALL_RELEASE=("${TMP_INSTALL_BIN}" install-release --data-dir "$DATA_DIR"
 step 4 "Install"
 "${INSTALL_RELEASE[@]}" --check || die "This installation was not changed"
 
-stop_home_service "$RUNTIME_BIN"
+stop_home_service "$RUNTIME_BIN" || die "This installation was not changed"
 info "Stopping verified Runtime processes for this installation so the new version can be installed..."
 # An installation from before 0.8 runs its Runtime from the elastos command path.
 RECORDED_BIN="$(recorded_runtime "$DATA_DIR")"
