@@ -6,7 +6,7 @@
 //! Kubo API authority.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
@@ -20,14 +20,23 @@ const DEFAULT_MAX_GRAPH_BYTES: usize = 64 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_COORD_BYTES: u64 = 64 * 1024;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CoordFile {
     kubo_pid: u32,
     api_port: u16,
     gateway_port: u16,
     started_at: u64,
     last_used: u64,
+    /// Bearer secret Kubo's API requires (`API.Authorizations`).
+    api_secret: String,
+}
+
+/// Kubo API base URL and the Authorization header value it requires.
+struct KuboApi {
+    url: String,
+    authorization: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,7 +128,7 @@ impl ContentBlockGraphProvider {
                 "schema": GRAPH_SCHEMA,
                 "backend": self.backend_status(),
                 "operations": ["export_graph", "import_graph", "status"],
-                "status": if self.kubo_api_url().is_ok() {
+                "status": if self.kubo_api().is_ok() {
                     "ready"
                 } else {
                     "backend_not_configured"
@@ -167,7 +176,7 @@ impl ContentBlockGraphProvider {
             "version": PROVIDER_VERSION,
             "schema": GRAPH_SCHEMA,
             "backend": self.backend_status(),
-            "status": if self.kubo_api_url().is_ok() {
+            "status": if self.kubo_api().is_ok() {
                 "ready"
             } else {
                 "backend_not_configured"
@@ -323,7 +332,7 @@ impl ContentBlockGraphProvider {
         }
     }
 
-    fn kubo_api_url(&self) -> Result<String, String> {
+    fn kubo_api(&self) -> Result<KuboApi, String> {
         let coord = read_coord_file(&self.data_dir).ok_or_else(|| {
             format!(
                 "Kubo coord file missing at {}; start ipfs-provider before block graph repair",
@@ -333,12 +342,17 @@ impl ContentBlockGraphProvider {
         if coord.api_port == 0 {
             return Err("Kubo coord file has no API port".to_string());
         }
-        Ok(format!("http://127.0.0.1:{}", coord.api_port))
+        Ok(KuboApi {
+            url: format!("http://127.0.0.1:{}", coord.api_port),
+            authorization: format!("Bearer {}", coord.api_secret),
+        })
     }
 
     fn kubo_dag_export(&self, cid: &str) -> Result<Vec<u8>, String> {
-        let url = format!("{}/api/v0/dag/export?arg={}", self.kubo_api_url()?, cid);
+        let api = self.kubo_api()?;
+        let url = format!("{}/api/v0/dag/export?arg={}", api.url, cid);
         let response = ureq::post(&url)
+            .set("Authorization", &api.authorization)
             .timeout(LARGE_HTTP_TIMEOUT)
             .call()
             .map_err(|err| format!("kubo dag export failed: {err}"))?;
@@ -359,7 +373,7 @@ impl ContentBlockGraphProvider {
     }
 
     fn kubo_dag_import_and_pin(&self, cid: &str, car: &[u8]) -> Result<(), String> {
-        let api_url = self.kubo_api_url()?;
+        let api = self.kubo_api()?;
         let boundary = format!("----elastos-block-graph-{}", now_unix_secs());
         let mut body = Vec::new();
         write!(body, "--{boundary}\r\n").unwrap();
@@ -372,8 +386,9 @@ impl ContentBlockGraphProvider {
         body.extend_from_slice(car);
         write!(body, "\r\n--{boundary}--\r\n").unwrap();
 
-        let import_url = format!("{api_url}/api/v0/dag/import?pin-roots=true");
+        let import_url = format!("{}/api/v0/dag/import?pin-roots=true", api.url);
         let response = ureq::post(&import_url)
+            .set("Authorization", &api.authorization)
             .set(
                 "Content-Type",
                 &format!("multipart/form-data; boundary={boundary}"),
@@ -388,8 +403,9 @@ impl ContentBlockGraphProvider {
             ));
         }
 
-        let pin_url = format!("{api_url}/api/v0/pin/add?arg={cid}");
+        let pin_url = format!("{}/api/v0/pin/add?arg={cid}", api.url);
         let pin_response = ureq::post(&pin_url)
+            .set("Authorization", &api.authorization)
             .timeout(HTTP_TIMEOUT)
             .call()
             .map_err(|err| format!("kubo pin after dag import failed: {err}"))?;
@@ -449,10 +465,101 @@ fn coord_file_path(data_dir: &Path) -> PathBuf {
     data_dir.join("ipfs-coords.json")
 }
 
+// ipfs-coords.json carries the Kubo API secret. ipfs-provider writes it as a
+// new owner-only file renamed into place; it is trusted only when it is a
+// regular file owned by this user with mode 0600.
 fn read_coord_file(data_dir: &Path) -> Option<CoordFile> {
-    let path = coord_file_path(data_dir);
-    let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    #[cfg(unix)]
+    let owner = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let owner = 0;
+    read_private_coord(&coord_file_path(data_dir), owner)
+}
+
+fn read_private_coord(path: &Path, owner: u32) -> Option<CoordFile> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let private =
+            |m: &fs::Metadata| m.is_file() && m.mode() & 0o777 == 0o600 && m.uid() == owner;
+        if !private(&metadata) {
+            return None;
+        }
+        let file = options.custom_flags(libc::O_NOFOLLOW).open(path).ok()?;
+        if !private(&file.metadata().ok()?) {
+            return None;
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let _ = owner;
+        options.open(path).ok()?
+    };
+    let mut data = Vec::new();
+    file.take(MAX_COORD_BYTES + 1).read_to_end(&mut data).ok()?;
+    if data.len() as u64 > MAX_COORD_BYTES {
+        return None;
+    }
+    let coord: CoordFile = serde_json::from_slice(&data).ok()?;
+    let secret_ok = coord.api_secret.len() == 64
+        && coord
+            .api_secret
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    secret_ok.then_some(coord)
+}
+
+/// Writes a new owner-only file beside `path`, syncs it and renames it over
+/// `path`. Neither the temporary name nor an existing link is followed.
+fn write_private_file_atomically(path: &Path, data: &[u8]) -> io::Result<()> {
+    let refused = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
+    let parent = path
+        .parent()
+        .ok_or_else(|| refused("private file path has no parent"))?;
+    if !fs::symlink_metadata(parent)?.file_type().is_dir() {
+        return Err(refused("private file parent must be a real directory"));
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.file_type().is_file() {
+            return Err(refused("private file target must be a regular file"));
+        }
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| refused("private file name is invalid"))?;
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    let nonce: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+    let temporary = parent.join(format!(".{name}.{nonce}.tmp"));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn update_coord_last_used(data_dir: &Path) {
@@ -460,19 +567,8 @@ fn update_coord_last_used(data_dir: &Path) {
         return;
     };
     coord.last_used = now_unix_secs();
-    let path = coord_file_path(data_dir);
-    let Ok(json) = serde_json::to_string_pretty(&json!({
-        "kubo_pid": coord.kubo_pid,
-        "api_port": coord.api_port,
-        "gateway_port": coord.gateway_port,
-        "started_at": coord.started_at,
-        "last_used": coord.last_used,
-    })) else {
-        return;
-    };
-    let tmp = path.with_extension("tmp");
-    if fs::write(&tmp, json).is_ok() {
-        let _ = fs::rename(tmp, path);
+    if let Ok(json) = serde_json::to_vec_pretty(&coord) {
+        let _ = write_private_file_atomically(&coord_file_path(data_dir), &json);
     }
 }
 
@@ -543,6 +639,135 @@ mod tests {
         assert!(validate_cid("").is_err());
         assert!(validate_cid("../secret").is_err());
         assert!(validate_cid("bafy cid").is_err());
+    }
+
+    const FIXTURE_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn write_fixture_coord(data_dir: &Path, api_port: u16) {
+        let coord = CoordFile {
+            kubo_pid: std::process::id(),
+            api_port,
+            gateway_port: 0,
+            started_at: 1,
+            last_used: 1,
+            api_secret: FIXTURE_SECRET.to_string(),
+        };
+        write_private_file_atomically(
+            &coord_file_path(data_dir),
+            &serde_json::to_vec(&coord).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn coord_reader_trusts_only_private_current_coordinates() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let data_dir = temp_dir("private-coord");
+        let path = coord_file_path(&data_dir);
+        let previous = unsafe { libc::umask(0o022) };
+        write_fixture_coord(&data_dir, 5001);
+        unsafe { libc::umask(previous) };
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            read_coord_file(&data_dir).unwrap().api_secret,
+            FIXTURE_SECRET
+        );
+        // Another owner's file is not trusted even when it is private.
+        let owner = unsafe { libc::geteuid() };
+        assert!(read_private_coord(&path, owner + 1).is_none());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_coord_file(&data_dir).is_none());
+        // A refresh never rewrites coordinates it does not trust.
+        update_coord_last_used(&data_dir);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+
+        let target = data_dir.join("elsewhere.json");
+        fs::rename(&path, &target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_coord_file(&data_dir).is_none());
+        assert!(write_private_file_atomically(&path, b"{}").is_err());
+        fs::remove_file(&path).unwrap();
+
+        // Coordinates from before the API secret existed name no usable backend.
+        write_private_file_atomically(
+            &path,
+            br#"{"kubo_pid":1,"api_port":5001,"gateway_port":0,"started_at":1,"last_used":1}"#,
+        )
+        .unwrap();
+        assert!(read_coord_file(&data_dir).is_none());
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn export_graph_sends_the_kubo_api_secret_and_keeps_it_on_refresh() {
+        use std::io::{BufRead as _, BufReader};
+        use std::os::unix::fs::MetadataExt;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(err) => panic!("export never reached the Kubo API fixture: {err}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                headers.push(line.trim_end().to_ascii_lowercase());
+            }
+            let authorized = headers.contains(&format!("authorization: bearer {FIXTURE_SECRET}"));
+            let response: &[u8] = if authorized {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\ncar"
+            } else {
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            };
+            (&socket).write_all(response).unwrap();
+            headers
+        });
+        let data_dir = temp_dir("export-auth");
+        write_fixture_coord(&data_dir, port);
+        let provider = ContentBlockGraphProvider {
+            data_dir: data_dir.clone(),
+            ..Default::default()
+        };
+        let response = provider.export_graph(GraphRequest {
+            cid: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".to_string(),
+            schema: Some(GRAPH_SCHEMA.to_string()),
+            repair_graph_kind: Some("ipld_dag".to_string()),
+            availability_requirements: Value::Null,
+            policy: None,
+            object_did: None,
+            publisher_did: None,
+            _runtime_invocation: None,
+            _runtime_transfer: None,
+        });
+        let headers = server.join().unwrap();
+        assert_eq!(response["status"], "ok", "{response} {headers:?}");
+        assert_eq!(response["data"]["graph"]["car"], BASE64.encode(b"car"));
+        let coord = read_coord_file(&data_dir).unwrap();
+        assert!(coord.last_used > 1);
+        assert_eq!(coord.api_secret, FIXTURE_SECRET);
+        assert_eq!(
+            fs::metadata(coord_file_path(&data_dir)).unwrap().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(&data_dir);
     }
 
     #[test]

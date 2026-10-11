@@ -41,6 +41,8 @@ name = "content-block-graph-provider"
 version = "0.1.0"
 dependencies = [
  "base64 0.21.7",
+ "getrandom",
+ "libc",
  "serde",
  "serde_json",
  "ureq",
