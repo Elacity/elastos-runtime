@@ -1,0 +1,55 @@
+# Issue #345: two Homes behind separate NATs reach each other by node ID
+# alone through the seed's relay and exchange Chat messages both ways.
+name: Carrier NAT Linux
+
+on:
+  pull_request:
+    # scripts/ci-release-policy-test.py requires every repository input the
+    # nat job's scripts call to match these paths.
+    paths:
+      - .github/workflows/carrier-nat-linux.yml
+      - rust-toolchain.toml
+      - .cargo/config.toml
+      - elastos/Cargo.toml
+      - elastos/Cargo.lock
+      - elastos/crates/elastos-server/Cargo.toml
+      - elastos/crates/elastos-server/src/carrier*.rs
+      - elastos/crates/elastos-server/src/sources.rs
+      - elastos/crates/elastos-server/src/operator_control.rs
+      - scripts/carrier-nat-test.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: carrier-nat-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '4'
+
+jobs:
+  nat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: 1.91.0
+      - name: build the Carrier test binary from this source
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path elastos/Cargo.toml -p elastos-server --lib --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .target.kind == ["lib"]) | .executable' > "$RUNNER_TEMP/carrier-test-bin"
+          test -x "$(cat "$RUNNER_TEMP/carrier-test-bin")"
+      - name: two Homes behind separate NATs and one relay
+        timeout-minutes: 10
+        run: sudo scripts/carrier-nat-test.sh "$(cat "$RUNNER_TEMP/carrier-test-bin")"
