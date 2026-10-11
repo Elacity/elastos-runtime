@@ -27,23 +27,25 @@ class UpstreamTest(unittest.TestCase):
             archive = Path(scratch) / "source.tar.gz"
             archive.write_bytes(self.tar([(name, 'file')]))
             members = upstream.archive_members(archive, 'tar.gz', 'fixture', 4096,
-                                               source_archive=True)
+                                               source_archive="build")
             self.assertIn(name, members)
             with tarfile.open(archive) as source:
                 self.assertEqual(source.extractfile(members[name]['source']).read(), b'payload')
             with self.assertRaises(ValueError):
                 upstream.archive_members(archive, 'tar.gz', 'fixture', 4096)
+            with self.assertRaises(ValueError):
+                upstream.archive_members(archive, 'tar.gz', 'fixture', 4096, source_archive=True)
             archive.write_bytes(self.tar([(name, 'file'),
                                           ('fixture/alias', 'symlink', '../outside props.json')]))
             with self.assertRaises(ValueError):
-                upstream.archive_members(archive, 'tar.gz', 'fixture', 4096, source_archive=True)
+                upstream.archive_members(archive, 'tar.gz', 'fixture', 4096, source_archive="build")
         for path in ('fixture/../full props.json', '/fixture/full props.json',
                      'fixture/ full props.json', 'fixture/full props.json ',
                      'fixture/ spaced/file.json', 'fixture/spaced /file.json',
                      'fixture/full\tprops.json', 'fixture/full\nprops.json',
                      'fixture/full\u00a0props.json', 'fixture/full\\props.json'):
             with self.subTest(path=path), self.assertRaises(ValueError):
-                upstream.relative(path, source_archive=True)
+                upstream.relative(path, source_archive="build")
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
