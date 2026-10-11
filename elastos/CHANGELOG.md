@@ -6,6 +6,41 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Added
+
+- docs/INSTALL.md describes how to reach Home from a phone: your own HTTPS
+  address in front of the loopback gateway, `gateway_allowed_hosts`, and an
+  owner passkey created at that address.
+
+### Removed
+
+- `elastos tls trust` and `elastos tls regen`.
+- The Runtime no longer changes file owners when it is started with sudo.
+
+### Security
+
+- The data folder is private to your account. ElastOS creates it with mode
+  0700 and makes an existing folder 0700 each time it starts, including folders
+  from earlier releases. It stops only when the folder is a link, belongs to
+  another account or can be changed by every account, and says what to run.
+- Files that let a command attach to the running Runtime are written owner-only
+  (0600) in one step and are read only when they belong to your account.
+  Older ones are made owner-only when read. The capability signing key is
+  replaced in one step when it is rotated.
+- ElastOS web listeners use `127.0.0.1` unless you pass another `--addr`:
+  `serve`, `room open`, `node room open` and `gateway --public` now default to
+  loopback. A microVM with a guest network reaches the Runtime on its own link
+  address only. Carrier's authenticated UDP port 4433 is the only listener on
+  all interfaces; docs/INSTALL.md explains why.
+- Kubo listens only on 127.0.0.1, has no swarm listener and opens no UDP
+  sockets; mDNS, router port mapping, relays and telemetry are off. Its API
+  requires a secret kept in the owner-only `ipfs-coords.json`. Library and
+  Documents publishing work as before; Kubo from an earlier release is
+  restarted with these settings when it is next used.
+- ElastOS no longer creates a local certificate authority, and removes the one
+  earlier releases left in the data folder. If you trusted it, you can remove it
+  from your trust store.
+
 ## [0.8.0-alpha.15]
 
 Test-channel release. Signed releases show these notes in System before you update.

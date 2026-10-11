@@ -459,7 +459,7 @@ The trusted orchestration layer around Carrier. Manages capsule lifecycle, capab
 **Current implementation:**
 - `elastos-server` (CLI + HTTP API)
 - `elastos-runtime` (capability authority, request handler)
-- `elastos-identity`, `elastos-tls`, `elastos-namespace`
+- `elastos-identity`, `elastos-namespace`
 
 **Transport:** a substrate-specific, capsule-scoped Runtime adapter. Components
 use ElastOS Bus; web projections and microVMs use their documented narrow

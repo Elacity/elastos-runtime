@@ -52,7 +52,6 @@ target.
 | Project creation | `elastos init <name>`, `elastos init <name> --type content` | Creates files in the current directory. |
 | Configuration | `elastos config show`, `elastos config set` | Reads or writes local configuration. |
 | Identity | `elastos identity show`, `elastos identity nickname get`, `elastos identity nickname set`, `elastos identity arm-owner`, `elastos identity arm-owner-recovery` | Reads or updates the local DID-backed profile. `nickname set` prompts only when no value is supplied and a TTY is available. `arm-owner` admits one first-owner passkey at an exact public HTTPS Home address. `arm-owner-recovery` prints a one-time code for recovering this Home's admin with the Recovery Kit; use the command shown on the sign-in screen. |
-| TLS | `elastos tls trust`, `elastos tls regen` | Prints trust instructions or regenerates the local leaf certificate. |
 | Emergency | `elastos emergency rotate` | Attempts to persist a new signing key. The active Runtime changes only after restart, and current persistence failure is not fail-closed. See the [security finding](../SECURITY.md#capability-state-and-key-rotation-are-not-restart-safe). |
 | Trusted sources | `elastos source add`, `elastos source list`, `elastos source show`, `elastos source switch-channel`, `elastos source verify` | Manages local trusted-release source state. |
 | Updates | `elastos update` | Checks the trusted source over Carrier only. No local runtime is required. See [INSTALL.md](INSTALL.md#how-updates-reach-your-home). |
