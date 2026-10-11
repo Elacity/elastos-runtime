@@ -906,12 +906,14 @@ PY
 
 retire_legacy_browser_runtime_turn() {
     [[ "$PLATFORM" == linux-* ]] || return 0
-    DATA_DIR="$DATA_DIR" python3 - <<'PY'
+    DATA_DIR="$DATA_DIR" OWNED_REMOVAL_HELPER="${ROOT}/scripts/lib/owned_removal.py" python3 - <<'PY'
 import os
 from pathlib import Path
 import select
 import signal
 import stat
+import subprocess
+import sys
 
 root = Path(os.environ['DATA_DIR'])
 repair = 'Previous Browser TURN owner record requires repair before setup.'
@@ -945,13 +947,14 @@ except OSError:
 
 def remove_record(info):
     try:
-        current = os.stat('turnserver.pid', dir_fd=turn_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+        result = subprocess.run([
+            sys.executable, os.environ['OWNED_REMOVAL_HELPER'], str(root),
+            'runtime-turn/turnserver.pid', '--expect', f'{info.st_dev}:{info.st_ino}',
+        ], timeout=5, stdout=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
         raise SystemExit(repair)
-    # removal-ok: descriptor-relative PID removal after device/inode verification.
-    os.unlink('turnserver.pid', dir_fd=turn_fd)
+    if result.returncode:
+        raise SystemExit(repair)
 
 def retire_owner():
     try:

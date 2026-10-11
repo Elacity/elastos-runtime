@@ -3,8 +3,9 @@
 
     remove_owned(root, relative, expected=None) -> bool
 
-`root` is the owned directory. Its own last component must be a real
-directory, not a link; the folders above it are the caller's trust anchor.
+`root` is the owned directory. Its absolute path and every
+parent below it are opened one component at a time without following links.
+Relative roots use the current directory descriptor as their trust anchor.
 `relative` names the exact path below it in plain components (no absolute
 path, "", "." or "..").
 
@@ -14,7 +15,10 @@ redirecting the removal elsewhere. The leaf is inspected without following it:
 a link is removed itself, a directory is removed entry by entry relative to
 open descriptors (never following a link inside it), anything else is
 unlinked. With `expected` = (st_dev, st_ino) recorded earlier, a leaf with
-another identity is refused.
+another identity is refused. Expected files are first moved to a private
+holding directory, then compared and removed there. A replacement at the
+original name survives. A changed captured file is restored without overwrite;
+a restore conflict is retained in the holding directory for repair.
 
 Returns False when the leaf or one of its parents does not exist and True
 after removing it. Raises UnsafeRemoval when a parent is a link or not a
@@ -31,6 +35,7 @@ import errno
 import os
 from pathlib import PurePath
 import stat
+import secrets
 import sys
 
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -58,6 +63,57 @@ def _open_directory(name, dir_fd=None):
         raise
 
 
+def _open_root(root):
+    path = PurePath(root)
+    if ".." in path.parts:
+        raise UnsafeRemoval("the removal root contains a parent traversal")
+    directory = _open_directory("/" if path.is_absolute() else ".")
+    try:
+        for name in path.parts[1:] if path.is_absolute() else path.parts:
+            inner = _open_directory(name, directory)
+            os.close(directory)
+            directory = inner
+        return directory
+    except BaseException:
+        os.close(directory)
+        raise
+
+
+def _remove_expected_file(directory, leaf, expected):
+    # Capture the name before inspecting it. Replacements at the original
+    # name remain outside the private directory and survive this removal.
+    holding = ".elastos-remove-" + secrets.token_hex(16)
+    os.mkdir(holding, mode=0o700, dir_fd=directory)
+    captured = _open_directory(holding, directory)
+    empty = True
+    try:
+        try:
+            os.rename(leaf, "entry", src_dir_fd=directory, dst_dir_fd=captured)
+        except FileNotFoundError:
+            return False
+        empty = False
+        found = os.lstat("entry", dir_fd=captured)
+        identity = (found.st_dev, found.st_ino)
+        if identity != tuple(expected) or stat.S_ISDIR(found.st_mode):
+            # Restore a file/link only if the original name is still empty.
+            # A conflict retains the captured file for explicit repair.
+            try:
+                os.link("entry", leaf, src_dir_fd=captured, dst_dir_fd=directory,
+                        follow_symlinks=False)
+                os.unlink("entry", dir_fd=captured)
+                empty = True
+            except OSError as error:
+                raise UnsafeRemoval(f"{leaf} changed; its captured replacement is kept in {holding}/entry") from error
+            raise UnsafeRemoval(f"{leaf} is no longer the recorded file; it was kept")
+        os.unlink("entry", dir_fd=captured)
+        empty = True
+        return True
+    finally:
+        os.close(captured)
+        if empty:
+            os.rmdir(holding, dir_fd=directory)
+
+
 def _remove_tree(parent, name, identity):
     descriptor = _open_directory(name, parent)
     try:
@@ -80,7 +136,7 @@ def _remove_tree(parent, name, identity):
 def remove_owned(root, relative, expected=None):
     names = _names(relative)
     try:
-        directory = _open_directory(os.fspath(root))
+        directory = _open_root(root)
     except FileNotFoundError:
         return False
     try:
@@ -99,6 +155,8 @@ def remove_owned(root, relative, expected=None):
         identity = (found.st_dev, found.st_ino)
         if expected is not None and identity != tuple(expected):
             raise UnsafeRemoval(f"{os.fspath(relative)} is no longer the recorded file; it was kept")
+        if not stat.S_ISDIR(found.st_mode) and expected is not None:
+            return _remove_expected_file(directory, leaf, expected)
         if stat.S_ISDIR(found.st_mode):
             _remove_tree(directory, leaf, identity)
         else:

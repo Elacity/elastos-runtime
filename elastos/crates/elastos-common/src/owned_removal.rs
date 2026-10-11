@@ -3,11 +3,15 @@
 //! [`remove_owned`] opens the owned root with `O_DIRECTORY|O_NOFOLLOW` and
 //! every folder below it with `openat(O_DIRECTORY|O_NOFOLLOW)`, so a folder
 //! swapped for a link fails instead of redirecting the removal elsewhere. The
-//! root's own parents are the caller's trust anchor. The leaf is inspected
+//! absolute root is also opened one component at a time. A relative root uses
+//! the current directory descriptor as its trust anchor. The leaf is inspected
 //! without following it: a link is removed itself, a folder is removed entry
 //! by entry relative to open descriptors (never following a link inside it),
 //! anything else is unlinked. When the caller recorded the leaf's device and
-//! inode, a leaf with another identity is kept.
+//! inode, expected files are captured in a private directory before their
+//! identity is checked and they are deleted. A new file at the original name
+//! survives. Changed captured files are restored without overwrite; conflicts
+//! stay in the private directory for repair.
 //!
 //! `scripts/removal-guard.py` refuses raw deletion added to product code;
 //! this is the Rust helper it names. Python and shell callers use
@@ -84,7 +88,6 @@ pub fn remove_owned(
         names.push(CString::new(name.as_bytes()).map_err(|_| not_exact())?);
     }
     let leaf = names.pop().ok_or_else(not_exact)?;
-    let root_name = CString::new(root.as_os_str().as_bytes()).map_err(|_| not_exact())?;
     let failed = |source| RemovalError::Io {
         path: root.join(relative),
         source,
@@ -97,7 +100,7 @@ pub fn remove_owned(
         }
         Err(error) => Err(failed(error)),
     };
-    let Some(mut directory) = folder(open_directory(None, &root_name))? else {
+    let Some(mut directory) = folder(open_root(root))? else {
         return Ok(false);
     };
     for name in &names {
@@ -115,6 +118,13 @@ pub fn remove_owned(
     if expected.is_some_and(|expected| expected != identity) {
         return Err(RemovalError::IdentityChanged(relative.to_path_buf()));
     }
+    if let Some(expected) = expected.filter(|_| found.st_mode & libc::S_IFMT != libc::S_IFDIR) {
+        return match remove_expected_file(&directory, &leaf, expected).map_err(failed)? {
+            Some(true) => Ok(true),
+            None => Ok(false),
+            Some(false) => Err(RemovalError::IdentityChanged(relative.to_path_buf())),
+        };
+    }
     if found.st_mode & libc::S_IFMT == libc::S_IFDIR {
         remove_tree(&directory, &leaf, identity)
     } else {
@@ -122,6 +132,91 @@ pub fn remove_owned(
     }
     .map_err(failed)?;
     Ok(true)
+}
+
+fn open_root(root: &Path) -> io::Result<OwnedFd> {
+    let mut directory = open_directory(None, if root.is_absolute() { c"/" } else { c"." })?;
+    for component in root.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                let name = CString::new(name.as_bytes())
+                    .map_err(|_| io::Error::other("invalid removal root"))?;
+                directory = open_directory(Some(&directory), &name)?;
+            }
+            _ => return Err(io::Error::other("invalid removal root")),
+        }
+    }
+    Ok(directory)
+}
+
+/// Capture before checking: removal acts only on the private captured entry.
+/// None means absent; false means a changed entry was restored without overwrite.
+fn remove_expected_file(
+    parent: &OwnedFd,
+    leaf: &CStr,
+    expected: FileIdentity,
+) -> io::Result<Option<bool>> {
+    let mut random = [0_u8; 16];
+    if unsafe { libc::getentropy(random.as_mut_ptr().cast(), random.len()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let holding = CString::new(format!(".elastos-remove-{}", hex::encode(random))).unwrap();
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), holding.as_ptr(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let captured = open_directory(Some(parent), &holding)?;
+    let result = (|| {
+        if unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
+                captured.as_raw_fd(),
+                c"entry".as_ptr(),
+            )
+        } != 0
+        {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        let found = lstat_at(&captured, c"entry")?;
+        if FileIdentity::of_stat(&found) != expected
+            || found.st_mode & libc::S_IFMT == libc::S_IFDIR
+        {
+            // linkat leaves any new original name intact. A restore conflict
+            // retains both entries and reports the holding path for repair.
+            if unsafe {
+                libc::linkat(
+                    captured.as_raw_fd(),
+                    c"entry".as_ptr(),
+                    parent.as_raw_fd(),
+                    leaf.as_ptr(),
+                    0,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            unlink_at(&captured, c"entry", 0)?;
+            return Ok(Some(false));
+        }
+        unlink_at(&captured, c"entry", 0)?;
+        Ok(Some(true))
+    })();
+    match result {
+        Ok(value) => {
+            unlink_at(parent, &holding, libc::AT_REMOVEDIR)?;
+            Ok(value)
+        }
+        Err(error) => Err(io::Error::other(format!(
+            "captured entry kept in {}/entry for repair: {error}",
+            holding.to_string_lossy()
+        ))),
+    }
 }
 
 fn open_directory(at: Option<&OwnedFd>, name: &CStr) -> io::Result<OwnedFd> {
@@ -235,7 +330,9 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         )));
-        let (root, outside) = (temp.path().join("root"), temp.path().join("outside"));
+        fs::create_dir_all(temp.path()).unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (root, outside) = (base.join("root"), base.join("outside"));
         fs::create_dir_all(root.join("owned/nested")).unwrap();
         fs::create_dir_all(&outside).unwrap();
         fs::write(root.join("owned/file"), b"owned").unwrap();
@@ -259,7 +356,7 @@ mod tests {
         symlink(&outside, root.join("linked")).unwrap();
         let error = remove_owned(&root, Path::new("linked/file"), None).unwrap_err();
         assert!(matches!(error, RemovalError::LinkedParent(_)), "{error}");
-        let linked_root = temp.path().join("linked-root");
+        let linked_root = temp.path().canonicalize().unwrap().join("linked-root");
         symlink(&outside, &linked_root).unwrap();
         let error = remove_owned(&linked_root, Path::new("file"), None).unwrap_err();
         assert!(matches!(error, RemovalError::LinkedParent(_)), "{error}");
@@ -289,6 +386,52 @@ mod tests {
         assert_eq!(fs::read(root.join("owned/file")).unwrap(), b"replacement");
         let current = FileIdentity::of(&fs::symlink_metadata(root.join("owned/file")).unwrap());
         assert!(remove_owned(&root, Path::new("owned/file"), Some(current)).unwrap());
+    }
+
+    #[test]
+    fn linked_ancestor_above_a_real_root_is_refused() {
+        let (temp, root, outside) = tree();
+        let linked = temp.path().canonicalize().unwrap().join("linked-ancestor");
+        symlink(&root, &linked).unwrap();
+        let error = remove_owned(&linked.join("owned"), Path::new("file"), None).unwrap_err();
+        assert!(matches!(error, RemovalError::LinkedParent(_)), "{error}");
+        assert_eq!(fs::read(root.join("owned/file")).unwrap(), b"owned");
+        assert_eq!(fs::read(outside.join("file")).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn capture_restores_a_leaf_replaced_after_its_identity_was_checked() {
+        let (_temp, root, _) = tree();
+        let file = root.join("owned/file");
+        let recorded = FileIdentity::of(&fs::symlink_metadata(&file).unwrap());
+        let parent = open_root(&root.join("owned")).unwrap();
+        fs::rename(&file, root.join("owned/old-file")).unwrap();
+        fs::write(&file, b"replacement").unwrap();
+        assert_eq!(
+            remove_expected_file(&parent, c"file", recorded).unwrap(),
+            Some(false)
+        );
+        assert_eq!(fs::read(file).unwrap(), b"replacement");
+        assert!(!fs::read_dir(root.join("owned")).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".elastos-remove-")));
+    }
+
+    #[test]
+    fn a_parent_swapped_for_a_link_keeps_removal_on_the_open_directory() {
+        let (_temp, root, outside) = tree();
+        let recorded = FileIdentity::of(&fs::symlink_metadata(root.join("owned/file")).unwrap());
+        let parent = open_root(&root.join("owned")).unwrap();
+        fs::rename(root.join("owned"), root.join("moved")).unwrap();
+        symlink(&outside, root.join("owned")).unwrap();
+        assert_eq!(
+            remove_expected_file(&parent, c"file", recorded).unwrap(),
+            Some(true)
+        );
+        assert_eq!(fs::read(outside.join("file")).unwrap(), b"outside");
+        assert!(!root.join("moved/file").exists());
     }
 
     #[test]

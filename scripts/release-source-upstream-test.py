@@ -214,6 +214,8 @@ class SourceUpstreamTests(unittest.TestCase):
         (self.root / 'scripts').mkdir(mode=0o700)
         for name in ('seed-kubo-cache.sh', 'release-upstream-input.py'):
             shutil.copy2(ROOT / 'scripts' / name, self.root / 'scripts' / name)
+        (self.root / 'scripts/lib').mkdir()
+        shutil.copy2(ROOT / 'scripts/lib/owned_removal.py', self.root / 'scripts/lib/owned_removal.py')
         self.cache, self.data = self.root / 'cache', self.root / 'data'
         self.data.mkdir(mode=0o700)
         self.recipes = [self.recipe('kubo', 'kubo', 'ipfs', '1.2.3', 'bin/kubo'),

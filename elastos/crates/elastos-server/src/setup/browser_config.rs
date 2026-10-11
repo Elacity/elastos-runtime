@@ -350,7 +350,21 @@ fn retire_host(data: &Path, manifest: &super::ComponentsManifest) -> anyhow::Res
     let mut removed = false;
     for relative in paths {
         // Never through a linked folder; a link itself is removed, its target never followed.
-        match elastos_common::owned_removal::remove_owned(data, &relative, None) {
+        let expected = if matches!(
+            relative.to_str(),
+            Some(
+                "bin/browser-vm-local-crosvm-launcher" | "bin/browser-vm-local-crosvm-launcher.mjs"
+            )
+        ) {
+            match data.join(&relative).symlink_metadata() {
+                Ok(info) => Some(elastos_common::owned_removal::FileIdentity::of(&info)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        match elastos_common::owned_removal::remove_owned(data, &relative, expected) {
             Ok(found) => removed |= found,
             Err(elastos_common::owned_removal::RemovalError::LinkedParent(_)) => println!(
                 "Kept {}: a folder on its path is a link, so removing it could reach files outside the data directory.",
@@ -864,7 +878,8 @@ mod tests {
             },
         );
         let temp = tempfile::tempdir().unwrap();
-        let data = temp.path();
+        let canonical = temp.path().canonicalize().unwrap();
+        let data = canonical.as_path();
         let crosvm = "libexec/browser/crosvm/0.1.0-2ac141082d17/linux-arm64";
         let removed = [
             "scripts/browser-vm-linux-network.py",
@@ -926,7 +941,8 @@ mod tests {
         let manifest: super::super::ComponentsManifest =
             serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let (data, outside) = (temp.path().join("elastos"), temp.path().join("outside"));
+        let base = temp.path().canonicalize().unwrap();
+        let (data, outside) = (base.join("elastos"), base.join("outside"));
         let kept = [
             data.join("Users/owner/image-set/profile.ext4"),
             outside.join("browser-vm-control-service"),
@@ -960,7 +976,8 @@ mod tests {
         let manifest: super::super::ComponentsManifest =
             serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let (real, linked) = (temp.path().join("real"), temp.path().join("elastos"));
+        let base = temp.path().canonicalize().unwrap();
+        let (real, linked) = (base.join("real"), base.join("elastos"));
         let image = real.join(super::super::browser_vm_image::INSTALL_PATH);
         fs::create_dir_all(&image).unwrap();
         fs::write(image.join("rootfs.ext4"), b"owner data").unwrap();
@@ -969,6 +986,33 @@ mod tests {
         assert_eq!(fs::read(image.join("rootfs.ext4")).unwrap(), b"owner data");
         retire_host(&real, &manifest).unwrap();
         assert!(!image.exists());
+    }
+
+    #[test]
+    fn retirement_keeps_launchers_under_a_linked_data_ancestor() {
+        use std::os::unix::fs::symlink;
+        let manifest: super::super::ComponentsManifest =
+            serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let real = base.join("real");
+        let data = real.join("elastos");
+        fs::create_dir_all(data.join("bin")).unwrap();
+        let names = [
+            "browser-vm-local-crosvm-launcher",
+            "browser-vm-local-crosvm-launcher.mjs",
+        ];
+        for name in names {
+            fs::write(data.join("bin").join(name), b"kept launcher").unwrap();
+        }
+        symlink(&real, base.join("linked")).unwrap();
+        retire_host(&base.join("linked/elastos"), &manifest).unwrap();
+        for name in names {
+            assert_eq!(
+                fs::read(data.join("bin").join(name)).unwrap(),
+                b"kept launcher"
+            );
+        }
     }
 
     #[test]
