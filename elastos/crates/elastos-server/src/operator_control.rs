@@ -497,6 +497,7 @@ pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdate
     let client = tokio::time::timeout(
         Duration::from_secs(OPERATOR_CONNECT_TIMEOUT_SECS),
         crate::carrier::CarrierClient::connect_trusted_source(
+            data_dir,
             &source,
             OPERATOR_CONNECT_TIMEOUT_SECS,
         ),
@@ -720,6 +721,7 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
 
     let session = OperatorCarrierSession::new(
         crate::carrier::CarrierClient::connect_trusted_source(
+            data_dir,
             &source,
             OPERATOR_CONNECT_TIMEOUT_SECS,
         )
@@ -1199,7 +1201,7 @@ async fn request_remote_typed_with_args<T: DeserializeOwned>(
     args: serde_json::Value,
 ) -> Result<T> {
     validate_action(action)?;
-    let client = OperatorClient::connect(peer, OPERATOR_CONNECT_TIMEOUT_SECS).await?;
+    let client = OperatorClient::connect(data_dir, peer, OPERATOR_CONNECT_TIMEOUT_SECS).await?;
     let (signing_key, requester_did) = elastos_identity::load_or_create_did(data_dir)?;
     let request_payload = OperatorRequestPayload {
         version: 1,
@@ -1756,8 +1758,7 @@ fn finalize_reserved_request(
 }
 
 fn local_endpoint_ticket(endpoint: &Endpoint) -> Option<String> {
-    let mut watcher = endpoint.watch_addr();
-    let addr = watcher.get();
+    let addr = crate::carrier::published_ticket_addr(endpoint.watch_addr().get());
     let ticket_json = serde_json::json!({
         "topic": null,
         "endpoints": [addr],
@@ -1793,8 +1794,13 @@ struct OperatorClient {
 }
 
 impl OperatorClient {
-    async fn connect_endpoint_addr(addr: iroh::EndpointAddr, timeout_secs: u64) -> Result<Self> {
-        let (endpoint, addr) = crate::carrier::bind_short_lived_carrier_dial(addr).await?;
+    async fn connect_endpoint_addr(
+        data_dir: &Path,
+        addr: iroh::EndpointAddr,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        let (endpoint, addr) =
+            crate::carrier::bind_short_lived_carrier_dial(data_dir, addr).await?;
 
         let conn = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
@@ -1810,31 +1816,21 @@ impl OperatorClient {
         })
     }
 
-    async fn connect(peer: &OperatorPeer, timeout_secs: u64) -> Result<Self> {
+    /// The operator peer by its DID; a stored ticket adds IP hints for that
+    /// DID only, and the pinned relay covers the rest.
+    async fn connect(data_dir: &Path, peer: &OperatorPeer, timeout_secs: u64) -> Result<Self> {
         validate_peer_did(&peer.did)?;
-
-        if !peer.connect_ticket.trim().is_empty() {
-            let ticket_endpoints = decode_ticket_endpoints(&peer.connect_ticket);
-            if ticket_endpoints.is_empty() {
-                anyhow::bail!("operator peer '{}' has an invalid connect ticket", peer.did);
-            }
-
-            let mut ticket_errors = Vec::new();
-            for endpoint in ticket_endpoints {
-                match Self::connect_endpoint_addr(endpoint, timeout_secs).await {
-                    Ok(client) => return Ok(client),
-                    Err(err) => ticket_errors.push(err.to_string()),
-                }
-            }
-            anyhow::bail!(
-                "operator connection failed using the explicit ticket route: {}",
-                ticket_errors.join(" | ")
-            );
-        }
-
         let public_key = public_key_from_did(&peer.did)?;
-        let endpoint = iroh::EndpointAddr::from(public_key);
-        Self::connect_endpoint_addr(endpoint, timeout_secs).await
+        let hints = decode_ticket_endpoints(&peer.connect_ticket);
+        if !peer.connect_ticket.trim().is_empty() && hints.is_empty() {
+            anyhow::bail!("operator peer '{}' has an invalid connect ticket", peer.did);
+        }
+        Self::connect_endpoint_addr(
+            data_dir,
+            crate::carrier::peer_dial_addr(public_key, &hints),
+            timeout_secs,
+        )
+        .await
     }
 
     async fn send_request<T: Serialize>(&self, value: &T) -> Result<Vec<u8>> {
@@ -2205,7 +2201,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_client_rejects_peers_without_direct_routes() {
+    async fn operator_client_without_route_or_pinned_relay_fails_before_any_relay() {
+        let dir = tempfile::tempdir().unwrap();
         let secret = iroh::SecretKey::from_bytes(&[91u8; 32]);
         for addr in [
             iroh::EndpointAddr::from(secret.public()),
@@ -2213,9 +2210,9 @@ mod tests {
                 "https://relay.example.invalid./".parse().unwrap(),
             )]),
         ] {
-            let result = OperatorClient::connect_endpoint_addr(addr, 1).await;
-            let error = result.err().expect("direct route is required");
-            assert!(error.to_string().contains("no IP route"), "{error:#}");
+            let result = OperatorClient::connect_endpoint_addr(dir.path(), addr, 1).await;
+            let error = format!("{:#}", result.err().expect("a route is required"));
+            assert!(!error.contains("relay.example.invalid"), "{error}");
         }
     }
 
@@ -2416,7 +2413,7 @@ mod tests {
             .unwrap();
         let ticket = local_endpoint_ticket(&node.endpoint).unwrap();
         let addr = decode_ticket_endpoints(&ticket).remove(0);
-        let client = OperatorClient::connect_endpoint_addr(addr, 10)
+        let client = OperatorClient::connect_endpoint_addr(dir.path(), addr, 10)
             .await
             .unwrap();
 

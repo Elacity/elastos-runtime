@@ -637,6 +637,7 @@ pub async fn fetch_source_file(
         Ok(())
     };
     crate::carrier::fetch_file_from_trusted_source_to_bound(
+        data,
         source,
         cid,
         &mut file,

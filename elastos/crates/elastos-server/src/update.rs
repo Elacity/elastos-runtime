@@ -901,7 +901,7 @@ async fn run_update_with_restart(
         // Covers both an unreachable source and one that did not answer in time.
         resolved.ok_or_else(|| {
             anyhow::anyhow!(
-                "Could not discover updates: the trusted release source did not answer over Carrier. Check the network (ElastOS needs outgoing UDP to port 4433), then try again."
+                "Could not discover updates: the trusted release source did not answer over Carrier. Check the network (ElastOS uses UDP port 4433, or HTTPS port 443 through the publisher's relay), then try again."
             )
         })?
     };

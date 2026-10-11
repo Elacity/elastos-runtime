@@ -107,11 +107,13 @@ tar = "0.4"
 zip = { version = "2.4.2", default-features = false, features = ["deflate-flate2", "flate2"] }
 libc = "0.2"
 
-# Built-in Carrier transport (P2P for updates, gossip messaging, DHT discovery).
+# Built-in Carrier transport (P2P for updates, gossip messaging, the seed's relay).
 # These versions form one coordinated generation and must move together.
 iroh = "=1.0.2"
 iroh-gossip = "=0.101.0"
 iroh-mdns-address-lookup = "=0.4.0"
+# The relay iroh already uses as a client; `server` lets the seed run it.
+iroh-relay = { version = "=1.0.3", features = ["server"] }
 distributed-topic-tracker = "=0.3.5"
 futures-lite = "2.6"
 getrandom = "0.2"
