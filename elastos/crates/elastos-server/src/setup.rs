@@ -242,6 +242,7 @@ pub async fn run(
     let data_dir = data_dir()?;
     run_with_data_dir(
         data_dir,
+        explicit_components_manifest_path(),
         profile,
         with,
         without,
@@ -252,8 +253,12 @@ pub async fn run(
     .await
 }
 
+/// `manifest_path` is the explicit manifest (`$ELASTOS_COMPONENTS_MANIFEST` in
+/// production); tests pass it here instead of mutating process-global env.
+#[allow(clippy::too_many_arguments)]
 async fn run_with_data_dir(
     data_dir: PathBuf,
+    manifest_path: Option<PathBuf>,
     profile: Option<String>,
     with: Vec<String>,
     without: Vec<String>,
@@ -287,7 +292,7 @@ async fn run_with_data_dir(
     let (manifest_path, manifest, signed_setup) = match signed_setup {
         Some((manifest, metadata)) => (data_dir.join("components.json"), manifest, Some(metadata)),
         None => {
-            let (path, manifest) = load_manifest_with_path()?;
+            let (path, manifest) = load_manifest_with_path(manifest_path)?;
             (path, manifest, None)
         }
     };
@@ -629,11 +634,13 @@ async fn admit_installed_setup_metadata(
 
 #[cfg(test)]
 fn load_manifest() -> anyhow::Result<ComponentsManifest> {
-    Ok(load_manifest_with_path()?.1)
+    Ok(load_manifest_with_path(explicit_components_manifest_path())?.1)
 }
 
-fn load_manifest_with_path() -> anyhow::Result<(PathBuf, ComponentsManifest)> {
-    if let Some(path) = explicit_components_manifest_path() {
+fn load_manifest_with_path(
+    explicit: Option<PathBuf>,
+) -> anyhow::Result<(PathBuf, ComponentsManifest)> {
+    if let Some(path) = explicit {
         let manifest = load_manifest_from_path(&path)?;
         return Ok((path, manifest));
     }
@@ -4522,10 +4529,6 @@ pub(crate) mod tests {
         }
     }
 
-    // tokio Mutex so the async prerequisite test can hold the guard across
-    // its await without blocking the runtime; sync tests use blocking_lock.
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[test]
     fn unsupported_model_host_skips_engine_without_aborting_setup() {
         let selected = || vec!["kubo".to_string(), "llama-server".to_string()];
@@ -4744,7 +4747,6 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn test_missing_managed_media_tools_fail_before_first_component_install_effect() {
-        let _guard = ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let xdg_data_home = temp.path().join("xdg-data");
         let manifest_path = temp.path().join("components.json");
@@ -4783,13 +4785,9 @@ pub(crate) mod tests {
         // this test can never write into the live user installation and never
         // poisons concurrently running tests through process-global env.
         let data_dir = xdg_data_home.join("elastos");
-        let original_manifest = std::env::var_os(COMPONENTS_MANIFEST_ENV);
-        let original_path = std::env::var_os("PATH");
-        std::env::set_var(COMPONENTS_MANIFEST_ENV, &manifest_path);
-        std::env::set_var("PATH", "");
-
         let result = run_with_data_dir(
             data_dir.clone(),
+            Some(manifest_path),
             Some("media-preflight".to_string()),
             vec![],
             vec![],
@@ -4798,15 +4796,6 @@ pub(crate) mod tests {
             None,
         )
         .await;
-
-        match original_manifest {
-            Some(value) => std::env::set_var(COMPONENTS_MANIFEST_ENV, value),
-            None => std::env::remove_var(COMPONENTS_MANIFEST_ENV),
-        }
-        match original_path {
-            Some(value) => std::env::set_var("PATH", value),
-            None => std::env::remove_var("PATH"),
-        }
 
         assert!(result.unwrap_err().to_string().contains("media-tools"));
         assert!(!data_dir.join("bin/effect").exists());
@@ -4818,6 +4807,7 @@ pub(crate) mod tests {
         let data = temp.path().join("data");
         let error = run_with_data_dir(
             data.clone(),
+            None,
             None,
             vec![],
             vec![],
@@ -4897,7 +4887,6 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_managed_media_tools_are_imported_before_other_components() {
         use std::os::unix::fs::PermissionsExt;
-        let _guard = ENV_LOCK.lock().await;
         let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/media-setup-test-fixtures");
         fs::create_dir_all(&parent).unwrap();
@@ -4963,14 +4952,17 @@ pub(crate) mod tests {
         for path in [&dest, &dest.join("bin")] {
             assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o022, 0);
         }
-        let original = std::env::var_os(COMPONENTS_MANIFEST_ENV);
-        std::env::set_var(COMPONENTS_MANIFEST_ENV, &manifest_path);
-        let result =
-            run_with_data_dir(data.clone(), None, vec![], vec![], false, false, None).await;
-        match original {
-            Some(value) => std::env::set_var(COMPONENTS_MANIFEST_ENV, value),
-            None => std::env::remove_var(COMPONENTS_MANIFEST_ENV),
-        }
+        let result = run_with_data_dir(
+            data.clone(),
+            Some(manifest_path),
+            None,
+            vec![],
+            vec![],
+            false,
+            false,
+            None,
+        )
+        .await;
         result.unwrap();
         let installed = load_manifest_from_path(&data.join("components.json")).unwrap();
         assert_eq!(
@@ -5300,7 +5292,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_load_manifest_uses_explicit_manifest_override() {
-        let _guard = ENV_LOCK.blocking_lock();
         let temp = tempfile::tempdir().unwrap();
         let source_manifest =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../components.json");
@@ -7007,8 +6998,6 @@ pub(crate) mod tests {
     fn installed_archive_component_is_verified_by_its_bound_receipts() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
-        // These tests run `tar` from PATH, which another setup test clears under ENV_LOCK.
-        let _guard = ENV_LOCK.blocking_lock();
         let (_tmp, data_dir, bytes, manifest) = archive_component_home_without_executable_record();
         let platform = detect_platform();
         let component = &manifest.external["kubo"];
@@ -7091,7 +7080,6 @@ pub(crate) mod tests {
             }
         }
 
-        let _guard = ENV_LOCK.lock().await;
         // A signed CID wins over the release name, which may serve newer bytes;
         // without a CID the release name is the source.
         for signed_cid in [false, true] {
@@ -8166,7 +8154,7 @@ pub(crate) mod tests {
             before
         });
         let result =
-            run_with_data_dir(data.clone(), None, vec![], vec![], false, false, None).await;
+            run_with_data_dir(data.clone(), None, None, vec![], vec![], false, false, None).await;
         server.close().await;
         let before = serving.await.unwrap();
         drop(held);
