@@ -1290,6 +1290,45 @@ pub(crate) fn verify_release_binding(
     Ok(())
 }
 
+/// Fetches the release-pinned Community network by its pinned CID with the
+/// other release downloads. A Home that keeps its own collaboration state
+/// fetches nothing.
+async fn fetch_release_network_for_update(
+    data_dir: &Path,
+    manifest: &crate::setup::ComponentsManifest,
+    fetch_fn: &FetchFn,
+    ordered_gateways: &[String],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    crate::collaboration_release_network::fetch_release_network(
+        data_dir,
+        manifest.collaboration_network.as_ref(),
+        |pin| fetch_fn(pin.head_cid.clone(), ordered_gateways.to_vec()),
+    )
+    .await
+}
+
+/// The CLI update and Home's System update join the release-pinned network.
+/// The offline hop without a restart owner admits only an unchanged pin.
+fn joins_release_network(apply_mode: ApplyMode, has_restart_owner: bool) -> bool {
+    apply_mode == ApplyMode::Normal || has_restart_owner
+}
+
+/// Joins or advances the release-pinned Community network from bytes fetched
+/// before Home stopped or the binary changed.
+fn join_release_network(
+    data_dir: &Path,
+    manifest: &crate::setup::ComponentsManifest,
+    fetched: Option<&[u8]>,
+) -> anyhow::Result<crate::collaboration_release_network::ReleaseNetworkOutcome> {
+    let outcome = crate::collaboration_release_network::install_fetched_release_network(
+        data_dir,
+        manifest.collaboration_network.as_ref(),
+        fetched,
+    )?;
+    tracing::info!(?outcome, "release collaboration network applied");
+    Ok(outcome)
+}
+
 /// Execute upgrade from a verified release head.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
@@ -1610,14 +1649,27 @@ async fn run_upgrade_with_restart(
         crate::installed_release::admit_descriptor(comp_info, comp_sha256, comp_data.len() as u64)
     })())?;
     // These bytes already match the signed digest, so a refusal here is the publisher's.
-    refused((|| {
+    let manifest = refused((|| {
         anyhow::ensure!(
             comp_data.len() <= 4 * 1024 * 1024,
             "Installed components exceed their byte bound"
         );
         let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(&comp_data)?;
-        crate::setup::admit_release_components(&manifest, &component_platform)
+        crate::setup::admit_release_components(&manifest, &component_platform)?;
+        Ok(manifest)
     })())?;
+
+    // 9b. Fetch and verify the release-pinned Community network while Home
+    // still runs and before the binary changes.
+    let joins_network = joins_release_network(apply_mode, restart_owner.is_some());
+    let release_network = if joins_network {
+        fetch_release_network_for_update(data_dir, &manifest, fetch_fn, ordered_gateways).await?
+    } else {
+        None
+    };
+    if release_network.is_some() {
+        println!("  Community network verified (pinned CID ✓)");
+    }
 
     if apply_mode == ApplyMode::Normal {
         // 10. Atomic replace binary
@@ -1785,6 +1837,13 @@ async fn run_upgrade_with_restart(
                 "  Principal-root readiness: {} ({} object(s))",
                 principal_root_receipt.status, principal_root_receipt.object_count
             );
+
+            // 13. Join or advance the release-pinned Community network last, so
+            // an earlier refusal leaves the Home's network unchanged.
+            let outcome = join_release_network(data_dir, &manifest, release_network.as_deref())?;
+            if let Some(line) = outcome.summary_line() {
+                println!("  {line}");
+            }
 
             Ok(())
         }
@@ -1975,19 +2034,30 @@ async fn run_upgrade_with_restart(
             data_dir, "update", "offline",
         )?);
     }
-    let activation = transaction.commit_checked(|| {
-        if support_snapshot(
-            data_dir,
-            &old_components,
-            &comp_data,
-            &component_platform,
-            &transaction.excluded_paths(),
-        )? != support
-        {
-            anyhow::bail!("installed support changed during activation");
-        }
-        Ok(())
-    });
+    let activation = transaction
+        .commit_checked(|| {
+            if support_snapshot(
+                data_dir,
+                &old_components,
+                &comp_data,
+                &component_platform,
+                &transaction.excluded_paths(),
+            )? != support
+            {
+                anyhow::bail!("installed support changed during activation");
+            }
+            Ok(())
+        })
+        .and_then(|()| {
+            // Join after activation while the offline fence holds. A release that
+            // is rolled back later keeps the joined network, as the CLI update
+            // does: Runtime never drops an accepted network.
+            if joins_network {
+                join_release_network(data_dir, &manifest, release_network.as_deref()).map(|_| ())
+            } else {
+                Ok(())
+            }
+        });
     if let Some(owner) = restart_owner.as_mut() {
         drop(offline);
         let candidate = match activation {
@@ -2125,7 +2195,13 @@ pub(crate) fn frozen_support_snapshot(
     {
         anyhow::bail!("unsupported components schema for offline update");
     }
-    for field in ["external", "capsules", "profiles", "model_catalog"] {
+    for field in [
+        "external",
+        "capsules",
+        "profiles",
+        "model_catalog",
+        "collaboration_network",
+    ] {
         if old_value.get(field) != new_value.get(field) {
             anyhow::bail!(
                 "support change in {field} requires complete staging by the release owner"
@@ -5269,5 +5345,407 @@ mod tests {
                 }
             }
         }
+    }
+
+    const EMPTY_COMPONENTS: &[u8] =
+        br#"{"schema":"elastos.components/v1","external":{},"profiles":{},"capsules":{}}"#;
+
+    fn components_pinning_network(config: &[u8]) -> Vec<u8> {
+        let parsed: serde_json::Value = serde_json::from_slice(config).unwrap();
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "elastos.components/v1", "external": {}, "profiles": {}, "capsules": {},
+            "collaboration_network": {
+                "head_cid": crate::setup::catalog_head_cid(config).unwrap(),
+                "expected_network_id": parsed["expected_network_id"],
+                "trusted_profile_signer_dids": parsed["trusted_profile_signer_dids"],
+            },
+        }))
+        .unwrap()
+    }
+
+    /// A flat signed publication that `Publication` admits, and the content a
+    /// Carrier source serves from it: the publisher imports exactly the
+    /// admitted artifacts and the two metadata envelopes, addressed by CID.
+    #[cfg(unix)]
+    struct PublishedRelease {
+        _input: tempfile::TempDir,
+        head_cid: String,
+        content: std::collections::HashMap<String, Vec<u8>>,
+    }
+
+    #[cfg(unix)]
+    fn published_release(
+        executable: &[u8],
+        components: &[u8],
+        network: Option<&[u8]>,
+    ) -> PublishedRelease {
+        published_release_with_version(executable, components, network, "0.7.1")
+    }
+
+    #[cfg(unix)]
+    fn published_release_with_version(
+        executable: &[u8],
+        components: &[u8],
+        network: Option<&[u8]>,
+        version: &str,
+    ) -> PublishedRelease {
+        use sha2::Digest;
+        let input = tempfile::tempdir().unwrap();
+        // Publication admission refuses symlinked ancestors such as macOS /var.
+        let root = input.path().canonicalize().unwrap();
+        let platform = detect_release_platform();
+        let installer = b"#!/bin/sh\n# fixture installer\n";
+        let mut files = vec![
+            (format!("elastos-{platform}"), executable),
+            (format!("components-{platform}.json"), components),
+            ("install.sh".to_string(), installer.as_slice()),
+        ];
+        if let Some(network) = network {
+            files.push((
+                crate::collaboration_release_network::RELEASE_COLLABORATION_NETWORK_FILE
+                    .to_string(),
+                network,
+            ));
+        }
+        for (name, bytes) in &files {
+            std::fs::write(root.join(name), bytes).unwrap();
+        }
+        let descriptor = |bytes: &[u8]| {
+            serde_json::json!({
+                "cid": raw_cid(bytes), "sha256": hex::encode(sha2::Sha256::digest(bytes)),
+                "size": bytes.len()
+            })
+        };
+        let release = binding_envelope(
+            serde_json::json!({
+                "schema": "elastos.release/v1", "version": version, "channel": "stable",
+                "source": {"commit": "a".repeat(40), "tree": "b".repeat(40)},
+                "released_at": 1, "prev_release_cid": null,
+                "installer_sha256": hex::encode(sha2::Sha256::digest(installer)),
+                "platforms": {(platform): {
+                    "binary": descriptor(executable), "components": descriptor(components)
+                }}
+            }),
+            "elastos.release.v1",
+        );
+        let did =
+            crate::crypto::encode_signing_key_did(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+        let mut head = binding_head(&release);
+        head["version"] = serde_json::json!(version);
+        head["signer_did"] = serde_json::json!(did);
+        head["updated_at"] = serde_json::json!(2);
+        head["prev_head_cid"] = serde_json::Value::Null;
+        let head = binding_envelope(head, "elastos.release.head.v1");
+        std::fs::write(root.join("release.json"), &release).unwrap();
+        std::fs::write(root.join("release-head.json"), &head).unwrap();
+        let publication = crate::release_publication::Publication::open_flat(&root, &did).unwrap();
+        let mut content = std::collections::HashMap::from([
+            (raw_cid(&head), head.clone()),
+            (publication.release_cid().to_string(), release),
+        ]);
+        for artifact in publication.artifacts() {
+            content.insert(
+                artifact.cid.clone(),
+                publication.read_verified_artifact(&artifact.name).unwrap(),
+            );
+        }
+        PublishedRelease {
+            _input: input,
+            head_cid: raw_cid(&head),
+            content,
+        }
+    }
+
+    /// Runs a normal update against a source that answers only for content
+    /// it published, like a Carrier `content_fetch`. Returns each requested
+    /// CID with whether the installed binary was still the previous one.
+    #[cfg(unix)]
+    async fn update_from_published(
+        data: &Path,
+        binary: &Path,
+        published: &PublishedRelease,
+    ) -> (anyhow::Result<()>, Vec<(String, bool)>) {
+        let previous_binary = std::fs::read(binary).unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let content = published.content.clone();
+        let binary = binary.to_path_buf();
+        let fetch: FetchFn = Box::new(move |cid, gateways| {
+            assert!(gateways.is_empty(), "fixture uses only its Carrier source");
+            let before_activation = std::fs::read(&binary).unwrap() == previous_binary;
+            observed
+                .lock()
+                .unwrap()
+                .push((cid.clone(), before_activation));
+            let served = content
+                .get(&cid)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("content {cid} is not published by this source"));
+            Box::pin(async move { served })
+        });
+        let result = run_update_for_data_dir(
+            data,
+            &fetch,
+            None,
+            false,
+            Some(published.head_cid.clone()),
+            true,
+            vec![],
+            "0.7.0",
+            true,
+            false,
+            false,
+        )
+        .await;
+        let requests = requests.lock().unwrap().clone();
+        (result, requests)
+    }
+
+    #[cfg(unix)]
+    fn release_files(data: &Path, binary: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        [
+            binary.to_path_buf(),
+            data.join("components.json"),
+            data.join("sources.json"),
+            installation_release_head_path(data),
+            installation_release_manifest_path(data),
+        ]
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect()
+    }
+
+    fn startup_config(data: &Path) -> PathBuf {
+        data.join(crate::collaboration_startup::COLLABORATION_STARTUP_CONFIG_FILE)
+    }
+
+    const NEXT_EXECUTABLE: &[u8] = b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_fetches_the_pinned_network_before_activation_and_joins_it() {
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1);
+        let (_fixture, data, binary, _source) = default_apply_fixture(EMPTY_COMPONENTS);
+        let components = components_pinning_network(&chain[0]);
+        let published = published_release(NEXT_EXECUTABLE, &components, Some(&chain[0]));
+
+        let (result, requests) = update_from_published(&data, &binary, &published).await;
+
+        result.unwrap();
+        let network_cid = crate::setup::catalog_head_cid(&chain[0]).unwrap();
+        assert_eq!(
+            requests.iter().find(|(cid, _)| *cid == network_cid),
+            Some(&(network_cid, true)),
+            "the network is fetched once, before the binary changes: {requests:?}"
+        );
+        assert_eq!(std::fs::read(startup_config(&data)).unwrap(), chain[0]);
+        assert_eq!(std::fs::read(&binary).unwrap(), NEXT_EXECUTABLE);
+        assert_eq!(
+            std::fs::read(data.join("components.json")).unwrap(),
+            components
+        );
+        assert!(!InstallTransaction::has_pending_recovery(&binary));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn undo_keeps_joined_network_revision_and_data_written_after_update() {
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(2);
+        for previous_pins_network in [false, true] {
+            let previous_network = previous_pins_network.then_some(chain[0].as_slice());
+            let previous_components = previous_network
+                .map(components_pinning_network)
+                .unwrap_or_else(|| EMPTY_COMPONENTS.to_vec());
+            let (_fixture, data, binary, _source) = default_apply_fixture(&previous_components);
+            let previous_binary = std::fs::read(&binary).unwrap();
+            let previous = published_release_with_version(
+                &previous_binary,
+                &previous_components,
+                previous_network,
+                "0.7.0",
+            );
+            let components = components_pinning_network(&chain[1]);
+            let next = published_release(NEXT_EXECUTABLE, &components, Some(&chain[1]));
+            update_from_published(&data, &binary, &next)
+                .await
+                .0
+                .unwrap();
+            crate::collaboration_startup::load_and_accept_collaboration_startup_configuration(
+                &data,
+            )
+            .unwrap();
+            let accepted_path = data.join("collaboration/config/accepted-profile-head-v1.json");
+            let accepted = std::fs::read(&accepted_path).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&accepted).unwrap()["revision"],
+                2
+            );
+            std::fs::write(data.join("owner-data"), b"written after update").unwrap();
+
+            let content = previous.content.clone();
+            let fetch: FetchFn = Box::new(move |cid, gateways| {
+                assert!(gateways.is_empty(), "fixture uses only its Carrier source");
+                let served = content.get(&cid).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("content {cid} is not published by this source")
+                });
+                Box::pin(async move { served })
+            });
+            // release_cmd maps --rollback-to to this head override and force=true.
+            run_update_for_data_dir(
+                &data,
+                &fetch,
+                None,
+                false,
+                Some(previous.head_cid),
+                true,
+                vec![],
+                "0.7.1",
+                true,
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(std::fs::read(&binary).unwrap(), previous_binary);
+            assert_eq!(
+                std::fs::read(data.join("components.json")).unwrap(),
+                previous_components
+            );
+            assert_eq!(
+                load_trusted_sources(&data)
+                    .unwrap()
+                    .default_source()
+                    .unwrap()
+                    .installed_version,
+                "0.7.0"
+            );
+            assert_eq!(std::fs::read(startup_config(&data)).unwrap(), chain[1]);
+            assert_eq!(std::fs::read(&accepted_path).unwrap(), accepted);
+            assert_eq!(
+                std::fs::read(data.join("owner-data")).unwrap(),
+                b"written after update"
+            );
+            crate::collaboration_startup::load_and_accept_collaboration_startup_configuration(
+                &data,
+            )
+            .unwrap();
+            assert!(!InstallTransaction::has_pending_recovery(&binary));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_of_an_isolated_home_fetches_no_network() {
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1);
+        let (_fixture, data, binary, _source) = default_apply_fixture(EMPTY_COMPONENTS);
+        crate::collaboration_release_network::choose_isolated(&data).unwrap();
+        let components = components_pinning_network(&chain[0]);
+        let published = published_release(NEXT_EXECUTABLE, &components, Some(&chain[0]));
+
+        let (result, requests) = update_from_published(&data, &binary, &published).await;
+
+        result.unwrap();
+        assert_eq!(
+            requests.len(),
+            4,
+            "head, release, binary, components: {requests:?}"
+        );
+        assert!(std::fs::symlink_metadata(startup_config(&data)).is_err());
+        assert!(crate::collaboration_release_network::is_isolated(&data));
+        assert_eq!(std::fs::read(&binary).unwrap(), NEXT_EXECUTABLE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_refuses_network_bytes_that_differ_from_the_pin_before_activation() {
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1);
+        let (_other, other_chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1);
+        let (_fixture, data, binary, _source) = default_apply_fixture(EMPTY_COMPONENTS);
+        let components = components_pinning_network(&chain[0]);
+        let mut published = published_release(NEXT_EXECUTABLE, &components, Some(&chain[0]));
+        published.content.insert(
+            crate::setup::catalog_head_cid(&chain[0]).unwrap(),
+            other_chain[0].clone(),
+        );
+        let original = release_files(&data, &binary);
+
+        let (result, _requests) = update_from_published(&data, &binary, &published).await;
+
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("does not match the pinned"), "{error}");
+        assert_eq!(release_files(&data, &binary), original);
+        assert!(std::fs::symlink_metadata(startup_config(&data)).is_err());
+        assert!(!InstallTransaction::has_pending_recovery(&binary));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_restores_release_files_when_the_network_install_fails() {
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1);
+        let (_fixture, data, binary, _source) = default_apply_fixture(EMPTY_COMPONENTS);
+        // A directory where the configuration belongs makes the last support
+        // step fail after the binary was activated.
+        std::fs::create_dir(startup_config(&data)).unwrap();
+        let components = components_pinning_network(&chain[0]);
+        let published = published_release(NEXT_EXECUTABLE, &components, Some(&chain[0]));
+        let original = release_files(&data, &binary);
+
+        let (result, _requests) = update_from_published(&data, &binary, &published).await;
+
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("original release files restored"), "{error}");
+        assert_eq!(release_files(&data, &binary), original);
+        assert!(!InstallTransaction::has_pending_recovery(&binary));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_of_an_unpinned_release_leaves_collaboration_unchanged() {
+        let (_fixture, data, binary, _source) = default_apply_fixture(EMPTY_COMPONENTS);
+        let published = published_release(NEXT_EXECUTABLE, EMPTY_COMPONENTS, None);
+
+        let (result, requests) = update_from_published(&data, &binary, &published).await;
+
+        result.unwrap();
+        assert_eq!(requests.len(), 4, "{requests:?}");
+        assert!(std::fs::symlink_metadata(startup_config(&data)).is_err());
+        assert!(!crate::collaboration_release_network::is_isolated(&data));
+        assert_eq!(std::fs::read(&binary).unwrap(), NEXT_EXECUTABLE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offline_update_refuses_a_changed_network_pin() {
+        let (_signer, chain) =
+            crate::collaboration_release_network::tests::signed_profile_chain_config(1);
+        let (_fixture, data, binary, source) = default_apply_fixture(EMPTY_COMPONENTS);
+        let original = release_files(&data, &binary);
+
+        let error = apply_signed_executable_fixture(
+            &data,
+            &source,
+            NEXT_EXECUTABLE,
+            &components_pinning_network(&chain[0]),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("support change in collaboration_network"),
+            "{error:#}"
+        );
+        assert_eq!(release_files(&data, &binary), original);
+        assert!(std::fs::symlink_metadata(startup_config(&data)).is_err());
+        assert!(!InstallTransaction::has_pending_recovery(&binary));
     }
 }

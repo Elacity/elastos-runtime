@@ -156,12 +156,12 @@ pub(super) fn configured_discovery_network_profile_for_test(
     }
 }
 
-struct TestCollaborationMessageScope<'a> {
-    network_id: &'a str,
-    conversation_id: &'a str,
+pub(super) struct TestCollaborationMessageScope<'a> {
+    pub(super) network_id: &'a str,
+    pub(super) conversation_id: &'a str,
 }
 
-fn signed_discovery_message_for_test(
+pub(super) fn signed_discovery_message_for_test(
     signing_key: &SigningKey,
     sender_profile_did: &str,
     scope: TestCollaborationMessageScope<'_>,
@@ -4122,6 +4122,18 @@ fn assert_recovery_readiness_projection(payload: &Value, status: &str, path: &st
     );
 }
 
+fn assert_recovery_setup_required_projection(payload: &Value, reason: &str, path: &str) {
+    assert_eq!(
+        payload["identity"]["recovery_readiness"],
+        json!({
+            "schema": "elastos.recovery.readiness/v1",
+            "status": "setup_required",
+            "reason": reason,
+        }),
+        "{path}"
+    );
+}
+
 #[tokio::test]
 async fn existing_profile_setup_protects_root_without_claiming_recovery() {
     let dir = tempfile::tempdir().unwrap();
@@ -4256,7 +4268,11 @@ async fn existing_profile_setup_protects_root_without_claiming_recovery() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
-    assert_recovery_readiness_projection(&payload, "setup_required", "profile without backup");
+    assert_recovery_setup_required_projection(
+        &payload,
+        "recovery_kit_missing",
+        "profile without backup",
+    );
     assert_eq!(
         payload["discovery"]["status"], "unconfigured",
         "Profile creation does not opt into discovery"
@@ -4285,7 +4301,7 @@ async fn test_recovery_readiness_does_not_claim_profile_coverage() {
     ] {
         let (status, payload) = home_test_get_json(&app, path, token, origin).await;
         assert_eq!(status, StatusCode::OK, "{path}");
-        assert_recovery_readiness_projection(&payload, "setup_required", path);
+        assert_recovery_setup_required_projection(&payload, "recovery_kit_missing", path);
     }
     assert_eq!(file_snapshot(dir.path()), before_summary);
 
@@ -4321,6 +4337,24 @@ async fn test_recovery_readiness_does_not_claim_profile_coverage() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["profile"]["display_name"], "Owner");
     assert_eq!(payload["profile_readiness"]["status"], "ready");
+
+    // A verified kit that predates the Profile is outdated, not missing.
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_recovery_setup_required_projection(&payload, "recovery_kit_outdated", path);
+    }
 }
 
 #[tokio::test]
@@ -5487,6 +5521,109 @@ async fn test_system_guest_registration_requires_admin_passkey() {
         .as_str()
         .unwrap()
         .starts_with("localhost://Users/"));
+}
+
+#[tokio::test]
+async fn system_community_membership_is_home_wide_and_requires_current_owner_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let port = crate::collaboration_product::test_chat_product_port(
+        dir.path(),
+        "membership-network",
+        "community",
+    );
+    let mut state = test_state(dir.path());
+    state.collaboration_chat_product_port = Some(port.clone());
+    let app = gateway_router(state);
+    let marker = dir
+        .path()
+        .join("collaboration-community-membership-v1.json");
+    let mut denied_tokens = vec![
+        system_app_token(dir.path()),
+        projection_launch_token_for_authority_context(dir.path(), PEOPLE_CAPSULE_ID, &authority),
+    ];
+    for index in 0..3 {
+        let guest = passkey_authority_with_profile_role_credential(
+            dir.path(),
+            &format!("Guest {index}"),
+            crate::auth::RuntimePrincipalRole::Guest,
+            &format!("membership-guest-{index}"),
+        );
+        denied_tokens.push(guest.system_token);
+    }
+    for token in denied_tokens {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/system/community")
+                    .header("x-elastos-home-token", token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"joined":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(port.community_membership().joined());
+        assert!(!marker.exists());
+    }
+    for joined in [false, true] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/system/community")
+                    .header("x-elastos-home-token", &authority.system_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"joined": joined}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["joined"], joined);
+        assert_eq!(port.community_membership().joined(), joined);
+    }
+    let before = std::fs::read(&marker).unwrap();
+    let mut principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    principal.role = crate::auth::RuntimePrincipalRole::Guest;
+    let mut auth = crate::auth::load_auth_state(dir.path()).unwrap();
+    let current = auth
+        .principals
+        .iter_mut()
+        .find(|entry| entry.principal_id == principal.principal_id)
+        .unwrap();
+    *current = principal;
+    crate::auth::save_auth_state(dir.path(), &auth).unwrap();
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/system/community")
+                .header("x-elastos-home-token", authority.system_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"joined":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an earlier owner token cannot retain a removed admin role"
+    );
+    assert_eq!(std::fs::read(marker).unwrap(), before);
 }
 
 #[test]

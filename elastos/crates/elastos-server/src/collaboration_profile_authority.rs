@@ -250,8 +250,9 @@ pub(crate) fn load_profile_authority(
     principal_id: &str,
     localhost_root: &str,
 ) -> anyhow::Result<Option<VerifiedCollaborationProfileDocument>> {
-    load_bundle_state(data_dir, principal_id, localhost_root)
-        .map(|state| state.map(|state| state.verified))
+    load_authority_bundle(data_dir, principal_id, localhost_root)?
+        .map(|bundle| verify_signed_profile_document(&bundle.signed_profile))
+        .transpose()
 }
 
 pub(crate) fn update_profile_authority(
@@ -1033,11 +1034,11 @@ struct LoadedBundleState {
     verified: VerifiedCollaborationProfileDocument,
 }
 
-fn load_bundle_state(
+fn load_authority_bundle(
     data_dir: &Path,
     principal_id: &str,
     localhost_root: &str,
-) -> anyhow::Result<Option<LoadedBundleState>> {
+) -> anyhow::Result<Option<CollaborationProfileAuthorityBundle>> {
     let path = profile_authority_path(data_dir, localhost_root)?;
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -1049,19 +1050,26 @@ fn load_bundle_state(
     if !metadata.is_file() {
         anyhow::bail!("profile authority bundle must be a regular file");
     }
-    let protection =
-        crate::auth::load_principal_root_protection(data_dir, principal_id, localhost_root)?;
-    if protection.is_none() {
-        anyhow::bail!("protected principal root is required for profile authority");
-    }
-    let bytes = crate::auth::read_principal_root_object(
+    let bytes = crate::auth::read_protected_principal_root_object(
         data_dir,
         principal_id,
         localhost_root,
         &profile_authority_object_uri(localhost_root),
         &path,
-    )?;
+    )?
+    .ok_or_else(|| anyhow!("protected principal root is required for profile authority"))?;
     let bundle = decode_profile_authority_bundle(&bytes)?;
+    Ok(Some(bundle))
+}
+
+fn load_bundle_state(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+) -> anyhow::Result<Option<LoadedBundleState>> {
+    let Some(bundle) = load_authority_bundle(data_dir, principal_id, localhost_root)? else {
+        return Ok(None);
+    };
     let verified = verify_signed_profile_document(&bundle.signed_profile)?;
     let signing_key = SigningKey::from_bytes(&decode_profile_signing_seed(
         &bundle.profile_signing_seed_hex,

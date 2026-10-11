@@ -1374,7 +1374,9 @@ mod tests {
         .contains("invalid home launch token payload"));
 
         let mut future = valid_envelope.clone();
-        future.payload.iat = now_ts().saturating_add(61);
+        // Keep this token beyond the clock allowance while the full parallel
+        // suite signs it and checks its current authority.
+        future.payload.iat = now_ts().saturating_add(HOME_LAUNCH_TOKEN_TTL_SECS + 61);
         future.payload.exp = future
             .payload
             .iat

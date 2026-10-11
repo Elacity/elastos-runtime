@@ -704,6 +704,35 @@ class SignerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "catalog head differs"):
             self.prepare()
 
+    def test_pinned_community_network_is_bound_like_the_catalog(self):
+        name = "collaboration-network-release-v1.json"
+        network = S.json_bytes({"expected_network_id": "fixture-network"})
+        def clear_snapshot():
+            for path in self.snapshot.iterdir():
+                path.unlink()
+        def pin(components, data):
+            components = copy.deepcopy(components)
+            components["collaboration_network"] = {"head_cid": S.raw_cid(data), "expected_network_id": "fixture-network",
+                                                   "trusted_profile_signer_dids": [DID]}
+            return components
+        original = self.current_shape()
+        (self.root / name).write_bytes(network)
+        self.manifest["files"][name] = {"sha256": S.sha256(network), "size": len(network), "cid": S.raw_cid(network)}
+        self.reapprove_components(pin(original, network))
+        self.assertEqual(len(self.prepare().files), 7)
+        self.assertFalse(self.marker.exists())
+        for components, message in ((pin(original, b"other network"), "Community network head differs"),
+                                    (original, "unbound artifact")):
+            clear_snapshot()
+            self.reapprove_components(components)
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self.prepare()
+        clear_snapshot()
+        del self.manifest["files"][name]
+        self.reapprove_components(pin(original, network))
+        with self.assertRaisesRegex(ValueError, "Community network snapshot required"):
+            self.prepare()
+
     def reapprove_components(self, components):
         data = S.json_bytes(components)
         (self.root / "components.json").write_bytes(data)

@@ -134,6 +134,14 @@ const summary = { authority: { signed_in: true }, identity: {
   recovery_readiness: { schema: "elastos.recovery.readiness/v1", status: "setup_required" },
 } };
 assert.equal(home.homeSetupNeedsAct(summary), true, "existing Profile still needs an exported kit covering it");
+vm.runInContext(functionSource(setup, "homeRecoveryKitOutdated"), home);
+assert.equal(home.homeRecoveryKitOutdated(summary), false, "a kit without a stated reason reads as a first kit");
+summary.identity.recovery_readiness.reason = "recovery_kit_missing";
+assert.equal(home.homeRecoveryKitOutdated(summary), false, "a new account is greeted with a first-kit message");
+summary.identity.recovery_readiness.reason = "recovery_kit_outdated";
+assert.equal(home.homeRecoveryKitOutdated(summary), true, "a kit that predates the Profile reads as outdated");
+delete summary.identity.recovery_readiness.reason;
+assert(setup.includes("Save a Recovery Kit so you can get back into your account."), "new accounts get first-kit copy");
 let shown = 0;
 Object.assign(home, { SETUP_HOLD_TARGETS: new Set(["chat-room"]), shellState: { currentSummary: summary }, showSetupSheet: () => { shown += 1; } });
 vm.runInContext(functionSource(setup, "holdHomeSetupAct"), home);

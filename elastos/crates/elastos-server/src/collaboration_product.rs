@@ -1,7 +1,8 @@
 //! Typed product boundary for the verified default collaboration conversation.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,8 @@ const CHAT_MESSAGE_TTL_SECS: u64 = 300;
 #[derive(Clone)]
 pub struct CollaborationChatProductPort {
     core: Arc<CollaborationCore>,
+    history_status: Arc<Mutex<crate::room_service::RoomHistoryView>>,
+    community_connected: Arc<AtomicBool>,
 }
 
 /// Read-only result of durably preparing one outgoing Chat message.
@@ -32,6 +35,7 @@ pub struct PreparedCollaborationChatMessage {
     network_id: String,
     conversation_id: String,
     envelope_sha256: String,
+    envelope_bytes: Vec<u8>,
     sender_profile_did: String,
     sender_profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
     body: String,
@@ -45,6 +49,7 @@ pub struct CollaborationChatHandoff {
     network_id: String,
     conversation_id: String,
     envelope_sha256: String,
+    envelope_bytes: Vec<u8>,
     sender_profile_did: String,
     sender_profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
     body: String,
@@ -63,7 +68,14 @@ impl CollaborationChatProductPort {
         if core.sender_service() != CHAT_SERVICE {
             anyhow::bail!("default collaboration conversation is not owned by Chat");
         }
-        Ok(Self { core })
+        Ok(Self {
+            core,
+            community_connected: Arc::new(AtomicBool::new(false)),
+            history_status: Arc::new(Mutex::new(crate::room_service::RoomHistoryView {
+                status: "searching".to_string(),
+                detail: "Checking recent Community history from online participants.".to_string(),
+            })),
+        })
     }
 
     #[cfg(test)]
@@ -96,11 +108,37 @@ impl CollaborationChatProductPort {
     }
 
     pub(crate) fn conversation_transport_view(&self) -> crate::room_service::RoomTransportView {
+        let joined = self.community_membership().joined();
+        let connected = self.community_connected.load(Ordering::Relaxed);
         crate::room_service::RoomTransportView {
             configured: true,
-            available: true,
-            status: Some("Collaboration is configured.".to_string()),
+            available: joined && connected,
+            community_joined: Some(joined),
+            status: Some(if !joined {
+                crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL.to_string()
+            } else if connected {
+                "Community is connected.".to_string()
+            } else {
+                "Community is unreachable. Retained messages stay available.".to_string()
+            }),
+            history: self.history_status.lock().ok().map(|status| status.clone()),
         }
+    }
+
+    pub(crate) fn community_membership(
+        &self,
+    ) -> &Arc<crate::collaboration_release_network::CommunityMembership> {
+        self.core.community_membership()
+    }
+
+    pub(crate) fn set_community_joined(&self, joined: bool) -> anyhow::Result<()> {
+        self.core.set_community_joined(joined)?;
+        self.set_community_connected(false);
+        Ok(())
+    }
+
+    pub(crate) fn set_community_connected(&self, connected: bool) {
+        self.community_connected.store(connected, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -180,6 +218,8 @@ impl CollaborationChatProductPort {
             local_session_token,
         )?;
         self.core
+            .retain_history_message(&prepared.envelope_bytes, now_secs())?;
+        self.core
             .acknowledge_outgoing_product_projection(&prepared.envelope_sha256)?;
         Ok(object)
     }
@@ -201,8 +241,109 @@ impl CollaborationChatProductPort {
             None,
         )?;
         self.core
+            .retain_history_message(&handoff.envelope_bytes, now_secs())?;
+        self.core
             .acknowledge_product_handoff(&handoff.envelope_sha256)?;
         Ok(object)
+    }
+
+    pub(crate) fn history_scope(&self) -> (&str, &str) {
+        self.core.conversation_scope()
+    }
+
+    pub(crate) fn local_device_did(&self) -> String {
+        self.core.local_device_did()
+    }
+
+    pub(crate) fn retained_history(&self, now: u64) -> anyhow::Result<Vec<Vec<u8>>> {
+        let messages = self.core.conversation_history(now)?;
+        for bytes in &messages {
+            self.history_handoff(bytes, now)?;
+        }
+        Ok(messages)
+    }
+
+    /// Verify the entire bounded batch before any product write. Projection and
+    /// retention both use the original message hash, so interrupted/repeated
+    /// catch-up resumes through the existing idempotent room projection.
+    pub(crate) fn project_history(
+        &self,
+        data_dir: &Path,
+        messages: &[Vec<u8>],
+        now: u64,
+    ) -> anyhow::Result<()> {
+        let handoffs = messages
+            .iter()
+            .map(|bytes| self.history_handoff(bytes, now))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let candidates = self.core.history_projection_candidates(messages, now)?;
+        let hashes = candidates
+            .iter()
+            .map(|bytes| {
+                elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(bytes)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for handoff in handoffs
+            .into_iter()
+            .filter(|handoff| hashes.contains(&handoff.envelope_sha256))
+        {
+            crate::room_service::project_collaboration_text(
+                data_dir,
+                (&handoff.network_id, &handoff.conversation_id),
+                &handoff.envelope_sha256,
+                &room_profile_card(&handoff.sender_profile),
+                &handoff.body,
+                handoff.issued_at,
+                None,
+            )?;
+        }
+        self.core.retain_history_messages(&candidates, now)
+    }
+
+    fn history_handoff(&self, bytes: &[u8], now: u64) -> anyhow::Result<CollaborationChatHandoff> {
+        let authorized = self.core.authorize_history_message(bytes, now)?;
+        let message = &authorized.message().envelope().payload;
+        if message.payload_type != CHAT_PAYLOAD_TYPE {
+            anyhow::bail!("collaboration history is not the current Chat product");
+        }
+        let payload = exact_chat_payload(authorized.product_payload())?;
+        let profile = authorized.sender_profile().clone();
+        Ok(CollaborationChatHandoff {
+            core: self.core.clone(),
+            network_id: message.network_id.clone(),
+            conversation_id: message.conversation_id.clone(),
+            envelope_sha256: authorized.message().envelope_sha256().to_string(),
+            envelope_bytes: bytes.to_vec(),
+            sender_profile_did: profile.document().profile_did.clone(),
+            sender_profile: profile,
+            body: payload.body,
+            issued_at: message.created_at,
+            expires_at: message.expires_at,
+        })
+    }
+
+    pub(crate) fn set_history_searching(&self) {
+        if let Ok(mut status) = self.history_status.lock() {
+            status.status = "searching".to_string();
+            status.detail =
+                "Checking recent Community history from online participants.".to_string();
+        }
+    }
+
+    pub(crate) fn set_history_status(&self, available: bool) {
+        if let Ok(mut status) = self.history_status.lock() {
+            status.status = if available {
+                "available"
+            } else {
+                "unavailable"
+            }
+            .to_string();
+            status.detail = if available {
+                "Recent Community history is available from an online participant."
+            } else {
+                "Recent Community history is unavailable. Another participant must be online to catch up."
+            }.to_string();
+        }
     }
 
     /// Read only this port's verified collaboration namespace from Chat's store.
@@ -219,6 +360,65 @@ impl CollaborationChatProductPort {
             network_id,
             conversation_id,
             since,
+        )
+    }
+
+    pub(crate) fn community_unread(
+        &self,
+        data_dir: &Path,
+        reader: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) -> anyhow::Result<bool> {
+        self.sync_community_read(data_dir, reader, None, now)
+    }
+
+    /// A visible read acknowledges through the returned verified scoped rows,
+    /// including own rows after an older unread remote row has been evicted.
+    /// The caller's cursor and latest_seq are not read evidence.
+    pub(crate) fn conversation_poll_with_read_intent(
+        &self,
+        data_dir: &Path,
+        token: &str,
+        since: u64,
+        reader: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+        mark_read: bool,
+        now: u64,
+    ) -> anyhow::Result<crate::room_service::RoomPollView> {
+        let poll = self.conversation_poll(data_dir, token, since)?;
+        if mark_read {
+            let read_through = poll
+                .objects
+                .iter()
+                .filter(|object| object.sender_profile_verified == Some(true))
+                .map(|object| object.seq)
+                .max();
+            self.sync_community_read(data_dir, reader, read_through, now)?;
+        }
+        Ok(poll)
+    }
+
+    fn sync_community_read(
+        &self,
+        data_dir: &Path,
+        reader: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+        read_through: Option<u64>,
+        now: u64,
+    ) -> anyhow::Result<bool> {
+        let (network_id, conversation_id) = self.core.conversation_scope();
+        let reader_did = reader.document().profile_did.as_str();
+        let seq = crate::room_service::collaboration_latest_remote_message_seq(
+            data_dir,
+            network_id,
+            conversation_id,
+            reader_did,
+        )?;
+        crate::notifications::sync_community_message_notification(
+            data_dir,
+            reader_did,
+            (network_id, conversation_id),
+            seq,
+            read_through,
+            now,
         )
     }
 
@@ -447,6 +647,7 @@ fn prepared_chat_message(
         network_id: message.network_id.clone(),
         conversation_id: message.conversation_id.clone(),
         envelope_sha256: prepared.envelope_sha256().to_string(),
+        envelope_bytes: prepared.envelope_bytes().to_vec(),
         sender_profile_did,
         sender_profile,
         body: payload.body,
@@ -472,6 +673,11 @@ fn chat_handoff(
         network_id: payload.network_id.clone(),
         conversation_id: payload.conversation_id.clone(),
         envelope_sha256: message.envelope_sha256().to_string(),
+        envelope_bytes:
+            elastos_common::collaboration_protocol::canonical_signed_collaboration_message_bytes(
+                message.envelope(),
+            )
+            .ok()?,
         sender_profile_did,
         sender_profile,
         body: chat.body,
@@ -516,6 +722,13 @@ fn normalize_chat_body(body: &str) -> anyhow::Result<String> {
     Ok(body.to_string())
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +768,11 @@ mod tests {
 
     fn fixture() -> Fixture {
         let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let mut fixture = fixture_at(temp.path(), NETWORK, CONVERSATION);
         fixture._temp = Some(temp);
         fixture
@@ -658,6 +876,113 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn community_availability_tracks_current_peers_and_left_takes_priority() {
+        let fixture = fixture();
+        let other_port = fixture.port.clone();
+        assert!(!fixture.port.conversation_transport_view().available);
+        assert_eq!(
+            fixture.port.conversation_transport_view().community_joined,
+            Some(true)
+        );
+        fixture.port.set_community_connected(true);
+        assert!(other_port.conversation_transport_view().available);
+        fixture.port.set_community_connected(false);
+        assert!(!other_port.conversation_transport_view().available);
+        fixture.port.set_community_connected(true);
+        fixture.port.set_community_joined(false).unwrap();
+        fixture.port.set_community_connected(true);
+        let left = other_port.conversation_transport_view();
+        assert!(!left.available);
+        assert_eq!(left.community_joined, Some(false));
+        assert_eq!(
+            left.status.as_deref(),
+            Some(crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL)
+        );
+        fixture.port.set_community_joined(true).unwrap();
+        assert!(!other_port.conversation_transport_view().available);
+        fixture.port.set_community_connected(true);
+        assert!(other_port.conversation_transport_view().available);
+    }
+
+    #[test]
+    fn leaving_community_keeps_original_history_and_refuses_new_shared_intent() {
+        let fixture = fixture();
+        let session = crate::room_service::start_local_runtime_session(
+            &fixture.data_root,
+            &fixture.person_profile.document().profile_did,
+            "Reader",
+            "Community membership test",
+        )
+        .unwrap();
+        let now = now_secs();
+        let prepared = fixture
+            .port
+            .prepare_message(
+                binding(&fixture, "before-leave", "retained history"),
+                "retained history",
+                &fixture.person_profile,
+                now,
+            )
+            .unwrap();
+        fixture
+            .port
+            .project_prepared_message(&fixture.data_root, &prepared, Some(&session.token))
+            .unwrap();
+        let original_history = fixture.core.conversation_history(now).unwrap();
+        let original_core = fixture.core.summary().unwrap();
+        fixture
+            .port
+            .community_membership()
+            .set_joined(false)
+            .unwrap();
+        assert!(fixture
+            .port
+            .prepare_message(
+                binding(&fixture, "after-leave", "refused"),
+                "refused",
+                &fixture.person_profile,
+                now,
+            )
+            .is_err());
+        assert_eq!(fixture.core.summary().unwrap(), original_core);
+        assert_eq!(
+            fixture.core.conversation_history(now).unwrap(),
+            original_history
+        );
+        let view = fixture.port.conversation_transport_view();
+        assert_eq!(view.community_joined, Some(false));
+        assert!(!view.available);
+        let poll = fixture
+            .port
+            .conversation_poll(&fixture.data_root, &session.token, 0)
+            .unwrap();
+        assert_eq!(poll.objects.len(), 1);
+        assert_eq!(poll.objects[0].body.as_deref(), Some("retained history"));
+        fixture
+            .port
+            .community_membership()
+            .set_joined(true)
+            .unwrap();
+        assert_eq!(
+            fixture.port.conversation_transport_view().community_joined,
+            Some(true)
+        );
+        assert_eq!(
+            fixture.core.conversation_history(now).unwrap(),
+            original_history
+        );
+        fixture
+            .port
+            .prepare_message(
+                binding(&fixture, "after-rejoin", "joined again"),
+                "joined again",
+                &fixture.person_profile,
+                now + 1,
+            )
+            .unwrap();
+    }
+
     fn remote_authority(
         fixture: &Fixture,
     ) -> (
@@ -685,6 +1010,240 @@ mod tests {
         )
         .unwrap();
         (authority, person_profile)
+    }
+
+    #[test]
+    fn community_unread_uses_scoped_other_authors_and_only_visible_returned_rows() {
+        let fixture = fixture();
+        let now = now_secs();
+        let session = crate::room_service::start_local_runtime_session(
+            &fixture.data_root,
+            &fixture.person_profile.document().profile_did,
+            "Reader",
+            "Community unread test",
+        )
+        .unwrap();
+        let own = fixture
+            .port
+            .prepare_message(
+                binding(&fixture, "community-own", "own text"),
+                "own text",
+                &fixture.person_profile,
+                now,
+            )
+            .unwrap();
+        fixture
+            .port
+            .project_prepared_message(&fixture.data_root, &own, Some(&session.token))
+            .unwrap();
+        assert!(!fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        let (remote, remote_profile) = remote_authority(&fixture);
+        crate::room_service::project_collaboration_text(
+            &fixture.data_root,
+            ("foreign-network", "foreign-conversation"),
+            &format!("sha256:{}", "f".repeat(64)),
+            &room_profile_card(&remote_profile),
+            "foreign text",
+            now,
+            None,
+        )
+        .unwrap();
+        assert!(!fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        let incoming = remote
+            .prepare_profile_outgoing(
+                &remote_profile,
+                CHAT_SERVICE,
+                CHAT_PAYLOAD_TYPE,
+                serde_json::json!({"body":"remote text"}),
+                now,
+                CHAT_MESSAGE_TTL_SECS,
+            )
+            .unwrap();
+        fixture
+            .core
+            .accept_incoming_from_signed_source_for_test(incoming.envelope_bytes(), now)
+            .unwrap();
+        let handoff = fixture.port.pending_messages().unwrap().remove(0);
+        fixture
+            .port
+            .project_handoff(&fixture.data_root, &handoff)
+            .unwrap();
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        // For the remote account, the first author's text is also unread.
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &remote_profile, now)
+            .unwrap());
+        let background = fixture
+            .port
+            .conversation_poll_with_read_intent(
+                &fixture.data_root,
+                &session.token,
+                0,
+                &fixture.person_profile,
+                false,
+                now,
+            )
+            .unwrap();
+        assert_eq!(background.objects.len(), 2);
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        // A client cannot turn its invented high cursor into read evidence.
+        let empty = fixture
+            .port
+            .conversation_poll_with_read_intent(
+                &fixture.data_root,
+                &session.token,
+                u64::MAX,
+                &fixture.person_profile,
+                true,
+                now,
+            )
+            .unwrap();
+        assert!(empty.objects.is_empty());
+        assert_eq!(empty.latest_seq, u64::MAX);
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        assert!(fixture
+            .port
+            .conversation_poll_with_read_intent(
+                &fixture.data_root,
+                "invalid-session",
+                0,
+                &fixture.person_profile,
+                true,
+                now,
+            )
+            .is_err());
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        let visible = fixture
+            .port
+            .conversation_poll_with_read_intent(
+                &fixture.data_root,
+                &session.token,
+                0,
+                &fixture.person_profile,
+                true,
+                now,
+            )
+            .unwrap();
+        assert_eq!(visible.objects.len(), 2);
+        assert!(!fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now)
+            .unwrap());
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &remote_profile, now)
+            .unwrap());
+        let next = remote
+            .prepare_profile_outgoing(
+                &remote_profile,
+                CHAT_SERVICE,
+                CHAT_PAYLOAD_TYPE,
+                serde_json::json!({"body":"next remote text"}),
+                now + 1,
+                CHAT_MESSAGE_TTL_SECS,
+            )
+            .unwrap();
+        fixture
+            .core
+            .accept_incoming_from_signed_source_for_test(next.envelope_bytes(), now + 1)
+            .unwrap();
+        let handoff = fixture.port.pending_messages().unwrap().remove(0);
+        fixture
+            .port
+            .project_handoff(&fixture.data_root, &handoff)
+            .unwrap();
+        assert!(fixture
+            .port
+            .community_unread(&fixture.data_root, &fixture.person_profile, now + 1)
+            .unwrap());
+    }
+
+    #[test]
+    fn product_retains_original_after_durable_projection_and_retries_a_failed_sidecar_write() {
+        let fixture = fixture();
+        let now = now_secs();
+        let prepared = fixture
+            .port
+            .prepare_message(
+                binding(&fixture, "history-product", "retained text"),
+                "retained text",
+                &fixture.person_profile,
+                now,
+            )
+            .unwrap();
+        assert!(fixture.port.retained_history(now).unwrap().is_empty());
+        let namespace =
+            std::fs::read_dir(fixture.data_root.join("collaboration/default-conversation"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+        let history_path = namespace.join("history-v1.json");
+        // A storage refusal after the room write leaves the live projection
+        // pending. Repairing storage lets the same exact request finish once.
+        std::fs::create_dir(&history_path).unwrap();
+        assert!(fixture
+            .port
+            .project_prepared_message(&fixture.data_root, &prepared, None)
+            .is_err());
+        assert_eq!(
+            fixture.port.pending_outgoing_messages(now).unwrap().len(),
+            1
+        );
+        std::fs::remove_dir(&history_path).unwrap();
+        let object = fixture
+            .port
+            .project_prepared_message(&fixture.data_root, &prepared, None)
+            .unwrap();
+        let retry = fixture
+            .port
+            .project_prepared_message(&fixture.data_root, &prepared, None)
+            .unwrap();
+        assert_eq!(object.seq, retry.seq);
+        assert!(fixture
+            .port
+            .pending_outgoing_messages(now)
+            .unwrap()
+            .is_empty());
+        let bytes = fixture.port.retained_history(now).unwrap();
+        assert_eq!(bytes, vec![prepared.envelope_bytes.clone()]);
+        let restarted = Arc::new(
+            CollaborationCore::new(
+                &fixture.data_root,
+                fixture.device_key.clone(),
+                fixture.profile.clone(),
+                fixture.grant.clone(),
+                CHAT_ROOM_CAPSULE,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            CollaborationChatProductPort::new(restarted)
+                .unwrap()
+                .retained_history(now)
+                .unwrap(),
+            bytes
+        );
     }
 
     #[test]

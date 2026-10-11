@@ -404,23 +404,33 @@ pub(super) async fn home_summary(
                 Ok(authority) => authority,
                 Err(err) => return home_error_response(err),
             };
-            if let Err(err) = apply_profile_people_authority(
+            let contact_read = match contact_authority
+                .as_ref()
+                .map(|authority| authority.store.read_only_snapshot())
+                .transpose()
+            {
+                Ok(read) => read,
+                Err(err) => return home_error_response(err),
+            };
+            if let Err(err) = apply_profile_people_authority_from_snapshot(
                 &mut home_state.people,
-                contact_authority.as_ref().map(|authority| &authority.store),
+                contact_read.as_ref(),
             ) {
                 return home_error_response(err);
             }
-            if let Err(err) = apply_contact_request_notification_projection(
+            if let Err(err) = apply_contact_request_notification_projection_from_snapshot(
                 &state.data_dir,
-                contact_authority.as_ref().map(|authority| &authority.store),
+                contact_authority.as_ref(),
+                contact_read.as_ref(),
+                state.collaboration_chat_product_port.as_ref(),
                 &mut home_state.notifications,
             ) {
                 return home_error_response(err);
             }
-            if let Err(err) = apply_services_peer_authority(
+            if let Err(err) = apply_services_peer_authority_from_snapshot(
                 &state.data_dir,
                 context,
-                state.collaboration_discovery_service.as_ref(),
+                contact_read.as_ref(),
                 &mut home_state.services,
             ) {
                 return home_error_response(err);
@@ -457,7 +467,12 @@ pub(super) async fn home_summary(
         };
 
     let mut notifications = home_state.notifications;
-    let active_shell = match home_active_shell_summary(&state.data_dir, context.as_ref()) {
+    let capsule_catalog = capsule_catalog_summary(&state.data_dir);
+    let active_shell = match home_active_shell_summary_from_catalog(
+        &state.data_dir,
+        context.as_ref(),
+        &capsule_catalog,
+    ) {
         Ok(shell) => shell,
         Err(err) => return home_error_response(err),
     };
@@ -478,10 +493,9 @@ pub(super) async fn home_summary(
         }
         append_home_service_access_notifications(&state.data_dir, context, &mut notifications);
     }
-    let capsule_catalog = capsule_catalog_summary(&state.data_dir);
     let targets = home_targets_from_catalog(&capsule_catalog);
-    let capsule_interfaces = capsule_interface_registry_summary_with_bindings(
-        &state.data_dir,
+    let capsule_interfaces = capsule_interface_registry_summary_with_bindings_from_catalog(
+        &capsule_catalog,
         state.provider_registry.as_deref(),
     )
     .await;
@@ -587,7 +601,11 @@ pub(super) async fn people_discovery_update(
                     now,
                 )
                 .await?;
-            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)?;
+            service.wake_registered_discovery_now(
+                authority.store.as_ref(),
+                &authority.profile,
+                now,
+            )?;
             service.local_status(authority.store.as_ref(), &authority.profile, now)
         },
     )
@@ -608,7 +626,11 @@ pub(super) async fn people_discovery_refresh(
         &headers,
         false,
         |service, authority, now| async move {
-            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)?;
+            service.wake_registered_discovery_now(
+                authority.store.as_ref(),
+                &authority.profile,
+                now,
+            )?;
             service.local_status(authority.store.as_ref(), &authority.profile, now)
         },
     )
@@ -745,7 +767,13 @@ pub(super) async fn people_contact_remove(
 fn configured_people_summary_from_contact_store(
     store: &crate::collaboration_contact_store::CollaborationContactStore,
 ) -> anyhow::Result<HomePeopleSummary> {
-    let snapshot = store.snapshot()?;
+    configured_people_summary_from_snapshot(&store.read_only_snapshot()?)
+}
+
+fn configured_people_summary_from_snapshot(
+    read: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+) -> anyhow::Result<HomePeopleSummary> {
+    let snapshot = read.snapshot()?;
     let now = now_ts();
     let mut contacts = snapshot
         .contacts()
@@ -774,7 +802,7 @@ fn configured_people_summary_from_contact_store(
         .iter()
         .map(|contact| contact.remote_profile_did().to_string())
         .collect();
-    for requested in store.outgoing_pending_requests(now)? {
+    for requested in read.outgoing_pending_requests(now)? {
         if !seen.insert(requested.remote_profile_did.clone()) {
             continue;
         }
@@ -816,7 +844,7 @@ fn configured_people_summary_from_contact_store(
             reachable: None,
         });
     }
-    for declined in store.declined_relationships()? {
+    for declined in read.declined_relationships()? {
         if !seen.insert(declined.remote_profile_did.clone()) {
             continue;
         }
@@ -854,13 +882,38 @@ pub(super) struct ConfiguredContactAuthority {
 /// read response. The contact store remains the only persistent truth.
 pub(super) fn apply_contact_request_notification_projection(
     data_dir: &std::path::Path,
-    contact_store: Option<
-        &std::sync::Arc<crate::collaboration_contact_store::CollaborationContactStore>,
-    >,
+    contact_authority: Option<&ConfiguredContactAuthority>,
+    community: Option<&crate::collaboration_product::CollaborationChatProductPort>,
     notifications: &mut HomeNotificationsSummary,
 ) -> anyhow::Result<()> {
-    let pending = match contact_store {
-        Some(store) => store
+    let read = contact_authority
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose()?;
+    apply_contact_request_notification_projection_from_snapshot(
+        data_dir,
+        contact_authority,
+        read.as_ref(),
+        community,
+        notifications,
+    )
+}
+
+fn apply_contact_request_notification_projection_from_snapshot(
+    data_dir: &std::path::Path,
+    contact_authority: Option<&ConfiguredContactAuthority>,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+    community: Option<&crate::collaboration_product::CollaborationChatProductPort>,
+    notifications: &mut HomeNotificationsSummary,
+) -> anyhow::Result<()> {
+    let contact_store = match (contact_authority, read) {
+        (Some(authority), Some(read)) if std::ptr::eq(authority.store.as_ref(), read.store()) => {
+            Some(read.store())
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("Home notification snapshot does not match its contact authority"),
+    };
+    let pending = match read {
+        Some(read) => read
             .pending_incoming_requests()?
             .iter()
             .map(
@@ -876,6 +929,23 @@ pub(super) fn apply_contact_request_notification_projection(
         None => Vec::new(),
     };
     let mut summary = crate::notifications::load_summary(data_dir)?;
+    if let Some(store) = contact_store {
+        crate::notifications::project_direct_message_notifications(
+            &mut summary,
+            data_dir,
+            store.local_profile_did(),
+        )?;
+    }
+    if let Some(authority) = contact_authority {
+        if let Some(port) = community {
+            port.community_unread(data_dir, &authority.profile, now_ts())?;
+        }
+        crate::notifications::project_community_message_notifications(
+            &mut summary,
+            data_dir,
+            authority.profile.document().profile_did.as_str(),
+        )?;
+    }
     crate::notifications::project_contact_request_notifications(&mut summary, &pending);
     *notifications = home_notifications_summary(summary);
     Ok(())
@@ -894,6 +964,15 @@ pub(super) fn load_configured_contact_authority_for_context(
     let Some(profile) = load_profile_authority_for_context(data_dir, context)? else {
         return Ok(None);
     };
+    configured_contact_authority_from_profile(data_dir, context, discovery_service, profile)
+        .map(Some)
+}
+pub(super) fn configured_contact_authority_from_profile(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    discovery_service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+) -> anyhow::Result<ConfiguredContactAuthority> {
     let local_device_did = crate::collaboration_profile_authority::load_existing_device_did(
         data_dir,
     )?
@@ -908,7 +987,7 @@ pub(super) fn load_configured_contact_authority_for_context(
             &local_device_did,
         )?,
     );
-    Ok(Some(ConfiguredContactAuthority { profile, store }))
+    Ok(ConfiguredContactAuthority { profile, store })
 }
 
 pub(super) fn load_profile_authority_for_context(
@@ -1044,9 +1123,12 @@ fn configured_people_discovery_summary(
         .filter(|deadline| *deadline > now);
     let remote_visibility_remaining_seconds =
         remote_visibility_may_remain_until.map(|deadline| deadline.saturating_sub(now));
-    let (status_code, status_message) = if !status.enabled()
-        && remote_visibility_may_remain_until.is_some()
-    {
+    let (status_code, status_message) = if status.community_paused() {
+        (
+            "community_left",
+            crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL.to_string(),
+        )
+    } else if !status.enabled() && remote_visibility_may_remain_until.is_some() {
         let remaining = remote_visibility_remaining_seconds.expect("derived from deadline");
         (
             "off_pending_expiry",
@@ -1056,6 +1138,12 @@ fn configured_people_discovery_summary(
         )
     } else if !status.enabled() {
         ("off", "Discovery is off.".to_string())
+    } else if status.connecting() {
+        (
+            "connecting",
+            "Discovery is connecting. People who are visible appear here in a few seconds."
+                .to_string(),
+        )
     } else if status.available() {
         (
             "visible",
@@ -1236,6 +1324,29 @@ mod discovery_summary_tests {
         assert_eq!(json["status"], "off");
         assert!(json.get("remote_visibility_may_remain_until").is_none());
         assert!(json.get("remote_visibility_remaining_seconds").is_none());
+    }
+
+    #[test]
+    fn configured_discovery_summary_reports_connecting_before_first_relay_pass() {
+        let summary = configured_people_discovery_summary(
+            &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus::test_new(
+                false,
+                true,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_connecting_for_test(),
+            100,
+        );
+
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["status"], "connecting");
+        assert_eq!(
+            json["status_message"],
+            "Discovery is connecting. People who are visible appear here in a few seconds."
+        );
     }
 
     #[test]
@@ -1722,6 +1833,27 @@ mod discovery_summary_tests {
             .unwrap();
 
         assert_eq!(fixture.store.snapshot().unwrap().contacts().len(), 1);
+        let response_read = fixture.store.read_only_snapshot().unwrap();
+        let context = HomeLaunchTokenContext {
+            principal_id: fixture.store.principal_id().to_string(),
+            session_id: "session".to_string(),
+            proof_binding_id: Some("proof".to_string()),
+            grant_id: "grant".to_string(),
+        };
+        let authority = ConfiguredContactAuthority {
+            profile: fixture.local_profile.clone(),
+            store: fixture.store.clone(),
+        };
+        let mut notifications = HomeNotificationsSummary::default();
+        apply_contact_request_notification_projection_from_snapshot(
+            fixture.store.data_root(),
+            Some(&authority),
+            Some(&response_read),
+            None,
+            &mut notifications,
+        )
+        .unwrap();
+        let original_notifications = serde_json::to_value(&notifications).unwrap();
         let revocation = signed_discovery_message(
             &fixture.local_key,
             &fixture.local_profile.document().profile_did,
@@ -1756,6 +1888,35 @@ mod discovery_summary_tests {
             .record_local_contact_revocation(&revocation, &fixture.local_profile, now + 3)
             .unwrap();
 
+        // The already started response retains one view across the real revocation.
+        let response_people = configured_people_summary_from_snapshot(&response_read).unwrap();
+        assert_eq!(response_people.contacts[0].relationship, "connected");
+        assert_eq!(
+            home_services_peer_contacts_state_from_snapshot(&context, Some(&response_read))
+                .unwrap()
+                .contacts
+                .len(),
+            1
+        );
+        apply_contact_request_notification_projection_from_snapshot(
+            fixture.store.data_root(),
+            Some(&authority),
+            Some(&response_read),
+            None,
+            &mut notifications,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&notifications).unwrap(),
+            original_notifications
+        );
+        let next_read = fixture.store.read_only_snapshot().unwrap();
+        assert!(
+            home_services_peer_contacts_state_from_snapshot(&context, Some(&next_read))
+                .unwrap()
+                .contacts
+                .is_empty()
+        );
         let snapshot = fixture.store.snapshot().unwrap();
         assert!(snapshot.contacts().is_empty());
         assert_eq!(snapshot.removed().len(), 1);
@@ -1777,6 +1938,56 @@ mod discovery_summary_tests {
             resendable[0].remote_profile_did,
             remote_profile.document().profile_did
         );
+        let object_uri = format!(
+            "{}/.AppData/ElastOS/People/contact-state.json",
+            fixture.store.localhost_root()
+        );
+        let path = rooted_localhost_fs_path(fixture.store.data_root(), &object_uri).unwrap();
+        crate::auth::write_protected_principal_root_object(
+            fixture.store.data_root(),
+            fixture.store.principal_id(),
+            fixture.store.localhost_root(),
+            &object_uri,
+            &path,
+            b"{}",
+        )
+        .unwrap();
+        assert_eq!(
+            configured_people_summary_from_snapshot(&next_read)
+                .unwrap()
+                .contacts[0]
+                .relationship,
+            "removed"
+        );
+        assert!(fixture.store.read_only_snapshot().is_err());
+        assert!(configured_people_summary_from_contact_store(&fixture.store).is_err());
+    }
+
+    #[test]
+    fn home_contact_read_refuses_foreign_authority_and_principal_root() {
+        let fixture = configured_people_fixture();
+        let foreign = configured_people_fixture();
+        let read = fixture.store.read_only_snapshot().unwrap();
+        let authority = ConfiguredContactAuthority {
+            profile: foreign.local_profile.clone(),
+            store: foreign.store.clone(),
+        };
+        let mut notifications = HomeNotificationsSummary::default();
+        assert!(apply_contact_request_notification_projection_from_snapshot(
+            fixture.store.data_root(),
+            Some(&authority),
+            Some(&read),
+            None,
+            &mut notifications,
+        )
+        .is_err());
+        let context = HomeLaunchTokenContext {
+            principal_id: "person:local:foreign-home-reader".to_string(),
+            session_id: "session".to_string(),
+            proof_binding_id: Some("proof".to_string()),
+            grant_id: "grant".to_string(),
+        };
+        assert!(home_services_peer_contacts_state_from_snapshot(&context, Some(&read)).is_err());
     }
 
     #[test]
@@ -1904,6 +2115,18 @@ fn apply_profile_people_authority(
     Ok(())
 }
 
+fn apply_profile_people_authority_from_snapshot(
+    people: &mut HomePeopleSummary,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+) -> anyhow::Result<()> {
+    if let Some(read) = read {
+        *people = configured_people_summary_from_snapshot(read)?;
+        return Ok(());
+    }
+    *people = HomePeopleSummary::default();
+    Ok(())
+}
+
 fn apply_services_peer_authority(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -1912,7 +2135,22 @@ fn apply_services_peer_authority(
     >,
     services: &mut HomeServicesSummary,
 ) -> anyhow::Result<()> {
-    let contacts = home_services_peer_contacts_state(data_dir, context, discovery_service)?;
+    let authority =
+        load_configured_contact_authority_for_context(data_dir, context, discovery_service)?;
+    let read = authority
+        .as_ref()
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose()?;
+    apply_services_peer_authority_from_snapshot(data_dir, context, read.as_ref(), services)
+}
+
+fn apply_services_peer_authority_from_snapshot(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+    services: &mut HomeServicesSummary,
+) -> anyhow::Result<()> {
+    let contacts = home_services_peer_contacts_state_from_snapshot(context, read)?;
     let mut remote_offers = contacts
         .contacts
         .values()
@@ -5138,46 +5376,64 @@ async fn home_realtime_snapshot(
         context,
         state.collaboration_discovery_service.as_ref(),
     );
-    let mut contact_authority_unavailable = contact_authority.is_err();
-    if apply_contact_request_notification_projection(
+    let contact_read = contact_authority
+        .as_ref()
+        .ok()
+        .and_then(|authority| authority.as_ref())
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose();
+    let mut contact_authority_unavailable = contact_authority.is_err() || contact_read.is_err();
+    if apply_contact_request_notification_projection_from_snapshot(
         &state.data_dir,
         contact_authority
             .as_ref()
             .ok()
-            .and_then(|authority| authority.as_ref())
-            .map(|authority| &authority.store),
+            .and_then(|authority| authority.as_ref()),
+        contact_read.as_ref().ok().and_then(|read| read.as_ref()),
+        state.collaboration_chat_product_port.as_ref(),
         &mut home_state.notifications,
     )
     .is_err()
     {
         contact_authority_unavailable = true;
     }
-    if apply_profile_people_authority(
+    if apply_profile_people_authority_from_snapshot(
         &mut home_state.people,
-        contact_authority
-            .as_ref()
-            .ok()
-            .and_then(|authority| authority.as_ref())
-            .map(|authority| &authority.store),
+        contact_read.as_ref().ok().and_then(|read| read.as_ref()),
     )
     .is_err()
     {
         home_state.people = HomePeopleSummary::default();
     }
-    if apply_services_peer_authority(
-        &state.data_dir,
-        context,
-        state.collaboration_discovery_service.as_ref(),
-        &mut home_state.services,
-    )
-    .is_err()
+    if contact_authority.is_err()
+        || contact_read.is_err()
+        || apply_services_peer_authority_from_snapshot(
+            &state.data_dir,
+            context,
+            contact_read.as_ref().ok().and_then(|read| read.as_ref()),
+            &mut home_state.services,
+        )
+        .is_err()
     {
         home_state.services = HomeServicesSummary::default();
     }
     if apply_home_services_selection(&state.data_dir, context, &mut home_state.services).is_err() {
         home_state.services = HomeServicesSummary::default();
     }
-    let room_signature = home_room_realtime_signature(&home_state.room);
+    // A new direct message refreshes its conversation's notification time,
+    // so the newest such time signals direct messages alongside the room.
+    let direct_message_marker = home_state
+        .notifications
+        .entries
+        .iter()
+        .filter(|entry| crate::notifications::is_direct_message_notification_id(&entry.id))
+        .map(|entry| entry.created_at)
+        .max()
+        .unwrap_or_default();
+    let room_signature = format!(
+        "{}:dm{direct_message_marker}",
+        home_room_realtime_signature(&home_state.room)
+    );
     let mut notifications = home_state.notifications;
     let wallet_approvals = system_wallet_approvals_summary(state, authority, false).await;
     let mut wallet_request_signature = wallet_approvals
@@ -5221,7 +5477,17 @@ async fn home_realtime_snapshot(
     .await;
     let recovery_readiness = recovery_readiness_for_context(&state.data_dir, context);
     let desktop_signature = home_desktop_events_signature(state, context).await;
-    let people_signature = home_people_realtime_signature(&home_state.people);
+    let mut people_signature = home_people_realtime_signature(&home_state.people);
+    if let (Some(service), Ok(Some(authority))) = (
+        state.collaboration_discovery_service.as_ref(),
+        contact_authority.as_ref(),
+    ) {
+        if let Ok(status) =
+            service.read_only_status(authority.store.as_ref(), &authority.profile, now_ts())
+        {
+            people_signature.push(home_discovery_realtime_signature(&status));
+        }
+    }
     let services_signature = home_services_realtime_signature(&home_state.services);
     HomeRealtimeSnapshot {
         principal_id: context.principal_id.clone(),
@@ -5335,8 +5601,9 @@ fn home_room_realtime_signature(room: &HomeRoomSummary) -> String {
         .collect::<Vec<_>>();
     sessions.sort();
     format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
         room.room_slug,
+        room.latest_seq,
         room.pending_count,
         room.active_session_count,
         room.member_count,
@@ -5344,6 +5611,27 @@ fn home_room_realtime_signature(room: &HomeRoomSummary) -> String {
         room.local_runtime_role.as_deref().unwrap_or_default(),
         pending.join(","),
         sessions.join(",")
+    )
+}
+
+/// Discovery state that People shows. Countdown seconds stay out so the
+/// signature changes only when what a person can act on changes.
+fn home_discovery_realtime_signature(
+    status: &crate::collaboration_discovery_runtime::CollaborationDiscoveryStatus,
+) -> String {
+    let mut visible = status
+        .visible_people()
+        .iter()
+        .map(|person| person.advertisement_id())
+        .collect::<Vec<_>>();
+    visible.sort_unstable();
+    format!(
+        "discovery:{}:{}:{}:{}:{}",
+        status.enabled(),
+        status.connecting(),
+        status.available(),
+        status.incoming_requests().len(),
+        visible.join(",")
     )
 }
 
@@ -5671,15 +5959,18 @@ pub(super) fn recovery_readiness_for_context(
         &home_browser_localhost_root(context),
     ) {
         Ok(recovery) => {
+            let kit_outdated = recovery
+                .required_actions
+                .iter()
+                .any(|action| action == "download_recovery_kit_with_profile");
             if crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery)
-                && !recovery
-                    .required_actions
-                    .iter()
-                    .any(|action| action == "download_recovery_kit_with_profile")
+                && !kit_outdated
             {
                 RecoveryReadinessSummary::ready()
+            } else if recovery.recovery_configured {
+                RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_OUTDATED)
             } else {
-                RecoveryReadinessSummary::setup_required()
+                RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_MISSING)
             }
         }
         Err(_) => RecoveryReadinessSummary::unavailable(),
@@ -5793,7 +6084,15 @@ fn home_active_shell_summary(
     data_dir: &std::path::Path,
     context: Option<&HomeLaunchTokenContext>,
 ) -> anyhow::Result<HomeActiveShellSummary> {
-    let candidates = home_active_shell_candidates(data_dir);
+    home_active_shell_summary_from_catalog(data_dir, context, &capsule_catalog_summary(data_dir))
+}
+
+fn home_active_shell_summary_from_catalog(
+    data_dir: &std::path::Path,
+    context: Option<&HomeLaunchTokenContext>,
+    catalog: &CapsuleCatalogResponse,
+) -> anyhow::Result<HomeActiveShellSummary> {
+    let candidates = home_active_shell_candidates_from_catalog(catalog);
     let saved = match context {
         Some(context) => home_active_shell_state(data_dir, context)?.map(|state| state.active),
         None => None,
@@ -5846,18 +6145,24 @@ pub(super) fn home_active_shell_snapshot_value(
 }
 
 fn home_active_shell_candidates(data_dir: &std::path::Path) -> Vec<HomeActiveShellCandidate> {
+    home_active_shell_candidates_from_catalog(&capsule_catalog_summary(data_dir))
+}
+
+fn home_active_shell_candidates_from_catalog(
+    catalog: &CapsuleCatalogResponse,
+) -> Vec<HomeActiveShellCandidate> {
     let mut candidates = BTreeMap::<String, HomeActiveShellCandidate>::new();
-    for capsule in capsule_catalog_summary(data_dir)
+    for capsule in catalog
         .capsules
-        .into_iter()
+        .iter()
         .filter(|capsule| capsule.role == CapsuleRole::Shell && capsule.launchable)
         .filter(|capsule| capsule.name != HOME_CAPSULE_ID)
         .filter(|capsule| is_trusted_home_shell_id(&capsule.name))
     {
-        let Some(catalog_route) = capsule.route else {
+        let Some(catalog_route) = capsule.route.clone() else {
             continue;
         };
-        let capsule_name = capsule.name;
+        let capsule_name = capsule.name.clone();
         let is_home_gui = capsule_name == HOME_GUI_SHELL_ID;
         let name = capsule_name.clone();
         let candidate = HomeActiveShellCandidate {
@@ -5865,17 +6170,17 @@ fn home_active_shell_candidates(data_dir: &std::path::Path) -> Vec<HomeActiveShe
             title: if is_home_gui {
                 "Home GUI".to_string()
             } else {
-                capsule.title
+                capsule.title.clone()
             },
-            description: capsule.description,
+            description: capsule.description.clone(),
             route: if is_home_gui {
                 HOME_ROUTE.to_string()
             } else {
                 catalog_route
             },
-            role: capsule.role,
+            role: capsule.role.clone(),
             launchable: capsule.launchable,
-            trust_state: capsule.trust_state,
+            trust_state: capsule.trust_state.clone(),
         };
         candidates.insert(name, candidate);
     }
@@ -6445,16 +6750,32 @@ fn home_services_peer_contacts_state(
         &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
 ) -> anyhow::Result<HomeServicesPeerContactsState> {
+    let authority =
+        load_configured_contact_authority_for_context(data_dir, context, discovery_service)?;
+    let read = authority
+        .as_ref()
+        .map(|authority| authority.store.read_only_snapshot())
+        .transpose()?;
+    home_services_peer_contacts_state_from_snapshot(context, read.as_ref())
+}
+
+fn home_services_peer_contacts_state_from_snapshot(
+    context: &HomeLaunchTokenContext,
+    read: Option<&crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>>,
+) -> anyhow::Result<HomeServicesPeerContactsState> {
     let mut state = default_home_services_peer_contacts_state(context);
-    let Some(authority) =
-        load_configured_contact_authority_for_context(data_dir, context, discovery_service)?
-    else {
+    let Some(read) = read else {
         return Ok(state);
     };
+    if read.store().principal_id() != state.principal_id
+        || read.store().localhost_root() != state.localhost_root
+    {
+        anyhow::bail!("Home Services snapshot does not match its principal root");
+    }
     // A contact permits a request. The provider's separate approval grants use.
     // Delivery follows the endpoint in the current verified Profile chain;
     // legacy peer files remain migration evidence, never contact authority.
-    for contact in authority.store.snapshot()?.contacts() {
+    for contact in read.snapshot()?.contacts() {
         let endpoint_did = contact.remote_presence_device_did();
         let peer_id = crate::carrier::did_to_public_key(endpoint_did)
             .ok_or_else(|| {
@@ -7110,6 +7431,68 @@ pub(super) async fn system_guest_registration_update(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SystemCommunityMembershipRequest {
+    joined: bool,
+}
+
+fn system_community_membership_summary(state: &GatewayState) -> serde_json::Value {
+    let membership = state
+        .collaboration_chat_product_port
+        .as_ref()
+        .map(|port| port.community_membership());
+    let joined = membership.is_some_and(|membership| membership.joined());
+    serde_json::json!({
+        "schema": "elastos.community-membership/v1",
+        "configured": membership.is_some(),
+        "joined": joined,
+        "detail": if membership.is_none() {
+            "Community is not configured on this Home."
+        } else if joined {
+            "This Home joins Community. Its owner can leave while keeping contacts, Direct messages and history."
+        } else {
+            crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+        },
+    })
+}
+
+pub(super) async fn system_community_membership_get(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+        Ok(_) => Json(system_community_membership_summary(&state)).into_response(),
+        Err(error) => system_error_response(error),
+    }
+}
+
+pub(super) async fn system_community_membership_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<SystemCommunityMembershipRequest>,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(error) => return system_error_response(error),
+        };
+    if let Err(error) = require_admin_principal(&state.data_dir, &context) {
+        return system_error_response(error);
+    }
+    let Some(port) = state.collaboration_chat_product_port.as_ref() else {
+        return (
+            StatusCode::CONFLICT,
+            "Community is not configured on this Home.",
+        )
+            .into_response();
+    };
+    match port.set_community_joined(body.joined) {
+        Ok(()) => Json(system_community_membership_summary(&state)).into_response(),
+        Err(error) => system_error_response(error),
+    }
+}
+
 struct HomeBackgroundImageEntry {
     path: PathBuf,
     object_uri: String,
@@ -7747,6 +8130,14 @@ mod home_realtime_tests {
     use super::*;
 
     #[test]
+    fn room_realtime_signature_changes_when_a_message_arrives() {
+        let mut room = HomeRoomSummary::default();
+        let before = home_room_realtime_signature(&room);
+        room.latest_seq = 7;
+        assert_ne!(home_room_realtime_signature(&room), before);
+    }
+
+    #[test]
     fn room_realtime_signature_ignores_session_last_seen_heartbeat() {
         let mut room = HomeRoomSummary {
             active_session_count: 1,
@@ -7992,7 +8383,9 @@ mod home_realtime_tests {
         let snapshot = HomeRealtimeSnapshot {
             principal_id: "person:local:test".to_string(),
             runtime_signature: String::new(),
-            recovery_readiness: RecoveryReadinessSummary::setup_required(),
+            recovery_readiness: RecoveryReadinessSummary::setup_required(
+                RECOVERY_READINESS_REASON_KIT_MISSING,
+            ),
             profile_readiness: ProfileReadinessSummary::setup_required(),
             notification_signature: Vec::new(),
             wallet_request_signature: Vec::new(),
@@ -8108,5 +8501,110 @@ mod services_kind_tests {
             ..Default::default()
         };
         assert!(!remote_offer_request_expired(&denied, 100));
+    }
+}
+
+#[cfg(test)]
+mod home_catalogue_snapshot_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn home_catalogue_projections_share_one_snapshot_and_next_read_sees_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let original: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../capsules/home-gui/capsule.json"
+        ))
+        .unwrap();
+        for name in ["home-gui", "fixture-app"] {
+            let dir = root.path().join("capsules").join(name);
+            std::fs::create_dir_all(dir.join("browser")).unwrap();
+            let mut manifest = original.clone();
+            manifest["name"] = name.into();
+            if name == "fixture-app" {
+                manifest["role"] = "app".into();
+                manifest["description"] = "Before".into();
+            }
+            std::fs::write(
+                dir.join("capsule.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(dir.join("browser/index.html"), "Home fixture").unwrap();
+        }
+        let registry = root.path().join("components.json");
+        let mut components = serde_json::json!({"external": {
+            "home-gui": {"install_path": "capsules/home-gui", "platforms": {}},
+            "fixture-app": {"install_path": "capsules/fixture-app", "platforms": {}}
+        }, "capsules": {}, "profiles": {}});
+        std::fs::write(&registry, serde_json::to_vec(&components).unwrap()).unwrap();
+        let catalog = capsule_catalog_summary(root.path());
+        let shells = home_active_shell_summary_from_catalog(root.path(), None, &catalog).unwrap();
+        assert_eq!(shells.active, HOME_GUI_SHELL_ID);
+        assert_eq!(shells.candidates.len(), 1);
+        let targets = serde_json::to_value(home_targets_from_catalog(&catalog)).unwrap();
+        let interfaces = serde_json::to_value(
+            capsule_interface_registry_summary_with_bindings_from_catalog(&catalog, None).await,
+        )
+        .unwrap();
+        assert!(interfaces["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["capsule"] == "fixture-app"));
+
+        components["external"]
+            .as_object_mut()
+            .unwrap()
+            .remove("home-gui");
+        std::fs::write(&registry, serde_json::to_vec(&components).unwrap()).unwrap();
+        let path = root.path().join("capsules/fixture-app/capsule.json");
+        let mut updated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        updated["description"] = "After".into();
+        updated["interfaces"] = serde_json::json!([]);
+        std::fs::write(path, serde_json::to_vec(&updated).unwrap()).unwrap();
+        assert_eq!(
+            home_active_shell_summary_from_catalog(root.path(), None, &catalog)
+                .unwrap()
+                .active,
+            HOME_GUI_SHELL_ID
+        );
+        assert_eq!(
+            serde_json::to_value(home_targets_from_catalog(&catalog)).unwrap(),
+            targets
+        );
+        assert_eq!(
+            serde_json::to_value(
+                capsule_interface_registry_summary_with_bindings_from_catalog(&catalog, None).await
+            )
+            .unwrap(),
+            interfaces
+        );
+
+        let next = capsule_catalog_summary(root.path());
+        assert!(
+            home_active_shell_summary_from_catalog(root.path(), None, &next)
+                .unwrap()
+                .active
+                .is_empty()
+        );
+        assert_eq!(
+            next.capsules
+                .iter()
+                .find(|row| row.name == "fixture-app")
+                .unwrap()
+                .description,
+            "After"
+        );
+        assert!(
+            capsule_interface_registry_summary_with_bindings_from_catalog(&next, None)
+                .await
+                .interfaces
+                .is_empty()
+        );
+        assert!(home_active_shell_summary(root.path(), None)
+            .unwrap()
+            .active
+            .is_empty());
     }
 }

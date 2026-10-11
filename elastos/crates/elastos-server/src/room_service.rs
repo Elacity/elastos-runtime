@@ -82,6 +82,10 @@ pub struct RoomSummary {
     pub browser_access_block_reason: Option<String>,
     #[serde(default)]
     pub transport: RoomTransportView,
+    /// Sequence number of the newest room object, so Home can signal new
+    /// messages without reading them.
+    #[serde(default)]
+    pub latest_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,13 +332,23 @@ pub struct RoomPollView {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoomHistoryView {
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoomTransportView {
     #[serde(default)]
     pub configured: bool,
     #[serde(default)]
     pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community_joined: Option<bool>,
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<RoomHistoryView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -870,6 +884,7 @@ pub fn load_summary(data_dir: &Path) -> anyhow::Result<RoomSummary> {
             browser_access_allowed: true,
             browser_access_block_reason: None,
             transport: RoomTransportView::default(),
+            latest_seq: state.next_seq.saturating_sub(1),
         })
     })
 }
@@ -2904,6 +2919,31 @@ pub(crate) fn project_collaboration_text(
     })
 }
 
+/// Internal metadata reads use the exact Runtime-owned collaboration scope
+/// and verified Profile attribution. They leave the account's read state alone.
+pub(crate) fn collaboration_latest_remote_message_seq(
+    data_dir: &Path,
+    network_id: &str,
+    conversation_id: &str,
+    reader_profile_did: &str,
+) -> anyhow::Result<u64> {
+    let scope = collaboration_object_scope(network_id, conversation_id)?;
+    let reader = normalize_member_did(reader_profile_did)?;
+    with_expired_read_state(data_dir, |state| {
+        Ok(state
+            .objects
+            .iter()
+            .filter(|item| {
+                item.collaboration_scope.as_ref() == Some(&scope)
+                    && item.sender_member_did.as_deref() != Some(reader.as_str())
+                    && verified_collaboration_sender_profile(item).is_some()
+            })
+            .map(|item| item.seq)
+            .max()
+            .unwrap_or(0))
+    })
+}
+
 pub(crate) fn collaboration_room_poll(
     data_dir: &Path,
     token: &str,
@@ -2912,9 +2952,9 @@ pub(crate) fn collaboration_room_poll(
     since: u64,
 ) -> anyhow::Result<RoomPollView> {
     let scope = collaboration_object_scope(network_id, conversation_id)?;
-    with_locked_state(data_dir, |_, state| {
+    with_expired_read_state(data_dir, |state| {
         let (display_name, expires_at, current_session) = {
-            let session = validate_session(state, token)?;
+            let session = validate_session_for_read(state, token)?;
             (
                 session.display_name.clone(),
                 session.expires_at,
@@ -3295,6 +3335,25 @@ fn validate_session<'a>(
         .find(|item| item.token == token)
         .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
     ensure_session_actor_id(session);
+    if !session
+        .capabilities
+        .iter()
+        .any(|capability| capability == ROOM_ACCESS_CAPABILITY)
+    {
+        anyhow::bail!("session is not approved for room access");
+    }
+    Ok(session)
+}
+
+fn validate_session_for_read<'a>(
+    state: &'a RoomState,
+    token: &str,
+) -> anyhow::Result<&'a SessionRecord> {
+    let session = state
+        .sessions
+        .iter()
+        .find(|item| item.token == token && item.expires_at > now_ts())
+        .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
     if !session
         .capabilities
         .iter()
@@ -5306,6 +5365,29 @@ mod tests {
         snapshot
     }
 
+    fn room_state_file_metadata(data_dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+        use std::os::unix::fs::MetadataExt;
+
+        let paths = storage_paths(data_dir).unwrap();
+        [
+            paths.room_meta_path,
+            paths.control_path,
+            paths.members_path,
+            paths.invites_path,
+            paths.key_epochs_path,
+            paths.pair_requests_path,
+            paths.sessions_path,
+            paths.objects_path,
+            paths.uploads_path,
+        ]
+        .into_iter()
+        .map(|path| {
+            let metadata = fs::metadata(&path).unwrap();
+            (path, metadata.ino(), metadata.modified().unwrap())
+        })
+        .collect()
+    }
+
     fn assert_meaningful_bootstrap_state_rejects_adoption(
         owner: &Path,
         join_token: &str,
@@ -7303,6 +7385,130 @@ mod tests {
     }
 
     #[test]
+    fn visible_community_read_clears_an_evicted_remote_row_without_own_send_unread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = room_test_profile(tmp.path(), 121, "Local", None);
+        let remote = room_test_profile(tmp.path(), 122, "Remote", None);
+        let port = crate::collaboration_product::test_chat_product_port(
+            tmp.path(),
+            "unread-network",
+            "unread-conversation",
+        );
+        let session =
+            start_local_runtime_session(tmp.path(), &local.profile_did, "Local", "Unread test")
+                .unwrap();
+        let card = |actor: &RoomTestActor| RoomProfileCardView {
+            schema: "elastos.profile-card/v1".to_string(),
+            profile_id: actor.profile_did.clone(),
+            display_name: actor.profile.document().display_name.clone(),
+            handle: None,
+            updated_at: actor.profile.document().updated_at,
+        };
+        project_collaboration_text(
+            tmp.path(),
+            ("unread-network", "unread-conversation"),
+            &format!("sha256:{}", "e".repeat(64)),
+            &card(&remote),
+            "remote",
+            now_ts(),
+            None,
+        )
+        .unwrap();
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let scope = collaboration_object_scope("unread-network", "unread-conversation").unwrap();
+        // Run the real bounded projection policy once, without 500 disk writes
+        // or relaxing the separate live send limit.
+        with_locked_state(tmp.path(), |_, state| {
+            for index in 0..MAX_OBJECTS {
+                push_object(
+                    state,
+                    ConversationObjectRecord {
+                        seq: 0,
+                        event_id: format!("sha256:{index:064x}"),
+                        collaboration_scope: Some(scope.clone()),
+                        sender: "Local".to_string(),
+                        sender_member_did: Some(local.profile_did.clone()),
+                        sender_profile: Some(card(&local)),
+                        sender_actor_id: String::new(),
+                        kind: ConversationObjectKind::Text,
+                        body: Some(format!("own {index}")),
+                        emoji: None,
+                        link: None,
+                        attachment: None,
+                        created_at: now_ts(),
+                    },
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            collaboration_latest_remote_message_seq(
+                tmp.path(),
+                "unread-network",
+                "unread-conversation",
+                &local.profile_did
+            )
+            .unwrap(),
+            0
+        );
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let hidden = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                0,
+                &local.profile,
+                false,
+                now_ts(),
+            )
+            .unwrap();
+        assert_eq!(hidden.objects.len(), MAX_OBJECTS);
+        assert!(hidden
+            .objects
+            .iter()
+            .all(|object| object.sender_member_did.as_deref() == Some(local.profile_did.as_str())));
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let empty = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                u64::MAX,
+                &local.profile,
+                true,
+                now_ts(),
+            )
+            .unwrap();
+        assert!(empty.objects.is_empty());
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let visible = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                0,
+                &local.profile,
+                true,
+                now_ts(),
+            )
+            .unwrap();
+        assert_eq!(visible.objects.len(), MAX_OBJECTS);
+        assert!(!port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        assert!(!port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+    }
+
+    #[test]
     fn collaboration_text_projection_is_scoped_idempotent_and_presentation_only() {
         let tmp = tempfile::tempdir().unwrap();
         let local_actor = room_test_profile(tmp.path(), 118, "Local", Some("local"));
@@ -7530,6 +7736,148 @@ mod tests {
         assert!(empty_state.invites.is_empty());
         assert!(empty_state.sessions.is_empty());
         assert_eq!(empty_state.objects.len(), 1);
+    }
+
+    #[test]
+    fn configured_collaboration_room_poll_preserves_store_bytes_and_file_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = start_configured_collaboration_principal_session(
+            tmp.path(),
+            "did:key:z6configured",
+            "principal-one",
+            "Alice",
+            "ElastOS shell",
+        )
+        .unwrap();
+        let profile = RoomProfileCardView {
+            schema: "elastos.profile-card/v1".to_string(),
+            profile_id: "did:key:z6configured".to_string(),
+            display_name: "Alice".to_string(),
+            handle: None,
+            updated_at: now_ts(),
+        };
+        let object = project_collaboration_text(
+            tmp.path(),
+            ("network-one", "conversation-one"),
+            &format!("sha256:{}", "c".repeat(64)),
+            &profile,
+            "configured message",
+            now_ts(),
+            Some(&session.token),
+        )
+        .unwrap();
+        let before = room_state_snapshot(tmp.path());
+        let metadata_before = room_state_file_metadata(tmp.path());
+        assert_eq!(metadata_before.len(), 9);
+        // Keep the original inodes allocated while the poll runs.
+        let _retained_store_files = metadata_before
+            .iter()
+            .map(|(path, _, _)| fs::File::open(path).unwrap())
+            .collect::<Vec<_>>();
+
+        for _ in 0..8 {
+            let feed = collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .unwrap();
+            assert_eq!(feed.display_name, "Alice");
+            assert_eq!(feed.expires_at, session.expires_at);
+            assert_eq!(feed.latest_seq, object.seq);
+            assert_eq!(feed.objects.len(), 1);
+            assert_eq!(feed.objects[0].body.as_deref(), Some("configured message"));
+            assert!(feed.objects[0].from_current_session);
+            assert_eq!(feed.participants.len(), 1);
+            assert_eq!(feed.participants[0].display_name, "Alice");
+        }
+
+        assert_eq!(room_state_snapshot(tmp.path()), before);
+        assert_eq!(room_state_file_metadata(tmp.path()), metadata_before);
+    }
+
+    #[test]
+    fn configured_collaboration_room_poll_rechecks_session_authority_without_writes() {
+        for refusal in ["expired", "unapproved", "left"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = start_configured_collaboration_principal_session(
+                tmp.path(),
+                "did:key:z6configured",
+                "principal-one",
+                "Alice",
+                "ElastOS shell",
+            )
+            .unwrap();
+            assert!(collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .is_ok());
+            if refusal == "left" {
+                leave_configured_collaboration_principal_session(
+                    tmp.path(),
+                    "did:key:z6configured",
+                    "principal-one",
+                )
+                .unwrap();
+            } else {
+                with_locked_state(tmp.path(), |_, state| {
+                    let stored = state
+                        .sessions
+                        .iter_mut()
+                        .find(|item| item.token == session.token)
+                        .unwrap();
+                    if refusal == "expired" {
+                        stored.expires_at = now_ts();
+                    } else {
+                        stored.capabilities.clear();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let before = room_state_snapshot(tmp.path());
+            let metadata_before = room_state_file_metadata(tmp.path());
+            let error = collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(if refusal == "unapproved" {
+                    "session is not approved for room access"
+                } else {
+                    "invalid or expired session"
+                }),
+                "{refusal}: {error}"
+            );
+            assert_eq!(room_state_snapshot(tmp.path()), before, "{refusal}");
+            assert_eq!(
+                room_state_file_metadata(tmp.path()),
+                metadata_before,
+                "{refusal}"
+            );
+        }
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(collaboration_room_poll(
+            empty.path(),
+            "unknown-token",
+            "network-one",
+            "conversation-one",
+            0,
+        )
+        .is_err());
+        assert!(!storage_paths(empty.path()).unwrap().root_dir.exists());
     }
 
     #[test]

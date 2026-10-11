@@ -20,6 +20,7 @@ const passkeyHintPanel = document.querySelector("#home-passkey-hint-panel");
 const passkeyHintInput = document.querySelector("#home-passkey-hint");
 const passkeyHintCancel = document.querySelector("#home-passkey-hint-cancel");
 const unlockSecondary = document.querySelector("#home-unlock-secondary");
+const unlockCreate = document.querySelector("#home-unlock-create");
 const unlockStatus = document.querySelector("#home-unlock-status");
 const unlockName = document.querySelector("#home-unlock-name");
 const ownerToken = document.querySelector("#home-owner-token");
@@ -204,6 +205,16 @@ export function bindHomeUnlock() {
   };
   unlockPrimary?.addEventListener("click", startUnlock);
   unlockPerson?.addEventListener("click", startUnlock);
+  // First-visit entry on the lock face: the same guest enrollment the card's
+  // secondary action opens, reachable without first failing a passkey prompt.
+  unlockCreate?.addEventListener("click", () => {
+    if (busy || !guestRegistrationAvailable) return;
+    clearRecoverySelection();
+    recoverySession = null;
+    recoveryTerminalToken = "";
+    unlockMode = "create_guest";
+    renderUnlockMode({ registered: true, guestRegistrationEnabled: true });
+  });
   unlockSecondary?.addEventListener("click", () => {
     clearRecoverySelection();
     recoverySession = null;
@@ -411,6 +422,10 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
   }
   if (unlockFace) {
     unlockFace.hidden = !showFace;
+  }
+  if (unlockCreate) {
+    unlockCreate.hidden = !(showFace && guestRegistrationEnabled);
+    unlockCreate.disabled = unlockMode === "unsupported";
   }
   if (unlockCard) {
     unlockCard.hidden = showFace;

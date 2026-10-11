@@ -229,6 +229,7 @@ async fn direct_api_auth_list_and_message_projection_are_bounded_and_redacted() 
             "conversation_id": fixture.peer.conversation_id,
             "display_name": "Remote Person",
             "removed": false,
+            "unread": false,
         })
     );
     let list_text = list.to_string();
@@ -309,36 +310,93 @@ async fn direct_api_auth_list_and_message_projection_are_bounded_and_redacted() 
     }
     assert_eq!(room_store_snapshot(fixture.dir.path()), group_before);
 
+    wait_for_direct_peer_ready(&fixture.peer, &fixture.peer._remote_node).await;
+    let settled_send = json!({
+        "request_id": "read-model-settled",
+        "conversation_id": fixture.peer.conversation_id,
+        "text": "verified delivery"
+    });
+    let (status, body) = direct_send(&fixture, settled_send.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"status":"receipt_settled"}));
+    let retained_records = direct
+        .records_for_test(&local_profile_did, crate::auth::now_ts())
+        .unwrap();
+    assert_eq!(retained_records.len(), 202);
+    assert!(retained_records
+        .iter()
+        .any(|record| !record.incoming && record.receipt_settled));
+
     crate::auth::revoke_session_grant(
         &home_launch_auth_data_dir(fixture.dir.path()),
         &fixture.session_id,
         crate::auth::now_ts(),
     )
     .unwrap();
-    let revoked = fixture
-        .app
-        .clone()
-        .oneshot(direct_api_request(
-            Some(&fixture.chat_token),
+    let mut settled_retry = settled_send;
+    settled_retry["retry_existing"] = json!(true);
+    for (method, uri, body) in [
+        (
             "GET",
-            "/api/apps/chat-room/direct/conversations",
+            "/api/apps/chat-room/direct/conversations".to_string(),
             Body::empty(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
-    // The chat window shares the person's real session, so revoking it also
-    // retires the registered delivery context — background direct-message
-    // authority fails closed with the session instead of outliving it.
-    assert!(fixture
-        .peer
-        .service
-        .direct_message_service()
-        .records_for_test(
-            fixture.peer.store.local_profile_did(),
-            crate::auth::now_ts(),
-        )
-        .is_err());
+        ),
+        (
+            "GET",
+            format!(
+                "/api/apps/chat-room/direct/conversations/{}/messages?retry_details=true&mark_read=false",
+                fixture.peer.conversation_id
+            ),
+            Body::empty(),
+        ),
+        (
+            "POST",
+            "/api/apps/chat-room/direct/messages/send".to_string(),
+            Body::from(
+                json!({
+                    "request_id": "revoked-fresh-send",
+                    "conversation_id": fixture.peer.conversation_id,
+                    "text": "new delivery"
+                })
+                .to_string(),
+            ),
+        ),
+        (
+            "POST",
+            "/api/apps/chat-room/direct/messages/send".to_string(),
+            Body::from(settled_retry.to_string()),
+        ),
+    ] {
+        let revoked = fixture
+            .app
+            .clone()
+            .oneshot(direct_api_request(
+                Some(&fixture.chat_token),
+                method,
+                &uri,
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        let revoked_body = axum::body::to_bytes(revoked.into_body(), 8 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            revoked_body.as_ref(),
+            b"Gateway request requires an admitted host and caller",
+            "{method} {uri}"
+        );
+    }
+    // Runtime retains the person's signed delivery history and verified
+    // receipt. The revoked Home session cannot read, send or retry it.
+    assert_eq!(
+        direct
+            .records_for_test(&local_profile_did, crate::auth::now_ts())
+            .unwrap(),
+        retained_records
+    );
+    assert_eq!(room_store_snapshot(fixture.dir.path()), group_before);
 }
 
 #[tokio::test]
@@ -568,7 +626,19 @@ async fn direct_api_pending_retry_settles_the_same_durable_envelope() {
 async fn direct_api_authority_configuration_and_corruption_fail_closed() {
     let fixture = direct_api_route_fixture().await;
 
-    let missing_service = gateway_router(test_state(fixture.dir.path()))
+    let unconfigured = gateway_router(test_state(fixture.dir.path()));
+    let invalid_authority = unconfigured
+        .clone()
+        .oneshot(direct_api_request(
+            Some(&fixture.wrong_capsule_token),
+            "GET",
+            "/api/apps/chat-room/direct/conversations",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_authority.status(), StatusCode::UNAUTHORIZED);
+    let missing_service = unconfigured
         .oneshot(direct_api_request(
             Some(&fixture.chat_token),
             "GET",
@@ -577,7 +647,14 @@ async fn direct_api_authority_configuration_and_corruption_fail_closed() {
         ))
         .await
         .unwrap();
-    assert_eq!(missing_service.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(missing_service.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_response(missing_service).await,
+        json!({
+            "error": "direct messaging is unavailable on this Home",
+            "code": "direct_service_unavailable"
+        })
+    );
 
     let empty = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_name(empty.path(), Some("Setup Name"));
@@ -682,4 +759,102 @@ async fn direct_api_authority_configuration_and_corruption_fail_closed() {
     let error = json_response(corrupted).await.to_string();
     assert!(!error.contains(fixture.dir.path().to_string_lossy().as_ref()));
     assert!(!error.contains("did:key"));
+}
+
+#[tokio::test]
+async fn direct_api_unread_dot_and_inbox_entry_belong_to_one_account() {
+    let fixture = direct_api_route_fixture().await;
+    let data = fixture.dir.path();
+    let conversation = fixture.peer.conversation_id.clone();
+    let owner = fixture.profile.document().profile_did.clone();
+    // Another account on the same Home.
+    let other = "did:key:z6MkOtherAccountOnThisHome";
+    let inbox_token = issue_home_projection_launch_token_with_context(
+        data,
+        INBOX_CAPSULE_ID,
+        INBOX_CAPSULE_ID,
+        &fixture.chat_context,
+    )
+    .unwrap();
+    let unread = |app: Router| {
+        let token = fixture.chat_token.clone();
+        async move {
+            let list = app
+                .oneshot(direct_api_request(
+                    Some(&token),
+                    "GET",
+                    "/api/apps/chat-room/direct/conversations",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            json_response(list).await["conversations"][0]["unread"].clone()
+        }
+    };
+    let inbox_direct_entries = |app: Router| {
+        let token = inbox_token.clone();
+        async move {
+            let summary = app
+                .oneshot(direct_api_request(
+                    Some(&token),
+                    "GET",
+                    "/api/apps/inbox/summary",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(summary.status(), StatusCode::OK);
+            json_response(summary).await["notifications"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["kind"] == "direct_message")
+                .count()
+        }
+    };
+
+    // Another account's message alert never shows for this account.
+    crate::notifications::upsert_direct_message_notification(
+        data,
+        other,
+        &conversation,
+        "Remote Person",
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    assert_eq!(unread(fixture.app.clone()).await, json!(false));
+    assert_eq!(inbox_direct_entries(fixture.app.clone()).await, 0);
+
+    // Its own alert shows as a dot and an Inbox entry.
+    crate::notifications::upsert_direct_message_notification(
+        data,
+        &owner,
+        &conversation,
+        "Remote Person",
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    assert_eq!(unread(fixture.app.clone()).await, json!(true));
+    assert_eq!(inbox_direct_entries(fixture.app.clone()).await, 1);
+
+    // Opening the conversation clears only this account's alert.
+    let opened = fixture
+        .app
+        .clone()
+        .oneshot(direct_api_request(
+            Some(&fixture.chat_token),
+            "GET",
+            &format!("/api/apps/chat-room/direct/conversations/{conversation}/messages"),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), StatusCode::OK);
+    assert_eq!(unread(fixture.app.clone()).await, json!(false));
+    assert_eq!(inbox_direct_entries(fixture.app.clone()).await, 0);
+    assert!(
+        crate::notifications::unread_direct_message_conversations(data, other)
+            .unwrap()
+            .contains(&conversation)
+    );
 }

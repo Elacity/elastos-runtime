@@ -28,6 +28,11 @@ use crate::collaboration_protocol::{
     verify_stored_acceptance_receipt_envelope, verify_stored_collaboration_acceptance_receipt,
     verify_stored_collaboration_message, VerifiedCollaborationMessage,
 };
+use crate::collaboration_rate_limit::{
+    CommunitySendRateLimited, HeldFrame, HeldFrames, HoldOutcome, ProfileRateLimiter,
+    COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE, COMMUNITY_RATE_WINDOW_SECS,
+    COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW, COMMUNITY_SENDS_PER_WINDOW,
+};
 use crate::esp_binding::{esp_request_binding, EspRequestBinding, ESP_REQUEST_BINDING_SCHEMA};
 use crate::host_lock::FileLock;
 
@@ -35,22 +40,32 @@ const CORE_STATE_SCHEMA: &str = "elastos.collaboration.default-conversation-stat
 const CORE_STATE_DIR: &str = "collaboration/default-conversation";
 const CORE_STATE_FILE: &str = "state-v1.json";
 const CORE_LOCK_FILE: &str = "state-v1.lock";
+const HISTORY_STATE_FILE: &str = "history-v1.json";
+const HISTORY_STATE_SCHEMA: &str = "elastos.collaboration.conversation-history/v1";
 const CORE_NAMESPACE_DOMAIN: &[u8] = b"elastos.collaboration.default-conversation-state.v1";
 pub(crate) const DEFAULT_CONVERSATION_SEND_METHOD: &str = "message.send";
 const MAX_CORE_STATE_BYTES: usize = 24 * 1024 * 1024;
 const MAX_UNRESOLVED_OUTGOING: usize = 64;
 const MAX_OUTGOING_RECORDS: usize = 4_096;
 const MAX_PENDING_INCOMING: usize = 32;
-const MAX_PENDING_INCOMING_PER_SENDER: usize = 8;
+pub(crate) const MAX_PENDING_INCOMING_PER_SENDER: usize = 8;
 const MAX_ACCEPTANCE_RECEIPTS_PER_OUTGOING: usize = 32;
 const MAX_INCOMING_RECORDS_AND_TOMBSTONES: usize = 4_096;
+pub(crate) const MAX_CONVERSATION_HISTORY_MESSAGES: usize = 200;
+pub(crate) const MAX_CONVERSATION_HISTORY_BYTES: usize = 1024 * 1024;
+pub(crate) const CONVERSATION_HISTORY_RETENTION_SECS: u64 = 24 * 60 * 60;
 
 pub(crate) struct CollaborationCore {
     authority: DefaultConversationDeviceAuthority,
     operation_capsule: String,
     data_root: PathBuf,
     state_dir: PathBuf,
+    community_membership: std::sync::Arc<crate::collaboration_release_network::CommunityMembership>,
     mutation_mutex: Mutex<()>,
+    /// Counted from stored outgoing messages, so only a saved message counts.
+    sends_per_window: usize,
+    receive_rate: ProfileRateLimiter,
+    held: HeldFrames,
     #[cfg(test)]
     write_fault: std::sync::atomic::AtomicU8,
 }
@@ -68,6 +83,9 @@ pub(crate) struct CollaborationCoreSummary {
 pub(crate) struct DurableOutgoingMessage {
     envelope_bytes: Vec<u8>,
     envelope_sha256: String,
+    created_at: u64,
+    shared_chat: bool,
+    accepted_endpoints: Vec<String>,
 }
 
 pub(crate) struct PendingOutgoingProductProjection {
@@ -81,12 +99,31 @@ impl PendingOutgoingProductProjection {
 }
 
 impl DurableOutgoingMessage {
+    pub(crate) fn shared_chat(&self) -> bool {
+        self.shared_chat
+    }
+
+    pub(crate) fn accepted_by(&self, endpoint: &str) -> bool {
+        self.accepted_endpoints
+            .iter()
+            .any(|accepted| accepted == endpoint)
+    }
+
     pub(crate) fn envelope_bytes(&self) -> &[u8] {
         &self.envelope_bytes
     }
 
     pub(crate) fn envelope_sha256(&self) -> &str {
         &self.envelope_sha256
+    }
+
+    pub(crate) fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remote_acceptance_recorded(&self) -> bool {
+        !self.accepted_endpoints.is_empty()
     }
 }
 
@@ -159,6 +196,12 @@ pub(crate) enum CollaborationTransportRejection {
     AcceptanceWithoutOutgoingMessage,
     AcceptanceBeforeProductProjection,
     AcceptanceRecipientConflict,
+    /// The sender is over the receive limit. The Home holds the frame and
+    /// retries it once the sender's window slides.
+    SenderRateLimited,
+    /// The sender already has the most messages waiting for Chat. Held and
+    /// retried like `SenderRateLimited`, so one sender never holds the batch.
+    SenderBacklogFull,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -195,6 +238,14 @@ struct CoreState {
     outgoing: Vec<OutgoingRecord>,
     incoming: Vec<IncomingRecord>,
     incoming_tombstones: Vec<IncomingTombstone>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationHistoryState {
+    schema: String,
+    binding: CoreStateBinding,
+    envelopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,12 +332,25 @@ impl CollaborationCore {
         let state_dir = data_root
             .join(CORE_STATE_DIR)
             .join(state_namespace(&authority));
+        let community_membership = std::sync::Arc::new(
+            crate::collaboration_release_network::CommunityMembership::load(
+                data_root,
+                authority.network_id(),
+            )?,
+        );
         Ok(Self {
             authority,
             operation_capsule: operation_capsule.to_string(),
             data_root: data_root.to_path_buf(),
             state_dir,
+            community_membership,
             mutation_mutex: Mutex::new(()),
+            sends_per_window: COMMUNITY_SENDS_PER_WINDOW,
+            receive_rate: ProfileRateLimiter::new(
+                COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW,
+                COMMUNITY_RATE_WINDOW_SECS,
+            ),
+            held: HeldFrames::default(),
             #[cfg(test)]
             write_fault: std::sync::atomic::AtomicU8::new(0),
         })
@@ -294,6 +358,22 @@ impl CollaborationCore {
 
     pub(crate) fn sender_service(&self) -> &str {
         self.authority.sender_service()
+    }
+
+    pub(crate) fn community_membership(
+        &self,
+    ) -> &std::sync::Arc<crate::collaboration_release_network::CommunityMembership> {
+        &self.community_membership
+    }
+
+    /// Serialize the Home-wide choice with durable Community admission. A send
+    /// accepted before Leave may remain queued; a send cannot commit across it.
+    pub(crate) fn set_community_joined(&self, joined: bool) -> anyhow::Result<()> {
+        let _guard = self
+            .mutation_mutex
+            .lock()
+            .map_err(|_| anyhow::anyhow!("collaboration mutation mutex is poisoned"))?;
+        self.community_membership.set_joined(joined)
     }
 
     pub(crate) fn conversation_scope(&self) -> (&str, &str) {
@@ -322,6 +402,253 @@ impl CollaborationCore {
             self.authority.sender_service(),
         )?;
         authorize_default_conversation_message(self.authority.grant(), &verified)
+    }
+
+    /// Historical admission checks original authorship and the exact grant,
+    /// independently of the short live-delivery lifetime and replay path.
+    pub(crate) fn authorize_history_message(
+        &self,
+        envelope_bytes: &[u8],
+        now: u64,
+    ) -> anyhow::Result<AuthorizedDefaultConversationMessage> {
+        let authorized = self.authorize_stored_product_message(envelope_bytes)?;
+        let message = &authorized.message().envelope().payload;
+        if message.created_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+            || message
+                .created_at
+                .saturating_add(CONVERSATION_HISTORY_RETENTION_SECS)
+                <= now
+        {
+            anyhow::bail!("collaboration history message is outside its retention window");
+        }
+        Ok(authorized)
+    }
+
+    /// Read bounded canonical originals without changing the live replay state.
+    pub(crate) fn conversation_history(&self, now: u64) -> anyhow::Result<Vec<Vec<u8>>> {
+        let state = self.load_history()?.unwrap_or_else(|| self.empty_history());
+        state
+            .envelopes
+            .iter()
+            .filter_map(|envelope| {
+                let authorized = self.authorize_stored_product_message(envelope.as_bytes());
+                match authorized {
+                    Ok(message)
+                        if message
+                            .message()
+                            .envelope()
+                            .payload
+                            .created_at
+                            .saturating_add(CONVERSATION_HISTORY_RETENTION_SECS)
+                            > now =>
+                    {
+                        Some(
+                            self.authorize_history_message(envelope.as_bytes(), now)
+                                .map(|_| envelope.as_bytes().to_vec()),
+                        )
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
+    }
+
+    /// Return only newly retained originals in the same age/count/byte window.
+    /// An older peer cache cannot repeatedly reinsert rows the product evicted.
+    pub(crate) fn history_projection_candidates(
+        &self,
+        envelopes: &[Vec<u8>],
+        now: u64,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        if envelopes.len() > MAX_CONVERSATION_HISTORY_MESSAGES {
+            anyhow::bail!("collaboration history batch exceeds its message bound");
+        }
+        for envelope in envelopes {
+            self.authorize_stored_product_message(envelope)?;
+        }
+        self.validate_history_live_identities(envelopes)?;
+        let mut state = self.load_history()?.unwrap_or_else(|| self.empty_history());
+        let known = state
+            .envelopes
+            .iter()
+            .map(|entry| collaboration_message_envelope_sha256(entry.as_bytes()))
+            .collect::<HashSet<_>>();
+        append_history_envelopes(&mut state, envelopes)?;
+        self.validate_history_identities(&state)?;
+        prune_history(&mut state, now)?;
+        Ok(state
+            .envelopes
+            .into_iter()
+            .filter(|envelope| {
+                !known.contains(&collaboration_message_envelope_sha256(envelope.as_bytes()))
+            })
+            .map(String::into_bytes)
+            .collect())
+    }
+
+    /// Called by a product only after its durable projection succeeds. Old
+    /// projections can finish normally while their originals age out of history.
+    pub(crate) fn retain_history_message(
+        &self,
+        envelope_bytes: &[u8],
+        now: u64,
+    ) -> anyhow::Result<()> {
+        self.retain_history_messages(&[envelope_bytes.to_vec()], now)
+    }
+
+    pub(crate) fn retain_history_messages(
+        &self,
+        envelopes: &[Vec<u8>],
+        now: u64,
+    ) -> anyhow::Result<()> {
+        if envelopes.len() > MAX_CONVERSATION_HISTORY_MESSAGES {
+            anyhow::bail!("collaboration history batch exceeds its message bound");
+        }
+        for envelope in envelopes {
+            self.authorize_stored_product_message(envelope)?;
+        }
+        let _process = self
+            .mutation_mutex
+            .lock()
+            .map_err(|_| anyhow::anyhow!("collaboration mutation mutex is poisoned"))?;
+        self.ensure_state_directory()?;
+        let _file = lock_owner_only_file(&self.lock_path())?;
+        self.validate_history_live_identities(envelopes)?;
+        let mut state = self.load_history()?.unwrap_or_else(|| self.empty_history());
+        let before = canonical_history_bytes(&state)?;
+        append_history_envelopes(&mut state, envelopes)?;
+        self.validate_history_identities(&state)?;
+        prune_history(&mut state, now)?;
+        self.validate_history(&state)?;
+        if canonical_history_bytes(&state)? != before {
+            self.write_history(&state)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn local_device_did(&self) -> String {
+        self.authority.local_device_did()
+    }
+
+    pub(crate) fn is_bootstrap_endpoint(&self, endpoint: &str) -> bool {
+        let Some(key) = crate::carrier::did_to_public_key(endpoint) else {
+            return true;
+        };
+        self.authority
+            .profile()
+            .profile()
+            .bootstrap_peers
+            .iter()
+            .any(|peer| peer.node_id == key.to_string())
+    }
+
+    /// Gossip carries Presence metadata. Shared originals and their receipts
+    /// belong to an authenticated Home-to-Home provider exchange.
+    pub(crate) fn allows_gossip_frame(&self, frame: &[u8]) -> anyhow::Result<bool> {
+        let Ok(frame) = verify_collaboration_transport_frame(frame) else {
+            return Ok(false);
+        };
+        match collaboration_transport_frame_kind(frame.envelope_bytes()) {
+            Ok(CollaborationTransportFrameKind::Message) => {
+                let Ok(message) = self.authorize_stored_product_message(frame.envelope_bytes())
+                else {
+                    return Ok(false);
+                };
+                Ok(message.message().envelope().payload.payload_type
+                    == crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE)
+            }
+            Ok(CollaborationTransportFrameKind::AcceptanceReceipt) => {
+                let Ok(receipt) = verify_stored_acceptance_receipt_envelope(frame.envelope_bytes())
+                else {
+                    return Ok(false);
+                };
+                let state = self.load_state()?.unwrap_or_else(|| self.empty_state());
+                let hash = &receipt.envelope().payload.message_envelope_sha256;
+                let Some(outgoing) = state.outgoing.iter().find(|entry| {
+                    collaboration_message_envelope_sha256(entry.envelope.as_bytes()) == *hash
+                }) else {
+                    return Ok(false);
+                };
+                Ok(self
+                    .verify_outgoing_record(outgoing)?
+                    .envelope()
+                    .payload
+                    .payload_type
+                    == crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(crate) fn allows_gossip_receipt(
+        &self,
+        receipt_frame: &[u8],
+        original_frame: &[u8],
+    ) -> anyhow::Result<bool> {
+        let original = verify_collaboration_transport_frame(original_frame)?;
+        let message = self.authorize_stored_product_message(original.envelope_bytes())?;
+        if message.message().envelope().payload.payload_type
+            != crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE
+        {
+            return Ok(false);
+        }
+        let receipt = verify_collaboration_transport_frame(receipt_frame)?;
+        crate::collaboration_protocol::verify_stored_collaboration_acceptance_receipt(
+            receipt.envelope_bytes(),
+            message.message(),
+        )?;
+        Ok(true)
+    }
+
+    pub(crate) fn accept_home_chat(
+        &self,
+        frame: &[u8],
+        source: &str,
+        now: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.community_membership.require_joined()?;
+        if self.is_bootstrap_endpoint(source)
+            || self.is_bootstrap_endpoint(&self.local_device_did())
+        {
+            anyhow::bail!("Community bootstrap endpoints carry discovery metadata only");
+        }
+        let verified = verify_collaboration_transport_frame(frame)?;
+        if verified.source_endpoint_did() != source
+            || self
+                .authorize_stored_product_message(verified.envelope_bytes())?
+                .message()
+                .envelope()
+                .payload
+                .payload_type
+                != COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE
+        {
+            anyhow::bail!("Shared delivery does not match its authenticated Home source");
+        }
+        match self.ingest_transport_frame(frame, now) {
+            Ok(CollaborationTransportIngestion::Incoming(accepted)) => {
+                Ok(accepted.acceptance_receipt_bytes().to_vec())
+            }
+            _ => anyhow::bail!("Shared delivery was refused"),
+        }
+    }
+
+    pub(crate) fn record_home_chat_acceptance(
+        &self,
+        receipt: &[u8],
+        message_hash: &str,
+        endpoint: &str,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        self.community_membership.require_joined()?;
+        let verified = verify_stored_acceptance_receipt_envelope(receipt)?;
+        if self.is_bootstrap_endpoint(endpoint)
+            || verified.accepting_endpoint_did() != endpoint
+            || verified.envelope().payload.message_envelope_sha256 != message_hash
+        {
+            anyhow::bail!("Shared acceptance does not name the selected Home");
+        }
+        self.record_remote_acceptance(receipt, now)
     }
 
     pub(crate) fn prepare_transport_frame(&self, envelope_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -372,6 +699,9 @@ impl CollaborationCore {
         frame: &[u8],
         now: u64,
     ) -> Result<CollaborationTransportIngestion, CollaborationTransportRetryableError> {
+        if !self.community_membership.joined() {
+            return Err(CollaborationTransportRetryableError);
+        }
         let verified_transport = match verify_collaboration_transport_frame(frame) {
             Ok(verified) => verified,
             Err(_) => {
@@ -386,6 +716,7 @@ impl CollaborationCore {
         };
         match kind {
             CollaborationTransportFrameKind::Message => self.ingest_transport_message(
+                frame,
                 verified_transport.envelope_bytes(),
                 verified_transport.source_endpoint_did(),
                 now,
@@ -401,6 +732,7 @@ impl CollaborationCore {
 
     fn ingest_transport_message(
         &self,
+        transport_frame: &[u8],
         frame: &[u8],
         source_endpoint_did: &str,
         now: u64,
@@ -466,12 +798,48 @@ impl CollaborationCore {
                 CollaborationTransportRejection::MessageIdentityConflict,
             ));
         }
+        // Count only an authorized, new message, so a forged or replayed frame
+        // cannot spend another sender's budget. A per-sender refusal lets the
+        // rest of the batch move on; this Home holds the frame and retries it,
+        // because the sender stops resending once any other Home accepts it.
+        let rate_limited_sender = (incoming.message().envelope().payload.payload_type
+            == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE)
+            .then(|| {
+                incoming
+                    .message()
+                    .envelope()
+                    .payload
+                    .sender_profile_did
+                    .clone()
+            });
+        if let Some(sender_profile_did) = &rate_limited_sender {
+            if self.receive_rate.check(sender_profile_did, now).is_err() {
+                return self.hold_refused(
+                    transport_frame,
+                    incoming.message(),
+                    CollaborationTransportRejection::SenderRateLimited,
+                    now,
+                );
+            }
+        }
+        if self.sender_backlog_full(&state, incoming.message()) {
+            return self.hold_refused(
+                transport_frame,
+                incoming.message(),
+                CollaborationTransportRejection::SenderBacklogFull,
+                now,
+            );
+        }
+        // Home-wide limits stay retryable: the whole Home must catch up first.
         self.ensure_incoming_capacity(&state, incoming.message(), frame)
             .map_err(|_| CollaborationTransportRetryableError)?;
 
         let accepted = self
             .accept_incoming(frame, source_endpoint_did, now)
             .map_err(|_| CollaborationTransportRetryableError)?;
+        if let Some(sender_profile_did) = &rate_limited_sender {
+            self.receive_rate.record(sender_profile_did, now);
+        }
         Ok(CollaborationTransportIngestion::Incoming(
             transport_incoming_acceptance(accepted),
         ))
@@ -565,6 +933,7 @@ impl CollaborationCore {
         now: u64,
         ttl_secs: u64,
     ) -> anyhow::Result<DurableOutgoingMessage> {
+        self.community_membership.require_joined()?;
         let authenticated_payload =
             crate::collaboration_default_conversation::profile_authenticated_conversation_payload(
                 sender_profile,
@@ -578,7 +947,10 @@ impl CollaborationCore {
             ttl_secs,
         )?;
 
+        let rate_limited_sender = (payload_type == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE)
+            .then(|| sender_profile.document().profile_did.as_str());
         self.with_mutation(Some(now), |state| {
+            self.community_membership.require_joined()?;
             if let Some(existing) = state
                 .outgoing
                 .iter()
@@ -603,6 +975,10 @@ impl CollaborationCore {
                 });
             }
 
+            // A retry of a stored request_id returned above and is not counted.
+            if let Some(sender_profile_did) = rate_limited_sender {
+                self.check_community_send_window(state, sender_profile_did, now)?;
+            }
             let unresolved = state
                 .outgoing
                 .iter()
@@ -642,6 +1018,42 @@ impl CollaborationCore {
         })
     }
 
+    /// Counts this Profile's stored Community messages created in the last
+    /// window. Stored state is the count, so an unsaved send never counts and
+    /// a saved one always does, across restarts too.
+    fn check_community_send_window(
+        &self,
+        state: &CoreState,
+        sender_profile_did: &str,
+        now: u64,
+    ) -> Result<(), CommunitySendRateLimited> {
+        let window_start = now.saturating_sub(COMMUNITY_RATE_WINDOW_SECS);
+        let recent = state
+            .outgoing
+            .iter()
+            .filter_map(|entry| {
+                serde_json::from_str::<SignedCollaborationMessage>(&entry.envelope).ok()
+            })
+            .filter(|message| {
+                message.payload.payload_type == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE
+                    && message.payload.sender_profile_did == sender_profile_did
+                    && message.payload.created_at > window_start
+            })
+            .map(|message| message.payload.created_at);
+        let (count, oldest) = recent.fold((0, u64::MAX), |(count, oldest), created_at| {
+            (count + 1, oldest.min(created_at))
+        });
+        if count < self.sends_per_window {
+            return Ok(());
+        }
+        Err(CommunitySendRateLimited {
+            retry_after_secs: oldest
+                .saturating_add(COMMUNITY_RATE_WINDOW_SECS)
+                .saturating_sub(now)
+                .max(1),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn prepare_outgoing(
         &self,
@@ -665,16 +1077,19 @@ impl CollaborationCore {
             .outgoing
             .iter()
             .filter_map(|entry| {
-                if entry.local_product_projection == OutgoingProductProjectionState::Complete
-                    && entry.remote_acceptance_receipts.is_empty()
-                {
+                if entry.local_product_projection == OutgoingProductProjectionState::Complete {
                     Some((entry, self.verify_outgoing_record(entry)))
                 } else {
                     None
                 }
             })
             .filter_map(|(entry, verified)| match verified {
-                Ok(verified) if verified.envelope().payload.expires_at > now => {
+                Ok(verified)
+                    if verified.envelope().payload.expires_at > now
+                        && (entry.remote_acceptance_receipts.is_empty()
+                            || verified.envelope().payload.payload_type
+                                == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE) =>
+                {
                     if verified.envelope().payload.created_at
                         <= now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
                     {
@@ -767,6 +1182,11 @@ impl CollaborationCore {
                 })
                 .context("acceptance receipt does not match a persisted outgoing message")?;
             let verified_message = self.verify_outgoing_record(entry)?;
+            if verified_message.envelope().payload.payload_type
+                == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE
+            {
+                self.community_membership.require_joined()?;
+            }
             verify_collaboration_acceptance_receipt(receipt_bytes, &verified_message, now)?;
 
             for existing in &entry.remote_acceptance_receipts {
@@ -826,6 +1246,11 @@ impl CollaborationCore {
         }
 
         self.with_mutation(Some(now), |state| {
+            if incoming.message().envelope().payload.payload_type
+                == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE
+            {
+                self.community_membership.require_joined()?;
+            }
             if let Some(existing) =
                 self.exact_incoming_replay(state, envelope_bytes, &envelope_hash, now)?
             {
@@ -979,6 +1404,64 @@ impl CollaborationCore {
         Ok(None)
     }
 
+    /// Holds a frame refused by a per-sender limit for this Home's own retry.
+    /// A sender past its held allowance is flooding and loses the frame; a
+    /// Home full of fair holders keeps it in transport instead.
+    fn hold_refused(
+        &self,
+        transport_frame: &[u8],
+        message: &VerifiedCollaborationMessage,
+        reason: CollaborationTransportRejection,
+        now: u64,
+    ) -> Result<CollaborationTransportIngestion, CollaborationTransportRetryableError> {
+        let payload = &message.envelope().payload;
+        match self.held.hold(
+            HeldFrame::new(
+                transport_frame,
+                message.envelope_sha256(),
+                &payload.sender_profile_did,
+                payload.expires_at,
+            ),
+            now,
+        ) {
+            HoldOutcome::Held => {}
+            HoldOutcome::Dropped => {
+                tracing::debug!(
+                    ?reason,
+                    "Community message dropped: sender is over its limits"
+                );
+            }
+            HoldOutcome::HomeFull => return Err(CollaborationTransportRetryableError),
+        }
+        Ok(CollaborationTransportIngestion::Rejected(reason))
+    }
+
+    /// Frames refused by a per-sender limit, oldest first, for the driver to
+    /// retry before it reads new ones.
+    pub(crate) fn take_held_frames(&self, now: u64) -> Vec<HeldFrame> {
+        self.held.take(now)
+    }
+
+    /// Returns held frames that a retry did not settle.
+    pub(crate) fn restore_held_frames(&self, held: Vec<HeldFrame>) {
+        self.held.restore(held);
+    }
+
+    fn sender_backlog_full(
+        &self,
+        state: &CoreState,
+        message: &VerifiedCollaborationMessage,
+    ) -> bool {
+        let sender = &message.envelope().payload.sender_profile_did;
+        state
+            .incoming
+            .iter()
+            .filter_map(|entry| self.verify_incoming_record(entry).ok())
+            .filter(|entry| entry.message().envelope().payload.sender_profile_did == *sender)
+            .count()
+            >= MAX_PENDING_INCOMING_PER_SENDER
+    }
+
     fn ensure_incoming_capacity(
         &self,
         state: &CoreState,
@@ -991,14 +1474,7 @@ impl CollaborationCore {
         {
             anyhow::bail!("collaboration incoming capacity is exhausted");
         }
-        let sender = &message.envelope().payload.sender_profile_did;
-        let per_sender = state
-            .incoming
-            .iter()
-            .filter_map(|entry| self.verify_incoming_record(entry).ok())
-            .filter(|entry| entry.message().envelope().payload.sender_profile_did == *sender)
-            .count();
-        if per_sender >= MAX_PENDING_INCOMING_PER_SENDER {
+        if self.sender_backlog_full(state, message) {
             anyhow::bail!("collaboration incoming sender capacity is exhausted");
         }
         let current_bytes = canonical_state_bytes(state)?.len();
@@ -1134,6 +1610,160 @@ impl CollaborationCore {
         }
         self.validate_state(&state)?;
         Ok(Some(state))
+    }
+
+    fn empty_history(&self) -> ConversationHistoryState {
+        ConversationHistoryState {
+            schema: HISTORY_STATE_SCHEMA.to_string(),
+            binding: self.state_binding(),
+            envelopes: Vec::new(),
+        }
+    }
+
+    fn history_path(&self) -> PathBuf {
+        self.state_dir.join(HISTORY_STATE_FILE)
+    }
+
+    fn load_history(&self) -> anyhow::Result<Option<ConversationHistoryState>> {
+        if !self.validate_existing_state_ancestors()? {
+            return Ok(None);
+        }
+        let path = self.history_path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        validate_owner_only_regular_file(&path, &metadata)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&path)?;
+        let metadata = file.metadata()?;
+        validate_owner_only_regular_file(&path, &metadata)?;
+        if metadata.len() as usize > MAX_CONVERSATION_HISTORY_BYTES {
+            anyhow::bail!("collaboration retained history exceeds its byte limit");
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_CONVERSATION_HISTORY_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_CONVERSATION_HISTORY_BYTES {
+            anyhow::bail!("collaboration retained history exceeds its byte limit");
+        }
+        let state: ConversationHistoryState = serde_json::from_slice(&bytes)?;
+        if canonical_history_bytes(&state)? != bytes {
+            anyhow::bail!("collaboration retained history is not canonical JSON");
+        }
+        self.validate_history(&state)?;
+        Ok(Some(state))
+    }
+
+    /// The bounded original cache can evict a message while its verified live
+    /// acceptance remains. Historical admission preserves that sender identity;
+    /// only the exact accepted hash can replay it.
+    fn validate_history_live_identities(&self, envelopes: &[Vec<u8>]) -> anyhow::Result<()> {
+        let live = self.load_state()?.unwrap_or_else(|| self.empty_state());
+        let mut ids = HashMap::new();
+        let mut nonces = HashMap::new();
+        for entry in &live.incoming {
+            let authorized = self.verify_incoming_record(entry)?;
+            let message = authorized.message();
+            insert_incoming_identity(
+                &mut ids,
+                &mut nonces,
+                &message.envelope().payload,
+                message.envelope_sha256(),
+            )?;
+        }
+        for entry in &live.incoming_tombstones {
+            let receipt =
+                verify_stored_acceptance_receipt_envelope(entry.acceptance_receipt.as_bytes())?;
+            insert_receipt_identity(&mut ids, &mut nonces, &receipt.envelope().payload)?;
+        }
+        for envelope in envelopes {
+            let authorized = self.authorize_stored_product_message(envelope)?;
+            let message = authorized.message();
+            let payload = &message.envelope().payload;
+            for accepted_hash in [
+                ids.get(&(
+                    payload.sender_profile_did.clone(),
+                    payload.message_id.clone(),
+                )),
+                nonces.get(&(payload.sender_profile_did.clone(), payload.nonce.clone())),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if accepted_hash != message.envelope_sha256() {
+                    anyhow::bail!("collaboration history sender reused a live message ID or nonce");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_history_identities(&self, state: &ConversationHistoryState) -> anyhow::Result<()> {
+        let mut ids = HashMap::new();
+        let mut nonces = HashMap::new();
+        for envelope in &state.envelopes {
+            let authorized = self.authorize_stored_product_message(envelope.as_bytes())?;
+            let message = authorized.message();
+            insert_incoming_identity(
+                &mut ids,
+                &mut nonces,
+                &message.envelope().payload,
+                message.envelope_sha256(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_history(&self, state: &ConversationHistoryState) -> anyhow::Result<()> {
+        if state.schema != HISTORY_STATE_SCHEMA
+            || state.binding != self.state_binding()
+            || state.envelopes.len() > MAX_CONVERSATION_HISTORY_MESSAGES
+            || canonical_history_bytes(state)?.len() > MAX_CONVERSATION_HISTORY_BYTES
+        {
+            anyhow::bail!("collaboration retained history has an invalid binding or bounds");
+        }
+        self.validate_history_identities(state)
+    }
+
+    fn write_history(&self, state: &ConversationHistoryState) -> anyhow::Result<()> {
+        self.validate_history(state)?;
+        let bytes = canonical_history_bytes(state)?;
+        let temp = self
+            .state_dir
+            .join(format!(".{HISTORY_STATE_FILE}.{}.tmp", random_hex_128()?));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut renamed = false;
+        let result = (|| -> anyhow::Result<()> {
+            let mut file = options.open(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            validate_owner_only_regular_file(&temp, &file.metadata()?)?;
+            if let Ok(metadata) = fs::symlink_metadata(self.history_path()) {
+                validate_owner_only_regular_file(&self.history_path(), &metadata)?;
+            }
+            fs::rename(&temp, self.history_path())?;
+            renamed = true;
+            File::open(&self.state_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() && !renamed {
+            let _ = fs::remove_file(&temp);
+        }
+        result
     }
 
     fn validate_existing_state_ancestors(&self) -> anyhow::Result<bool> {
@@ -1534,6 +2164,18 @@ fn outgoing_handle(
     DurableOutgoingMessage {
         envelope_bytes: entry.envelope.as_bytes().to_vec(),
         envelope_sha256: verified.envelope_sha256().to_string(),
+        created_at: verified.envelope().payload.created_at,
+        shared_chat: verified.envelope().payload.payload_type
+            == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE,
+        accepted_endpoints: entry
+            .remote_acceptance_receipts
+            .iter()
+            .filter_map(|bytes| {
+                verify_stored_acceptance_receipt_envelope(bytes.as_bytes())
+                    .ok()
+                    .map(|receipt| receipt.accepting_endpoint_did().to_string())
+            })
+            .collect(),
     }
 }
 
@@ -1590,6 +2232,62 @@ fn prune_terminal_state(state: &mut CoreState, now: u64) -> anyhow::Result<bool>
         .retain(|entry| entry.retain_until >= now);
     Ok(state.outgoing.len() != outgoing_before
         || state.incoming_tombstones.len() != tombstones_before)
+}
+
+fn canonical_history_bytes(state: &ConversationHistoryState) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::to_value(state)?)?)
+}
+
+fn append_history_envelopes(
+    state: &mut ConversationHistoryState,
+    envelopes: &[Vec<u8>],
+) -> anyhow::Result<()> {
+    let mut hashes = state
+        .envelopes
+        .iter()
+        .map(|entry| collaboration_message_envelope_sha256(entry.as_bytes()))
+        .collect::<HashSet<_>>();
+    for envelope in envelopes {
+        if hashes.insert(collaboration_message_envelope_sha256(envelope)) {
+            state
+                .envelopes
+                .push(std::str::from_utf8(envelope)?.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn prune_history(state: &mut ConversationHistoryState, now: u64) -> anyhow::Result<()> {
+    let mut retained = Vec::with_capacity(state.envelopes.len());
+    for envelope in state.envelopes.drain(..) {
+        let message: SignedCollaborationMessage = serde_json::from_str(&envelope)?;
+        if message
+            .payload
+            .created_at
+            .saturating_add(CONVERSATION_HISTORY_RETENTION_SECS)
+            > now
+        {
+            retained.push((
+                message.payload.created_at,
+                collaboration_message_envelope_sha256(envelope.as_bytes()),
+                envelope,
+            ));
+        }
+    }
+    retained.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    state.envelopes = retained
+        .into_iter()
+        .map(|(_, _, envelope)| envelope)
+        .collect();
+    while state.envelopes.len() > MAX_CONVERSATION_HISTORY_MESSAGES
+        || canonical_history_bytes(state)?.len() > MAX_CONVERSATION_HISTORY_BYTES
+    {
+        if state.envelopes.is_empty() {
+            anyhow::bail!("collaboration history binding exceeds its byte limit");
+        }
+        state.envelopes.remove(0);
+    }
+    Ok(())
 }
 
 fn stored_message_expiry(envelope: &str) -> anyhow::Result<u64> {
@@ -1747,6 +2445,11 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let data_root = temp.path().join("data");
             fs::create_dir(&data_root).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&data_root, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             let (profile_signer, _) = generate_keypair();
             let grant_bytes =
                 canonical_default_conversation_grant_bytes(&DefaultConversationGrant {
@@ -1922,6 +2625,176 @@ mod tests {
             now,
             ttl_secs,
         )
+    }
+
+    #[test]
+    fn community_leave_serializes_with_durable_admission_and_refuses_left_intents() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let fixture = Fixture::new();
+        let core = Arc::new(fixture.core());
+        prepare(
+            &core,
+            "accepted-before-leave",
+            serde_json::json!({"content":"before"}),
+            NOW,
+            TTL,
+        )
+        .unwrap();
+        let original = fs::read(core.state_path()).unwrap();
+        let mutation = core.mutation_mutex.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (left_tx, left_rx) = mpsc::sync_channel(0);
+        let leaving = core.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = leaving.set_community_joined(false);
+            left_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            left_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(core.community_membership().joined());
+        drop(mutation);
+        left_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert!(!core.community_membership().joined());
+        assert!(!fixture.core().community_membership().joined());
+        assert_eq!(fs::read(core.state_path()).unwrap(), original);
+        assert!(prepare(
+            &core,
+            "refused-while-left",
+            serde_json::json!({"content":"left"}),
+            NOW + 1,
+            TTL,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains(crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL));
+        assert_eq!(fs::read(core.state_path()).unwrap(), original);
+        core.set_community_joined(true).unwrap();
+        prepare(
+            &core,
+            "accepted-after-rejoin",
+            serde_json::json!({"content":"rejoined"}),
+            NOW + 2,
+            TTL,
+        )
+        .unwrap();
+        let state = core.load_state().unwrap().unwrap();
+        assert_eq!(state.outgoing.len(), 2);
+        assert!(state
+            .outgoing
+            .iter()
+            .all(|record| record.operation.request_id != "refused-while-left"));
+    }
+
+    #[test]
+    fn entered_home_delivery_and_receipt_writes_finish_before_leave() {
+        use std::sync::{mpsc, Arc, TryLockError};
+        use std::time::{Duration, Instant};
+
+        for settlement in [false, true] {
+            let fixture = Fixture::new();
+            let core = Arc::new(fixture.core());
+            let outgoing = prepare(
+                &core,
+                "local",
+                serde_json::json!({"body":"local"}),
+                NOW,
+                TTL,
+            )
+            .unwrap();
+            complete_projection(&core, &outgoing);
+            let (remote_key, _) = generate_keypair();
+            let remote = fixture.authority(remote_key.clone());
+            let remote_did = remote.local_device_did();
+            let bytes = if settlement {
+                remote_receipt(&fixture, &outgoing, remote_key.clone(), NOW + 1)
+            } else {
+                remote_transport_message(&fixture, remote_key.clone(), NOW).1
+            };
+            let file = lock_owner_only_file(&core.lock_path()).unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let admission = core.clone();
+            let bytes_copy = bytes.clone();
+            let endpoint = remote_did.clone();
+            let hash = outgoing.envelope_sha256().to_string();
+            let write = std::thread::spawn(move || {
+                let result = if settlement {
+                    admission.record_home_chat_acceptance(&bytes_copy, &hash, &endpoint, NOW + 1)
+                } else {
+                    admission
+                        .accept_home_chat(&bytes_copy, &endpoint, NOW + 1)
+                        .map(|_| ())
+                };
+                done_tx.send(result).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match core.mutation_mutex.try_lock() {
+                    Err(TryLockError::WouldBlock) => break,
+                    Err(error) => panic!("mutation lock failed: {error}"),
+                    Ok(guard) => drop(guard),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Home admission did not enter Core"
+                );
+                std::thread::yield_now();
+            }
+            let (left_tx, left_rx) = mpsc::channel();
+            let leaving = core.clone();
+            let leave = std::thread::spawn(move || {
+                left_tx.send(leaving.set_community_joined(false)).unwrap();
+            });
+            assert!(matches!(
+                left_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(core.community_membership().joined());
+            drop(file);
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            left_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            write.join().unwrap();
+            leave.join().unwrap();
+            let committed = fs::read(core.state_path()).unwrap();
+            let retry = if settlement {
+                core.record_home_chat_acceptance(
+                    &bytes,
+                    outgoing.envelope_sha256(),
+                    &remote_did,
+                    NOW + 1,
+                )
+            } else {
+                core.accept_home_chat(&bytes, &remote_did, NOW + 1)
+                    .map(|_| ())
+            };
+            assert!(retry.is_err());
+            // The inner durable boundary also refuses an operation whose outer
+            // Home admission already ran before Leave.
+            let inner = if settlement {
+                core.record_remote_acceptance(&bytes, NOW + 2)
+            } else {
+                let (_, fresh) = remote_message(&fixture, remote_key, NOW + 2);
+                core.accept_incoming(&fresh, &remote_did, NOW + 2)
+                    .map(|_| ())
+            };
+            assert!(inner.is_err());
+            assert_eq!(fs::read(core.state_path()).unwrap(), committed);
+        }
     }
 
     fn complete_projection(core: &CollaborationCore, outgoing: &DurableOutgoingMessage) {
@@ -2128,7 +3001,10 @@ mod tests {
         for _ in 0..2 {
             anyhow::ensure!(core.pending_outgoing_product_projections(NOW)?.is_empty());
         }
-        anyhow::ensure!(core.pending_outgoing(NOW)?.is_empty());
+        anyhow::ensure!(core
+            .pending_outgoing(NOW)?
+            .iter()
+            .all(DurableOutgoingMessage::remote_acceptance_recorded));
         for _ in 0..2 {
             anyhow::ensure!(core.pending_product_handoffs()?.is_empty());
         }
@@ -2309,6 +3185,137 @@ mod tests {
     }
 
     #[test]
+    fn community_send_limit_refuses_a_burst_but_not_retries_or_a_later_message() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        for index in 0..COMMUNITY_SENDS_PER_WINDOW {
+            prepare(
+                &core,
+                &format!("burst-{index}"),
+                serde_json::json!({"index":index}),
+                NOW,
+                TTL,
+            )
+            .unwrap();
+        }
+        let before = fs::read(core.state_path()).unwrap();
+        let error = prepare(
+            &core,
+            "burst-over",
+            serde_json::json!({"over":true}),
+            NOW + 1,
+            TTL,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<CommunitySendRateLimited>(),
+            Some(&CommunitySendRateLimited {
+                retry_after_secs: COMMUNITY_RATE_WINDOW_SECS - 1
+            })
+        );
+        assert_eq!(fs::read(core.state_path()).unwrap(), before);
+
+        // A retry of a stored message is not a new send.
+        prepare(
+            &core,
+            "burst-0",
+            serde_json::json!({"index":0}),
+            NOW + 1,
+            TTL,
+        )
+        .unwrap();
+        // The window slides.
+        prepare(
+            &core,
+            "burst-over",
+            serde_json::json!({"over":true}),
+            NOW + COMMUNITY_RATE_WINDOW_SECS,
+            TTL,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn community_send_limit_counts_exactly_the_saved_messages() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        // A send that fails before the write saves nothing and counts nothing.
+        for _ in 0..=COMMUNITY_SENDS_PER_WINDOW {
+            core.inject_write_fault(WriteFault::BeforeWrite);
+            assert!(
+                prepare(&core, "unsaved", serde_json::json!({"n":0}), NOW, TTL)
+                    .unwrap_err()
+                    .downcast_ref::<CommunitySendRateLimited>()
+                    .is_none()
+            );
+        }
+        // A send that fails after the rename is saved, and counts.
+        core.inject_write_fault(WriteFault::AfterRename);
+        assert!(prepare(
+            &core,
+            "saved-late",
+            serde_json::json!({"late":true}),
+            NOW,
+            TTL
+        )
+        .is_err());
+        for index in 1..COMMUNITY_SENDS_PER_WINDOW {
+            prepare(
+                &core,
+                &format!("saved-{index}"),
+                serde_json::json!({"index":index}),
+                NOW,
+                TTL,
+            )
+            .unwrap();
+        }
+        let error = prepare(&core, "over", serde_json::json!({"over":true}), NOW, TTL).unwrap_err();
+        assert!(error.downcast_ref::<CommunitySendRateLimited>().is_some());
+        // Its retry returns the stored message without counting again.
+        prepare(
+            &core,
+            "saved-late",
+            serde_json::json!({"late":true}),
+            NOW,
+            TTL,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn community_receive_limit_drops_a_flooding_sender_without_stalling_others() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let accept = |frame: &[u8], now: u64| {
+            transport_incoming(&core, frame, now);
+            for handoff in core.pending_product_handoffs().unwrap() {
+                core.acknowledge_product_handoff(
+                    handoff.authorized_message().message().envelope_sha256(),
+                )
+                .unwrap();
+            }
+        };
+        let (flooder, _) = generate_keypair();
+        for _ in 0..COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW {
+            let (_, frame) = remote_transport_message(&fixture, flooder.clone(), NOW);
+            accept(&frame, NOW);
+        }
+        let (_, over) = remote_transport_message(&fixture, flooder, NOW);
+        let before = fs::read(core.state_path()).unwrap();
+        assert_eq!(
+            transport_rejection(&core, &over, NOW + 1),
+            CollaborationTransportRejection::SenderRateLimited
+        );
+        assert_eq!(fs::read(core.state_path()).unwrap(), before);
+
+        // Another sender in the same window is unaffected.
+        let (_, other) = remote_transport_message(&fixture, generate_keypair().0, NOW);
+        accept(&other, NOW + 1);
+        // The flooder's rebroadcast lands once its window slides.
+        accept(&over, NOW + COMMUNITY_RATE_WINDOW_SECS);
+    }
+
+    #[test]
     fn transport_dispatch_and_pure_message_rejections_are_deterministic() {
         let fixture = Fixture::new();
         let core = fixture.core();
@@ -2464,15 +3471,23 @@ mod tests {
         let capacity_fixture = Fixture::new();
         let capacity_core = capacity_fixture.core();
         let (sender_key, _) = generate_keypair();
-        for _ in 0..MAX_PENDING_INCOMING_PER_SENDER {
-            let (_, frame) = remote_transport_message(&capacity_fixture, sender_key.clone(), NOW);
-            transport_incoming(&capacity_core, &frame, NOW);
+        // Spread over receive windows, so the backlog binds before the rate.
+        let at = |index: usize| {
+            NOW + (index / COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW) as u64
+                * COMMUNITY_RATE_WINDOW_SECS
+        };
+        for index in 0..MAX_PENDING_INCOMING_PER_SENDER {
+            let (_, frame) =
+                remote_transport_message(&capacity_fixture, sender_key.clone(), at(index));
+            transport_incoming(&capacity_core, &frame, at(index));
         }
-        let (_, over_capacity) = remote_transport_message(&capacity_fixture, sender_key, NOW);
+        let last = at(MAX_PENDING_INCOMING_PER_SENDER - 1);
+        let (_, over_capacity) = remote_transport_message(&capacity_fixture, sender_key, last);
         let before_capacity = fs::read(capacity_core.state_path()).unwrap();
-        assert!(capacity_core
-            .ingest_transport_frame(&over_capacity, NOW)
-            .is_err());
+        assert_eq!(
+            transport_rejection(&capacity_core, &over_capacity, last),
+            CollaborationTransportRejection::SenderBacklogFull
+        );
         assert_eq!(
             fs::read(capacity_core.state_path()).unwrap(),
             before_capacity
@@ -2745,6 +3760,325 @@ mod tests {
     }
 
     #[test]
+    fn history_sidecar_keeps_originals_without_changing_live_state_format() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let outgoing = prepare(
+            &core,
+            "history-outgoing",
+            serde_json::json!({"body":"local"}),
+            NOW,
+            TTL,
+        )
+        .unwrap();
+        assert!(core.conversation_history(NOW).unwrap().is_empty());
+        complete_projection(&core, &outgoing);
+        assert!(!core.history_path().exists());
+        core.retain_history_message(outgoing.envelope_bytes(), NOW)
+            .unwrap();
+        let live_before = fs::read(core.state_path()).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&live_before)
+            .unwrap()
+            .get("history")
+            .is_none());
+        let (remote, _) = generate_keypair();
+        let (_, incoming) = remote_message(&fixture, remote, NOW + 1);
+        let accepted = core
+            .accept_incoming_from_signed_source_for_test(&incoming, NOW + 1)
+            .unwrap();
+        core.acknowledge_product_handoff(accepted.authorized_message().message().envelope_sha256())
+            .unwrap();
+        assert_eq!(core.conversation_history(NOW + 1).unwrap().len(), 1);
+        let live_before = fs::read(core.state_path()).unwrap();
+        core.retain_history_message(&incoming, NOW + 1).unwrap();
+        assert_eq!(fs::read(core.state_path()).unwrap(), live_before);
+        assert_eq!(
+            fixture.core().conversation_history(NOW + TTL + 1).unwrap(),
+            vec![outgoing.envelope_bytes().to_vec(), incoming.clone()]
+        );
+        core.retain_history_message(&incoming, NOW + TTL + 1)
+            .unwrap();
+        assert_eq!(core.conversation_history(NOW + TTL + 1).unwrap().len(), 2);
+        assert!(core
+            .conversation_history(NOW + CONVERSATION_HISTORY_RETENTION_SECS + 1)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn history_admission_preserves_live_expiry_and_refuses_foreign_or_altered_messages() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let (remote, _) = generate_keypair();
+        let (_, original) = remote_message(&fixture, remote, NOW);
+        assert!(core
+            .authorize_history_message(&original, NOW + TTL + 1)
+            .is_ok());
+        assert!(core
+            .accept_incoming_from_signed_source_for_test(
+                &original,
+                NOW + TTL + MAX_COLLABORATION_CLOCK_SKEW_SECS + 1
+            )
+            .is_err());
+        assert!(core
+            .authorize_history_message(&original, NOW + CONVERSATION_HISTORY_RETENTION_SECS)
+            .is_err());
+        assert!(core
+            .authorize_history_message(&original, NOW - MAX_COLLABORATION_CLOCK_SKEW_SECS - 1)
+            .is_err());
+        let mut altered: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        altered["payload"]["payload"]["product"]["content"] = serde_json::json!("altered");
+        assert!(core
+            .authorize_history_message(&serde_json::to_vec(&altered).unwrap(), NOW)
+            .is_err());
+        let foreign =
+            alternate_grant_core(&fixture, fixture.device_key.clone(), "foreign-conversation");
+        assert!(foreign.authorize_history_message(&original, NOW).is_err());
+    }
+
+    #[test]
+    fn history_retention_enforces_age_count_and_serialized_byte_bounds() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let (remote, _) = generate_keypair();
+        let authority = fixture.authority(remote);
+        let mut state = core.empty_history();
+        for offset in 0..205 {
+            let outgoing = authority
+                .prepare_outgoing(
+                    SERVICE,
+                    "elastos.chat.message/v1",
+                    serde_json::json!({"body":format!("history {offset}")}),
+                    NOW + offset,
+                    TTL,
+                )
+                .unwrap();
+            state
+                .envelopes
+                .push(String::from_utf8(outgoing.envelope_bytes().to_vec()).unwrap());
+            prune_history(&mut state, NOW + 205).unwrap();
+        }
+        assert_eq!(state.envelopes.len(), MAX_CONVERSATION_HISTORY_MESSAGES);
+        assert_eq!(
+            serde_json::from_str::<SignedCollaborationMessage>(&state.envelopes[0])
+                .unwrap()
+                .payload
+                .created_at,
+            NOW + 5
+        );
+        let retained = state
+            .envelopes
+            .iter()
+            .map(|envelope| envelope.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        // The product retention port owns directory creation and the write lock.
+        // Seed this fresh root through that port, as durable projections do.
+        core.retain_history_messages(&retained, NOW + 205).unwrap();
+        assert_eq!(core.conversation_history(NOW + 205).unwrap(), retained);
+        let before = fs::read(core.history_path()).unwrap();
+        let older = authority
+            .prepare_outgoing(
+                SERVICE,
+                "elastos.chat.message/v1",
+                serde_json::json!({"body":"older than the retained window"}),
+                NOW,
+                TTL,
+            )
+            .unwrap();
+        assert!(core
+            .history_projection_candidates(&[older.envelope_bytes().to_vec()], NOW + 205)
+            .unwrap()
+            .is_empty());
+        let newest = authority
+            .prepare_outgoing(
+                SERVICE,
+                "elastos.chat.message/v1",
+                serde_json::json!({"body":"new retained original"}),
+                NOW + 205,
+                TTL,
+            )
+            .unwrap();
+        assert_eq!(
+            core.history_projection_candidates(
+                &[
+                    state.envelopes[0].as_bytes().to_vec(),
+                    newest.envelope_bytes().to_vec()
+                ],
+                NOW + 205
+            )
+            .unwrap(),
+            vec![newest.envelope_bytes().to_vec()]
+        );
+        assert_eq!(fs::read(core.history_path()).unwrap(), before);
+        for offset in 205..230 {
+            let outgoing = authority
+                .prepare_outgoing(
+                    SERVICE,
+                    "elastos.chat.message/v1",
+                    serde_json::json!({"body":"x".repeat(48 * 1024)}),
+                    NOW + offset,
+                    TTL,
+                )
+                .unwrap();
+            state
+                .envelopes
+                .push(String::from_utf8(outgoing.envelope_bytes().to_vec()).unwrap());
+            prune_history(&mut state, NOW + 230).unwrap();
+        }
+        assert!(state.envelopes.len() < MAX_CONVERSATION_HISTORY_MESSAGES);
+        assert!(canonical_history_bytes(&state).unwrap().len() <= MAX_CONVERSATION_HISTORY_BYTES);
+        core.validate_history(&state).unwrap();
+        prune_history(&mut state, NOW + 230 + CONVERSATION_HISTORY_RETENTION_SECS).unwrap();
+        assert!(state.envelopes.is_empty());
+    }
+
+    #[test]
+    fn history_refuses_live_identity_conflicts_after_original_cache_eviction_before_product_writes()
+    {
+        let fixture = Fixture::new();
+        let core = std::sync::Arc::new(fixture.core());
+        let product =
+            crate::collaboration_product::CollaborationChatProductPort::new(core.clone()).unwrap();
+        let now = now_secs();
+        let (remote_key, _) = generate_keypair();
+        let authority = fixture.authority(remote_key.clone());
+        let original = authority
+            .prepare_outgoing(
+                SERVICE,
+                "elastos.chat.message/v1",
+                serde_json::json!({"body":"original live message"}),
+                now - 1_000,
+                TTL,
+            )
+            .unwrap();
+        core.accept_incoming_from_signed_source_for_test(original.envelope_bytes(), now - 999)
+            .unwrap();
+
+        // Both a reused ID and a reused nonce have valid current signatures,
+        // but refer to different originals from the same Profile.
+        let mut conflicts = Vec::new();
+        for reuse_id in [true, false] {
+            let mut altered: SignedCollaborationMessage =
+                serde_json::from_slice(original.envelope_bytes()).unwrap();
+            altered.payload.created_at = now;
+            altered.payload.expires_at = now + TTL;
+            altered.payload.payload["product"]["body"] = serde_json::json!("conflicting original");
+            if reuse_id {
+                altered.payload.nonce = random_hex_128().unwrap();
+            } else {
+                altered.payload.message_id = random_hex_128().unwrap();
+            }
+            let (signature, signer_did) = crate::crypto::domain_separated_sign(
+                &remote_key,
+                COLLABORATION_MESSAGE_SIGNATURE_DOMAIN_V1,
+                &canonical_collaboration_message_bytes(&altered.payload).unwrap(),
+            );
+            altered.signature = signature;
+            altered.signer_did = signer_did;
+            let bytes = canonical_signed_collaboration_message_bytes(&altered).unwrap();
+            assert!(core.authorize_history_message(&bytes, now).is_ok());
+            // A still-pending live envelope also owns its identity.
+            assert!(core
+                .history_projection_candidates(std::slice::from_ref(&bytes), now)
+                .is_err());
+            conflicts.push(bytes);
+        }
+        assert_eq!(
+            core.history_projection_candidates(&[original.envelope_bytes().to_vec()], now)
+                .unwrap(),
+            vec![original.envelope_bytes().to_vec()]
+        );
+        let handoff = product.pending_messages().unwrap().remove(0);
+        product
+            .project_handoff(&fixture.data_root, &handoff)
+            .unwrap();
+        assert_eq!(core.summary().unwrap().replay_tombstones, 1);
+
+        // These signed originals model a participant cache, rather than new
+        // local sends. Retention does not change the five-send live policy.
+        let replacements = (0..MAX_CONVERSATION_HISTORY_MESSAGES)
+            .map(|offset| {
+                authority
+                    .prepare_outgoing(
+                        SERVICE,
+                        "elastos.chat.message/v1",
+                        serde_json::json!({"body":format!("cached history {offset}")}),
+                        now - 999 + offset as u64,
+                        TTL,
+                    )
+                    .unwrap()
+                    .envelope_bytes()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        core.retain_history_messages(&replacements, now).unwrap();
+        let retained = core.conversation_history(now).unwrap();
+        assert_eq!(retained.len(), MAX_CONVERSATION_HISTORY_MESSAGES);
+        assert!(!retained.contains(&original.envelope_bytes().to_vec()));
+        // Exact accepted originals remain valid replays even after eviction.
+        assert!(core
+            .history_projection_candidates(&[original.envelope_bytes().to_vec()], now)
+            .unwrap()
+            .is_empty());
+        core.retain_history_message(original.envelope_bytes(), now)
+            .unwrap();
+
+        let new_original = authority
+            .prepare_outgoing(
+                SERVICE,
+                "elastos.chat.message/v1",
+                serde_json::json!({"body":"otherwise valid catch-up"}),
+                now,
+                TTL,
+            )
+            .unwrap();
+        let session = crate::room_service::start_local_runtime_session(
+            &fixture.data_root,
+            &core.local_device_did(),
+            "Reader",
+            "history identity test",
+        )
+        .unwrap();
+        let before_poll = product
+            .conversation_poll(&fixture.data_root, &session.token, 0)
+            .unwrap();
+        assert_eq!(before_poll.objects.len(), 1);
+        let room_path = elastos_common::localhost::rooted_localhost_fs_path(
+            &fixture.data_root,
+            crate::room_service::room_root_uri(),
+        )
+        .unwrap()
+        .join("room/objects.json");
+        let before_room = fs::read(&room_path).unwrap();
+        let before_live = fs::read(core.state_path()).unwrap();
+        let before_history = fs::read(core.history_path()).unwrap();
+        for conflict in conflicts {
+            assert!(core
+                .accept_incoming_from_signed_source_for_test(&conflict, now)
+                .is_err());
+            assert!(product
+                .project_history(
+                    &fixture.data_root,
+                    &[new_original.envelope_bytes().to_vec(), conflict.clone()],
+                    now,
+                )
+                .is_err());
+            assert!(core.retain_history_message(&conflict, now).is_err());
+            assert_eq!(fs::read(&room_path).unwrap(), before_room);
+            assert_eq!(fs::read(core.state_path()).unwrap(), before_live);
+            assert_eq!(fs::read(core.history_path()).unwrap(), before_history);
+            let after_poll = product
+                .conversation_poll(&fixture.data_root, &session.token, 0)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&after_poll.objects).unwrap(),
+                serde_json::to_value(&before_poll.objects).unwrap()
+            );
+            assert_eq!(after_poll.latest_seq, before_poll.latest_seq);
+        }
+    }
+
+    #[test]
     fn absent_summary_is_pure_and_outgoing_idempotency_uses_the_exact_runtime_binding() {
         let fixture = Fixture::new();
         let core = fixture.core();
@@ -2984,6 +4318,55 @@ mod tests {
     }
 
     #[test]
+    fn custody_settles_presence_while_shared_chat_retries_its_original_lifetime() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let chat = prepare(
+            &core,
+            "shared-custody",
+            serde_json::json!({"content":"retained original"}),
+            NOW,
+            TTL,
+        )
+        .unwrap();
+        let presence_type = "elastos.chat.presence/v1";
+        let presence_payload = serde_json::json!({"online":true});
+        let presence = core
+            .prepare_outgoing(
+                operation(
+                    &core,
+                    "presence-custody",
+                    presence_type,
+                    &presence_payload,
+                    45,
+                ),
+                SERVICE,
+                presence_type,
+                presence_payload,
+                NOW,
+                45,
+            )
+            .unwrap();
+        let recipient = generate_keypair().0;
+        for outgoing in [&chat, &presence] {
+            complete_projection(&core, outgoing);
+            core.record_remote_acceptance(
+                &remote_receipt(&fixture, outgoing, recipient.clone(), NOW + 1),
+                NOW + 1,
+            )
+            .unwrap();
+        }
+        let before = fs::read(core.state_path()).unwrap();
+        let retry = fixture.core().pending_outgoing(NOW + 1).unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].envelope_bytes(), chat.envelope_bytes());
+        assert!(retry[0].remote_acceptance_recorded());
+        assert_eq!(retry[0].created_at(), NOW);
+        assert!(core.pending_outgoing(NOW + TTL).unwrap().is_empty());
+        assert_eq!(fs::read(core.state_path()).unwrap(), before);
+    }
+
+    #[test]
     fn self_echo_remote_acceptance_and_recipient_replay_are_fail_closed() {
         let fixture = Fixture::new();
         let core = fixture.core();
@@ -3021,7 +4404,11 @@ mod tests {
         let receipt = remote_receipt(&fixture, &outgoing, recipient_key.clone(), NOW + 1);
         core.record_remote_acceptance(&receipt, NOW + 1).unwrap();
         core.record_remote_acceptance(&receipt, NOW + 1).unwrap();
-        assert!(core.pending_outgoing(NOW + 1).unwrap().is_empty());
+        let retry = core.pending_outgoing(NOW + 1).unwrap();
+        assert_eq!(retry.len(), 1);
+        assert!(retry[0].remote_acceptance_recorded());
+        assert_eq!(retry[0].envelope_bytes(), outgoing.envelope_bytes());
+        assert!(core.pending_outgoing(NOW + TTL).unwrap().is_empty());
 
         let conflicting = remote_receipt(&fixture, &outgoing, recipient_key, NOW + 2);
         assert!(core
@@ -3105,7 +4492,9 @@ mod tests {
         );
 
         let fixture = Fixture::new();
-        let core = fixture.core();
+        let mut core = fixture.core();
+        // This test fills the outbox in one second; pacing has its own test.
+        core.sends_per_window = usize::MAX;
         for index in 0..MAX_UNRESOLVED_OUTGOING {
             prepare(
                 &core,

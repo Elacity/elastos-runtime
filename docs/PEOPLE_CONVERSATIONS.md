@@ -250,8 +250,9 @@ Privacy constraints:
 
 ## QR, Code, and Link Flow
 
-QR/code/link remains an explicit alternate onboarding and invite path and
-should ship first.
+QR/code/link is an alternate onboarding and invite path. The current Chat
+journey uses Community Profiles, a contact request and recipient Inbox approval.
+The owning GitHub invite issue records when the alternate path is implemented.
 
 Use it for:
 
@@ -400,7 +401,10 @@ User test:
 Status: implemented. Direct conversations are Profile-scoped, Runtime-authorized
 on every read and send, and routed over the Runtime-mediated peer path. Shared
 group Chat is unchanged. Bilateral removal, shared-room Profile attribution,
-and incoming-message notifications have landed with it. Direct conversations
+and incoming-message notifications have landed with it. A message alert and its
+unread dot belong to the account that received the message: many accounts can
+share one Home, so Home, Inbox and Chat show each account only its own alerts,
+and only that account can read, dismiss or clear them. Direct conversations
 are text-only for now: attachments need object handling and a delivery path of
 their own, designed on the unified delivery layer, and until then the attach
 control is visibly unavailable in direct mode rather than silently missing.
@@ -417,11 +421,10 @@ Scope:
   - device signature proves the sending endpoint;
   - the retained signed Profile document proves that device is currently
     authorized for the participant Profile DID.
-- The selected Carrier session already provides encrypted peer confidentiality:
-  the current `PeerDid` path uses Iroh QUIC/TLS, relays forward encrypted bytes
-  only, and Runtime binds delivery to the accepted Profile's current authorized
-  endpoint before admitting the message. The seed/bootstrap path receives no
-  direct-message plaintext and no direct-message authority.
+- Carrier connects the two Homes directly over encrypted Iroh QUIC/TLS.
+  Runtime binds delivery to the accepted Profile's current authorized endpoint
+  before admitting the message. The sender and recipient own Direct plaintext
+  and authority; the Community bootstrap node supplies network discovery.
 - Plaintext direct-message content exists only in the sender's and recipient's
   protected principal-root direct-message store under
   `.AppData/ElastOS/Chat/direct-messages.json`.
@@ -461,6 +464,32 @@ offline, and neither invents a third party to hide it:
   [COLLABORATION_HANDOFF.md](COLLABORATION_HANDOFF.md) §1. The window is a
   deliberate bound, not a shared constant with the 64-head contact store: the
   ring bounds announcement payloads, the head store bounds relationships.
+
+## Spam Limits
+
+Each limit is a constant in the Runtime and refuses only the extra item:
+
+- Community messages: a Home sends at most 5 messages per Profile in any
+  10 seconds. The sixth gets HTTP 429 with `Retry-After`, Chat shows "Slow
+  down", and the draft stays in the composer. A retry of an already accepted
+  message is free; the count comes from saved messages, so a send that fails
+  to save does not count. Every receiving Home also accepts at most 5
+  messages per sender Profile in 10 seconds, and keeps at most 8 per sender
+  waiting for Chat. Past either limit it holds that sender's message and
+  retries it itself, since the sender stops resending once any other Home
+  accepts it; other senders' messages in the same batch keep flowing. Network
+  delay can bunch an honest sender's messages into one window; the Home holds
+  them and lets them in as the window slides. A Home holds at most 5 messages
+  per sender, and drops a sender's flood beyond that. When its 64 held
+  messages are full, the sender holding the most gives up its newest one first; if every sender holds as few, the Home waits and
+  retries the batch instead of dropping a message. Receive windows and held
+  messages live in memory and reset on restart.
+- Discovery relay: a Home's Carrier endpoint is its signing device, and the
+  relay accepts a listing or contact request only from the device that signed
+  it, so another Home cannot replay it. One Home lists at most 4 people in
+  `Visible now`; renewing a stored listing is free. The relay stores at most 8
+  contact requests per sender Profile and 16 per Home, and refuses a call
+  without an authenticated Carrier endpoint.
 
 ## Near-Term Non-Goals
 

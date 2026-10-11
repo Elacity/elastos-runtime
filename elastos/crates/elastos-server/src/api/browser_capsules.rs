@@ -1512,6 +1512,100 @@ mod tests {
     }
 
     #[test]
+    fn targeted_browser_resolution_reloads_registry_metadata_and_entrypoint() {
+        let root = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(root.path(), "system", "Before", "app");
+        let dir = root.path().join("capsules/system");
+        assert_eq!(
+            resolve_browser_capsule(root.path(), "system")
+                .unwrap()
+                .manifest
+                .description
+                .as_deref(),
+            Some("Before")
+        );
+
+        write_test_browser_capsule(root.path(), "system", "After", "app");
+        assert_eq!(
+            resolve_browser_capsule(root.path(), "system")
+                .unwrap()
+                .manifest
+                .description
+                .as_deref(),
+            Some("After")
+        );
+        write_test_components_manifest(root.path(), &[]);
+        assert!(resolve_browser_capsule(root.path(), "system").is_err());
+        activate_test_capsule(root.path(), "system");
+        assert!(resolve_browser_capsule(root.path(), "system").is_ok());
+
+        let contract = fs::read(dir.join("capsule.json")).unwrap();
+        fs::remove_file(dir.join("capsule.json")).unwrap();
+        assert!(resolve_browser_capsule(root.path(), "system").is_err());
+        fs::write(dir.join("capsule.json"), b"invalid manifest").unwrap();
+        assert!(resolve_browser_capsule(root.path(), "system").is_err());
+        let mut mismatch: serde_json::Value = serde_json::from_slice(&contract).unwrap();
+        mismatch["name"] = "other".into();
+        fs::write(
+            dir.join("capsule.json"),
+            serde_json::to_vec(&mismatch).unwrap(),
+        )
+        .unwrap();
+        assert!(resolve_browser_capsule(root.path(), "system").is_err());
+        fs::write(dir.join("capsule.json"), contract).unwrap();
+        fs::remove_file(dir.join("index.html")).unwrap();
+        assert!(resolve_browser_capsule(root.path(), "system").is_err());
+    }
+
+    #[test]
+    fn targeted_browser_resolution_keeps_platform_install_path_rules() {
+        let root = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(root.path(), "system", "System", "app");
+        let path = root.path().join("components.json");
+        let original: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let absolute = root.path().join("capsules/system");
+        let platform = crate::setup::detect_platform();
+        for unsafe_path in [absolute.to_str().unwrap(), "../outside", "missing"] {
+            let mut changed = original.clone();
+            changed["external"]["system"]["platforms"][platform.as_str()] =
+                serde_json::json!({"install_path": unsafe_path});
+            fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            assert!(
+                resolve_browser_capsule(root.path(), "system").is_err(),
+                "{unsafe_path}"
+            );
+        }
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        assert!(resolve_browser_capsule(root.path(), "system").is_ok());
+    }
+
+    #[test]
+    fn targeted_viewer_resolution_rechecks_both_current_contracts() {
+        let root = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(root.path(), "viewer", "Viewer", "viewer");
+        write_test_viewer_capsule(root.path(), "content", "viewer", "game.gba", "Content");
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_some());
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "other").is_none());
+        let path = root.path().join("capsules/content/capsule.json");
+        let original = fs::read(&path).unwrap();
+        let mut retargeted: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        retargeted["viewer"] = "other".into();
+        fs::write(&path, serde_json::to_vec(&retargeted).unwrap()).unwrap();
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_none());
+        fs::write(path, original).unwrap();
+        write_test_components_manifest(root.path(), &["content"]);
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_none());
+        activate_test_capsule(root.path(), "viewer");
+        write_test_browser_capsule(root.path(), "viewer", "Wrong role", "app");
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_none());
+        write_test_browser_capsule(root.path(), "viewer", "Viewer", "viewer");
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_some());
+        fs::remove_file(root.path().join("capsules/content/game.gba")).unwrap();
+        assert!(resolve_viewer_bound_capsule(root.path(), "content", "viewer").is_none());
+    }
+
+    #[test]
     fn list_viewer_bound_capsules_prefers_installed_capsules() {
         let data_dir = tempfile::tempdir().unwrap();
         write_test_browser_capsule(

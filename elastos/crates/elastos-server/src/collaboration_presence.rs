@@ -21,7 +21,7 @@ use crate::collaboration_core::{
 use crate::collaboration_product::{CHAT_INTERFACE, CHAT_ROOM_CAPSULE, CHAT_SERVICE};
 use crate::esp_binding::{esp_request_binding, EspRequestBinding};
 
-const PRESENCE_PAYLOAD_TYPE: &str = "elastos.chat.presence/v1";
+pub(crate) const PRESENCE_PAYLOAD_TYPE: &str = "elastos.chat.presence/v1";
 const PRESENCE_RESOURCE: &str = "elastos://chat/presence";
 const PRESENCE_TTL_SECS: u64 = 45;
 const PRESENCE_STATE_SCHEMA: &str = "elastos.chat.presence-state/v1";
@@ -84,6 +84,14 @@ pub struct CollaborationPresenceSnapshotRecord {
     handle: Option<String>,
     last_seen_at: u64,
     expires_at: u64,
+}
+
+/// Internal route evidence. The signed original still owns all Profile and
+/// conversation authority; capsule projections expose neither it nor routes.
+#[derive(Clone)]
+pub(crate) struct HistoryParticipant {
+    pub(crate) endpoint_did: String,
+    pub(crate) presence_envelope: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +224,68 @@ impl CollaborationPresenceProductPort {
 
     pub fn snapshot(&self, now: u64) -> anyhow::Result<CollaborationPresenceSnapshot> {
         self.read_model.snapshot(now)
+    }
+
+    pub(crate) fn history_participants(&self, now: u64) -> anyhow::Result<Vec<HistoryParticipant>> {
+        let state = self
+            .read_model
+            .load_state()?
+            .unwrap_or_else(|| self.read_model.empty_state());
+        let mut peers = Vec::new();
+        for record in state.records {
+            let presence = self.read_model.verify_record(&record)?;
+            if presence.expires_at <= now
+                || presence.issued_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+            {
+                continue;
+            }
+            let authorized = self
+                .core
+                .authorize_stored_product_message(record.envelope.as_bytes())?;
+            if let Ok(endpoint) = authorized.sender_profile().sole_endpoint_did() {
+                if self.core.is_bootstrap_endpoint(endpoint) {
+                    continue;
+                }
+                peers.push(HistoryParticipant {
+                    endpoint_did: endpoint.to_string(),
+                    presence_envelope: record.envelope,
+                });
+            }
+        }
+        peers.sort_by(|left, right| left.endpoint_did.cmp(&right.endpoint_did));
+        peers.dedup_by(|left, right| left.endpoint_did == right.endpoint_did);
+        Ok(peers)
+    }
+
+    /// The request carries its own live signed presence, avoiding a race with
+    /// the receiver's next gossip projection. Carrier owns the source fact.
+    pub(crate) fn authorize_history_requester(
+        &self,
+        envelope_bytes: &[u8],
+        source_endpoint_did: &str,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        if self.core.is_bootstrap_endpoint(source_endpoint_did)
+            || self
+                .core
+                .is_bootstrap_endpoint(&self.core.local_device_did())
+        {
+            anyhow::bail!("Community bootstrap endpoints carry discovery metadata only");
+        }
+        let presence = self.read_model.verify_envelope(envelope_bytes)?;
+        if presence.expires_at <= now
+            || presence.issued_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+        {
+            anyhow::bail!("history requester presence is unavailable");
+        }
+        let authorized = self.core.authorize_stored_product_message(envelope_bytes)?;
+        if !authorized
+            .sender_profile()
+            .authorizes_endpoint(source_endpoint_did)
+        {
+            anyhow::bail!("history requester source is outside its signed Profile");
+        }
+        Ok(())
     }
 
     fn require_prepared(&self, prepared: &PreparedCollaborationPresence) -> anyhow::Result<()> {

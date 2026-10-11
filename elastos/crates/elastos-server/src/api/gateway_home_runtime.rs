@@ -1012,6 +1012,7 @@ fn home_site_summary(data_dir: &std::path::Path) -> HomeSiteSummary {
 
 fn home_room_summary(summary: crate::room_service::RoomSummary) -> HomeRoomSummary {
     HomeRoomSummary {
+        latest_seq: summary.latest_seq,
         room_slug: summary.room_slug,
         title: summary.room_control.title,
         member_count: summary.room_control.member_count,
