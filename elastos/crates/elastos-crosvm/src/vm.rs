@@ -49,6 +49,7 @@ impl Drop for BootParams {
     fn drop(&mut self) {
         if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
             if metadata.is_file() && metadata.dev() == self.device && metadata.ino() == self.inode {
+                // removal-ok: create_new UUID boot file; recorded device/inode still match.
                 let _ = std::fs::remove_file(&self.path);
             }
         }

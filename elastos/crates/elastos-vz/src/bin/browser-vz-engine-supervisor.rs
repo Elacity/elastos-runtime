@@ -3230,6 +3230,7 @@ fn clone_or_copy_writable_rootfs(source: &Path, destination: &Path) -> std::io::
             .arg(destination)
             .status()?;
         if !result.success() {
+            // removal-ok: this copy's partial rootfs in the caller-owned launch directory.
             let _ = fs::remove_file(destination);
             return Err(std::io::Error::other(
                 "Browser sparse rootfs staging failed",

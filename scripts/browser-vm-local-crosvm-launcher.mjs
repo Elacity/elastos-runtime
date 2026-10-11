@@ -574,6 +574,7 @@ function removePrivateSessionInputs(inputs = privateSessionInputs) {
   for (const [file, owned] of inputs) {
     try {
       const stat = fs.lstatSync(file);
+      // removal-ok: exclusive per-session input; recorded device/inode still match.
       if (stat.isFile() && stat.dev === owned.dev && stat.ino === owned.ino) fs.unlinkSync(file);
     } catch (error) { if (error.code !== "ENOENT") logPhase("private session input cleanup failed"); }
   }

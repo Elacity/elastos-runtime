@@ -1465,6 +1465,7 @@ prepare_source_home_setup() (
     # Runtime admits the source catalogue beside the final stamped manifest.
     # The reviewed media pair was already prepared above with MustMatch trust.
     setup_stage="$(mktemp -d "${DATA_DIR}/.source-home-setup.XXXXXX")"
+    # removal-ok: exact private staging directory created by mktemp in this subshell.
     trap 'rm -rf "${setup_stage}"' EXIT
     install -m 600 "${DATA_DIR}/components.json" "${setup_stage}/components.json"
     install -m 600 "${ROOT}/model-catalog.json" "${setup_stage}/model-catalog.json"

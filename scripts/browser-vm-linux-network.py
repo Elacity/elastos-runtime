@@ -305,6 +305,7 @@ def configure(user, remove=False):
             run('systemctl', 'disable', '--now', unit, optional=True)
             unit_path.unlink(missing_ok=True)
             udev.unlink(missing_ok=True)
+            # removal-ok: exact UID legacy rule; trusted_path verifies root-owned parents above.
             legacy_udev.unlink(missing_ok=True)
             state.unlink()
         for n in networks(uid):
@@ -337,6 +338,7 @@ def configure(user, remove=False):
             shutil.copyfile(__file__, HELPER)
         HELPER.chmod(0o755)
         udev.write_text(''.join(f'KERNEL=="{device}", RUN+="{shutil.which("setfacl")} -m u:{uid}:rw /dev/{device}"\n' for device in ['kvm', 'vhost-vsock']))
+        # removal-ok: exact UID legacy rule; trusted_path verifies root-owned parents above.
         legacy_udev.unlink(missing_ok=True)
         command = f'{sys.executable} {HELPER}'
         unit_path.write_text(f'[Unit]\nDescription=ElastOS Browser network for UID {uid}\nAfter=network.target {FIREWALL_SERVICES}\nPartOf={FIREWALL_SERVICES}\nReloadPropagatedFrom={FIREWALL_SERVICES}\n\n[Service]\nType=oneshot\nExecStart={command} restore --user {user.pw_name}\nExecReload={command} restore --user {user.pw_name}\nExecStop={command} invalidate --user {user.pw_name}\nExecStopPost={command} invalidate --user {user.pw_name}\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n')
