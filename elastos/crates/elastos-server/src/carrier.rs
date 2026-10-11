@@ -1236,7 +1236,7 @@ fn short_lived_endpoint_builder(
         network != CarrierNodeNetwork::Isolated || approved_relay.is_none(),
         "ELASTOS_RELAY_URL cannot be set with ELASTOS_CARRIER_NETWORK=direct"
     );
-    Ok(match network {
+    let builder = match network {
         CarrierNodeNetwork::Isolated => apply_isolated_endpoint_policy(
             Endpoint::builder(iroh::endpoint::presets::Minimal).secret_key(secret_key),
         ),
@@ -1244,7 +1244,16 @@ fn short_lived_endpoint_builder(
             Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key),
             approved_relay,
         ),
-    })
+    };
+    // Linux Carrier sends separate UDP datagrams so delivery does not depend on
+    // the network driver's segmentation offload support.
+    #[cfg(target_os = "linux")]
+    let builder = builder.transport_config(
+        iroh::endpoint::QuicTransportConfig::builder()
+            .enable_segmentation_offload(false)
+            .build(),
+    );
+    Ok(builder)
 }
 
 async fn bind_carrier_endpoint(
@@ -12392,7 +12401,9 @@ pub(crate) mod tests {
 
     async fn assert_private_carrier_reply_bound(target: &str, operation: &str, limit: usize) {
         let fixture = peer_did_route_fixture(181, 182).await;
-        let size = Arc::new(std::sync::atomic::AtomicUsize::new(32));
+        let payload_size = 32 * 1024;
+        assert!(payload_size < limit);
+        let size = Arc::new(std::sync::atomic::AtomicUsize::new(payload_size));
         let requests = Arc::new(StdMutex::new(Vec::new()));
         fixture
             ._remote_registry
@@ -12430,7 +12441,7 @@ pub(crate) mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(response["body"], "x".repeat(32));
+        assert_eq!(response["body"], "x".repeat(payload_size));
         let mut request = requests.lock().unwrap()[0].clone();
         assert_eq!(
             request["_runtime_invocation"]["carrier"]["source_endpoint_did"],
