@@ -43,11 +43,14 @@ Setup and updates need outgoing UDP to port 4433 for Carrier.
 
 The installer detects the platform (Linux `x86_64`/`aarch64` or
 macOS Apple silicon), verifies the signed release, installs Runtime, and
-fetches the Home profile from the trusted publisher. It
-starts Home at `http://localhost:8090/home/` and opens your browser. Keep the
-terminal open while you use Home; Ctrl+C stops it. With no interactive terminal,
-setup completes and prints the full command for opening Home later. The installer
-uses the installed binary's full path, so editing PATH is optional.
+fetches the Home profile from the trusted publisher. It then starts Home at
+`http://localhost:8090/home/` in the background and opens your browser; Home
+keeps running after the terminal closes. See
+[Home in the background](#home-in-the-background). If the background service
+cannot start, the installer says why in one line and runs Home in the terminal
+as before. With no interactive terminal, it then prints the full command for
+opening Home later. The installer uses the installed command's full path, so
+editing PATH is optional.
 
 For automated provisioning, use `--install-only`:
 
@@ -92,6 +95,60 @@ it still needs a trusted source before fetching published components.
 See [Getting started](GETTING_STARTED.md#source-built-trusted-source-example)
 for an explicit `source add` example. Use the public installer when testing the
 published install path.
+
+## Home in the background
+
+The installer runs Home as a background service of your own account: a systemd
+user unit `elastos-home.service` on Linux and a LaunchAgent `org.elastos.home`
+on macOS. The service runs `<data directory>/bin/elastos home --browser`. Home
+keeps running after the terminal closes and starts again when you log in.
+Installing or running the service needs no administrator rights.
+
+| To | Run |
+| --- | --- |
+| Open Home in your browser | `elastos home --browser`; starts the service first if it is stopped |
+| Use Home in the terminal | `elastos home`; attaches to the running Home |
+| Stop Home | `elastos service stop`; Home starts again at your next login or with `elastos home --browser` |
+| See whether Home runs | `elastos service status` |
+| Read the service log | Linux: `journalctl --user -u elastos-home`; macOS: `logs/home-service.log` in the data directory |
+
+Home's own startup log is `update-controller/runtime.log` in the data directory.
+
+On Linux a user service stops when you log out unless your account lingers. The
+installer turns lingering on when the system allows it without an
+administrator. Otherwise it says so in one sentence, and Home runs while you are
+logged in. macOS loads the LaunchAgent only in a desktop login session and lists
+it under System Settings > General > Login Items & Extensions.
+
+`elastos update` and Undo stop the service, apply the change and start it again.
+An update you approve in System restarts Home inside the running service. While
+an interrupted install or update waits for recovery, the service stays stopped
+instead of restarting; running the installer or `elastos update` recovers it.
+
+### What the service may and may not do
+
+The service runs as you, with your account's rights, like a program you start
+yourself. It can read and write what your account can, including the rest of
+your home folder, and it can use your keys. It gets no administrator rights and
+nothing in it calls `sudo`. Code that runs as your account or as root can use
+your keys; see [Data, keys and backups](#data-keys-and-backups).
+
+On Linux the unit also enforces:
+
+- no new privileges: Home and its children cannot gain rights through setuid
+  programs or file capabilities, and cannot create setuid or setgid files;
+- private files: everything Home creates is readable only by you (`UMask=0077`);
+- no realtime scheduling, no personality changes and native system calls only;
+- at most five automatic restarts within five minutes after a crash.
+
+The unit does not hide the rest of your home folder or the system from Home:
+those limits need user namespaces, which some supported Linux systems refuse to
+user services, and Home must start everywhere.
+
+On macOS the LaunchAgent sets private file permissions, runs only in your
+desktop session and restarts Home at most every 30 seconds after a crash. macOS
+offers no equivalent of the Linux unit's limits for a user's own background
+service, so on macOS Home has exactly the access of any app you open yourself.
 
 ## Optional components
 
@@ -336,14 +393,19 @@ of that key exists.
 
 | What | macOS | Linux |
 | --- | --- | --- |
-| Runtime binary | `~/.local/bin/elastos` | `~/.local/bin/elastos` |
+| Runtime binary | `bin/elastos` in the data directory | same |
+| `elastos` command | `~/.local/bin/elastos`, a link to the Runtime binary | same |
+| Background service | `~/Library/LaunchAgents/org.elastos.home.plist` | `~/.config/systemd/user/elastos-home.service`, or under `$XDG_CONFIG_HOME` when set |
 | Data directory | `~/Library/Application Support/elastos` | `~/.local/share/elastos`, or `$XDG_DATA_HOME/elastos` when set |
 | Components | `bin/`, `capsules/`, `tools/`, `libexec/`, `scripts/`, `browser-vm/image-set/`, `components.json`, `model-catalog.json` and `update-controller/` in the data directory | same |
 | Trusted sources and verified release | `sources.json` and `installation/` in the data directory | same |
 
-`--install-dir` moves only the binary. Everything else in the data directory is
-yours: identity keys, wallets, recovery material and user files. ElastOS adds
-no login items, launch agents, desktop entries or shell profile changes.
+`--install-dir` moves only the `elastos` command. An installation from before
+0.8.0 kept the Runtime binary at `~/.local/bin/elastos`; the installer moves it
+into the data directory and leaves the link in its place. Everything else in the
+data directory is yours: identity keys, wallets, recovery material and user
+files. Apart from the background service, ElastOS adds no login items, desktop
+entries or shell profile changes.
 
 The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and
@@ -358,11 +420,12 @@ owns exact public-manifest parity evidence.
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash -s -- --uninstall
 ```
 
-The installer stops this installation's Runtime the same way an install does:
-it stops only processes whose ownership records and command match this
-installation, and removes nothing if another process holds them. It then
-removes the binary, the components (including the release scripts and the
-Browser image), the trusted sources and the verified release. Your data
+The installer stops Home's background service, then stops this installation's
+Runtime the same way an install does: it stops only processes whose ownership
+records and command match this installation, and removes nothing if another
+process holds them. It then removes the background service, the `elastos`
+command, the Runtime binary, the components (including the release scripts and
+the Browser image), the trusted sources and the verified release. Your data
 directory stays, including Browser profiles, so installing again continues with
 the same identity. Pass the same `--install-dir` you installed with. An install
 or update that is running or was interrupted stops the removal; finish it first.
