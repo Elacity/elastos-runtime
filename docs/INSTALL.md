@@ -148,25 +148,24 @@ The installer detects Linux `aarch64`:
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-Home and chat use the ordinary user account. Browser uses the local Engine's
-virtual machine. When the signed release supplies Browser support, setup obtains
-its matching helpers and verified image before Home starts. The image streams to
-disk with progress; a transfer stops after 30 seconds without data. Runtime keeps
-the committed Browser profile separate from the image during reopen and updates.
+Home and chat use the ordinary user account. Browser runs on Apple Silicon Macs
+and uses the local Engine's virtual machine. When the signed release supplies
+Browser support, setup obtains its matching helpers and verified image before
+Home starts. The image streams to disk with progress; a transfer stops after 30
+seconds without data. Runtime keeps the committed Browser profile separate from
+the image during reopen and updates.
 
-On Linux, the installer offers one administrator step to grant this user KVM
-access and prepare the confined Browser network device. It explains the changes
-and asks before applying them. Runtime then uses the ordinary user's access to
-launch and close the Engine. A machine without virtualization receives a plain
-Browser message. The host setup can be removed with:
+On other computers, including Linux ARM64 (Jetson) and Linux x86-64, Browser is
+hidden until the next release; setup prints "Browser is not available on this
+computer yet." Setup also clears the Browser Engine selection and removes the
+Browser host helpers and image an earlier release installed (Browser profiles
+stay). The installer runs its Linux host step only after setup and only if the
+helper is still present, so it asks for no administrator step. If an earlier
+release set up Browser host access on Linux, it can be removed with:
 
 ```sh
 sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user "$(id -un)"
 ```
-
-For a piped or unattended install, follow the host setup command printed by the
-installer before opening Browser. The [Browser host setup](BROWSER_VM_TARGET.md)
-describes the installed adapter and its removal boundary.
 
 The [Browser VM target](BROWSER_VM_TARGET.md) documents the target contract and
 maintenance boundary. [Scripts](../scripts/README.md) maps the executable proof
@@ -368,8 +367,8 @@ directory stays, including Browser profiles, so installing again continues with
 the same identity. Pass the same `--install-dir` you installed with. An install
 or update that is running or was interrupted stops the removal; finish it first.
 
-On Linux, the uninstall leaves the one-time Browser host access in place. After
-closing Browser, remove it with:
+On Linux, the uninstall leaves any Browser host access an earlier release set
+up in place. Remove it with:
 
 ```sh
 sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user "$(id -un)"

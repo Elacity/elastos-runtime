@@ -15,6 +15,13 @@ pub(in crate::api::gateway) const CAPSULE_INTERFACE_REGISTRY_SCHEMA: &str =
 pub(in crate::api::gateway) fn capsule_catalog_summary(
     data_dir: &std::path::Path,
 ) -> CapsuleCatalogResponse {
+    capsule_catalog_summary_for(data_dir, &crate::setup::detect_platform())
+}
+
+pub(in crate::api::gateway) fn capsule_catalog_summary_for(
+    data_dir: &std::path::Path,
+    platform: &str,
+) -> CapsuleCatalogResponse {
     let launch_targets = home_launch_targets(data_dir)
         .into_iter()
         .map(|target| (target.target.clone(), target))
@@ -33,6 +40,8 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
             protected_content
                 || manifest.name != crate::protected_content_runtime::ELACITY_PLAYER_CAPSULE_ID
         })
+        // Browser is absent, not merely unlaunchable, where it is unavailable.
+        .filter(|manifest| manifest.name != "browser" || crate::setup::browser_available(platform))
         .map(|manifest| {
             catalog_capsule_summary(
                 manifest,
@@ -158,7 +167,14 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
 pub(in crate::api::gateway) fn capsule_interface_registry_summary(
     data_dir: &std::path::Path,
 ) -> CapsuleInterfaceRegistryResponse {
-    let catalog = capsule_catalog_summary(data_dir);
+    capsule_interface_registry_summary_for(data_dir, &crate::setup::detect_platform())
+}
+
+pub(in crate::api::gateway) fn capsule_interface_registry_summary_for(
+    data_dir: &std::path::Path,
+    platform: &str,
+) -> CapsuleInterfaceRegistryResponse {
+    let catalog = capsule_catalog_summary_for(data_dir, platform);
     let mut interfaces = Vec::new();
     for capsule in catalog.capsules {
         for interface in capsule.interfaces {

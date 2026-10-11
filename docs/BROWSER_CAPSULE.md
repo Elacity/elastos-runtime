@@ -1039,6 +1039,8 @@ prepares the owner's Engine and Exit selection through normal setup. Mac Apple
 Virtualization and Linux ARM64 crosvm run the same guest. Other hosts select an
 approved remote Engine through Runtime and Carrier. The guest input hash permits
 reuse while its recipe, locked dependencies and build options remain identical.
+In 0.8.0-alpha.15, setup offers Browser only on Apple Silicon Macs; Linux ARM64
+(Jetson) and Linux x86-64 hosts keep Browser hidden until the next release.
 
 The first installed journey covers Home sign-in, a decoded WebRTC page,
 navigate/type/scroll/click/reload, Close and profile reopen. Repeat that journey

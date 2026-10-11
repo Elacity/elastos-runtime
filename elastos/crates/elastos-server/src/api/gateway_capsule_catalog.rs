@@ -1252,7 +1252,16 @@ mod tests {
             "expected the first-party development capsule set to be visible"
         );
 
-        let catalog = capsule_catalog_summary(data_dir.path());
+        for platform in ["linux-arm64", "linux-amd64"] {
+            // Where Browser is unavailable it is absent, not merely unlaunchable.
+            assert!(
+                !read_model::capsule_catalog_summary_for(data_dir.path(), platform)
+                    .capsules
+                    .iter()
+                    .any(|capsule| capsule.name == "browser")
+            );
+        }
+        let catalog = read_model::capsule_catalog_summary_for(data_dir.path(), "darwin-arm64");
         assert_eq!(catalog.schema, read_model::CAPSULE_CATALOG_SCHEMA);
         assert_eq!(catalog.counts.total, catalog.capsules.len());
         let catalog_names = catalog
@@ -1503,7 +1512,8 @@ mod tests {
             }
         }
 
-        let registry = capsule_interface_registry_summary(data_dir.path());
+        let registry =
+            read_model::capsule_interface_registry_summary_for(data_dir.path(), "darwin-arm64");
         assert_eq!(
             registry.schema,
             read_model::CAPSULE_INTERFACE_REGISTRY_SCHEMA

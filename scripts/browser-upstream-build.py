@@ -52,7 +52,7 @@ def validate(recipe, upstream):
 def extract(source, root, destination, upstream):
     # Validate first; materialize file aliases as copies, without following links.
     members = upstream.archive_members(source, 'tar.gz', root, 1024**3,
-                                       source_archive=True, max_files=8192)
+                                       source_archive='build', max_files=8192)
     with tarfile.open(source, 'r:gz') as archive:
         for name, info in members.items():
             path = destination / name
@@ -61,6 +61,35 @@ def extract(source, root, destination, upstream):
                 shutil.copyfileobj(stream, target)
             path.chmod(info['mode'])
     return destination / root
+
+
+def linux_uapi_headers(work, env):
+    """Copy only the Linux UAPI headers for a musl build.
+
+    C_INCLUDE_PATH reaches every C compile, including generators that run
+    plain $CC (Minijail). GCC searches it after musl's own headers, so it
+    adds linux/, asm/ and asm-generic/ without glibc's include root.
+    """
+    headers = Path(env.pop('ELASTOS_BROWSER_LINUX_UAPI_INCLUDE', '/usr/include'))
+    multiarch = ('aarch64' if platform.machine() in ('arm64', 'aarch64') else 'x86_64') + '-linux-gnu'
+    uapi = work / 'linux-uapi'
+    for name in ('linux', 'asm-generic', 'asm'):
+        origin = headers / name
+        if name == 'asm' and not origin.is_dir():
+            origin = headers / multiarch / 'asm'
+        if not origin.is_dir():
+            raise ValueError('musl build needs Linux UAPI headers: ' + name)
+        shutil.copytree(origin, uapi / name)
+    env['C_INCLUDE_PATH'] = str(uapi)
+    return uapi
+
+
+def retain_linux_uapi(archive, root, uapi):
+    """Keep the exact headers a musl build compiled against beside its sources."""
+    headers = uapi.with_name('linux-uapi.tar.gz')
+    with tarfile.open(headers, 'x:gz', format=tarfile.GNU_FORMAT) as sources:
+        sources.add(uapi, arcname='linux-uapi', filter=source_header)
+    archive.add(headers, arcname=root + '/sources/' + headers.name)
 
 
 def audit_libraries(text, darwin):
@@ -83,7 +112,7 @@ def build(recipe, payload, cache, upstream):
         'arm64' if platform.machine() in ('arm64', 'aarch64') else 'amd64')
     if recipe['platform'] != native:
         raise ValueError('TURN source build requires its native platform runner')
-    tools = ('perl', 'make', 'aclocal', 'autoconf', 'automake',
+    tools = ('perl', 'make', 'aclocal', 'autoconf', 'automake', 'pkg-config',
              'glibtoolize' if native.startswith('darwin') else 'libtoolize',
              'cc' if native.startswith('darwin') else 'musl-gcc')
     missing = [name for name in tools if not shutil.which(name)]
@@ -107,10 +136,13 @@ def build(recipe, payload, cache, upstream):
                'ELASTOS_BROWSER_BUILD_ROOT': str(work), 'TURN_DISABLE_RPATH': '1',
                'CPPFLAGS': '-I' + str(prefix / 'include'),
                'LDFLAGS': '-L' + str(prefix / 'lib'), 'LC_ALL': 'C',
-               'CFLAGS': '-O2 -g0 -ffile-prefix-map=' + str(work) + '=/usr/src/elastos-browser'}
+               'CFLAGS': '-O2 -g0 -ffile-prefix-map=' + str(work) + '=/usr/src/elastos-browser',
+               # coturn otherwise enables SCTP when the host has glibc's netinet/sctp.h.
+               'TURN_NO_SCTP': '1'}
+        uapi = None
         if native.startswith('linux'):
             env['CC'] = 'musl-gcc'
-            env['LDFLAGS'] += ' -static'
+            uapi = linux_uapi_headers(work, env)
         for key in ('CPATH', 'LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'LD_LIBRARY_PATH', 'LD_PRELOAD'):
             env.pop(key, None)
         # OpenSSL encodes compiler flags as characters in its version metadata.
@@ -123,19 +155,46 @@ def build(recipe, payload, cache, upstream):
         build_info.write_text(original.replace(marker, marker + '\n'
             '# ElastOS removes private build roots from informational compiler flags.\n'
             '$cflags =~ s/\\Q$ENV{ELASTOS_BROWSER_BUILD_ROOT}\\E/\\/usr\\/src\\/elastos-browser/g;'))
+        # coturn adds -I${PREFIX}/include/ and -I/usr/local/include/; with
+        # --prefix=/usr that is the host libc's include root. The staged
+        # OpenSSL and libevent headers already come from CPPFLAGS.
+        makefile = turn / 'Makefile.in'
+        original = makefile.read_text()
+        marker = 'LIBEVENT_INCLUDE = -I${PREFIX}/include/ -I/usr/local/include/\n'
+        if original.count(marker) != 1:
+            raise ValueError('pinned coturn include-path marker changed')
+        makefile.write_text(original.replace(marker, 'LIBEVENT_INCLUDE =\n'))
         def run(args, cwd):
             subprocess.run(args, cwd=cwd, env=env, check=True)
+        def pkg_config(*args):
+            return subprocess.run(['pkg-config', *args], env=env, check=True,
+                                  capture_output=True, text=True).stdout.strip()
         target = {'darwin-arm64': 'darwin64-arm64-cc', 'linux-arm64': 'linux-aarch64',
                   'linux-amd64': 'linux-x86_64'}[native]
+        # coturn links only libssl/libcrypto. Without the openssl program, no
+        # dynamic musl link runs before LDFLAGS gains -static below.
         run(['perl', './Configure', target, '--prefix=/usr', '--libdir=lib', '--openssldir=/etc/ssl',
-             'no-shared', 'no-module', 'no-async', 'no-tests', 'no-zlib'], openssl)
+             'no-shared', 'no-module', 'no-async', 'no-tests', 'no-zlib', 'no-apps'], openssl)
         run(['make', '-j' + jobs], openssl)
         run(['make', 'install_sw', 'DESTDIR=' + str(work / 'static')], openssl)
+        if native.startswith('linux'):
+            # OpenSSL's Configure reads -static in LDFLAGS as no-threads, which
+            # drops OPENSSL_THREADS and coturn's THREAD_setup. Link statically after.
+            env['LDFLAGS'] += ' -static'
         run(['./autogen.sh'], event)
         run(['./configure', '--prefix=/usr', '--disable-shared', '--enable-static',
              '--enable-openssl', '--disable-samples', '--disable-libevent-regress'], event)
         run(['make', '-j' + jobs], event)
         run(['make', 'install', 'DESTDIR=' + str(work / 'static')], event)
+        # coturn's own probe links -lcrypto -lssl before libevent_openssl. A
+        # static link resolves archives in order, so give configure libevent's
+        # static closure followed by OpenSSL's (the order GNU ld needs).
+        event_packages = ('libevent_core', 'libevent_extra', 'libevent_openssl', 'libevent_pthreads')
+        env['EVENT_CFLAGS'] = pkg_config('--cflags', *event_packages)
+        env['EVENT_LIBS'] = (pkg_config('--static', '--libs', *event_packages) + ' '
+                             + pkg_config('--static', '--libs', 'libssl', 'libcrypto'))
+        if not env['EVENT_CFLAGS'] or not {'-levent_openssl', '-lssl', '-lcrypto'} <= set(env['EVENT_LIBS'].split()):
+            raise ValueError('staged libevent and OpenSSL pkg-config metadata is missing')
         run(['./configure', '--prefix=/usr', '--disable-shared',
              '--disable-sqlite', '--disable-mysql', '--disable-redis', '--disable-postgresql',
              '--disable-mongodb', '--disable-prometheus'], turn)
@@ -165,6 +224,8 @@ def build(recipe, payload, cache, upstream):
             archive.addfile(member, io.BytesIO(data))
             for root, path in inputs:
                 archive.add(path, arcname=recipe['root'] + '/sources/' + root + '.tar.gz')
+            if uapi is not None:
+                retain_linux_uapi(archive, recipe['root'], uapi)
         os.link(staged, output)
         return output
 
@@ -268,8 +329,10 @@ def build_browser_native(recipe, payload, cache, upstream):
         for key in ('CPATH', 'LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'LD_LIBRARY_PATH', 'LD_PRELOAD'):
             env.pop(key, None)
         jobs = str(min(os.cpu_count() or 2, 4))
+        uapi = None
         if native.startswith('linux'):
             env.update(CC='musl-gcc', CXX='musl-g++', LDFLAGS='-static')
+            uapi = linux_uapi_headers(work, env)
         binaries = {}
         if recipe['component'] == 'debugfs':
             subprocess.run(['./configure', '--disable-nls', '--disable-elf-shlibs',
@@ -293,25 +356,13 @@ def build_browser_native(recipe, payload, cache, upstream):
             if shutil.which('compile_seccomp_policy', path=env.get('PATH')):
                 raise ValueError('crosvm build PATH must leave seccomp compilation to pinned Minijail')
             env['CROSS_COMPILE'] = ''
-            # Keep musl's standard headers first. Supply only Linux UAPI from
-            # the native build toolchain, without adding glibc's include root.
-            headers = Path(env.pop('ELASTOS_BROWSER_LINUX_UAPI_INCLUDE', '/usr/include'))
-            uapi = work / 'linux-uapi'
-            for name in ('linux', 'asm-generic', 'asm'):
-                origin = headers / name
-                if name == 'asm' and not origin.is_dir():
-                    origin = headers / 'aarch64-linux-gnu/asm'
-                if not origin.is_dir():
-                    raise ValueError('crosvm build needs Linux UAPI headers: ' + name)
-                shutil.copytree(origin, uapi / name)
             libcap = extract(inputs[2][1], inputs[2][0], work / 'dependencies', upstream)
             subprocess.run(['make', '-C', str(libcap / 'libcap'), '-j' + jobs, 'libcap.a',
                             'CC=' + env['CC'], 'BUILD_CC=cc', 'SHARED=no', 'GOLANG=no',
                             'PAM_CAP=no', 'USE_GPERF=no', 'CFLAGS=' + env['CFLAGS'] + ' -fPIC'],
                            env=env, check=True)
             env.update(MINIJAIL_DIR=str(destination),
-                       CPPFLAGS='-I' + str(libcap / 'libcap/include') + ' -I' + str(libcap / 'libcap/include/uapi')
-                                + ' -idirafter ' + str(uapi),
+                       CPPFLAGS='-I' + str(libcap / 'libcap/include') + ' -I' + str(libcap / 'libcap/include/uapi'),
                        LDFLAGS='-L' + str(libcap / 'libcap'))
             env['BINDGEN_EXTRA_CLANG_ARGS'] = env['CPPFLAGS']
             env['MINIJAIL_BINDGEN_TARGET'] = 'aarch64-unknown-linux-musl'
@@ -348,18 +399,20 @@ def build_browser_native(recipe, payload, cache, upstream):
             binaries['crosvm'] = source / 'target' / target / 'release/crosvm'
         audit_records = []
         for name, binary in binaries.items():
-            upstream.regular(binary)
-            if str(work).encode() in binary.read_bytes():
-                raise ValueError('Browser binary contains its private build path: ' + name)
-            result = subprocess.run(['otool', '-L', str(binary)] if native.startswith('darwin')
-                                    else ['ldd', str(binary)], capture_output=True, text=True)
-            audit_libraries(result.stdout + result.stderr, native.startswith('darwin'))
-            audit_records.append((result.stdout + result.stderr).replace(str(binary), name))
+            # Cargo hard-links release outputs into deps/. Audit and ship an
+            # independent copy (a symlink stays a symlink and is refused).
             relocated = work / 'relocated/bin' / name
             relocated.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(binary, relocated)
-            # debugfs -V reports version; crosvm supports --version.
-            check = subprocess.run([str(relocated), '--version' if name == 'crosvm' else '-V'],
+            shutil.copy2(binary, relocated, follow_symlinks=False)
+            upstream.regular(relocated)
+            if str(work).encode() in relocated.read_bytes():
+                raise ValueError('Browser binary contains its private build path: ' + name)
+            result = subprocess.run(['otool', '-L', str(relocated)] if native.startswith('darwin')
+                                    else ['ldd', str(relocated)], capture_output=True, text=True)
+            audit_libraries(result.stdout + result.stderr, native.startswith('darwin'))
+            audit_records.append((result.stdout + result.stderr).replace(str(relocated), name))
+            # debugfs -V reports its version; crosvm has a `version` subcommand.
+            check = subprocess.run([str(relocated), 'version' if name == 'crosvm' else '-V'],
                                    env=env, capture_output=True, text=True)
             accepted = (0,) if name == 'crosvm' else (0, 1)
             if check.returncode not in accepted or not (check.stdout + check.stderr).strip():
@@ -370,9 +423,6 @@ def build_browser_native(recipe, payload, cache, upstream):
             vendor_sources = work / 'cargo-vendor.tar.gz'
             with tarfile.open(vendor_sources, 'x:gz', format=tarfile.GNU_FORMAT) as archive:
                 archive.add(source / 'registry-vendor', arcname='registry-vendor', filter=source_header)
-            header_sources = work / 'linux-uapi.tar.gz'
-            with tarfile.open(header_sources, 'x:gz', format=tarfile.GNU_FORMAT) as archive:
-                archive.add(uapi, arcname='linux-uapi', filter=source_header)
         with tarfile.open(staged, 'x:gz', format=tarfile.GNU_FORMAT) as archive:
             for name in binaries:
                 archive.add(work / 'relocated/bin' / name, arcname=recipe['root'] + '/bin/' + name)
@@ -382,9 +432,10 @@ def build_browser_native(recipe, payload, cache, upstream):
             archive.addfile(member, io.BytesIO(data))
             for root, path in inputs:
                 archive.add(path, arcname=recipe['root'] + '/sources/' + root + '.tar.gz')
+            if uapi is not None:
+                retain_linux_uapi(archive, recipe['root'], uapi)
             if recipe['component'] == 'crosvm':
                 archive.add(vendor_sources, arcname=recipe['root'] + '/sources/cargo-vendor.tar.gz')
-                archive.add(header_sources, arcname=recipe['root'] + '/sources/linux-uapi.tar.gz')
                 archive.add(source / 'Cargo.lock', arcname=recipe['root'] + '/sources/Cargo.lock')
         os.link(staged, output)
         return output

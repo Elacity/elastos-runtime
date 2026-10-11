@@ -1492,7 +1492,7 @@ mod tests {
         write_test_browser_capsule(data_dir.path(), "browser", "Browser", "app");
         for (platform, listed) in [
             ("linux-amd64", false),
-            ("linux-arm64", true),
+            ("linux-arm64", false),
             ("darwin-arm64", true),
         ] {
             let names: Vec<_> = list_launchable_browser_capsules_for(data_dir.path(), platform)

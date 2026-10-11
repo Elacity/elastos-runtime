@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod browser_config;
-pub(crate) use browser_config::browser_available;
+pub use browser_config::browser_available;
 mod browser_vm_image;
 #[cfg(unix)]
 mod local_model_engine_receipt;

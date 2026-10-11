@@ -23,16 +23,12 @@ Test-channel release. Signed releases show these notes in System before you upda
   sign-in screen, run the command it shows on the computer that runs Home
   (`elastos identity arm-owner-recovery --origin … --rp-id …` with that page's
   address filled in), then enter the code the command prints.
-- Browser installs and runs on Apple Silicon Macs and on Linux ARM64 computers
-  such as a Jetson. On Linux it needs a one-time host setup, which the
-  installer offers.
+- Browser installs and runs on Apple Silicon Macs; on other computers,
+  including Linux ARM64 (Jetson) and Linux x86-64, it is hidden until the next
+  release.
 
 ### Changed
 
-- Browser is hidden on computers without a local Engine (anything other than
-  an Apple Silicon Mac or a Linux ARM64 computer such as a Jetson) for now.
-- On Linux, Browser asks you once to run its one-time host setup again after
-  this update. Run the command it shows; Browser then works as before.
 - Setup installs one Home; it no longer prints options for other setups.
 - The terminal Home no longer offers the old native Chat, which used a
   different network from the Chat on the Desktop.
@@ -464,10 +460,13 @@ Test-channel release. Signed releases show these notes in System before you upda
   and removes the rest, so an image update or Undo never boots the previous
   rootfs with the new kernel; a refill that sees the image change discards its
   copy (#307).
-- `elastos setup` on Linux writes a per-Home TURN credential to the owner-only
-  `runtime-turn/turn-credentials.env` (kept on later runs), so a fresh
-  Linux/Jetson Home gets the session-local TURN configuration the crosvm
-  launcher requires (#307).
+- Linux Browser support (per-Home TURN credential in the owner-only
+  `runtime-turn/turn-credentials.env`, crosvm launcher, network setup) stays in
+  the code, but setup selects Browser only on `darwin-arm64`. Elsewhere the
+  capsule catalog omits Browser, Runtime starts no Browser helpers, and setup
+  resets the Engine selection to empty and removes the release-owned Browser
+  host files and image an earlier release installed (profiles under `Users/`
+  stay), so the installer's later Linux host step never asks for sudo (#307).
 - Browser TURN relays only to its own relay address on both hosts: coturn
   denies loopback, private ranges and every other peer. On Mac, a loopback relay
   keeps loopback peers, and the media bridge closes any guest TURN stream that

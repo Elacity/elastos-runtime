@@ -1453,6 +1453,44 @@ finish_install
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(calls.read_text().splitlines(), ['SETUP:setup', 'HOST_READY', 'SETUP:setup', 'HOME_READY'])
 
+    def test_rerun_with_retained_linux_helper_never_asks_for_sudo_after_setup_retires_it(self):
+        # An earlier release left the helper and its check now fails. Setup runs
+        # first and, where Browser is unavailable, removes the helper, so the
+        # host step that follows finds nothing to set up.
+        function = SOURCE.split("prepare_browser_linux_host() {", 1)[1].split("\nfinish_install()", 1)[0]
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / 'data/scripts').mkdir(parents=True)
+            helper = root / 'data/scripts/browser-vm-linux-network.py'
+            device, terminal = root / 'kvm', root / 'terminal'
+            device.touch(); terminal.touch()
+            runtime = root / 'elastos'
+            runtime.write_text("#!/bin/bash\n" +
+                               'printf "SETUP:%s\\n" "$*" >> "$CALLS"\n' +
+                               '[[ "$1" != setup || "$RETIRES" != yes ]] || rm -f "$HELPER"\n')
+            runtime.chmod(0o755)
+            function = "prepare_browser_linux_host() {" + function
+            function = function.replace('/dev/kvm', str(device)).replace('/dev/tty', str(terminal))
+            function = function.replace('/usr/bin/python3', 'fixture_python')
+            script = function + """
+INSTALL_DIR="$1" INSTALL_ONLY=false DATA_DIR="$1/data"
+export CALLS="$1/calls" HELPER="$1/data/scripts/browser-vm-linux-network.py" RETIRES="$2"
+uname() { printf 'Linux\\n'; }
+fixture_python() { return 1; }
+sudo() { printf 'ROOT_STEP:%s\\n' "$*" >> "$CALLS"; return 1; }
+show_ready() { printf 'HOME_READY\\n' >> "$CALLS"; }
+finish_install </dev/null
+"""
+            for retires in ['yes', 'no']:
+                helper.write_text('retained helper from an earlier release')
+                (root / 'calls').unlink(missing_ok=True)
+                result = shell(script, root, retires)
+                calls = (root / 'calls').read_text().splitlines()
+                with self.subTest(retires=retires):
+                    self.assertEqual(calls[0], 'SETUP:setup', result.stderr)
+                    # The control case shows the step would prompt if the helper stayed.
+                    self.assertEqual(any(c.startswith('ROOT_STEP:') for c in calls), retires == 'no')
+
     def test_three_platform_release_keys(self):
         for system, machine, expected in [("Linux", "x86_64", "x86_64-linux"),
                                           ("Linux", "aarch64", "aarch64-linux"),

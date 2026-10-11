@@ -1220,7 +1220,14 @@ async fn setup_server_infrastructure_impl(
         Err(e) => tracing::warn!("Skipping net-provider due to verification failure: {}", e),
     }
 
-    if let Some(local_exit_config) = browser_local_exit_config_from_env(&data_dir) {
+    // Retained Browser helpers from an earlier release stay stopped where
+    // Browser is unavailable.
+    let browser_available =
+        elastos_server::setup::browser_available(&elastos_server::setup::detect_platform());
+    if let Some(local_exit_config) = browser_available
+        .then(|| browser_local_exit_config_from_env(&data_dir))
+        .flatten()
+    {
         if let Some(path) = crate::find_installed_provider_binary("browser-local-exit") {
             if let Err(e) = verify_provider_binary("browser-local-exit", &path) {
                 tracing::warn!(
@@ -1272,7 +1279,12 @@ async fn setup_server_infrastructure_impl(
         Err(e) => tracing::warn!("Skipping exit-provider due to verification failure: {}", e),
     }
 
-    match binaries::resolve_verified_native_provider_binary("browser-engine-adapter") {
+    let browser_engine_adapter = if browser_available {
+        binaries::resolve_verified_native_provider_binary("browser-engine-adapter")
+    } else {
+        Ok(None)
+    };
+    match browser_engine_adapter {
         Ok(Some(path)) => {
             let browser_engine_config = provider::BridgeProviderConfig {
                 extra: browser_engine_adapter_config_from_env(&data_dir)

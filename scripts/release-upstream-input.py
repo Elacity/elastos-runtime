@@ -38,7 +38,10 @@ def canonical(value):
 
 
 def relative(value, *, source_archive=False):
-    pattern = r"[.A-Za-z0-9_@][A-Za-z0-9._+@-]*" if source_archive else r"[A-Za-z0-9][A-Za-z0-9._+-]*"
+    # source_archive="build": a pinned source tree extracted privately for a
+    # build and never installed; upstream test fixtures there use inner spaces.
+    pattern = {False: r"[A-Za-z0-9][A-Za-z0-9._+-]*", True: r"[.A-Za-z0-9_@][A-Za-z0-9._+@-]*",
+               "build": r"[.A-Za-z0-9_@](?:[A-Za-z0-9._+@ -]*[A-Za-z0-9._+@-])?"}[source_archive]
     if (not isinstance(value, str) or len(value) > 240 or "\\" in value
             or PurePosixPath(value).is_absolute()
             or any(not re.fullmatch(pattern, part)

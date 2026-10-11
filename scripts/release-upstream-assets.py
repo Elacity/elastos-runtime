@@ -6,6 +6,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 
@@ -82,7 +83,14 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--llama-arm64-bundle", type=Path)
     args = parser.parse_args()
-    print(json.dumps(prepare(args.platform, args.cache, args.output, args.llama_arm64_bundle)))
+    # The caller captures stdout as JSON. Source builds (configure, make) inherit
+    # file descriptors, so point fd 1 at stderr while building and write the
+    # result to the saved original stdout.
+    result_stream = os.fdopen(os.dup(1), "w")
+    os.dup2(2, 1)
+    result = prepare(args.platform, args.cache, args.output, args.llama_arm64_bundle)
+    print(json.dumps(result), file=result_stream)
+    result_stream.close()
 
 
 if __name__ == "__main__":

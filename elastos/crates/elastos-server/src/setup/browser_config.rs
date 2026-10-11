@@ -108,9 +108,10 @@ fn read_engine_selection(
     }
 }
 
-/// Browser runs only on hosts with a local Engine.
-pub(crate) fn browser_available(platform: &str) -> bool {
-    matches!(platform, "darwin-arm64" | "linux-arm64")
+/// Browser runs only on hosts with a local Engine. Linux hosts keep their
+/// Engine machinery but stay hidden until their Browser path is released.
+pub fn browser_available(platform: &str) -> bool {
+    platform == "darwin-arm64"
 }
 
 fn local_vm_selected_with_override(
@@ -196,6 +197,9 @@ pub(super) async fn prepare_home(
     browser_selected: bool,
 ) {
     let result: anyhow::Result<()> = async {
+        if !browser_available(platform) {
+            return retire_host(data, manifest);
+        }
         if browser_selected && manifest.profiles.contains_key("browser-host") {
             println!("Preparing Browser Engine helpers...");
             ensure_host_components(
@@ -234,6 +238,90 @@ pub(super) async fn prepare_home(
     if let Err(error) = result {
         println!("Browser preparation is incomplete: {error}. Home setup continues. Repair Browser with elastos setup, or select another approved Engine.");
     }
+}
+
+/// A host without Browser keeps no Engine selection and none of the
+/// release-owned Browser host files an earlier release installed, so neither
+/// Runtime nor the installer's Linux host step acts on them. Browser profiles
+/// under `Users/` belong to their owner and stay.
+fn retire_host(data: &Path, manifest: &super::ComponentsManifest) -> anyhow::Result<()> {
+    let browser_installed = data.join("capsules/browser").is_dir();
+    let selection = data.join("config/browser-engine-adapter.json");
+    if browser_installed || selection.symlink_metadata().is_ok() {
+        fs::create_dir_all(data.join("config"))?;
+        super::atomic_write_file(&selection, b"{\"adapters\": []}\n")?;
+    }
+    // Exact release paths, relative to the data directory.
+    let mut paths = vec![PathBuf::from(super::browser_vm_image::INSTALL_PATH)];
+    if let Some(profile) = manifest.profiles.get("browser-host") {
+        for name in &profile.components {
+            let shared = manifest
+                .profiles
+                .iter()
+                .any(|(other, value)| other != "browser-host" && value.components.contains(name));
+            let Some(component) = manifest.external.get(name).filter(|_| !shared) else {
+                continue;
+            };
+            // Every platform's path: an earlier release may have used another.
+            for info in component.platforms.values() {
+                if let Some(relative) = super::resolve_install_path(component, Some(info)) {
+                    crate::install_transaction::validate_support_path(Path::new(relative))?;
+                    paths.push(PathBuf::from(relative));
+                }
+                if info.binary_path.is_some() {
+                    paths.push(Path::new("bin").join(name));
+                }
+            }
+        }
+    }
+    let mut removed = false;
+    for relative in paths {
+        if !parents_are_real_directories(data, &relative) {
+            println!(
+                "Kept {}: a folder on its path is a link, so removing it could reach files outside the data directory.",
+                relative.display()
+            );
+            continue;
+        }
+        let path = data.join(&relative);
+        // A link is removed itself; its target is never followed.
+        match path.symlink_metadata() {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path)?,
+            Ok(_) => fs::remove_file(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
+        removed = true;
+    }
+    if removed {
+        println!("Removed the Browser host files an earlier release installed.");
+    }
+    if browser_installed {
+        println!("Browser is not available on this computer yet.");
+    }
+    Ok(())
+}
+
+/// True when the data directory and every folder from it down to `relative`'s
+/// parent are real directories, so a removal stays inside the data directory.
+fn parents_are_real_directories(data: &Path, relative: &Path) -> bool {
+    if !data.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+        return false;
+    }
+    let mut current = data.to_path_buf();
+    for component in relative.parent().into_iter().flat_map(Path::components) {
+        let std::path::Component::Normal(part) = component else {
+            return false;
+        };
+        current.push(part);
+        match current.symlink_metadata() {
+            Ok(meta) if meta.is_dir() => {}
+            // A missing folder holds nothing to remove.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            _ => return false,
+        }
+    }
+    true
 }
 
 pub(super) fn configure(data: &Path, platform: &str, release_image: bool) -> anyhow::Result<()> {
@@ -468,7 +556,7 @@ mod tests {
             r#"{"external":{},"profiles":{}}"#,
         )
         .unwrap();
-        prepare_home(data, &manifest, "linux-arm64", true).await;
+        prepare_home(data, &manifest, "darwin-arm64", true).await;
         assert_eq!(fs::read(data.join("profile.ext4")).unwrap(), b"owner state");
         assert_eq!(
             fs::read(data.join("config/browser-engine-adapter.json")).unwrap(),
@@ -491,7 +579,8 @@ mod tests {
                     .all(|name| name == "crosvm" || !names.contains(name)));
             }
         }
-        for platform in ["darwin-arm64", "linux-arm64"] {
+        let platform = "darwin-arm64";
+        {
             let temp = tempfile::tempdir().unwrap();
             let data = temp.path();
             fs::create_dir_all(data.join("capsules/browser")).unwrap();
@@ -640,20 +729,147 @@ mod tests {
         assert!(!temp.path().join("bin").exists());
     }
 
-    #[test]
-    fn x86_setup_prepares_remote_viewer_without_host_helpers() {
+    #[tokio::test]
+    async fn linux_setup_installs_no_browser_host_helpers_or_image() {
+        let manifest: super::super::ComponentsManifest =
+            serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
+        assert!(manifest.profiles["browser-host"]
+            .components
+            .iter()
+            .any(|name| name == "browser-vm-linux-network"));
+        for platform in ["linux-arm64", "linux-amd64"] {
+            assert!(!browser_available(platform));
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path();
+            fs::create_dir_all(data.join("capsules/browser")).unwrap();
+            prepare_home(data, &manifest, platform, true).await;
+            assert!(!local_vm_selected(data, platform).unwrap());
+            // install.sh asks for sudo only when this helper exists.
+            assert!(!data.join("scripts/browser-vm-linux-network.py").exists());
+            assert!(!data.join("scripts").exists());
+            assert!(!data.join("bin").exists());
+            assert!(!data.join("browser-vm").exists());
+            let config: Value = serde_json::from_slice(
+                &fs::read(data.join("config/browser-engine-adapter.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(config["adapters"], serde_json::json!([]));
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_setup_removes_browser_host_files_an_earlier_release_installed() {
+        use std::os::unix::fs::symlink;
+        let mut manifest: super::super::ComponentsManifest =
+            serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
+        // A component another profile also lists keeps its files.
+        manifest.profiles.insert(
+            "other".into(),
+            super::super::Profile {
+                description: None,
+                components: vec!["browser-vm-artifact-preflight".into()],
+            },
+        );
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path();
-        fs::create_dir_all(data.join("capsules/browser")).unwrap();
-        configure(data, "linux-amd64", true).unwrap();
-        assert!(!local_vm_selected(data, "linux-amd64").unwrap());
-        let config: Value = serde_json::from_slice(
-            &fs::read(data.join("config/browser-engine-adapter.json")).unwrap(),
+        let crosvm = "libexec/browser/crosvm/0.1.0-2ac141082d17/linux-arm64";
+        let removed = [
+            "scripts/browser-vm-linux-network.py",
+            "bin/browser-vm-control-service",
+            "bin/browser-vm-control-service.mjs",
+            "bin/browser-vm-local-crosvm-launcher",
+            "browser-vm/image-set/rootfs.ext4",
+            "libexec/browser/crosvm/0.1.0-2ac141082d17/linux-arm64/bin/crosvm",
+        ];
+        let kept = [
+            "Users/owner/BrowserProfiles/default/profile.ext4",
+            "bin/browser-engine-adapter",
+            "bin/elastos-unrelated",
+            "scripts/unrelated.sh",
+            "capsules/browser/capsule.json",
+            "scripts/browser-vm-artifact-preflight.sh",
+            // Only exact component paths go; a matching name alone does not.
+            "scripts/browser-vm-retired-by-an-earlier-release.mjs",
+        ];
+        for name in removed.iter().chain(&kept) {
+            let path = data.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, name.as_bytes()).unwrap();
+        }
+        symlink(
+            data.join(crosvm).join("bin/crosvm"),
+            data.join("bin/crosvm"),
         )
         .unwrap();
+        fs::create_dir_all(data.join("config")).unwrap();
+        let selection = data.join("config/browser-engine-adapter.json");
+        fs::write(
+            &selection,
+            r#"{"adapters":[{"kind":"chromium_microvm","supervisor":{"program":"/vm/local"}}]}"#,
+        )
+        .unwrap();
+        prepare_home(data, &manifest, "linux-arm64", true).await;
+        for name in removed {
+            assert!(!data.join(name).exists(), "{name}");
+        }
+        assert!(data.join("bin/crosvm").symlink_metadata().is_err());
+        assert!(!data.join(crosvm).exists());
+        assert!(!data.join("browser-vm/image-set").exists());
+        for name in kept {
+            assert_eq!(
+                fs::read(data.join(name)).unwrap(),
+                name.as_bytes(),
+                "{name}"
+            );
+        }
+        let config: Value = serde_json::from_slice(&fs::read(&selection).unwrap()).unwrap();
         assert_eq!(config["adapters"], serde_json::json!([]));
-        assert!(crate::carrier::browser_engine_media::configuration_ready(data).is_ok());
-        assert!(!data.join("bin").exists());
+    }
+
+    #[tokio::test]
+    async fn linux_setup_never_removes_through_a_linked_folder() {
+        use std::os::unix::fs::symlink;
+        let manifest: super::super::ComponentsManifest =
+            serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (data, outside) = (temp.path().join("elastos"), temp.path().join("outside"));
+        let kept = [
+            data.join("Users/owner/image-set/profile.ext4"),
+            outside.join("browser-vm-control-service"),
+            outside.join("crosvm"),
+        ];
+        for path in &kept {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"owner data").unwrap();
+        }
+        symlink(data.join("Users/owner"), data.join("browser-vm")).unwrap();
+        symlink(&outside, data.join("bin")).unwrap();
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(data.join("scripts/browser-vm-linux-network.py"), b"helper").unwrap();
+        prepare_home(&data, &manifest, "linux-arm64", true).await;
+        for path in &kept {
+            assert_eq!(fs::read(path).unwrap(), b"owner data", "{}", path.display());
+        }
+        assert!(data.join("bin").symlink_metadata().unwrap().is_symlink());
+        assert!(data
+            .join("browser-vm")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink());
+        // Paths under real folders are still removed.
+        assert!(!data.join("scripts/browser-vm-linux-network.py").exists());
+    }
+
+    #[test]
+    fn removal_never_goes_through_a_linked_data_directory() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let (real, linked) = (temp.path().join("real"), temp.path().join("elastos"));
+        fs::create_dir_all(real.join("browser-vm")).unwrap();
+        symlink(&real, &linked).unwrap();
+        let relative = Path::new("browser-vm/image-set");
+        assert!(parents_are_real_directories(&real, relative));
+        assert!(!parents_are_real_directories(&linked, relative));
     }
 
     #[test]
@@ -665,16 +881,19 @@ mod tests {
         fs::create_dir_all(data.join("config")).unwrap();
         let file = data.join("config/browser-engine-adapter.json");
         fs::write(&file, local).unwrap();
-        assert!(local_vm_selected_with_override(data, "linux-arm64", None).unwrap());
+        assert!(local_vm_selected_with_override(data, "darwin-arm64", None).unwrap());
+        for platform in ["linux-arm64", "linux-amd64"] {
+            assert!(!local_vm_selected_with_override(data, platform, None).unwrap());
+            assert!(!local_vm_selected_with_override(data, platform, Some(local)).unwrap());
+        }
         for inline in [
             r#"{"adapters":[]}"#,
             r#"{"adapters":[{"kind":"chromium_microvm","supervisor":{"program":"/vm/browser-vm-remote-vz-launcher"}}]}"#,
         ] {
-            assert!(!local_vm_selected_with_override(data, "linux-arm64", Some(inline)).unwrap());
             assert!(!local_vm_selected_with_override(data, "darwin-arm64", Some(inline)).unwrap());
         }
-        assert!(local_vm_selected_with_override(data, "linux-arm64", Some(local)).unwrap());
-        assert!(local_vm_selected_with_override(data, "linux-arm64", Some("invalid")).is_err());
+        assert!(local_vm_selected_with_override(data, "darwin-arm64", Some(local)).unwrap());
+        assert!(local_vm_selected_with_override(data, "darwin-arm64", Some("invalid")).is_err());
         assert_eq!(fs::read_to_string(file).unwrap(), local);
     }
 
