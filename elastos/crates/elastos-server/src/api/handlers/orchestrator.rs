@@ -1,7 +1,7 @@
 //! Orchestrator endpoints — shell-only operations for runtime coordination.
 //!
-//! Allows a second CLI process (e.g. `elastos agent`) to mint a fresh capsule
-//! session on an already-running runtime (e.g. started by `elastos chat`).
+//! Allows a second CLI process (e.g. `elastos run`) to mint a fresh capsule
+//! session on an already-running runtime.
 
 use std::sync::Arc;
 

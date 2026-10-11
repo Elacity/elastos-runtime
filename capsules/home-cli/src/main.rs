@@ -52,9 +52,6 @@ struct HomeSnapshot {
     runtime: RuntimeStatus,
     #[serde(default)]
     services: Option<serde_json::Value>,
-    site: SiteStatus,
-    #[serde(default)]
-    shares: ShareStatus,
     #[serde(default)]
     room: RoomStatus,
     #[serde(default)]
@@ -112,28 +109,6 @@ struct HomeTargetStatus {
     viewer: Option<String>,
     #[serde(default)]
     viewer_title: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-struct ShareStatus {
-    #[serde(default)]
-    channel_count: usize,
-    #[serde(default)]
-    active_count: usize,
-    #[serde(default)]
-    author_did: Option<String>,
-    #[serde(default)]
-    channels: Vec<ShareChannelStatus>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ShareChannelStatus {
-    name: String,
-    latest_cid: String,
-    latest_version: u64,
-    status: String,
-    #[serde(default)]
-    head_cid: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -220,7 +195,7 @@ struct PeopleContactStatus {
     #[serde(default)]
     relationship: String,
     #[serde(default)]
-    route: String,
+    conversation_id: Option<String>,
     #[serde(default)]
     can_message: bool,
     #[serde(default)]
@@ -286,21 +261,6 @@ struct RuntimeStatus {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct SiteStatus {
-    staged: bool,
-    #[serde(default)]
-    local_url: Option<String>,
-    #[serde(default)]
-    active_release: Option<String>,
-    #[serde(default)]
-    active_channel: Option<String>,
-    #[serde(default)]
-    active_bundle_cid: Option<String>,
-    #[serde(default)]
-    release_count: usize,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct RootStatus {
     name: String,
     #[serde(default)]
@@ -349,7 +309,7 @@ enum Tab {
 }
 
 const DEFAULT_TABS: &[Tab] = &[Tab::Home, Tab::Inbox, Tab::People, Tab::Apps, Tab::System];
-const HOME_ACTION_IDS: &[&str] = &["chat", "room-approve", "room-deny", "room-revoke-all"];
+const HOME_ACTION_IDS: &[&str] = &["room-approve", "room-deny", "room-revoke-all"];
 
 #[derive(Debug, Clone)]
 struct TuiState {
@@ -438,7 +398,7 @@ struct ControlSpec {
 
 const HELP_TAB_COMMANDS: &[&str] = &["home", "inbox", "people", "apps", "system"];
 const HELP_CONTROL_COMMANDS: &[&str] = &["refresh", "help", "exit"];
-const HELP_ADVANCED_COMMANDS: &[&str] = &["mywebsite", "wallet", "exits", "invoke"];
+const HELP_ADVANCED_COMMANDS: &[&str] = &["wallet", "exits", "invoke"];
 const HELP_DEBUG_COMMANDS: &[&str] = &["debug"];
 
 include!("runtime_io.rs");

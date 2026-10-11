@@ -413,12 +413,22 @@ fn home_document_origin(headers: &axum::http::HeaderMap) -> Option<String> {
 }
 
 pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<LaunchableBrowserCapsule> {
+    list_launchable_browser_capsules_for(data_dir, &crate::setup::detect_platform())
+}
+
+fn list_launchable_browser_capsules_for(
+    data_dir: &Path,
+    platform: &str,
+) -> Vec<LaunchableBrowserCapsule> {
     let mut capsules = BTreeMap::new();
     for manifest in list_active_capsule_manifests(data_dir) {
         if !manifest.role.is_shell_launchable() {
             continue;
         }
         if ensure_wallet_connector_configured(data_dir, &manifest.name).is_err() {
+            continue;
+        }
+        if manifest.name == "browser" && !crate::setup::browser_available(platform) {
             continue;
         }
         let Ok(capsule) = resolve_browser_capsule(data_dir, &manifest.name) else {
@@ -1474,6 +1484,23 @@ mod tests {
         assert!(!list_launchable_browser_capsules(data_dir.path())
             .iter()
             .any(|capsule| capsule.name == WALLET_WALLETCONNECT_CAPSULE_ID));
+    }
+
+    #[test]
+    fn browser_is_launchable_only_on_hosts_with_a_local_engine() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(data_dir.path(), "browser", "Browser", "app");
+        for (platform, listed) in [
+            ("linux-amd64", false),
+            ("linux-arm64", true),
+            ("darwin-arm64", true),
+        ] {
+            let names: Vec<_> = list_launchable_browser_capsules_for(data_dir.path(), platform)
+                .into_iter()
+                .map(|capsule| capsule.name)
+                .collect();
+            assert_eq!(names.contains(&"browser".to_string()), listed, "{platform}");
+        }
     }
 
     #[test]

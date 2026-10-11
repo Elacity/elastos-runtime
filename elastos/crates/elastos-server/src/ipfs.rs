@@ -541,8 +541,8 @@ pub async fn publish_microvm_capsule(
         println!("Kernel CID:  {}", k);
     }
     println!();
-    println!("Run with:");
-    println!("  sudo elastos serve --cid {} --forward 4100:4100", cid);
+    println!("Run with (while `elastos serve` is running):");
+    println!("  elastos run --cid {}", cid);
     println!();
     println!(
         "Note: First run will download the rootfs ({} MB) from IPFS.",

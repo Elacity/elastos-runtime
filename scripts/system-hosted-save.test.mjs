@@ -638,14 +638,24 @@ test("System cancellation explains the unchanged Home and keeps private errors o
   assert(!f.status.textContent.includes("private"));
 });
 
-test("System reports an unreachable update source before queueing and allows a new choice", async () => {
-  const f = updateFixture();
-  f.context.fetchJson = async () => { const error = new Error("private source endpoint"); error.status = 424; throw error; };
-  await f.context.onRuntimeUpdateApply();
-  assert.equal(f.status.textContent, "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again.");
-  assert.equal(f.context.runtimeUpdatePending, null);
-  assert.equal(f.button.disabled, false);
-  assert.equal(f.approvals.length, 1);
+test("System explains an unreachable source or another tab's update before queueing and allows a new choice", async () => {
+  for (const [status, text] of [
+    [424, "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again."],
+    [423, "Another update was started on this Home. Wait for it to finish, then check the update again."],
+    [410, "This approval is no longer valid. Check for the update again and approve it once more."],
+  ]) {
+    const f = updateFixture();
+    f.context.fetchJson = async (_url, init) => {
+      f.posts.push(init);
+      const error = new Error("private server detail"); error.status = status; throw error;
+    };
+    await f.context.onRuntimeUpdateApply();
+    assert.equal(f.status.textContent, text);
+    assert.equal(f.posts.length, 1, "a definite refusal is not resubmitted");
+    assert.equal(f.context.runtimeUpdatePending, null);
+    assert.equal(f.button.disabled, false);
+    assert.equal(f.approvals.length, 1);
+  }
 });
 
 test("a slow update keeps polling while Home reports the approved download", async () => {

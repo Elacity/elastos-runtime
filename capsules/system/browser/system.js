@@ -3917,6 +3917,10 @@ async function onRuntimeUpdateApply() {
         ? "You cancelled the update. Home is unchanged."
         : error.status === 424
           ? "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again."
+        : error.status === 423
+          ? "Another update was started on this Home. Wait for it to finish, then check the update again."
+        : error.status === 410
+          ? "This approval is no longer valid. Check for the update again and approve it once more."
         : error.status === 401 || error.status === 403
           ? "Sign in as the Home owner to start the update."
           : "The update could not start: the release was refused or verification failed. Select Update again.";

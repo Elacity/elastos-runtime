@@ -60,7 +60,7 @@ static HOME_TERMINAL_ARCHIVED_REPLAYS: OnceLock<StdMutex<HomeTerminalArchivedRep
 
 // Runtime owns this setting outside the app storage roots. The host CLI owns
 // changes to developer_mode; the gateway reads the value for each request.
-fn home_terminal_policy_allows(data_dir: &FsPath) -> bool {
+pub(super) fn home_terminal_policy_allows(data_dir: &FsPath) -> bool {
     let developer_mode = std::fs::read_to_string(data_dir.join("config.toml"))
         .ok()
         .and_then(|contents| contents.parse::<toml::Table>().ok())
@@ -147,7 +147,6 @@ pub(super) struct HomeTerminalHostIntentRequest {
     action_id: Option<String>,
     source: Option<String>,
     contact_id: Option<String>,
-    route: Option<String>,
     query: Option<serde_json::Value>,
 }
 
@@ -366,8 +365,6 @@ struct HomeTerminalAuthorizedIntent {
     source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     contact_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    route: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     query: Option<serde_json::Value>,
 }
@@ -1773,7 +1770,6 @@ fn authorize_home_terminal_host_intent(
             action_id,
             source: None,
             contact_id: None,
-            route: None,
             query: None,
         });
     }
@@ -1789,7 +1785,6 @@ fn authorize_home_terminal_host_intent(
             action_id,
             source: None,
             contact_id: None,
-            route: None,
             query: None,
         });
     }
@@ -1816,7 +1811,6 @@ fn authorize_home_terminal_host_intent(
             action_id,
             source: None,
             contact_id: None,
-            route: None,
             query: None,
         });
     }
@@ -1835,7 +1829,7 @@ fn authorize_home_terminal_host_intent(
         if intent.query.is_some() {
             return Err("terminal Inbox handoff query is not authorized");
         }
-        if intent.source.is_some() || intent.contact_id.is_some() || intent.route.is_some() {
+        if intent.source.is_some() || intent.contact_id.is_some() {
             return Err("terminal Inbox handoff has unsupported fields");
         }
         return Ok(HomeTerminalAuthorizedIntent {
@@ -1845,7 +1839,6 @@ fn authorize_home_terminal_host_intent(
             action_id,
             source: None,
             contact_id: None,
-            route: None,
             query: Some(serde_json::json!({
                 "notification_id": notification_id
             })),
@@ -1865,13 +1858,10 @@ fn authorize_home_terminal_host_intent(
         if contact_id != expected_contact_id {
             return Err("terminal people contact does not match action_id");
         }
-        let route = required_intent_text(intent.route.as_deref(), "terminal people route")?;
-        if terminal_host_intent_target_from_route(&route).as_deref() != Some(target.as_str()) {
-            return Err("terminal people route does not match target");
+        if !switch_shell_open_target || target != "chat-room" {
+            return Err("terminal people action must open Chat on the Desktop");
         }
-        if intent.query.is_some() {
-            return Err("terminal people query is not authorized");
-        }
+        let conversation_id = terminal_people_conversation_id(intent.query.as_ref())?;
         return Ok(HomeTerminalAuthorizedIntent {
             schema: HOME_TERMINAL_HOST_INTENT_SCHEMA,
             action,
@@ -1879,8 +1869,7 @@ fn authorize_home_terminal_host_intent(
             action_id,
             source,
             contact_id: Some(contact_id),
-            route: Some(route),
-            query: None,
+            query: Some(serde_json::json!({ "conversation_id": conversation_id })),
         });
     }
 
@@ -1901,14 +1890,27 @@ fn optional_intent_text(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn terminal_host_intent_target_from_route(route: &str) -> Option<String> {
-    let rest = route.trim().strip_prefix("/apps/")?;
-    let target = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
-    if target.is_empty() {
-        None
-    } else {
-        Some(target.to_string())
-    }
+/// The only query a People hand-off may carry: one bounded direct
+/// conversation id, the same `conversation_id` People sends to Chat.
+fn terminal_people_conversation_id(
+    query: Option<&serde_json::Value>,
+) -> Result<String, &'static str> {
+    let query = query
+        .and_then(serde_json::Value::as_object)
+        .filter(|query| query.len() == 1)
+        .ok_or("terminal people query must name only a conversation")?;
+    let conversation_id = query
+        .get("conversation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 256
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b":._-".contains(&byte))
+        })
+        .ok_or("terminal people conversation id is invalid")?;
+    Ok(conversation_id.to_string())
 }
 
 fn now_unix_ms() -> u64 {
@@ -2257,17 +2259,21 @@ mod tests {
         let people =
             authorize_home_terminal_host_intent(test_terminal_host_intent(serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "open-target",
+                "action": "switch-shell-open-target",
                 "action_id": "people-message:contact-alice",
                 "target": "chat-room",
                 "source": "people-contact",
                 "contact_id": "contact-alice",
-                "route": "/apps/chat-room/"
+                "query": { "conversation_id": "direct:sha256:abc" }
             })))
-            .expect("people contact route should be authorized");
+            .expect("people contact conversation should be authorized");
         assert_eq!(people.action_id, "people-message:contact-alice");
         assert_eq!(people.source.as_deref(), Some("people-contact"));
         assert_eq!(people.contact_id.as_deref(), Some("contact-alice"));
+        assert_eq!(
+            people.query,
+            Some(serde_json::json!({ "conversation_id": "direct:sha256:abc" }))
+        );
 
         let inbox =
             authorize_home_terminal_host_intent(test_terminal_host_intent(serde_json::json!({
@@ -2348,12 +2354,48 @@ mod tests {
             }),
             serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
-                "action": "switch-shell-open-target",
                 "action_id": "people-message:contact-alice",
-                "target": "wallet",
                 "source": "people-contact",
                 "contact_id": "contact-alice",
-                "route": "/apps/chat-room/"
+                "action": "switch-shell-open-target",
+                "target": "wallet",
+                "query": { "conversation_id": "direct:sha256:abc" }
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action_id": "people-message:contact-alice",
+                "source": "people-contact",
+                "contact_id": "contact-alice",
+                "action": "open-target",
+                "target": "chat-room",
+                "query": { "conversation_id": "direct:sha256:abc" }
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action_id": "people-message:contact-alice",
+                "source": "people-contact",
+                "contact_id": "contact-alice",
+                "action": "switch-shell-open-target",
+                "target": "chat-room",
+                "query": { "conversation_id": "direct:sha256:abc", "debug": "1" }
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action_id": "people-message:contact-alice",
+                "source": "people-contact",
+                "contact_id": "contact-alice",
+                "action": "switch-shell-open-target",
+                "target": "chat-room",
+                "query": { "conversation_id": "../x?y" }
+            }),
+            serde_json::json!({
+                "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,
+                "action_id": "people-message:contact-alice",
+                "source": "people-contact",
+                "contact_id": "contact-alice",
+                "action": "switch-shell-open-target",
+                "target": "chat-room",
+                "query": {}
             }),
             serde_json::json!({
                 "schema": HOME_TERMINAL_HOST_INTENT_SCHEMA,

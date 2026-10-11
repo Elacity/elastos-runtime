@@ -11,7 +11,13 @@ frames. Runtime checks each app's signed launch token and actor before it perfor
 Home can currently obtain every app's capability, so a compromised Home can
 reach those apps' authority. The target limits Home to delegation and gives each
 app a separate, revocable capability. The WASM Component authoring path runs in
-Wasmtime with memory and fuel limits and Runtime Bus hostcalls.
+Wasmtime with memory and fuel limits and Runtime Bus hostcalls. Components run
+inside the Runtime process: separate linear memories, but the same operating
+system process as Runtime keys. Installed Homes admit only release-path
+capsules matched by signed CID receipts and capsules signed by the release
+publisher, so third-party executable capsules need key-free, confined
+worker processes before they are admitted
+([World Computer plan](https://github.com/Elacity/elastos-runtime/issues/285)).
 
 Providers run as native operating-system processes with the Runtime user's
 rights. Only the model provider is partly confined. The trusted shell helper
@@ -71,17 +77,23 @@ a capsule capability-token field. Runtime owns admission for this trusted
 provider class. Its trust boundary must remain explicit in manifests and audit
 output; the envelope is not an independent grant of capsule authority.
 
-### Request framing remains incompletely bounded
+### I/O bridge line reads are not bounded while reading
 
-**Files:** `elastos/crates/elastos-server/src/carrier.rs`, `elastos/crates/elastos-runtime/src/handler/io_bridge.rs`
+**Files:** `elastos/crates/elastos-runtime/src/handler/io_bridge.rs`
 **Status:** Open
 
-The incoming Carrier request handler reads a line before parsing without a
-request-size cap or read deadline at that boundary. The I/O bridge rejects
-complete lines above 1 MiB, but its line readers allocate before that check.
-Size checks after reading do not bound memory use or an incomplete frame's
-lifetime. Add bounds while reading, with oversized and slow-frame tests;
-the Carrier integration task is tracked in [deferred work](docs/DEFERRED_WORK.md#retained-source-integration).
+The I/O bridge rejects complete lines above 1 MiB, but its line readers
+allocate before that check. Size checks after reading do not bound memory use
+or an incomplete frame's lifetime. Add bounds while reading, with oversized
+and slow-frame tests.
+
+### Whole-object Carrier fetch replies are not size-bounded
+
+**Files:** `elastos/crates/elastos-server/src/carrier.rs`
+**Status:** Open ([#341](https://github.com/Elacity/elastos-runtime/issues/341))
+
+A whole-object content fetch reply arrives as one line without a size cap.
+Only two such fetches run at once, and one per peer.
 
 ## Resolved Findings
 
@@ -96,6 +108,21 @@ These findings are resolved in source but remain listed as security history beca
 The I/O bridge rejects complete request lines above 1 MiB before parsing. The
 old `carrier_bridge.rs` has been removed. This resolved parse-size check does
 not close the read-time framing gap above.
+
+### Carrier and operator peer reads
+
+**Files:** `elastos/crates/elastos-server/src/carrier.rs`, `elastos/crates/elastos-server/src/operator_control.rs`
+**Status:** Fixed
+
+Lines from peers are read with a size cap and a deadline, and longer lines are
+refused before they are buffered. Incoming Carrier requests allow one provider
+request or one gossip message plus envelope, within 10 seconds. Operator
+requests, read before their signature is checked, allow 64 KiB within 10
+seconds. Replies are capped by what the request can return: a full gossip
+topic for a pull, one importable object for a provider call, update metadata
+for an operator answer. Provider replies share a 256 MiB in-flight budget.
+Whole-object content fetch replies are the open exception below. Relays close after five minutes without bytes in
+either direction, and stream acknowledgements have deadlines.
 
 ## Architecture
 

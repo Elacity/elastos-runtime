@@ -132,6 +132,10 @@ button {
   text-transform: uppercase;
 }
 
+.store-nav-item[hidden] {
+  display: none;
+}
+
 .store-nav-item {
   display: flex;
   align-items: center;

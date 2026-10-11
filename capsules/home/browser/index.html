@@ -82,20 +82,14 @@
                 </span>
               </button>
               <p id="home-unlock-person-name" class="home-unlock-account-name" hidden></p>
+              <button id="home-recover-owner" class="home-unlock-recover" type="button">Recover this Home with your Recovery Kit</button>
             </div>
           </div>
         </div>
-        <button id="home-older-key-action" class="home-unlock-button home-unlock-older-key" type="button" hidden>Use an older security key</button>
         <div class="home-unlock-card" role="dialog" aria-modal="true" aria-labelledby="home-unlock-title" aria-describedby="home-unlock-copy">
           <img class="home-unlock-logo" src="./elastos-logo.svg" alt="ElastOS" draggable="false" />
           <h1 id="home-unlock-title">Sign in</h1>
           <p id="home-unlock-copy">Use your passkey to unlock your data, apps and desktop.</p>
-          <div id="home-passkey-hint-panel" hidden>
-            <label for="home-passkey-hint">Private security-key hint</label>
-            <input id="home-passkey-hint" aria-label="Private security-key hint" class="home-unlock-input" type="password" maxlength="1800" autocomplete="off" spellcheck="false" aria-describedby="home-passkey-hint-help" />
-            <p id="home-passkey-hint-help">Paste the JSON hint from your Home operator. Home clears this field after each attempt.</p>
-            <button id="home-passkey-hint-cancel" class="home-unlock-button home-unlock-button-secondary" type="button">Back to sign in</button>
-          </div>
           <fieldset id="home-enrollment-choice" hidden>
             <legend>Set up your identity</legend>
             <label for="home-enrollment-create"><input id="home-enrollment-create" type="radio" name="home-enrollment-purpose" value="create" aria-label="Create account" checked /> Create account</label>
@@ -121,6 +115,8 @@
           <p id="home-unlock-name-hint" hidden>The name people will see. Discovery starts off.</p>
           <label id="home-owner-token-label" for="home-owner-token" hidden>Operator enrollment token</label>
           <input id="home-owner-token" class="home-unlock-input" type="password" maxlength="64" autocomplete="off" spellcheck="false" hidden />
+          <label id="home-owner-recovery-code-label" for="home-owner-recovery-code" hidden>Code from the terminal</label>
+          <input id="home-owner-recovery-code" class="home-unlock-input" type="password" maxlength="128" autocomplete="off" spellcheck="false" hidden />
           <div class="home-unlock-actions">
             <button id="home-unlock-primary" class="home-unlock-button" type="button">Use passkey</button>
             <button id="home-unlock-secondary" class="home-unlock-button home-unlock-button-secondary" type="button" hidden>Create guest account</button>

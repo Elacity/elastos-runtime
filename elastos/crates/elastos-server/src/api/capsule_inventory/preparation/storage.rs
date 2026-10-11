@@ -91,6 +91,49 @@ fn unlink_at(dir: &File, name: &CStr) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reads and validates state.json as last published. Publication renames a
+/// complete synced file over it, so an opened state file never changes.
+fn read_state(dir: &File) -> anyhow::Result<(PreparationInventory, Option<Stamp>)> {
+    let (state, original) = match optional_file(dir, STATE)? {
+        Some(mut file) => {
+            let before = stamp(&file.metadata()?);
+            let mut bytes = Vec::new();
+            (&mut file)
+                .take(MAX_STATE_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 <= MAX_STATE_BYTES && stamp(&file.metadata()?) == before,
+                "preparation state changed during read"
+            );
+            (
+                serde_json::from_slice::<PreparationInventory>(&bytes)?,
+                Some(before),
+            )
+        }
+        None => (PreparationInventory::default(), None),
+    };
+    state.validate()?;
+    Ok((state, original))
+}
+
+/// The last durably saved inventory, read without the inventory lock.
+/// Status reads use it so a download's progress saves never make them wait
+/// or fail. Any change still takes the lock and reloads.
+pub(super) fn saved_inventory(data_path: &Path) -> anyhow::Result<PreparationInventory> {
+    let data = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(data_path)?;
+    check_directory(&data.metadata()?, false)?;
+    let dir = open_at(&data, DIRECTORY, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    check_directory(&dir.metadata()?, true)?;
+    // Refuse the same unsafe lock and temporary shapes a locked read refuses.
+    check_file(&open_at(&dir, LOCK, libc::O_RDONLY)?.metadata()?, 0)?;
+    let state = read_state(&dir)?.0;
+    let _ = optional_file(&dir, NEXT)?;
+    Ok(state)
+}
+
 // This lock protects exactly one bounded inventory snapshot. Separate opens
 // contend across both processes and threads; dropping the guard releases flock.
 pub(super) struct Inventory {
@@ -131,10 +174,10 @@ impl Inventory {
             libc::O_RDWR | if create { libc::O_CREAT } else { 0 },
         )?;
         check_file(&lock.metadata()?, 0)?;
-        // Snapshot readers and progress writers share this short transaction
-        // lock. Ordinary contention must not terminate the preparation worker.
-        // Keep the wait bounded; the separate worker lock still rejects a
-        // competing preparation immediately.
+        // Writers and checked snapshots share this short transaction lock.
+        // Ordinary contention must not terminate the preparation worker. Keep
+        // the wait bounded; the separate worker lock still rejects a competing
+        // preparation immediately. Status reads use `saved_inventory` instead.
         let lock = FileLock::exclusive_within(lock, Duration::from_secs(1))
             .context("preparation inventory busy")?;
         let result = Self {
@@ -188,25 +231,7 @@ impl Inventory {
 
     pub(super) fn snapshot(&self) -> anyhow::Result<PreparationInventory> {
         self.revalidate()?;
-        let file = optional_file(&self.dir, STATE)?;
-        let (state, original) = if let Some(mut file) = file {
-            let before = stamp(&file.metadata()?);
-            let mut bytes = Vec::new();
-            (&mut file)
-                .take(MAX_STATE_BYTES + 1)
-                .read_to_end(&mut bytes)?;
-            ensure!(
-                bytes.len() as u64 <= MAX_STATE_BYTES && stamp(&file.metadata()?) == before,
-                "preparation state changed during read"
-            );
-            (
-                serde_json::from_slice::<PreparationInventory>(&bytes)?,
-                Some(before),
-            )
-        } else {
-            (PreparationInventory::default(), None)
-        };
-        state.validate()?;
+        let (state, original) = read_state(&self.dir)?;
         for entry in std::fs::read_dir(self.data_path.join("model-preparation"))? {
             let name = entry?.file_name();
             if name == "stage" {

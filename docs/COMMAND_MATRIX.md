@@ -6,6 +6,11 @@ behavior. See
 input, exit, and return behavior. CLI help remains the source of truth for the
 complete command and flag inventory.
 
+Operator commands work but are hidden from `elastos --help`: `serve`,
+`publish-release`, `content`, `collaboration-config`,
+`protected-content-config`, `node`, `gateway`, `sign-payload`, `keys`, `tls`
+and `emergency`. `elastos <command> --help` still shows their help.
+
 ## Runtime classes
 
 | Class | Meaning |
@@ -25,8 +30,6 @@ it when it starts. A command must not silently start a competing host.
 | --- | --- | --- |
 | `elastos`, `elastos home` | Managed user lane | Opens Home. `elastos home` starts or reuses the managed Home runtime. It does not attach to an operator runtime that already owns the same home. |
 | `elastos home --status`, `elastos home --json` | Self-contained | Reads and prints a Home-state probe. It does not start Home. |
-| `elastos chat` | Managed user lane | Reuses a healthy, version-matched managed Home runtime. Otherwise it starts a separate managed chat runtime with its narrower policy, or reuses that runtime when it is already active. It does not attach to an operator runtime. |
-| `elastos agent` | Operator lane | Attaches to the operator runtime. This applies to local, Venice, and Codex backends. |
 | `elastos run <path>` or `elastos run --cid <cid>`, `type=data` | Self-contained | Materializes the capsule, creates an in-process Runtime and preview server, opens the browser, and remains active until stopped. It does not attach to `elastos serve`. |
 | `elastos run <path>` or `elastos run --cid <cid>`, Component | Operator lane | Accepts only `type=wasm` with `runtime_abi="elastos.component/v1"`. It attaches to the operator runtime for Bus authorization, then executes the Component locally. |
 | `elastos run <path>` or `elastos run --cid <cid>`, microVM | Operator lane | Uses the operator runtime supervisor to launch and stop the microVM. |
@@ -45,22 +48,23 @@ target.
 | Command family | Included commands | Notes |
 | --- | --- | --- |
 | CLI information | `elastos --help`, `elastos --version`, `elastos version` | Reads no runtime coordinates. |
-| Setup | `elastos setup`, including `--list`, profiles, `--with`, and `--without` | Installs or lists components and external dependencies. |
+| Setup | `elastos setup`, `elastos setup --list`; hidden developer flags `--profile`, `--with`, and `--without` | Installs Home or lists components and external dependencies. |
 | Project creation | `elastos init <name>`, `elastos init <name> --type content` | Creates files in the current directory. |
 | Configuration | `elastos config show`, `elastos config set` | Reads or writes local configuration. |
-| Identity | `elastos identity show`, `elastos identity nickname get`, `elastos identity nickname set` | Reads or updates the local DID-backed profile. `nickname set` prompts only when no value is supplied and a TTY is available. |
+| Identity | `elastos identity show`, `elastos identity nickname get`, `elastos identity nickname set`, `elastos identity arm-owner`, `elastos identity arm-owner-recovery` | Reads or updates the local DID-backed profile. `nickname set` prompts only when no value is supplied and a TTY is available. `arm-owner` admits one first-owner passkey at an exact public HTTPS Home address. `arm-owner-recovery` prints a one-time code for recovering this Home's admin with the Recovery Kit; use the command shown on the sign-in screen. |
 | TLS | `elastos tls trust`, `elastos tls regen` | Prints trust instructions or regenerates the local leaf certificate. |
 | Emergency | `elastos emergency rotate` | Attempts to persist a new signing key. The active Runtime changes only after restart, and current persistence failure is not fail-closed. See the [security finding](../SECURITY.md#capability-state-and-key-rotation-are-not-restart-safe). |
 | Trusted sources | `elastos source add`, `elastos source list`, `elastos source show`, `elastos source switch-channel`, `elastos source verify` | Manages local trusted-release source state. |
-| Updates | `elastos update`, `elastos upgrade` | `upgrade` dispatches to the same update handler. Checks the trusted source over Carrier; HTTP only with `--gateway` or `--no-p2p`. No local runtime is required. See [INSTALL.md](INSTALL.md#how-updates-reach-your-home). |
+| Updates | `elastos update` | Checks the trusted source over Carrier only. No local runtime is required. See [INSTALL.md](INSTALL.md#how-updates-reach-your-home). |
 | Offline principal-root maintenance | hidden `elastos principal-root-migrate`, hidden `elastos principal-root-upgrade` | Operates on an explicit data directory. The Runtime must be offline and the command requires explicit backup inputs. |
 
 The host operator controls web terminal access with
 `elastos config set developer_mode true` and
 `elastos config set developer_mode false`. Runtime stores this boolean in
 `config.toml` in its data folder. The default is off. Home and apps use Runtime
-routes and app storage roots; the host CLI owns this setting. The existing
-`dev_mode` setting controls capsule signature checks separately.
+routes and app storage roots; the host CLI owns this setting. The separate
+`dev_mode` setting lets source and CI Homes run unsigned local capsules; an
+installed signed release ignores it.
 
 Runtime refuses all web terminal routes with HTTP 403 while developer mode is
 off or guest registration is enabled. This includes signed-in owners. A refused
@@ -113,7 +117,7 @@ local result.
 
 | Command family | Class | Included behavior |
 | --- | --- | --- |
-| Local room state | Self-contained | `elastos room show`, `elastos room pending`, `elastos room seed`, `elastos room invite`, `elastos room invite-export`, `elastos room invite-import`, `elastos room accept`, `elastos room accept-export`, `elastos room accept-import`, `elastos room approve`, `elastos room deny`, `elastos room reset` |
+| Local room state | Self-contained | `elastos room show`, `elastos room pending`, `elastos room approve`, `elastos room deny`, `elastos room reset` |
 | Local room gateway | Operator lane | `elastos room open` requires the room capsule and a live operator runtime. It asks that runtime to start the room gateway. |
 | Local node state | Self-contained | `elastos node info`, `elastos node peer add`, `elastos node peer list`, `elastos node peer remove` |
 | Remote node reads | Self-contained locally | `elastos node status`, `elastos node room show`, `elastos node room pending`. The target peer needs a reachable operator runtime and the matching allowlisted action. |

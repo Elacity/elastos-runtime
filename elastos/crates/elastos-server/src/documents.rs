@@ -684,7 +684,7 @@ fn documents_operation_error_message(err: anyhow::Error) -> String {
 
 fn documents_viewer_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
     let viewer_dir = data_dir.join("capsules").join("documents");
-    if viewer_dir.join("index.html").is_file() {
+    if crate::shares::check_viewer_entrypoint(&viewer_dir).is_ok() {
         return Ok(viewer_dir);
     }
 
@@ -1668,6 +1668,7 @@ mod tests {
     struct MockIpfsProvider {
         cid: String,
         add_count: tokio::sync::Mutex<usize>,
+        published_paths: tokio::sync::Mutex<Vec<String>>,
         unpinned: tokio::sync::Mutex<Vec<String>>,
     }
 
@@ -1676,6 +1677,7 @@ mod tests {
             Self {
                 cid: cid.to_string(),
                 add_count: tokio::sync::Mutex::new(0),
+                published_paths: tokio::sync::Mutex::new(Vec::new()),
                 unpinned: tokio::sync::Mutex::new(Vec::new()),
             }
         }
@@ -1704,6 +1706,12 @@ mod tests {
             match request.get("op").and_then(|op| op.as_str()) {
                 Some("add_directory") => {
                     *self.add_count.lock().await += 1;
+                    *self.published_paths.lock().await = request["files"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|file| file["path"].as_str().map(str::to_string))
+                        .collect();
                     Ok(json!({
                         "status": "ok",
                         "data": {
@@ -1731,14 +1739,19 @@ mod tests {
         }
     }
 
+    /// Installs the repository's real Documents capsule (manifest plus its
+    /// `browser/` entrypoint directory), the layout setup installs.
     fn install_test_documents_viewer(data_dir: &Path) {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../capsules/documents");
         let viewer_dir = data_dir.join("capsules").join("documents");
-        std::fs::create_dir_all(&viewer_dir).unwrap();
-        std::fs::write(
-            viewer_dir.join("index.html"),
-            "<!doctype html><title>Documents</title>",
-        )
-        .unwrap();
+        let mut files = Vec::new();
+        crate::ipfs::collect_files_for_ipfs(&source, &source, &mut files).unwrap();
+        for rel in files {
+            let dest = viewer_dir.join(&rel);
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::copy(source.join(&rel), dest).unwrap();
+        }
+        assert!(!viewer_dir.join("index.html").exists());
     }
 
     #[test]
@@ -2113,6 +2126,19 @@ mod tests {
         assert_eq!(published.uri, format!("elastos://{TEST_CID}"));
         assert_eq!(published.route, format!("/s/{TEST_CID}/"));
         assert_eq!(*ipfs_provider.add_count.lock().await, 1);
+        let paths = ipfs_provider.published_paths.lock().await.clone();
+        for expected in [
+            "index.html",
+            "documents.js",
+            "elastos-ui.css",
+            "_share.json",
+        ] {
+            assert!(
+                paths.iter().any(|path| path == expected),
+                "{expected} missing from {paths:?}"
+            );
+        }
+        assert!(!paths.iter().any(|path| path.starts_with("browser/")));
 
         let republished = client.publish(&document.doc_did).await.unwrap();
         assert_eq!(republished.cid, TEST_CID);

@@ -170,7 +170,8 @@ export function isRuntimeCustodyProtectableVideo(object) {
     !object?.metadata?.readonly &&
     !object?.metadata?.protected_content &&
     String(object.mime || "").startsWith("video/") &&
-    capabilities?.includes("publish")
+    capabilities?.includes("publish") &&
+    capabilities.includes("protect")
   );
 }
 

@@ -169,30 +169,17 @@ def shutdown(master: int, proc: subprocess.Popen) -> None:
     finally:
         os.close(master)
 
-def run_chat_case(label: str, payload: bytes) -> None:
+def run_repeated_action_case() -> None:
+    # Two actions in a row must keep Home open (the second one used to quit
+    # with "provider localhost/delete failed [403 Forbidden]").
     master, proc = launch_pty()
     try:
-        read_until(label, master, lambda text: "ElastOS Home" in text, 10.0)
-        send(master, b"\r\n")
-        chat = read_until(
-            label,
-            master,
-            lambda text: "Chat #general as " in text,
-            20.0,
-        )
-        if "Press Enter again" in chat:
-            raise SystemExit(f"{label}: installed Chat still requires a second launch confirmation:\n{chat}")
-        if "Action failed:" in chat:
-            raise SystemExit(f"{label}: installed Chat surfaced a launch failure:\n{chat}")
-        send(master, payload, 0.5)
-        after_exit = read_until(
-            label,
-            master,
-            lambda text: "ElastOS Home" in text,
-            8.0,
-        )
-        if "ElastOS Home" not in after_exit:
-            raise SystemExit(f"{label}: installed exit input did not return Home:\n{after_exit}")
+        read_until("repeat", master, lambda text: "ElastOS Home" in text, 10.0)
+        for attempt in (1, 2):
+            send(master, b"r", 0.5)
+            screen = read_until("repeat", master, lambda text: "ElastOS Home" in text, 8.0)
+            if proc.poll() is not None or "ElastOS Home" not in screen or "Error:" in screen:
+                raise SystemExit(f"repeat: installed Home did not stay open after action {attempt}:\n{screen}")
     finally:
         shutdown(master, proc)
 
@@ -202,7 +189,7 @@ def run_navigation_case() -> None:
         initial = read_until(
             "nav",
             master,
-            lambda text: "\x1b[30;46;1m Home \x1b[0m" in text and "> 1 Chat [ready]" in text,
+            lambda text: "\x1b[30;46;1m Home \x1b[0m" in text,
             10.0,
         )
         if "\x1b[30;46;1m Home \x1b[0m" not in initial:
@@ -228,69 +215,7 @@ def run_navigation_case() -> None:
     finally:
         shutdown(master, proc)
 
-def run_down_navigation_case() -> None:
-    master, proc = launch_pty()
-    try:
-        initial = read_until(
-            "nav-down",
-            master,
-            lambda text: "> 1 Chat [ready]" in text,
-            10.0,
-        )
-        if "> 1 Chat [ready]" not in initial:
-            raise SystemExit(f"nav-down: installed Home did not highlight Chat first:\n{initial}")
-        send(master, b"\x1b[B", 0.4)
-        after_down = read_until(
-            "nav-down",
-            master,
-            lambda text: "> 2 MyWebSite [" in text,
-            4.0,
-        )
-        if "> 2 MyWebSite [" not in after_down:
-            raise SystemExit(f"nav-down: installed down arrow did not move selection:\n{after_down}")
-    finally:
-        shutdown(master, proc)
-
-def run_home_case(label: str, payload: bytes, expected_fragments: tuple[str, ...]) -> None:
-    proc = subprocess.run(
-        cmd + ["home"],
-        input=payload,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=env,
-        timeout=20,
-    )
-    output = proc.stdout.decode("utf-8", "replace")
-    if proc.returncode != 0:
-        raise SystemExit(f"{label}: installed home command failed:\n{output}")
-    if not any(fragment in output for fragment in expected_fragments):
-        joined = "\n".join(expected_fragments)
-        raise SystemExit(f"{label}: expected one of:\n{joined}\n\nactual output:\n{output}")
-
 run_navigation_case()
-run_down_navigation_case()
-run_chat_case("esc", b"\x1b")
-run_chat_case("home", b"/home\r")
-run_chat_case("quit", b"/quit\r")
-run_home_case(
-    "mywebsite",
-    b"2\n\nq\n",
-    (
-        "MyWebSite is empty.",
-        "MyWebSite is staged at localhost://MyWebSite.",
-        "MyWebSite is not ready: missing site-provider",
-    ),
-)
-run_home_case(
-    "updates",
-    b"3\nq\n",
-    (
-        "Returned home from Updates.",
-        "Updates:",
-        "Installed release is up to date.",
-        "Updates could not complete the trusted-source check:",
-    ),
-)
-
+run_repeated_action_case()
 print("[public-home-frontdoor] OK")
 PY

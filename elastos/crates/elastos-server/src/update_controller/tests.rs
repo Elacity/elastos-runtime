@@ -1089,6 +1089,269 @@ async fn desktop_and_wallet_bindings_reach_captured_and_retained_child_commands(
     }
 }
 
+struct ReadyHomeCleanup {
+    fixture: PrivateFixture,
+    backup: PathBuf,
+    payload: PathBuf,
+    accepted: Arc<std::sync::atomic::AtomicBool>,
+    home_requests: Arc<std::sync::atomic::AtomicUsize>,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    server: tokio::task::JoinHandle<()>,
+    host_guard: FileLock,
+}
+
+/// One migrated object, an installed release and a Home server owned by this
+/// process. The server serves the installed Home only once `accepted` is set.
+async fn ready_home_cleanup(backup: &str, role: &str) -> ReadyHomeCleanup {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::io::{Seek, SeekFrom};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let fixture = PrivateFixture::new();
+    let capsule = fixture.data.join("capsules/home");
+    fs::create_dir_all(capsule.join("browser")).unwrap();
+    let document = b"accepted Home document";
+    fixture.file(
+        &capsule.join("capsule.json"),
+        &serde_json::to_vec(&json!({
+            "schema":"elastos.capsule/v1", "name":"home", "version":"0.1.0",
+            "description":"Cleanup readiness fixture", "author":"fixture",
+            "role":"app", "type":"data", "entrypoint":"browser/index.html"
+        }))
+        .unwrap(),
+        0o600,
+    );
+    fixture.file(&capsule.join("browser/index.html"), document, 0o600);
+    fixture.publish_installed_release_with_components(
+        &serde_json::to_vec(&json!({
+            "schema":"elastos.components/v1",
+            "external":{"home":{"install_path":"capsules/home","platforms":{}}},
+            "capsules":{}, "profiles":{}
+        }))
+        .unwrap(),
+    );
+    let principal = "person:local:cleanup-ready";
+    let protection = crate::auth::store_test_principal_root_protection(&fixture.data, principal);
+    let uri = format!(
+        "{}/.AppData/LocalHost/GBA/ucity/ready.sav",
+        protection.localhost_root
+    );
+    let object = elastos_common::localhost::rooted_localhost_fs_path(&fixture.data, &uri).unwrap();
+    fs::create_dir_all(object.parent().unwrap()).unwrap();
+    fixture.file(&object, b"private legacy save", 0o600);
+    let plan_path = fixture.data.join("migration-plan.json");
+    fixture.file(
+        &plan_path,
+        &serde_json::to_vec_pretty(&crate::auth::PrincipalRootMigrationPlanV1 {
+            schema: crate::auth::PRINCIPAL_ROOT_MIGRATION_PLAN_SCHEMA.into(),
+            principal_id: principal.into(),
+            localhost_root: protection.localhost_root,
+            objects: vec![crate::auth::PrincipalRootMigrationSelectionV1 {
+                object_uri: uri,
+                plaintext_sha256: format!("sha256:{}", digest(b"private legacy save")),
+            }],
+        })
+        .unwrap(),
+        0o600,
+    );
+    let backup = fixture.data.join(backup);
+    if let Some(parent) = backup.parent().filter(|parent| !parent.exists()) {
+        fs::DirBuilder::new().mode(0o700).create(parent).unwrap();
+    }
+    crate::auth::migrate_principal_root_objects_offline(&fixture.data, &plan_path, &backup)
+        .unwrap();
+    let payload = fs::read_dir(&backup)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().ends_with(".encrypted.backup"))
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let generation = "c".repeat(32);
+    write_private(&crate::runtime_control::gateway_runtime_coord_path(&fixture.data), &json!({
+        "api_url":format!("http://127.0.0.1:{port}"), "home_url":format!("http://127.0.0.1:{port}/home/"),
+        "attach_secret":"fixture-attach", "runtime_kind":"gateway", "pid":std::process::id(),
+        "generation":generation, "binary_sha256":digest(&fs::read(&fixture.binary).unwrap())
+    })).unwrap();
+    let host_guard = crate::host_lock::acquire_host_process_lock(
+        &fixture.data,
+        role,
+        &format!("127.0.0.1:{port}"),
+    )
+    .unwrap();
+    // Migration leaves the real host lock in place. Update its held inode,
+    // just as the host does, instead of replacing it as private controller JSON.
+    let mut host_file: &File = &host_guard;
+    host_file.set_len(0).unwrap();
+    host_file.seek(SeekFrom::Start(0)).unwrap();
+    serde_json::to_writer(
+        &mut host_file,
+        &json!({
+            "pid":std::process::id(), "generation":generation, "role":role,
+            "addr":format!("127.0.0.1:{port}")
+        }),
+    )
+    .unwrap();
+    host_file.sync_data().unwrap();
+    let accepted = Arc::new(AtomicBool::new(false));
+    let served = accepted.clone();
+    let home_requests = Arc::new(AtomicUsize::new(0));
+    let fetched = home_requests.clone();
+    let router = Router::new()
+        .route(
+            "/api/health",
+            get(|| async { Json(json!({"version":"0.7.0"})) }),
+        )
+        .route(
+            "/api/auth/attach",
+            post(|Json(input): Json<Value>| async move {
+                assert_eq!(input["secret"], "fixture-attach");
+                assert_eq!(input["scope"], "client");
+                Json(json!({"token":"fixture-token"}))
+            }),
+        )
+        .route(
+            "/home/",
+            get(move || {
+                let served = served.clone();
+                fetched.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if served.load(Ordering::SeqCst) {
+                        document.as_slice()
+                    } else {
+                        b"stale Home document".as_slice()
+                    }
+                }
+            }),
+        );
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    ReadyHomeCleanup {
+        fixture,
+        backup,
+        payload,
+        accepted,
+        home_requests,
+        shutdown,
+        server,
+        host_guard,
+    }
+}
+
+impl ReadyHomeCleanup {
+    async fn stop(self) -> PrivateFixture {
+        let _ = self.shutdown.send(());
+        self.server.await.unwrap();
+        drop(self.host_guard);
+        assert!(crate::host_lock::active_host_process(&self.fixture.data)
+            .unwrap()
+            .is_none());
+        self.fixture
+    }
+}
+
+#[tokio::test]
+async fn migration_cleanup_requires_a_fresh_installed_home_proof() {
+    use std::sync::atomic::Ordering;
+    let home = ready_home_cleanup("manual-migration-backup", "gateway").await;
+    let (data, binary) = (home.fixture.data.clone(), home.fixture.binary.clone());
+    let stale = finalize_principal_root_backups(&data, &binary, None).await;
+    let retained_after_stale = home.payload.is_file();
+    let fetched_after_stale = home.home_requests.load(Ordering::SeqCst);
+    home.accepted.store(true, Ordering::SeqCst);
+    let finalized = finalize_principal_root_backups(&data, &binary, None).await;
+    let payload_removed = !home.payload.exists();
+    let receipt_retained = home.backup.join("receipt.json").is_file();
+    let home_requests = home.home_requests.clone();
+    home.stop().await;
+    let stale_error = stale.expect_err("stale served Home refuses migration cleanup");
+    assert!(
+        stale_error
+            .to_string()
+            .contains("Served Home differs from the installed capsule"),
+        "{stale_error:#}"
+    );
+    assert!(
+        retained_after_stale,
+        "stale served Home retains the encrypted rollback"
+    );
+    assert_eq!(fetched_after_stale, 1);
+    assert_eq!(finalized.unwrap(), 1);
+    assert!(payload_removed);
+    assert!(receipt_retained);
+    assert_eq!(home_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn local_and_public_home_starts_remove_legacy_plaintext_backups() {
+    use std::sync::atomic::Ordering;
+    fn plaintext_backups(directory: &Path) -> usize {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .map(|entry| {
+                if entry.file_type().unwrap().is_dir() {
+                    plaintext_backups(&entry.path())
+                } else {
+                    usize::from(
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .ends_with(".plaintext.backup"),
+                    )
+                }
+            })
+            .sum()
+    }
+    for role in ["gateway", "gateway-public"] {
+        let home = ready_home_cleanup("backups/principal-root-migration-legacy", role).await;
+        let data = home.fixture.data.clone();
+        // Model an older release: plaintext payload, a receipt binding its hash
+        // and no cleanup record.
+        let receipt_path = home.backup.join("receipt.json");
+        let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        let plaintext_sha256 = receipt["objects"][0]["plaintext_sha256"].clone();
+        receipt["objects"][0]["backup_sha256"] = plaintext_sha256;
+        fs::remove_file(&receipt_path).unwrap();
+        home.fixture
+            .file(&receipt_path, &serde_json::to_vec(&receipt).unwrap(), 0o600);
+        let legacy = PathBuf::from(
+            home.payload
+                .to_string_lossy()
+                .replace(".encrypted.backup", ".plaintext.backup"),
+        );
+        fs::remove_file(&home.payload).unwrap();
+        home.fixture.file(&legacy, b"private legacy save", 0o600);
+        let records = crate::auth::auth_state_path(&data)
+            .unwrap()
+            .with_file_name("principal-root-migration-cleanup");
+        for record in fs::read_dir(&records).unwrap() {
+            fs::remove_file(record.unwrap().path()).unwrap();
+        }
+        home.accepted.store(true, Ordering::SeqCst);
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            finalize_principal_root_backups_after_start(data.clone()),
+        )
+        .await
+        .unwrap();
+        let plaintext_left = plaintext_backups(&data.join("backups"));
+        let receipt_retained = receipt_path.is_file();
+        home.stop().await;
+        assert_eq!(plaintext_left, 0, "{role}");
+        assert!(receipt_retained, "{role}");
+    }
+}
+
 #[tokio::test]
 async fn readiness_uses_the_reported_ipv6_home_listener_and_checks_its_served_bytes() {
     use axum::{
@@ -2865,7 +3128,7 @@ async fn real_controller_restart_failure(failure: &str) {
             "home":{"install_path":"capsules/home", "platforms":{}},
             "fixture-provider":{"install_path":"bin/fixture-provider", "platforms":{
                 (crate::setup::detect_platform()):{
-                    "cid":raw_cid(support), "checksum":format!("sha256:{}", digest(support)), "size":support.len()
+                    "release_path":"fixture-provider", "cid":raw_cid(support), "checksum":format!("sha256:{}", digest(support)), "size":support.len()
                 }
             }}
         }
@@ -2917,7 +3180,7 @@ async fn real_controller_restart_failure(failure: &str) {
         (raw_cid(&candidate_components), candidate_components),
         (raw_cid(b"new support"), b"new support".to_vec()),
     ]);
-    let fetch: crate::update::FetchFn = Box::new(move |cid, _| {
+    let fetch: crate::update::FetchFn = Box::new(move |cid| {
         let bytes = items
             .get(&cid)
             .unwrap_or_else(|| panic!("unexpected fetch: {cid}"))
@@ -3471,7 +3734,7 @@ async fn staged_support_skips_linux_only_home_component_on_darwin() {
         }}
     }))
     .unwrap();
-    let fetch: crate::update::FetchFn = Box::new(|_, _| panic!("unavailable support fetched"));
+    let fetch: crate::update::FetchFn = Box::new(|_| panic!("unavailable support fetched"));
     let (_, paths) = crate::setup::stage_update_support(
         &fixture.data,
         &fs::read(fixture.data.join("components.json")).unwrap(),
@@ -3519,7 +3782,7 @@ async fn staged_support_replaces_a_component_left_by_an_interrupted_undo() {
         }}}
     }))
     .unwrap();
-    let fetch: crate::update::FetchFn = Box::new(move |key, _| {
+    let fetch: crate::update::FetchFn = Box::new(move |key| {
         assert_eq!(key, cid);
         Box::pin(async move { Ok(signed.to_vec()) })
     });
@@ -3589,7 +3852,7 @@ async fn system_update_and_undo_repair_the_installed_release_before_admission() 
         }
         let served = (catalogue_cid.clone(), catalogue.clone());
         let offline = case == "catalogue offline";
-        let fetch: crate::update::FetchFn = Box::new(move |cid, _| {
+        let fetch: crate::update::FetchFn = Box::new(move |cid| {
             let bytes = if offline {
                 Err(anyhow::Error::from(crate::update::UpdateSourceUnavailable))
             } else {
@@ -3724,7 +3987,7 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             serde_json::to_vec(&json!({
             "schema":"elastos.components/v1", "profiles":{}, "capsules":{},
             "external":{"fixture-provider":{"install_path":"bin/fixture-provider", "platforms":{
-                (crate::setup::detect_platform()): {"cid":raw_cid(bytes), "checksum":format!("sha256:{}", digest(bytes)), "size":bytes.len()}
+                (crate::setup::detect_platform()): {"release_path":"fixture-provider", "cid":raw_cid(bytes), "checksum":format!("sha256:{}", digest(bytes)), "size":bytes.len()}
             }}}
         })).unwrap()
         };
@@ -3762,7 +4025,7 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             let optional = json!({
                 "install_path":"libexec/optional/v2/runner",
                 "platforms":{(crate::setup::detect_platform()):{
-                    "cid":raw_cid(b"optional support"), "checksum":format!("sha256:{}", digest(b"optional support"))
+                    "release_path":"optional", "cid":raw_cid(b"optional support"), "checksum":format!("sha256:{}", digest(b"optional support"))
                 }}
             });
             if outcome == "optional moved restored" {
@@ -3792,7 +4055,7 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             let bytes = archive.into_inner().unwrap().finish().unwrap();
             value["external"]["fixture-provider"]["install_path"] = json!("tools/fixture-provider");
             value["external"]["fixture-provider"]["platforms"][crate::setup::detect_platform()] = json!({
-                "cid":raw_cid(&bytes), "checksum":format!("sha256:{}", digest(&bytes)), "size":bytes.len(),
+                "release_path":"fixture-provider.tar.gz", "cid":raw_cid(&bytes), "checksum":format!("sha256:{}", digest(&bytes)), "size":bytes.len(),
                 "install_path":"tools/fixture-provider", "extract_path":"fixture-provider", "binary_path":"runner"
             });
             bytes
@@ -3801,10 +4064,10 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         };
         if outcome.starts_with("support path") {
             // Only a descriptor without a signed CID is fetched by release name.
-            let platform = &mut value["external"]["fixture-provider"]["platforms"]
-                [crate::setup::detect_platform()];
-            platform["release_path"] = json!("fixture-provider");
-            platform.as_object_mut().unwrap().remove("cid");
+            value["external"]["fixture-provider"]["platforms"][crate::setup::detect_platform()]
+                .as_object_mut()
+                .unwrap()
+                .remove("cid");
         }
         value["capsules"]["fixture-app"] = json!({
             "cid":raw_cid(&app), "sha256":digest(&app), "size":app.len()
@@ -3818,7 +4081,8 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             value["external"]["fixture-provider"]["platforms"][crate::setup::detect_platform()]
                 ["strategy"] = json!("source-build");
         } else if outcome == "optional missing checksum" {
-            value["external"]["optional"] = json!({"platforms":{"*":{"cid":raw_cid(b"optional")}}});
+            value["external"]["optional"] =
+                json!({"platforms":{"*":{"release_path":"optional", "cid":raw_cid(b"optional")}}});
         } else if outcome == "metadata development strategy" {
             value["external"]["fixture-provider"]["capsule_metadata"] = json!({
                 "platforms":{"*":{"strategy":"local-copy", "checksum":format!("sha256:{}", digest(b"metadata"))}}
@@ -3922,7 +4186,7 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
             (app_cid.clone(), app),
             (catalogue_cid.clone(), catalogue.1.clone()),
         ]);
-        let fetch: crate::update::FetchFn = Box::new(move |cid, _| {
+        let fetch: crate::update::FetchFn = Box::new(move |cid| {
             if [
                 "missing checksum",
                 "development strategy",

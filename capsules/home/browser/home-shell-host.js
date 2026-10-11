@@ -1060,6 +1060,19 @@ async function activateDesktopShell() {
   await showHomeGuiDesktop();
 }
 
+async function resetActiveShellToDesktop(unavailableTarget) {
+  try {
+    await fetchJson("/api/apps/home/active-shell", {
+      method: "POST",
+      body: JSON.stringify({ active: HOME_GUI_SHELL_ID }),
+    });
+    requestShellSummaryRefresh({ reason: "active-shell-unavailable", delay: 0 });
+  } catch (error) {
+    console.error("active shell desktop fallback failed", error);
+    showActiveShellError(unavailableTarget, error);
+  }
+}
+
 function shellDisplayName(target) {
   const shell = normalizedActiveShellName(target);
   if (shell === HOME_GUI_SHELL_ID) {
@@ -1357,7 +1370,18 @@ async function syncActiveShellRoot(summary, options = {}) {
 
   const candidate = activeShellCandidate(summary, target);
   if (!candidate || candidate.launchable !== true) {
-    clearActiveShellRoot();
+    clearActiveShellRoot({ resetHint: true });
+    if (
+      target !== HOME_GUI_SHELL_ID &&
+      activeShellCandidate(summary, HOME_GUI_SHELL_ID)?.launchable === true
+    ) {
+      // A saved view that can no longer start (for example Terminal after
+      // developer mode is turned off) must not strand the user: reset the
+      // saved choice so this and every later load land on the Desktop.
+      showHostBootMask();
+      void resetActiveShellToDesktop(target);
+      return "alternate";
+    }
     showActiveShellError(target, "The selected Home shell is not launchable");
     return "locked";
   }

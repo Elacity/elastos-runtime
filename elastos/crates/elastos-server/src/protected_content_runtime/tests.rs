@@ -65,16 +65,17 @@ use super::{
     register_protected_content_decrypt_provider, resolve_runtime_rights_policy,
     runtime_media_source_digest, runtime_mint_journal, runtime_protected_content_id,
     runtime_purchase_path, unresolved_release_audit_records, write_owner_only_bytes,
-    InactiveCustodyProvider, RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
-    RuntimeCustodyLibraryPublishInput, RuntimeCustodyLibrarySourceInput,
-    RuntimeCustodyPurchaseAccessEvidenceRecord, RuntimeCustodyPurchaseProgress,
-    RuntimeCustodyPurchaseRecord, RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
+    InactiveCustodyProvider, MediaToolsTrust, RuntimeCustodyComposition,
+    RuntimeCustodyCompositionConfigFile, RuntimeCustodyLibraryPublishInput,
+    RuntimeCustodyLibrarySourceInput, RuntimeCustodyPurchaseAccessEvidenceRecord,
+    RuntimeCustodyPurchaseProgress, RuntimeCustodyPurchaseRecord,
+    RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
     RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
     RuntimeCustodyTerminalPurchaseRecord, RuntimeDecryptRegistryAdapter,
-    RuntimeLibraryMediaPreparation, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
-    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, CUSTODY_PROVIDER_OPERATIONS,
-    MAX_CHAIN_PROVIDER_CONFIG_BYTES, MEDIA_PROVIDER_CONFIG_SCHEMA_V1, MEDIA_PROVIDER_ID,
-    MEDIA_PROVIDER_MAX_INPUT_BYTES_V1, MEDIA_PROVIDER_TIMEOUT_MS_V1,
+    RuntimeLibraryMediaPreparation, SignedMediaToolDigests,
+    CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1, CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID,
+    CUSTODY_PROVIDER_OPERATIONS, MAX_CHAIN_PROVIDER_CONFIG_BYTES, MEDIA_PROVIDER_CONFIG_SCHEMA_V1,
+    MEDIA_PROVIDER_ID, MEDIA_PROVIDER_MAX_INPUT_BYTES_V1, MEDIA_PROVIDER_TIMEOUT_MS_V1,
     PROTECTED_CONTENT_CHAIN_PROVIDER_CONFIG_SCHEMA_V1, PROTECTED_CONTENT_DECRYPT_PROVIDER_ID,
     PROTECTED_CONTENT_DECRYPT_PROVIDER_OPERATIONS, PROTECTED_CONTENT_PROVIDER_STATUS_TIMEOUT,
     PROTECT_PROVIDER_ID, PROTECT_PROVIDER_OPERATIONS, PROTECT_PROVIDER_PROCESS_ID,
@@ -3775,7 +3776,8 @@ fn prepare_test_media_prerequisite(data_dir: &Path, root: &Path) {
     owner_only_dir(root);
     write_media_prerequisite(&root.join("ffmpeg"), b"ffmpeg-private-test", 0o700);
     write_media_prerequisite(&root.join("ffprobe"), b"ffprobe-private-test", 0o700);
-    prepare_runtime_media_provider_prerequisite(data_dir, root).unwrap();
+    prepare_runtime_media_provider_prerequisite(data_dir, root, MediaToolsTrust::MustMatch)
+        .unwrap();
 }
 
 #[cfg(unix)]
@@ -3797,12 +3799,14 @@ fn media_prerequisite_import_is_bounded_private_idempotent_and_never_executes_to
         0o700,
     );
 
-    prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap();
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source, MediaToolsTrust::MustMatch)
+        .unwrap();
     let config_path = media_config_path(&data_dir);
     let original_config = fs::read(&config_path).unwrap();
     let original_ffmpeg =
         fs::read(data_dir.join("protected-content/media-provider/tools/ffmpeg")).unwrap();
-    prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap();
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source, MediaToolsTrust::MustMatch)
+        .unwrap();
 
     assert!(!marker.exists());
     assert_eq!(fs::read(&config_path).unwrap(), original_config);
@@ -3846,28 +3850,112 @@ fn media_prerequisite_import_is_bounded_private_idempotent_and_never_executes_to
     let bounded_bytes = serde_json::to_vec_pretty(&bounded).unwrap();
     fs::write(&config_path, &bounded_bytes).unwrap();
     fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
-    prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap();
-    assert_eq!(fs::read(config_path).unwrap(), bounded_bytes);
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source, MediaToolsTrust::MustMatch)
+        .unwrap();
+    assert_eq!(fs::read(&config_path).unwrap(), bounded_bytes);
 
-    let imported_probe =
-        fs::read(data_dir.join("protected-content/media-provider/tools/ffprobe")).unwrap();
-    write_media_prerequisite(
-        &source.join("ffprobe"),
-        b"different supplied ffprobe",
-        0o700,
-    );
-    let error = prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap_err();
+    // A differing pair without signed provenance is refused with nothing changed.
+    let tools_dir = data_dir.join("protected-content/media-provider/tools");
+    let imported_ffmpeg = fs::read(tools_dir.join("ffmpeg")).unwrap();
+    let imported_probe = fs::read(tools_dir.join("ffprobe")).unwrap();
+    write_media_prerequisite(&source.join("ffmpeg"), b"upgraded ffmpeg", 0o700);
+    write_media_prerequisite(&source.join("ffprobe"), b"upgraded ffprobe", 0o700);
+    let unchanged = |config: &[u8]| {
+        assert_eq!(fs::read(&config_path).unwrap(), config);
+        assert_eq!(fs::read(tools_dir.join("ffmpeg")).unwrap(), imported_ffmpeg);
+        assert_eq!(fs::read(tools_dir.join("ffprobe")).unwrap(), imported_probe);
+        assert_eq!(fs::read_dir(&tools_dir).unwrap().count(), 2);
+    };
+    let error =
+        prepare_runtime_media_provider_prerequisite(&data_dir, &source, MediaToolsTrust::MustMatch)
+            .unwrap_err();
     assert!(error
         .to_string()
         .contains("differ from the private imported pair"));
-    assert_eq!(
-        fs::read(media_config_path(&data_dir)).unwrap(),
-        bounded_bytes
-    );
-    assert_eq!(
-        fs::read(data_dir.join("protected-content/media-provider/tools/ffprobe")).unwrap(),
-        imported_probe
-    );
+    unchanged(&bounded_bytes);
+
+    // Bytes altered after the signed archive was verified are refused before any rename.
+    let signed = MediaToolsTrust::SignedRelease(SignedMediaToolDigests {
+        ffmpeg: sha2::Sha256::digest(b"upgraded ffmpeg").into(),
+        ffprobe: sha2::Sha256::digest(b"upgraded ffprobe").into(),
+    });
+    write_media_prerequisite(&source.join("ffprobe"), b"tampered ffprobe", 0o700);
+    let error =
+        prepare_runtime_media_provider_prerequisite(&data_dir, &source, signed).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("does not match the signed release media tools"));
+    unchanged(&bounded_bytes);
+
+    // A symlinked supplied tool is refused, whatever its target.
+    let linked = temp.path().join("linked-source");
+    owner_only_dir(&linked);
+    write_media_prerequisite(&linked.join("real-ffprobe"), b"upgraded ffprobe", 0o700);
+    std::os::unix::fs::symlink(linked.join("real-ffprobe"), linked.join("ffprobe")).unwrap();
+    fs::copy(source.join("ffmpeg"), linked.join("ffmpeg")).unwrap();
+    let error =
+        prepare_runtime_media_provider_prerequisite(&data_dir, &linked, signed).unwrap_err();
+    assert!(error.to_string().contains("symbolic link"), "{error}");
+    unchanged(&bounded_bytes);
+    write_media_prerequisite(&source.join("ffprobe"), b"upgraded ffprobe", 0o700);
+    let linked_dir = temp.path().join("linked-dir");
+    std::os::unix::fs::symlink(&source, &linked_dir).unwrap();
+    let error =
+        prepare_runtime_media_provider_prerequisite(&data_dir, &linked_dir, signed).unwrap_err();
+    assert!(error.to_string().contains("symbolic link"), "{error}");
+    unchanged(&bounded_bytes);
+    // Even a root-owned system link (macOS /tmp or /var) on a supplied path is refused.
+    if let Some(system_link) = ["/tmp", "/var", "/etc"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| {
+            fs::symlink_metadata(path)
+                .is_ok_and(|meta| meta.file_type().is_symlink() && meta.uid() == 0)
+        })
+    {
+        let error = prepare_runtime_media_provider_prerequisite(
+            &data_dir,
+            &system_link.join("media-tools"),
+            signed,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        unchanged(&bounded_bytes);
+    }
+
+    // The signed release's pair is re-imported and tuned limits are kept.
+    write_media_prerequisite(&source.join("ffprobe"), b"upgraded ffprobe", 0o700);
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source, signed).unwrap();
+    let upgraded = || {
+        assert_eq!(fs::read(&config_path).unwrap(), bounded_bytes);
+        assert_eq!(
+            fs::read(tools_dir.join("ffmpeg")).unwrap(),
+            b"upgraded ffmpeg"
+        );
+        assert_eq!(
+            fs::read(tools_dir.join("ffprobe")).unwrap(),
+            b"upgraded ffprobe"
+        );
+        for name in ["ffmpeg", "ffprobe"] {
+            let metadata = fs::symlink_metadata(tools_dir.join(name)).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o500);
+            assert_eq!(metadata.nlink(), 1);
+        }
+        assert_eq!(fs::read_dir(&tools_dir).unwrap().count(), 2);
+    };
+    upgraded();
+    let bridge = load_runtime_media_provider_bridge_config(&data_dir)
+        .unwrap()
+        .expect("upgraded config must survive restart validation");
+    assert_eq!(bridge.extra["timeout_ms"], 5_000);
+
+    // A pair left half-replaced by an interrupted run is repaired on rerun.
+    let probe = tools_dir.join("ffprobe");
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&probe, &imported_probe).unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o500)).unwrap();
+    prepare_runtime_media_provider_prerequisite(&data_dir, &source, signed).unwrap();
+    upgraded();
 }
 
 #[cfg(unix)]
@@ -3878,7 +3966,12 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     let missing = temp.path().join("missing-tools");
     owner_only_dir(&missing);
     write_media_prerequisite(&missing.join("ffmpeg"), b"ffmpeg", 0o700);
-    let error = prepare_runtime_media_provider_prerequisite(&missing_data, &missing).unwrap_err();
+    let error = prepare_runtime_media_provider_prerequisite(
+        &missing_data,
+        &missing,
+        MediaToolsTrust::MustMatch,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("ffprobe"));
     assert!(!media_config_path(&missing_data).exists());
 
@@ -3887,12 +3980,14 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     owner_only_dir(&unsafe_tools);
     write_media_prerequisite(&unsafe_tools.join("ffmpeg"), b"ffmpeg", 0o720);
     write_media_prerequisite(&unsafe_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(
-        prepare_runtime_media_provider_prerequisite(&unsafe_data, &unsafe_tools)
-            .unwrap_err()
-            .to_string()
-            .contains("ffmpeg prerequisite")
-    );
+    assert!(prepare_runtime_media_provider_prerequisite(
+        &unsafe_data,
+        &unsafe_tools,
+        MediaToolsTrust::MustMatch
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("ffmpeg prerequisite"));
     assert!(!media_config_path(&unsafe_data).exists());
 
     let oversized_data = temp.path().join("oversized-data");
@@ -3906,12 +4001,14 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     )
     .unwrap();
     write_media_prerequisite(&oversized_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(
-        prepare_runtime_media_provider_prerequisite(&oversized_data, &oversized_tools)
-            .unwrap_err()
-            .to_string()
-            .contains("exceeds bounds")
-    );
+    assert!(prepare_runtime_media_provider_prerequisite(
+        &oversized_data,
+        &oversized_tools,
+        MediaToolsTrust::MustMatch
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("exceeds bounds"));
     assert!(!media_config_path(&oversized_data).exists());
 
     let non_file_data = temp.path().join("non-file-data");
@@ -3919,12 +4016,14 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     owner_only_dir(&non_file_tools);
     owner_only_dir(&non_file_tools.join("ffmpeg"));
     write_media_prerequisite(&non_file_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(
-        prepare_runtime_media_provider_prerequisite(&non_file_data, &non_file_tools)
-            .unwrap_err()
-            .to_string()
-            .contains("ffmpeg prerequisite")
-    );
+    assert!(prepare_runtime_media_provider_prerequisite(
+        &non_file_data,
+        &non_file_tools,
+        MediaToolsTrust::MustMatch
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("ffmpeg prerequisite"));
 
     let unsafe_parent_data = temp.path().join("unsafe-parent-data");
     let unsafe_parent_tools = temp.path().join("unsafe-parent-tools");
@@ -3932,10 +4031,13 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     write_media_prerequisite(&unsafe_parent_tools.join("ffmpeg"), b"ffmpeg", 0o700);
     write_media_prerequisite(&unsafe_parent_tools.join("ffprobe"), b"ffprobe", 0o700);
     fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o775)).unwrap();
-    let refusal =
-        prepare_runtime_media_provider_prerequisite(&unsafe_parent_data, &unsafe_parent_tools)
-            .unwrap_err()
-            .to_string();
+    let refusal = prepare_runtime_media_provider_prerequisite(
+        &unsafe_parent_data,
+        &unsafe_parent_tools,
+        MediaToolsTrust::MustMatch,
+    )
+    .unwrap_err()
+    .to_string();
     let fix = format!(
         "chmod go-w '{}'",
         fs::canonicalize(&unsafe_parent_tools).unwrap().display()
@@ -3970,12 +4072,14 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     )
     .unwrap();
     write_media_prerequisite(&linked_tools.join("ffprobe"), b"ffprobe", 0o700);
-    assert!(
-        prepare_runtime_media_provider_prerequisite(&linked_data, &linked_tools)
-            .unwrap_err()
-            .to_string()
-            .contains("ffmpeg prerequisite")
-    );
+    assert!(prepare_runtime_media_provider_prerequisite(
+        &linked_data,
+        &linked_tools,
+        MediaToolsTrust::MustMatch
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("ffmpeg prerequisite"));
 }
 
 #[cfg(unix)]
@@ -4050,7 +4154,9 @@ fn media_prerequisite_conflict_cleans_only_files_created_by_that_attempt() {
     owner_only_dir(&tools);
     write_media_prerequisite(&tools.join("ffprobe"), b"preserved-conflict", 0o500);
 
-    let error = prepare_runtime_media_provider_prerequisite(&data_dir, &source).unwrap_err();
+    let error =
+        prepare_runtime_media_provider_prerequisite(&data_dir, &source, MediaToolsTrust::MustMatch)
+            .unwrap_err();
 
     assert!(error.to_string().contains("ffprobe import conflicts"));
     assert_eq!(

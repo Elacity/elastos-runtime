@@ -207,14 +207,14 @@ function renderSetupSheet(summary) {
   if (titleNode) titleNode.textContent = "Welcome to Home";
   if (leadNode) leadNode.textContent = complete ? "Home is set up."
     : unavailable ? "Open System to check setup."
-    : profileReady ? "Save an updated Recovery Kit that includes your Profile."
+    : profileReady ? "Save your Recovery Kit to finish setting up Home."
     : "Create your Profile and save a complete Recovery Kit in System.";
   recoveryStep?.classList.toggle("is-complete", complete);
   recoveryStep?.classList.toggle("is-current", !complete && !unavailable);
   if (recoveryBody) recoveryBody.textContent = unavailable
     ? "Open System to check setup."
     : complete ? "Profile and Recovery Kit are ready."
-    : profileReady ? "Your Profile stays unchanged. Save the updated kit offline."
+    : profileReady ? "Your Profile is ready. Save the kit somewhere safe and offline."
     : "Confirm your name and save the kit offline.";
   if (recoveryButton) {
     recoveryButton.textContent = complete ? "Ready" : unavailable ? "Open System"

@@ -299,9 +299,14 @@ active. CSS hiding is not an accepted lifecycle model for a live previous
 shell. Home's browser-local active-shell hint may suppress a flash during boot,
 but Runtime state remains authoritative.
 
-If the selected shell cannot launch, Home shows the host-owned recovery surface.
-Recovery can retry, return to `home-gui` through the Runtime shell route, or sign
-out. It does not mount a hidden desktop as a fallback.
+If the selected shell fails to launch, Home shows the host-owned recovery
+surface. Recovery can retry, return to `home-gui` through the Runtime shell
+route, or sign out. It does not mount a hidden desktop as a fallback.
+
+A saved shell that is no longer launchable (for example the Terminal view when
+host developer mode is off) is not a launch failure: Runtime drops it from the
+shell candidates and resets the saved choice, and Home switches to `home-gui`
+through the same Runtime shell route, so every later load opens the Desktop.
 
 ## Verification
 
@@ -315,6 +320,7 @@ node scripts/home-clipboard-headless-smoke.mjs
 node scripts/home-clipboard-source-gate.mjs
 node scripts/home-shell-system-switch-smoke.mjs
 node scripts/home-shell-switchback-recovery-smoke.mjs
+node scripts/home-shell-unavailable-shell-fallback-smoke.mjs
 node scripts/home-cli-browser-smoke.mjs
 node scripts/wallet-connector-transaction-smoke.mjs
 node scripts/check-product-data.mjs

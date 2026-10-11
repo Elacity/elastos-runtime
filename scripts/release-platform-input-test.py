@@ -29,6 +29,9 @@ signer_spec = importlib.util.spec_from_file_location("release_signer_fixture", P
 signer = importlib.util.module_from_spec(signer_spec)
 sys.modules[signer_spec.name] = signer
 signer_spec.loader.exec_module(signer)
+provenance_spec = importlib.util.spec_from_file_location("release_provenance", Path(__file__).with_name("release-provenance.py"))
+provenance = importlib.util.module_from_spec(provenance_spec)
+provenance_spec.loader.exec_module(provenance)
 
 
 def binary(platform):
@@ -57,6 +60,11 @@ def archive_bytes(entries=None):
                 archive.addfile(info, io.BytesIO(payload))
     return output.getvalue()
 
+
+
+_GUEST_SPEC = importlib.util.spec_from_file_location("guest_inputs", Path(__file__).with_name("browser-vm-image-inputs.py"))
+guest_inputs = importlib.util.module_from_spec(_GUEST_SPEC)
+_GUEST_SPEC.loader.exec_module(guest_inputs)
 
 class PlatformInputTest(unittest.TestCase):
     def setUp(self):
@@ -135,6 +143,144 @@ class PlatformInputTest(unittest.TestCase):
         })
         self.refresh(root)
         return root
+
+    def browser_image_package(self, platform="linux-arm64", corrupt=False):
+        payloads = {"rootfs.ext4": b"tiny rootfs", "vmlinux": b"image kernel", "initrd": b"image initrd"}
+        record = lambda data: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        receipt = {"schema": "elastos.browser.vm-rootfs-build/v1", "ok": True,
+                   "inputs_sha256": guest_inputs.identity()["sha256"],
+                   "recipe_options": guest_inputs.identity()["options"],
+                   "target_platform": platform, **record(payloads["rootfs.ext4"]),
+                   "kernel": record(payloads["vmlinux"]), "initrd": record(payloads["initrd"]),
+                   "preflight": {"ok": True, "audio_default_ready": True}}
+        if corrupt:
+            payloads["vmlinux"] = b"different kernel"
+        payloads["browser-vm-rootfs-manifest.json"] = json.dumps(receipt).encode()
+        package = self.root / "browser-image.tar.gz"
+        package.write_bytes(archive_bytes([(inputs.BROWSER_IMAGE + "/" + name, data, None)
+                                          for name, data in payloads.items()]))
+        return package
+
+    def test_browser_scripts_require_reviewed_bytes_and_executable_mode(self):
+        source = inputs.SOURCE_ROOT / "scripts/browser-vm-control-service.mjs"
+        source.parent.mkdir()
+        source.write_bytes(b"#!/usr/bin/env node\n// reviewed fixture\n")
+        name = "browser-vm-control-service-module"
+        component = {"install_path": "bin/browser-vm-control-service.mjs", "platforms": {
+            "darwin-arm64": {"source": "scripts/browser-vm-control-service.mjs", "strategy": "source-build",
+                             "release_path": "browser-control-darwin-arm64"}}}
+        self.template["external"][name] = component
+        self.template["profiles"]["browser-host"] = {"components": [name]}
+        self.write_json(inputs.SOURCE_ROOT / "components.json", self.template)
+        root = self.bundles["aarch64-darwin"]
+        manifest = json.loads((root / "components.json").read_text())
+        manifest["profiles"] = self.template["profiles"]
+        artifact = root / "artifacts/browser-control-darwin-arm64"
+        artifact.write_bytes(source.read_bytes())
+        artifact.chmod(0o755)
+        info = {"release_path": artifact.name, "checksum": "sha256:" + inputs.digest(artifact),
+                "size": artifact.stat().st_size, "install_path": component["install_path"]}
+        manifest["external"][name] = {"install_path": component["install_path"], "platforms": {"darwin-arm64": info}}
+        self.write_json(root / "components-template.json", self.template)
+        self.write_json(root / "components.json", manifest)
+        self.refresh(root)
+        inputs.verify(root)
+        artifact.chmod(0o644)
+        self.refresh(root)
+        with self.assertRaisesRegex(ValueError, "reviewed executable source"):
+            inputs.verify(root)
+        artifact.chmod(0o755)
+        artifact.write_bytes(b"#!/usr/bin/env node\n// unreviewed replacement\n")
+        info.update(checksum="sha256:" + inputs.digest(artifact), size=artifact.stat().st_size)
+        self.write_json(root / "components.json", manifest)
+        self.refresh(root)
+        with self.assertRaisesRegex(ValueError, "reviewed executable source"):
+            inputs.verify(root)
+
+    def test_browser_image_input_is_local_pinned_and_platform_checked(self):
+        template = copy.deepcopy(self.template)
+        template["external"][inputs.BROWSER_IMAGE] = {
+            "install_path": inputs.BROWSER_IMAGE_INSTALL, "platforms": {
+                "darwin-arm64": {"strategy": inputs.BROWSER_IMAGE,
+                    "release_path": "browser-vm-image-darwin-arm64.tar.gz"}}}
+        self.write_json(inputs.SOURCE_ROOT / "components.json", template)
+        stage = self.root / "image-stage"
+        (stage / "artifacts").mkdir(parents=True)
+        package = self.browser_image_package()
+        args = SimpleNamespace(root=stage, platform="aarch64-darwin", package=str(package),
+                               sha256=inputs.digest(package), output=stage / "overlay.json")
+        installer = (inputs.SCRIPT_ROOT / "install.sh").read_text()
+        reserve = int(installer.split("FREE_SPACE_RESERVE_BYTES=", 1)[1].splitlines()[0])
+        self.assertEqual(inputs.BROWSER_IMAGE_RESERVE_BYTES, reserve)
+        with patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(
+                total=1000 * 1024**3, free=package.stat().st_size + reserve)):
+            inputs.stage_browser_image(args)
+        info = json.loads(args.output.read_bytes())["external"][inputs.BROWSER_IMAGE]["platforms"]["darwin-arm64"]
+        self.assertEqual(info["strategy"], "browser-vm-image")
+        self.assertEqual(info["install_path"], "browser-vm/image-set")
+        self.assertEqual(info["checksum"], "sha256:" + inputs.digest(package))
+        staged = stage / "artifacts" / info["release_path"]
+        self.assertEqual(staged.read_bytes(), package.read_bytes())
+        # A repeated stage preserves its immutable artifact.
+        with self.assertRaises(FileExistsError):
+            inputs.stage_browser_image(args)
+        self.assertEqual(staged.read_bytes(), package.read_bytes())
+        staged.unlink()
+        args.output.unlink()
+        for free in (0, package.stat().st_size + reserve - 1):
+            with self.subTest(free=free), patch.object(inputs.shutil, "disk_usage",
+                    return_value=SimpleNamespace(total=1000 * 1024**3, free=free)):
+                with self.assertRaisesRegex(ValueError, "free disk space"):
+                    inputs.stage_browser_image(args)
+        self.assertFalse(staged.exists())
+        for concern in ("missing", "pin", "guest", "payload", "truncated", "symlink"):
+            with self.subTest(concern=concern):
+                args.package = str(self.browser_image_package("linux-amd64" if concern == "guest" else "linux-arm64",
+                                                            corrupt=concern == "payload"))
+                if concern == "truncated":
+                    package = Path(args.package)
+                    package.write_bytes(package.read_bytes()[:-8])
+                args.sha256 = inputs.digest(Path(args.package))
+                if concern == "missing": args.package = ""
+                if concern == "pin": args.sha256 = "0" * 64
+                if concern == "symlink":
+                    alias = self.root / "image-alias"
+                    alias.symlink_to(args.package)
+                    args.package = str(alias)
+                with self.assertRaises((ValueError, FileNotFoundError, EOFError)):
+                    inputs.stage_browser_image(args)
+                self.assertFalse(staged.exists())
+                self.assertFalse(args.output.exists())
+
+    def test_browser_image_signed_input_keeps_install_strategy(self):
+        for platform in self.bundles:
+            setup_platform = inputs.PLATFORMS[platform][0]
+            if setup_platform == "linux-amd64":
+                continue
+            descriptor = {"strategy": "browser-vm-image", "release_path": "browser-vm-image-arm64.tar.gz",
+                          "install_path": "browser-vm/image-set", "extract_path": "browser-vm-image"}
+            self.template["external"].setdefault(inputs.BROWSER_IMAGE, {"install_path": "browser-vm/image-set", "platforms": {}})["platforms"][setup_platform] = descriptor
+        self.write_json(inputs.SOURCE_ROOT / "components.json", self.template)
+        for platform, root in self.bundles.items():
+            setup_platform = inputs.PLATFORMS[platform][0]
+            if setup_platform == "linux-amd64":
+                continue
+            package = self.browser_image_package("linux-arm64")
+            self.write_json(root / "components-template.json", self.template)
+            data = json.loads((root / "components.json").read_bytes())
+            component = copy.deepcopy(self.template["external"][inputs.BROWSER_IMAGE])
+            descriptor = component["platforms"][setup_platform]
+            shutil.copyfile(package, root / "artifacts" / descriptor["release_path"])
+            descriptor.update(checksum="sha256:" + inputs.digest(package), size=package.stat().st_size)
+            data["external"][inputs.BROWSER_IMAGE] = component
+            self.write_json(root / "components.json", data)
+            self.refresh(root)
+            inputs.verify(root)
+            descriptor["strategy"] = "other-installer"
+            self.write_json(root / "components.json", data)
+            self.refresh(root)
+            with self.assertRaisesRegex(ValueError, "strategy"):
+                inputs.verify(root)
 
     def reuse_fixture(self, version="0.7.2", platform="aarch64-darwin"):
         stage = (self.root / "reused").resolve()
@@ -405,8 +551,8 @@ class PlatformInputTest(unittest.TestCase):
         (source / ".gitignore").write_text("__pycache__/\n")
         (source / "elastos/Cargo.lock").write_text("version = 4\n")
         self.write_json(source / "components.json", self.template)
-        for name in ("release-platform-input.py", "components-release-integrity-check.py",
-                     "publish-release.sh", "check-versioning.sh", "install.sh"):
+        for name in ("release-platform-input.py", "components-release-integrity-check.py", "release-platforms.json", "release-signer.py",
+                     "publish-release.sh", "check-versioning.sh", "install.sh", "browser-host-release.py"):
             shutil.copyfile(Path(__file__).with_name(name), source / "scripts" / name)
         for args in (("init", "-q"), ("add", "."),
                      ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
@@ -1048,8 +1194,10 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         self.write_json(cids_path, cids)
         # RFC 8032 public verification key only; no signing seed or backend.
         did = signer.public_did(bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"))
-        stamps = {"MAINTAINER_DID": did, "SOURCE_CONNECT_TICKET": "public-ticket",
-                  "PUBLISHER_NODE_ID": "public-node", "PUBLISHER_GATEWAY": "https://staging.invalid",
+        node = "4" * 64
+        ticket = base64.b32encode(signer.json_bytes({"endpoints": [{"id": node, "addrs": []}]})).decode().lower().rstrip("=")
+        stamps = {"MAINTAINER_DID": did, "SOURCE_CONNECT_TICKET": ticket,
+                  "PUBLISHER_NODE_ID": node, "PUBLISHER_GATEWAY": "https://staging.invalid",
                   "IPNS_NAME": ""}
         stamps_path = self.root / "signing-stamps.json"
         self.write_json(stamps_path, stamps)
@@ -1061,9 +1209,10 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
                 patch.object(inputs.shutil, "disk_usage", return_value=SimpleNamespace(total=100 * 1024**3, free=50 * 1024**3))):
             context.start()
             self.addCleanup(context.stop)
+        (self.root / "work").mkdir()
         return SimpleNamespace(stage=stage, cids=cids, cids_path=cids_path, stamps=stamps,
                                stamps_path=stamps_path, template=template, blob_oid=blob_oid,
-                               output=self.root / "unsigned-input", platform=platform)
+                               output=self.root / "work/unsigned", platform=platform)
 
     def prepare_signing_fixture(self, fixture, **overrides):
         options = {"channel": "canary", "output": fixture.output, "preview_platform": fixture.platform}
@@ -1178,15 +1327,100 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
             f"{prefix}/git/blobs/{fixture.blob_oid}": {"sha": fixture.blob_oid, "encoding": "base64", "size": len(fixture.template),
                 "content": base64.b64encode(fixture.template).decode()},
         }
+        template_bytes = (inputs.SOURCE_ROOT / "components.json").read_bytes()
+        template_oid = hashlib.sha1(b"blob " + str(len(template_bytes)).encode() + b"\0" + template_bytes).hexdigest()
+        api[f"{prefix}/git/trees/{tree}"]["tree"].append({"path": "components.json", "type": "blob", "mode": "100644", "sha": template_oid})
+        api[f"{prefix}/git/blobs/{template_oid}"] = {"sha": template_oid, "encoding": "base64", "size": len(template_bytes),
+                                                     "content": base64.b64encode(template_bytes).decode()}
+        # Independent approval lives under protected repository ancestors and
+        # outside the system-temp candidate root. All identities are public
+        # fixtures; only the gh verification result is mocked below.
+        approval_temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent)
+        self.addCleanup(approval_temp.cleanup)
+        approval_root = Path(approval_temp.name).resolve()
+        workflow, workflow_tree = "9" * 40, "8" * 40
+        gh_path = Path(signer_spec.origin).resolve()
+        approval = {"schema": signer.APPROVAL_SCHEMA, "repository": signer.REPOSITORY,
+                    "source": manifest["source"],
+                    "workflow": {"commit": workflow, "tree": workflow_tree, "ref": "refs/heads/develop"},
+                    "delivery": fixture.stamps,
+                    "gh": {"path": str(gh_path), "sha256": signer.sha256(gh_path.read_bytes())}}
+        approval_path = approval_root / "approval.json"
+        approval_path.write_bytes(signer.json_bytes(approval))
+        approval_path.chmod(0o600)
+        approval_pin = {"path": str(approval_path), "sha256": signer.sha256(approval_path.read_bytes())}
+        run = {"id": 123, "run_attempt": 2, "head_sha": workflow, "head_branch": "develop",
+               "path": signer.PACKAGE_WORKFLOW, "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+               "repository": {"id": 1234, "full_name": signer.REPOSITORY},
+               "head_repository": {"id": 1234, "full_name": signer.REPOSITORY}}
+        artifact = {"id": 1, "name": f"release-mac-{commit}-1", "digest": "sha256:" + "6" * 64, "attempt": 1}
+        proof_artifact = {"id": 101, "name": f"release-proof-mac-{commit}-2", "digest": "sha256:" + "7" * 64, "attempt": 2}
+        receipt = {"schema": "elastos.release-platform-input/v1", "platform": fixture.platform, "version": manifest["version"],
+                   "source": {**manifest["source"], "clean": True},
+                   "producer": {"artifact": artifact, "run_id": run["id"], "workflow_commit": workflow, "attestation_attempt": 2},
+                   "files": {"artifacts/" + name: inputs.file_record(fixture.stage / "artifacts" / name) for name in fixture.cids}}
+        bundle_files = json.loads((self.bundles[fixture.platform] / "platform-input.json").read_text())["files"]
+        receipt["files"].update({name: bundle_files[name] for name in ("components.json", "components-template.json")})
+        # The production binder adds the proof to the staged layout prepare writes.
+        work = fixture.output.parent.resolve()
+        platform_input = work / "inputs" / fixture.platform / "N1"
+        platform_input.mkdir(parents=True)
+        (platform_input / "platform-input.json").write_bytes(signer.json_bytes(receipt))
+        shutil.copyfile(self.bundles[fixture.platform] / "components.json", platform_input / "components.json")
+        (platform_input.parent / "provenance.jsonl").write_bytes(b"{}")
+        self.write_json(work / "run.json", {"approval": approval_pin, "platforms": [fixture.platform], "input": "N1",
+                                            "run": str(run["id"]), "run_attempt": run["run_attempt"],
+                                            "receipts": [{"platform": fixture.platform, "artifact": artifact,
+                                                          "proof_artifact": proof_artifact}]})
+        provenance.bind(approval_path, approval, approval_pin["sha256"], work)
+        self.assertEqual((fixture.output / "signing-input.json").stat().st_mode & 0o777, 0o400)
+        manifest = signer.parse_json((fixture.output / "signing-input.json").read_bytes())
+        receipt_path = fixture.output / f"provenance/{fixture.platform}.receipt.json"
+        origin = {"id": run["id"], "head_sha": workflow, "head_branch": run["head_branch"]}
+        api.update({f"{prefix}/git/commits/{workflow}": {"sha": workflow, "tree": {"sha": workflow_tree}},
+                    f"{prefix}/actions/runs/{run['id']}": run,
+                    f"{prefix}/actions/runs/{run['id']}/artifacts?per_page=100&page=1":
+                        {"artifacts": [{**item, "expired": False, "workflow_run": origin} for item in (artifact, proof_artifact)]}})
+        for root in (tree, workflow_tree):
+            github, workflows = (hashlib.sha1((root + part).encode()).hexdigest() for part in (".github", "workflows"))
+            api.setdefault(f"{prefix}/git/trees/{root}", {"sha": root, "truncated": False, "tree": []})["tree"].append(
+                {"path": ".github", "type": "tree", "mode": "040000", "sha": github})
+            api[f"{prefix}/git/trees/{github}"] = {"sha": github, "truncated": False,
+                "tree": [{"path": "workflows", "type": "tree", "mode": "040000", "sha": workflows}]}
+            api[f"{prefix}/git/trees/{workflows}"] = {"sha": workflows, "truncated": False,
+                "tree": [{"path": "release-package.yml", "type": "blob", "mode": "100644", "sha": "7" * 40}]}
+
+        def verified_attestation(approved, package_run, path, bundle, scratch):
+            uri = f"https://github.com/{signer.REPOSITORY}/{signer.PACKAGE_WORKFLOW}@refs/heads/develop"
+            certificate = {"issuer": "https://token.actions.githubusercontent.com", "subjectAlternativeName": uri,
+                "buildSignerURI": uri, "buildSignerDigest": workflow, "runnerEnvironment": "github-hosted",
+                "sourceRepositoryURI": f"https://github.com/{signer.REPOSITORY}", "sourceRepositoryDigest": workflow,
+                "sourceRepositoryIdentifier": "1234", "sourceRepositoryRef": "refs/heads/develop",
+                "buildConfigURI": uri, "buildConfigDigest": workflow, "buildTrigger": "workflow_dispatch",
+                "runInvocationURI": f"https://github.com/{signer.REPOSITORY}/actions/runs/{run['id']}/attempts/2"}
+            return [{"verificationResult": {"signature": {"certificate": certificate}, "verifiedTimestamps": [{"type": "Tlog"}],
+                "statement": {"predicateType": "https://slsa.dev/provenance/v1", "subject": [{"digest": {"sha256": signer.sha256(path.read_bytes())}}]}}}]
+
         policy = {"repository": signer.REPOSITORY, "develop_oid": commit, "commit": commit, "tree": tree,
                   "version": "0.7.1", "channel": "canary", "publisher_did": fixture.stamps["MAINTAINER_DID"],
-                  "manifest_sha256": signer.sha256(signer.json_bytes(manifest)),
+                  "manifest_sha256": signer.sha256(signer.json_bytes(manifest)), "approval": approval_pin,
                   "max_file_bytes": 1024 * 1024, "max_snapshot_bytes": 8 * 1024 * 1024}
         snapshot = (self.root / "custodian-public-snapshot").resolve()
         snapshot.mkdir(mode=0o700)
-        prepared = signer.prepare(policy, fixture.output.resolve(), "signing-input.json", api.__getitem__, snapshot)
-        self.assertEqual(prepared.release, signer.json_bytes(manifest["release"]))
-        self.assertEqual(dict(prepared.files)["install.sh"].read_bytes(), rendered)
+        with patch.object(signer, "attestation_result", side_effect=verified_attestation) as verifier:
+            prepared = signer.prepare(policy, fixture.output.resolve(), "signing-input.json", api.__getitem__, snapshot)
+            self.assertEqual(prepared.release, signer.json_bytes(manifest["release"]))
+            self.assertEqual(dict(prepared.files)["install.sh"].read_bytes(), rendered)
+            self.assertEqual(verifier.call_count, 1)
+            self.assertEqual(verifier.call_args.args[0], approval)
+            self.assertEqual(verifier.call_args.args[1]["run_attempt"], proof_artifact["attempt"])
+            # A valid verified subject still fails if its receipt claims a
+            # foreign H/tree. The production provenance validator owns this gate.
+            receipt["source"]["tree"] = "f" * 40
+            receipt_path.unlink()
+            receipt_path.write_bytes(signer.json_bytes(receipt))
+            with self.assertRaisesRegex(ValueError, "attested platform source/version differs"):
+                signer.prepare(policy, fixture.output.resolve(), "signing-input.json", api.__getitem__, snapshot)
 
     def test_unsigned_handoff_refuses_existing_and_symlink_output(self):
         fixture = self.signing_fixture()
@@ -1656,7 +1890,8 @@ def load_tests(loader, tests, pattern):
     # Load each inert wrapper case into CI's existing entry point. The same
     # loader keeps unittest -k filters; explicit class/method selections retain
     # unittest's normal behavior and do not enter this module hook.
-    for name in ("release-upstream-input-test.py", "release-source-upstream-test.py"):
+    for name in ("release-upstream-input-test.py", "release-source-upstream-test.py", "release-provenance-seal-test.py",
+                 "browser-host-release-test.py", "browser-upstream-build-test.py"):
         sibling_spec = importlib.util.spec_from_file_location(
             name.replace("-", "_").removesuffix(".py"), Path(__file__).with_name(name))
         sibling = importlib.util.module_from_spec(sibling_spec)

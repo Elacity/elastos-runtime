@@ -6,6 +6,478 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+## [0.8.0-alpha.15]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- You can remove ElastOS with the installer:
+  `curl -fsSL https://elastos.elacitylabs.com/install.sh | bash -s -- --uninstall`.
+  It stops ElastOS and removes the program and its apps but keeps your identity
+  and files, so installing again continues where you were. Add `--remove-data`
+  to delete those too; keep your Recovery Kit first.
+- An owner who lost every passkey can recover their Home with their
+  Recovery Kit, even when guest accounts are off. Before, the sign-in screen
+  offered no way back. Choose "Recover this Home with your Recovery Kit" on the
+  sign-in screen, run the command it shows on the computer that runs Home
+  (`elastos identity arm-owner-recovery --origin … --rp-id …` with that page's
+  address filled in), then enter the code the command prints.
+- Browser installs and runs on Apple Silicon Macs and on Linux ARM64 computers
+  such as a Jetson. On Linux it needs a one-time host setup, which the
+  installer offers.
+
+### Changed
+
+- Browser is hidden on computers without a local Engine (anything other than
+  an Apple Silicon Mac or a Linux ARM64 computer such as a Jetson) for now.
+- On Linux, Browser asks you once to run its one-time host setup again after
+  this update. Run the command it shows; Browser then works as before.
+- Setup installs one Home; it no longer prints options for other setups.
+- The terminal Home no longer offers the old native Chat, which used a
+  different network from the Chat on the Desktop.
+- People "Message" in the terminal Home no longer opens that old Chat. In the
+  browser terminal it opens Chat on the Desktop at that person's conversation;
+  in a native terminal it says "Open Chat on the Desktop to message <name>."
+- `elastos --help` lists only the everyday commands. Commands for people who
+  run servers or publish releases (such as `serve`, `gateway`, `keys` and
+  `publish-release`) still work and still have their own `--help`.
+
+### Fixed
+
+- On Linux, Carrier sends one UDP datagram at a time. Some Wi-Fi drivers, such
+  as the Jetson's, dropped batched datagrams, which stalled connections, Chat
+  and downloads.
+- The terminal Home no longer quits with "403 Forbidden" after the first
+  action; you can run actions one after another.
+- In the terminal Inbox, direct messages and service requests say "Open Inbox
+  on the Desktop to answer this" instead of "no longer available".
+- In the terminal Apps tab, Enter on an app that only opens on the Desktop
+  says "Open <App> on the Desktop" instead of doing nothing.
+- Publishing a document (Documents Publish and `elastos share`) works again:
+  it copied a viewer file from a place the Documents app does not ship (#128).
+- Importing your Recovery Kit with a new passkey now keeps your admin role.
+  Before, an owner who added a guest passkey and imported their Kit stayed a
+  guest, and the Home was left with no admin.
+- Home no longer runs out of memory when it starts with Qwen2.5 1.5B on the
+  device. On an 8 GB Linux computer, Home used more than 7 GB within seconds of
+  starting, and the system stopped it.
+- On Linux, a reply right after Get no longer fails with "Not enough free
+  memory" when most of the memory in use is only cached files.
+- `elastos setup` on a Home that imported media tools before 0.8.0-alpha.9
+  stopped with "supplied media tools differ from the private imported pair".
+  On an installed signed release, setup now fetches and verifies the release's
+  media tools again and replaces the private copy, keeping your media limits.
+- While a model downloads, Marketplace and System no longer stop at "Status is
+  unavailable. Refresh to check before trying again." after one missed status
+  check. They show "Checking status…" and keep checking.
+- While a model is being set up after its download, Marketplace and System show
+  "Finishing setup…" instead of "Model service unavailable." with a Retry button.
+  If setup takes more than two minutes, Retry comes back.
+- When no model is ready yet and one is downloading, Assistant shows, for
+  example, "SmolLM2 is downloading (42%)" instead of "No model".
+- System > Shell and Marketplace > Home views no longer offer Terminal unless
+  developer mode is on. If Terminal was chosen and can no longer start, Home
+  opens the Desktop instead of showing an error after every reload.
+- A new Home no longer asks in Inbox for market-price access before you open
+  Wallet.
+- Assistant no longer shows a microphone button that cannot work inside Home.
+- The welcome sheet no longer talks about an "updated" Recovery Kit on a new
+  Home, and the lock screen shows the first letter of your name.
+- Apps that ask for the ElastOS version now get the same version that
+  `elastos --version` and System show.
+- A model download that stopped with "Model content could not be read" now
+  continues from where it stopped when you press Retry. Before, Retry started
+  the download again from 0%.
+- Right after Get, Assistant's model menu no longer lists the new model by its
+  file name, such as "qwen2.5-1.5b-instruct-q4-k-m-local". It shows the model's
+  name from the model list, such as "Qwen2.5 1.5B Instruct", as soon as Home
+  has finished setting it up, without pressing Refresh models.
+- When the installed version record is damaged, `elastos update` now tells you
+  to run `elastos update --force` even if it cannot reach the update source.
+  Before, a connection error hid that advice.
+- When an update is already running, started from a second System window,
+  System now says "Another update was started on this Home. Wait for it to
+  finish, then check the update again." When a later approval has replaced
+  yours and nothing is running, it says "This approval is no longer valid.
+  Check for the update again and approve it once more." Before, both said the
+  release was refused or verification failed.
+- If the connection drops while `curl … | bash` is still sending the
+  installer, nothing happens: no Runtime is stopped and no file changes. Before,
+  bash ran the part that had arrived, which could leave the Runtime stopped.
+- Runtime setup and the first Home started by the installer keep your own
+  temporary folder. Before, they got the installer's temporary folder, which it
+  deleted when it finished.
+- The installer downloads release data over HTTPS only and stops with a clear
+  message if a server redirects it to plain HTTP.
+- Running the installer again while Home is open now works: it closes Home,
+  installs, and opens Home again. Before, it stopped with "Recorded Runtime is
+  foreign or ambiguous".
+- On a Mac without Apple's Command Line Tools, the installer now stops before
+  downloading anything and says: run `xcode-select --install`, then run the
+  installer again. Before, it failed with "Invalid release-head.json format".
+- The installer no longer prints a raw JSON receipt near the end; it prints
+  "Protected roots are ready". A receipt for moved data stays in its backup
+  folder.
+- When setup or an update cannot reach the trusted source, ElastOS now says
+  so in plain words: it needs outgoing UDP to port 4433, so check the firewall
+  or network, then run `elastos setup` again.
+- With no model yet, Assistant now says "Get a model to start. Models run on
+  this Home." and shows a Get a model button that opens Models in Apps. Send
+  says the same when you point at it.
+- Assistant's other no-model message now names the real app: Apps
+  (Marketplace) → Models.
+- Pressing Stop in Assistant now shows "Stopped." instead of "Settlement
+  unknown".
+- If there is not enough free disk space to get a model, Apps now says so and
+  how much space the model needs, instead of "Model action could not be
+  confirmed". While a model waits for space, it shows how much it needs.
+- Assistant's description in Apps now reads "Chat with an AI model that runs
+  on this Home."
+
+### Removed
+
+- The sign-in screen no longer shows "Use an older security key". To replace a
+  passkey, restore your Recovery Kit and create a new one.
+- Protected content is not part of 0.8.0. Elacity Player is no longer listed in
+  Apps or search, Library no longer offers "Protect and List…", and Marketplace
+  no longer has a Media tab. They return in a later release.
+- `elastos agent`. Its app was retired earlier and the command could not work.
+- `elastos upgrade`; use `elastos update`. The `--no-confirm` spelling of
+  `--yes` on `elastos update` is gone too.
+- `elastos update --gateway` and `--no-p2p`, and the installer's IPFS-gateway
+  options (`--gateway`, `--head-cid`, `--publisher-node-id`). Updates come
+  only from your trusted source over Carrier; the installer downloads only
+  from its publisher address. `elastos update --head-cid` and `--rollback-to`
+  stay.
+- ElastOS no longer attaches downloads to GitHub Releases. Install with
+  `install.sh`; it and System fetch the signed release over Carrier.
+
+### Security
+
+- An installed Home runs a local capsule only when it comes from the signed
+  release or is signed by the release publisher. Homes built from source keep
+  running unsigned capsules. This needs no action after the update.
+- Recovery Kit import accepts only a Kit made on this Home for that account,
+  and refuses any import that would leave the Home without an admin passkey.
+- Requests and replies from other computers now have limits and deadlines:
+  whole-object fetch replies are limited to two at once and one per peer, and
+  a connection passing data through your computer closes after five minutes
+  with no data in either direction.
+
+### Developer detail
+
+- The local pre-push gate now runs the CI behaviour suite and the CI
+  source-gate checks before Cargo work. CI, `just test-behaviour` and the gate
+  share `scripts/test-behaviour.sh`; CI source-gate, `just verify` and the gate
+  share `scripts/test-source-gate.sh`. A failing check stops the push locally
+  and names the test. Run `just test-behaviour-inputs` once to install the
+  pinned Playwright inputs.
+- Removed `elastos identity passkey-hint` and the private credential-hint
+  sign-in path. Anonymous sign-in options still never list an account's
+  credentials.
+- The capsule catalogue marks `home-cli` not launchable unless the host
+  terminal policy allows it (`developer_mode = true` and closed guest
+  registration), so Home view candidates, System and Marketplace follow the same
+  rule; the active-shell summary already repairs a saved shell that is no longer
+  a candidate. Home host also resets a non-launchable saved shell to `home-gui`
+  through `POST /api/apps/home/active-shell`
+  (`scripts/home-shell-unavailable-shell-fallback-smoke.mjs`).
+- `protected_content = true` in the host `config.toml` (`elastos config set
+  protected_content true`; default off) is the one switch for protected content:
+  off, the catalogue drops `elacity-player` and reports
+  `policy.protected_content: false` (Marketplace hides Media), Library objects
+  lack the `protect` capability that "Protect and List…" requires, and
+  `object/publish` with `protection` is refused.
+- `GET /api/wallet/prices` raises the CoinGecko Inbox request only with
+  `request_access=true`, and not within 24 hours of a dismissal or rejection
+  (new `dismissed_at` on Inbox entries). Wallet sends it unless it was preloaded
+  by the rail (`preload=1`); opening the rail sends `elastos:wallet-refresh`,
+  which asks.
+- `model-management.js` adds the `finishing` phase (admitted, activation
+  pending, no dispatch-unavailable reason), which turns back into the
+  unavailable phase with Retry after 120 s. `model-selection.js` adds
+  `downloadPercent` and `downloadingModel`.
+- `components.json` keeps only the `home` profile and the `browser-host`
+  helper set that setup installs automatically; `demo`, `operator`,
+  `blockchain`, `agent-local-ai`, `public-gateway`, `minimal` and `full` are
+  removed. Developer components (GBA, site, tunnel, cloudflared, availability
+  and the DRM, rights, key, decrypt and custody providers) still publish with
+  each release and install with `elastos setup --with <name>`.
+- `--profile`, `--with` and `--without` are hidden from `elastos setup --help`
+  but still accepted; the help no longer names a nonexistent `chat` profile.
+- MyWebSite and Shared leave the home-cli for 0.8.0; `elastos site`, `share`
+  and `shares` stay operator commands. The Rust `demo` publish profile is gone;
+  `scripts/home-demo-local.sh` runs plain `setup`, and the operator smoke and
+  pinned-model proof use `--with`.
+- `elastos update` and System Update stage this profile change normally; only
+  the standalone frozen offline path refuses a `profiles` difference.
+- Home consumes `intent.json` by overwriting it with empty content instead of
+  deleting it; the session holds only read and write capabilities. A
+  regression test runs two intents against a provider that refuses delete.
+- The `chat` core action and `ManagedChat` launch are removed from Home.
+  `elastos chat` is hidden from help and kept only for the native chat smoke
+  scripts. `people-message:` emits a `switch-shell-open-target` host intent for
+  `chat-room` with `{conversation_id}` (the query People sends); the gateway
+  accepts only that bounded query for People hand-offs. Home and home-cli key
+  messaging on the contact's `conversation_id` (the People summary never had
+  `route`), and `run_chat_from_home` is removed.
+- `elastos agent`, `agent_cmd.rs` and the shell's `agent` command request are
+  removed. The `capsule` help, the serve banner, the first-run welcome and the
+  microVM publish hint (no `serve --forward` flag) name commands that exist.
+  `docs/COMMAND_MATRIX.md` drops `chat`, `agent` and seven nonexistent `room`
+  subcommands; GETTING_STARTED no longer suggests `elastos chat`.
+- Share bundles copy the viewer from its manifest `entrypoint`
+  (`browser/index.html` plus its assets) to the bundle root. The entrypoint
+  must be a relative path inside the viewer. Every path component is opened
+  with `openat(O_NOFOLLOW)` from the viewer directory's descriptor, so a
+  symlink anywhere in the copied tree, even one swapped in after listing, is
+  refused; the copy is capped at 256 files and 16 MiB. The Documents
+  publish test installs the real `capsules/documents` layout and checks the
+  published file list.
+- Startup restore and repair of complete local Content objects skip
+  Runtime-private `model-preparation`. Admitted models are verified at
+  admission, and this Home's Kubo does not hold them in 0.8.0; serving them to
+  peers is the holder role (#324). Before this, restore read each admitted
+  model file whole, then base64-encoded it and copied it through the provider
+  bridge, using about 8 times the file size.
+- Restore and repair now stream every local object from disk into Kubo,
+  unpinned, through a new Runtime-private ipfs-provider operation
+  (`runtime_add_local_object`). It uses the same parts and add options as
+  `add_directory`, so the CID matches the original import. The provider opens
+  the object below its data root and each file without following links
+  (regular files owned by this user only). Content pins only a matching CID:
+  repair pins the requested CID, and restore pins a CID with a Content receipt
+  that was not withdrawn by unpublish. Runtime hashes the files with a streamed
+  reader and sends only their paths and sizes, so memory stays the same
+  whatever the object's size.
+- model-provider's cgroup v2 memory check subtracts reclaimable file cache
+  (`active_file + inactive_file - file_dirty - file_writeback` in
+  `memory.stat`, never below zero) from `memory.current`.
+- `elastos update` checks the installed version before connecting to Carrier
+  (#156). Runtime admission and the release integrity checker now read one
+  platform table, `scripts/release-platforms.json` (`darwin-arm64` =
+  `aarch64-darwin`, `darwin-amd64` = `x86_64-darwin`). The checker no longer
+  uses `macos-arm64`, so it no longer skips the Mac entries Runtime admits.
+- Capsule admission (`Runtime::configure_capsule_admission`): a Home with an
+  installed signed release verifies each capsule against the signed release:
+  it trusts the default trusted source's publisher DID keys plus
+  `trusted_keys`, and admits a capsule without a publisher signature only from
+  its release install path when `components.json` matches the signed release
+  and the capsule's `.elastos-cid` and archive receipts match its entry.
+  Source and CI Homes keep developer mode explicitly (`setup-source-home.sh`,
+  `ci-installed-journeys.py`). The new Runtime applies this on its first start
+  and leaves `config.toml` unchanged.
+- `commit_recovered_root_reassignment` sets the importer's role inside the
+  same auth-state mutation: Admin if the importer or any replaced record of the
+  recovered principal or root was Admin, otherwise Guest. The commit fails, with
+  auth state unchanged, if no active admin passkey would remain. (#88)
+  Reassignment also requires that, when this Home already knows the recovered
+  principal or root, a stored `principal_root_protections` entry for that exact
+  principal/root has the Kit's `data_key_id` (the Kit unwraps the same data
+  key). The import route checks this before deriving keys, activating
+  protection or creating the recovery archive key, so a refusal writes only
+  the denial audit event. The Kit's archive is sealed inside the commit's auth
+  lock; if this commit created the recovery archive key and the auth file on
+  disk does not reference the new archive after a failure, the key is removed.
+- New `elastos identity arm-owner-recovery --origin --rp-id [--expires-in ≤900]`
+  stores the digest of a one-time code (`AuthState.owner_recovery`); the Home
+  must already have an admin. `POST /api/auth/owner-recovery/begin` and
+  `/complete` (header `x-elastos-owner-recovery`) register a passkey only when,
+  in one auth write, the code matches (constant-time), has not expired, and the
+  presented Kit belongs to an existing Admin record whose stored root protection
+  has the Kit's `data_key_id`. That write replaces the admin's records, revokes
+  their sessions, binds the new passkey as Admin, consumes the code and audits
+  `auth.owner.recovered`. Both routes share the passkey-registration rate
+  limit, and each checks the code (armed, unexpired, constant-time match)
+  before any password derivation or Kit work; an unarmed or expired Home
+  refuses without writing, and the fifth wrong code burns the armed code. A Kit
+  refusal leaves auth state and the credential store unchanged. The credential
+  is written just before the auth write; a crash between them leaves an orphan
+  credential that a retry with the same passkey reconciles. (#88)
+- Assistant empty state: `showEmptyState()` builds its lines with DOM nodes;
+  `paintEmptyModelHint()` shows the no-model line and a `data-agent-get-model`
+  button (`openModelsFromAgent()`, Marketplace `category: models`) only after a
+  successful offers read returned none (`endpointState: "no-model-offers"`) and
+  no model is downloading. A failed read or an unavailable chosen model beside
+  others keeps the usual hero and model menu. The harness refreshes it on
+  `assistant:live-models` via `refreshEmptyModelHint()`. `syncAgentSendButton`
+  titles a disabled Send "Get a model to start".
+- `streamChatViaContract` results carry `stopRequested`. A user Stop that the
+  engine settles as `settlement_unknown` shows `STOPPED_STATUS`; the turn
+  manifest keeps `settlement_unknown`.
+- Preparation `use` refused by `require_space` now reports the model's whole
+  unwritten size (`NotEnoughFreeSpace { needed: unwritten }`), not the zero-byte
+  probe. The capsule invoke gateway maps it to HTTP 507
+  `not_enough_free_space` with a plain message; `_shared/model-management.js`
+  shows that message, leaves Get available and skips reconcile. The
+  `capacity_pending` phase text is built by `capacityText()` with the remaining
+  bytes.
+- `Commands` in `main.rs` marks `serve`, `publish-release`, `content`,
+  `collaboration-config`, `protected-content-config`, `node`, `gateway`,
+  `sign-payload`, `keys`, `tls` and `emergency` with `hide = true`;
+  `docs/COMMAND_MATRIX.md` lists them. Removed the `Upgrade` variant, the
+  `no-confirm` alias, and the retired hidden `publish-release --key` /
+  `--allow-no-bootstrap` flags with their `PublishReleaseOptions` fields. The
+  `just publish*` recipes, which always failed on the retired `--key`, are gone.
+- `get_runtime_info` in `resource_bridge.rs` (both the local and the attached
+  bridge) returns `ELASTOS_VERSION` from `build.rs` instead of
+  `CARGO_PKG_VERSION`.
+- `carrier.rs` reads peer lines through `read_peer_line` (`take(max + 1)`
+  under a timeout). Caps come from the protocol limits: `handle_file_stream`
+  takes the I/O bridge line limit or one `GOSSIP_WIRE_MESSAGE_MAX_BYTES`
+  message plus 64 KiB of envelope, within 10 s; `gossip_pull` replies take
+  `GOSSIP_TOPIC_BUFFER_MAX_BYTES` plus envelope; open-ended provider replies
+  take one `MAX_CARRIER_OBJECT_IMPORT_BYTES` object as base64 within an hour
+  and share a 256 MiB in-flight budget (`CARRIER_REPLY_BUDGET`; refused past
+  it); whole-object content fetch replies keep no size cap (the object is one
+  JSON line) but run two at once and one per peer;
+  bounded reads keep 128 KiB and now also get the route deadline on peer-DID
+  routes. `operator_control.rs` reads requests (before signature checks) at
+  64 KiB / 10 s and replies at 1 MiB / 1 h. Relays in `carrier.rs`,
+  `carrier_engine_media.rs` and `carrier_engine_binding.rs` close after 5 min
+  with no bytes either way (`RelayActivity`), and stream acks have deadlines.
+- Model preparation keeps its stage after any `MetadataRead`, `WeightsRead` or
+  `Capacity` failure, not only after a read typed as in transit (`Io`). A part
+  that a holder refuses or answers malformed is rejected before it is written,
+  so the staged prefix stays valid; the next Use re-hashes it and continues
+  after the last whole part. Integrity, local storage, authority, policy and
+  Cancel still remove the stage. Seen on a Jetson running alpha.14: a read that
+  ended as a `Provider` error at 78.7% sent the next Retry back to 0%.
+- Assistant lists a Runtime-admitted model offer (`model:<sha256>`) only through
+  its catalogue row (title and CID); `liveMenuOffers()` leaves it out of the raw
+  offer rows, which could not be chosen anyway. While Assistant is open
+  (`watchLiveModels`), `agent-live.js` reads the catalogue again every 3 s when
+  such an offer is listed but its catalogue row is not yet bound to it
+  (`dispatch_ready: false`, for example the first read after activation), at
+  most 10 times, and while a model downloads with nothing selectable. One timer
+  serves both, it skips while a read is in flight, and closing Assistant stops
+  it. Every probe result is published as `assistant:live-models`; the harness
+  updates the chip and an open menu from it, keeping keyboard focus on a row or
+  menu action. Before, an open menu kept the earlier read while the chip changed.
+- Owner update refusals caused by another owner action are typed. The System
+  update route answers `update_controller::UpdateInProgress` (owner-action lock
+  held, `WouldBlock` only, or a different request queued or active) with 423,
+  and `ApprovalReplaced` (a later approval replaced the receipt and nothing is
+  queued or active) with 410; `system.js` shows the plain messages above. Other
+  lock I/O failures and refusals keep 409. Covered by
+  `system_update_refuses_a_concurrent_tab_and_a_replaced_approval`.
+- `scripts/install.sh` runs every action inside `main`, called on its last
+  line, so bash parses the whole script before acting. `install-bootstrap-test.py`
+  feeds the installer truncated at each step and after the Runtime stop, and
+  asserts no request, output, Runtime call or HOME change.
+- `install.sh` keeps its scratch directory in `INSTALL_SCRATCH` and never
+  assigns `TMPDIR`, so `elastos setup`, Home and the update controller's saved
+  launch environment see the caller's `TMPDIR`. Tests: a policy check, and the
+  fixture's `setup` stub records the `TMPDIR` it receives.
+- `install.sh` fetches through `fetch_url`, which runs curl with
+  `--proto '=https' --proto-redir '=https' --tlsv1.2`. Only an exact
+  `http://127.0.0.1`, `http://[::1]` or `http://localhost` origin (optional
+  port, no userinfo) may use HTTP, and such a fetch follows no redirect
+  (`--max-redirs 0`). curl's exit 1 (protocol refused) names the URL. The
+  bootstrap fixture's curl stand-in requires these flags on every request;
+  real-curl tests cover userinfo tricks and HTTP and HTTPS redirects to plain HTTP.
+- Removed the web transport override from the Runtime update flow (gateway
+  head discovery, `/ipfs/<cid>` fetches, the gateway release-manifest path and
+  the third-party IPFS host list) and the installer's CID-gateway bootstrap
+  (`ipfs_fetch`, `ELASTOS_IPFS_GATEWAYS`) with its docs and fixture transport.
+  Dead installer values (`PUBLISHER_HASH`, `LAST_SUCCESS_GATEWAY`) are gone.
+- The installer's identity-checked stop recognises this installation's Home:
+  `<bin> home …` is a Runtime command, and when its parent is this data
+  root's `update-controller/runtime __update-controller --receipt …`, the
+  controller is stopped first so it does not restart Home. Real-process fixture
+  test: `test_open_home_stops_through_its_update_controller`.
+- `install.sh` still needs python3 to check the Ed25519 signature: stock macOS
+  `openssl` (LibreSSL 3.3.6) has no Ed25519. Its preflight now runs
+  `python3 -c ''` and, if the macOS stub (or any broken python3) cannot run,
+  stops with one next step before the first request. Test:
+  `test_python3_that_cannot_run_stops_before_any_download_with_one_next_step`.
+- `install.sh` discards `principal-root-upgrade`'s stdout receipt (written to
+  the backup directory when objects move) and prints one line. The command's
+  JSON output is unchanged for the source-restart scripts that parse it.
+- Setup, Home capsule launch, update refresh and the supervisor install every
+  component only over Carrier by its signed `release_path`; the HTTP
+  `{gateway}/ipfs/<cid>` content path (`download_streaming`,
+  `build_gateway_list`, `ElastosFetchPath`, the update HTTP download helpers)
+  is removed. Admission refuses a component without a non-blank `release_path`
+  (`component_without_signed_release_path_is_refused_before_fetch`). sources.json
+  `gateways` now serves only Carrier ticket refresh.
+- `CarrierClient::connect_trusted_source` wraps a failed connection in that
+  plain message; the per-route ticket and fallback errors stay in the cause
+  chain (`{:#}`). Test: `unreachable_trusted_source_names_the_network_fix`.
+- `install.sh --uninstall [--remove-data]` (#315) first refuses, before
+  stopping anything, a data directory that is a link, belongs to another user,
+  is not named `elastos` or is `$HOME` or one of its parents (compared by device
+  and inode, so aliases and case variants count), and a release entry that is a
+  link. It then stops the installation with the installer's identity-checked
+  `installer_runtime_control`, takes the Runtime writer's
+  `.elastos.install.lock` and refuses while it is held or an update journal
+  exists. It removes the binary and the release-owned data entries (`bin`,
+  `capsules`, `libexec`, `tools`, `model-catalog.json`, `components.json`,
+  `sources.json`, `installation`, `update-controller`); with `--remove-data` it
+  removes the whole data directory instead, without following links. It
+  downloads nothing and needs no trust anchors. `docs/INSTALL.md` now lists the
+  macOS and Linux paths and documents removal.
+- `docs/VERSIONING.md` "Withdraw a bad release" (#321): publish N+2 from the
+  last good source, announce on #93, point affected Homes to Undo; the seed
+  keeps N pinned. Decision: no withdrawn-versions list in the signed head for
+  0.8.0; revisit with #157 and #213.
+- The local pre-push gate refuses what CI refuses: its Cargo calls use
+  `RUSTFLAGS=-D warnings` and drop `CARGO_ENCODED_RUSTFLAGS`, clippy covers
+  the touched packages and their reverse dependencies in each workspace, and a
+  change to `scripts/release-*`, `scripts/install.sh` or
+  `scripts/publish-release.sh` runs `release-platform-input-test.py` and
+  `ci-release-policy-test.py`. Documentation-only changes keep fmt and git
+  checks without rebuilding unrelated workspaces (#319). The installed Home
+  journey waits the model-preparation window for the first engine refusal.
+- The `custody-harness-smoke` path filter and the Linux holder canary's paths
+  now include every input their jobs build or call (setup and restart scripts,
+  `chain-provider`, `elastos-runtime`, the workspace manifest and lock,
+  `rust-toolchain.toml`, the Cargo configuration it reads, `components.json`,
+  the workflow, the canary's `localhost-provider` capsule, hop observer and
+  Kubo seed scripts, and the crates each capsule names by path).
+  `ci-release-policy-test.py` follows each job's shell scripts, Dockerfiles,
+  Cargo configuration, `-p` capsule packages and path dependencies, and fails
+  when a called input is outside the filter (#317).
+- `ci.yml` no longer publishes a GitHub Release or uploads `elastos-runtime-*`
+  packages on tags, `main` or dispatch: those unsigned assets were a second
+  channel beside the signed Carrier release. CI still packages ARM64 for the
+  Jetson compatibility gate. The nine required checks are unchanged.
+- New `update-hop-linux` CI job proves install and update on
+  Linux x86-64 as `source-home-macos` does on Mac: the pinned published release
+  (0.8.0-alpha.8, which carries x86_64-linux artifacts) installs with its own
+  `install.sh`, its System installs this source and Home reconnects, this
+  source's System refuses a tampered offer and applies the next release, the
+  CLI refusals (wrong signers, platform, version, tampered binary) leave Homes
+  unchanged, and `update --rollback-to` undoes the hop. `update-hop-compare.py`
+  runs CLI fixtures natively on Linux (`HOME/.local/share/elastos`, ELF
+  admission, `xdg-open` fixture opener, Runtime's platform aliases). The seed's
+  HTTP route does not serve every Linux artifact, so its new
+  `install-previous-release` installs a disposable Home with the published
+  `install.sh`, rolls it back over Carrier to the pinned head (`head_cid`, new
+  in `update-hop-previous-release.json`) and copies the release out under its
+  signed hashes, rebuilding capsule archives as releases build them. On Linux
+  and Mac, the `check-result` verdict in the job summary also requires and
+  names the next release, the refused tampered offer and each CLI refusal (#320).
+- Linux Browser's prepared rootfs pool names each copy by the admitted rootfs
+  hash from the image manifest. Launch boots only copies of the current image
+  and removes the rest, so an image update or Undo never boots the previous
+  rootfs with the new kernel; a refill that sees the image change discards its
+  copy (#307).
+- `elastos setup` on Linux writes a per-Home TURN credential to the owner-only
+  `runtime-turn/turn-credentials.env` (kept on later runs), so a fresh
+  Linux/Jetson Home gets the session-local TURN configuration the crosvm
+  launcher requires (#307).
+- Browser TURN relays only to its own relay address on both hosts: coturn
+  denies loopback, private ranges and every other peer. On Mac, a loopback relay
+  keeps loopback peers, and the media bridge closes any guest TURN stream that
+  addresses a peer outside the session relay ports or asks for a TCP relay
+  (#307).
+- Linux Browser network setup adds a per-slot output rule: UDP from the TURN
+  relay ports reaches only the slot's TURN ports. coturn's RFC 6062 TCP
+  relays are off on both hosts. `check` refuses a setup receipt without the
+  rule, so Browser asks to re-run the root setup once (#307).
+
 ## [0.8.0-alpha.14]
 
 Test-channel release. Signed releases show these notes in System before you update.

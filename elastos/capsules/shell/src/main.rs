@@ -571,20 +571,6 @@ enum CommandRequest {
         history_limit: Option<usize>,
     },
 
-    #[serde(rename = "agent")]
-    Agent {
-        #[serde(default)]
-        nick: Option<String>,
-        #[serde(default)]
-        channel: String,
-        #[serde(default)]
-        backend: String,
-        #[serde(default)]
-        connect: Option<String>,
-        #[serde(default)]
-        respond_all: bool,
-    },
-
     #[serde(rename = "gateway")]
     Gateway {
         #[serde(default)]
@@ -707,24 +693,6 @@ fn command_spec(cmd: &CommandRequest) -> Result<CommandSpec, String> {
                 "no_history": no_history,
                 "no_sync": no_sync,
                 "history_limit": history_limit,
-            }),
-        },
-        CommandRequest::Agent {
-            nick,
-            channel,
-            backend,
-            connect,
-            respond_all,
-        } => CommandSpec {
-            target: "agent".into(),
-            lifecycle: CommandLifecycle::Interactive,
-            interactive_target: false,
-            target_config: serde_json::json!({
-                "nick": nick,
-                "channel": channel,
-                "backend": backend,
-                "connect": connect,
-                "respond_all": respond_all,
             }),
         },
         CommandRequest::Gateway {
@@ -1094,7 +1062,6 @@ fn dispatch_command(api: &str, token: &str, command_json: &str) {
                 "shell: command '{}' requires a published capsule named '{}' in components.json",
                 match &cmd {
                     CommandRequest::Chat { .. } => "chat",
-                    CommandRequest::Agent { .. } => "agent",
                     CommandRequest::Gateway { .. } => "gateway",
                     CommandRequest::Share { .. } => "share",
                     CommandRequest::Open { .. } => "open",
@@ -1431,20 +1398,6 @@ mod tests {
     }
 
     #[test]
-    fn command_spec_for_agent() {
-        let cmd = CommandRequest::Agent {
-            nick: None,
-            channel: "#general".into(),
-            backend: "local".into(),
-            connect: None,
-            respond_all: false,
-        };
-        let spec = command_spec(&cmd).unwrap();
-        assert_eq!(spec.target, "agent");
-        assert_eq!(spec.lifecycle, CommandLifecycle::Interactive);
-    }
-
-    #[test]
     fn command_spec_for_gateway_public() {
         let cmd = CommandRequest::Gateway {
             addr: "0.0.0.0:8090".into(),
@@ -1566,13 +1519,14 @@ mod tests {
     }
 
     #[test]
-    fn config_for_capsule_agent_local_keeps_non_target_config_empty() {
-        let cmd = CommandRequest::Agent {
+    fn config_for_capsule_non_target_config_stays_empty() {
+        let cmd = CommandRequest::Chat {
             nick: Some("bot".into()),
-            channel: "#general".into(),
-            backend: "local".into(),
             connect: None,
-            respond_all: false,
+            standalone: false,
+            no_history: false,
+            no_sync: false,
+            history_limit: None,
         };
         let spec = command_spec(&cmd).unwrap();
 
@@ -1582,19 +1536,20 @@ mod tests {
 
     #[test]
     fn config_for_capsule_target_merges_cli_payload() {
-        let cmd = CommandRequest::Agent {
+        let cmd = CommandRequest::Chat {
             nick: Some("bot".into()),
-            channel: "#general".into(),
-            backend: "local".into(),
             connect: Some("ticket-1".into()),
-            respond_all: true,
+            standalone: false,
+            no_history: true,
+            no_sync: false,
+            history_limit: Some(5),
         };
         let spec = command_spec(&cmd).unwrap();
-        let cfg = config_for_capsule(&cmd, &spec, "agent", true);
+        let cfg = config_for_capsule(&cmd, &spec, "chat", true);
         assert_eq!(cfg["nick"], "bot");
-        assert_eq!(cfg["channel"], "#general");
-        assert_eq!(cfg["respond_all"], true);
-        assert_eq!(cfg["backend"], "local");
+        assert_eq!(cfg["connect"], "ticket-1");
+        assert_eq!(cfg["no_history"], true);
+        assert_eq!(cfg["history_limit"], 5);
     }
 
     #[test]

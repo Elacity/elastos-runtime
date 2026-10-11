@@ -7,6 +7,8 @@ mod error;
 mod free_space;
 pub mod localhost;
 mod manifest;
+#[cfg(unix)]
+pub mod process_lifetime;
 pub mod protected_content;
 pub mod timestamp;
 mod types;

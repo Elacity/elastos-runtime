@@ -17,12 +17,13 @@ import {
   abortLiveChatStream,
   detachLiveChatStream,
   selectedLiveOffer,
+  liveDownloadingModel,
   unresolvedModelTurn,
 } from "./agent-live.js";
 import { stampMessageNode, contentHash, newTurnId, createTurnManifest, turnStorePut, turnStorePatch, turnStoreGet, TurnState, cheapTurnSnapshot, resolveReasoningPolicy } from "./agent-context.js";
 import { setAgentComposerProcessing } from "./agent-shelf.js";
 import { renderHarnessPage } from "./agent-configure.js";
-import { postToHome, openInboxFromAgent } from "./harness-host.js";
+import { postToHome, openInboxFromAgent, openModelsFromAgent } from "./harness-host.js";
 import {
   createProgressController,
   snapshotProgress,
@@ -862,6 +863,33 @@ export function drainFollowUpQueue() {
   startTurnForPrompt(next.text);
 }
 
+/** Without a model the hero names the one step that unlocks chat. Only a
+ * successful read that found no usable model may say so: an unprobed or failed
+ * read, or a chosen model that is unavailable beside others, keeps the usual
+ * hero and the model menu path. */
+function paintEmptyModelHint(empty) {
+  const noModel = getLiveInferenceState().endpointState === "no-model-offers" && !liveDownloadingModel();
+  empty.querySelector(".agent-harness-empty-sub").textContent = noModel ? NO_MODEL_STATUS : "Private on this Home";
+  let get = empty.querySelector("[data-agent-get-model]");
+  if (noModel && !get) {
+    get = document.createElement("button");
+    get.type = "button";
+    get.className = "agent-harness-empty-action";
+    get.dataset.agentGetModel = "";
+    get.textContent = "Get a model";
+    get.addEventListener("click", () => openModelsFromAgent());
+    empty.append(get);
+  } else if (!noModel) {
+    get?.remove();
+  }
+}
+
+/** The harness calls this when the model list changes. */
+export function refreshEmptyModelHint() {
+  const empty = document.querySelector(".agent-harness-empty");
+  if (empty) paintEmptyModelHint(empty);
+}
+
 export function showEmptyState() {
   const column = host.streamEl();
   const viewport = host.streamViewportEl();
@@ -877,12 +905,13 @@ export function showEmptyState() {
   const empty = document.createElement("div");
   empty.className = "agent-harness-empty";
   empty.setAttribute("role", "status");
-  const sub = "Private on this Home";
-  empty.innerHTML =
-    `<p class="agent-harness-empty-greeting"></p>` +
-    `<p class="agent-harness-empty-sub"></p>`;
-  empty.querySelector(".agent-harness-empty-greeting").textContent = greeting;
-  empty.querySelector(".agent-harness-empty-sub").textContent = sub;
+  for (const [className, text] of [["agent-harness-empty-greeting", greeting], ["agent-harness-empty-sub", ""]]) {
+    const line = document.createElement("p");
+    line.className = className;
+    line.textContent = text;
+    empty.append(line);
+  }
+  paintEmptyModelHint(empty);
   /* Viewport — not the dock-width column — so the hero sits in true room center. */
   viewport.append(empty);
 }
@@ -1542,8 +1571,10 @@ export function stopAgentStream({ keepPartial = true, drainQueue = false, cancel
   }
 }
 
+export const NO_MODEL_STATUS = "Get a model to start. Models run on this Home.";
 export const NO_MODEL_OFFER_STATUS =
-  "No model offer on this Home — install a model provider (Store · Services) to chat";
+  "No model on this Home yet. Open Apps (Marketplace) → Models to get one.";
+export const STOPPED_STATUS = "Stopped.";
 
 export function canSubmitNewTurn() {
   const turn = ctx.sessions.find((s) => s.id === ctx.activeSessionId)?.lastTurn;
@@ -2519,6 +2550,12 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       const partial = materializeCanonical();
       commitAgentReply(session, partial.answer, partial.reasoning, { partial: true, turn: result.turnManifest });
       answerRow?.classList.remove("is-streaming");
+      if (result.stopRequested && result.settlementUnknown) {
+        /* Local engines cannot confirm a stop; the turn keeps its unknown state. */
+        progress.dispatch({ type: "GENERATION_STOPPED" });
+        setStreamStatus(STOPPED_STATUS);
+        return;
+      }
       progress.dispatch({ type: "GENERATION_ERROR", text: "Settlement unknown" });
       showRunSettlement(result.turnManifest);
       return;

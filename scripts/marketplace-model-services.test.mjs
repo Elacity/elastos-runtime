@@ -145,3 +145,22 @@ test("a signed model shows its own description and never Runtime's generic capsu
     [undefined, "Language model for Assistant."],
   ]) assert.equal(context.capsuleToApp({ ...model, description }, new Map(), []).description, expected);
 });
+
+test("the catalog's protected-content policy decides whether Marketplace shows Media", async () => {
+  const source = readFileSync(new URL("../capsules/marketplace/browser/marketplace.js", import.meta.url), "utf8");
+  for (const enabled of [false, true]) {
+    const mediaNav = { hidden: false };
+    const context = publisherFixture();
+    context.state.destination = "media";
+    context.document = { querySelectorAll: selector => selector === '[data-destination="media"]' ? [mediaNav] : [] };
+    context.categories = [];
+    context.selectDestination = id => { context.state.destination = context.normalizeDestination(id); };
+    vm.runInContext(source.slice(source.indexOf("  function syncProtectedContent()"), source.indexOf("  function destinationTitle(")), context);
+    context.fetch = async url => ({ ok: true, json: async () => url.endsWith("catalog")
+      ? { model_catalog_state: "unconfigured", capsules: [], policy: { protected_content: enabled } } : { interfaces: [] } });
+    await context.loadCatalogData();
+    context.syncProtectedContent();
+    assert.equal(mediaNav.hidden, !enabled);
+    assert.equal(context.state.destination, enabled ? "media" : "discover");
+  }
+});

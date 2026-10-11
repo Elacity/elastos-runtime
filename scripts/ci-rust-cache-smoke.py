@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """Prove Rust dependency cache reuse and source/release-stamp invalidation."""
 import argparse
-from contextlib import contextmanager
 import hashlib
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
@@ -13,61 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from threading import Thread
 import time
-
-
-@contextmanager
-def read_only_gha(report):
-    """Use sccache 0.18's GHA v2 RPC with a private, always-empty backend."""
-    lookup = "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
-    requests = []
-
-    class Handler(BaseHTTPRequestHandler):
-        def setup(self):
-            self.request.settimeout(5)
-            super().setup()
-
-        def log_message(self, _format, *_args):
-            pass
-
-        def respond(self):
-            requests.append((self.command, self.path))
-            length = int(self.headers.get("Content-Length", "0"))
-            valid = (self.command == "POST" and self.path == lookup
-                     and self.headers.get("Content-Type") == "application/protobuf"
-                     and self.headers.get("Authorization") == "Bearer ci-cache-probe"
-                     and 0 < length <= 4096)
-            if valid:
-                valid = len(self.rfile.read(length)) == length
-            # Locked opendal-service-ghac 0.58.1: bool ok is protobuf field 1.
-            body = b"\x08\x00" if valid else b""
-            self.send_response(200 if valid else 403)
-            self.send_header("Content-Type", "application/protobuf")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            if not valid:
-                report.setdefault("unexpected_remote_requests", []).append(self.path)
-
-        do_POST = do_GET = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = respond
-
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    worker = Thread(target=server.serve_forever, daemon=True)
-    worker.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_port}/"
-    finally:
-        server.shutdown()
-        worker.join(timeout=5)
-        server.server_close()
-        report["remote_lookup_requests"] = sum(item == ("POST", lookup) for item in requests)
-        report["remote_write_requests"] = sum(item != ("POST", lookup) for item in requests)
-        report["isolated_remote_stopped"] = not worker.is_alive()
-        if worker.is_alive():
-            raise RuntimeError("owned GHA fixture thread did not exit")
-    if not report["remote_lookup_requests"] or report["remote_write_requests"] or report.get("unexpected_remote_requests"):
-        raise RuntimeError("expected remote cache reads and zero remote writes")
 
 
 def cleanup_group(child):
@@ -160,6 +104,11 @@ def library_hashes(target):
     return result
 
 
+def client_environment():
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith(("SCCACHE_", "CARGO_", "ACTIONS_")) and k != "OPENDAL_TEST"}
+
+
 def probe(args, report):
     if os.name != "posix":
         raise RuntimeError("this probe uses a private POSIX Unix socket")
@@ -170,7 +119,7 @@ def probe(args, report):
             raise RuntimeError(f"{name} executable is required")
         # Preserve Rustup proxy basenames instead of resolving their symlinks.
         tools[name] = os.path.abspath(found)
-    with tempfile.TemporaryDirectory(prefix="ci-rust-cache-", dir="/tmp") as directory, read_only_gha(report) as gha_url:
+    with tempfile.TemporaryDirectory(prefix="ci-rust-cache-", dir="/tmp") as directory:
         root = Path(directory)
         report["fixture_dir"] = str(root)
         target = root / "target"
@@ -180,18 +129,11 @@ def probe(args, report):
         shutil.copyfile(Path(__file__).resolve().parents[1] / "rust-toolchain.toml",
                         root / "rust-toolchain.toml")
         (root / "sccache.json").write_text("{}\n")
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("SCCACHE_", "CARGO_")) and k != "OPENDAL_TEST"}
+        env = client_environment()
         env.update(SCCACHE_DIR=str(root / "cache"), SCCACHE_CACHE_SIZE="64M",
                    SCCACHE_CONF=str(root / "sccache.json"),
                    SCCACHE_CACHED_CONF=str(root / "sccache-cached.toml"),
-                   SCCACHE_SERVER_UDS=str(uds), SCCACHE_GHA_ENABLED="on",
-                   SCCACHE_MULTILEVEL_CHAIN="disk,gha", SCCACHE_LOCAL_RW_MODE="READ_WRITE",
-                   SCCACHE_GHA_RW_MODE="READ_ONLY", SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY="l0",
-                   ACTIONS_CACHE_SERVICE_V2="1", GITHUB_SERVER_URL="https://github.com",
-                   ACTIONS_RESULTS_URL=gha_url, ACTIONS_CACHE_URL=gha_url,
-                   ACTIONS_RUNTIME_TOKEN="ci-cache-probe", NO_PROXY="127.0.0.1", no_proxy="127.0.0.1",
-                   SCCACHE_NO_DAEMON="1",
+                   SCCACHE_SERVER_UDS=str(uds), SCCACHE_NO_DAEMON="1",
                    SCCACHE_IDLE_TIMEOUT="60", CARGO_HOME=str(root / "cargo-home"),
                     CARGO_TARGET_DIR=str(target), CARGO_BUILD_BUILD_DIR=str(build), CARGO_INCREMENTAL="0",
                    RUSTC=tools["rustc"], RUSTC_WRAPPER=tools["sccache"],
@@ -287,13 +229,6 @@ def probe(args, report):
                             if (hashes[library] != previous_hashes[library]) != (library == changed):
                                 raise RuntimeError(f"{name}: unexpected {library} rlib hash change")
                     previous_hashes = hashes
-                fields = ("name", "hits", "misses", "writes", "write_failures")
-                report["cache_levels"] = [dict(zip(fields, (level[field] for field in fields)))
-                                           for level in after["multi_level"]]
-                expected_levels = [dict(zip(fields, values)) for values in (
-                    ("L0 (disk)", 10, 6, 6, 0), ("L1 (ghac)", 0, 6, 0, 0))]
-                if report["cache_levels"] != expected_levels:
-                    raise RuntimeError("expected writable disk reuse beside read-only GHA")
             finally:
                 try:
                     run([tools["sccache"], "--stop-server"], root, env, timeout=10)

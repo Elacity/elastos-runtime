@@ -51,6 +51,7 @@ pub(crate) use gateway_browser::gateway_browser_operator::{
     register_browser_operator_sessions, BrowserOperatorService,
 };
 pub(crate) use gateway_browser::gateway_browser_remote::invoke as invoke_remote_browser_engine;
+pub(crate) use gateway_browser::gateway_browser_remote::provider_transport_ready as browser_remote_provider_transport_ready;
 #[path = "gateway_capsule_catalog.rs"]
 mod gateway_capsule_catalog;
 #[path = "gateway_collaboration_presence.rs"]
@@ -636,6 +637,14 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/auth/passkey/register/complete",
             post(super::auth_gateway::passkey_register_complete)
                 .layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/auth/owner-recovery/begin",
+            post(super::auth_gateway::owner_recovery_begin),
+        )
+        .route(
+            "/api/auth/owner-recovery/complete",
+            post(super::auth_gateway::owner_recovery_complete),
         )
         .route(
             "/api/auth/passkey/authenticate/begin",
@@ -1571,9 +1580,6 @@ fn home_error_response(err: anyhow::Error) -> Response {
 #[cfg(test)]
 #[path = "gateway_browser_tests.rs"]
 mod gateway_browser_tests;
-#[cfg(test)]
-#[path = "gateway_legacy_passkey_tests.rs"]
-mod gateway_legacy_passkey_tests;
 #[cfg(test)]
 #[path = "gateway_tests/mod.rs"]
 mod gateway_tests;

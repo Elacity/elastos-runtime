@@ -32,11 +32,10 @@ Usage:
 What it does:
   1. Builds the repo-local elastos binary (unless --skip-build)
   2. Installs into a clean temp home using the canonical maintainer DID + gateway
-  3. Generates a local override manifest for the current demo profile
+  3. Generates a local override manifest for Home
   4. Reuses host-installed `crosvm` / `vmlinux` when available
-  5. Runs `setup --profile demo`
-  6. Stages a tiny MyWebSite demo page
-  7. Launches repo-local `elastos` into Home (unless --prepare-only)
+  5. Runs `setup`
+  6. Launches repo-local `elastos` into Home (unless --prepare-only)
 
 When it finishes preparing, it prints the demo HOME path so you can reuse it.
 EOF
@@ -78,7 +77,6 @@ fi
 
 XDG_DATA_HOME="${DEMO_HOME}/xdg-data"
 ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos"
-SITE_SRC="${DEMO_HOME}/demo-site"
 
 case "$(uname -m)" in
     x86_64)
@@ -249,31 +247,15 @@ with open(output_path, "w", encoding="utf-8") as f:
 PY
 cp "$LOCAL_MANIFEST" "$XDG_DATA_HOME/elastos/components.json"
 
-echo "[home-demo-local] setup demo profile"
+echo "[home-demo-local] setup Home"
 HOME="$DEMO_HOME" \
 XDG_DATA_HOME="$XDG_DATA_HOME" \
 ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \
-"$ROOT/elastos/target/debug/elastos" setup --profile demo
+"$ROOT/elastos/target/debug/elastos" setup
 test -x "$ELASTOS_DATA_DIR/capsules/home-cli/bin/home-cli" || {
     echo "[home-demo-local] published Home CLI archive did not install its native renderer" >&2
     exit 1
 }
-
-mkdir -p "$SITE_SRC"
-cat > "$SITE_SRC/index.html" <<'HTML'
-<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>Home Demo</title></head>
-  <body><h1>Home Demo Site</h1></body>
-</html>
-HTML
-
-echo "[home-demo-local] stage demo site"
-HOME="$DEMO_HOME" \
-XDG_DATA_HOME="$XDG_DATA_HOME" \
-ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \
-"$ROOT/elastos/target/debug/elastos" site stage "$SITE_SRC"
-
 echo
 echo "[home-demo-local] ready"
 echo "  home: $DEMO_HOME"

@@ -137,6 +137,13 @@ async fn start_gateway_server_with_shutdown(
         }
         None => None,
     };
+    // Every Home start, local or public and whoever launched it, publishes its
+    // coordinates here. Cleanup then proves this Home ready before removing files.
+    let backup_cleanup = gateway_local_control.as_ref().map(|_| {
+        tokio::spawn(
+            crate::update_controller::finalize_principal_root_backups_after_start(data_dir.clone()),
+        )
+    });
     let managed_owner = crate::runtime_control::gateway_children::Owner::read(&data_dir).ok();
     let advertised = advertised_gateway_urls(addr);
     println!("ElastOS Gateway v{}", GATEWAY_VERSION);
@@ -172,6 +179,9 @@ async fn start_gateway_server_with_shutdown(
             (&mut server).await
         }
     };
+    if let Some(task) = backup_cleanup {
+        task.abort();
+    }
     connections.shutdown();
     // The server's deadline signals connection tasks. Wait for their request
     // futures to drop before cleanup can release this data root to a new host.

@@ -200,25 +200,75 @@ class NetworkTest(unittest.TestCase):
             with network.locks(self.uid, self.pool):
                 self.fail('active VM must block root changes')
 
-    def test_firewall_order_scope_and_removal(self):
+    def fake_tables(self):
+        """iptables/ip6tables state for -C/-D/-S/-F/-X/-N/-A/-I."""
+        tables = {'iptables': {}, 'ip6tables': {}}
+        builtin = ['INPUT', 'FORWARD', 'OUTPUT']
+        for state in tables.values():
+            for name in builtin:
+                state[name] = []
+        def run(tool, wait, op, name, *rule, optional=False):
+            state, rule = tables[tool], list(rule)
+            found = name in state
+            if op == '-C':
+                ok = found and rule in state[name]
+            elif op == '-D':
+                state[name].remove(rule)
+                ok = True
+            elif op == '-S':
+                ok = found
+            elif op == '-F':
+                state[name].clear()
+                ok = True
+            elif op == '-X':
+                ok = not any(r[-1] == name for chain in state.values() for r in chain)
+                del state[name]
+            elif op == '-N':
+                ok = not found
+                state[name] = []
+            elif op == '-A':
+                state[name].append(rule)
+                ok = True
+            else:
+                state[name].insert(0, rule)
+                ok = True
+            if not ok and not optional:
+                raise RuntimeError(f'{tool} {op} {name} failed')
+            return SimpleNamespace(returncode=0 if ok else 1, stdout='')
+        return tables, run
+
+    def test_firewall_confines_tap_input_and_relayed_output_idempotently(self):
         n = self.pool[0]
-        network.firewall(n)
+        tables, run = self.fake_tables()
+        with patch.object(network, 'run', side_effect=run):
+            network.firewall(n)
+            network.firewall(n)
         for tool in ['iptables', 'ip6tables']:
-            calls = [c for c in self.calls if c[0] == tool]
-            rules = [list(c[4:]) for c in calls if c[2] == '-A']
-            expected = network.input_rules(n) if tool == 'iptables' else [['-j', 'DROP']]
-            self.assertEqual(rules, expected)
-            self.assertIn((tool, '-w', '-I', 'FORWARD', '-i', n['tapName'], '-j', 'DROP'), calls)
-            self.assertEqual(calls[-1], (tool, '-w', '-I', 'INPUT', '-i', n['tapName'], '-j', network.chain(n)))
-        rules = network.input_rules(n)
-        self.assertEqual(rules[-1], ['-j', 'DROP'])
-        for rule in rules[:-1]:
-            self.assertEqual(rule[:4], ['-s', n['guestIp'], '-d', n['hostIp']])
-        self.calls.clear()
-        with patch.object(network, 'run', side_effect=lambda *a, **kw: (self.calls.append(a) or SimpleNamespace(returncode=1 if '-C' in a else 0))):
+            state = tables[tool]
+            self.assertEqual(state['INPUT'], [['-i', n['tapName'], '-j', network.chain(n)]])
+            self.assertEqual(state['FORWARD'], [['-i', n['tapName'], '-j', 'DROP']])
+            self.assertEqual(state[network.chain(n)], network.input_rules(n) if tool == 'iptables' else [['-j', 'DROP']])
+        # coturn's relayed packets leave as local output from the relay ports:
+        # only the slot's TURN ports are reachable, never other host services.
+        ipv4 = tables['iptables']
+        self.assertEqual(ipv4['OUTPUT'], [network.relay_hook(n)[1:]])
+        self.assertEqual(network.relay_hook(n)[1:7], ['-s', n['hostIp'], '-p', 'udp', '--sport', '49152:49215'])
+        self.assertEqual(ipv4[network.relay_chain(n)], [
+            ['-d', n['hostIp'], '-p', 'udp', '--dport', '49152:49215', '-j', 'RETURN'],
+            ['-d', n['hostIp'], '-p', 'udp', '--dport', '41000', '-j', 'RETURN'],
+            ['-j', 'DROP']])
+        self.assertNotIn(network.relay_chain(n), tables['ip6tables'])
+        with patch.object(network, 'run', side_effect=run):
             network.firewall(n, remove=True)
-        self.assertTrue(all('-A' not in c and '-I' not in c for c in self.calls))
-        self.assertEqual(len([c for c in self.calls if '-X' in c]), 2)
+            network.firewall(n, remove=True)
+        for state in tables.values():
+            self.assertEqual(sorted(state), ['FORWARD', 'INPUT', 'OUTPUT'])
+            self.assertTrue(all(chain == [] for chain in state.values()))
+
+    def test_receipt_without_relay_confinement_is_refused(self):
+        self.receipt['policy'] = {key: value for key, value in network.policy(self.pool).items() if key != 'ipv4_relay'}
+        with self.assertRaisesRegex(RuntimeError, 'network policy'):
+            network.check(self.uid)
 
     def test_restore_constructs_user_owned_taps_and_receipt(self):
         user = SimpleNamespace(pw_uid=self.uid, pw_gid=1001)

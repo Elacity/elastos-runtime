@@ -72,7 +72,7 @@ Runtime.
 
 Only one live host may own an ElastOS data home at a time. Stop Home before
 using the separate operator runtime in the same home. See [Installing
-ElastOS](docs/INSTALL.md) for profiles, updates, trust verification, and
+ElastOS](docs/INSTALL.md) for updates, trust verification, and
 operator setup. See the [Mac staging runbook](docs/MAC.md) for source-home
 staging and Browser VM work.
 

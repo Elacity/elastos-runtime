@@ -1,5 +1,4 @@
-//! Update/upgrade logic: Carrier-first release fetch, explicit transport
-//! overrides, platform detection, cache management, and the main update flow.
+//! Update logic: signed release fetch over Carrier, platform detection, cache management, and the main update flow.
 //!
 //! CLI and operator entry points share signed head discovery and admission.
 
@@ -23,11 +22,8 @@ use crate::sources::{
 };
 
 /// Async callback for fetching a CID or `release-path:<path>` from the trusted source.
-/// The caller decides whether any explicit transport override is allowed.
 pub type FetchFn = Box<
-    dyn Fn(String, Vec<String>) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send>> + Send + Sync,
 >;
 
 /// Builds a large future on the heap from inside this small frame. An unoptimized
@@ -151,9 +147,7 @@ impl std::fmt::Display for InvalidInstalledVersion {
 }
 impl std::error::Error for InvalidInstalledVersion {}
 
-pub(crate) fn installed_release_version(
-    installed: &str,
-) -> anyhow::Result<Option<semver::Version>> {
+pub fn installed_release_version(installed: &str) -> anyhow::Result<Option<semver::Version>> {
     if installed.is_empty() {
         return Ok(None);
     }
@@ -232,223 +226,6 @@ fn append_varint(target: &mut Vec<u8>, mut value: usize) {
         value >>= 7;
     }
     target.push(value as u8);
-}
-
-pub fn ordered_update_gateways(source_gateways: &[String]) -> Vec<String> {
-    let mut gateways = Vec::new();
-    for gateway in source_gateways {
-        let gateway = gateway.trim_end_matches('/').to_string();
-        if !gateway.is_empty() && !gateways.iter().any(|g| g == &gateway) {
-            gateways.push(gateway);
-        }
-    }
-    gateways
-}
-
-/// Check if a gateway URL is a public IPFS content gateway (serves /ipfs/<cid> only).
-/// These don't serve `/release-head.json`.
-pub fn is_ipfs_content_gateway(url: &str) -> bool {
-    let url_lower = url.to_lowercase();
-    [
-        "ipfs.io",
-        "dweb.link",
-        "w3s.link",
-        "cloudflare-ipfs.com",
-        "gateway.pinata.cloud",
-        "nftstorage.link",
-    ]
-    .iter()
-    .any(|host| url_lower.contains(host))
-}
-
-/// Try to fetch `release-head.json` directly from an explicitly granted
-/// transport override URL. Skips IPFS content gateways (they only serve
-/// `/ipfs/<cid>` paths). Returns `(release_cid, head_bytes, working_url)`.
-pub async fn try_gateway_head_discovery(
-    gateway_urls: &[String],
-    publisher_did: &str,
-) -> Option<(String, Vec<u8>, String)> {
-    let publisher_gateways: Vec<&String> = gateway_urls
-        .iter()
-        .filter(|gw| !is_ipfs_content_gateway(gw))
-        .collect();
-
-    if publisher_gateways.is_empty() {
-        return None;
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .ok()?;
-
-    for gw in publisher_gateways {
-        let url = format!("{}/release-head.json", gw.trim_end_matches('/'));
-        tracing::debug!("update: trying explicit transport override: {}", gw);
-        let resp = match client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                eprintln!("  Explicit transport override {}: HTTP {}", gw, r.status());
-                continue;
-            }
-            Err(e) => {
-                eprintln!("  Explicit transport override {}: {}", gw, e);
-                continue;
-            }
-        };
-        let bytes = match resp.bytes().await {
-            Ok(b) => b.to_vec(),
-            Err(e) => {
-                eprintln!(
-                    "  Explicit transport override {}: failed to read body: {}",
-                    gw, e
-                );
-                continue;
-            }
-        };
-        match crate::crypto::verify_release_envelope(
-            &bytes,
-            "elastos.release.head.v1",
-            publisher_did,
-        ) {
-            Ok(head) => {
-                let version = head["payload"]["version"].as_str().unwrap_or("unknown");
-                let release_cid = head["payload"]["latest_release_cid"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                println!("  Found via explicit transport override: v{}", version);
-                if release_cid.is_empty() {
-                    eprintln!("  Gateway HEAD has no latest_release_cid, skipping");
-                    continue;
-                }
-                return Some((release_cid, bytes, gw.clone()));
-            }
-            Err(e) => {
-                eprintln!(
-                    "  Explicit transport override {}: verification failed: {}",
-                    gw, e
-                );
-            }
-        }
-    }
-    None
-}
-
-/// Fetch a raw CID payload through the ordered gateway list using `/ipfs/<cid>`.
-pub async fn fetch_cid_via_gateways(cid: &str, gateway_urls: &[String]) -> anyhow::Result<Vec<u8>> {
-    if gateway_urls.is_empty() {
-        anyhow::bail!("no gateway URLs configured for CID fetch");
-    }
-
-    let client = download_http_client()?;
-
-    let mut failures = Vec::new();
-    for gw in gateway_urls {
-        let gateway = gw.trim_end_matches('/');
-        if gateway.is_empty() {
-            continue;
-        }
-        let url = format!("{}/ipfs/{}", gateway, cid);
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let max_bytes = crate::carrier::MAX_DOWNLOAD_BYTES as u64;
-                return read_download_body(resp, cid, max_bytes)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("{gateway}: {err:#}"));
-            }
-            Ok(resp) => failures.push(format!("{} -> HTTP {}", gateway, resp.status())),
-            Err(err) => failures.push(format!("{} -> {}", gateway, err)),
-        }
-    }
-
-    anyhow::bail!(
-        "failed to fetch CID {} from configured gateways: {}",
-        cid,
-        failures.join("; ")
-    )
-}
-
-/// HTTP client for release downloads. A download fails only when no bytes
-/// arrive for `DOWNLOAD_IDLE_TIMEOUT`, never on total time; a source that
-/// trickles is still bounded by the size ceiling of each reader below.
-pub(crate) fn download_http_client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .connect_timeout(crate::carrier::DOWNLOAD_IDLE_TIMEOUT)
-        .read_timeout(crate::carrier::DOWNLOAD_IDLE_TIMEOUT)
-        .build()?)
-}
-
-/// Names a stall instead of reqwest's generic timeout.
-pub(crate) fn download_read_error(err: reqwest::Error, name: &str) -> anyhow::Error {
-    if err.is_timeout() {
-        anyhow::anyhow!(
-            "no data for {} s while downloading {name}",
-            crate::carrier::DOWNLOAD_IDLE_TIMEOUT.as_secs()
-        )
-    } else {
-        err.into()
-    }
-}
-
-pub(crate) fn ensure_download_within(name: &str, bytes: u64, max_bytes: u64) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        bytes <= max_bytes,
-        "{name} exceeds its {max_bytes}-byte bound ({bytes} bytes)"
-    );
-    Ok(())
-}
-
-/// Reads a download body of at most `max_bytes`, refusing a larger one
-/// before buffering it.
-pub(crate) async fn read_download_body(
-    mut response: reqwest::Response,
-    name: &str,
-    max_bytes: u64,
-) -> anyhow::Result<Vec<u8>> {
-    ensure_download_within(name, response.content_length().unwrap_or(0), max_bytes)?;
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|err| download_read_error(err, name))?
-    {
-        ensure_download_within(name, (body.len() + chunk.len()) as u64, max_bytes)?;
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-/// Fetch the signed `release.json` envelope directly from a publisher-style
-/// gateway edge. This is the correct follow-on after successful
-/// `release-head.json` discovery via that same gateway.
-pub async fn fetch_release_manifest_via_gateway(gateway_url: &str) -> anyhow::Result<Vec<u8>> {
-    let gateway = gateway_url.trim_end_matches('/');
-    if gateway.is_empty() {
-        anyhow::bail!("gateway URL is empty");
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    let url = format!("{}/release.json", gateway);
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("{} -> {}", gateway, e))?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("{} -> HTTP {}", gateway, resp.status());
-    }
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| anyhow::anyhow!("{}: failed to read response body: {}", gateway, e))?;
-
-    Ok(bytes.to_vec())
 }
 
 pub fn format_bytes(bytes: usize) -> String {
@@ -793,8 +570,6 @@ pub async fn run_update(
     try_p2p_fn: Option<&TryP2pFn>,
     check_only: bool,
     head_cid_override: Option<String>,
-    no_p2p: bool,
-    cli_gateways: Vec<String>,
     version: &str,
     auto_confirm: bool,
     force: bool,
@@ -806,8 +581,6 @@ pub async fn run_update(
         try_p2p_fn,
         check_only,
         head_cid_override,
-        no_p2p,
-        cli_gateways,
         version,
         auto_confirm,
         force,
@@ -824,8 +597,6 @@ pub async fn run_update_for_data_dir(
     try_p2p_fn: Option<&TryP2pFn>,
     check_only: bool,
     head_cid_override: Option<String>,
-    no_p2p: bool,
-    cli_gateways: Vec<String>,
     version: &str,
     auto_confirm: bool,
     force: bool,
@@ -837,8 +608,6 @@ pub async fn run_update_for_data_dir(
         try_p2p_fn,
         check_only,
         head_cid_override,
-        no_p2p,
-        cli_gateways,
         version,
         auto_confirm,
         force,
@@ -855,8 +624,6 @@ pub(crate) async fn run_update_for_data_dir_in_context(
     try_p2p_fn: Option<&TryP2pFn>,
     check_only: bool,
     head_cid_override: Option<String>,
-    no_p2p: bool,
-    cli_gateways: Vec<String>,
     version: &str,
     auto_confirm: bool,
     force: bool,
@@ -869,8 +636,6 @@ pub(crate) async fn run_update_for_data_dir_in_context(
         try_p2p_fn,
         check_only,
         head_cid_override,
-        no_p2p,
-        cli_gateways,
         version,
         auto_confirm,
         force,
@@ -892,8 +657,6 @@ pub async fn run_frozen_update_for_data_dir(
     try_p2p_fn: Option<&TryP2pFn>,
     check_only: bool,
     head_cid_override: Option<String>,
-    no_p2p: bool,
-    cli_gateways: Vec<String>,
     version: &str,
     auto_confirm: bool,
     force: bool,
@@ -904,8 +667,6 @@ pub async fn run_frozen_update_for_data_dir(
         try_p2p_fn,
         check_only,
         head_cid_override,
-        no_p2p,
-        cli_gateways,
         version,
         auto_confirm,
         force,
@@ -1006,8 +767,6 @@ pub(crate) async fn run_restarting_update(
         None,
         false,
         Some(head_cid),
-        false,
-        Vec::new(),
         env!("ELASTOS_VERSION"),
         true,
         false,
@@ -1026,8 +785,6 @@ async fn run_update_for_data_dir_with_mode(
     try_p2p_fn: Option<&TryP2pFn>,
     check_only: bool,
     head_cid_override: Option<String>,
-    no_p2p: bool,
-    cli_gateways: Vec<String>,
     version: &str,
     auto_confirm: bool,
     force: bool,
@@ -1042,8 +799,6 @@ async fn run_update_for_data_dir_with_mode(
             try_p2p_fn,
             check_only,
             head_cid_override,
-            no_p2p,
-            cli_gateways,
             version,
             auto_confirm,
             force,
@@ -1063,8 +818,6 @@ async fn run_update_with_restart(
     try_p2p_fn: Option<&TryP2pFn>,
     check_only: bool,
     head_cid_override: Option<String>,
-    no_p2p: bool,
-    cli_gateways: Vec<String>,
     version: &str,
     auto_confirm: bool,
     force: bool,
@@ -1084,8 +837,6 @@ async fn run_update_with_restart(
         source.publisher_dids.first().cloned().ok_or_else(|| {
             anyhow::anyhow!("Trusted source '{}' has no publisher DID", source.name)
         })?;
-    // Explicit transport override only. Default update path is Carrier-first.
-    let ordered_gateways = ordered_update_gateways(&cli_gateways);
 
     let current_version = source.installed_version.clone();
     if !repair_invalid_version {
@@ -1110,7 +861,6 @@ async fn run_update_with_restart(
     // 2. Resolve release head
     let mut resolved_head_cid: Option<String> = None;
     let mut discovered_head_bytes: Option<Vec<u8>> = None;
-    let mut working_gateway: Option<String> = None;
     let discovery_method = if let Some(ref cid) = head_cid_override {
         if force {
             println!("  Rollback to HEAD CID: {}", cid);
@@ -1124,78 +874,40 @@ async fn run_update_with_restart(
             "manual (--head-cid)"
         }
     } else {
-        // Step A: Try P2P discovery (unless --no-p2p)
+        // Discover the signed head over Carrier.
         let mut resolved: Option<&str> = None;
-        if !no_p2p {
-            if let Some(p2p_fn) = try_p2p_fn {
-                println!("  Checking for updates...");
-                if !source.connect_ticket.is_empty() {
-                    println!("  Bootstrap: direct publisher ticket configured");
-                }
-                resolved = match tokio::time::timeout(
-                    std::time::Duration::from_secs(20),
-                    p2p_fn(source.clone(), primary_publisher.clone()),
-                )
-                .await
-                {
-                    Ok(Ok(Some(head))) => {
-                        resolved_head_cid = head.head_cid;
-                        discovered_head_bytes = Some(head.bytes);
-                        Some("Carrier")
-                    }
-                    Ok(Ok(None)) => None,
-                    Ok(Err(error)) => return Err(error),
-                    Err(_) => None,
-                };
+        if let Some(p2p_fn) = try_p2p_fn {
+            println!("  Checking for updates...");
+            if !source.connect_ticket.is_empty() {
+                println!("  Bootstrap: direct publisher ticket configured");
             }
-        }
-
-        // Step B: try an explicitly granted transport override.
-        if resolved.is_none() && !ordered_gateways.is_empty() {
-            if no_p2p {
-                println!("  Checking explicit transport override...");
-            } else {
-                eprintln!("  Carrier unavailable, trying explicit transport override...");
-            }
-            if let Some((_release_cid, head_bytes, gw)) =
-                try_gateway_head_discovery(&ordered_gateways, &primary_publisher).await
+            resolved = match tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                p2p_fn(source.clone(), primary_publisher.clone()),
+            )
+            .await
             {
-                discovered_head_bytes = Some(head_bytes);
-                working_gateway = Some(gw);
-                resolved = Some("gateway");
-            }
+                Ok(Ok(Some(head))) => {
+                    resolved_head_cid = head.head_cid;
+                    discovered_head_bytes = Some(head.bytes);
+                    Some("Carrier")
+                }
+                Ok(Ok(None)) => None,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => None,
+            };
         }
 
+        // Covers both an unreachable source and one that did not answer in time.
         resolved.ok_or_else(|| {
-            let mut msg = String::from("Could not discover updates.");
-            if no_p2p {
-                msg.push_str("\n  Carrier was skipped (--no-p2p).");
-            } else {
-                msg.push_str("\n  Carrier discovery did not find a live trusted source.");
-            }
-            if ordered_gateways.is_empty() {
-                msg.push_str(
-                    "\n  No explicit transport override configured. Use --gateway <url> only when you explicitly approve web transport.",
-                );
-            } else {
-                msg.push_str("\n  Explicit transport override was also unreachable.");
-            }
-            if source.head_cid.is_empty() {
-                msg.push_str("\n  No cached head CID in sources.json.");
-            }
-            msg.push_str("\n  Manual override: elastos update --head-cid <cid>");
-            anyhow::anyhow!("{}", msg)
+            anyhow::anyhow!(
+                "Could not discover updates: the trusted release source did not answer over Carrier. Check the network (ElastOS needs outgoing UDP to port 4433), then try again."
+            )
         })?
     };
 
     // 3. Fetch or reuse release-head.json
     let head_bytes = if let Some(bytes) = discovered_head_bytes {
-        if let Some(ref gw) = working_gateway {
-            println!(
-                "  Using release head from explicit transport override: {}",
-                gw
-            );
-        }
         bytes
     } else {
         let head_cid = resolved_head_cid
@@ -1205,7 +917,7 @@ async fn run_update_with_restart(
             "  Fetching release head: {}...",
             &head_cid[..12.min(head_cid.len())]
         );
-        fetch_fn(head_cid, ordered_gateways.clone()).await?
+        fetch_fn(head_cid).await?
     };
     if let Some(cid) = resolved_head_cid.as_deref() {
         mismatched(verify_release_metadata_cid(cid, &head_bytes))?;
@@ -1238,12 +950,10 @@ async fn run_update_with_restart(
             &source,
             data_dir,
             check_only,
-            &ordered_gateways,
             auto_confirm,
             force,
             repair_invalid_version,
             discovery_method,
-            working_gateway.as_deref(),
             carrier_context,
             apply_mode,
             restart_owner,
@@ -1305,11 +1015,9 @@ async fn run_upgrade_from_head(
     source: &TrustedSource,
     data_dir: &std::path::Path,
     check_only: bool,
-    ordered_gateways: &[String],
     auto_confirm: bool,
     force: bool,
     discovery_method: &str,
-    working_gateway: Option<&str>,
     carrier_context: crate::setup::FirstPartyCarrierContext,
     apply_mode: ApplyMode,
 ) -> anyhow::Result<()> {
@@ -1325,12 +1033,10 @@ async fn run_upgrade_from_head(
         source,
         data_dir,
         check_only,
-        ordered_gateways,
         auto_confirm,
         force,
         false,
         discovery_method,
-        working_gateway,
         carrier_context,
         apply_mode,
         None,
@@ -1351,12 +1057,10 @@ async fn run_upgrade_with_restart(
     source: &TrustedSource,
     data_dir: &Path,
     check_only: bool,
-    ordered_gateways: &[String],
     auto_confirm: bool,
     force: bool,
     repair_invalid_version: bool,
     discovery_method: &str,
-    working_gateway: Option<&str>,
     carrier_context: crate::setup::FirstPartyCarrierContext,
     apply_mode: ApplyMode,
     mut restart_owner: Option<&mut dyn RestartOwner>,
@@ -1371,19 +1075,8 @@ async fn run_upgrade_with_restart(
         "  Fetching release: {}...",
         &release_cid[..12.min(release_cid.len())]
     );
-    let release_bytes = if let Some(gateway) = working_gateway {
-        println!(
-            "  Using release manifest from explicit transport override: {}",
-            gateway
-        );
-        fetch_release_manifest_via_gateway(gateway).await?
-    } else {
-        fetch_fn(release_cid.to_string(), ordered_gateways.to_vec()).await?
-    };
-    // Gateway bytes are bound by verify_release_binding; release_sha256 must stay mandatory.
-    if working_gateway.is_none() {
-        mismatched(verify_release_metadata_cid(release_cid, &release_bytes))?;
-    }
+    let release_bytes = fetch_fn(release_cid.to_string()).await?;
+    mismatched(verify_release_metadata_cid(release_cid, &release_bytes))?;
 
     // Verify the chosen envelope, then its binding to the already verified head.
     let (release, signer_did) = refused(
@@ -1533,7 +1226,7 @@ async fn run_upgrade_with_restart(
     if let Some(owner) = restart_owner.as_ref() {
         owner.progress("downloading", &download_message(binary_size))?;
     }
-    let binary_data = fetch_fn(binary_cid.to_string(), ordered_gateways.to_vec()).await?;
+    let binary_data = fetch_fn(binary_cid.to_string()).await?;
     if let Some(owner) = restart_owner.as_ref() {
         owner.progress(
             "verifying",
@@ -1576,7 +1269,7 @@ async fn run_upgrade_with_restart(
     if let Some(owner) = restart_owner.as_ref() {
         owner.progress("downloading", &download_message(comp_size))?;
     }
-    let comp_data = fetch_fn(comp_cid.to_string(), ordered_gateways.to_vec()).await?;
+    let comp_data = fetch_fn(comp_cid.to_string()).await?;
     if let Some(owner) = restart_owner.as_ref() {
         owner.progress(
             "verifying",
@@ -1666,26 +1359,9 @@ async fn run_upgrade_with_restart(
         })
         .await?;
         // Prepare all five original backups before the first live artifact changes.
-        // Build gateway list with working gateway first (if discovered via gateway)
-        let save_gateways = if ordered_gateways.is_empty() && working_gateway.is_none() {
-            normalize_gateways(&source.gateways)
-        } else if let Some(wg) = working_gateway {
-            let wg_normalized = wg.trim_end_matches('/').to_string();
-            let mut gws = vec![wg_normalized.clone()];
-            for g in ordered_gateways {
-                let normalized = g.trim_end_matches('/').to_string();
-                if normalized != wg_normalized {
-                    gws.push(normalized);
-                }
-            }
-            normalize_gateways(&gws)
-        } else {
-            normalize_gateways(ordered_gateways)
-        };
-
         let mut sources = load_trusted_sources(data_dir)?;
         if let Some(stored_source) = sources.source_named_mut(Some(&source.name)) {
-            stored_source.gateways = save_gateways;
+            stored_source.gateways = normalize_gateways(&source.gateways);
             stored_source.installed_version = version.to_string();
             stored_source.install_path = bin_path.display().to_string();
             stored_source.head_cid = resolved_head_cid
@@ -1693,7 +1369,7 @@ async fn run_upgrade_with_restart(
                 .unwrap_or_else(|| stored_source.head_cid.clone());
         } else {
             let mut updated_source = source.clone();
-            updated_source.gateways = save_gateways;
+            updated_source.gateways = normalize_gateways(&source.gateways);
             updated_source.installed_version = version.to_string();
             updated_source.install_path = bin_path.display().to_string();
             updated_source.head_cid = resolved_head_cid
@@ -1879,23 +1555,6 @@ async fn run_upgrade_with_restart(
     }
     let bin_path = transaction.binary_path();
 
-    // Build gateway list with working gateway first (if discovered via gateway)
-    let save_gateways = if ordered_gateways.is_empty() && working_gateway.is_none() {
-        normalize_gateways(&source.gateways)
-    } else if let Some(wg) = working_gateway {
-        let wg_normalized = wg.trim_end_matches('/').to_string();
-        let mut gws = vec![wg_normalized.clone()];
-        for g in ordered_gateways {
-            let normalized = g.trim_end_matches('/').to_string();
-            if normalized != wg_normalized {
-                gws.push(normalized);
-            }
-        }
-        normalize_gateways(&gws)
-    } else {
-        normalize_gateways(ordered_gateways)
-    };
-
     let mut sources = load_trusted_sources(data_dir)?;
     let installed_source = sources.source_named(Some(&source.name)).ok_or_else(|| {
         anyhow::anyhow!("update source changed while preparing the release; retry")
@@ -1904,7 +1563,7 @@ async fn run_upgrade_with_restart(
         anyhow::bail!("update source changed while preparing the release; retry");
     }
     let stored_source = sources.source_named_mut(Some(&source.name)).unwrap();
-    stored_source.gateways = save_gateways;
+    stored_source.gateways = normalize_gateways(&source.gateways);
     stored_source.installed_version = version.to_string();
     stored_source.install_path = bin_path.display().to_string();
     if let Some(head_cid) = resolved_head_cid {
@@ -2295,11 +1954,6 @@ fn optional_release_object_cid(head: &serde_json::Value) -> anyhow::Result<Optio
 mod tests {
     use super::*;
     use crate::sources::save_trusted_sources;
-    use axum::body::Body;
-    use axum::extract::Path as AxumPath;
-    use axum::http::StatusCode;
-    use axum::routing::get;
-    use axum::Router;
 
     fn raw_cid(bytes: &[u8]) -> String {
         use sha2::Digest;
@@ -2632,7 +2286,7 @@ mod tests {
             save_trusted_sources(data.path(), &sources).unwrap();
             let bytes = release.clone();
             let expected = release_cid.clone();
-            let fetch: FetchFn = Box::new(move |cid, _| {
+            let fetch: FetchFn = Box::new(move |cid| {
                 assert_eq!(cid, expected);
                 Box::pin(std::future::ready(Ok(bytes.clone())))
             });
@@ -2642,8 +2296,6 @@ mod tests {
                 Some(&discovery),
                 true,
                 None,
-                false,
-                Vec::new(),
                 installed,
                 true,
                 false,
@@ -2665,8 +2317,6 @@ mod tests {
                 Some(&discovery),
                 true,
                 Some(release_cid.clone()),
-                false,
-                Vec::new(),
                 installed,
                 true,
                 false,
@@ -2682,7 +2332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_verification_error_stops_transport_fallback() {
+    async fn discovery_verification_error_stops_update() {
         let (source, head, release) = discovery_fixture();
         let announcement = serde_json::json!({
             "head_cid": raw_cid(&head), "release_cid": raw_cid(&release)
@@ -2700,16 +2350,13 @@ mod tests {
                     .map(Some)
             })
         });
-        let fetch: FetchFn =
-            Box::new(|_, _| panic!("invalid discovery must stop content fetching"));
+        let fetch: FetchFn = Box::new(|_| panic!("invalid discovery must stop content fetching"));
         let err = run_update_for_data_dir(
             data.path(),
             &fetch,
             Some(&discovery),
             true,
             None,
-            false,
-            vec!["http://127.0.0.1:1".into()],
             "0.7.0",
             true,
             false,
@@ -2761,7 +2408,7 @@ mod tests {
         let expected_release = release_cid.clone();
         let old_bytes = old_head.clone();
         let release_bytes = release.clone();
-        let fetch: FetchFn = Box::new(move |cid, _| {
+        let fetch: FetchFn = Box::new(move |cid| {
             requested.lock().unwrap().push(cid.clone());
             let bytes = if cid == expected_head {
                 old_bytes.clone()
@@ -2778,8 +2425,6 @@ mod tests {
             None,
             true,
             Some(old_head_cid.clone()),
-            true,
-            Vec::new(),
             "0.6.0",
             true,
             false,
@@ -2792,7 +2437,7 @@ mod tests {
             vec![old_head_cid.clone(), release_cid]
         );
 
-        let wrong_bytes: FetchFn = Box::new(move |_, _| {
+        let wrong_bytes: FetchFn = Box::new(move |_| {
             let bytes = newer_head.clone();
             Box::pin(async move { Ok(bytes) })
         });
@@ -2802,8 +2447,6 @@ mod tests {
             None,
             true,
             Some(old_head_cid),
-            true,
-            Vec::new(),
             "0.6.0",
             true,
             false,
@@ -2839,7 +2482,7 @@ mod tests {
         let head = binding_envelope(payload, "elastos.release.head.v1");
         let head_cid = raw_cid(&head);
         let requested_head_cid = head_cid.clone();
-        let fetch: FetchFn = Box::new(move |cid, _| {
+        let fetch: FetchFn = Box::new(move |cid| {
             assert_eq!(cid, requested_head_cid);
             let bytes = head.clone();
             Box::pin(async move { Ok(bytes) })
@@ -2850,8 +2493,6 @@ mod tests {
             None,
             true,
             Some(head_cid),
-            true,
-            Vec::new(),
             "0.7.0",
             true,
             false,
@@ -2881,7 +2522,7 @@ mod tests {
         }))
         .unwrap();
         let release_cid = raw_cid(&release);
-        let fetch: FetchFn = Box::new(move |_, _| {
+        let fetch: FetchFn = Box::new(move |_| {
             let bytes = release.clone();
             Box::pin(async move { Ok(bytes) })
         });
@@ -2898,11 +2539,9 @@ mod tests {
             &source,
             data.path(),
             true,
-            &[],
             true,
             false,
             "fixture",
-            None,
             crate::setup::FirstPartyCarrierContext::Setup,
             ApplyMode::Normal,
         )
@@ -2923,11 +2562,9 @@ mod tests {
             &source,
             data.path(),
             true,
-            &[],
             true,
             true,
             "fixture",
-            None,
             crate::setup::FirstPartyCarrierContext::Setup,
             ApplyMode::Normal,
         )
@@ -2957,7 +2594,7 @@ mod tests {
         .unwrap();
         let release_cid = raw_cid(&release);
         let requested_release_cid = release_cid.clone();
-        let fetch: FetchFn = Box::new(move |cid, _| {
+        let fetch: FetchFn = Box::new(move |cid| {
             let bytes = if cid == requested_release_cid {
                 release.clone()
             } else if cid == "binary-a" {
@@ -2980,11 +2617,9 @@ mod tests {
             &source,
             data.path(),
             false,
-            &[],
             true,
             false,
             "fixture",
-            None,
             crate::setup::FirstPartyCarrierContext::Setup,
             ApplyMode::Normal,
         )
@@ -3034,7 +2669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_release_binding_precedes_artifacts_check_and_same_version_on_both_transports() {
+    async fn test_release_binding_precedes_artifacts_check_and_same_version() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -3073,120 +2708,80 @@ mod tests {
             ("invalid digest", invalid, release.clone(), false),
             ("invalid head schema", schema, release.clone(), false),
         ];
-        for gateway_transport in [false, true] {
-            for (name, payload, release_bytes, matching) in &cases {
-                for mode in ["install", "check", "same-version"] {
-                    let head_bytes = binding_envelope(payload.clone(), "elastos.release.head.v1");
-                    let did = crate::crypto::encode_signing_key_did(
-                        &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                    );
-                    let verified_head =
-                        verify_release_envelope(&head_bytes, "elastos.release.head.v1", &did)
-                            .unwrap();
-                    let source: TrustedSource = serde_json::from_value(serde_json::json!({
-                        "name": "test", "publisher_dids": [did], "channel": "stable"
-                    }))
-                    .unwrap();
-                    let artifact_requests = Arc::new(AtomicUsize::new(0));
-                    let cid_requests = Arc::new(AtomicUsize::new(0));
-                    let counter = artifact_requests.clone();
-                    let metadata_counter = cid_requests.clone();
-                    let bytes = release_bytes.clone();
-                    let requested_release_cid = release_cid.clone();
-                    let fetch: FetchFn = Box::new(move |cid, _| {
-                        let counter = counter.clone();
-                        let metadata_counter = metadata_counter.clone();
-                        let bytes = bytes.clone();
-                        let requested_release_cid = requested_release_cid.clone();
-                        Box::pin(async move {
-                            if cid == requested_release_cid {
-                                metadata_counter.fetch_add(1, Ordering::SeqCst);
-                                return Ok(bytes);
-                            }
-                            counter.fetch_add(1, Ordering::SeqCst);
-                            anyhow::bail!("artifact-request-blocked")
-                        })
-                    });
-                    let bytes = release_bytes.clone();
-                    let gateway_requests = Arc::new(AtomicUsize::new(0));
-                    let metadata_counter = gateway_requests.clone();
-                    let app = Router::new().route(
-                        "/release.json",
-                        get(move || {
-                            let bytes = bytes.clone();
+        for (name, payload, release_bytes, matching) in &cases {
+            for mode in ["install", "check", "same-version"] {
+                let head_bytes = binding_envelope(payload.clone(), "elastos.release.head.v1");
+                let did = crate::crypto::encode_signing_key_did(
+                    &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                );
+                let verified_head =
+                    verify_release_envelope(&head_bytes, "elastos.release.head.v1", &did).unwrap();
+                let source: TrustedSource = serde_json::from_value(serde_json::json!({
+                    "name": "test", "publisher_dids": [did], "channel": "stable"
+                }))
+                .unwrap();
+                let artifact_requests = Arc::new(AtomicUsize::new(0));
+                let cid_requests = Arc::new(AtomicUsize::new(0));
+                let counter = artifact_requests.clone();
+                let metadata_counter = cid_requests.clone();
+                let bytes = release_bytes.clone();
+                let requested_release_cid = release_cid.clone();
+                let fetch: FetchFn = Box::new(move |cid| {
+                    let counter = counter.clone();
+                    let metadata_counter = metadata_counter.clone();
+                    let bytes = bytes.clone();
+                    let requested_release_cid = requested_release_cid.clone();
+                    Box::pin(async move {
+                        if cid == requested_release_cid {
                             metadata_counter.fetch_add(1, Ordering::SeqCst);
-                            async move { bytes }
-                        }),
-                    );
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let gateway = format!("http://{}", listener.local_addr().unwrap());
-                    let server = tokio::spawn(async move {
-                        axum::serve(listener, app).await.unwrap();
-                    });
-                    let data = tempfile::tempdir().unwrap();
-                    let result = run_upgrade_from_head(
-                        &fetch,
-                        &verified_head,
-                        &head_bytes,
-                        None,
-                        "0.7.1",
-                        &release_cid,
-                        None,
-                        if mode == "same-version" {
-                            "0.7.1"
-                        } else {
-                            "0.7.0"
-                        },
-                        &source,
-                        data.path(),
-                        mode == "check",
-                        &[],
-                        true,
-                        false,
-                        "test",
-                        gateway_transport.then_some(gateway.as_str()),
-                        crate::setup::FirstPartyCarrierContext::Setup,
-                        ApplyMode::Normal,
-                    )
-                    .await;
-                    server.abort();
-                    assert_eq!(
-                        cid_requests.load(Ordering::SeqCst),
-                        usize::from(!gateway_transport)
-                    );
-                    assert_eq!(
-                        gateway_requests.load(Ordering::SeqCst),
-                        usize::from(gateway_transport)
-                    );
-                    let expects_artifact = *matching && mode == "install";
-                    assert_eq!(
-                        artifact_requests.load(Ordering::SeqCst),
-                        usize::from(expects_artifact),
-                        "{name}/{mode}/{gateway_transport}"
-                    );
-                    if expects_artifact {
-                        assert!(result
-                            .unwrap_err()
-                            .to_string()
-                            .contains("artifact-request-blocked"));
+                            return Ok(bytes);
+                        }
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        anyhow::bail!("artifact-request-blocked")
+                    })
+                });
+                let data = tempfile::tempdir().unwrap();
+                let result = run_upgrade_from_head(
+                    &fetch,
+                    &verified_head,
+                    &head_bytes,
+                    None,
+                    "0.7.1",
+                    &release_cid,
+                    None,
+                    if mode == "same-version" {
+                        "0.7.1"
                     } else {
-                        assert_eq!(
-                            result.is_ok(),
-                            *matching,
-                            "{name}/{mode}/{gateway_transport}: {result:?}"
-                        );
-                    }
-                    assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
+                        "0.7.0"
+                    },
+                    &source,
+                    data.path(),
+                    mode == "check",
+                    true,
+                    false,
+                    "test",
+                    crate::setup::FirstPartyCarrierContext::Setup,
+                    ApplyMode::Normal,
+                )
+                .await;
+                assert_eq!(cid_requests.load(Ordering::SeqCst), 1);
+                let expects_artifact = *matching && mode == "install";
+                assert_eq!(
+                    artifact_requests.load(Ordering::SeqCst),
+                    usize::from(expects_artifact),
+                    "{name}/{mode}"
+                );
+                if expects_artifact {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("artifact-request-blocked"));
+                } else {
+                    assert_eq!(result.is_ok(), *matching, "{name}/{mode}: {result:?}");
                 }
+                assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 0);
             }
         }
-    }
-
-    #[test]
-    fn test_is_ipfs_content_gateway_matches_known_hosts() {
-        assert!(is_ipfs_content_gateway("https://ipfs.io"));
-        assert!(is_ipfs_content_gateway("https://dweb.link"));
-        assert!(!is_ipfs_content_gateway("https://publisher.example.com"));
     }
 
     #[test]
@@ -3349,8 +2944,7 @@ mod tests {
             (components_cid, components.to_vec()),
         ]);
         artifacts.extend(support);
-        let fetch: FetchFn = Box::new(move |cid, gateways| {
-            assert!(gateways.is_empty(), "fixture must use only its CID fetcher");
+        let fetch: FetchFn = Box::new(move |cid| {
             let bytes = artifacts
                 .get(&cid)
                 .cloned()
@@ -3363,8 +2957,6 @@ mod tests {
             None,
             false,
             Some(head_cid),
-            true,
-            vec![],
             "0.6.0",
             true,
             rollback,
@@ -3727,7 +3319,9 @@ mod tests {
                 .unwrap_err();
                 let message = format!("{error:#}");
                 assert!(
-                    message.contains("checksum") || message.contains("strategy"),
+                    message.contains("checksum")
+                        || message.contains("strategy")
+                        || message.contains("release_path is required"),
                     "{message}"
                 );
                 assert_eq!(std::fs::read(&binary).unwrap(), before_binary);
@@ -4523,76 +4117,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_fetch_cid_via_gateways_uses_ipfs_path() {
-        async fn handler(AxumPath(cid): AxumPath<String>) -> (StatusCode, Body) {
-            assert_eq!(cid, "bafy-test-cid");
-            (StatusCode::OK, Body::from("gateway-bytes"))
-        }
-
-        let app = Router::new().route("/ipfs/:cid", get(handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let bytes = fetch_cid_via_gateways("bafy-test-cid", &[format!("http://{}", addr)])
-            .await
-            .unwrap();
-        assert_eq!(bytes, b"gateway-bytes");
-    }
-
-    #[tokio::test]
-    async fn fetch_cid_via_gateways_fails_only_on_stall_and_bounds_size() {
-        use crate::setup::tests::serve_http_slowly;
-        use std::time::Duration;
-        const CHUNKS: &[&[u8]] = &[b"fi", b"xt", b"ur", b"e-", b"ok"];
-        // 5 chunks 400 ms apart: 2 s in total, twice the 1 s test idle deadline.
-        let slow = serve_http_slowly(10, CHUNKS, Duration::from_millis(400)).await;
-        let bytes = fetch_cid_via_gateways("bafy-slow", &[slow]).await.unwrap();
-        assert_eq!(bytes, b"fixture-ok");
-
-        let stalled = serve_http_slowly(10, CHUNKS, Duration::from_secs(3)).await;
-        let error = fetch_cid_via_gateways("bafy-slow", std::slice::from_ref(&stalled))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!("{stalled}: no data for 1 s while downloading bafy-slow")
-        );
-
-        // Without a signed size, the general 200 MiB ceiling applies.
-        let declared = crate::carrier::MAX_DOWNLOAD_BYTES as u64 + 1;
-        let oversize = serve_http_slowly(declared, CHUNKS, Duration::ZERO).await;
-        let error = fetch_cid_via_gateways("bafy-big", std::slice::from_ref(&oversize))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!("{oversize}: bafy-big exceeds its 209715200-byte bound ({declared} bytes)")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_fetch_release_manifest_via_gateway_uses_release_json_path() {
-        async fn handler() -> (StatusCode, Body) {
-            (StatusCode::OK, Body::from("release-manifest"))
-        }
-
-        let app = Router::new().route("/release.json", get(handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let bytes = fetch_release_manifest_via_gateway(&format!("http://{}", addr))
-            .await
-            .unwrap();
-        assert_eq!(bytes, b"release-manifest");
-    }
-
     /// install.sh admission and recovery through the shared installation writer.
     #[cfg(unix)]
     mod installer {
@@ -5026,7 +4550,7 @@ mod tests {
             // `elastos update` keeps refusing the new key and names install.sh.
             let head = std::fs::read(&new_key[2]).unwrap();
             let head_cid = raw_cid(&head);
-            let fetch: FetchFn = Box::new(move |_, _| {
+            let fetch: FetchFn = Box::new(move |_| {
                 let bytes = head.clone();
                 Box::pin(async move { Ok(bytes) })
             });
@@ -5036,8 +4560,6 @@ mod tests {
                 None,
                 true,
                 Some(head_cid),
-                true,
-                Vec::new(),
                 "0.7.0",
                 true,
                 false,
@@ -5135,8 +4657,7 @@ mod tests {
                     (raw_cid(&bytes[0]), bytes[0].clone()),
                     (raw_cid(components), components.to_vec()),
                 ]);
-                let fetch: FetchFn = Box::new(move |cid, gateways| {
-                    assert!(gateways.is_empty());
+                let fetch: FetchFn = Box::new(move |cid| {
                     let bytes = artifacts.get(&cid).expect("unexpected fixture CID").clone();
                     Box::pin(async move { Ok(bytes) })
                 });
@@ -5147,8 +4668,6 @@ mod tests {
                     None,
                     false,
                     Some(head_cid.clone()),
-                    true,
-                    vec![],
                     "0.7.1",
                     true,
                     true,

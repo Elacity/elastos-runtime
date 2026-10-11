@@ -28,7 +28,7 @@ reuses one, or needs none.
 Useful next commands:
 
 ```bash
-elastos chat --nick alice
+elastos home --status
 elastos update --check
 ```
 
@@ -36,12 +36,11 @@ Open Documents or Library from Home to work with your files. The source Home
 profile includes these apps and their content backend. For an installed release,
 its signed manifest determines the available components.
 
-The demo profile adds more Apps and tools. The operator profile supports
-`serve`, remote node control, agents, WASM or microVM `run`, and non-interactive
-capsule work. Data `run` and interactive packaged capsules use the lanes in the
-command matrix.
-[Installing ElastOS](INSTALL.md) documents profiles, trust, and updates.
-[Sites](SITES.md) documents local site staging and publication.
+The same install also provides the operator runtime for `serve`, remote node
+control, WASM or microVM `run`, and non-interactive capsule work. Data
+`run` and interactive packaged capsules use the lanes in the command matrix.
+[Installing ElastOS](INSTALL.md) documents setup, trust, and updates.
+[Sites](SITES.md) documents the `elastos site` operator commands.
 
 ## Build from source
 

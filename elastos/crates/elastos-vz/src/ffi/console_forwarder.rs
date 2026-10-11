@@ -46,30 +46,33 @@ const KERNEL_CONSOLE_MAX_LINE_BYTES: usize = 65_536;
 /// `VZVirtualMachine` releases the `NSFileHandle` — i.e. when
 /// `VzMachineHandle` itself drops).
 ///
-/// Tests can call [`Self::shutdown_and_join`] to bound the wait
-/// for the task to finish in a deterministic way; production
-/// code never needs to — see the long-form note in
-/// [`crate::ffi::lifecycle::VzMachineHandle::stop`].
+/// Browser terminal retirement releases and observes the native object, then
+/// awaits [`Self::join_retained`] so a cancelled observer keeps the reader
+/// owned. Tests can use [`Self::shutdown_and_join`] with their own writer.
 pub(crate) struct ConsoleForwarder {
-    // `dead_code` because the *value* `handle` is never read
-    // outside `shutdown_and_join` (which itself is test-only). The
-    // field still has to live on the struct so tests can move it
-    // out via `self.handle`. Future runtime-side abort support may
-    // use it once we add a
-    // `VZVirtualMachineDelegate`.
-    #[allow(dead_code)]
+    // Both terminal retirement and tests keep this join owned until it ends.
     handle: JoinHandle<()>,
+    joined: bool,
 }
 
 impl ConsoleForwarder {
+    // The native release owner awaits this by borrow. A cancelled observation
+    // retains the join and the VM queue/weak-object proof for the next attempt.
+    pub(crate) async fn join_retained(&mut self) -> bool {
+        if !self.joined {
+            let _ = (&mut self.handle).await;
+            self.joined = true;
+        }
+        self.joined
+    }
+
     /// Wait for the forwarder to finish naturally (EOF on the
-    /// pipe), with a hard upper bound. If the timeout elapses
-    /// the task is aborted; any unread bytes are lost.
+    /// pipe), with a hard upper bound on this test's wait. A timeout reports
+    /// an error; the test's writer still controls when the reader sees EOF.
     ///
-    /// Production callers do **not** use this method — Apple's
-    /// VZVirtualMachine holds the write fd open across `stop`,
-    /// so a forced join would always time out. The method
-    /// exists for tests that explicitly close their own writer.
+    /// Tests use this method after closing their own writer. Browser terminal
+    /// retirement uses the borrowed join after native object deallocation;
+    /// a stop alone leaves the native write fd open.
     #[allow(dead_code)]
     pub(crate) async fn shutdown_and_join(self, timeout: Duration) -> Result<(), String> {
         match tokio::time::timeout(timeout, self.handle).await {
@@ -266,7 +269,10 @@ pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -
         }
     });
 
-    ConsoleForwarder { handle }
+    ConsoleForwarder {
+        handle,
+        joined: false,
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +293,25 @@ mod tests {
         let r = unsafe { std::fs::File::from_raw_fd(fds[0]) };
         let w = unsafe { std::fs::File::from_raw_fd(fds[1]) };
         (r, w)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn console_join_retained_survives_cancelled_observer_until_eof() {
+        let (read, write) = pipe_pair();
+        let mut forwarder = spawn_console_forwarder(read, "vz-console-retained".to_string());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), forwarder.join_retained())
+                .await
+                .is_err()
+        );
+        assert!(!forwarder.joined);
+        drop(write);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), forwarder.join_retained())
+                .await
+                .unwrap()
+        );
+        assert!(forwarder.join_retained().await);
     }
 
     #[tokio::test(flavor = "multi_thread")]

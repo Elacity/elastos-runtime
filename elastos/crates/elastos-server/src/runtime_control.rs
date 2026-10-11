@@ -303,7 +303,7 @@ fn managed_runtime_lane_conflict_message(
 ) -> String {
     let next_step = match owner.role.as_str() {
         "serve" => format!(
-            "`elastos serve` already owns this home. Stop it first if you want the managed {} lane, or keep using the operator lane with commands like `elastos node ...`, `elastos agent`, `elastos run`, or `elastos capsule`.",
+            "`elastos serve` already owns this home. Stop it first if you want the managed {} lane, or keep using the operator lane with commands like `elastos node ...`, `elastos run`, or `elastos capsule`.",
             surface_name
         ),
         "gateway" | "gateway-public" => format!(
@@ -994,90 +994,6 @@ async fn call_attach(
         .ok_or_else(|| anyhow::anyhow!("attach response missing token"))
 }
 
-async fn supervisor_post(
-    client: &reqwest::Client,
-    api_base: &LoopbackHttpBaseUrl,
-    token: &str,
-    path: &str,
-    body: serde_json::Value,
-    timeout: Option<Duration>,
-) -> anyhow::Result<serde_json::Value> {
-    let url = api_base.join(path)?;
-    let mut req = client.post(url).bearer_auth(token).json(&body);
-    if let Some(timeout) = timeout {
-        req = req.timeout(timeout);
-    }
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("supervisor endpoint {} failed ({}): {}", path, status, body);
-    }
-    Ok(resp.json::<serde_json::Value>().await?)
-}
-
-pub(crate) async fn dispatch_via_existing_runtime(
-    coords: &RuntimeCoords,
-    command: serde_json::Value,
-) -> anyhow::Result<()> {
-    const SUPERVISOR_PREPARE_TIMEOUT: Duration = Duration::from_secs(300);
-
-    let client = reqwest::Client::new();
-    let api_base = LoopbackHttpBaseUrl::parse(&coords.api_url).map_err(|e| {
-        anyhow::anyhow!(
-            "runtime API URL must remain local-only for supervisor attach/control: {}",
-            e
-        )
-    })?;
-
-    eprintln!(
-        "[runtime] Attaching to existing runtime at {}",
-        api_base.as_str()
-    );
-
-    let tokens = attach_to_runtime(coords).await?;
-
-    let _ = supervisor_post(
-        &client,
-        &api_base,
-        &tokens.shell_token,
-        "/api/supervisor/ensure-capsule",
-        serde_json::json!({ "name": "shell" }),
-        Some(SUPERVISOR_PREPARE_TIMEOUT),
-    )
-    .await?;
-
-    let launch = supervisor_post(
-        &client,
-        &api_base,
-        &tokens.shell_token,
-        "/api/supervisor/launch-capsule",
-        serde_json::json!({
-            "name": "shell",
-            "config": command,
-        }),
-        Some(SUPERVISOR_PREPARE_TIMEOUT),
-    )
-    .await?;
-
-    let handle = launch
-        .get("handle")
-        .and_then(|h| h.as_str())
-        .ok_or_else(|| anyhow::anyhow!("launch response missing handle"))?;
-
-    let _ = supervisor_post(
-        &client,
-        &api_base,
-        &tokens.shell_token,
-        "/api/supervisor/wait-capsule",
-        serde_json::json!({ "handle": handle }),
-        None,
-    )
-    .await?;
-
-    Ok(())
-}
-
 /// Ensure a runtime is running for native chat. If none exists, starts a
 /// managed background runtime with a chat-safe policy (auto-approves peer,
 /// did, and storage capabilities). Returns the runtime coords.
@@ -1559,7 +1475,7 @@ fn summarize_runtime_start_failure_contents(contents: &str) -> Option<String> {
         && last_line.contains("components.json")
     {
         return Some(format!(
-            "Installed core components are out of sync with the stamped manifest.\nRun `elastos setup --profile home` (or `elastos setup`) to reconcile installed support assets, then retry.\nLast runtime error: {}",
+            "Installed core components are out of sync with the stamped manifest.\nRun `elastos setup` to reconcile installed support assets, then retry.\nLast runtime error: {}",
             last_line
         ));
     }
@@ -1585,7 +1501,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(summary.contains("Run `elastos setup --profile home`"));
+        assert!(summary.contains("Run `elastos setup` to reconcile"));
         assert!(
             summary.contains("Last runtime error: Error: installed component 'localhost-provider'")
         );

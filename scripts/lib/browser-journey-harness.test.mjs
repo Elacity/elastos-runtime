@@ -671,7 +671,7 @@ test("journey preserves click/key timing and exact close even when diagnostic st
         assert.equal(result.controlled_journey.profile.mode, target.profile.mode);
         assert.equal(result.controlled_journey.profile.documents.length, profileReload ? 4 : 3);
         assert.equal(result.controlled_journey.profile.binding.principal_sha256, hash(principal));
-        assert.equal(result.controlled_journey.profile.binding.engine_id, "", "ordinary Automatic Engine selection");
+        assert.equal(result.controlled_journey.profile.binding.engine_id, "", "ordinary local VM Engine selection");
         for (const url of urls) {
           const query = new URL(url).searchParams;
           assert.equal(query.get("run"), runId); assert.equal(query.get("profile"), target.profile.mode);

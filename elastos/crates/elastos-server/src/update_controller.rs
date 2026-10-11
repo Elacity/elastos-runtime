@@ -298,6 +298,37 @@ struct OwnerActionReceipt {
     queued: bool,
 }
 
+/// Another owner action holds the lock or has a request queued or running.
+#[derive(Debug)]
+pub(crate) struct UpdateInProgress;
+
+impl std::fmt::Display for UpdateInProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Another Home update is in progress.")
+    }
+}
+
+impl std::error::Error for UpdateInProgress {}
+
+/// A later approval replaced this one, and nothing is queued or running.
+#[derive(Debug)]
+pub(crate) struct ApprovalReplaced;
+
+impl std::fmt::Display for ApprovalReplaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Home approval was replaced by a later one.")
+    }
+}
+
+impl std::error::Error for ApprovalReplaced {}
+
+fn refuse_other_owner_action(directory: &Path) -> Result<()> {
+    if path_present(&directory.join(REQUEST))? || path_present(&directory.join(ACTIVE_REQUEST))? {
+        return Err(UpdateInProgress.into());
+    }
+    Err(ApprovalReplaced.into())
+}
+
 fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, FileLock)> {
     let data_dir = fs::canonicalize(data_dir)?;
     let directory = controller_directory(&data_dir)?;
@@ -310,20 +341,30 @@ fn owner_action_guard(data_dir: &Path) -> Result<(PathBuf, FileLock)> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(directory.join("owner-action.lock"))?;
     check_private_file(&lock)?;
-    let lock =
-        FileLock::try_exclusive(lock).context("Another Home owner action is in progress.")?;
+    let lock = FileLock::try_exclusive(lock).map_err(|error| {
+        let held = error.kind() == std::io::ErrorKind::WouldBlock;
+        let error = anyhow::Error::new(error);
+        if held {
+            error.context(UpdateInProgress)
+        } else {
+            error.context("Home could not lock the owner action.")
+        }
+    })?;
     Ok((directory, lock))
 }
 
 fn check_owner_effect(
+    directory: &Path,
     receipt: &OwnerActionReceipt,
     request: &UpdateRequest,
     effect_id: &str,
     request_sha256: &str,
 ) -> Result<()> {
+    if receipt.effect_id != effect_id {
+        return refuse_other_owner_action(directory);
+    }
     anyhow::ensure!(
         receipt.schema == "elastos.home-update-owner/v1"
-            && receipt.effect_id == effect_id
             && receipt.request_sha256 == request_sha256
             && receipt.request == *request,
         "Home approval intent changed."
@@ -357,17 +398,14 @@ pub(crate) fn reserve_owner_update(
             "Unknown Home approval receipt."
         );
         if previous.effect_id == effect_id {
-            return check_owner_effect(&previous, request, effect_id, request_sha256);
+            return check_owner_effect(&directory, &previous, request, effect_id, request_sha256);
         }
-        anyhow::ensure!(
-            !recovered,
-            "Home approval effect belongs to an earlier action."
-        );
-        anyhow::ensure!(
-            !path_present(&directory.join(REQUEST))?
-                && !path_present(&directory.join(ACTIVE_REQUEST))?,
-            "Another Home update is pending."
-        );
+        if recovered
+            || path_present(&directory.join(REQUEST))?
+            || path_present(&directory.join(ACTIVE_REQUEST))?
+        {
+            return refuse_other_owner_action(&directory);
+        }
     } else {
         anyhow::ensure!(!recovered, "Home approval effect has no recovery receipt.");
     }
@@ -391,7 +429,7 @@ pub(crate) fn owner_update_is_queued(
 ) -> Result<bool> {
     let directory = data_dir.join(DIRECTORY);
     let receipt: OwnerActionReceipt = read_private_json(&directory.join("owner-action.json"))?;
-    check_owner_effect(&receipt, request, effect_id, request_sha256)?;
+    check_owner_effect(&directory, &receipt, request, effect_id, request_sha256)?;
     if receipt.queued {
         return Ok(true);
     }
@@ -402,7 +440,7 @@ pub(crate) fn owner_update_is_queued(
         let path = directory.join(name);
         if path_present(&path)? {
             let existing: UpdateRequest = read_private_json(&path)?;
-            anyhow::ensure!(existing == *request, "Another update identity is pending.");
+            anyhow::ensure!(existing == *request, UpdateInProgress);
             dispatched = true;
         }
     }
@@ -444,7 +482,7 @@ pub(crate) fn queue_owner_update(
     let (directory, _lock) = owner_action_guard(data_dir)?;
     let path = directory.join("owner-action.json");
     let mut receipt: OwnerActionReceipt = read_private_json(&path)?;
-    check_owner_effect(&receipt, &request, effect_id, request_sha256)?;
+    check_owner_effect(&directory, &receipt, &request, effect_id, request_sha256)?;
     if receipt.queued {
         return Ok(());
     }
@@ -1177,7 +1215,7 @@ impl Controller {
         let fetch_client = client.clone();
         let choice = request.clone();
         let trusted = source.clone();
-        let fetch: crate::update::FetchFn = Box::new(move |cid, _| {
+        let fetch: crate::update::FetchFn = Box::new(move |cid| {
             let client = fetch_client.clone();
             let choice = choice.clone();
             let trusted = trusted.clone();
@@ -1943,6 +1981,155 @@ fn home_digest(data_dir: &Path) -> Result<String> {
     Ok(digest(&read_regular_bounded(&path, 2 * 1024 * 1024)?))
 }
 
+/// The explicit operator route uses the same fresh installed Home proof as
+/// Home start. Legacy manual backup paths need their original hash-bound plan.
+pub async fn finalize_principal_root_backups(
+    data_dir: &Path,
+    binary: &Path,
+    legacy: Option<(&Path, &Path)>,
+) -> Result<usize> {
+    finalize_principal_root_migrations_after_ready(data_dir, binary, legacy, None).await
+}
+
+const START_CLEANUP_ATTEMPTS: usize = 10;
+
+/// Every Home gateway runs this beside its server, whichever process started
+/// it. Release recovery keeps its rollback, so cleanup waits for it to settle
+/// and then proves this exact Home generation ready before removing payload.
+pub(crate) async fn finalize_principal_root_backups_after_start(data_dir: PathBuf) {
+    let mut failures = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        match finalize_after_start_attempt(&data_dir).await {
+            Ok(Some(removed)) => {
+                if removed > 0 {
+                    tracing::info!(removed, "Verified migration backup payload removed.");
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                failures += 1;
+                if failures == START_CLEANUP_ATTEMPTS {
+                    tracing::warn!(error = %error,
+                        "Migration backup retained. Its owner must reconcile cleanup before claiming it complete.");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// `None` means this Home has not published its coordinates yet, or a release
+/// transaction still owns the rollback.
+async fn finalize_after_start_attempt(data_dir: &Path) -> Result<Option<usize>> {
+    let data_dir = &fs::canonicalize(data_dir)?;
+    if !crate::auth::principal_root_migration_cleanup_pending(data_dir).unwrap_or(true) {
+        return Ok(Some(0));
+    }
+    let binary =
+        crate::install_transaction::installed_binary(data_dir, installed_writer_binary(data_dir)?)?
+            .context("Migration backup cleanup needs an installed Runtime release.")?;
+    let binary = fs::canonicalize(
+        binary
+            .parent()
+            .context("installed Runtime parent is missing")?,
+    )?
+    .join(
+        binary
+            .file_name()
+            .context("installed Runtime name is missing")?,
+    );
+    if InstallTransaction::has_pending_recovery(&binary) {
+        return Ok(None);
+    }
+    let Some(coords) = read_private_json::<crate::runtime_control::RuntimeCoords>(
+        &crate::runtime_control::gateway_runtime_coord_path(data_dir),
+    )
+    .ok()
+    .filter(|coords| coords.pid == std::process::id()) else {
+        return Ok(None);
+    };
+    finalize_principal_root_migrations_after_ready(
+        data_dir,
+        &binary,
+        None,
+        Some((Some(coords.pid), &coords.generation)),
+    )
+    .await
+    .map(Some)
+}
+
+async fn finalize_principal_root_migrations_after_ready(
+    data_dir: &Path,
+    binary: &Path,
+    legacy: Option<(&Path, &Path)>,
+    expected: Option<(Option<u32>, &str)>,
+) -> Result<usize> {
+    anyhow::ensure!(
+        data_dir.is_absolute() && binary.is_absolute(),
+        "Migration cleanup data and installed Runtime paths must be absolute."
+    );
+    if let Some((plan, backup)) = legacy {
+        anyhow::ensure!(
+            plan.is_absolute() && backup.is_absolute(),
+            "Legacy migration plan and backup paths must be absolute."
+        );
+    }
+    let writer = crate::install_transaction::InstallationGuard::acquire(
+        binary
+            .parent()
+            .context("installed Runtime parent is missing")?,
+    )?;
+    anyhow::ensure!(
+        !InstallTransaction::has_pending_recovery(binary),
+        "Retain migration backups until release recovery and Home acceptance finish."
+    );
+    let source = installed_source(data_dir)?;
+    let installed = crate::installed_release::read_without_migration(data_dir, binary, &source)?;
+    let coords: crate::runtime_control::RuntimeCoords = read_private_json(
+        &crate::runtime_control::gateway_runtime_coord_path(data_dir),
+    )?;
+    if let Some((pid, generation)) = expected {
+        anyhow::ensure!(
+            pid == Some(coords.pid) && generation == coords.generation,
+            "Migration cleanup belongs to a different Home generation."
+        );
+    }
+    let start = process_start(coords.pid).context("accepted Home has exited")?;
+    let port = url::Url::parse(&coords.home_url)?
+        .port()
+        .context("accepted Home listener port is missing")?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    prove_ready(
+        &client,
+        data_dir,
+        port,
+        coords.pid,
+        &coords.generation,
+        &source.installed_version,
+        &installed.binary_sha256,
+        &home_digest(data_dir)?,
+    )
+    .await?;
+    anyhow::ensure!(
+        process_start(coords.pid).as_deref() == Some(start.as_str()),
+        "Home process changed during migration cleanup acceptance."
+    );
+    if let Some((plan, backup)) = legacy {
+        crate::auth::reconcile_legacy_principal_root_migration(
+            data_dir, plan, backup, binary, &writer,
+        )?;
+    }
+    crate::api::auth_gateway::finalize_configured_principal_root_migrations_with_writer(
+        data_dir, binary, &writer,
+    )
+}
+
 async fn response_bytes(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     anyhow::ensure!(
         response.status().is_success(),
@@ -1999,10 +2186,14 @@ async fn prove_ready(
         &data_dir.join("host-process.lock"),
         4096,
     )?)?;
+    // Local and public Home gateways hold the host lock under their own roles.
     anyhow::ensure!(
         metadata["pid"].as_u64() == Some(u64::from(pid))
             && metadata["generation"].as_str() == Some(generation)
-            && metadata["role"] == "gateway",
+            && matches!(
+                metadata["role"].as_str(),
+                Some("gateway" | "gateway-public")
+            ),
         "Home host lock differs from the claimed generation"
     );
     let home_url = approved_home_url(&coords.home_url, home_port)?;

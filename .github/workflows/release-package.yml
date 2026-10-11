@@ -19,6 +19,18 @@ on:
         description: Update version N+1, built with N's support
         required: true
         type: string
+      browser_image_cid:
+        description: Qualified common ARM64 guest archive CID (served as its immutable filename)
+        required: true
+        type: string
+      browser_image_sha256:
+        description: Independent SHA-256 of that guest archive
+        required: true
+        type: string
+      browser_image_size:
+        description: Exact archive bytes
+        required: true
+        type: string
       seed_package:
         description: Also build the Linux seed package (only to upgrade the seed Runtime)
         type: boolean
@@ -35,6 +47,12 @@ env:
   SOURCE_COMMIT: ${{ inputs.source_commit }}
   INSTALL_VERSION: ${{ inputs.install_version }}
   UPDATE_VERSION: ${{ inputs.update_version }}
+  BROWSER_IMAGE_CID: ${{ inputs.browser_image_cid }}
+  BROWSER_IMAGE_SHA256: ${{ inputs.browser_image_sha256 }}
+  BROWSER_IMAGE_SIZE: ${{ inputs.browser_image_size }}
+  BROWSER_IMAGE_PUBLISHER_DID: ${{ vars.BROWSER_IMAGE_PUBLISHER_DID }}
+  BROWSER_IMAGE_PUBLISHER_NODE_ID: ${{ vars.BROWSER_IMAGE_PUBLISHER_NODE_ID }}
+  BROWSER_IMAGE_CONNECT_TICKET: ${{ secrets.BROWSER_IMAGE_CONNECT_TICKET }}
   CARGO_BUILD_JOBS: '4'
   PYTHONDONTWRITEBYTECODE: '1'
   # Shipped release builds stay hermetic: no compiler wrapper or cache.
@@ -53,6 +71,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == Elacity/elastos-runtime ]] \
+            || { echo 'The canonical builder repository is required' >&2; exit 1; }
+          [[ "$GITHUB_REF" == refs/heads/develop ]] \
+            || { echo 'The develop builder ref is required' >&2; exit 1; }
           version='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo 'source_commit must be a full SHA' >&2; exit 1; }
           [[ "$INSTALL_VERSION" =~ $version && "$UPDATE_VERSION" =~ $version && "$INSTALL_VERSION" != "$UPDATE_VERSION" ]] \
@@ -65,12 +87,24 @@ jobs:
           # Preparation may run beside CI. Publication still requires green CI
           # for this exact source and the release acceptance gate.
           echo "source_tree=$tree" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - name: admit the common immutable image selector
+        run: |
+          set -euo pipefail
+          python3 -I -S scripts/browser-image-cid-input.py "$BROWSER_IMAGE_CID" "$BROWSER_IMAGE_SHA256" "$BROWSER_IMAGE_SIZE"
+          [[ "$BROWSER_IMAGE_PUBLISHER_DID" == did:key:* && "$BROWSER_IMAGE_PUBLISHER_NODE_ID" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo 'Configure the explicit Browser image publisher DID and Carrier node ID' >&2; exit 1; }
 
   mac:
     name: Apple silicon N and N+1
     needs: admit
     runs-on: macos-14
     timeout-minutes: 300
+    permissions:
+      contents: read
     defaults:
       run:
         shell: bash
@@ -107,7 +141,7 @@ jobs:
         timeout-minutes: 20
         run: |
           set -euo pipefail
-          brew install e2fsprogs coturn pkg-config openssl@3
+          brew install e2fsprogs coturn pkg-config openssl@3 autoconf automake libtool zstd
           python3 -I -S ../workflow/.github/scripts/release-mac-capacity.py
       - name: keep the capacity record
         if: always() && env.RELEASE_ROOT != ''
@@ -131,8 +165,10 @@ jobs:
             [[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]]
             reuse=()
             [[ "$name" == N ]] || reuse=(--reuse-support "$inputs/N")
+            image=()
+            [[ "$name" != N ]] || image=(--browser-vm-image-cid "$BROWSER_IMAGE_CID" --browser-vm-image-sha256 "$BROWSER_IMAGE_SHA256" --browser-vm-image-size "$BROWSER_IMAGE_SIZE")
             HOME="$RELEASE_ROOT/home" scripts/prepare-release-platform.sh \
-              --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"}
+              --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"} ${image[@]+"${image[@]}"}
             python3 -I -S scripts/release-platform-input.py verify "$inputs/$name" > /dev/null
             rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
           done
@@ -157,7 +193,7 @@ jobs:
           rm -rf home
           (cd inputs && find . -type f -print0 | sort -z | xargs -0 shasum -a 256 > ../SHA256SUMS && mv ../SHA256SUMS .)
           install -d -m 700 package
-          tar -cf - inputs | gzip -1 | split -b 2000m -a 3 - package/release-inputs.tar.gz.part
+          COPYFILE_DISABLE=1 tar -cf - inputs | gzip -1 | split -b 2000m -a 3 - package/release-inputs.tar.gz.part
           (cd package && shasum -a 256 release-inputs.tar.gz.part* > SHA256SUMS)
       - id: upload
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
@@ -224,8 +260,7 @@ jobs:
           echo "cache-key=develop-llama-arm64-${recipe_hash}" >> "$GITHUB_OUTPUT"
       - name: restore pinned ARM64 engine
         id: engine-cache
-        # Caches belong to the workflow ref. A main dispatch can miss the
-        # develop cache and take the same verified cold build below.
+        # A miss takes the same verified cold build below.
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/llama-arm64-bundle
@@ -252,6 +287,8 @@ jobs:
     needs: [admit, engine-llama-arm64]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 300
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -297,7 +334,7 @@ jobs:
         timeout-minutes: 15
         run: |
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y build-essential cmake coturn e2fsprogs ffmpeg musl-tools nasm pkg-config
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y build-essential cmake coturn e2fsprogs ffmpeg musl-tools nasm pkg-config autoconf automake libtool libclang-dev linux-libc-dev zstd
       - name: download pinned ARM64 engine input
         if: matrix.platform == 'aarch64-linux'
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -319,8 +356,10 @@ jobs:
             [[ ! -e "$CARGO_TARGET_DIR" && ! -L "$CARGO_TARGET_DIR" && ! -e "$CARGO_BUILD_BUILD_DIR" && ! -L "$CARGO_BUILD_BUILD_DIR" ]]
             reuse=()
             [[ "$name" == N ]] || reuse=(--reuse-support "$inputs/N")
+            image=()
+            [[ "$name" != N || "$RELEASE_PLATFORM" != aarch64-linux ]] || image=(--browser-vm-image-cid "$BROWSER_IMAGE_CID" --browser-vm-image-sha256 "$BROWSER_IMAGE_SHA256" --browser-vm-image-size "$BROWSER_IMAGE_SIZE")
             HOME="$RELEASE_ROOT/home" scripts/prepare-release-platform.sh \
-              --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"}
+              --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"} ${image[@]+"${image[@]}"}
             python3 -I -S scripts/release-platform-input.py verify "$inputs/$name" > /dev/null
             rm -rf "$CARGO_TARGET_DIR" "$CARGO_BUILD_BUILD_DIR"
           done
@@ -369,7 +408,7 @@ jobs:
           if [[ "$RELEASE_PLATFORM" == aarch64-linux ]]; then
             cp jetson-*.receipt.json package/
           fi
-          tar -cf - inputs | gzip -1 | split -b 2000m -a 3 - package/release-inputs.tar.gz.part
+          COPYFILE_DISABLE=1 tar -cf - inputs | gzip -1 | split -b 2000m -a 3 - package/release-inputs.tar.gz.part
           (cd package && shasum -a 256 -- * > SHA256SUMS)
       - id: upload
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
@@ -388,6 +427,8 @@ jobs:
     if: inputs.seed_package
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    permissions:
+      contents: read
     env:
       SOURCE_TREE: ${{ needs.admit.outputs.source_tree }}
       # The seed Runtime embeds its build path and runs the release helpers
@@ -435,6 +476,21 @@ jobs:
           grep -qaF "$SEED_SOURCE_ROOT/elastos/crates/elastos-server" "$package/elastos"
           if ldd "$package/elastos" "$package/ipfs-provider" | grep 'not found'; then exit 1; fi
           tar -czf "$package/source.tar.gz" -C "$SEED_SOURCE_ROOT" .
+          python3 -I -S - "$package" "$SOURCE_COMMIT" "$SOURCE_TREE" "$INSTALL_VERSION" <<'PYTHON'
+          import hashlib, json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          files = {}
+          for name in ("elastos", "ipfs-provider", "source.tar.gz"):
+              path = root / name
+              digest = hashlib.sha256()
+              with path.open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              files[name] = {"sha256": digest.hexdigest(), "size": path.stat().st_size}
+          receipt = {"schema": "elastos.release-seed-input/v1", "source": {"commit": sys.argv[2], "tree": sys.argv[3]},
+                     "version": sys.argv[4], "files": files}
+          (root / "seed-input.json").write_text(json.dumps(receipt, sort_keys=True) + "\n")
+          PYTHON
           (cd "$package" && sha256sum elastos ipfs-provider source.tar.gz > SHA256SUMS)
       - id: upload
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
@@ -445,3 +501,102 @@ jobs:
           retention-days: 14
       - name: record the artifact
         run: echo "Seed package artifact ${{ steps.upload.outputs.artifact-id }}, zip sha256:${{ steps.upload.outputs.artifact-digest }}" >> "$GITHUB_STEP_SUMMARY"
+
+  attest-platform:
+    name: attest inert ${{ matrix.platform }} receipts
+    needs: [admit, mac, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: aarch64-darwin
+            prefix: release-mac
+          - platform: x86_64-linux
+            prefix: release-x86_64-linux
+          - platform: aarch64-linux
+            prefix: release-aarch64-linux
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      # This fresh runner executes W helpers only. Candidate H owns build
+      # bytes, while W and the original dispatch inputs own these assertions.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: hash native payloads and seal original-input receipts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TREE: ${{ needs.admit.outputs.source_tree }}
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+          RELEASE_PREFIX: ${{ matrix.prefix }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          python3 -I -S scripts/release-provenance-seal.py attest \
+            --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" \
+            --workflow-commit "$GITHUB_SHA" --workflow-ref "$GITHUB_REF" \
+            --run "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --platform "$RELEASE_PLATFORM" --prefix "$RELEASE_PREFIX" \
+            --install-version "$INSTALL_VERSION" --update-version "$UPDATE_VERSION" \
+            --output "$RUNNER_TEMP/proof-$RELEASE_PLATFORM"
+      - id: provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ runner.temp }}/proof-${{ matrix.platform }}/*.platform-input.json
+      - name: keep the receipt bundle
+        run: install -m 600 '${{ steps.provenance.outputs.bundle-path }}' "$RUNNER_TEMP/proof-${{ matrix.platform }}/provenance.jsonl"
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+        with:
+          name: release-proof-${{ matrix.platform == 'aarch64-darwin' && 'mac' || matrix.platform }}-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/proof-${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 14
+
+  attest-seed:
+    name: attest inert seed receipt
+    needs: [admit, seed]
+    if: inputs.seed_package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: hash seed payloads and seal original-input receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TREE: ${{ needs.admit.outputs.source_tree }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          python3 -I -S scripts/release-provenance-seal.py attest \
+            --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" \
+            --workflow-commit "$GITHUB_SHA" --workflow-ref "$GITHUB_REF" \
+            --run "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --platform seed --prefix release-seed \
+            --install-version "$INSTALL_VERSION" --update-version "$UPDATE_VERSION" \
+            --output "$RUNNER_TEMP/proof-seed"
+      - id: provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ runner.temp }}/proof-seed/seed-input.json
+      - name: keep the receipt bundle
+        run: install -m 600 '${{ steps.provenance.outputs.bundle-path }}' "$RUNNER_TEMP/proof-seed/provenance.jsonl"
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+        with:
+          name: release-proof-seed-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/proof-seed
+          if-no-files-found: error
+          retention-days: 14

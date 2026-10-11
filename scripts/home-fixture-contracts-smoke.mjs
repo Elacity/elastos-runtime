@@ -25,12 +25,14 @@ test("valid product data leaves Home isolation and Runtime projection evidence o
   assert.match(audit.criteria.find((entry) => entry.id === "capsule_interface_projection").missing, /installed \/api\/capsules\/contracts\/audit/);
 });
 
-test("generated native media defaults do not accept missing product or manual evidence", () => {
+test("source defaults require accepted VM media and matching human evidence", () => {
   const result = spawnSync(process.execPath, [fileURLToPath(new URL("./browser-objective-audit.mjs", import.meta.url))], { encoding: "utf8" });
   assert.equal(result.status, 1, result.stderr);
   const audit = JSON.parse(result.stdout);
-  assert.equal(audit.criteria.find((entry) => entry.id === "native_media_not_faked").ok, true);
-  for (const id of ["native_product_media_accepted", "manual_ux_accepted"]) {
+  for (const id of ["single_vm_engine", "retired_native_engine_absent"]) {
+    assert.equal(audit.criteria.find((entry) => entry.id === id).ok, true, id);
+  }
+  for (const id of ["vm_product_media_accepted", "manual_ux_accepted"]) {
     assert.equal(audit.criteria.find((entry) => entry.id === id).ok, false, id);
   }
   assert.equal(audit.product_provider_accepted, false);

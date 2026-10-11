@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -102,11 +102,17 @@ const SEALED_OBJECT_PATH: &str = "sealed.json";
 pub const CONTENT_OBJECT_MANIFEST_PATH: &str = OBJECT_MANIFEST_PATH;
 const MAX_LOCAL_OBJECT_DIRS: usize = 16;
 const MAX_LOCAL_OBJECT_WALK_DEPTH: usize = 8;
+// Bounds the one local object file Runtime reads whole: 4096 manifest entries.
+const MAX_LOCAL_OBJECT_MANIFEST_BYTES: u64 = 1024 * 1024;
 const LOCAL_OBJECT_WALK_SKIP: &[&str] = &[
     "ipfs-repo",
     "logs",
     "bin",
     "managed-runtimes",
+    // Runtime-private model inventory. Admitted models are verified at
+    // admission and this Home's Kubo does not hold them in 0.8.0; serving
+    // them to peers is the holder role of #324.
+    "model-preparation",
     "target",
     ".git",
 ];
@@ -4271,21 +4277,20 @@ impl ContentProvider {
     ) -> Result<bool, ProviderError> {
         for dir in complete_local_object_dirs(&self.data_dir) {
             match self.import_local_object_dir(registry, &dir).await {
-                Ok(imported_cid) if imported_cid == cid => return Ok(true),
-                Ok(imported_cid) => {
-                    let _ = self
+                // The import is unpinned; only the requested CID is pinned.
+                Ok(imported_cid) if imported_cid == cid => {
+                    let pinned = self
                         .invoke_provider(
                             registry,
                             "ipfs",
-                            "unpin",
-                            json!({
-                                "op": "unpin",
-                                "cid": imported_cid,
-                            }),
+                            "pin",
+                            json!({ "op": "pin", "cid": cid }),
                             ProviderTransfer::Json,
                         )
-                        .await;
+                        .await?;
+                    return Ok(pinned["status"] == "ok");
                 }
+                Ok(_) => {}
                 Err(err) => {
                     tracing::debug!(
                         dir = %dir.display(),
@@ -4303,32 +4308,38 @@ impl ContentProvider {
         registry: &ProviderRegistry,
         dir: &Path,
     ) -> Result<String, ProviderError> {
-        let files = local_object_dir_files(dir)?;
-        let ipfs_response = self
-            .invoke_provider(
-                registry,
-                "ipfs",
-                "add_directory",
-                json!({
-                    "op": "add_directory",
-                    "files": files,
-                    "pin": true,
-                }),
-                ProviderTransfer::Json,
-            )
-            .await?;
-        provider_response_ok(&ipfs_response, "content local object import")?;
-        provider_response_cid(&ipfs_response).map_err(|err| {
-            ProviderError::Provider(format!("content local object import missing CID: {err}"))
-        })
+        // The provider streams the files from disk into Kubo; Runtime sends
+        // only their paths and recorded sizes, whatever the object's size.
+        registry
+            .add_local_ipfs_object(dir, &local_object_dir_files(dir)?)
+            .await
     }
 
+    /// Restores the replicas this Content plane recorded: a complete local
+    /// object is pinned and announced only when its imported CID has a Content
+    /// receipt that was not withdrawn by unpublish.
     pub async fn restore_complete_local_objects(&self) {
         let Ok(registry) = self.registry() else {
             return;
         };
+        let held: BTreeSet<String> = match self.latest_receipts() {
+            Ok(receipts) => receipts
+                .into_iter()
+                .filter(|receipt| receipt.payload.status != "local_unpinned")
+                .map(|receipt| receipt.payload.cid)
+                .collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "content: local object restore skipped");
+                return;
+            }
+        };
         for dir in complete_local_object_dirs(&self.data_dir) {
             match self.import_local_object_dir(&registry, &dir).await {
+                Ok(cid) if !held.contains(&cid) => tracing::warn!(
+                    dir = %dir.display(),
+                    cid = %cid,
+                    "content: local object CID has no Content receipt; not restored"
+                ),
                 Ok(cid) => match self
                     .ensure(&json!({
                         "cid": cid,
@@ -8854,55 +8865,55 @@ fn walk_local_object_dirs(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
 }
 
 fn local_object_dir_is_complete(dir: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(dir.join(OBJECT_MANIFEST_PATH)) else {
+    let Some((_, manifest)) = local_object_manifest(dir) else {
         return false;
     };
-    let Ok(manifest) = serde_json::from_slice::<ContentObjectManifest>(&bytes) else {
-        return false;
-    };
-    if manifest.schema != OBJECT_MANIFEST_SCHEMA || manifest.files.is_empty() {
-        return false;
-    }
     manifest.files.iter().all(|file| {
-        if validate_content_path(&file.path).is_err() {
-            return false;
-        }
-        let path = dir.join(&file.path);
-        let Ok(bytes) = std::fs::read(&path) else {
-            return false;
-        };
-        bytes.len() as u64 == file.size
-            && format!("{:x}", sha2::Sha256::digest(&bytes)) == file.sha256
+        validate_content_path(&file.path).is_ok()
+            && local_object_file_sha256(&dir.join(&file.path), file.size).as_deref()
+                == Some(file.sha256.as_str())
     })
 }
 
-fn local_object_dir_files(dir: &Path) -> Result<Vec<Value>, ProviderError> {
-    let manifest_path = dir.join(OBJECT_MANIFEST_PATH);
-    let manifest_bytes = std::fs::read(&manifest_path)?;
-    let manifest: ContentObjectManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|err| {
-            ProviderError::Provider(format!(
-                "content local object manifest decode failed: {err}"
-            ))
-        })?;
+fn local_object_manifest(dir: &Path) -> Option<(u64, ContentObjectManifest)> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(dir.join(OBJECT_MANIFEST_PATH))
+        .ok()?
+        .take(MAX_LOCAL_OBJECT_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let manifest: ContentObjectManifest = serde_json::from_slice(&bytes).ok()?;
+    (bytes.len() as u64 <= MAX_LOCAL_OBJECT_MANIFEST_BYTES
+        && manifest.schema == OBJECT_MANIFEST_SCHEMA
+        && !manifest.files.is_empty())
+    .then_some((bytes.len() as u64, manifest))
+}
+
+/// Streams a file that must be exactly `size` bytes through SHA-256.
+fn local_object_file_sha256(path: &Path, size: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?.take(size + 1);
+    let mut digest = sha2::Sha256::new();
+    let read = std::io::copy(&mut file, &mut digest).ok()?;
+    (read == size).then(|| format!("{:x}", digest.finalize()))
+}
+
+/// Paths and recorded sizes of a local object, manifest last, as the original
+/// directory import sent them.
+fn local_object_dir_files(dir: &Path) -> Result<Vec<(String, u64)>, ProviderError> {
+    let (manifest_bytes, manifest) = local_object_manifest(dir).ok_or_else(|| {
+        ProviderError::Provider("content local object manifest is invalid".into())
+    })?;
     let mut files = Vec::with_capacity(manifest.files.len().saturating_add(1));
-    for file in &manifest.files {
+    for file in manifest.files {
         if validate_content_path(&file.path).is_err() {
             return Err(ProviderError::Provider(format!(
                 "content local object path {} is invalid",
                 file.path
             )));
         }
-        let bytes = std::fs::read(dir.join(&file.path))?;
-        files.push(json!({
-            "path": file.path,
-            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-        }));
+        files.push((file.path, file.size));
     }
-    files.push(json!({
-        "path": OBJECT_MANIFEST_PATH,
-        "data": base64::engine::general_purpose::STANDARD.encode(manifest_bytes),
-    }));
+    files.push((OBJECT_MANIFEST_PATH.to_string(), manifest_bytes));
     Ok(files)
 }
 
@@ -9430,12 +9441,19 @@ mod tests {
         async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
             self.requests.lock().await.push(request.clone());
             match request.get("op").and_then(|op| op.as_str()) {
-                Some("add_directory") => {
+                Some(op @ ("add_directory" | "runtime_add_local_object")) => {
                     *self.add_count.lock().await += 1;
+                    let files = if op == "add_directory" {
+                        &request["files"]
+                    } else {
+                        // The blocks are now local, so a later pin succeeds.
+                        *self.pin_error.lock().await = None;
+                        &request["object"]["files"]
+                    };
                     self.added_directories
                         .lock()
                         .await
-                        .push(request["files"].as_array().cloned().unwrap_or_default());
+                        .push(files.as_array().cloned().unwrap_or_default());
                     Ok(provider_ok(json!({ "cid": TEST_CID })))
                 }
                 Some("add_bytes") => {
@@ -11867,7 +11885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_restore_imports_complete_local_objects() {
+    async fn content_restore_pins_only_local_objects_with_a_content_receipt() {
         let (data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
         let body = b"hello object";
         let digest = format!("{:x}", sha2::Sha256::digest(body));
@@ -11890,10 +11908,24 @@ mod tests {
         )
         .unwrap();
 
+        // No Content receipt names the imported CID: it is never pinned.
         content.restore_complete_local_objects().await;
-
         assert_eq!(ipfs.added_directories.lock().await.len(), 1);
+        assert!(ipfs.pinned.lock().await.is_empty());
+
+        // A recorded replica is pinned again on restore.
+        let ensure = json!({"op": "ensure", "cid": TEST_CID});
+        assert_eq!(content.send_raw(&ensure).await.unwrap()["status"], "ok");
+        ipfs.pinned.lock().await.clear();
+        content.restore_complete_local_objects().await;
         assert_eq!(ipfs.pinned.lock().await.as_slice(), [TEST_CID.to_string()]);
+
+        // Unpublish withdraws the replica; restore does not pin it again.
+        let unpublish = json!({"op": "unpublish", "cid": TEST_CID});
+        assert_eq!(content.send_raw(&unpublish).await.unwrap()["status"], "ok");
+        ipfs.pinned.lock().await.clear();
+        content.restore_complete_local_objects().await;
+        assert!(ipfs.pinned.lock().await.is_empty());
     }
 
     #[tokio::test]

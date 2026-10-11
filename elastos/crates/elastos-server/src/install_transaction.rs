@@ -266,7 +266,10 @@ pub(crate) fn acquire_installed_writer(
     Ok(Some(guard))
 }
 
-fn installed_binary(data_dir: &Path, retained: Option<PathBuf>) -> anyhow::Result<Option<PathBuf>> {
+pub(crate) fn installed_binary(
+    data_dir: &Path,
+    retained: Option<PathBuf>,
+) -> anyhow::Result<Option<PathBuf>> {
     let binary = match retained {
         Some(binary) => binary,
         None => {
@@ -1910,6 +1913,19 @@ pub(crate) mod tests {
             failure.observed_prefix = fs::metadata(&failure.partial).ok().map(|file| file.len());
             Some((1 << 40, failure.available))
         })
+    }
+
+    #[test]
+    fn browser_script_support_paths_keep_the_release_journal_boundary() {
+        validate_support_path(Path::new("scripts/browser-vm-linux-network.py")).unwrap();
+        for path in [
+            "scripts/../config/owner.json",
+            "scripts/.elastos.update-status",
+            "/scripts/helper",
+            "config/owner.json",
+        ] {
+            assert!(validate_support_path(Path::new(path)).is_err());
+        }
     }
 
     /// Writes a version script and holds a writable descriptor to it for 100 ms;

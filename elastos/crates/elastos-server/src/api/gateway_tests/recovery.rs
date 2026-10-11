@@ -758,8 +758,8 @@ async fn test_full_recovery_activation_migrates_existing_plaintext_gba_save() {
     // plaintext before a person can reach Recovery, while the offline
     // migration path demands protection that cannot exist yet. Activation
     // therefore migrates surviving plaintext under its own guard: the export
-    // succeeds, the object becomes an envelope, and the original bytes land
-    // in a backup under the Home's backups directory.
+    // succeeds, and the object and retained backup become bound encrypted
+    // envelopes that can recover the original bytes.
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(wallet_test_state(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("alex"));
@@ -816,9 +816,7 @@ async fn test_full_recovery_activation_migrates_existing_plaintext_gba_save() {
     let migrated = std::fs::read(&save_path).unwrap();
     assert_ne!(migrated, b"existing uCity save");
     let envelope: Value = serde_json::from_slice(&migrated).expect("migrated object is JSON");
-    assert!(envelope["schema"]
-        .as_str()
-        .is_some_and(|schema| schema.starts_with("elastos.principal-root.object/")));
+    assert_eq!(envelope["schema"], "elastos.principal-root.object/v1");
 
     assert!(crate::auth::load_principal_root_protection(
         dir.path(),
@@ -839,27 +837,35 @@ async fn test_full_recovery_activation_migrates_existing_plaintext_gba_save() {
                 .starts_with("principal-root-migration-")
         })
         .expect("migration backup directory exists");
-    let mut backed_up = Vec::new();
-    let mut pending = vec![backup_entry.path()];
-    while let Some(path) = pending.pop() {
-        if path.is_dir() {
-            pending.extend(
-                std::fs::read_dir(&path)
-                    .unwrap()
-                    .filter_map(Result::ok)
-                    .map(|entry| entry.path()),
-            );
-        } else if std::fs::read(&path)
-            .map(|bytes| bytes == b"existing uCity save")
-            .unwrap_or(false)
-        {
-            backed_up.push(path);
-        }
+    let backup_path = std::fs::read_dir(backup_entry.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".encrypted.backup")
+                && std::fs::read(entry.path()).unwrap() == migrated
+        })
+        .expect("backup must retain the bound encrypted save envelope")
+        .path();
+    let backup_bytes = std::fs::read(&backup_path).unwrap();
+    assert!(!backup_bytes
+        .windows(b"existing uCity save".len())
+        .any(|window| window == b"existing uCity save"));
+    for path in [&save_path, &backup_path] {
+        assert_eq!(
+            crate::auth::read_principal_root_object(
+                dir.path(),
+                &authority.principal_id,
+                &principal.localhost_root,
+                &save_uri,
+                path,
+            )
+            .unwrap(),
+            b"existing uCity save"
+        );
     }
-    assert!(
-        !backed_up.is_empty(),
-        "backup must preserve the original plaintext bytes"
-    );
 }
 
 #[tokio::test]
@@ -1924,4 +1930,143 @@ async fn test_full_recovery_bundle_sanitizes_malformed_wallet_restore_after_reas
     assert!(!serialized.contains("missing status"));
     assert!(!serialized.contains("invalid Wallet provider"));
     assert!(!serialized.contains("private_key_hex"));
+}
+
+/// The owner lost every passkey and guest registration is off. The operator
+/// arms a code on this computer; the sign-in screen registers a new passkey
+/// bound to the owner's Recovery Kit, and the usual full import then restores.
+#[tokio::test]
+async fn test_owner_recovery_restores_same_home_after_every_passkey_is_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let owner = passkey_authority_with_name(dir.path(), Some("owner"));
+    let owner_principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &owner.proof_binding_id).unwrap();
+    // A real Home keeps the owner's (now lost) passkey in its identity store.
+    let owner_passkey = owner_principal.proof_binding.passkey.as_ref().unwrap();
+    let mut store = elastos_identity::IdentityStore::new(dir.path()).unwrap();
+    store.load().unwrap();
+    store.add_credential(elastos_identity::StoredCredential {
+        credential_id: owner_passkey.credential_id.clone(),
+        public_key: owner_passkey.public_key.clone(),
+        sign_count: owner_passkey.sign_count,
+        rp_id: owner_passkey.rp_id.clone(),
+    });
+    store.save().unwrap();
+    let export =
+        export_full_recovery_bundle_response(&app, dir.path(), &owner, &owner_principal).await;
+    assert_eq!(export.status(), StatusCode::OK);
+    let bundle: Value = serde_json::from_slice(
+        &axum::body::to_bytes(export.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!crate::auth::guest_registration_enabled(dir.path()).unwrap());
+
+    let code =
+        crate::auth::arm_owner_recovery(dir.path(), "http://localhost:61180", "localhost", 300)
+            .unwrap();
+    let request = |path: &str, body: Value| {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("host", "localhost:61180")
+            .header("origin", "http://localhost:61180")
+            .header("x-elastos-owner-recovery", code.as_str())
+            .header(CONTENT_TYPE, "application/json")
+            .extension(axum::extract::ConnectInfo(
+                "127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let begin = app
+        .clone()
+        .oneshot(request("/api/auth/owner-recovery/begin", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(begin.status(), StatusCode::OK);
+    let begin: Value = serde_json::from_slice(
+        &axum::body::to_bytes(begin.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let attestation = crate::auth::passkey_attestation_with_id_for_test(
+        begin["options"]["publicKey"]["challenge"].as_str().unwrap(),
+        "localhost",
+        "http://localhost:61180",
+        b"replacement-owner-passkey",
+    );
+    let complete = app
+        .clone()
+        .oneshot(request(
+            "/api/auth/owner-recovery/complete",
+            json!({"ceremony_id": begin["ceremony_id"], "response": attestation, "bundle": bundle}),
+        ))
+        .await
+        .unwrap();
+    let status = complete.status();
+    let body = axum::body::to_bytes(complete.into_body(), 65536)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let complete: Value = serde_json::from_slice(&body).unwrap();
+
+    let recovered = crate::auth::load_principal_for_proof_binding(
+        dir.path(),
+        complete["proof_binding_id"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recovered.principal_id, owner_principal.principal_id);
+    assert_eq!(recovered.role, crate::auth::RuntimePrincipalRole::Admin);
+    assert!(
+        crate::auth::load_principal_for_proof_binding(dir.path(), &owner.proof_binding_id).is_err()
+    );
+    assert_eq!(
+        crate::auth::active_admin_passkey_principal_count(dir.path()).unwrap(),
+        1
+    );
+
+    // The new session restores the rest exactly as the sign-in screen does.
+    let import = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/auth/recovery/full-import")
+                .header(
+                    "x-elastos-home-token",
+                    complete["system_token"].as_str().unwrap(),
+                )
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "schema": "elastos.full-recovery-bundle.import.request/v1",
+                        "principal_id": recovered.principal_id,
+                        "localhost_root": recovered.localhost_root,
+                        "bundle": bundle,
+                        "reassign_to_current_principal": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(import.status(), StatusCode::OK);
+
+    // The code was used once; it opens nothing now.
+    let reused = app
+        .clone()
+        .oneshot(request("/api/auth/owner-recovery/begin", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(reused.status(), StatusCode::FORBIDDEN);
 }

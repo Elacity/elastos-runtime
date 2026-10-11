@@ -76,6 +76,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest as _;
 
+/// Protected content (Elacity Player, Protect and List, Marketplace Media)
+/// ships after 0.8.0 (#91). It stays off, and Home hides those surfaces and
+/// refuses protected publishing, unless the host sets
+/// `elastos config set protected_content true`.
+pub(crate) fn protected_content_enabled(data_dir: &Path) -> bool {
+    fs::read_to_string(data_dir.join("config.toml"))
+        .ok()
+        .and_then(|contents| contents.parse::<toml::Table>().ok())
+        .and_then(|config| {
+            config
+                .get("protected_content")
+                .and_then(toml::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+pub(crate) const ELACITY_PLAYER_CAPSULE_ID: &str = "elacity-player";
+
 pub(crate) const CUSTODY_PROVIDER_ID: &str = "custody";
 pub(crate) const PROTECT_PROVIDER_ID: &str = "protect";
 pub(crate) const MEDIA_PROVIDER_ID: &str = "media";
@@ -96,7 +113,6 @@ const MEDIA_PROVIDER_MAX_SOURCE_HEIGHT_V1: u32 = 2_160;
 const MEDIA_PROVIDER_MAX_SOURCE_FPS_V1: u32 = 60;
 const MEDIA_PROVIDER_MAX_SEGMENT_COUNT_V1: usize = MAX_PROTECT_MEDIA_SEGMENTS_V1 as usize;
 const MEDIA_PROVIDER_MAX_TOTAL_OUTPUT_BYTES_V1: u64 = 2 << 30;
-const ELACITY_PLAYER_CAPSULE_ID: &str = "elacity-player";
 const CONTENT_PROVIDER_ID: &str = "content";
 const PROTECTED_CONTENT_REPLICATION_POLICY: &str = "protected-content-replication/v1";
 const PROTECTED_CONTENT_MIN_REPLICAS: u32 = 3;
@@ -1778,9 +1794,45 @@ pub fn load_runtime_media_provider_bridge_config(
     }))
 }
 
+/// SHA-256 digests of ffmpeg and ffprobe read from a media-tools archive whose
+/// checksum was just verified against the installed signed release manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SignedMediaToolDigests {
+    pub(crate) ffmpeg: [u8; 32],
+    pub(crate) ffprobe: [u8; 32],
+}
+
+/// How a supplied pair may relate to an existing private import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MediaToolsTrust {
+    /// The supplied pair must equal the private import byte for byte.
+    MustMatch,
+    /// A differing private import is replaced, but only with bytes that hash to
+    /// the signed release's digests.
+    SignedRelease(SignedMediaToolDigests),
+}
+
+/// Whether a private import exists and either tool differs from the supplied pair.
+pub(crate) fn runtime_media_import_differs(
+    data_dir: &Path,
+    tools_dir: &Path,
+) -> anyhow::Result<bool> {
+    if load_runtime_media_provider_bridge_config(data_dir)?.is_none() {
+        return Ok(false);
+    }
+    let mut ffmpeg = open_runtime_media_tool(tools_dir, "ffmpeg")?;
+    let mut ffprobe = open_runtime_media_tool(tools_dir, "ffprobe")?;
+    let tools = runtime_media_provider_tools_root(data_dir);
+    Ok(
+        !runtime_media_tool_matches(&mut ffmpeg, &tools.join("ffmpeg"), "ffmpeg")?
+            || !runtime_media_tool_matches(&mut ffprobe, &tools.join("ffprobe"), "ffprobe")?,
+    )
+}
+
 pub(crate) fn prepare_runtime_media_provider_prerequisite(
     data_dir: &Path,
     tools_dir: &Path,
+    trust: MediaToolsTrust,
 ) -> anyhow::Result<()> {
     // Open the complete supplied pair before creating or changing private state.
     let mut ffmpeg = open_runtime_media_tool(tools_dir, "ffmpeg")?;
@@ -1791,13 +1843,35 @@ pub(crate) fn prepare_runtime_media_provider_prerequisite(
                 invalid_media_provider_config("config file disappeared during validation")
             })?;
             let tools = runtime_media_provider_tools_root(data_dir);
-            if !runtime_media_tool_matches(&mut ffmpeg, &tools.join("ffmpeg"), "ffmpeg")?
-                || !runtime_media_tool_matches(&mut ffprobe, &tools.join("ffprobe"), "ffprobe")?
+            if runtime_media_tool_matches(&mut ffmpeg, &tools.join("ffmpeg"), "ffmpeg")?
+                && runtime_media_tool_matches(&mut ffprobe, &tools.join("ffprobe"), "ffprobe")?
             {
+                return Ok(());
+            }
+            let MediaToolsTrust::SignedRelease(digests) = trust else {
                 return Err(invalid_media_provider_config(
                     "supplied media tools differ from the private imported pair",
                 ));
+            };
+            // The config stores only private paths and operator-tuned limits, so a
+            // release upgrade replaces the imported bytes and leaves the config alone.
+            #[cfg(unix)]
+            {
+                let canonical_tools = fs::canonicalize(&tools)
+                    .map_err(|_| invalid_media_provider_config("tools root is unavailable"))?;
+                replace_runtime_media_pair(
+                    &canonical_tools,
+                    [
+                        ("ffmpeg", &mut ffmpeg, &digests.ffmpeg),
+                        ("ffprobe", &mut ffprobe, &digests.ffprobe),
+                    ],
+                )?;
+                load_runtime_media_provider_bridge_config(data_dir)?.ok_or_else(|| {
+                    invalid_media_provider_config("config file disappeared after upgrade")
+                })?;
             }
+            #[cfg(not(unix))]
+            let _ = digests;
             return Ok(());
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1933,23 +2007,16 @@ pub(crate) fn ensure_media_provider_directory(path: &Path, label: &str) -> anyho
 #[cfg(unix)]
 fn open_runtime_media_tool(tools_dir: &Path, name: &str) -> anyhow::Result<RuntimeMediaToolSource> {
     let candidate = tools_dir.join(name);
-    let canonical = match fs::canonicalize(&candidate) {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(invalid_media_provider_config(format!("media-provider prerequisite '{name}' was not found in the supplied tools directory")));
-        }
-        Err(_) => {
-            return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite is unavailable"
-            )))
-        }
+    let literal = if candidate.is_absolute() {
+        candidate.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| {
+                invalid_media_provider_config(format!("{name} prerequisite is unavailable"))
+            })?
+            .join(&candidate)
     };
-    validate_safe_media_source_parent_chain(&canonical, name)?;
-    let mut options = fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let file = options.open(&canonical).map_err(|_| {
-        invalid_media_provider_config(format!("{name} prerequisite is unavailable"))
-    })?;
+    let file = open_media_source_no_links(&literal, name)?;
     let metadata = file.metadata().map_err(|_| {
         invalid_media_provider_config(format!("{name} prerequisite metadata is unavailable"))
     })?;
@@ -1981,24 +2048,41 @@ fn open_runtime_media_tool(
     anyhow::bail!("owner-only media-provider prerequisite setup is unsupported on this platform")
 }
 
+/// Open an absolute source path one directory at a time with `openat` and
+/// `O_NOFOLLOW`, so no link anywhere on the path is followed and every checked
+/// directory is the one the next step opens from. Callers that need a system link
+/// in their own root (macOS /var) canonicalize that root first.
 #[cfg(unix)]
-fn validate_safe_media_source_parent_chain(path: &Path, name: &str) -> anyhow::Result<()> {
+fn open_media_source_no_links(literal: &Path, name: &str) -> anyhow::Result<fs::File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Component;
+
     let uid = unsafe { libc::geteuid() };
-    for parent in path.ancestors().skip(1) {
-        let metadata = fs::symlink_metadata(parent).map_err(|_| {
+    let open_at = |dir: &fs::File, part: &std::ffi::OsStr, flags: libc::c_int| {
+        let part = std::ffi::CString::new(part.as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                part.as_ptr(),
+                flags | libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    };
+    let check_dir = |dir: &fs::File, display: &Path| -> anyhow::Result<()> {
+        let metadata = dir.metadata().map_err(|_| {
             invalid_media_provider_config(format!("{name} prerequisite parent is unavailable"))
         })?;
-        let quoted = crate::install_transaction::shell_quote_path(parent);
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite parent is unsafe: {} is not a real directory",
-                parent.display()
-            )));
-        }
+        let quoted = crate::install_transaction::shell_quote_path(display);
         if metadata.uid() != 0 && metadata.uid() != uid {
             return Err(invalid_media_provider_config(format!(
                 "{name} prerequisite parent is unsafe: {} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}",
-                parent.display()
+                display.display()
             )));
         }
         if metadata.permissions().mode() & 0o022 != 0 {
@@ -2009,11 +2093,58 @@ fn validate_safe_media_source_parent_chain(path: &Path, name: &str) -> anyhow::R
             };
             return Err(invalid_media_provider_config(format!(
                 "{name} prerequisite parent is unsafe: {} is group- or world-writable; fix with: {sudo}chmod go-w {quoted}",
-                parent.display()
+                display.display()
             )));
         }
+        Ok(())
+    };
+
+    let parts: Vec<Component> = literal.components().collect();
+    let Some((Component::Normal(file_name), dirs)) = parts.split_last() else {
+        return Err(invalid_media_provider_config(format!(
+            "{name} prerequisite path is invalid"
+        )));
+    };
+    let mut display = PathBuf::from("/");
+    let mut dir = fs::File::open("/").map_err(|_| {
+        invalid_media_provider_config(format!("{name} prerequisite parent is unavailable"))
+    })?;
+    check_dir(&dir, &display)?;
+    for part in dirs {
+        let step = match part {
+            Component::RootDir | Component::Prefix(_) | Component::CurDir => continue,
+            Component::ParentDir => {
+                display.pop();
+                std::ffi::OsStr::new("..")
+            }
+            Component::Normal(part) => {
+                display.push(part);
+                part
+            }
+        };
+        dir = open_at(&dir, step, libc::O_DIRECTORY).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                invalid_media_provider_config(format!("media-provider prerequisite '{name}' was not found in the supplied tools directory"))
+            } else {
+                invalid_media_provider_config(format!(
+                    "{name} prerequisite parent is unsafe: {} is a symbolic link or not a real directory",
+                    display.display()
+                ))
+            }
+        })?;
+        check_dir(&dir, &display)?;
     }
-    Ok(())
+    open_at(&dir, file_name, 0).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            invalid_media_provider_config(format!(
+                "media-provider prerequisite '{name}' was not found in the supplied tools directory"
+            ))
+        } else if error.raw_os_error() == Some(libc::ELOOP) {
+            invalid_media_provider_config(format!("{name} prerequisite is a symbolic link"))
+        } else {
+            invalid_media_provider_config(format!("{name} prerequisite is unavailable"))
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -2080,34 +2211,9 @@ fn import_runtime_media_tool(
         }
     }
 
-    let mut nonce = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let temp_path = tools_root.join(format!(".{name}.tmp-{}", hex::encode(nonce)));
-    let mut options = fs::OpenOptions::new();
-    options
-        .create_new(true)
-        .write(true)
-        .mode(0o500)
-        .custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(&temp_path).map_err(|_| {
-        invalid_media_provider_config(format!("{name} temporary import could not be created"))
-    })?;
+    let temp_path = stage_runtime_media_tool(tools_root, name, source)?;
     let mut published = false;
     let result = (|| -> anyhow::Result<()> {
-        source.file.seek(SeekFrom::Start(0))?;
-        let copied = std::io::copy(
-            &mut std::io::Read::by_ref(&mut source.file)
-                .take(MAX_MEDIA_PROVIDER_IMPORTED_TOOL_BYTES + 1),
-            &mut file,
-        )?;
-        if copied != source.size {
-            return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite changed during import"
-            )));
-        }
-        file.sync_all()?;
-        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o500))?;
-        drop(file);
         fs::hard_link(&temp_path, &destination).map_err(|_| {
             invalid_media_provider_config(format!(
                 "{name} import could not be installed atomically"
@@ -2129,6 +2235,111 @@ fn import_runtime_media_tool(
         path: destination,
         created: true,
     })
+}
+
+/// Copy the supplied tool into an fsynced owner-only temporary file beside its destination.
+#[cfg(unix)]
+fn stage_runtime_media_tool(
+    tools_root: &Path,
+    name: &str,
+    source: &mut RuntimeMediaToolSource,
+) -> anyhow::Result<PathBuf> {
+    let mut nonce = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let temp_path = tools_root.join(format!(".{name}.tmp-{}", hex::encode(nonce)));
+    let mut options = fs::OpenOptions::new();
+    options
+        .create_new(true)
+        .write(true)
+        .mode(0o500)
+        .custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&temp_path).map_err(|_| {
+        invalid_media_provider_config(format!("{name} temporary import could not be created"))
+    })?;
+    let result = (|| -> anyhow::Result<()> {
+        source.file.seek(SeekFrom::Start(0))?;
+        let copied = std::io::copy(
+            &mut std::io::Read::by_ref(&mut source.file)
+                .take(MAX_MEDIA_PROVIDER_IMPORTED_TOOL_BYTES + 1),
+            &mut file,
+        )?;
+        if copied != source.size {
+            return Err(invalid_media_provider_config(format!(
+                "{name} prerequisite changed during import"
+            )));
+        }
+        file.sync_all()?;
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o500))?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    Ok(temp_path)
+}
+
+/// Replace the private pair with the signed release's tools. Every staged copy is
+/// hashed against the signed digest before any rename, so altered bytes publish
+/// nothing. A tool whose private copy already has the signed digest is kept, which
+/// also repairs a pair left half-replaced by an interrupted run. Each previous
+/// import stays in place until its rename publishes the new bytes.
+#[cfg(unix)]
+fn replace_runtime_media_pair(
+    tools_root: &Path,
+    pair: [(&str, &mut RuntimeMediaToolSource, &[u8; 32]); 2],
+) -> anyhow::Result<()> {
+    let mut staged = Vec::with_capacity(pair.len());
+    let result = (|| -> anyhow::Result<()> {
+        for (name, source, expected) in pair {
+            let destination = tools_root.join(name);
+            validate_runtime_media_import(&destination, tools_root, name)?;
+            if runtime_media_file_sha256(&destination, name)? == *expected {
+                continue;
+            }
+            let temp_path = stage_runtime_media_tool(tools_root, name, source)?;
+            staged.push((name, temp_path.clone(), destination));
+            if runtime_media_file_sha256(&temp_path, name)? != *expected {
+                return Err(invalid_media_provider_config(format!(
+                    "{name} does not match the signed release media tools"
+                )));
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for (_, temp_path, _) in staged {
+            let _ = fs::remove_file(temp_path);
+        }
+        return Err(error);
+    }
+    for (name, temp_path, destination) in staged {
+        if fs::rename(&temp_path, &destination).is_err() {
+            let _ = fs::remove_file(&temp_path);
+            return Err(invalid_media_provider_config(format!(
+                "{name} import could not be replaced atomically"
+            )));
+        }
+        sync_runtime_storage_parent(tools_root)?;
+        validate_runtime_media_import(&destination, tools_root, name)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn runtime_media_file_sha256(path: &Path, name: &str) -> anyhow::Result<[u8; 32]> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .map_err(|_| invalid_media_provider_config(format!("{name} import is unavailable")))?;
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(
+        &mut file.take(MAX_MEDIA_PROVIDER_IMPORTED_TOOL_BYTES + 1),
+        &mut hasher,
+    )?;
+    Ok(hasher.finalize().into())
 }
 
 #[cfg(unix)]

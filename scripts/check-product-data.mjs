@@ -204,12 +204,12 @@ export function validateContracts(manifests) {
 
 const homeCore = [
   "shell", "localhost-provider", "did-provider", "chain-provider", "net-provider", "exit-provider",
-  "browser-engine-adapter", "browser-engine-supervisor", "browser-native-proxy-engine", "browser-stream-bridge", "browser-local-exit",
+  "browser-engine-adapter", "browser-local-exit",
   "webspace-provider", "object-provider", "wallet-provider", "model-provider",
   "home", "home-cli", "home-gui", "system", "services", "people", "browser", "documents", "library", "marketplace", "archive-manager", "inbox", "chat-room",
 ];
 const protectedProviders = ["protected-content-protect-provider", "media-provider", "custody-provider", "protected-content-decrypt-provider"];
-const obsolete = ["chat", "agent", "esp-shell", "capsule-inspector", "gba-engine-provider", "ai-provider", "llama-provider"];
+const obsolete = ["browser-engine-supervisor", "browser-native-proxy-engine", "browser-stream-bridge", "chat", "agent", "esp-shell", "capsule-inspector", "gba-engine-provider", "ai-provider", "llama-provider"];
 const archiveAssets = ["home", "system", "services", "people", "documents", "library", "marketplace", "archive-manager", "inbox"];
 
 export function parsePublishData(shellSource, rustSource) {
@@ -225,7 +225,7 @@ export function parsePublishData(shellSource, rustSource) {
   };
   const lists = {
     shellDefault: shell("DEFAULT_CAPSULES"), shellRequired: shell("REQUIRED_SUPPORTED_CAPSULES"),
-    rustHome: rust("HOME_PUBLISH_CAPSULES"), rustDemo: rust("DEMO_PUBLISH_CAPSULES"),
+    rustHome: rust("HOME_PUBLISH_CAPSULES"),
   };
   for (const [name, values] of Object.entries(lists)) {
     assert(values.length > 0 && values.every((value) => typeof value === "string" && /^[a-z0-9][a-z0-9-]*$/.test(value)), `${name}: invalid publish capsule data`);
@@ -243,8 +243,6 @@ export function validatePublishData(components, manifests, lists) {
     unique(values, `${name}: publish capsules`);
     for (const capsule of values) assert(Object.hasOwn(manifests, capsule) && !obsolete.includes(capsule), `${name}: unknown or retired publish capsule ${capsule}`);
   }
-  for (const capsule of ["gba-emulator", "gba-ucity", "tunnel-provider"]) assert(lists.rustDemo.includes(capsule), `rustDemo: missing demo capsule ${capsule}`);
-  for (const capsule of lists.rustDemo) assert(components.profiles.demo.components.includes(capsule) && !installedHome.includes(capsule), `rustDemo: ${capsule} belongs in the demo profile`);
 }
 
 export function validateComponents(components, manifests) {
@@ -254,7 +252,7 @@ export function validateComponents(components, manifests) {
   for (const name of obsolete) assert(!known.has(name), `Retired component ${name} is packaged`);
   for (const [name, profile] of Object.entries(components.profiles)) {
     const list = requireList(profile.components, `${name}: components`);
-    // full has a historical duplicate ipfs-provider; preserve this accepted profile for now.
+    // Profile entries must name known, unretired components.
     const installed = new Set(list);
     for (const entry of list) assert(known.has(entry) && !obsolete.includes(entry), `${name}: unknown component ${entry}`);
     if (["wallet", "wallet-metamask", "wallet-unisat", "wallet-walletconnect", "browser", "inbox"].some((entry) => installed.has(entry))) {
@@ -266,22 +264,15 @@ export function validateComponents(components, manifests) {
       }
     }
   }
-  for (const [profile, required] of [
-    ["home", homeCore],
-    ["demo", [...homeCore, "kubo", "ipfs-provider", "site-provider", "tunnel-provider", "cloudflared", "gba-emulator", "gba-ucity"]],
-    ["blockchain", ["shell", "localhost-provider", "did-provider", "chain-provider", "wallet-provider", "drm-provider", "rights-provider", "key-provider", "decrypt-provider", ...protectedProviders]],
-  ]) {
-    const list = components.profiles[profile]?.components ?? [];
-    for (const name of required) assert(list.includes(name), `${profile}: required component ${name}`);
-  }
+  // browser-host is the helper set setup adds on supported hosts, not a user profile.
+  same(Object.keys(components.profiles).filter((name) => name !== "browser-host"), ["home"], "Setup installs one Home: profiles");
   const home = components.profiles.home.components;
-  for (const name of ["availability-provider", "site-provider", "tunnel-provider", "cloudflared", "drm-provider", "rights-provider", "key-provider", "decrypt-provider"]) assert(!home.includes(name), `Home: ${name} belongs to an explicit profile`);
+  for (const name of homeCore) assert(home.includes(name), `home: required component ${name}`);
+  for (const name of ["availability-provider", "site-provider", "tunnel-provider", "cloudflared", "drm-provider", "rights-provider", "key-provider", "decrypt-provider", "custody-provider", "gba-emulator", "gba-ucity"]) assert(!home.includes(name), `Home: ${name} is a developer --with component`);
   // Local AI is optional: Assistant fetches the engine and models from the signed release on demand (#217).
   // model-provider is the Runtime's model broker, not a model.
   const localAi = home.filter((name) => name === "llama-server" || (name.startsWith("model-") && name !== "model-provider"));
   assert(localAi.length === 0, `Home: local AI installs on demand, found ${localAi.join(", ")}`);
-  for (const name of ["gba-emulator", "gba-ucity"]) assert(!home.includes(name) && components.profiles.demo.components.includes(name), `${name}: demo profile placement`);
-  same(Object.entries(components.profiles).filter(([, profile]) => profile.components.includes("custody-provider")).map(([name]) => name).sort(), ["blockchain", "full"], "Custody profile placement");
   for (const [name, component] of Object.entries(components.external)) {
     // microVM pieces publish no platform until signed, artifact-backed bytes exist.
     const unreleased = ["crosvm", "vmlinux"].includes(name);

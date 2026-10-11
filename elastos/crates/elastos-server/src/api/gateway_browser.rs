@@ -318,6 +318,20 @@ pub(super) async fn browser_app_profile_reset(
     ) {
         return (StatusCode::CONFLICT, error.to_string()).into_response();
     }
+    let (disk_path, _) =
+        match browser_profile_launch_descriptor(&state.data_dir, &context.principal_id) {
+            Ok(profile) => profile,
+            Err(err) => return gateway_provider_error_response("browser", err),
+        };
+    let reset_guard = match crate::api::browser_profile_reset::acquire_profile_reset(
+        state.data_dir.clone(),
+        disk_path,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(err) => return browser_profile_reset_error_response(err),
+    };
     if browser_principal_has_live_sessions(&state.data_dir, &context.principal_id).await {
         return (
             StatusCode::CONFLICT,
@@ -325,20 +339,9 @@ pub(super) async fn browser_app_profile_reset(
         )
             .into_response();
     }
-    let (disk_path, _) =
-        match browser_profile_launch_descriptor(&state.data_dir, &context.principal_id) {
-            Ok(profile) => profile,
-            Err(err) => return gateway_provider_error_response("browser", err),
-        };
-    let removed = match tokio::fs::remove_file(&disk_path).await {
-        Ok(()) => true,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-        Err(err) => {
-            return gateway_provider_error_response(
-                "browser",
-                anyhow::anyhow!("Browser profile reset failed: {}", err),
-            )
-        }
+    let removed = match reset_guard.remove().await {
+        Ok(removed) => removed,
+        Err(err) => return browser_profile_reset_error_response(err),
     };
     Json(serde_json::json!({
         "schema": "elastos.browser.profile-reset/v1",
@@ -358,6 +361,20 @@ pub(super) async fn browser_app_profile_reset(
         "removed_profile_disk": removed,
     }))
     .into_response()
+}
+
+fn browser_profile_reset_error_response(
+    error: crate::api::browser_profile_reset::ProfileResetError,
+) -> Response {
+    use crate::api::browser_profile_reset::ProfileResetError;
+    match error {
+        ProfileResetError::Busy
+        | ProfileResetError::Unsafe(_)
+        | ProfileResetError::UnsupportedHost => {
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
+        error => gateway_provider_error_response("browser", anyhow::anyhow!(error)),
+    }
 }
 
 fn browser_profile_launch_descriptor(
@@ -993,7 +1010,10 @@ async fn execute_browser_open(
             )
             .with_outcome(outcome));
         }
-        if matches!(code, "browser_capacity_unavailable" | "resources_in_use") {
+        if matches!(
+            code,
+            "browser_capacity_unavailable" | "resources_in_use" | "profile_recovery_required"
+        ) {
             let outcome = match exact_did_not_act {
                 Some(outcome) => outcome,
                 None => {
@@ -2743,10 +2763,7 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                         state,
                         &cleanup,
                         None,
-                        engine_result
-                            .as_ref()
-                            .ok()
-                            .and_then(browser_profile_durability_from_receipt),
+                        engine_result.as_ref().ok(),
                     )
                     .await
                     {
@@ -2809,21 +2826,18 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
                 continue;
             }
         };
-        if terminal_retirement {
-            if commit_browser_terminal_cleanup(state, &cleanup, None, None)
+        if terminal_retirement
+            && commit_browser_terminal_cleanup(state, &cleanup, None, None)
                 .await
                 .is_ok()
-            {
-                release_browser_open_job_instance_for_owner(
-                    &state.data_dir,
-                    &cleanup.principal_id,
-                    &cleanup.owner_launch_id,
-                )
-                .await;
-                settled = true;
-            } else {
-                release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
-            }
+        {
+            release_browser_open_job_instance_for_owner(
+                &state.data_dir,
+                &cleanup.principal_id,
+                &cleanup.owner_launch_id,
+            )
+            .await;
+            settled = true;
             continue;
         }
         let engine_result = tokio::time::timeout(
@@ -2842,37 +2856,10 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
         .await
         .map_err(|_| "Browser stream cleanup timed out".to_string())
         .and_then(|result| result);
-        let already_absent = matches!(
-            (&engine_result, &stream_result),
-            (Err(message), Ok(())) if browser_engine_close_is_already_absent(message)
-        );
-        let ingress_released = if already_absent {
-            match release_absent_engine_viewer_ingress(state, &cleanup).await {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(
-                        page_id = %cleanup.page_id,
-                        error = %err,
-                        "Browser already-absent close could not retire its viewer ingress"
-                    );
-                    false
-                }
-            }
-        } else {
-            true
-        };
-        if (engine_result.is_ok() && stream_result.is_ok()) || (already_absent && ingress_released)
-        {
-            if let Err(err) = commit_browser_terminal_cleanup(
-                state,
-                &cleanup,
-                None,
-                engine_result
-                    .as_ref()
-                    .ok()
-                    .and_then(browser_profile_durability_from_receipt),
-            )
-            .await
+        if engine_result.is_ok() && stream_result.is_ok() {
+            if let Err(err) =
+                commit_browser_terminal_cleanup(state, &cleanup, None, engine_result.as_ref().ok())
+                    .await
             {
                 release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
                 tracing::warn!(
@@ -2935,13 +2922,13 @@ async fn commit_browser_terminal_cleanup(
     state: &GatewayState,
     cleanup: &BrowserEngineCleanup,
     terminal_owner_launch_id: Option<&str>,
-    profile_durability: Option<&str>,
+    terminal_receipt: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     record_browser_reaped_page_tombstone(
         &state.data_dir,
         cleanup,
         terminal_owner_launch_id,
-        profile_durability,
+        terminal_receipt,
     )
     .await?;
     gateway_browser_remote::mark_consumer_terminal_retirement(
@@ -2993,34 +2980,12 @@ async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanu
             release_browser_stream_cleanup_claim(&state.data_dir, cleanup).await;
         }
     }
-    let already_absent = matches!(
-        (&engine_result, &stream_result),
-        (Err(message), Ok(())) if browser_engine_close_is_already_absent(message)
-    );
-    let ingress_released = if already_absent {
-        match release_absent_engine_viewer_ingress(state, &engine_cleanup).await {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(
-                    page_id = %engine_cleanup.page_id,
-                    error = %err,
-                    "Browser already-absent stale close could not retire its viewer ingress"
-                );
-                false
-            }
-        }
-    } else {
-        true
-    };
-    if (engine_result.is_ok() && stream_result.is_ok()) || (already_absent && ingress_released) {
+    if engine_result.is_ok() && stream_result.is_ok() {
         if let Err(err) = commit_browser_terminal_cleanup(
             state,
             &engine_cleanup,
             None,
-            engine_result
-                .as_ref()
-                .ok()
-                .and_then(browser_profile_durability_from_receipt),
+            engine_result.as_ref().ok(),
         )
         .await
         {
@@ -3040,21 +3005,6 @@ async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanu
             "Browser stale page engine cleanup failed"
         );
     }
-}
-
-fn browser_engine_close_is_already_absent(message: &str) -> bool {
-    message.contains("indeterminate after service restart: exact owned launcher unavailable")
-        || message.contains("Engine retained owner unavailable")
-}
-
-async fn release_absent_engine_viewer_ingress(
-    state: &GatewayState,
-    cleanup: &BrowserEngineCleanup,
-) -> Result<(), String> {
-    let Some(authority) = cleanup.transport_authority.as_ref() else {
-        return Ok(());
-    };
-    gateway_browser_remote::close_transport_listener(state, authority).await
 }
 
 async fn attempt_browser_engine_cleanup(
@@ -3292,10 +3242,7 @@ async fn reap_browser_open_effect_after_failure(
             state,
             &engine_cleanup,
             None,
-            engine_result
-                .as_ref()
-                .ok()
-                .and_then(browser_profile_durability_from_receipt),
+            engine_result.as_ref().ok(),
         )
         .await
         {
@@ -4068,36 +4015,12 @@ pub(super) async fn browser_app_page_close(
     } else {
         close_browser_stream_cleanup(&state, page_cleanup.stream_cleanup).await
     };
-    let already_absent = matches!(
-        (&engine_result, &stream_result),
-        (Err(message), Ok(())) if browser_engine_close_is_already_absent(message)
-    );
-    let ingress_released = if already_absent {
-        match release_absent_engine_viewer_ingress(&state, &engine_cleanup).await {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(
-                    page_id = %engine_cleanup.page_id,
-                    error = %err,
-                    "Browser already-absent close could not retire its viewer ingress"
-                );
-                false
-            }
-        }
-    } else {
-        true
-    };
-    let terminal = if (engine_result.is_ok() && stream_result.is_ok())
-        || (already_absent && ingress_released)
-    {
+    let terminal = if engine_result.is_ok() && stream_result.is_ok() {
         commit_browser_terminal_cleanup(
             &state,
             &engine_cleanup,
             Some(&owner_launch_id),
-            engine_result
-                .as_ref()
-                .ok()
-                .and_then(browser_profile_durability_from_receipt),
+            engine_result.as_ref().ok(),
         )
         .await
     } else {
@@ -4117,15 +4040,6 @@ pub(super) async fn browser_app_page_close(
             &receipt,
         ))
         .into_response(),
-        Err(_) if already_absent && ingress_released => {
-            Json(browser_public_already_absent_close_receipt(
-                &page_id,
-                &cleanup_id,
-                cleanup_browser_instance,
-                None,
-            ))
-            .into_response()
-        }
         Err(message) => gateway_provider_error_response("browser-engine", anyhow::anyhow!(message)),
     }
 }

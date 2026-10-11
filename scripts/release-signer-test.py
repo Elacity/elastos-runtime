@@ -29,6 +29,8 @@ PUBLIC = bytes.fromhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68
 DID = S.public_did(PUBLIC)
 COMMIT, TREE, MAIN, SCRIPTS, TAG = (digit * 40 for digit in "abcde")
 DEVELOP = "1" * 40
+WORKFLOW, WORKFLOW_TREE = "9" * 40, "8" * 40
+DEVELOP_TREE, WORKFLOW_BLOB = "f" * 40, "7" * 40
 
 
 class FakeBackend:
@@ -66,47 +68,74 @@ class SignerTests(unittest.TestCase):
         self.snapshot.mkdir(mode=0o700)
         self.marker = self.base / "executed"
         self.binary = f"#!/bin/sh\ncat /custodian/unopened-signing.pem > {self.marker}\n".encode()
-        (self.root / "elastos").write_bytes(self.binary)
-        (self.root / "elastos").chmod(0o755)
-        self.components = S.json_bytes({"schema": "elastos.components/v1", "external": {}})
-        (self.root / "components.json").write_bytes(self.components)
+        (self.root / "elastos-x86_64-linux").write_bytes(self.binary)
+        (self.root / "elastos-x86_64-linux").chmod(0o755)
+        self.source_components = S.json_bytes({"external": {"localhost-provider": {}}, "profiles": {}})
+        self.source_components_oid = hashlib.sha1(b"blob " + str(len(self.source_components)).encode() + b"\0" + self.source_components).hexdigest()
+        self.platform_components, self.unattested = {}, set()
         self.template = ("#!/bin/sh\n" + "\n".join(f'{name}="__{name}__"' for name in sorted(S.STAMPS | {"HEAD_CID"})) + f"\ncat /custodian/unopened-signing.pem > {self.marker}\n").encode()
         self.blob_oid = hashlib.sha1(b"blob " + str(len(self.template)).encode() + b"\0" + self.template).hexdigest()
-        self.stamps = {"MAINTAINER_DID": DID, "SOURCE_CONNECT_TICKET": "public-ticket",
-                       "PUBLISHER_GATEWAY": "https://publisher.invalid", "PUBLISHER_NODE_ID": "public-node", "IPNS_NAME": "public-ipns"}
+        node = "4" * 64
+        ticket = base64.b32encode(S.json_bytes({"endpoints": [{"id": node, "addrs": []}]})).decode().lower().rstrip("=")
+        self.stamps = {"MAINTAINER_DID": DID, "SOURCE_CONNECT_TICKET": ticket,
+                       "PUBLISHER_GATEWAY": "https://publisher.invalid", "PUBLISHER_NODE_ID": node, "IPNS_NAME": "public-ipns"}
         rendered = S.render_installer(self.template, self.stamps, DID)
         def record(data):
             return {"sha256": S.sha256(data), "size": len(data), "cid": S.raw_cid(data)}
         self.manifest = {"source": {"commit": COMMIT, "tree": TREE}, "version": "1.2.3", "channel": "stable",
-                         "files": {"elastos": record(self.binary), "components.json": record(self.components)},
+                         "files": {"elastos-x86_64-linux": record(self.binary)},
                          "installer": {"blob_oid": self.blob_oid, "stamps": self.stamps},
                          "release": {"schema": "elastos.release/v1", "source": {"commit": COMMIT, "tree": TREE},
                                      "version": "1.2.3", "channel": "stable", "released_at": 1, "prev_release_cid": None,
-                                     "platforms": {"x86_64-linux": {"binary": {k: record(self.binary)[k] for k in ("cid", "sha256")},
-                                                                    "components": {k: record(self.components)[k] for k in ("cid", "sha256")}}},
+                                     "platforms": {"x86_64-linux": {"binary": {k: record(self.binary)[k] for k in ("cid", "sha256")}}},
                                      "installer_sha256": S.sha256(rendered)},
                          "head": {"updated_at": 2, "prev_head_cid": None}}
         self.policy = {"repository": S.REPOSITORY, "tag": "v1.2.3", "tag_oid": COMMIT, "commit": COMMIT,
                        "tree": TREE, "version": "1.2.3", "channel": "stable", "publisher_did": DID,
                        "max_file_bytes": 1024 * 1024, "max_snapshot_bytes": 4 * 1024 * 1024,
                        "key_path": "/custodian/unopened-signing.pem"}
+        self.approval = {"schema": S.APPROVAL_SCHEMA, "repository": S.REPOSITORY,
+                         "source": {"commit": COMMIT, "tree": TREE},
+                         "workflow": {"commit": WORKFLOW, "tree": WORKFLOW_TREE, "ref": "refs/heads/develop"},
+                         "delivery": self.stamps,
+                         "gh": {"path": str(SOURCE), "sha256": S.sha256(SOURCE.read_bytes())}}
+        self.approval_path = self.base / "approval.json"
+        self.approval_path.write_bytes(S.json_bytes(self.approval))
+        self.approval_path.chmod(0o600)
+        self.policy["approval"] = {"path": str(self.approval_path), "sha256": S.sha256(self.approval_path.read_bytes())}
+        self.package_run = {"id": 123, "run_attempt": 2, "head_sha": WORKFLOW, "head_branch": "develop",
+                            "path": S.PACKAGE_WORKFLOW, "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+                            "head_repository": {"id": 1234, "full_name": S.REPOSITORY},
+                            "repository": {"id": 1234, "full_name": S.REPOSITORY}}
         self.approve_manifest()
         prefix = f"/repos/{S.REPOSITORY}"
         self.api = {
             f"{prefix}/git/ref/tags/v1.2.3": {"ref": "refs/tags/v1.2.3", "object": {"type": "commit", "sha": COMMIT}},
             f"{prefix}/git/commits/{COMMIT}": {"sha": COMMIT, "tree": {"sha": TREE}},
+            f"{prefix}/git/commits/{WORKFLOW}": {"sha": WORKFLOW, "tree": {"sha": WORKFLOW_TREE}},
+            f"{prefix}/actions/runs/123": self.package_run,
             f"{prefix}/git/ref/heads/main": {"ref": "refs/heads/main", "object": {"type": "commit", "sha": MAIN}},
-            f"{prefix}/git/commits/{MAIN}": {"sha": MAIN, "tree": {"sha": "f" * 40}},
+            f"{prefix}/git/commits/{MAIN}": {"sha": MAIN, "tree": {"sha": DEVELOP_TREE}},
+            f"{prefix}/git/ref/heads/develop": {"ref": "refs/heads/develop", "object": {"type": "commit", "sha": DEVELOP}},
+            f"{prefix}/git/commits/{DEVELOP}": {"sha": DEVELOP, "tree": {"sha": DEVELOP_TREE}},
             f"{prefix}/compare/{COMMIT}...{MAIN}?per_page=1": {"status": "ahead", "behind_by": 0, "ahead_by": 1,
                 "base_commit": {"sha": COMMIT}, "merge_base_commit": {"sha": COMMIT}},
-            f"{prefix}/git/trees/{TREE}": {"sha": TREE, "truncated": False, "tree": [{"path": "scripts", "type": "tree", "mode": "040000", "sha": SCRIPTS}]},
+            f"{prefix}/git/trees/{TREE}": {"sha": TREE, "truncated": False, "tree": [{"path": "scripts", "type": "tree", "mode": "040000", "sha": SCRIPTS},
+                {"path": "components.json", "type": "blob", "mode": "100644", "sha": self.source_components_oid}]},
             f"{prefix}/git/trees/{SCRIPTS}": {"sha": SCRIPTS, "truncated": False, "tree": [{"path": "install.sh", "type": "blob", "mode": "100755", "sha": self.blob_oid}]},
             f"{prefix}/git/blobs/{self.blob_oid}": {"sha": self.blob_oid, "encoding": "base64", "size": len(self.template), "content": base64.b64encode(self.template).decode()},
+            f"{prefix}/git/blobs/{self.source_components_oid}": {"sha": self.source_components_oid, "encoding": "base64",
+                "size": len(self.source_components), "content": base64.b64encode(self.source_components).decode()},
         }
+        for tree in (TREE, WORKFLOW_TREE, DEVELOP_TREE):
+            self.workflow_blob(tree, WORKFLOW_BLOB)
         self.requests = []
         self.no_process = mock.patch.object(S.subprocess, "run", side_effect=AssertionError("real subprocess refused in tests"))
         self.no_process.start()
         self.addCleanup(self.no_process.stop)
+        self.proof = mock.patch.object(S, "attestation_result", side_effect=self.verified_receipt)
+        self.proof.start()
+        self.addCleanup(self.proof.stop)
         # Unit fixtures use a deterministic healthy volume. The dedicated quota
         # case below overrides this with a full volume to prove the real guard.
         disk = mock.patch.object(S.shutil, "disk_usage", return_value=SimpleNamespace(
@@ -114,27 +143,95 @@ class SignerTests(unittest.TestCase):
         disk.start()
         self.addCleanup(disk.stop)
 
+    def workflow_blob(self, tree, blob):
+        prefix = f"/repos/{S.REPOSITORY}/git/trees/"
+        github, workflows = (hashlib.sha1((tree + part).encode()).hexdigest() for part in (".github", "workflows"))
+        listing = self.api.setdefault(prefix + tree, {"sha": tree, "truncated": False, "tree": []})["tree"]
+        listing[:] = [entry for entry in listing if entry["path"] != ".github"]
+        listing.append({"path": ".github", "type": "tree", "mode": "040000", "sha": github})
+        self.api[prefix + github] = {"sha": github, "truncated": False,
+                                     "tree": [{"path": "workflows", "type": "tree", "mode": "040000", "sha": workflows}]}
+        self.api[prefix + workflows] = {"sha": workflows, "truncated": False,
+                                        "tree": [{"path": "release-package.yml", "type": "blob", "mode": "100644", "sha": blob}]}
+
     def approve_manifest(self):
+        directory = self.root / "provenance"
+        directory.mkdir(exist_ok=True)
+        platforms = list(self.manifest["release"]["platforms"])
+        attested = {platform: S.json_bytes(self.platform_components.get(platform, {"schema": "elastos.components/v1", "external": {}}))
+                    for platform in platforms}
+        cids = {name: record["cid"] for name, record in self.manifest["files"].items()}
+        generated = S.json_bytes(S.bind_component_cids(S.merge_components(
+            S.parse_json(self.source_components), {p: S.parse_json(data) for p, data in attested.items()}), cids))
+        for platform in platforms:
+            name = f"components-{platform}.json"
+            (self.root / name).write_bytes(generated)
+            self.manifest["files"][name] = {"sha256": S.sha256(generated), "size": len(generated), "cid": S.raw_cid(generated)}
+            self.manifest["release"]["platforms"][platform]["components"] = {
+                key: self.manifest["files"][name][key] for key in ("cid", "sha256", "size")}
+        entries = []
+        for index, platform in enumerate(platforms):
+            receipt = {"schema": "elastos.release-platform-input/v1", "platform": platform, "version": self.manifest["version"],
+                       "source": {**self.manifest["source"], "clean": True},
+                       "files": {"artifacts/" + name: {"sha256": record["sha256"], "size": record["size"], "executable": True}
+                                 for name, record in self.manifest["files"].items()
+                                 if not name.startswith("components-") and name not in self.unattested}}
+            native = self.manifest["files"].get("elastos-" + platform, self.manifest["files"]["elastos-x86_64-linux"])
+            receipt["files"]["artifacts/elastos-" + platform] = {"sha256": native["sha256"], "size": native["size"], "executable": True}
+            for name, data in (("components.json", attested[platform]), ("components-template.json", self.source_components)):
+                receipt["files"][name] = {"sha256": S.sha256(data), "size": len(data), "executable": False}
+            receipt_name = f"provenance/{platform}.receipt.json"
+            bundle_name = f"provenance/{platform}.bundle.jsonl"
+            components_name = f"provenance/{platform}.components.json"
+            prefix = "release-mac" if platform == "aarch64-darwin" else "release-" + platform
+            artifact = {"id": index + 1, "digest": "sha256:" + "6" * 64, "name": f"{prefix}-{COMMIT}-2", "attempt": 2}
+            proof_artifact = {"id": index + 101, "digest": "sha256:" + "7" * 64,
+                              "name": f"{prefix.replace('release-', 'release-proof-', 1)}-{COMMIT}-2", "attempt": 2}
+            receipt["producer"] = {"artifact": artifact, "run_id": 123, "workflow_commit": WORKFLOW, "attestation_attempt": 2}
+            (self.root / receipt_name).write_bytes(S.json_bytes(receipt))
+            (self.root / bundle_name).write_bytes(b"{}")
+            (self.root / components_name).write_bytes(attested[platform])
+            entries.append({"platform": platform, "receipt": receipt_name, "bundle": bundle_name, "components": components_name,
+                            "artifact": artifact, "proof_artifact": proof_artifact})
+        self.manifest["provenance"] = {"schema": S.PROVENANCE_SCHEMA, "run_id": 123, "run_attempt": 2,
+                                       "approval_sha256": self.policy["approval"]["sha256"], "receipts": entries}
         data = S.json_bytes(self.manifest)
         (self.root / "signing-input.json").write_bytes(data)
         self.policy["manifest_sha256"] = S.sha256(data)
 
     def fetch(self, path):
         self.requests.append(path)
+        if path == f"/repos/{S.REPOSITORY}/actions/runs/123/artifacts?per_page=100&page=1":
+            return {"artifacts": [{**entry[kind], "expired": False,
+                                    "workflow_run": {"id": 123, "head_sha": WORKFLOW, "head_branch": "develop"}}
+                                   for entry in self.manifest["provenance"]["receipts"] for kind in ("artifact", "proof_artifact")]}
         if path not in self.api:
             raise ValueError("remote object unavailable")
         return copy.deepcopy(self.api[path])
+
+    def verified_receipt(self, approval, run, receipt_path, bundle_path, scratch):
+        workflow = approval["workflow"]
+        uri = f"https://github.com/{S.REPOSITORY}/{S.PACKAGE_WORKFLOW}@{workflow['ref']}"
+        certificate = {"issuer": "https://token.actions.githubusercontent.com", "subjectAlternativeName": uri,
+                       "buildSignerURI": uri, "buildSignerDigest": workflow["commit"], "runnerEnvironment": "github-hosted",
+                       "sourceRepositoryURI": f"https://github.com/{S.REPOSITORY}", "sourceRepositoryDigest": workflow["commit"],
+                       "sourceRepositoryIdentifier": "1234", "sourceRepositoryRef": workflow["ref"],
+                       "buildConfigURI": uri, "buildConfigDigest": workflow["commit"], "buildTrigger": "workflow_dispatch",
+                       "runInvocationURI": f"https://github.com/{S.REPOSITORY}/actions/runs/{run['id']}/attempts/{run['run_attempt']}"}
+        return [{"verificationResult": {"signature": {"certificate": certificate}, "verifiedTimestamps": [{"type": "Tlog"}],
+                                          "statement": {"predicateType": "https://slsa.dev/provenance/v1",
+                                                        "subject": [{"digest": {"sha256": S.sha256(receipt_path.read_bytes())}}]}}}]
 
     def prepare(self):
         return S.prepare(self.policy, self.root, "signing-input.json", self.fetch, self.snapshot)
 
     def test_snapshot_signs_only_frozen_bytes_and_binds_installer_release_head(self):
         prepared = self.prepare()
-        (self.root / "elastos").write_bytes(b"changed after snapshot")
-        (self.root / "components.json").write_bytes(b"changed after snapshot")
+        (self.root / "elastos-x86_64-linux").write_bytes(b"changed after snapshot")
+        (self.root / "components-x86_64-linux.json").write_bytes(b"changed after snapshot")
         backend = FakeBackend()
         publication = dict(S.sign_publication(prepared, backend))
-        self.assertEqual(publication["elastos"].read_bytes(), self.binary)
+        self.assertEqual(publication["elastos-x86_64-linux"].read_bytes(), self.binary)
         release = S.parse_json(publication["release.json"])
         head = S.parse_json(publication["release-head.json"])
         self.assertEqual(release["payload"]["installer_sha256"], S.sha256(publication["install.sh"].read_bytes()))
@@ -143,6 +240,263 @@ class SignerTests(unittest.TestCase):
         self.assertIn(b'HEAD_CID=""', publication["install.sh"].read_bytes())
         self.assertFalse(self.marker.exists())
         self.assertEqual(len([call for call in backend.calls if isinstance(call, tuple) and call[0] == "sign"]), 2)
+
+    def test_source_and_approved_builder_are_independent(self):
+        self.assertNotEqual(self.policy["commit"], self.approval["workflow"]["commit"])
+        self.prepare()
+        self.assertIn(f"/repos/{S.REPOSITORY}/git/commits/{WORKFLOW}", self.requests)
+
+    def test_retained_native_and_proof_attempts_survive_a_later_successful_retry(self):
+        self.package_run['run_attempt'] = 3
+        self.manifest['provenance']['run_attempt'] = 3
+        entry = self.manifest['provenance']['receipts'][0]
+        entry['artifact']['name'] = entry['artifact']['name'].rsplit('-', 1)[0] + '-1'
+        entry['artifact']['attempt'] = 1
+        receipt_path = self.root / entry['receipt']
+        receipt = S.parse_json(receipt_path.read_bytes())
+        receipt['producer']['artifact'] = entry['artifact']
+        receipt_path.write_bytes(S.json_bytes(receipt))
+        data = S.json_bytes(self.manifest)
+        (self.root / 'signing-input.json').write_bytes(data)
+        self.policy['manifest_sha256'] = S.sha256(data)
+        self.prepare()
+
+    def test_receipt_artifact_attempt_and_attestation_attempt_are_independent_exact_bindings(self):
+        entry = self.manifest['provenance']['receipts'][0]
+        path = self.root / entry['receipt']
+        original = S.parse_json(path.read_bytes())
+        for field in ('artifact', 'attestation_attempt'):
+            receipt = copy.deepcopy(original)
+            if field == 'artifact':
+                receipt['producer'][field]['attempt'] = 1
+            else:
+                receipt['producer'][field] = 1
+            path.write_bytes(S.json_bytes(receipt))
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'attested build artifact differs'):
+                self.prepare()
+        path.write_bytes(S.json_bytes(original))
+
+    def test_foreign_modified_incomplete_and_wrong_event_producers_are_refused(self):
+        for field, value in (("head_sha", COMMIT), ("head_branch", "feature/edited-workflow"),
+                             ("event", "pull_request_target"), ("status", "in_progress"),
+                             ("conclusion", "failure"), ("path", ".github/workflows/other.yml"),
+                             ("head_repository", {"id": 999, "full_name": "attacker/fork"}),
+                             ("run_attempt", True)):
+            with self.subTest(field=field), mock.patch.dict(self.package_run, {field: value}):
+                with self.assertRaisesRegex(ValueError, "producer|attempt"):
+                    self.prepare()
+            for path in self.snapshot.iterdir():
+                path.unlink()
+
+    def test_workflow_tree_and_source_tree_are_checked_independently(self):
+        self.api[f"/repos/{S.REPOSITORY}/git/commits/{WORKFLOW}"]["tree"]["sha"] = TREE
+        with self.assertRaisesRegex(ValueError, "producer/source tree"):
+            self.prepare()
+
+    def test_package_workflow_must_match_develop(self):
+        self.workflow_blob(WORKFLOW_TREE, "6" * 40)
+        with self.assertRaisesRegex(ValueError, "package workflow differs from develop"):
+            self.prepare()
+        self.workflow_blob(WORKFLOW_TREE, WORKFLOW_BLOB)
+        self.workflow_blob(DEVELOP_TREE, "6" * 40)
+        with self.assertRaisesRegex(ValueError, "package workflow differs from develop"):
+            S.checked_package_run(self.approval, 123, self.fetch)
+
+    def test_only_develop_producers_are_approved(self):
+        self.approval["workflow"]["ref"] = "refs/heads/main"
+        self.package_run["head_branch"] = "main"
+        self.approval_path.write_bytes(S.json_bytes(self.approval))
+        with self.assertRaisesRegex(ValueError, "approved develop producer ref required"):
+            S.approved_release(self.approval_path)
+        with self.assertRaisesRegex(ValueError, "package run differs"):
+            S.checked_package_run({**self.approval, "workflow": {**self.approval["workflow"], "ref": "refs/heads/develop"}}, 123, self.fetch)
+
+    def test_independent_approval_and_tool_pins_are_required(self):
+        pin = self.policy.pop("approval")
+        with self.assertRaisesRegex(ValueError, "approval pin"):
+            self.prepare()
+        self.policy["approval"] = pin
+        self.approval_path.write_bytes(self.approval_path.read_bytes() + b" ")
+        with self.assertRaisesRegex(ValueError, "approval changed"):
+            self.prepare()
+
+    def test_candidate_owned_approval_is_refused_even_with_a_matching_hash(self):
+        candidate = self.root / "approval.json"
+        candidate.write_bytes(self.approval_path.read_bytes())
+        self.policy["approval"]["path"] = str(candidate)
+        with self.assertRaisesRegex(ValueError, "outside candidate"):
+            self.prepare()
+
+    def test_candidate_manifest_cannot_reapprove_a_delivery_change(self):
+        self.manifest["installer"]["stamps"] = {**self.stamps, "PUBLISHER_NODE_ID": "5" * 64}
+        self.approve_manifest()
+        with self.assertRaisesRegex(ValueError, "delivery differs"):
+            self.prepare()
+
+    def test_approved_ticket_must_bind_every_endpoint_to_the_approved_node(self):
+        for ids in (["5" * 64], ["4" * 64, "5" * 64], []):
+            stamps = {**self.stamps, "SOURCE_CONNECT_TICKET": base64.b32encode(S.json_bytes({
+                "endpoints": [{"id": node, "addrs": []} for node in ids]})).decode().lower().rstrip("=")}
+            with self.subTest(ids=ids), self.assertRaisesRegex(ValueError, "every approved ticket endpoint"):
+                S.validate_delivery(stamps)
+        S.validate_delivery(self.stamps)
+
+    def test_immutable_attestation_certificate_and_subject_are_required(self):
+        for field, value in (("issuer", "https://issuer.invalid"),
+                             ("subjectAlternativeName", f"https://github.com/{S.REPOSITORY}/.github/workflows/foreign.yml@refs/heads/develop"),
+                             ("buildSignerURI", f"https://github.com/{S.REPOSITORY}/{S.PACKAGE_WORKFLOW}@refs/heads/foreign"),
+                             ("buildConfigURI", f"https://github.com/{S.REPOSITORY}/.github/workflows/foreign.yml@refs/heads/develop"),
+                             ("buildTrigger", "pull_request"), ("runnerEnvironment", "self-hosted"),
+                             ("sourceRepositoryDigest", COMMIT), ("buildSignerDigest", COMMIT),
+                             ("sourceRepositoryRef", "refs/heads/feature"), ("sourceRepositoryIdentifier", "999"),
+                             ("buildConfigDigest", COMMIT),
+                             ("runInvocationURI", f"https://github.com/{S.REPOSITORY}/actions/runs/123/attempts/1")):
+            def altered(*args):
+                result = self.verified_receipt(*args)
+                result[0]["verificationResult"]["signature"]["certificate"][field] = value
+                # Candidate-controlled predicate values cannot repair a certificate.
+                result[0]["verificationResult"]["statement"]["predicate"] = {"run_id": 123, "commit": WORKFLOW}
+                return result
+            with self.subTest(field=field), mock.patch.object(S, "attestation_result", side_effect=altered):
+                with self.assertRaisesRegex(ValueError, "certificate"):
+                    self.prepare()
+            for path in self.snapshot.iterdir():
+                path.unlink()
+        with mock.patch.object(S, "attestation_result", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "verified build attestation"):
+                self.prepare()
+
+    def test_forged_native_bytes_cannot_be_approved_by_only_the_manifest_hash(self):
+        malicious = b"x" * len(self.binary)
+        (self.root / "elastos-x86_64-linux").write_bytes(malicious)
+        record = self.manifest["files"]["elastos-x86_64-linux"]
+        record.update(sha256=S.sha256(malicious), cid=S.raw_cid(malicious))
+        self.manifest["release"]["platforms"]["x86_64-linux"]["binary"] = {k: record[k] for k in ("sha256", "cid")}
+        data = S.json_bytes(self.manifest)
+        (self.root / "signing-input.json").write_bytes(data)
+        self.policy["manifest_sha256"] = S.sha256(data)
+        with self.assertRaisesRegex(ValueError, "lack approved producer proof"):
+            self.prepare()
+
+    def test_wrong_receipt_subject_digest_is_refused(self):
+        def altered(*args):
+            result = self.verified_receipt(*args)
+            result[0]["verificationResult"]["statement"]["subject"][0]["digest"]["sha256"] = "0" * 64
+            return result
+        with mock.patch.object(S, "attestation_result", side_effect=altered):
+            with self.assertRaisesRegex(ValueError, "certificate"):
+                self.prepare()
+
+    def test_verifier_uses_exact_identity_ref_digests_and_isolated_environment(self):
+        self.proof.stop()
+        receipt = self.root / "provenance/x86_64-linux.receipt.json"
+        bundle = self.root / "provenance/x86_64-linux.bundle.jsonl"
+        result = self.verified_receipt(self.approval, self.package_run, receipt, bundle, self.snapshot)
+        with mock.patch.object(S.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=S.json_bytes(result)) ) as process:
+            actual = S.attestation_result(self.approval, self.package_run, receipt, bundle, self.snapshot)
+        self.assertEqual(actual, result)
+        command = process.call_args.args[0]
+        self.assertEqual(command[0], self.approval["gh"]["path"])
+        self.assertIn("--deny-self-hosted-runners", command)
+        identities = {"--cert-identity", "--cert-identity-regex", "--signer-repo", "--signer-workflow"}
+        self.assertEqual(identities.intersection(command), {"--cert-identity"})
+        for flag, expected in (("--source-digest", WORKFLOW), ("--signer-digest", WORKFLOW),
+                               ("--source-ref", "refs/heads/develop"),
+                               ("--cert-identity", f"https://github.com/{S.REPOSITORY}/{S.PACKAGE_WORKFLOW}@refs/heads/develop")):
+            self.assertEqual(command[command.index(flag) + 1], expected)
+        self.assertEqual(set(process.call_args.kwargs["env"]), {"PATH", "HOME", "GH_CONFIG_DIR", "GH_HOST", "GH_PROMPT_DISABLED", "GH_NO_UPDATE_NOTIFIER"})
+
+    def test_availability_failures_ask_for_retry_and_differ_from_provenance_refusals(self):
+        path = f"/repos/{S.REPOSITORY}/git/commits/{COMMIT}"
+        def response(status, **headers):
+            reply = mock.Mock(status=status)
+            reply.getheader.side_effect = lambda name, default=None: headers.get(name.replace("-", "_"), default)
+            return reply
+        for outcome, retry in ((OSError("Network is unreachable"), True), (response(429), True), (response(503), True),
+                               (response(403, X_RateLimit_Remaining="0"), True), (response(404), False), (response(403), False)):
+            connection = mock.Mock()
+            if isinstance(outcome, Exception):
+                connection.request.side_effect = outcome
+            else:
+                connection.getresponse.return_value = outcome
+            with self.subTest(outcome=outcome), mock.patch.object(S.http.client, "HTTPSConnection", return_value=connection), \
+                    mock.patch.dict(S.os.environ, {"GH_TOKEN": "operator-token"}):
+                with self.assertRaisesRegex(ValueError, "retry later. This is not a provenance refusal" if retry
+                                            else "GitHub source verification failed"):
+                    S.github_json(path)
+                self.assertEqual(connection.request.call_args.kwargs["headers"]["Authorization"], "Bearer operator-token")
+        receipt = self.root / "provenance/x86_64-linux.receipt.json"
+        bundle = self.root / "provenance/x86_64-linux.bundle.jsonl"
+        for outcome, expected in ((subprocess.TimeoutExpired("gh", 120), S.UNAVAILABLE),
+                                  (SimpleNamespace(returncode=1, stdout=b"", stderr=b"dial tcp: lookup tuf-repo-cdn.sigstore.dev: no such host"),
+                                   S.UNAVAILABLE),
+                                  (SimpleNamespace(returncode=1, stdout=b"",
+                                                   stderr=b"error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com"),
+                                   S.UNAVAILABLE),
+                                  (SimpleNamespace(returncode=1, stdout=b"", stderr=b"unsupported media type"),
+                                   "approved build attestation verification failed")):
+            self.proof.stop()
+            with self.subTest(outcome=outcome), mock.patch.object(S.subprocess, "run", side_effect=[outcome] if isinstance(outcome, Exception) else None,
+                                                                  return_value=outcome):
+                with self.assertRaises(ValueError) as caught:
+                    S.attestation_result(self.approval, self.package_run, receipt, bundle, self.snapshot)
+                self.assertIn(expected, str(caught.exception))
+            self.proof.start()
+        provenance_spec = importlib.util.spec_from_file_location("release_provenance", SOURCE.with_name("release-provenance.py"))
+        provenance = importlib.util.module_from_spec(provenance_spec)
+        provenance_spec.loader.exec_module(provenance)
+        for stderr, retry in ((b"error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com", True),
+                              (b"gh: Server Error (HTTP 502)", True), (b"gh: API rate limit exceeded (HTTP 403)", True),
+                              (b"", True), (b"gh: Not Found (HTTP 404)", False)):
+            with self.subTest(stderr=stderr), mock.patch.object(provenance.subprocess, "run",
+                                                                return_value=SimpleNamespace(returncode=1, stdout=b"", stderr=stderr)):
+                with self.assertRaises(ValueError) as caught:
+                    provenance.cli_fetch(self.approval, f"/repos/{S.REPOSITORY}/actions/runs/123")
+                self.assertEqual("not a provenance refusal" in str(caught.exception), retry)
+
+    def test_installed_gh_accepts_production_flags_and_refuses_the_inert_bundle(self):
+        # Exercise the real CLI parser with an empty test-only trust-root set.
+        # This keeps parser proof offline and refuses the inert bundle. The
+        # exact production vector was also checked with installed gh 2.101.0;
+        # successful hosted attestation remains a separate integration gate.
+        executable = shutil.which("gh")
+        if executable is None:
+            self.skipTest("installed gh is required for CLI compatibility proof")
+        executable = Path(executable).resolve()
+        self.assertFalse(executable.is_relative_to(self.root))
+        self.proof.stop()
+        self.no_process.stop()
+        real_run = subprocess.run
+        receipt = self.root / "provenance/x86_64-linux.receipt.json"
+        bundle = self.root / "provenance/x86_64-linux.bundle.jsonl"
+        self.assertEqual(bundle.read_bytes(), b"{}")
+        approval = copy.deepcopy(self.approval)
+        approval["gh"] = {"path": str(executable), "sha256": S.sha256(executable.read_bytes())}
+        calls = []
+        roots = self.base / "empty-test-trusted-roots.jsonl"
+        roots.write_bytes(b"")
+        offline = ["--custom-trusted-root", str(roots)]
+
+        def execute(*args, **kwargs):
+            result = real_run(args[0] + offline, **kwargs)
+            calls.append((args[0], kwargs, result))
+            return result
+
+        with mock.patch.object(S.subprocess, "run", side_effect=execute):
+            with self.assertRaisesRegex(ValueError, "attestation verification failed"):
+                S.attestation_result(approval, self.package_run, receipt, bundle, self.snapshot)
+        command, options, result = calls[0]
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"unsupported media type", result.stderr)
+        self.assertNotIn(b"were all set", result.stderr)
+        self.assertNotIn(b"unknown flag", result.stderr)
+        self.assertEqual(options["env"]["GH_CONFIG_DIR"], str(self.snapshot / "gh"))
+        # Reproduce the rejected former command with exactly the same inert
+        # payload, bundle and credential-free environment.
+        old = real_run(command + ["--signer-workflow", f"{S.REPOSITORY}/{S.PACKAGE_WORKFLOW}"] + offline,
+                       **{**options, "timeout": 10})
+        self.assertNotEqual(old.returncode, 0)
+        self.assertIn(b"[cert-identity signer-workflow] were all set", old.stderr)
 
     def test_bounded_changes_are_preserved_in_signed_release(self):
         for changes in ([], ["é" * 250], ["change"] * 32,
@@ -189,6 +543,9 @@ class SignerTests(unittest.TestCase):
             name: copy.deepcopy(platform)
             for name in ("aarch64-darwin", "x86_64-linux", "aarch64-linux")
         }
+        for name in ("aarch64-darwin", "aarch64-linux"):
+            (self.root / ("elastos-" + name)).write_bytes(self.binary)
+            self.manifest["files"]["elastos-" + name] = copy.deepcopy(self.manifest["files"]["elastos-x86_64-linux"])
         self.approve_manifest()
         prepared = self.prepare()
         self.assertEqual(set(S.parse_json(prepared.release)["platforms"]),
@@ -382,20 +739,20 @@ class SignerTests(unittest.TestCase):
         self.assertEqual(list(self.snapshot.iterdir()), [])
 
     def test_tampered_artifact_is_refused(self):
-        (self.root / "elastos").write_bytes(b"x" * len(self.binary))
+        (self.root / "elastos-x86_64-linux").write_bytes(b"x" * len(self.binary))
         with self.assertRaisesRegex(ValueError, "artifact differs"):
             self.prepare()
 
     def test_symlink_hardlink_directory_and_escape_are_refused(self):
-        path = self.root / "elastos"
+        path = self.root / "elastos-x86_64-linux"
         path.unlink()
-        path.symlink_to(self.root / "components.json")
+        path.symlink_to(self.root / "components-x86_64-linux.json")
         with self.assertRaises(OSError):
             self.prepare()
         for copied in self.snapshot.iterdir():
             copied.unlink()
         path.unlink()
-        os.link(self.root / "components.json", path)
+        os.link(self.root / "components-x86_64-linux.json", path)
         with self.assertRaisesRegex(ValueError, "unlinked"):
             self.prepare()
         for copied in self.snapshot.iterdir():
@@ -435,7 +792,7 @@ class SignerTests(unittest.TestCase):
         self.manifest = copy.deepcopy(original)
         self.manifest["release"]["platforms"]["x86_64-linux"]["binary"]["sha256"] = "0" * 64
         self.approve_manifest()
-        with self.assertRaisesRegex(ValueError, "reference differs"):
+        with self.assertRaisesRegex(ValueError, "reference differs|Runtime differs"):
             self.prepare()
 
     def test_template_hash_tree_mode_and_injection_are_refused(self):
@@ -600,7 +957,7 @@ class SignerTests(unittest.TestCase):
         self.policy.update(tool=tool, python={"path": str(Path(sys.executable).resolve()), "sha256": "0" * 64}, openssl={"path": "/custodian/openssl", "sha256": "0" * 64})
         with self.assertRaisesRegex(ValueError, "hash differs"):
             S.pinned_tools(self.policy, self.root)
-        self.policy["tool"]["path"] = str(self.root / "elastos")
+        self.policy["tool"]["path"] = str(self.root / "elastos-x86_64-linux")
         with self.assertRaises(ValueError):
             S.pinned_tools(self.policy, self.root)
         path = self.base / "operator-policy.json"
@@ -620,27 +977,27 @@ class SignerTests(unittest.TestCase):
                      "b" + base64.b32encode(b"\x01\x71\x12\x20" + root_digest).decode().lower().rstrip("=")):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 S.cid_info(text)
-        self.manifest["files"]["elastos"]["cid"] = v0
+        self.manifest["files"]["elastos-x86_64-linux"]["cid"] = v0
         self.manifest["release"]["platforms"]["x86_64-linux"]["binary"]["cid"] = v0
         self.approve_manifest()
         prepared = self.prepare()
         publication = dict(S.sign_publication(prepared, FakeBackend()))
         self.assertEqual(S.parse_json(publication["release.json"])["payload"]["platforms"]["x86_64-linux"]["binary"]["cid"], v0)
         self.assertNotEqual(root_digest, hashlib.sha256(self.binary).digest())
-        (self.root / "elastos").write_bytes(b"x" * len(self.binary))
+        (self.root / "elastos-x86_64-linux").write_bytes(b"x" * len(self.binary))
         fresh_snapshot = self.base / "tampered-snapshot"
         fresh_snapshot.mkdir(mode=0o700)
         with self.assertRaisesRegex(ValueError, "artifact differs"):
             S.prepare(self.policy, self.root, "signing-input.json", self.fetch, fresh_snapshot)
 
     def test_raw_cid_mismatch_and_changed_approved_cid_reference_are_refused(self):
-        self.manifest["files"]["elastos"]["cid"] = S.raw_cid(b"other bytes")
+        self.manifest["files"]["elastos-x86_64-linux"]["cid"] = S.raw_cid(b"other bytes")
         self.approve_manifest()
         with self.assertRaisesRegex(ValueError, "raw CID differs"):
             self.prepare()
         for path in self.snapshot.iterdir():
             path.unlink()
-        self.manifest["files"]["elastos"]["cid"] = S.raw_cid(self.binary)
+        self.manifest["files"]["elastos-x86_64-linux"]["cid"] = S.raw_cid(self.binary)
         self.manifest["release"]["platforms"]["x86_64-linux"]["binary"]["cid"] = S.base58_encode(b"\x12\x20" + bytes(32))
         self.approve_manifest()
         with self.assertRaisesRegex(ValueError, "reference differs"):
@@ -665,12 +1022,7 @@ class SignerTests(unittest.TestCase):
             "platforms": {"linux-amd64": external_ref(provider_record, "localhost-provider-linux-amd64")},
             "capsule_metadata": {"platforms": {"*": external_ref(metadata_record, "localhost-provider-capsule-metadata.tar.gz")}}}},
             "model_catalog": {"head_cid": catalog_record["cid"]}}
-        data = S.json_bytes(components)
-        components_record = add("components.json", data)
-        platform = self.manifest["release"]["platforms"]["x86_64-linux"]
-        platform["components"] = copy.deepcopy(components_record)
-        platform["binary"] = copy.deepcopy(self.manifest["files"]["elastos"])
-        self.approve_manifest()
+        self.reapprove_components(components)
         return components
 
     def test_current_release_sizes_external_checksum_paths_and_catalog_are_bound(self):
@@ -705,12 +1057,46 @@ class SignerTests(unittest.TestCase):
             self.prepare()
 
     def reapprove_components(self, components):
-        data = S.json_bytes(components)
-        (self.root / "components.json").write_bytes(data)
-        record = {"cid": S.raw_cid(data), "sha256": S.sha256(data), "size": len(data)}
-        self.manifest["files"]["components.json"] = record
-        self.manifest["release"]["platforms"]["x86_64-linux"]["components"] = copy.deepcopy(record)
+        self.platform_components["x86_64-linux"] = components
+        self.manifest["release"]["platforms"]["x86_64-linux"]["binary"] = copy.deepcopy(self.manifest["files"]["elastos-x86_64-linux"])
         self.approve_manifest()
+
+    def rewrite_signing_input(self):
+        data = S.json_bytes(self.manifest)
+        (self.root / "signing-input.json").write_bytes(data)
+        self.policy["manifest_sha256"] = S.sha256(data)
+
+    def test_generated_components_must_be_derived_from_attested_inputs(self):
+        self.current_shape()
+        name = "components-x86_64-linux.json"
+        derived = S.parse_json((self.root / name).read_bytes())
+        for change in ({"schema": "invalid-component-schema"}, {"profiles": {"extra": {}}},
+                       {"external": {**derived["external"], "unlisted": {"platforms": {}}}}):
+            data = S.json_bytes({**derived, **change})
+            (self.root / name).write_bytes(data)
+            record = {"sha256": S.sha256(data), "size": len(data), "cid": S.raw_cid(data)}
+            self.manifest["files"][name] = record
+            self.manifest["release"]["platforms"]["x86_64-linux"]["components"] = copy.deepcopy(record)
+            self.rewrite_signing_input()
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "release components differ from attested inputs"):
+                self.prepare()
+
+    def test_platform_components_and_template_must_match_attested_receipt(self):
+        (self.root / "provenance/x86_64-linux.components.json").write_bytes(
+            S.json_bytes({"schema": "elastos.components/v1", "external": {"localhost-provider": {"platforms": {"*": {"url": "x"}}}}}))
+        with self.assertRaisesRegex(ValueError, "platform components differ from attested receipt"):
+            self.prepare()
+        self.source_components = S.json_bytes({"external": {"localhost-provider": {}}, "profiles": {"other": {}}})
+        self.approve_manifest()
+        with self.assertRaisesRegex(ValueError, "attested components template differs from approved source"):
+            self.prepare()
+
+    def test_model_catalog_needs_attested_bytes(self):
+        self.current_shape()
+        self.unattested.add("model-catalog.json")
+        self.approve_manifest()
+        with self.assertRaisesRegex(ValueError, "lack approved producer proof: model-catalog.json"):
+            self.prepare()
 
     def test_single_chunk_unixfs_metadata_matches_existing_public_runtime_vector(self):
         data = b'{"payload":{"version":"0.7.1-rc.2"}}\n'

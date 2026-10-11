@@ -29,6 +29,137 @@ if [[ -z "$node_bin" ]]; then
 fi
 export PATH="$(dirname "$node_bin"):${PATH}"
 
+"$node_bin" --input-type=module - "$repo_root/scripts/browser-vm-control-service.mjs" <<'NODE'
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import vm from "node:vm";
+const source = fs.readFileSync(process.argv[2], "utf8");
+const watcher = source.slice(source.indexOf("export function watchParentPipe("),
+  source.indexOf("const CONFIG_ENV =")).replace("export function", "function");
+for (const mode of ["cancel", "early-close", "owned-error", "no-spawn"]) {
+  const observer = new EventEmitter(), actions = [];
+  if (mode !== "no-spawn") {
+    observer.pid = 12345;
+    observer.stdio = [null, null, null, { destroy: () => actions.push("cancel-channel") }];
+  }
+  observer.kill = signal => { actions.push(signal); return true; };
+  let ownerLosses = 0;
+  const watch = vm.runInNewContext(`${watcher}; watchParentPipe;`, {
+    parentPipeFd: () => 7, process: { execPath: "node", env: { NODE_OPTIONS: "preload" } },
+    spawn: (_program, _args, options) => {
+      assert.deepEqual(Array.from(options.stdio), [7, "ignore", "ignore", "pipe"]);
+      assert.equal(options.env.NODE_OPTIONS, "");
+      return observer;
+    },
+  });
+  const stop = watch(() => { ownerLosses++; }, 1000);
+  if (mode === "owned-error" || mode === "no-spawn") observer.emit("error", new Error("injected observer failure"));
+  if (mode === "early-close") observer.emit("close");
+  const pending = stop(); assert.equal(stop(), pending, "one exact observer reap owns cancellation");
+  let reaped = false; pending.then(() => { reaped = true; });
+  if (!["early-close", "no-spawn"].includes(mode)) {
+    await Promise.resolve();
+    assert.equal(reaped, false, "observer cancellation waits for ChildProcess.close");
+    observer.emit("close");
+  }
+  await pending;
+  assert.equal(ownerLosses, mode === "cancel" ? 0 : 1, "early/error closure invokes the same shutdown once");
+  assert.deepEqual(actions, ["early-close", "no-spawn"].includes(mode) ? [] : ["cancel-channel", "SIGTERM"]);
+}
+const parser = source.slice(source.indexOf("function persistentLauncherReadyLine("),
+  source.indexOf("function attachLauncherFailureContext("));
+const ready = JSON.stringify({ schema: "elastos.browser.engine.supervisor-result/v1" });
+const read = vm.runInNewContext(`${parser}; persistentLauncherReadyLine;`);
+assert.equal(read("{not-json"), null, "an incomplete chunk remains pending");
+assert.equal(read('Allocated inode: 728\n{"schema":'), null, "host noise and partial JSON remain pending");
+assert.equal(read(`Allocated inode: 728\n${ready}\n`), ready);
+assert.equal(read(ready), ready, "a complete result may arrive without a final newline");
+assert.throws(() => read("{not-json\n"), /JSON|property/);
+const run = source.slice(source.indexOf("function runPersistentProgram("),
+  source.indexOf("async function openPageInActiveVm("));
+const attach = source.slice(source.indexOf("function attachLauncherFailureContext("),
+  source.indexOf("function launchedChildFromFailure("));
+const batch = source.slice(source.indexOf("function batchLaunchReconciliations("),
+  source.indexOf("async function settleDispatchedTransportLaunchWithoutBinding("));
+const retained = new Map([["a", { state: "cleanup_pending" }], ["b", { state: "cleanup_pending" }]]);
+const stageBatch = vm.runInNewContext(`${batch}; batchLaunchReconciliations;`, {
+  persistLaunchReconciliations: () => { throw new Error("injected journal failure"); },
+});
+assert.throws(() => stageBatch({ records: retained }, staged => {
+  staged.records.set("a", { state: "terminal_post_effect_cleanup" });
+  staged.records.set("b", { state: "terminal_post_effect_cleanup" });
+}), /injected journal failure/);
+assert.equal(retained.get("a").state, "cleanup_pending");
+assert.equal(retained.get("b").state, "cleanup_pending", "a failed group journal preserves every original owner");
+const groupChild = {}, groupVm = { pages: new Set(["page:a", "page:b"]), launcher_child: groupChild };
+const groupBindings = new Map(["page:a", "page:b"].map(pageId => [pageId, {
+  page_id: pageId, generation: pageId, stream_id: pageId, process: { pid: 12345 },
+  control_socket_path: "/synthetic/shared.sock", isolation: {},
+}]));
+const groupPages = new Map([...groupBindings].map(([pageId, binding]) => [pageId, {
+  vm_key: "shared", launch: { lifecycle_generation: binding.generation, stream_id: binding.stream_id },
+  page: { page_id: pageId },
+}]));
+const groupOwners = new Map([["shared", groupVm]]);
+const groupRecords = new Map([...groupBindings].map(([pageId, binding]) => [pageId+":"+pageId, {
+  state: "page_acquired", launch: groupPages.get(pageId).launch, cleanup_binding: binding,
+}]));
+const originalRecords = JSON.stringify([...groupRecords]);
+const shutdown = source.slice(source.indexOf("async function shutdownPage("),
+  source.indexOf("function activePageGuestControl("));
+const groupShutdown = vm.runInNewContext(`${shutdown}; shutdownPage;`, {
+  safeId: () => true, validateRuntimeCleanupBinding: value => value,
+  requireExactDurableCleanupRecord: (store, binding) => store.records.get(binding.generation+":"+binding.stream_id),
+  requireExactRuntimeCleanupRecord: () => {}, ownedVmRecord: record => record ? groupVm : null,
+  cleanupBindingForSupervisorResult: (_config, _identity, _launch, page) => groupBindings.get(page.page_id),
+  exactOwnedLauncherProcess: () => groupChild, isDeepStrictEqual: (a, b) => JSON.stringify(a) === JSON.stringify(b),
+  launchReconciliationKey: (generation, stream) => generation+":"+stream,
+  LAUNCH_SETTLEMENT_TERMINAL: "terminal_post_effect_cleanup", LAUNCH_SETTLEMENT_PENDING: "cleanup_pending",
+  batchLaunchReconciliations: stageBatch,
+  recordLaunchReconciliation: (store, launch, state, fields) => {
+    assert.equal(groupVm.retirement_pending, true);
+    assert.equal(groupPages.get("page:a").cleanup_pending, true);
+    assert.equal(groupPages.get("page:b").cleanup_pending, true);
+    store.records.set(launch.lifecycle_generation+":"+launch.stream_id, { launch, state, ...fields });
+  },
+});
+await assert.rejects(groupShutdown({}, {}, { page_id: "page:a", force_retire_vm: true,
+  runtime_cleanup: groupBindings.get("page:a") }, groupPages, groupOwners, { records: groupRecords }, groupVm),
+  /injected journal failure/);
+assert.equal(groupVm.retirement_pending, true, "a failed pending write keeps the VM retirement barrier");
+assert.ok([...groupPages.values()].every(page => page.cleanup_pending === true));
+assert.equal(groupPages.size, 2); assert.equal(groupOwners.get("shared"), groupVm);
+assert.equal(JSON.stringify([...groupRecords]), originalRecords, "a failed pending write preserves durable owner bytes");
+for (const native of [false, true]) {
+  const child = new EventEmitter(); child.pid = 12345;
+  child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+  child.stdin = new EventEmitter(); child.stdin.end = () => {};
+  const retired = [];
+  const launchProgram = vm.runInNewContext(`${parser}\n${attach}\n${run}; runPersistentProgram;`, {
+    spawn: () => child, trackOwnedLauncherChild: value => value,
+    setTimeout: () => 1, clearTimeout: () => {},
+    LAUNCH_SETTLEMENT_PENDING: "cleanup_pending", LAUNCH_SETTLEMENT_TERMINAL: "terminal_post_effect_cleanup",
+    launchSettlementError: (error, state, cleanupError) => Object.assign(error, {
+      launch_settlement: state, launch_cleanup_error: cleanupError?.message }),
+    terminatePersistentLauncher: exact => {
+      assert.equal(exact, child); retired.push(exact);
+      return native ? Promise.reject(new Error("native cleanup remains pending")) : Promise.resolve();
+    },
+  });
+  const pending = launchProgram("fixture", [], {}, "{}\n", 1000, null,
+    native ? { transport_authority: {} } : {}, () => {});
+  child.stdout.emit("data", Buffer.from("{not-json\n"));
+  await assert.rejects(pending, error => {
+    assert.match(error.message, /JSON|property/);
+    assert.equal(error.launcher_child, child);
+    assert.equal(error.launch_settlement, native ? "cleanup_pending" : "terminal_post_effect_cleanup");
+    return true;
+  });
+  assert.deepEqual(retired, [child], "malformed readiness uses the exact launched-child cleanup");
+}
+NODE
+
 cleanup() {
   if [[ -n "$service_pid" ]]; then
     kill "$service_pid" >/dev/null 2>&1 || true
@@ -713,6 +844,213 @@ kill "$service_pid" >/dev/null 2>&1 || true
 wait "$service_pid" 2>/dev/null || true
 service_pid=""
 
+python3 - "$repo_root/scripts/browser-vm-control-service.mjs" "$fake_launcher" "$tmp_dir" "$node_bin" <<'PY'
+import http.client
+import fcntl
+import json
+import os
+from pathlib import Path
+import select
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+service_script, launcher, temporary, node = sys.argv[1:]
+root = Path(temporary)
+watcher_program = '''
+const {watchParentPipe} = await import(process.argv[2]);
+let stop;
+const finish = async reason => { await stop(); console.log('DONE '+reason); process.exit(0); };
+if (process.argv[3]) process.execPath = process.argv[3];
+stop = watchParentPipe(() => { void finish('owner-loss'); }, 1000);
+process.on('SIGTERM', () => { void finish('signal'); });
+console.log('READY');
+setInterval(() => {}, 1000);
+'''
+for mode in ('held-writer', 'runtime-eof', 'service-crash', 'observer-no-spawn'):
+    reader, writer = os.pipe(); identity = os.fstat(reader)
+    original_flags = fcntl.fcntl(reader, fcntl.F_GETFL)
+    environment = dict(os.environ, ELASTOS_UPDATE_PARENT_PIPE=
+        f'{reader}:{identity.st_dev}:{identity.st_ino & ((1<<64)-1)}')
+    # The eval caller has no entry file; the imported service stays a library.
+    command = [node, '--input-type=module', '-e', watcher_program, '', service_script]
+    if mode == 'observer-no-spawn': command.append(str(root/'missing-observer-node'))
+    service = subprocess.Popen(command,
+        env=environment, pass_fds=(reader,), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    sibling = subprocess.Popen([sys.executable, '-c',
+        'import os,sys; print("READING",flush=True); assert os.read(int(sys.argv[1]),1) in (b"",b"x")',
+        str(reader)], pass_fds=(reader,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    observer_pid = None
+    try:
+        assert select.select([service.stdout], [], [], 3)[0], 'passive service readiness timed out'
+        assert service.stdout.readline().strip() == b'READY'
+        assert select.select([sibling.stdout], [], [], 3)[0], 'sibling reader readiness timed out'
+        assert sibling.stdout.readline().strip() == 'READING'
+        if mode != 'observer-no-spawn':
+            observers = subprocess.check_output(['pgrep', '-P', str(service.pid)], text=True, timeout=2).split()
+            assert len(observers) == 1, 'passive watcher did not have one exact owned observer'
+            observer_pid = int(observers[0])
+        time.sleep(.1)
+        assert fcntl.fcntl(reader, fcntl.F_GETFL) == original_flags, 'watcher changed shared reader flags'
+        assert sibling.poll() is None, 'a live forwarded sibling reader exited before Runtime EOF'
+        if mode == 'runtime-eof':
+            os.close(writer); writer = None
+        elif mode == 'service-crash':
+            service.kill()
+        elif mode != 'observer-no-spawn':
+            service.send_signal(signal.SIGTERM)
+        output, error = service.communicate(timeout=3)
+        output, error = output.decode(), error.decode()
+        assert service.returncode == (-signal.SIGKILL if mode == 'service-crash' else 0), error
+        if mode != 'service-crash':
+            assert 'DONE '+('owner-loss' if mode in ('runtime-eof', 'observer-no-spawn') else 'signal') in output
+        deadline = time.monotonic()+3
+        while observer_pid is not None:
+            try: os.kill(observer_pid, 0)
+            except ProcessLookupError: break
+            assert time.monotonic() < deadline, 'passive observer survived its service'
+            time.sleep(.025)
+        assert fcntl.fcntl(reader, fcntl.F_GETFL) == original_flags, 'watcher cancellation changed reader flags'
+        if writer is not None:
+            assert sibling.poll() is None, 'service cancellation ended a live sibling lifetime'
+            os.write(writer, b'x')
+        _, sibling_error = sibling.communicate(timeout=3)
+        assert sibling.returncode == 0, sibling_error
+    finally:
+        if writer is not None: os.close(writer)
+        os.close(reader)
+        for child in (service, sibling):
+            if child.poll() is None: child.kill()
+            child.wait(timeout=3)
+        for child in (service, sibling):
+            child.stdout.close(); child.stderr.close()
+class UnixHttp(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.host)
+def request(control, method, path, body=None):
+    connection = UnixHttp(str(control), timeout=3)
+    try:
+        connection.request(method, path, json.dumps(body) if body else None,
+                           {'content-type': 'application/json'})
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+def wait_for(check, message, seconds=8):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if check(): return
+        time.sleep(.025)
+    raise AssertionError(message)
+def opened(control, stream):
+    profile = {'schema': 'elastos.browser.profile/v1', 'scope': 'active_principal',
+        'storage': 'principal_owned_profile_disk', 'storage_posture': 'principal_owned_reset_scoped_unprotected',
+        'protected_storage': False, 'encrypted': False, 'recoverable': False, 'recovery': 'not_recovery_kit_packaged',
+        'uri': 'localhost://Users/0123456789ab/BrowserProfiles/default/profile.ext4',
+        'public_uri': 'localhost://Users/self/BrowserProfiles/default/profile.ext4',
+        'profile_key': 'profile-' + 'a'*64, 'disk_path': str(root/'shared-profile.ext4'), 'reset': 'whole_profile'}
+    launch = {'schema': 'elastos.browser.engine.launch-request/v1', 'adapter': 'browser-vm-product',
+        'engine': 'chromium_microvm', 'url': 'https://example.com/', 'stream_id': stream,
+        'lifecycle_generation': 'sha256:' + stream, 'target': 'tls://example.com:443',
+        'principal_id': 'person:local:group-fixture', 'profile': profile,
+        'network_mode': 'runtime_net_only', 'direct_network': False, 'wallet_injection': False,
+        'display_mode': 'webrtc_remote_display', 'guarantee_level': 'mechanism_microvm'}
+    status, page = request(control, 'POST', '/pages', {'schema': 'elastos.browser.vm-engine.open/v1',
+        'launch_request': launch, 'profile': profile, 'requirements': {'substrate': 'microvm',
+        'display_mode': 'webrtc_remote_display', 'guarantee_level': 'mechanism_microvm',
+        'backend_class': 'product_compositor', 'network_mode': 'runtime_net_only', 'direct_network': False}})
+    assert status == 200, page
+    return page
+for mode in ('signal', 'eof', 'failure'):
+    proof = root / ('group-' + mode); proof.mkdir()
+    control = proof/'control.sock'; journal = Path(str(control)+'.launch-reconciliations.json')
+    held = proof/'hold-cleanup'; held.write_text('pending')
+    shutdown = proof/'shutdown.mjs'
+    shutdown.write_text('#!/usr/bin/env node\nimport fs from "node:fs";\n'
+        'if (fs.existsSync(process.env.GROUP_CLEANUP_HOLD)) process.exit(17);\n')
+    shutdown.chmod(0o700)
+    config = {'schema': 'elastos.browser.vm-control-service.config/v1', 'control_socket_path': str(control),
+        'launcher_program': launcher, 'persistent_launcher': True, 'max_active_pages': 2,
+        'reuse_idle_vms': True, 'launch_timeout_ms': 5000, 'shutdown_timeout_ms': 1000}
+    if mode == 'failure': config['shutdown_program'] = str(shutdown)
+    reader, writer = os.pipe(); identity = os.fstat(reader)
+    environment = dict(os.environ, ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG=json.dumps(config),
+        PERSISTENT_LAUNCHER_PROOF_DIR=str(proof), GROUP_CLEANUP_HOLD=str(held),
+        ELASTOS_UPDATE_PARENT_PIPE=f'{reader}:{identity.st_dev}:{identity.st_ino & ((1<<64)-1)}')
+    child_pid = None
+    with (proof/'service.out').open('wb') as output, (proof/'service.err').open('wb') as error:
+        service = subprocess.Popen([node, service_script], env=environment, stdout=output, stderr=error,
+            stdin=subprocess.DEVNULL, pass_fds=(reader,), start_new_session=True)
+        os.close(reader)
+        try:
+            wait_for(control.exists, 'shared fixture service did not bind')
+            pages = [opened(control, 'stream:shared-'+mode+'-'+str(index)) for index in range(2)]
+            child_pid = pages[0]['process']['pid']
+            assert pages[1]['process'] == pages[0]['process']
+            assert pages[1]['control_socket_path'] == pages[0]['control_socket_path']
+            before_bytes = journal.read_bytes()
+            before = json.loads(before_bytes)
+            bindings = {record['launch']['stream_id']: record['cleanup_binding'] for record in before['records']}
+            status, refusal = request(control, 'POST', '/shutdown', {'page_id': pages[0]['page_id'],
+                'runtime_cleanup': bindings[pages[0]['stream_id']], 'force_retire_vm': True})
+            assert status == 400 and 'another page' in refusal['error'], refusal
+            assert journal.read_bytes() == before_bytes, 'ordinary Close changed the shared owner journal'
+            status, unchanged = request(control, 'GET', '/status')
+            assert status == 200 and unchanged['active_pages'] == 2 and unchanged['active_vms'] == 1
+            if mode == 'eof': os.close(writer); writer = None
+            else: service.send_signal(signal.SIGTERM)
+            if mode == 'failure':
+                def pending():
+                    records = json.loads(journal.read_text())['records']
+                    return len(records) == 2 and all(record['state'] == 'cleanup_pending' for record in records)
+                wait_for(pending, 'shared cleanup did not retain both pending bindings')
+                status, capacity = request(control, 'GET', '/status')
+                assert status == 200 and capacity['active_pages'] == 2 and capacity['active_vms'] == 1
+                assert capacity['capacity_available'] is False and service.poll() is None
+                status, blocked = request(control, 'GET', '/pages/'+pages[1]['page_id']+'/status')
+                assert status == 404 and 'cleanup is pending' in blocked['error']
+                os.kill(child_pid, 0)
+                for record in json.loads(journal.read_text())['records']:
+                    assert record['cleanup_binding'] == bindings[record['launch']['stream_id']]
+                    assert 'terminal_cleanup_receipt' not in record
+                service.send_signal(signal.SIGTERM)
+                time.sleep(.1); assert service.poll() is None
+                status, refused_open = request(control, 'POST', '/pages', {})
+                assert status != 200
+                held.unlink()
+            assert service.wait(timeout=8) == 0
+            records = json.loads(journal.read_text())['records']; assert len(records) == 2
+            for record in records:
+                receipt = record['terminal_cleanup_receipt']
+                assert record['state'] == 'terminal_post_effect_cleanup'
+                assert receipt['binding'] == bindings[record['launch']['stream_id']] and receipt['terminal'] is True
+                assert set(receipt['effects']) == {'page_absent','child_absent','vm_absent','route_absent','socket_absent'}
+                assert all(value is True for value in receipt['effects'].values())
+            assert not control.exists() and not Path(pages[0]['control_socket_path']).exists()
+            try: os.kill(child_pid, 0)
+            except ProcessLookupError: pass
+            else: raise AssertionError('shared launcher survived terminal service cleanup')
+        except BaseException:
+            print('shared synthetic mode:', mode, file=sys.stderr)
+            print((proof/'service.err').read_text()[-4096:], file=sys.stderr)
+            if journal.exists():
+                print('shared synthetic journal states:', [record['state'] for record in json.loads(journal.read_text())['records']], file=sys.stderr)
+            raise
+        finally:
+            if writer is not None: os.close(writer)
+            if service.poll() is None: service.kill(); service.wait(timeout=3)
+            if child_pid:
+                observed = subprocess.run(['/bin/ps', '-p', str(child_pid), '-o', 'command=', '-ww'],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2)
+                if observed.returncode == 0 and launcher in observed.stdout:
+                    os.kill(child_pid, signal.SIGKILL)
+PY
+
 reuse_failure_control_socket="$tmp_dir/browser-vm-control-reuse-failure.sock"
 reuse_failure_proof_dir="$tmp_dir/p-reuse-failure"
 mkdir -p "$reuse_failure_proof_dir"
@@ -893,9 +1231,11 @@ const cleanupBody = (page) => ({
   }
   await request("POST", "/shutdown", cleanupBody(first));
   const terminal = await reconcile("stream:vm-reuse-failure-pending");
+  // The failed guest Open returned no accepted page binding. The existing VM
+  // was acquired, and its exact reap now settles the possible failed effects.
   if (
     terminal.state !== "terminal_post_effect_cleanup" ||
-    terminal.effects?.page_acquired !== true ||
+    terminal.effects?.page_acquired !== false ||
     terminal.effects?.vm_acquired !== true
   ) {
     throw new Error(`exact VM reap did not terminally settle reused failure: ${JSON.stringify(terminal)}`);

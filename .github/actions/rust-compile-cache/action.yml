@@ -4,11 +4,8 @@ runs:
   using: composite
   steps:
     - name: install checksummed sccache
-      id: install
       continue-on-error: true
       shell: bash
-      env:
-        CACHE_RW_MODE: ${{ env.CI_SAVE_CACHE == 'true' && 'READ_WRITE' || 'READ_ONLY' }}
       run: |
         set -euo pipefail
         checksum=(sha256sum)
@@ -35,26 +32,17 @@ runs:
           -o "$directory/$archive.tar.gz"
         echo "$digest  $directory/$archive.tar.gz" | "${checksum[@]}" -c -
         tar -xzf "$directory/$archive.tar.gz" -C "$directory" "$archive/sccache"
-        # sccache hashes each compiler invocation; lock edits can reuse other crates.
-        compiler_key=$(rustc -vV | "${checksum[@]}" | cut -d ' ' -f 1)
-        echo "$directory/$archive" >> "$GITHUB_PATH"
-        {
-          echo "SCCACHE_GHA_ENABLED=on"
-          echo "SCCACHE_GHA_VERSION=$compiler_key"
-          echo "SCCACHE_GHA_RW_MODE=$CACHE_RW_MODE"
-        } >> "$GITHUB_ENV"
-    - name: expose Actions cache runtime to sccache
-      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-    - name: enable Rust compile cache when ready
-      if: steps.install.outcome == 'success'
-      shell: bash
-      run: |
-        if sccache --start-server; then
+        # The job's Swatinem/rust-cache step restores and saves this directory.
+        # The daemon runs rustc and its proc macros, so it holds no Actions
+        # credential and uses no remote backend.
+        cache="$directory/objects"
+        # Keep the daemon that compiles every later step alive for its check.
+        if SCCACHE_DIR="$cache" SCCACHE_CACHE_SIZE=2G SCCACHE_IDLE_TIMEOUT=0 \
+            "$directory/$archive/sccache" --start-server; then
+          echo "$directory/$archive" >> "$GITHUB_PATH"
           {
+            echo "SCCACHE_DIR=$cache"
+            echo "SCCACHE_CACHE_SIZE=2G"
             echo "RUSTC_WRAPPER=sccache"
             echo "CARGO_INCREMENTAL=0"
           } >> "$GITHUB_ENV"

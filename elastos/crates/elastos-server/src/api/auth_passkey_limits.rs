@@ -24,7 +24,9 @@ enum CeremonyKind {
 impl CeremonyKind {
     fn from_path(path: &str) -> Option<Self> {
         match path {
-            "/api/auth/passkey/register/begin" => Some(Self::Registration),
+            "/api/auth/passkey/register/begin"
+            | "/api/auth/owner-recovery/begin"
+            | "/api/auth/owner-recovery/complete" => Some(Self::Registration),
             "/api/auth/passkey/authenticate/begin" => Some(Self::Authentication),
             _ => None,
         }

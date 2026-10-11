@@ -35,12 +35,8 @@ for (const [name, mutate, message] of [
   ["missing Rust Home capsule", (_components, lists) => lists.rustHome = lists.rustHome.filter((name) => name !== "services"), /rustHome: published capsules/],
   ["missing shell required capsule", (_components, lists) => lists.shellRequired = lists.shellRequired.filter((name) => name !== "wallet-provider"), /shellRequired: missing Home capsule wallet-provider/],
   ["demo capsule in default publication", (_components, lists) => lists.shellDefault.push("gba-emulator"), /shellDefault: published capsules/],
-  ["missing demo publication", (_components, lists) => lists.rustDemo = lists.rustDemo.filter((name) => name !== "gba-emulator"), /missing demo capsule/],
-  ["Home capsule in demo additions", (_components, lists) => lists.rustDemo.push("home"), /belongs in the demo profile/],
-  ["uninstalled demo publication", (value) => value.profiles.demo.components = value.profiles.demo.components.filter((name) => name !== "tunnel-provider"), /belongs in the demo profile/],
   ["Home installation without publication parity", (value) => value.profiles.home.components = value.profiles.home.components.filter((name) => name !== "assistant"), /published capsules/],
   ["different supported capsule sets", (_components, lists) => lists.shellRequired.push("key-provider"), /supported publish capsules must match/],
-  ["unknown publish capsule", (_components, lists) => lists.rustDemo.push("unknown"), /unknown or retired publish capsule/],
 ]) {
   test(`publication data refuse ${name}`, () => {
     const value = clone(components), lists = clone(publish);
@@ -61,7 +57,6 @@ for (const [name, shell, rust, message] of [
   ["shell default", shellPublish.replace(/(DEFAULT_CAPSULES=\([\s\S]*?)\n    home-gui\n/, "$1\n"), rustPublish, /shellDefault: published capsules/],
   ["shell required", shellPublish.replace(/(REQUIRED_SUPPORTED_CAPSULES=\([\s\S]*?)\n    wallet-provider\n/, "$1\n"), rustPublish, /shellRequired: missing Home capsule/],
   ["Rust Home", shellPublish, rustPublish.replace(/(const HOME_PUBLISH_CAPSULES:[\s\S]*?)\n    "services",/, "$1"), /rustHome: published capsules/],
-  ["Rust demo", shellPublish, rustPublish.replace('"gba-emulator", "gba-ucity", "tunnel-provider"', '"gba-ucity", "tunnel-provider"'), /missing demo capsule/],
 ]) {
   test(`changed ${name} declared publication data is refused`, () => {
     assert.throws(() => validatePublishData(components, manifests, parsePublishData(shell, rust)), message);
@@ -206,8 +201,10 @@ for (const [name, mutate, message] of [
   ["unknown profile component", (value) => value.profiles.home.components.push("missing-provider"), /unknown component/],
   ["missing Wallet dependency", (value) => value.profiles.home.components = value.profiles.home.components.filter((entry) => entry !== "wallet-provider"), /Wallet\/Browser dependency/],
   ["duplicate protected dependency", (value) => value.profiles.home.components.push("media-provider"), /must occur once/],
-  ["default public edge service", (value) => value.profiles.home.components.push("tunnel-provider"), /explicit profile/],
-  ["custody in default Home", (value) => value.profiles.home.components.push("custody-provider"), /Custody profile/],
+  ["default public edge service", (value) => value.profiles.home.components.push("tunnel-provider"), /developer --with component/],
+  ["custody in default Home", (value) => value.profiles.home.components.push("custody-provider"), /developer --with component/],
+  ["second setup profile", (value) => value.profiles.demo = { components: ["shell"] }, /Setup installs one Home/],
+  ["helper set as a second user profile", (value) => { value.profiles.demo = value.profiles["browser-host"]; delete value.profiles["browser-host"]; }, /Setup installs one Home/],
   ["missing release path", (value) => delete value.external["chain-provider"].platforms["linux-amd64"].release_path, /release path/],
   ["missing archive extraction path", (value) => delete value.external.browser.platforms["*"].extract_path, /archive extraction/],
   ["artifact path traversal", (value) => value.external.browser.platforms["*"].extract_path = "../outside", /safe artifact path/],

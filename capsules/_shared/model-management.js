@@ -20,18 +20,25 @@
   });
   // One phase per Runtime projection. The full view (System) and the compact
   // Marketplace detail read their copy from the same phase.
-  function phaseOf(r, p, message) {
+  function phaseOf(r, p, message, finishingExpired = false) {
     if (message) return "unavailable";
     if (r.dispatch_ready) return "ready";
-    if (r.admitted) return "service_unavailable";
+    // Admitted content whose engine is still being activated is finishing,
+    // not broken: Runtime clears activation_pending once dispatch can start.
+    // Activation failures are not reported, so a finish that takes longer
+    // than FINISHING_DEADLINE_MS reads as unavailable and offers Retry.
+    if (r.admitted) return activating(r, p) && !finishingExpired ? "finishing" : "service_unavailable";
     if (active(p)) return p.cancel_requested ? "cancelling" : p.state === "capacity_pending" ? "capacity" : p.state === "uncertain" ? "settling" : p.state === "verifying" ? "verifying" : "preparing";
     if (!p) return "absent";
     return p.state;
   }
+  const FINISHING_DEADLINE_MS = 120000;
+  const activating = (r, p) => Boolean(r.admitted && p?.activation_pending && !r.dispatch_unavailable_reason);
   const PHASE_TEXT = Object.freeze({
     unavailable: "Current status unavailable", ready: "Available on this device",
     service_unavailable: "Available on this device. Model service unavailable.",
-    cancelling: "Cancelling preparation…", capacity: "Waiting for local capacity…", settling: "Waiting for preparation to settle…",
+    finishing: "Finishing setup…",
+    cancelling: "Cancelling preparation…", settling: "Waiting for preparation to settle…",
     verifying: "Checking model files…", preparing: "Preparing local files…", absent: "Ready to prepare",
     reclaimed: "Model removed from local cache.", cancelled: "Preparation cancelled.", expired: "Preparation expired.",
   });
@@ -92,6 +99,8 @@
     const rank = bytes ? Math.min(4, Math.floor(Math.log(bytes) / Math.log(1000))) : 0;
     return `${(bytes / 1000 ** rank).toLocaleString(undefined, { maximumFractionDigits: rank ? 2 : 0 })} ${units[rank]}`;
   }
+  // Waiting for space names how much this model still needs, so the user knows what to free.
+  const capacityText = p => `Waiting for free space. This model needs ${formatBytes(p.total_bytes - p.completed_bytes)} on this Home, plus 2 GB kept free. Free some space and it continues.`;
   function element(tag, value, className) {
     const node = document.createElement(tag);
     if (value) node.textContent = value;
@@ -111,9 +120,14 @@
     create({ root, capsule, token, buttonClass = "pc2-btn pc2-btn-secondary", cid: requiredCid = null, compact = false, onReadyOpen = null }) {
       let visible = false, closed = false, generation = 0, busy = false, timer, reader;
       let selectedCid = requiredCid, choices = [], model = null, methods = new Map(), message = "", loading = false;
-      let unresolvedUse = null, reconcileRequired = false;
+      let unresolvedUse = null, reconcileRequired = false, refusal = "";
       let pendingFocus = null;
       let reclaimStep = "idle";
+      // Consecutive failed status reads while a preparation is pending. A short
+      // run keeps polling with backoff; only a long run gives up to Refresh.
+      let statusFailures = 0, statusFailingSince = 0;
+      // When this view first saw the current operation finishing setup.
+      let finishingOperation = "", finishingSince = 0;
       root.classList.add("model-management");
       root.tabIndex = -1;
       const show = () => visible && !closed && !document.hidden;
@@ -122,7 +136,14 @@
         const response = await fetch(path, { method: body ? "POST" : "GET", headers: {
           "x-elastos-home-token": token, ...(body ? { "content-type": "application/json" } : {}),
         }, ...(body ? { body: JSON.stringify(body) } : {}), signal });
-        if (!response.ok) throw new Error("Model request failed");
+        if (!response.ok) {
+          // A disk-space refusal is final and carries its plain reason; show it as is.
+          const refusal = await response.json().catch(() => null);
+          if (refusal?.code === "not_enough_free_space" && text(refusal.message, 300)) {
+            throw Object.assign(new Error(refusal.message), { refusal: refusal.message });
+          }
+          throw new Error("Model request failed");
+        }
         const raw = await response.text();
         check(raw.length <= 2 * 1024 * 1024);
         return JSON.parse(raw);
@@ -169,7 +190,7 @@
       async function load() {
         if (!show() || busy) return;
         stopRead(); const epoch = ++generation; const io = controller(); reader = io;
-        loading = true; message = ""; render();
+        loading = true; message = ""; refusal = ""; statusFailures = 0; render();
         try {
           const [catalog, interfaces] = await Promise.all([
             request("/api/capsules/catalog", null, io.signal), request("/api/capsules/interfaces", null, io.signal),
@@ -192,7 +213,7 @@
         const runtime = model?.model_runtime, preparation = runtime?.preparation;
         const pending = active(preparation) || (preparation && runtime.admitted && !runtime.dispatch_ready);
         if (!show() || busy || message || !pending) return;
-        timer = setTimeout(poll, 1500);
+        timer = setTimeout(poll, statusFailures ? Math.min(1500 * 2 ** statusFailures, 10000) : 1500);
       }
       async function poll() {
         if (!show() || busy || !model) return;
@@ -205,16 +226,20 @@
           const r = operationRuntime(result, cid);
           check(r.preparation?.operation_id === id);
           model.model_runtime = r;
+          statusFailures = 0;
         } catch {
           if (epoch !== generation || !show()) return;
-          message = "Status is unavailable. Refresh to check before trying again.";
+          if (!statusFailures++) statusFailingSince = Date.now();
+          if (statusFailures >= 5 && Date.now() - statusFailingSince >= 60000) {
+            message = "Status is unavailable. Refresh to check before trying again.";
+          }
         } finally { io.done(); if (epoch === generation) { render(); schedule(); } }
       }
       async function act(operation, keep) {
         if (busy || loading || !show() || !model || reconcileRequired) return;
         stopRead(); const epoch = ++generation, cid = model.cid;
         const id = model.model_runtime.preparation?.operation_id;
-        busy = true; message = ""; render();
+        busy = true; message = ""; refusal = ""; statusFailures = 0; render();
         const io = controller();
         try {
           const opening = operation === "open";
@@ -248,8 +273,11 @@
             model.model_runtime = r;
             if (operation === "use") unresolvedUse = null;
           }
-        } catch {
-          if (epoch === generation && show()) {
+        } catch (error) {
+          if (epoch === generation && show() && operation === "use" && error?.refusal) {
+            unresolvedUse = null;
+            refusal = error.refusal;
+          } else if (epoch === generation && show()) {
             if (operation === "reclaim") {
               try {
                 const catalog = await request("/api/capsules/catalog", null, io.signal);
@@ -291,7 +319,7 @@
         const refresh = button("Refresh models", () => void load(), loading);
         refresh.dataset.modelControl = "refresh";
         if (!compact) root.append(refresh);
-        const status = element("p", loading ? "Loading models…" : message);
+        const status = element("p", loading ? "Loading models…" : message || refusal || (statusFailures ? "Checking status…" : ""));
         status.setAttribute("role", "status"); status.hidden = compact && !status.textContent; root.append(status);
         if (!model) {
           if (!loading && !message && !requiredCid && choices.length > 1) {
@@ -323,8 +351,10 @@
             element("p", `Content ID: ${model.cid}`, "model-identity"));
           row.append(identity);
         }
-        const phase = phaseOf(r, p, message);
-        const label = phase === "failed" ? failureText(p) : phase === "service_unavailable" && r.dispatch_unavailable_reason
+        if (!activating(r, p)) finishingOperation = "";
+        else if (finishingOperation !== p.operation_id) { finishingOperation = p.operation_id; finishingSince = Date.now(); }
+        const phase = phaseOf(r, p, message, Boolean(finishingOperation) && Date.now() - finishingSince >= FINISHING_DEADLINE_MS);
+        const label = phase === "failed" ? failureText(p) : phase === "capacity" ? capacityText(p) : phase === "service_unavailable" && r.dispatch_unavailable_reason
           ? DISPATCH_UNAVAILABLE_TEXT[r.dispatch_unavailable_reason] : (compact ? COMPACT_PHASE_TEXT : PHASE_TEXT)[phase];
         row.append(element("p", label));
         if (active(p)) {
@@ -336,7 +366,7 @@
           : (p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : compact ? "Get" : "Download";
         const use = button(useLabel, () => void act("use"), active(p) || reconcileRequired);
         use.dataset.modelControl = "use";
-        if (!active(p) && !r.dispatch_ready) controls.append(use);
+        if (!active(p) && !r.dispatch_ready && phase !== "finishing") controls.append(use);
         if (r.dispatch_ready && typeof onReadyOpen === "function") {
           const open = button("Open in Assistant", () => void act("open"), reconcileRequired);
           open.dataset.modelControl = "open-assistant";

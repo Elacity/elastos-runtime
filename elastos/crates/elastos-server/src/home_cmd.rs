@@ -10,10 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::sleep;
 
-use elastos_common::localhost::{
-    edge_site_head_path, my_website_root_path, publisher_site_releases_dir, ALL_ROOTS,
-    DYNAMIC_ROOTS, FILE_BACKED_ROOTS, MY_WEBSITE_URI,
-};
+use elastos_common::localhost::{ALL_ROOTS, DYNAMIC_ROOTS, FILE_BACKED_ROOTS};
 use elastos_server::sources::{default_data_dir, load_trusted_sources};
 
 use crate::runtime_control;
@@ -25,21 +22,17 @@ const HOME_TERMINAL_HOST_INTENT_OSC_PREFIX: &str = "\x1b]777;elastos-home-intent
 const HOME_TERMINAL_HOST_INTENT_OSC_SUFFIX: &str = "\x07";
 const HOME_SESSION_ROOT: &str = "Local/SharedByLocalUsersAndBots/Home/sessions";
 const COMMAND_GROUPS: &[(&str, &[&str])] = &[
-    ("Home", &["home", "chat"]),
+    ("Home", &["home"]),
     (
         "Spaces",
         &["share", "open", "shares", "attest", "site", "webspace"],
     ),
-    (
-        "Operators",
-        &["serve", "gateway", "agent", "capsule", "run"],
-    ),
+    ("Operators", &["serve", "gateway", "capsule", "run"]),
     (
         "Trust",
         &[
             "source",
             "update",
-            "upgrade",
             "publish-release",
             "verify",
             "sign-payload",
@@ -69,7 +62,7 @@ const PLATFORM_LAYERS: &[(&str, &str)] = &[
     ),
     (
         "Apps",
-        "Things you launch from Home, such as chat, sharing, and site tools.",
+        "Things you launch from Home, such as chat and file tools.",
     ),
     (
         "ElastOS",
@@ -93,7 +86,7 @@ const SYSTEM_SERVICES: &[SystemServiceSpec] = &[
     },
     SystemServiceSpec {
         name: "Local World",
-        role: "Provides rooted localhost:// spaces such as Users, UsersAI, Public, and MyWebSite.",
+        role: "Provides rooted localhost:// spaces such as Users, UsersAI, and Public.",
         backing: &["localhost-provider"],
     },
     SystemServiceSpec {
@@ -112,16 +105,6 @@ const SYSTEM_SERVICES: &[SystemServiceSpec] = &[
         backing: &["ipfs-provider", "kubo"],
     },
     SystemServiceSpec {
-        name: "Site Edge",
-        role: "Serves localhost://MyWebSite into a browser-facing local edge when you open your site.",
-        backing: &["site-provider"],
-    },
-    SystemServiceSpec {
-        name: "Public Edge",
-        role: "Gives MyWebSite a temporary public browser URL when you explicitly ask for one.",
-        backing: &["tunnel-provider", "cloudflared"],
-    },
-    SystemServiceSpec {
         name: "Full-screen Apps",
         role: "Supports immersive full-screen app capsules such as packaged chat in microVM and WASM form.",
         backing: &["crosvm", "vmlinux"],
@@ -135,13 +118,6 @@ const CORE_ACTIONS: &[ActionSpec] = &[
         label: "Set nickname",
         description: "Set the DID-backed local nickname used by Chat and shown in Home.",
         args: &["identity", "nickname", "set"],
-        core: true,
-    },
-    ActionSpec {
-        id: "chat",
-        label: "Chat",
-        description: "Open native chat, send a message, and return here when you exit.",
-        args: &["chat"],
         core: true,
     },
     ActionSpec {
@@ -165,34 +141,6 @@ const CORE_ACTIONS: &[ActionSpec] = &[
         args: &[],
         core: false,
     },
-    ActionSpec {
-        id: "site-local",
-        label: "Preview",
-        description: "Start or reuse the local MyWebSite preview without opening a browser.",
-        args: &["site", "serve", "--mode", "local"],
-        core: true,
-    },
-    ActionSpec {
-        id: "site-ephemeral",
-        label: "Publish",
-        description: "Start a temporary public URL for MyWebSite without opening a browser.",
-        args: &["site", "serve", "--mode", "ephemeral"],
-        core: false,
-    },
-    ActionSpec {
-        id: "site-open",
-        label: "Open",
-        description: "Explicitly open the MyWebSite preview in a browser.",
-        args: &[],
-        core: false,
-    },
-    ActionSpec {
-        id: "shares-list",
-        label: "Shared",
-        description: "Open files and folders this Home already shared, then return here.",
-        args: &["shares", "list"],
-        core: true,
-    },
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,9 +161,6 @@ struct HomeSnapshot {
     active_shell: serde_json::Value,
     #[serde(default)]
     targets: Vec<HomeTargetStatus>,
-    site: SiteStatus,
-    #[serde(default)]
-    shares: ShareStatus,
     #[serde(default)]
     room: RoomStatus,
     #[serde(default)]
@@ -239,28 +184,6 @@ struct HomeSnapshot {
 struct HomeCliSessionStatus {
     mode: String,
     passkey_state: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ShareStatus {
-    #[serde(default)]
-    channel_count: usize,
-    #[serde(default)]
-    active_count: usize,
-    #[serde(default)]
-    author_did: Option<String>,
-    #[serde(default)]
-    channels: Vec<ShareChannelStatus>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ShareChannelStatus {
-    name: String,
-    latest_cid: String,
-    latest_version: u64,
-    status: String,
-    #[serde(default)]
-    head_cid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -375,8 +298,8 @@ struct PeopleContactStatus {
     handle: Option<String>,
     #[serde(default)]
     relationship: String,
-    #[serde(default)]
-    route: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
     #[serde(default)]
     can_message: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -538,23 +461,6 @@ struct SystemServiceStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SiteStatus {
-    staged: bool,
-    root_uri: String,
-    path: String,
-    #[serde(default)]
-    local_url: Option<String>,
-    #[serde(default)]
-    active_release: Option<String>,
-    #[serde(default)]
-    active_channel: Option<String>,
-    #[serde(default)]
-    active_bundle_cid: Option<String>,
-    #[serde(default)]
-    release_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RootStatus {
     name: String,
     kind: String,
@@ -580,22 +486,6 @@ struct ComponentStatus {
 struct CommandGroup {
     name: String,
     commands: Vec<String>,
-}
-
-#[derive(Debug, Default, Clone, Deserialize)]
-struct SiteHeadPayloadLite {
-    #[serde(default)]
-    bundle_cid: Option<String>,
-    #[serde(default)]
-    release_name: Option<String>,
-    #[serde(default)]
-    channel_name: Option<String>,
-}
-
-#[derive(Debug, Default, Clone, Deserialize)]
-struct SiteHeadEnvelopeLite {
-    #[serde(default)]
-    payload: SiteHeadPayloadLite,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -678,14 +568,6 @@ struct LoggingSuppressionGuard {
     previous: bool,
 }
 
-#[derive(Default)]
-struct DashboardContext {
-    local_site_preview: Option<crate::site_cmd::LocalSitePreviewSession>,
-    local_site_url: Option<String>,
-    local_site_public_url: Option<String>,
-    local_site_tunnel: Option<crate::site_cmd::PublicTunnelSession>,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 struct PeopleApiAction {
     path: String,
@@ -729,19 +611,6 @@ impl LoggingSuppressionGuard {
 impl Drop for LoggingSuppressionGuard {
     fn drop(&mut self) {
         crate::set_logging_suppressed(self.previous);
-    }
-}
-
-impl DashboardContext {
-    fn local_site_url(&self) -> Option<&str> {
-        self.local_site_url.as_deref()
-    }
-
-    async fn shutdown(&mut self) {
-        let _ = crate::site_cmd::shutdown_local_site_preview(&mut self.local_site_preview).await;
-        self.local_site_url = None;
-        let _ = crate::site_cmd::shutdown_public_tunnel(&mut self.local_site_tunnel).await;
-        self.local_site_public_url = None;
     }
 }
 
@@ -794,17 +663,15 @@ async fn run_managed_dashboard() -> anyhow::Result<()> {
         path: session.path.clone(),
     };
     let mut notice = None;
-    let mut dashboard = DashboardContext::default();
 
-    let result = loop {
-        let mut snapshot = gather_snapshot_with_site_preview(dashboard.local_site_url()).await?;
+    loop {
+        let mut snapshot = gather_snapshot().await?;
         snapshot.notice = notice.take();
         write_snapshot(&access, &session, &snapshot).await?;
         clear_intent(&access, &session).await?;
         let updater_access = access.clone();
         let updater_session = session.clone();
         let updater_notice = snapshot.notice.clone();
-        let updater_site_url = dashboard.local_site_url().map(|url| url.to_string());
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let updater = tokio::spawn(async move {
             loop {
@@ -813,11 +680,10 @@ async fn run_managed_dashboard() -> anyhow::Result<()> {
                     _ = sleep(Duration::from_millis(300)) => {}
                 }
 
-                let mut next_snapshot =
-                    match gather_snapshot_with_site_preview(updater_site_url.as_deref()).await {
-                        Ok(snapshot) => snapshot,
-                        Err(_) => continue,
-                    };
+                let mut next_snapshot = match gather_snapshot().await {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => continue,
+                };
                 next_snapshot.notice = updater_notice.clone();
                 let _ = write_snapshot(&updater_access, &updater_session, &next_snapshot).await;
             }
@@ -856,25 +722,19 @@ async fn run_managed_dashboard() -> anyhow::Result<()> {
                 if emit_gateway_home_terminal_host_intent(action_id, &snapshot)? {
                     break Ok(());
                 }
-                notice = Some(
-                    match dispatch_action(action_id, &snapshot, &coords, &mut dashboard).await {
-                        Ok(message) => {
-                            let _ = elastos_server::notifications::mark_acted_for_action(
-                                &default_data_dir(),
-                                action_id,
-                            );
-                            message
-                        }
-                        Err(err) => format!("Action failed: {}", err),
-                    },
-                );
+                notice = Some(match dispatch_action(action_id, &snapshot, &coords).await {
+                    Ok(message) => {
+                        let _ = elastos_server::notifications::mark_acted_for_action(
+                            &default_data_dir(),
+                            action_id,
+                        );
+                        message
+                    }
+                    Err(err) => format!("Action failed: {}", err),
+                });
             }
         }
-    };
-
-    dashboard.shutdown().await;
-
-    result
+    }
 }
 
 fn gateway_owned_home_terminal() -> bool {
@@ -1017,6 +877,29 @@ fn home_terminal_host_intent_for_action(
         }));
     }
 
+    if let Some(contact_id) = action_id.strip_prefix("people-message:").map(str::trim) {
+        if snapshot.session.mode != "browser_pty" {
+            return None;
+        }
+        let contact = snapshot
+            .people
+            .contacts
+            .iter()
+            .find(|contact| contact.contact_id == contact_id)?;
+        let conversation_id = people_contact_conversation(contact)?;
+        // home-cli.js forwards `switch-shell-open-target` to the Desktop, which
+        // opens Chat at this direct conversation (the same query People sends).
+        return Some(serde_json::json!({
+            "schema": "elastos.home.terminal-host-intent/v1",
+            "action": "switch-shell-open-target",
+            "action_id": action_id,
+            "target": "chat-room",
+            "source": "people-contact",
+            "contact_id": contact.contact_id,
+            "query": { "conversation_id": conversation_id },
+        }));
+    }
+
     let target = action_id.strip_prefix("shell-switch:")?.trim();
     if target != "home-gui" {
         return None;
@@ -1029,21 +912,16 @@ fn home_terminal_host_intent_for_action(
     }))
 }
 
-fn home_app_target_from_route(route: &str) -> Option<String> {
-    let rest = route.trim().strip_prefix("/apps/")?;
-    let target = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
-    if target.is_empty() {
-        None
-    } else {
-        Some(target.to_string())
-    }
-}
-
-fn people_contact_message_target(contact: &PeopleContactStatus) -> Option<String> {
+/// The direct Chat conversation of a contact that can be messaged.
+fn people_contact_conversation(contact: &PeopleContactStatus) -> Option<&str> {
     if !contact.can_message {
         return None;
     }
-    home_app_target_from_route(&contact.route)
+    contact
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
 }
 
 fn emit_gateway_home_terminal_host_intent(
@@ -1196,12 +1074,6 @@ fn format_home_cli_invoke_notice(body: &serde_json::Value, invoke: &HomeInvokeIn
 }
 
 async fn gather_snapshot() -> anyhow::Result<HomeSnapshot> {
-    gather_snapshot_with_site_preview(None).await
-}
-
-async fn gather_snapshot_with_site_preview(
-    site_local_url: Option<&str>,
-) -> anyhow::Result<HomeSnapshot> {
     let data_dir = default_data_dir();
     let gateway_owned = gateway_owned_home_terminal();
     let source = load_default_source(&data_dir)?;
@@ -1214,7 +1086,6 @@ async fn gather_snapshot_with_site_preview(
         source,
         local_runtime,
         home_summary_projection,
-        site_local_url,
     )
     .await
 }
@@ -1225,7 +1096,6 @@ async fn gather_snapshot_from_parts(
     source: Option<SourceStatus>,
     local_runtime: RuntimeStatus,
     home_summary_projection: Option<HomeSummaryFactsProjection>,
-    site_local_url: Option<&str>,
 ) -> anyhow::Result<HomeSnapshot> {
     let session = gather_home_cli_session_status();
     let runtime = home_summary_projection
@@ -1268,9 +1138,6 @@ async fn gather_snapshot_from_parts(
     } else {
         gather_active_shell_snapshot(data_dir)?
     };
-    let site_root = my_website_root_path(data_dir);
-    let site_head = load_site_head_summary(data_dir);
-    let release_count = count_site_releases(data_dir);
     let room_summary = elastos_server::room_service::load_summary(data_dir).unwrap_or_default();
     let native_notification_summary = if home_summary_projection.is_some() {
         None
@@ -1330,23 +1197,6 @@ async fn gather_snapshot_from_parts(
                 ))
                 .unwrap_or_default()
             }),
-        site: SiteStatus {
-            staged: site_root.join("index.html").exists(),
-            root_uri: "localhost://MyWebSite".to_string(),
-            path: site_root.display().to_string(),
-            local_url: site_local_url.map(|url| url.to_string()),
-            active_release: site_head
-                .as_ref()
-                .and_then(|head| head.payload.release_name.clone()),
-            active_channel: site_head
-                .as_ref()
-                .and_then(|head| head.payload.channel_name.clone()),
-            active_bundle_cid: site_head
-                .as_ref()
-                .and_then(|head| head.payload.bundle_cid.clone()),
-            release_count,
-        },
-        shares: gather_share_status(),
         room: RoomStatus {
             room_slug: room_summary.room_slug,
             title: room_summary.room_control.title,
@@ -1713,23 +1563,6 @@ fn gather_home_cli_session_status() -> HomeCliSessionStatus {
     }
 }
 
-fn load_site_head_summary(data_dir: &Path) -> Option<SiteHeadEnvelopeLite> {
-    let path = edge_site_head_path(data_dir, MY_WEBSITE_URI);
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn count_site_releases(data_dir: &Path) -> usize {
-    let dir = publisher_site_releases_dir(data_dir, MY_WEBSITE_URI);
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .count()
-}
-
 fn create_session(data_dir: &Path) -> anyhow::Result<HomeSession> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1787,12 +1620,14 @@ async fn write_snapshot(
     Ok(())
 }
 
+/// Consumes the renderer's intent by overwriting it with an empty file. The
+/// session only holds read and write authority, so deleting would be refused.
 async fn clear_intent(access: &SessionAccess, session: &HomeSession) -> anyhow::Result<()> {
     let path = format!("{}/intent.json", session.uri_root.trim_end_matches('/'));
     if !localhost_exists(access, &path).await? {
         return Ok(());
     }
-    delete_localhost_file(access, &path).await
+    write_localhost_file(access, &path, Vec::new()).await
 }
 
 async fn read_intent(
@@ -1804,6 +1639,9 @@ async fn read_intent(
         return Ok(None);
     }
     let data = read_localhost_file(access, &path).await?;
+    if data.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
     let intent: HomeIntent = serde_json::from_slice(&data)?;
     Ok(Some(intent))
 }
@@ -1910,11 +1748,10 @@ async fn dispatch_action(
     action_id: &str,
     snapshot: &HomeSnapshot,
     coords: &runtime_control::RuntimeCoords,
-    dashboard: &mut DashboardContext,
 ) -> anyhow::Result<String> {
     // Handle dynamically discovered capsule actions.
     if let Some(capsule_name) = action_id.strip_prefix("capsule-") {
-        return dispatch_capsule_action(capsule_name, snapshot, dashboard).await;
+        return dispatch_capsule_action(capsule_name, snapshot).await;
     }
     if action_id == "shell-switch:home-gui" {
         return Ok(
@@ -1923,7 +1760,7 @@ async fn dispatch_action(
         );
     }
     if action_id.starts_with("people-") {
-        return dispatch_people_action(action_id, snapshot, coords, dashboard).await;
+        return dispatch_people_action(action_id, snapshot, coords).await;
     }
     if let Some(notification_id) = action_id.strip_prefix("notification-read:") {
         return match elastos_server::notifications::mark_read(&default_data_dir(), notification_id)?
@@ -1972,18 +1809,6 @@ async fn dispatch_action(
             )),
             None => Ok("That Chat web guest session is already gone.".to_string()),
         };
-    }
-    if let Some(source) = action_id.strip_prefix("site-stage:") {
-        let source = source.trim();
-        if source.is_empty() {
-            anyhow::bail!("MyWebSite stage needs a directory path");
-        }
-        let source_path = PathBuf::from(source);
-        crate::site_cmd::stage_site_from_home(&source_path)?;
-        return Ok(format!(
-            "Staged MyWebSite from {}. Next: run `mywebsite preview`.",
-            source_path.display()
-        ));
     }
     if action_id == "room-policy-toggle-guests" {
         let actor_did = require_room_admin_actor(snapshot)?;
@@ -2042,12 +1867,8 @@ async fn dispatch_action(
     };
 
     match action_readiness(action_id, snapshot) {
-        ActionReadiness::Ready => run_action(action, snapshot, coords, dashboard).await,
-        ActionReadiness::Blocked(reason) => match action_id {
-            "site-local" | "site-open" => Ok(render_site_local_blocked_notice(snapshot, &reason)),
-            "site-ephemeral" => Ok(render_site_public_blocked_notice(snapshot, &reason)),
-            _ => Ok(format!("{} unavailable: {}", action.label, reason)),
-        },
+        ActionReadiness::Ready => run_action(action, snapshot).await,
+        ActionReadiness::Blocked(reason) => Ok(format!("{} unavailable: {}", action.label, reason)),
     }
 }
 
@@ -2055,7 +1876,6 @@ async fn dispatch_people_action(
     action_id: &str,
     snapshot: &HomeSnapshot,
     coords: &runtime_control::RuntimeCoords,
-    dashboard: &mut DashboardContext,
 ) -> anyhow::Result<String> {
     if let Some(action) = people_api_action(action_id) {
         let action = action?;
@@ -2072,15 +1892,11 @@ async fn dispatch_people_action(
         if !contact.can_message {
             anyhow::bail!("People contact is not message-ready yet");
         }
-        if people_contact_message_target(contact).is_none() {
+        if people_contact_conversation(contact).is_none() {
             anyhow::bail!("People contact has no message route in the current Runtime facts");
         }
-        let Some(action) = action_spec("chat") else {
-            anyhow::bail!("Chat action is not available");
-        };
-        run_action(action, snapshot, coords, dashboard).await?;
         let label = people_contact_display_name(contact, "contact");
-        return Ok(format!("Returned home from Chat with {label}."));
+        return Ok(format!("Open Chat on the Desktop to message {label}."));
     }
     anyhow::bail!("Unknown People action: {}", action_id)
 }
@@ -2158,7 +1974,6 @@ fn people_contact_display_name(contact: &PeopleContactStatus, fallback: &str) ->
 async fn dispatch_capsule_action(
     capsule_name: &str,
     snapshot: &HomeSnapshot,
-    dashboard: &mut DashboardContext,
 ) -> anyhow::Result<String> {
     if capsule_name == HOME_CLI_CAPSULE_NAME {
         return Ok("Home CLI is already active.".to_string());
@@ -2173,7 +1988,7 @@ async fn dispatch_capsule_action(
     if !catalog_capsule_has_cli_projection(capsule) {
         anyhow::bail!("Capsule {} is not a Home CLI launch action.", capsule_name);
     }
-    run_capsule_action(capsule_name, dashboard).await
+    run_capsule_action(capsule_name).await
 }
 
 fn action_spec(action_id: &str) -> Option<ActionSpec> {
@@ -2187,22 +2002,12 @@ fn action_spec(action_id: &str) -> Option<ActionSpec> {
 enum ActionLaunch {
     External(&'static [&'static str]),
     ManagedIdentityNicknameSet,
-    ManagedChat,
     ManagedRoomApprove,
     ManagedRoomDeny,
     ManagedRoomRevokeAll,
-    ManagedLocalSitePreview,
-    ManagedLocalSiteOpen,
-    ManagedPublicSitePublish,
-    ManagedSharesList,
 }
 
-async fn run_action(
-    action: ActionSpec,
-    snapshot: &HomeSnapshot,
-    coords: &runtime_control::RuntimeCoords,
-    dashboard: &mut DashboardContext,
-) -> anyhow::Result<String> {
+async fn run_action(action: ActionSpec, snapshot: &HomeSnapshot) -> anyhow::Result<String> {
     match action_launch(action, snapshot) {
         ActionLaunch::ManagedIdentityNicknameSet => {
             let nickname =
@@ -2211,11 +2016,6 @@ async fn run_action(
                 "Saved DID nickname as '{}'. You are back at Home.",
                 nickname
             ))
-        }
-        ActionLaunch::ManagedChat => {
-            let _parent_surface = ScopedEnvVar::set("ELASTOS_PARENT_SURFACE", "home");
-            crate::chat_cmd::run_chat_from_home(None, None, coords.clone()).await?;
-            Ok(format!("Returned home from {}.", action.label))
         }
         ActionLaunch::ManagedRoomApprove => {
             match elastos_server::room_service::approve_next_request(&default_data_dir())? {
@@ -2260,81 +2060,6 @@ async fn run_action(
                 None => Ok("No active Chat web guest sessions.".to_string()),
             }
         }
-        ActionLaunch::ManagedLocalSitePreview => {
-            let addr = crate::choose_local_open_addr(None)?;
-            let status = crate::site_cmd::ensure_local_site_preview(
-                &mut dashboard.local_site_preview,
-                &addr,
-            )
-            .await?;
-            let local_url = status
-                .local_url
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("site-provider start response missing local_url"))?;
-            dashboard.local_site_url = Some(local_url.clone());
-            let local_url = local_url.trim_end_matches('/').to_string();
-            Ok(render_site_preview_notice(
-                &snapshot.site,
-                &local_url,
-                status.reused.unwrap_or(false),
-            ))
-        }
-        ActionLaunch::ManagedLocalSiteOpen => {
-            let addr = crate::choose_local_open_addr(None)?;
-            let status = crate::site_cmd::ensure_local_site_preview(
-                &mut dashboard.local_site_preview,
-                &addr,
-            )
-            .await?;
-            let local_url = status
-                .local_url
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("site-provider start response missing local_url"))?;
-            dashboard.local_site_url = Some(local_url.clone());
-            crate::open_browser(&local_url);
-            Ok(format!(
-                "Opened MyWebSite preview at {}.",
-                local_url.trim_end_matches('/')
-            ))
-        }
-        ActionLaunch::ManagedPublicSitePublish => {
-            let addr = crate::choose_local_open_addr(None)?;
-            let status = crate::site_cmd::ensure_local_site_preview(
-                &mut dashboard.local_site_preview,
-                &addr,
-            )
-            .await?;
-            let local_url = status
-                .local_url
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("site-provider start response missing local_url"))?;
-            dashboard.local_site_url = Some(local_url.clone());
-            match crate::site_cmd::ensure_public_tunnel(
-                &mut dashboard.local_site_tunnel,
-                &local_url,
-                20,
-            )
-            .await
-            {
-                Ok(public_url) => {
-                    dashboard.local_site_public_url = Some(public_url.clone());
-                    Ok(render_site_public_notice(
-                        &snapshot.site,
-                        &local_url,
-                        &public_url,
-                    ))
-                }
-                Err(err) => {
-                    dashboard.local_site_public_url = None;
-                    Ok(format!(
-                        "MyWebSite public URL setup failed ({}). Local preview remains at {}.",
-                        err,
-                        local_url.trim_end_matches('/'),
-                    ))
-                }
-            }
-        }
-        ActionLaunch::ManagedSharesList => Ok(render_share_notice(&snapshot.shares)),
         ActionLaunch::External(args) => {
             let exe = std::env::current_exe().context("current exe unavailable")?;
             let status = Command::new(exe)
@@ -2358,10 +2083,7 @@ async fn run_action(
 }
 
 /// Launch a dynamically discovered capsule by name.
-async fn run_capsule_action(
-    capsule_name: &str,
-    _dashboard: &mut DashboardContext,
-) -> anyhow::Result<String> {
+async fn run_capsule_action(capsule_name: &str) -> anyhow::Result<String> {
     let exe = std::env::current_exe().context("current exe unavailable")?;
     let status = Command::new(exe)
         .args([
@@ -2421,9 +2143,6 @@ fn action_launch_with_kvm(
 ) -> ActionLaunch {
     if action.id == "identity-nickname-set" {
         ActionLaunch::ManagedIdentityNicknameSet
-    } else if action.id == "chat" {
-        let _ = (snapshot, kvm_supported);
-        ActionLaunch::ManagedChat
     } else if action.id == "room-approve" {
         let _ = (snapshot, kvm_supported);
         ActionLaunch::ManagedRoomApprove
@@ -2433,14 +2152,6 @@ fn action_launch_with_kvm(
     } else if action.id == "room-revoke-all" {
         let _ = (snapshot, kvm_supported);
         ActionLaunch::ManagedRoomRevokeAll
-    } else if action.id == "site-local" {
-        ActionLaunch::ManagedLocalSitePreview
-    } else if action.id == "site-open" {
-        ActionLaunch::ManagedLocalSiteOpen
-    } else if action.id == "site-ephemeral" {
-        ActionLaunch::ManagedPublicSitePublish
-    } else if action.id == "shares-list" {
-        ActionLaunch::ManagedSharesList
     } else {
         ActionLaunch::External(action.args)
     }
@@ -2468,15 +2179,6 @@ fn action_command_with_kvm(
         return "home: set the local DID profile nickname used across chat and people surfaces"
             .to_string();
     }
-    if action.id == "site-local" {
-        return "home: start MyWebSite local preview".to_string();
-    }
-    if action.id == "site-open" {
-        return "home: open MyWebSite preview in browser".to_string();
-    }
-    if action.id == "chat" {
-        return "home: open Chat".to_string();
-    }
     if action.id == "room-approve" {
         return "home: approve the next pending Chat web guest request".to_string();
     }
@@ -2485,12 +2187,6 @@ fn action_command_with_kvm(
     }
     if action.id == "room-revoke-all" {
         return "home: disconnect all active Chat web guest sessions".to_string();
-    }
-    if action.id == "site-ephemeral" {
-        return "home: publish a temporary HTTPS URL for MyWebSite".to_string();
-    }
-    if action.id == "shares-list" {
-        return "home: review current shared channels and open URLs".to_string();
     }
     format!(
         "elastos {}",
@@ -2526,162 +2222,6 @@ fn gather_system_services(components: &[ComponentStatus]) -> Vec<SystemServiceSt
             }
         })
         .collect()
-}
-
-fn gather_share_status() -> ShareStatus {
-    let Ok(catalog) = elastos_server::shares::load_share_catalog() else {
-        return ShareStatus::default();
-    };
-
-    let mut channels: Vec<ShareChannelStatus> = catalog
-        .channels
-        .iter()
-        .map(|(name, channel)| ShareChannelStatus {
-            name: name.clone(),
-            latest_cid: channel.latest_cid.clone(),
-            latest_version: channel.latest_version,
-            status: channel.status.to_string(),
-            head_cid: channel.head_cid.clone(),
-        })
-        .collect();
-
-    channels.sort_by(|a, b| a.name.cmp(&b.name));
-
-    ShareStatus {
-        channel_count: channels.len(),
-        active_count: channels
-            .iter()
-            .filter(|channel| channel.status == "active")
-            .count(),
-        author_did: catalog.author_did.clone(),
-        channels,
-    }
-}
-
-fn render_share_notice(shares: &ShareStatus) -> String {
-    if shares.channel_count == 0 {
-        return "Shared has nothing yet. Run `elastos share <path>` to publish a file or folder, then open it again from Home."
-            .to_string();
-    }
-
-    let mut parts = Vec::new();
-    for channel in shares.channels.iter().take(3) {
-        parts.push(format!(
-            "{} v{} {} elastos://{}",
-            channel.name,
-            channel.latest_version,
-            channel.status,
-            truncate_for_notice(&channel.latest_cid, 18)
-        ));
-    }
-
-    let more = shares.channel_count.saturating_sub(parts.len());
-    let mut summary = format!(
-        "Shared now has {} channel{} ({} active): {}.",
-        shares.channel_count,
-        if shares.channel_count == 1 { "" } else { "s" },
-        shares.active_count,
-        parts.join(" - ")
-    );
-    if more > 0 {
-        summary.push_str(&format!(" +{} more.", more));
-    }
-    summary.push_str(
-        " Next: `elastos open elastos://<cid>` or `elastos shares list` for the full catalog.",
-    );
-    summary
-}
-
-fn render_site_local_blocked_notice(snapshot: &HomeSnapshot, reason: &str) -> String {
-    if !snapshot.site.staged {
-        return "MyWebSite is empty. Stage a local directory with `elastos site stage <dir>`. Then reopen MyWebSite from Home to preview or go public."
-            .to_string();
-    }
-    if !component_available_in(&snapshot.components, "site-provider") {
-        return "MyWebSite is staged at localhost://MyWebSite. Run `elastos setup --profile demo` to install site-provider, then reopen MyWebSite from Home."
-            .to_string();
-    }
-    format!("MyWebSite unavailable: {}", reason)
-}
-
-fn render_site_public_blocked_notice(snapshot: &HomeSnapshot, reason: &str) -> String {
-    if !snapshot.site.staged {
-        return "MyWebSite needs a staged directory before it can go public. Run `elastos site stage <dir>` first."
-            .to_string();
-    }
-    if !component_available_in(&snapshot.components, "site-provider")
-        || !component_available_in(&snapshot.components, "tunnel-provider")
-        || !component_available_in(&snapshot.components, "cloudflared")
-    {
-        return "Publish needs site-provider, tunnel-provider, and cloudflared. Run `elastos setup --profile demo`, then try again."
-            .to_string();
-    }
-    format!("Publish unavailable: {}", reason)
-}
-
-fn render_site_preview_notice(site: &SiteStatus, local_url: &str, reused: bool) -> String {
-    let mut notice = if reused {
-        format!(
-            "MyWebSite preview is already live at {} for localhost://MyWebSite.",
-            local_url
-        )
-    } else {
-        format!(
-            "MyWebSite preview is live at {} for localhost://MyWebSite.",
-            local_url
-        )
-    };
-
-    if let Some(release) = site.active_release.as_deref() {
-        if let Some(channel) = site.active_channel.as_deref() {
-            notice.push_str(&format!(" Live release: {} on {}.", release, channel));
-        } else {
-            notice.push_str(&format!(" Live release: {}.", release));
-        }
-    } else if site.release_count > 0 {
-        notice.push_str(&format!(" Saved releases: {}.", site.release_count));
-    }
-
-    if let Some(cid) = site.active_bundle_cid.as_deref() {
-        notice.push_str(&format!(
-            " Bundle: elastos://{}.",
-            truncate_for_notice(cid, 22)
-        ));
-    }
-
-    notice.push_str(
-        " Next: use `mywebsite open` to open it, or `mywebsite publish` for a temporary HTTPS URL.",
-    );
-    notice
-}
-
-fn render_site_public_notice(site: &SiteStatus, local_url: &str, public_url: &str) -> String {
-    let mut notice = format!(
-        "MyWebSite public URL is live at {}. Local preview remains at {}.",
-        public_url.trim_end_matches('/'),
-        local_url.trim_end_matches('/'),
-    );
-
-    if let Some(release) = site.active_release.as_deref() {
-        if let Some(channel) = site.active_channel.as_deref() {
-            notice.push_str(&format!(" Live release: {} on {}.", release, channel));
-        } else {
-            notice.push_str(&format!(" Live release: {}.", release));
-        }
-    } else if site.release_count > 0 {
-        notice.push_str(&format!(" Saved releases: {}.", site.release_count));
-    }
-
-    notice.push_str(" Next: share the HTTPS URL, or manage releases with `elastos site publish|activate|rollback`.");
-    notice
-}
-
-fn truncate_for_notice(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
-        text.to_string()
-    } else {
-        format!("{}...", &text[..max_len])
-    }
 }
 
 fn summarize_component_sources(components: &[ComponentStatus], required: &[&str]) -> String {
@@ -3297,23 +2837,6 @@ async fn write_localhost_file(
     Ok(())
 }
 
-async fn delete_localhost_file(access: &SessionAccess, path: &str) -> anyhow::Result<()> {
-    let _ = provider_call(
-        &access.client,
-        &access.api_url,
-        &access.client_token,
-        &access.write_cap,
-        "localhost",
-        "delete",
-        &serde_json::json!({
-            "path": path,
-            "recursive": false,
-        }),
-    )
-    .await?;
-    Ok(())
-}
-
 fn print_home_state_probe(snapshot: &HomeSnapshot) -> anyhow::Result<()> {
     let mut out = std::io::stdout().lock();
     writeln!(out, "ElastOS Home State Probe")?;
@@ -3364,16 +2887,6 @@ fn print_home_state_probe(snapshot: &HomeSnapshot) -> anyhow::Result<()> {
             None => "runtime not connected yet".to_string(),
         }
     )?;
-    writeln!(
-        out,
-        "  MyWebSite: {} ({})",
-        snapshot.site.root_uri,
-        if snapshot.site.staged {
-            "staged"
-        } else {
-            "not staged"
-        }
-    )?;
     if snapshot.room.pending_count > 0 {
         let latest = match (
             snapshot.room.latest_request_name.as_deref(),
@@ -3396,9 +2909,6 @@ fn print_home_state_probe(snapshot: &HomeSnapshot) -> anyhow::Result<()> {
             snapshot.room.active_session_count,
             format_room_participants(&snapshot.room.active_participants)
         )?;
-    }
-    if let Some(url) = snapshot.site.local_url.as_deref() {
-        writeln!(out, "  Preview:   {}", url.trim_end_matches('/'))?;
     }
     writeln!(
         out,
@@ -3425,16 +2935,6 @@ fn print_home_state_probe(snapshot: &HomeSnapshot) -> anyhow::Result<()> {
     )?;
     writeln!(
         out,
-        "  Chat:      {}",
-        snapshot
-            .actions
-            .iter()
-            .find(|action| action.id == "chat")
-            .map(|action| if action.ready { "ready" } else { "needs setup" })
-            .unwrap_or("not available")
-    )?;
-    writeln!(
-        out,
         "  Carrier:   {} reachable",
         snapshot.runtime.peer_count.unwrap_or_default()
     )?;
@@ -3455,7 +2955,7 @@ fn print_home_state_probe(snapshot: &HomeSnapshot) -> anyhow::Result<()> {
     writeln!(out)?;
 
     writeln!(out, "Spaces")?;
-    for name in ["MyWebSite", "Public", "Local", "WebSpaces"] {
+    for name in ["Public", "Local", "WebSpaces"] {
         if let Some(root) = snapshot.roots.iter().find(|root| root.name == name) {
             writeln!(
                 out,
@@ -3544,12 +3044,8 @@ fn root_descriptor(root: &str) -> (&'static str, &'static str) {
             "Scratch space for temporary work, session state, and things that are not public yet.",
             "localhost://Local/Shared",
         ),
-        "MyWebSite" => (
-            "Browser-facing site root for the current sovereign Home, with preview, releases, and live channels.",
-            "localhost://MyWebSite/index.html",
-        ),
         "Public" => (
-            "Shared files root for things you want to open or pass around outside your private site.",
+            "Shared files root for things you want to open or pass around.",
             "localhost://Public/manual.pdf",
         ),
         "Users" => (
@@ -3612,11 +3108,6 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
             &["did-provider"],
             "run: elastos setup --with did-provider",
         ),
-        "chat" => require_components(
-            snapshot,
-            &["shell", "localhost-provider", "did-provider"],
-            "run: elastos setup",
-        ),
         "room-approve" | "room-deny" => {
             if snapshot.room.pending_count == 0 {
                 ActionReadiness::Blocked("no web guest requests pending".to_string())
@@ -3631,31 +3122,6 @@ fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness
                 ActionReadiness::Ready
             }
         }
-        "site-local" | "site-open" => {
-            if !snapshot.site.staged {
-                return ActionReadiness::Blocked(
-                    "stage a site first with `elastos site stage <dir>`".to_string(),
-                );
-            }
-            require_components(
-                snapshot,
-                &["site-provider"],
-                "run: elastos setup --profile demo",
-            )
-        }
-        "site-ephemeral" => {
-            if !snapshot.site.staged {
-                return ActionReadiness::Blocked(
-                    "stage a site first with `elastos site stage <dir>`".to_string(),
-                );
-            }
-            require_components(
-                snapshot,
-                &["site-provider", "tunnel-provider", "cloudflared"],
-                "run: elastos setup --profile demo",
-            )
-        }
-        "shares-list" => ActionReadiness::Ready,
         "room-policy-toggle-guests"
         | "room-policy-toggle-members"
         | "room-policy-toggle-member-hosts" => {
@@ -4141,7 +3607,6 @@ mod tests {
             None,
             RuntimeStatus::default(),
             Some(projection),
-            None,
         )
         .await
         .unwrap();
@@ -4215,7 +3680,6 @@ mod tests {
             None,
             RuntimeStatus::default(),
             Some(projection),
-            None,
         )
         .await
         .unwrap_err()
@@ -4281,7 +3745,6 @@ mod tests {
             None,
             RuntimeStatus::default(),
             Some(projection),
-            None,
         )
         .await
         .unwrap_err()
@@ -4336,17 +3799,6 @@ mod tests {
                 "candidates": []
             }),
             targets: Vec::new(),
-            site: SiteStatus {
-                staged: false,
-                root_uri: "localhost://MyWebSite".to_string(),
-                path: "/tmp/MyWebSite".to_string(),
-                local_url: None,
-                active_release: None,
-                active_channel: None,
-                active_bundle_cid: None,
-                release_count: 0,
-            },
-            shares: ShareStatus::default(),
             room: RoomStatus::default(),
             people: PeopleStatus::default(),
             notifications: NotificationStatus::default(),
@@ -4468,6 +3920,7 @@ mod tests {
                 }]
             })],
         );
+        std::fs::write(data_dir.join("config.toml"), "developer_mode = true\n").unwrap();
         write_home_cmd_active_shell_state(&data_dir, "person:test-home-cli", "home-cli");
 
         let snapshot = gather_snapshot().await.unwrap();
@@ -4549,7 +4002,7 @@ mod tests {
                     "contact_id": "contact-a",
                     "display_name": "Owner",
                     "relationship": "accepted",
-                    "route": "elastos://peer/contact-a",
+                    "conversation_id": "direct:v1:contact-a",
                     "can_message": true
                 }],
                 "service_offer_count": 2,
@@ -4725,33 +4178,80 @@ mod tests {
     }
 
     #[test]
-    fn home_terminal_people_message_stays_in_the_cli_runtime_path() {
+    fn home_terminal_people_message_hands_off_to_desktop_chat() {
         let mut snapshot = sample_snapshot_with_components(&[]);
+        snapshot.session.mode = "browser_pty".to_string();
         snapshot.people.contacts.push(PeopleContactStatus {
             contact_id: "contact-alice".to_string(),
             display_name: "Alice".to_string(),
             relationship: "conversation".to_string(),
-            route: "/apps/chat-room/".to_string(),
+            conversation_id: Some("direct:v1:alice".to_string()),
             can_message: true,
             ..PeopleContactStatus::default()
         });
 
-        assert!(
+        assert_eq!(
             home_terminal_host_intent_for_action("people-message:contact-alice", &snapshot)
-                .is_none()
+                .unwrap(),
+            serde_json::json!({
+                "schema": "elastos.home.terminal-host-intent/v1",
+                "action": "switch-shell-open-target",
+                "action_id": "people-message:contact-alice",
+                "target": "chat-room",
+                "source": "people-contact",
+                "contact_id": "contact-alice",
+                "query": { "conversation_id": "direct:v1:alice" },
+            })
         );
 
-        snapshot.people.contacts[0].route = "elastos://peer/peer-alice".to_string();
+        snapshot.people.contacts[0].conversation_id = None;
         assert!(
             home_terminal_host_intent_for_action("people-message:contact-alice", &snapshot)
                 .is_none()
         );
-        snapshot.people.contacts[0].route = "/apps/chat-room/".to_string();
+        snapshot.people.contacts[0].conversation_id = Some("direct:v1:alice".to_string());
         snapshot.people.contacts[0].can_message = false;
         assert!(
             home_terminal_host_intent_for_action("people-message:contact-alice", &snapshot)
                 .is_none()
         );
+        snapshot.people.contacts[0].can_message = true;
+        snapshot.session.mode = "native_terminal".to_string();
+        assert!(
+            home_terminal_host_intent_for_action("people-message:contact-alice", &snapshot)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_terminal_people_message_points_to_desktop_chat_without_native_chat() {
+        let mut snapshot = sample_snapshot_with_components(&[]);
+        snapshot.session.mode = "native_terminal".to_string();
+        snapshot.people.contacts.push(PeopleContactStatus {
+            contact_id: "contact-alice".to_string(),
+            display_name: "Alice".to_string(),
+            relationship: "conversation".to_string(),
+            conversation_id: Some("direct:v1:alice".to_string()),
+            can_message: true,
+            ..PeopleContactStatus::default()
+        });
+        // Unreachable coords: the hand-off must not touch the Runtime.
+        let coords = runtime_control::RuntimeCoords {
+            api_url: "http://127.0.0.1:9".to_string(),
+            attach_secret: String::new(),
+            pid: 0,
+            runtime_kind: String::new(),
+            binary_sha256: String::new(),
+            policy_sha256: String::new(),
+            dependency_sha256: String::new(),
+            generation: String::new(),
+            home_url: String::new(),
+        };
+
+        let notice = dispatch_people_action("people-message:contact-alice", &snapshot, &coords)
+            .await
+            .unwrap();
+        assert_eq!(notice, "Open Chat on the Desktop to message Alice.");
     }
 
     #[test]
@@ -5035,130 +4535,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_action_stays_native_when_fullscreen_chat_is_not_packaged() {
-        let snapshot = sample_snapshot_with_components(&[
-            "shell",
-            "localhost-provider",
-            "did-provider",
-            "crosvm",
-            "vmlinux",
-        ]);
-        let action = action_spec("chat").unwrap();
-
-        assert_eq!(
-            action_command_with_kvm(action, &snapshot, true),
-            "home: open Chat"
-        );
-    }
-
-    #[test]
-    fn chat_action_stays_native_even_when_fullscreen_chat_prereqs_are_present() {
-        let snapshot = sample_snapshot_with_components(&[
-            "shell",
-            "localhost-provider",
-            "did-provider",
-            "chat",
-            "crosvm",
-            "vmlinux",
-        ]);
-        let action = action_spec("chat").unwrap();
-
-        assert_eq!(
-            action_launch_with_kvm(action, &snapshot, true),
-            ActionLaunch::ManagedChat
-        );
-        assert_eq!(
-            action_command_with_kvm(action, &snapshot, true),
-            "home: open Chat"
-        );
-    }
-
-    #[test]
-    fn chat_action_stays_native_when_focus_chat_missing() {
-        let snapshot =
-            sample_snapshot_with_components(&["shell", "localhost-provider", "did-provider"]);
-        let action = action_spec("chat").unwrap();
-
-        assert_eq!(
-            action_command_with_kvm(action, &snapshot, false),
-            "home: open Chat"
-        );
-    }
-
-    #[test]
-    fn chat_action_launch_uses_managed_native_when_fullscreen_chat_is_not_packaged() {
-        let snapshot = sample_snapshot_with_components(&[
-            "shell",
-            "localhost-provider",
-            "did-provider",
-            "crosvm",
-            "vmlinux",
-        ]);
-        let action = action_spec("chat").unwrap();
-
-        assert_eq!(
-            action_launch_with_kvm(action, &snapshot, true),
-            ActionLaunch::ManagedChat
-        );
-    }
-
-    #[test]
-    fn chat_action_launch_uses_managed_native_when_focus_chat_missing() {
-        let snapshot =
-            sample_snapshot_with_components(&["shell", "localhost-provider", "did-provider"]);
-        let action = action_spec("chat").unwrap();
-
-        assert_eq!(
-            action_launch_with_kvm(action, &snapshot, false),
-            ActionLaunch::ManagedChat
-        );
-    }
-
-    #[test]
-    fn shares_action_uses_managed_summary() {
-        let snapshot = sample_snapshot_with_components(&[]);
-        let action = action_spec("shares-list").unwrap();
-
-        assert_eq!(
-            action_launch_with_kvm(action, &snapshot, false),
-            ActionLaunch::ManagedSharesList
-        );
-    }
-
-    #[test]
-    fn site_local_action_uses_managed_preview() {
-        let mut snapshot = sample_snapshot_with_components(&["site-provider"]);
-        snapshot.site.staged = true;
-        let action = action_spec("site-local").unwrap();
-
-        assert_eq!(
-            action_launch_with_kvm(action, &snapshot, false),
-            ActionLaunch::ManagedLocalSitePreview
-        );
-        assert_eq!(
-            action_command(action, &snapshot),
-            "home: start MyWebSite local preview"
-        );
-        assert!(!action_command(action, &snapshot).contains("browser"));
-    }
-
-    #[test]
-    fn site_open_is_the_explicit_browser_open_action() {
-        let mut snapshot = sample_snapshot_with_components(&["site-provider"]);
-        snapshot.site.staged = true;
-        let action = action_spec("site-open").unwrap();
-
-        assert_eq!(
-            action_launch_with_kvm(action, &snapshot, false),
-            ActionLaunch::ManagedLocalSiteOpen
-        );
-        assert_eq!(
-            action_command(action, &snapshot),
-            "home: open MyWebSite preview in browser"
-        );
-    }
-
-    #[test]
     fn core_actions_are_always_visible() {
         let core_ids: Vec<&str> = CORE_ACTIONS
             .iter()
@@ -5166,9 +4542,7 @@ mod tests {
             .map(|a| a.id)
             .collect();
         assert!(core_ids.contains(&"identity-nickname-set"));
-        assert!(core_ids.contains(&"chat"));
-        assert!(core_ids.contains(&"site-local"));
-        assert!(core_ids.contains(&"shares-list"));
+        assert!(!core_ids.contains(&"chat"));
         assert!(!core_ids.contains(&"update-check"));
     }
 
@@ -5179,8 +4553,6 @@ mod tests {
             .filter(|a| !a.core)
             .map(|a| a.id)
             .collect();
-        assert!(non_core.contains(&"site-ephemeral"));
-        assert!(non_core.contains(&"site-open"));
         assert!(non_core.contains(&"room-approve"));
         assert!(non_core.contains(&"room-deny"));
         assert!(non_core.contains(&"room-revoke-all"));
@@ -5325,42 +4697,90 @@ mod tests {
         }
     }
 
-    #[test]
-    fn blocked_local_site_notice_explains_stage_step() {
-        let snapshot = sample_snapshot_with_components(&[]);
-        let notice = render_site_local_blocked_notice(
-            &snapshot,
-            "stage a site first with `elastos site stage <dir>`",
-        );
-        assert_text_contains_all(
-            "empty MyWebSite notice",
-            &notice,
-            &[
-                "MyWebSite is empty",
-                "elastos site stage <dir>",
-                "preview",
-                "go public",
-            ],
-        );
-    }
+    /// The Home session only holds read and write authority, so consuming an
+    /// intent must never need delete (it used to quit Home with 403 Forbidden
+    /// after the first action).
+    #[tokio::test]
+    async fn home_session_consumes_two_consecutive_intents_without_delete_authority() {
+        use axum::extract::{Path as AxumPath, State};
+        use axum::http::StatusCode;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
 
-    #[test]
-    fn blocked_local_site_notice_explains_preview_prereq() {
-        let mut snapshot = sample_snapshot_with_components(&[]);
-        snapshot.site.staged = true;
-        let notice = render_site_local_blocked_notice(
-            &snapshot,
-            "missing site-provider -- run: elastos setup --profile demo",
-        );
-        assert_text_contains_all(
-            "staged MyWebSite notice",
-            &notice,
-            &[
-                "MyWebSite is staged",
-                "localhost://MyWebSite",
-                "elastos setup --profile demo",
-                "site-provider",
-            ],
-        );
+        type Files = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+        async fn localhost(
+            State(files): State<Files>,
+            AxumPath(op): AxumPath<String>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> (StatusCode, axum::Json<serde_json::Value>) {
+            let path = body["path"].as_str().unwrap_or_default().to_string();
+            let mut files = files.lock().await;
+            match op.as_str() {
+                "exists" => (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({"data": {"exists": files.contains_key(&path)}})),
+                ),
+                "read" => (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({"data": {"content": files.get(&path).cloned()}})),
+                ),
+                "write" => {
+                    let bytes = body["content"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|byte| byte.as_u64().unwrap() as u8)
+                        .collect();
+                    files.insert(path, bytes);
+                    (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({"status": "ok"})),
+                    )
+                }
+                _ => (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({}))),
+            }
+        }
+
+        let files: Files = Arc::default();
+        let app = axum::Router::new()
+            .route(
+                "/api/provider/localhost/:op",
+                axum::routing::post(localhost),
+            )
+            .with_state(files.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let temp = tempfile::tempdir().unwrap();
+        let session = HomeSession {
+            uri_root: "localhost://Local/Shared/Home/sessions/test".to_string(),
+            path: temp.path().to_path_buf(),
+        };
+        let access = SessionAccess {
+            client: reqwest::Client::new(),
+            api_url: format!("http://{addr}"),
+            client_token: "client".to_string(),
+            read_cap: "read".to_string(),
+            write_cap: "write".to_string(),
+        };
+        let intent_path = format!("{}/intent.json", session.uri_root);
+
+        clear_intent(&access, &session).await.unwrap();
+        for action in ["refresh", "open-settings"] {
+            write_localhost_file(
+                &access,
+                &intent_path,
+                serde_json::to_vec(&serde_json::json!({ "action": action })).unwrap(),
+            )
+            .await
+            .unwrap();
+            let intent = read_intent(&access, &session).await.unwrap().unwrap();
+            assert_eq!(intent.action, action);
+            clear_intent(&access, &session).await.unwrap();
+            assert!(read_intent(&access, &session).await.unwrap().is_none());
+        }
+        server.abort();
     }
 }

@@ -47,7 +47,7 @@ const GUARANTEE_OPERATOR_RBI = "operator_rbi";
 const GUARANTEE_POLICY_WEBVIEW = "policy_webview";
 const LOCAL_EXIT_LABEL = "This device";
 const LOCAL_EXIT_SUMMARY = "Use this device's Exit Node for Browser traffic.";
-const DEFAULT_ENGINE_LABEL = "Automatic";
+const DEFAULT_ENGINE_LABEL = "Local VM";
 const DEFAULT_ENGINE_SUMMARY = "Runtime chooses a compatible Browser Engine.";
 const BROWSER_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.browser.window-close.request/v1";
@@ -85,6 +85,9 @@ const backButton = document.querySelector("#browser-back");
 const forwardButton = document.querySelector("#browser-forward");
 const refreshButton = document.querySelector("#browser-refresh");
 const profileResetButton = document.querySelector("#browser-profile-reset");
+const profileResetConfirmation = document.querySelector("#browser-profile-reset-confirmation");
+const profileResetCancel = document.querySelector("#browser-profile-reset-cancel");
+const profileResetCommit = document.querySelector("#browser-profile-reset-commit");
 const settingsButton = document.querySelector("#browser-settings");
 const settingsPanel = document.querySelector("#browser-settings-panel");
 const settingsCloseButton = document.querySelector("#browser-settings-close");
@@ -146,6 +149,7 @@ function setSettingsOpen(open) {
     return;
   }
   settingsPanel.hidden = !open;
+  if (!open) profileResetConfirmation.hidden = true;
   settingsButton.setAttribute("aria-expanded", open ? "true" : "false");
 }
 
@@ -386,6 +390,7 @@ function setLoading(loading) {
   if (profileResetButton) {
     profileResetButton.disabled = loading;
   }
+  if (profileResetCommit) profileResetCommit.disabled = loading;
   renderEmpty.hidden = true;
   refreshButton.disabled = loading || !currentPage;
   updateNavState();
@@ -2086,7 +2091,7 @@ async function waitForRuntimeOpen(response, { engineLabel, exitLabel }) {
   while (Date.now() - startedAt < BROWSER_OPEN_POLL_TIMEOUT_MS) {
     const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     showStatus(
-      `Opening ${engineLabel} with ${exitLabel}... ${elapsedSeconds}s`,
+      `Browser is preparing ${engineLabel} with ${exitLabel} (${elapsedSeconds}s). Wait for preparation to finish, then close Browser if needed.`,
       { sticky: true },
     );
     await wait(BROWSER_OPEN_POLL_INTERVAL_MS);
@@ -2481,9 +2486,6 @@ async function resetBrowserProfile() {
     showStatus("Browser profile reset requires a Browser launch token.", { sticky: true });
     return;
   }
-  if (!window.confirm("Reset Browser cookies, local storage, history, and cache for this account?")) {
-    return;
-  }
   const activePage = currentPage;
   const activeGeneration = currentPageGeneration;
   const activeOwner = runtimePageOwner(activePage, activeGeneration);
@@ -2534,6 +2536,18 @@ async function resetBrowserProfile() {
 }
 
 profileResetButton?.addEventListener("click", () => {
+  profileResetConfirmation.hidden = false;
+  profileResetCancel.focus({ preventScroll: true });
+});
+
+profileResetCancel?.addEventListener("click", () => {
+  profileResetConfirmation.hidden = true;
+  profileResetButton.focus({ preventScroll: true });
+});
+
+profileResetCommit?.addEventListener("click", () => {
+  if (profileResetConfirmation.hidden || profileResetCommit.disabled) return;
+  profileResetConfirmation.hidden = true;
   resetBrowserProfile().catch((error) => {
     showStatus(friendlyOpenError(error), { sticky: true });
   });
@@ -2733,14 +2747,11 @@ const requestedStartupUrl = params.get("url");
 const initialUrl = requestedStartupUrl || DEFAULT_URL;
 addressInput.value = initialUrl;
 setLoading(true);
+showStatus("Browser is checking its Engine. Wait, or reopen Browser from Home to retry.", { sticky: true });
 fetchBrowserSummary({ remoteServices: false })
   .then(async (summary) => {
     if (await restoreRuntimePageViewer(summary)) return;
-    if (!requestedStartupUrl) {
-      setLoading(false);
-      return;
-    }
-    return requestRuntimeOpen(requestedStartupUrl, { history: "replace" });
+    return requestRuntimeOpen(initialUrl, { history: "replace" });
   })
   .catch((error) => {
     if (unloadCleanupStarted || homeWindowCloseInFlight || homeWindowTerminalCloseConfirmed) return;

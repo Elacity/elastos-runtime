@@ -25,6 +25,8 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     appLoadError: null,
     mediaLoadError: null,
     mediaTruncated: false,
+    // Runtime policy: protected content (Media) ships after 0.8.0 (#91).
+    protectedContent: false,
     modelCatalogState: "unconfigured",
     sharedModels: [],
     modelAccess: [],
@@ -308,8 +310,14 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     state.mediaLoadError = null;
     renderSurfaceState();
     await Promise.all([
-      loadCatalogData().then(render),
-      loadMediaData().then(render),
+      loadCatalogData().then(() => {
+        render();
+        if (!state.protectedContent) {
+          state.mediaLoading = false;
+          return undefined;
+        }
+        return loadMediaData().then(render);
+      }),
       ...(state.sharedLoaded ? [loadSharedModels()] : []),
     ]);
   }
@@ -361,6 +369,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       }
       const capsules = Array.isArray(catalog.capsules) ? catalog.capsules : [];
       state.modelCatalogState = catalog.model_catalog_state || "unconfigured";
+      state.protectedContent = catalog.policy?.protected_content === true;
       const modelCids = new Set();
       for (const capsule of capsules.filter(item => item.source === "signed-model-catalog")) {
         if (catalog.model_catalog_state !== "verified" || capsule.role !== "content" || capsule.installed !== false || capsule.launchable !== false ||
@@ -586,6 +595,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   function render() {
+    syncProtectedContent();
     selectDestination(state.destination, { silent: true });
     updateInstalledBadge();
     const surfaceBlocked = renderSurfaceState();
@@ -596,8 +606,15 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     openPendingModelDetail();
   }
 
+  function syncProtectedContent() {
+    document.querySelectorAll('[data-destination="media"]').forEach((node) => {
+      node.hidden = !state.protectedContent;
+    });
+    if (!state.protectedContent && state.destination === "media") selectDestination("discover", { silent: true });
+  }
+
   function normalizeDestination(id) {
-    if (id === "media") return "media";
+    if (id === "media") return state.protectedContent ? "media" : "discover";
     if (id === "installed") return "installed";
     if (categories.some((category) => category.id === id)) return id;
     return "discover";

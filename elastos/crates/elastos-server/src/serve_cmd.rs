@@ -444,7 +444,7 @@ pub async fn run_serve(
     } else if runtime_kind == crate::runtime_control::RUNTIME_KIND_MANAGED_CHAT {
         eprintln!("[serve] Managed chat runtime ready");
     } else {
-        eprintln!("[serve] Attach commands (elastos chat, elastos run) ready");
+        eprintln!("[serve] Attach commands (elastos run, elastos capsule) ready");
     }
 
     {

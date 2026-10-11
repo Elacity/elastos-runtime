@@ -34,7 +34,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.env = {**os.environ, 'PATH': str(self.bin) + os.pathsep + os.environ['PATH'],
                     'SOURCE_COMMIT': self.commit, 'SOURCE_TREE': self.tree,
                     'INSTALL_VERSION': '1.2.3', 'UPDATE_VERSION': '1.2.4',
-                    'GITHUB_REPOSITORY': 'fixture/runtime', 'GITHUB_OUTPUT': str(self.output),
+                    'GITHUB_REPOSITORY': 'Elacity/elastos-runtime', 'GITHUB_REF': 'refs/heads/develop',
+                    'GITHUB_OUTPUT': str(self.output),
                     'GH_CALLS': str(self.calls), 'GH_TREE': self.tree, 'GH_ON_DEVELOP': 'true',
                     'PYTHONDONTWRITEBYTECODE': '1'}
         gh = self.bin / 'gh'
@@ -70,6 +71,16 @@ esac
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.output.read_text(), 'source_tree=' + self.tree + '\n')
         self.assertEqual(len(self.calls.read_text().splitlines()), 2)
+
+    def test_release_rejects_noncanonical_refs_and_foreign_repository_before_api(self):
+        for overrides in ({'GITHUB_REF': 'refs/heads/feature/edited-workflow'},
+                          {'GITHUB_REF': 'refs/pull/123/merge'},
+                          {'GITHUB_REPOSITORY': 'fixture/runtime'}):
+            with self.subTest(overrides=overrides):
+                result = self.admit(**overrides)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.calls.exists())
+                self.assertFalse(self.output.exists())
 
     def test_release_rejects_open_pr_head_before_output(self):
         result = self.admit(GH_ON_DEVELOP='false')

@@ -428,12 +428,13 @@ Use target roles consistently:
 - Mac: staging, macOS VZ Browser proof, and cross-platform proof;
 - Jetson: Linux/crosvm native Browser target and intended main device proof.
 
-Mac staging requires durable SSH before serious testing. `tmate` is acceptable
+Browser staging on this local Mac uses direct execution. Remote Mac staging
+requires durable SSH before serious testing. `tmate` is acceptable
 only as a break-glass bootstrap channel. During that bootstrap, create or reuse a
 dedicated staging account, install an agent-owned public key in
 the target account's authorized-keys file, disable password assumptions, record a local SSH host
 alias, and verify non-interactive commands work. If no durable SSH is available,
-say the Mac is blocked instead of implying it was verified.
+say remote Mac staging is blocked instead of implying it was verified.
 
 Do not commit staging aliases, private key names, reverse-tunnel ports, local
 worktree paths, or operator usernames. Keep those details in private operational

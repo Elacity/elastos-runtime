@@ -28,6 +28,10 @@ def run(args, cwd, capture=False, lease=None):
         target = str(Path(cwd).resolve() / "target")
         environment["CARGO_TARGET_DIR"] = target
         environment["CARGO_BUILD_TARGET_DIR"] = target
+        # Use the same flags as CI. Caller lint caps, individual allows and
+        # encoded flags can otherwise weaken -D warnings or change the source.
+        environment.pop("CARGO_ENCODED_RUSTFLAGS", None)
+        environment["RUSTFLAGS"] = "-D warnings"
     if args[0] != "git":
         for name in GIT_LOCAL_ENV_VARS:
             environment.pop(name, None)
@@ -116,7 +120,7 @@ def current_develop(root, commit):
         return develop
     # An older base is safe when the merge is clean and develop changed none
     # of the candidate's files since the merge base; PR CI tests the merge.
-    merges = subprocess.run(["git", "merge-tree", "--write-tree", "--quiet", develop, commit],
+    merges = subprocess.run(["git", "merge-tree", "--write-tree", develop, commit],
                             cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     base = subprocess.run(["git", "merge-base", develop, commit], cwd=root,
                           capture_output=True, text=True).stdout.strip()
@@ -296,8 +300,18 @@ def touched_workspaces(root, paths, lease):
     manifests = {root / path for path in paths_from_git(root, "ls-files", "-z", "*Cargo.toml")}
     discoverable = {manifest for manifest in manifests
                     if not {"templates", "fixtures"}.intersection(manifest.relative_to(root).parts)}
-    broad = any(path in {"rust-toolchain.toml", ".cargo/config.toml"} for path in paths)
-    runtime_input = broad or any(path in {"elastos/Cargo.toml", "elastos/Cargo.lock"}
+    # A whole removed package (manifest and directory gone) is accepted; every
+    # workspace is checked so a remaining reference to it fails the gate.
+    removed = {(root / path).parent for path in paths
+               if path.endswith("/Cargo.toml") and not (root / path).exists()
+               and not {"templates", "fixtures"}.intersection(Path(path).parts)}
+    for folder in removed:
+        if folder.exists():
+            raise GateError("removed Rust package manifest left its directory behind: " +
+                            folder.relative_to(root).as_posix())
+    configuration_change = any(path in {"rust-toolchain.toml", ".cargo/config.toml"} for path in paths)
+    broad = bool(removed) or configuration_change
+    runtime_input = configuration_change or any(path in {"elastos/Cargo.toml", "elastos/Cargo.lock"}
                                  or path.startswith(("elastos/.cargo/", "elastos/wit/", "elastos/config/")) for path in paths)
     input_owners = external_input_owners(root, runtime_packages, paths)
     seeds = set(input_owners)
@@ -312,8 +326,8 @@ def touched_workspaces(root, paths, lease):
     for path in paths:
         if path.endswith("/Cargo.toml") and {"templates", "fixtures"}.intersection(Path(path).parts):
             continue
-        if path.endswith("/Cargo.toml") and not (root / path).exists():
-            raise GateError("removed Rust package needs an explicit acceptance plan: " + path)
+        if any((root / path).is_relative_to(folder) for folder in removed):
+            continue
         manifest = next((parent / "Cargo.toml" for parent in (root / path).parents
                          if parent / "Cargo.toml" in manifests), None)
         if manifest:
@@ -329,7 +343,25 @@ def touched_workspaces(root, paths, lease):
         if manifest not in known:
             workspace, packages = metadata(root, manifest, lease)
             workspaces[workspace] = packages
-    checked = set(workspaces)
+    for workspace, packages in workspaces.items():
+        if workspace == runtime:
+            continue
+        owners = external_input_owners(root, packages, paths)
+        input_owners.update(owners)
+        relative = workspace.relative_to(root).as_posix()
+        workspace_input = broad or any(path in {
+            relative + "/Cargo.toml", relative + "/Cargo.lock", relative + "/.cargo/config.toml"
+        } for path in paths)
+        for package in packages:
+            folder = Path(package["manifest_path"]).parent.resolve()
+            if workspace_input or folder in owners or any(
+                    (root / path).is_relative_to(folder) and Path(path).suffix not in {".md", ".txt"}
+                    for path in paths):
+                seeds.add(folder)
+    # A generic tooling/doc change has no Rust consumer. Keep formatting in
+    # the basic gate without cleaning and rebuilding an unrelated workspace.
+    checked = {workspace for workspace in workspaces if workspace != runtime}
+    related = set(seeds)
     if seeds:
         # --no-deps retains all declared path edges, including dev/build,
         # optional and target-specific dependencies. Discover each workspace
@@ -347,7 +379,6 @@ def touched_workspaces(root, paths, lease):
                 for dependency in package.get("dependencies", []):
                     if dependency.get("path"):
                         consumers.setdefault(Path(dependency["path"]).resolve(), set()).add(consumer)
-        related = set(seeds)
         pending = list(seeds)
         while pending:
             for consumer in consumers.get(pending.pop(), set()) - related:
@@ -360,16 +391,25 @@ def touched_workspaces(root, paths, lease):
         if workspace not in checked:
             continue
         relative = workspace.relative_to(root).as_posix()
-        workspace_change = broad or (workspace == runtime and runtime_input) or any(path in {
+        # Removal checks all remaining workspaces for dangling references.
+        # Unit evidence still belongs to changed inputs and their owners.
+        workspace_change = configuration_change or (workspace == runtime and runtime_input) or any(path in {
             relative + "/Cargo.toml", relative + "/Cargo.lock", relative + "/.cargo/config.toml",
         } for path in paths)
         selected = []
+        units = []
         for package in packages:
             prefix = Path(package["manifest_path"]).parent.relative_to(root).as_posix() + "/"
-            if workspace_change or Path(package["manifest_path"]).parent.resolve() in input_owners or any(
-                    path.startswith(prefix) for path in paths):
+            direct = workspace_change or Path(package["manifest_path"]).parent.resolve() in input_owners or any(
+                path.startswith(prefix) and Path(path).suffix not in {".md", ".txt"} for path in paths)
+            if direct or Path(package["manifest_path"]).parent.resolve() in related:
                 selected.append(package)
-        touched[workspace] = selected
+            if direct:
+                units.append(package)
+        # Dependent crates need lint checks for changed interfaces. Unit tests
+        # keep their existing direct-input scope, including product consumers.
+        if selected or units:
+            touched[workspace] = {"lint": selected, "units": units}
     return touched
 
 
@@ -419,7 +459,12 @@ def unit_plan(root, package, paths):
     targets = unit_targets(package)
     folder = Path(package["manifest_path"]).parent
     changed = [root / path for path in paths if (root / path).is_relative_to(folder)]
-    full = [(target, selectors, {""}) for target, selectors in targets]
+    # Policy beyond CI: a package whose own Rust source changed must run tests.
+    # A package reached only through other inputs (manifest, lockfile, config
+    # file, dependency) is tested when it has tests and never refused when it
+    # has none: CI does not refuse it either.
+    own_source = any(path.suffix == ".rs" for path in changed)
+    full = [(target, selectors, {""}, own_source) for target, selectors in targets]
     if not changed or any(path.suffix != ".rs" or not path.exists() for path in changed):
         return full
     plan = {}
@@ -433,7 +478,7 @@ def unit_plan(root, package, paths):
             return full
         for index, prefix in matches:
             plan.setdefault(index, set()).add(prefix)
-    return [(targets[index][0], targets[index][1], prefixes) for index, prefixes in sorted(plan.items())]
+    return [(targets[index][0], targets[index][1], prefixes, True) for index, prefixes in sorted(plan.items())]
 
 
 def passed_tests(output):
@@ -463,12 +508,14 @@ def crate_units(root, workspace, package, paths, lease):
         raise GateError(package["name"] + " has no enabled unit test target")
     prepared = False
     executed = 0
-    for target, selectors, prefixes in plan:
+    for target, selectors, prefixes, touched in plan:
         args = ["cargo", "test", "-p", package["name"], *selectors]
         listed = run([*args, "--", "--list"], workspace, capture=True, lease=lease)
         tests = re.findall(r"(?m)^(.+): test$", listed)
         if not tests:
-            raise GateError(package["name"] + " has zero unit tests on this host: " + " ".join(selectors))
+            if touched:
+                raise GateError(package["name"] + " has zero unit tests on this host: " + " ".join(selectors))
+            continue
         # A source module can use tests in another module. Fall back to all
         # tests in that target when a proven file path has no matching tests.
         if any(not any(name.startswith(prefix) for name in tests) for prefix in prefixes):
@@ -491,32 +538,48 @@ def crate_units(root, workspace, package, paths, lease):
             if count == 0:
                 raise GateError(package["name"] + " executed zero passing unit tests")
             executed += count
-    if executed == 0:
+    if executed == 0 and any(touched for _, _, _, touched in plan):
         raise GateError(package["name"] + " has zero unit tests on this host")
 
 
+LARGE_FILE_LIMIT = 50 * 1024 * 1024
+
+
+def refuse_large_files(root):
+    """GitHub refuses a push whose history adds a file over 100 MB, even if a
+    later commit deletes it, and warns above 50 MB. Check this first, in seconds."""
+    listing = run(["git", "rev-list", "--objects", "origin/develop..HEAD"], root, capture=True)
+    sizes = subprocess.run(["git", "cat-file", "--batch-check=%(objecttype) %(objectsize) %(rest)"],
+                           cwd=root, input=listing, check=True, capture_output=True, text=True).stdout
+    large = [line.split(" ", 2)[2] for line in sizes.splitlines()
+             if line.startswith("blob ") and int(line.split(" ", 2)[1]) > LARGE_FILE_LIMIT]
+    if large:
+        raise GateError("history adds files over 50 MB (deleting them in a later commit does not help; "
+                        "remove them from the commits that add them): " + ", ".join(sorted(set(large))[:5]))
+
+
 def gates(root, paths, lease):
+    refuse_large_files(root)
     run(["git", "diff", "--check", "origin/develop...HEAD"], root)
-    run(["node", "scripts/check-product-data.mjs"], root)
-    run(["node", "--test", "scripts/check-product-data.test.mjs"], root)
-    if any(path in {".githooks/pre-push", "scripts/ci-local-prepush.sh",
-                    "scripts/ci-local-prepush.py", "scripts/ci-local-prepush-test.py"}
-           for path in paths):
-        run(["python3", "scripts/ci-local-prepush-test.py"], root)
+    # The CI test-behaviour suite (about a minute); its last lines name failures.
+    run(["./scripts/test-behaviour.sh"], root)
+    # The CI source-gate checks, from the same list CI runs.
+    run(["./scripts/test-source-gate.sh"], root)
     workspaces = touched_workspaces(root, paths, lease)
     formats = {root / "elastos", root / "capsules/chain-provider", *workspaces}
     for workspace in sorted(formats):
         run(["cargo", "fmt", "--all", "--", "--check"], workspace, lease=lease)
     for workspace in sorted(workspaces):
         clean_repository_packages(root, workspace, lease)
-    for workspace, packages in sorted(workspaces.items()):
+    for workspace, scope in sorted(workspaces.items()):
         run(["cargo", "check", "--workspace", "--all-targets"], workspace, lease=lease)
+        packages = scope["lint"]
         if packages:
             args = ["cargo", "clippy", "--all-targets"]
             for package in packages:
                 args.extend(["-p", package["name"]])
             run([*args, "--", "-D", "warnings"], workspace, lease=lease)
-        for package in packages:
+        for package in scope["units"]:
             crate_units(root, workspace, package, paths, lease)
 
 

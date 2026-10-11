@@ -54,11 +54,13 @@ MAJOR.MINOR.PATCH[-prerelease]
 Preferred examples:
 
 - `1.0.0`
+- `1.2.3-alpha.1`
 - `1.2.3-rc.1`
 - `1.2.3-beta.3`
 
 Rejected examples:
 
+- `1.2.3-alpha1`
 - `1.2.3-rc31`
 - `1.2.3-beta3`
 
@@ -92,13 +94,17 @@ Use dotted prerelease identifiers such as `-rc.31`, not `-rc31`.
 
 ## Pre-release Policy
 
-Use `-rc.N` for a signed candidate that is published before its final version.
-A monthly source release (a repository tag with GitHub-built, unstamped
-binaries) uses plain `X.Y.Z`; its notes state what is not ready for users.
+Use `-alpha.N` for a signed test release published while a version is still
+being built; the 0.8.0 train ships `0.8.0-alpha.N`. Use `-rc.N` for a signed
+candidate that is published before its final version.
+A monthly source release (a repository tag; signed releases over Carrier are
+the only binary distribution) uses plain `X.Y.Z`; its notes state what is not
+ready for users.
 The release issue on GitHub records the active release and its evidence.
 
 Current rule:
 
+- test release: `X.Y.Z-alpha.N`
 - unstable public candidate: `X.Y.Z-rc.N`
 - stable release: `X.Y.Z`
 
@@ -169,32 +175,110 @@ writes `model-catalog.json` and prints its CID.
 `publisher_dids` (the signing DID) and `local_use` (`max_cache_bytes` 8 GiB, `max_model_memory_bytes` 4 GiB).
 Keep that head stable across releases: a new head means every admitted model needs Use again.
 
-1. **Build.** Run the `Release package` workflow
+Before preparing a release, the operator creates an approval file in a protected
+directory outside the candidate inputs and `RELEASE_WORK`. Set `RELEASE_APPROVAL`
+to its canonical absolute path. The directory and file belong to the operator
+or root and permit writes only by their owner. This file is an independent
+approval: preparation reads it and never creates it from downloaded inputs,
+the package run or the publisher's current HTTP response.
+
+The approval has these fields:
+
+```json
+{
+  "schema": "elastos.release.approval/v1",
+  "repository": "Elacity/elastos-runtime",
+  "source": {"commit": "APPROVED_SOURCE_COMMIT", "tree": "APPROVED_SOURCE_TREE"},
+  "workflow": {
+    "commit": "APPROVED_BUILDER_COMMIT",
+    "tree": "APPROVED_BUILDER_TREE",
+    "ref": "refs/heads/develop"
+  },
+  "delivery": {
+    "MAINTAINER_DID": "APPROVED_SIGNING_DID",
+    "PUBLISHER_GATEWAY": "https://APPROVED_PUBLISHER_ORIGIN",
+    "PUBLISHER_NODE_ID": "APPROVED_CARRIER_NODE_ID",
+    "SOURCE_CONNECT_TICKET": "APPROVED_CARRIER_TICKET",
+    "IPNS_NAME": "APPROVED_IPNS_NAME"
+  },
+  "gh": {"path": "/ABSOLUTE/PATH/TO/INSTALLED/GH", "sha256": "APPROVED_GH_SHA256"}
+}
+```
+
+Replace the descriptive values with independently verified identities. Source H
+and builder W are full Git commit/tree IDs and may differ. Approve W's complete
+workflow source, its helper code and pinned actions, rather than just its YAML
+filename. The producer ref is `refs/heads/develop`. Approve
+H through the ordinary exact-source CI acceptance flow before preparation.
+The independent source approval is deliberate key-owner trust; direct signer
+calls retain this operator boundary. Prepare and seed-upgrade enforce the CI gate.
+Approve the publisher tuple from the existing operator trust record. The Carrier node is
+its 64-character lower-case transport ID; every endpoint in the base32 JSON ticket
+has that same ID. A new ticket or delivery identity requires a new approval.
+The IPNS field can be empty when the approved delivery uses Carrier alone.
+The installed `gh` executable has a canonical path outside candidate inputs and
+a SHA-256 pin. It supports the attestation verification flags used by the signer.
+
+1. **Build.** Run the `Release package` workflow from `develop`
    ([`.github/workflows/release-package.yml`](../.github/workflows/release-package.yml))
    with the source commit, the install version N and the update version N+1.
-   The source is a commit on `develop`, or the head of an open pull request into
-   `develop` that already contains `develop`. The run builds native pairs for
+   Supply the qualified common ARM64 Browser archive's CID, independent SHA-256
+   and exact byte size. The operator builds that guest outside CI from the
+   committed Debian and Python locks, packages it once, and retains it in the
+   publisher artifact store under its canonical CID filename. Configure the
+   repository variables `BROWSER_IMAGE_PUBLISHER_DID` and
+   `BROWSER_IMAGE_PUBLISHER_NODE_ID`; an optional
+   `BROWSER_IMAGE_CONNECT_TICKET` secret supplies the direct bootstrap route.
+   The candidate Runtime downloads this input with `source fetch-file` through
+   the existing Carrier file stream. It checks the pinned peer, length and hash
+   before image admission. Mac and Linux ARM64 consume the same archive; x86-64
+   selects a remote Engine. Guest images remain outside CI builds.
+   The source is the approved commit on `develop`. The run builds native pairs for
    `aarch64-darwin`, `x86_64-linux` and `aarch64-linux` (Jetson). N+1 reuses
    N's support bytes. Each pair uses fresh Cargo directories and checks versions,
    source and support parity; ARM64 also passes the Jetson compatibility gate.
-   Each job summary records its artifact ID and digest.
+   Build jobs have read-only permissions. Fresh hosted attester jobs execute W's
+   helpers, read the downloaded payloads as inert data, and seal source H/tree and
+   version from the original workflow inputs and admission output. The attesters
+   hash every payload and publish small `release-proof-*` artifacts with receipts
+   and bundles. Candidate scripts and executables stay in the build jobs.
+   The job summary records each native artifact's ID and digest.
 2. **Prepare.** On the operator Mac, from a clone of this repository, run
    `scripts/release-publish.sh prepare RUN_ID VERSION`. It checks that the run
-   succeeded and that its source is on `develop` (merge an open pull request
-   first), downloads and verifies all three platform artifacts, and passes one
+   succeeded from approved W/ref/event and that source H is on `develop`, downloads
+   and verifies all three platform artifacts with their native name suffixes
+   and certificate-authenticated proof attempts. A retained native artifact from an earlier attempt can use its original
+   proof or a fresh proof from a later attempt in the same approved run. All selected
+   artifacts bind the same H/tree; the latest overall run must succeed. This permits
+   a Linux-only retry to preserve good Mac build bytes. The native name suffix
+   is a selection label; GitHub's certificate authenticates the proof attempt.
+   Each proof binds the selected artifact's immutable ID and ZIP digest.
+   Prepare passes one
    `--platform-input PLATFORM=DIR` per platform. Prepare also requires successful
    CI at that exact source commit, from a `develop` push or `develop` merge group,
    with every required job completed successfully. For a Mac-only preview, run
    `scripts/release-publish.sh prepare RUN_ID VERSION aarch64-darwin`. The Mac
    coordinator requires `aarch64-darwin` in every selection; only a single
    platform uses `--preview-platform`. Prepare checks out the exact source as
-   a worktree, takes Kubo from the Mac build, reads the publisher bootstrap and signer DID from the public origin, copies the seed's
+   a worktree, takes Kubo from the Mac build, checks the public bootstrap against
+   the independent delivery approval, copies the seed's
    current `publish-state.json` and runs `scripts/publish-release.sh
    --prepare-only` in an isolated data directory.
 3. **Sign.** `scripts/release-publish.sh policy VERSION SIGNER KEY OPENSSL`
-   writes the exact signer policy (with the current `develop` head) and prints
-   the `release-signer.py` command. The operator runs it and types the DID.
-   The signer refuses a commit that is not on `develop`.
+   writes the exact signer policy (with the current `develop` head and the
+   independent approval file's path and SHA-256) and prints the `release-signer.py`
+   command. The installed signer verifies W/tree/ref and that W's
+   `release-package.yml` equals `develop`'s, the GitHub-hosted certificate
+   identity, event, run and exact proof attempt, then binds each receipt to its
+   selected native artifact ID, digest and name suffix and the frozen
+   native bytes. Every published file is attested bytes, except
+   `components-PLATFORM.json`, which must equal the manifest the signer
+   re-derives from the approved source `components.json` and each platform's
+   attested `components.json`. It shows source, builder, publisher tuple and approval digest
+   before the operator types the DID. The source admission gate still applies.
+   A network, outage or rate-limit failure refuses with a retry message,
+   distinct from a provenance refusal; the printed command passes the operator's
+   `gh auth token` to avoid anonymous rate limits.
 4. **Import.** `scripts/release-publish.sh seed VERSION SIGNED_DIR` prints the
    seed sequence for the seed's installed Runtime: copy the signed installer
    and manifests, rebuild the rest from the selected CI artifacts, verify every
@@ -214,9 +298,10 @@ every published release pinned, so Undo and older Homes keep working. It does
 not push or notify anything. How Homes check and install is in
 [INSTALL.md](INSTALL.md#how-updates-reach-your-home).
 
-Upgrading the seed Runtime itself is rare. Run the workflow with
+Upgrading the seed Runtime itself is rare. Use the same independent approval and run the workflow with
 `seed_package` set, then `scripts/release-publish.sh seed-upgrade RUN_ID` prints
-the steps: create `/opt/elastos` for the service user, check and install the
+the steps only after the operator Mac verifies the approved producer, attested seed
+payloads and successful exact-source CI. Those steps create `/opt/elastos` for the service user, check and install the
 exact source at `/opt/elastos/release-source` (the seed Runtime runs its
 release helpers from the path it was built in), install the Runtime and IPFS
 provider, update the provider's pin in the installed `components.json`, verify
@@ -224,14 +309,59 @@ the provider and start the service. The seed needs glibc 2.39 or newer.
 
 Both seed sequences check sudo and every path they write before stopping the
 service, and once it is stopped an `EXIT` trap starts it again if any later
-step fails, so the seed is never left down. `seed-upgrade` checks the run the
-same way `prepare` does.
+step fails, so the seed is never left down. `seed-upgrade` checks the producer and
+exact-source CI through the same acceptance boundary as `prepare`. The printed
+commands retain the approved payload hashes and source tree before installation.
+
+Historical artifacts that lack fresh-job receipt attestations need a new run from
+an approved builder containing this workflow and its complete helper closure.
+Activate the workflow on the approved canonical ref and record its exact W/tree
+before dispatch. Exercise receipt verification with an isolated disposable-key
+fixture before production signing; local parser fixtures alone do not prove the
+GitHub OIDC certificate and CLI integration. Install the updated signer and verifier before using
+the new preparation flow; retain independent tool pins and the operator approval
+under their existing access controls. Changing the workflow ref, source, ticket or
+tools is an explicit new approval, rather than preparation-time discovery.
 
 Seed details come from `RELEASE_SEED`, `RELEASE_SEED_DATA`,
 `RELEASE_SEED_UNIT`, `RELEASE_SEED_STAGE`, `RELEASE_SEED_RUNTIME` and
 `RELEASE_SEED_USER`, not from this repository. Publish N first; after N is
 accepted on a real install, prepare N+1 from the same run before its artifacts
 expire (14 days).
+
+## Withdraw a bad release
+
+A published release cannot be taken back: Homes refuse a lower version unless
+the user runs Undo. Withdrawing a bad release therefore means publishing a
+newer good one.
+
+1. **Announce.** Post one comment on the release issue (#93) naming the bad
+   version, its head CID, what goes wrong, and the last good version with its
+   head CID. Tell affected users to stay on or return to the last good version
+   until the replacement arrives.
+2. **Publish N+2 from the last good source.** If version N is bad, its paired
+   N+1 was built in the same run from the same source, so it is bad too. Run the
+   [publishing steps](#publishing-a-release) with N+2 as the install version and
+   the last good source commit, or a `develop` commit that reverts the bad change,
+   as the source. Its changelog says it replaces N and why. In step 5, pin N+2.
+3. **Effect.** The seed's head now names N+2. Homes on N update to it normally,
+   because N+2 is newer. Homes that never installed N go straight to N+2, and new
+   installs get N+2: nothing offers N any more.
+4. **Undo for affected users.** A Home whose update to N failed to start has
+   already restored its previous release. A Home that runs N but works badly can
+   return to the last good release before N+2 is out with
+   `elastos update --rollback-to <last good head CID>` (see
+   [Undo an update](INSTALL.md#undo-an-update)). It then updates to N+2 normally.
+   Add a comment on #93 when N+2 is published.
+
+The seed keeps N pinned, like every published release; nothing is unpinned.
+Only the head moves, so no Home is offered N again. N stays fetchable by its
+CID, so an explicit `--head-cid` or `--rollback-to` that names it still works.
+
+Decision (October 2026): for 0.8.0 the signed head carries no list of withdrawn
+versions. Moving the head already stops every offer of N; a refusal list would
+change the head schema and depends on who may sign it. Revisit with the head
+freshness design (#157) and the publisher-keys statement (#213).
 
 ## Tagging Recommendation
 
@@ -240,6 +370,7 @@ Use annotated repo tags for runtime releases:
 ```text
 vX.Y.Z
 vX.Y.Z-rc.N
+vX.Y.Z-alpha.N
 ```
 
 This repo is a coordinated release train, so package-style per-component tags are less useful than one signed repo-level release tag per publish.

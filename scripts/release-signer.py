@@ -3,12 +3,24 @@
 Launch it from the signing account with an empty environment (env -i), so the
 OS loader and Python start without candidate-controlled library/site settings.
 
-Only api.github.com supplies source authority. The operator-owned policy (outside
-the input root) pins repository/commit/tree/version/channel and either a
-canary develop_oid or a remote version tag/tag_oid for main admission,
+Only api.github.com supplies source authority, authenticated with GH_TOKEN when
+the launch passes one (env -i GH_TOKEN=...), else anonymously. Network, outage
+and rate-limit failures refuse with a distinct retry message. The operator-owned
+policy (outside the input root) pins repository/commit/tree/version/channel and
+either a canary develop_oid or a remote version tag/tag_oid for main admission,
 publisher_did, manifest_sha256 and tool/python/openssl {path, sha256}, plus a
 custodian-owned key_path and max_file_bytes/max_snapshot_bytes quotas. The key
 is an Ed25519 PEM readable by OpenSSL only.
+
+Release policies also pin a pre-existing independent approval by path/SHA-256.
+It approves source H, complete workflow commit/tree W on refs/heads/develop, the
+publisher delivery tuple, and an installed gh verifier by path/SHA-256. W and H
+may differ. The signer verifies immutable certificate/run identities and attested
+receipt digests before freezing the native payloads. W's release-package.yml must
+equal develop's. Generated components-<platform>.json files must equal the
+manifest re-derived from the approved source template and each platform's
+attested components.json; every other file must be attested bytes. Old packages
+need a new build.
 
 Approved manifest: source {commit, tree}, version, channel, files mapping relative
 paths to {sha256, size, cid}; installer {blob_oid, stamps}; release payload;
@@ -34,6 +46,7 @@ real signing and installer integration require separate operator acceptance.
 
 import argparse
 import base64
+import copy
 from dataclasses import dataclass
 import hashlib
 import http.client
@@ -59,6 +72,10 @@ MAX_JSON = 2 * 1024 * 1024
 MAX_FILE = 512 * 1024 * 1024
 CHANNELS = {"stable", "canary", "jetson-test"}
 STAMPS = {"MAINTAINER_DID", "SOURCE_CONNECT_TICKET", "PUBLISHER_GATEWAY", "PUBLISHER_NODE_ID", "IPNS_NAME"}
+PACKAGE_WORKFLOW = ".github/workflows/release-package.yml"
+PACKAGE_REF = "refs/heads/develop"
+APPROVAL_SCHEMA = "elastos.release.approval/v1"
+PROVENANCE_SCHEMA = "elastos.release.provenance/v1"
 MODEL_CATALOG_DOMAIN = "elastos.model.catalog.v1"
 MODEL_CATALOG_SCHEMA = "elastos.model.catalog/v1"
 MAX_MODEL_CATALOG = 128 * 1024
@@ -275,17 +292,43 @@ def regular_bytes(path, limit, trusted=False, root_fd=None):
         os.close(fd)
 
 
+UNAVAILABLE = "GitHub or Sigstore is unavailable (network, outage or rate limit); retry later. This is not a provenance refusal"
+# gh reports transport failures in these families (Go net/http, TLS, DNS) and
+# GitHub outages or limits as HTTP 429/5xx or "rate limit".
+UNAVAILABLE_OUTPUT = re.compile(rb"error connecting to|dial tcp|no such host|lookup [^ ]+ on|i/o timeout|timed? ?out|deadline exceeded"
+                                rb"|Client\.Timeout|connection (?:refused|reset)|broken pipe|unexpected EOF|TLS handshake"
+                                rb"|network is (?:unreachable|down)|temporary failure|rate limit|HTTP (?:429|5[0-9][0-9])", re.I)
+# A GitHub answer that refuses the request itself (HTTP 4xx other than 429).
+HTTP_REFUSAL = re.compile(rb"HTTP 4(?!29)[0-9][0-9]")
+
+
+def unavailable(detail):
+    return ValueError(f"{UNAVAILABLE}: {detail}")
+
+
 def github_json(path):
     # Direct HTTPS ignores environment proxies. http.client never follows redirects.
     require(not any(name in os.environ for name in ("SSL_CERT_FILE", "SSL_CERT_DIR")), "TLS environment override refused")
     require(path.startswith(f"/repos/{REPOSITORY}/git/")
-            or path.startswith(f"/repos/{REPOSITORY}/compare/"), "GitHub path refused")
+            or path.startswith(f"/repos/{REPOSITORY}/compare/")
+            or re.fullmatch(rf"/repos/{REPOSITORY}/actions/runs/[1-9][0-9]*(?:/artifacts\?per_page=100&page=[1-9][0-9]*)?", path),
+            "GitHub path refused")
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "elastos-release-signer"}
+    if os.environ.get("GH_TOKEN"):
+        headers["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
     connection = http.client.HTTPSConnection("api.github.com", timeout=20,
                                              context=ssl.create_default_context())
     try:
-        connection.request("GET", path, headers={"Accept": "application/vnd.github+json",
-                           "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "elastos-release-signer"})
-        response = connection.getresponse()
+        try:
+            connection.request("GET", path, headers=headers)
+            response = connection.getresponse()
+        except (OSError, http.client.HTTPException) as error:
+            if isinstance(error, ssl.SSLCertVerificationError):
+                raise
+            raise unavailable(f"{type(error).__name__}: {error}") from error
+        limited = response.status == 403 and (response.getheader("X-RateLimit-Remaining") == "0" or response.getheader("Retry-After"))
+        if limited or response.status == 429 or response.status >= 500:
+            raise unavailable(f"HTTP {response.status}")
         require(response.status == 200, "GitHub source verification failed")
         require(response.getheader("Content-Type", "").split(";")[0] == "application/json", "GitHub JSON required")
         return parse_json(response.read(MAX_JSON + 1))
@@ -350,27 +393,332 @@ def verify_source(policy, fetch):
         require(type(compare.get(field)) is dict and compare[field].get("sha") == expected, "comparison commit differs")
 
 
-def installer_template(policy, blob_oid, fetch):
-    prefix = f"/repos/{REPOSITORY}/git"
-    tree_oid = policy["tree"]
-    for name, kind in (("scripts", "tree"), ("install.sh", "blob")):
-        response = fetch(f"{prefix}/trees/{tree_oid}")
+def tree_blob(tree_oid, path, fetch):
+    names = path.split("/")
+    for index, name in enumerate(names):
+        kind = "blob" if index == len(names) - 1 else "tree"
+        response = fetch(f"/repos/{REPOSITORY}/git/trees/{tree_oid}")
         require(response.get("sha") == tree_oid and response.get("truncated") is False
                 and type(response.get("tree")) is list and len(response["tree"]) <= 10000, "complete typed tree required")
         entries = [entry for entry in response["tree"] if type(entry) is dict and entry.get("path") == name]
-        require(len(entries) == 1 and entries[0].get("type") == kind,
-                "installer tree entry refused")
-        require(entries[0].get("mode") in (("040000",) if kind == "tree" else ("100644", "100755")), "installer object mode refused")
+        require(len(entries) == 1 and entries[0].get("type") == kind, path + " tree entry refused")
+        require(entries[0].get("mode") in (("040000",) if kind == "tree" else ("100644", "100755")), path + " object mode refused")
         tree_oid = oid(entries[0].get("sha"))
-    require(tree_oid == oid(blob_oid), "installer blob differs from approved input")
-    blob = fetch(f"{prefix}/blobs/{tree_oid}")
-    require(blob.get("sha") == tree_oid and blob.get("encoding") == "base64"
+    return tree_oid
+
+
+def git_blob(blob_oid, fetch):
+    blob = fetch(f"/repos/{REPOSITORY}/git/blobs/{blob_oid}")
+    require(blob.get("sha") == blob_oid and blob.get("encoding") == "base64"
             and type(blob.get("size")) is int and 0 < blob["size"] <= MAX_JSON
-            and type(blob.get("content")) is str, "typed installer blob required")
+            and type(blob.get("content")) is str, "typed Git blob required")
     data = base64.b64decode(blob["content"].replace("\n", ""), validate=True)
-    require(len(data) == blob["size"] and hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest() == tree_oid,
-            "installer Git blob hash differs")
+    require(len(data) == blob["size"] and hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest() == blob_oid,
+            "Git blob hash differs")
     return data
+
+
+def installer_template(policy, blob_oid, fetch):
+    tree_oid = tree_blob(policy["tree"], "scripts/install.sh", fetch)
+    require(tree_oid == oid(blob_oid), "installer blob differs from approved input")
+    return git_blob(tree_oid, fetch)
+
+
+# Release platform -> components.json platform keys, searched before "*".
+COMPONENT_KEYS = {"x86_64-linux": ("linux-amd64", "x86_64-linux"),
+                  "aarch64-linux": ("linux-arm64", "aarch64-linux"),
+                  "aarch64-darwin": ("darwin-arm64", "macos-arm64")}
+
+
+def merge_components(template, manifests):
+    """The release components manifest: the source template plus each
+    platform's attested descriptors, limited to the admitted platforms."""
+    require(type(template) is dict and type(template.get("external")) is dict
+            and all(type(component) is dict for component in template["external"].values()), "components template refused")
+    merged = copy.deepcopy(template)
+    merged["schema"], merged["capsules"] = "elastos.components/v1", {}
+    selected, pins = {}, []
+    for platform, manifest in sorted(manifests.items()):
+        require(platform in COMPONENT_KEYS and type(manifest) is dict and type(manifest.get("external")) is dict,
+                "platform components refused")
+        pins.append(manifest.get("model_catalog"))
+        for name, component in manifest["external"].items():
+            require(type(component) is dict and name in merged["external"], "platform component outside template: " + str(name))
+            for metadata in (False, True):
+                entry = component.get("capsule_metadata") if metadata else component
+                if entry is None:
+                    continue
+                require(type(entry) is dict and type(entry.get("platforms", {})) is dict, "platform component refused: " + name)
+                key, info = next(((key, entry["platforms"][key]) for key in (*COMPONENT_KEYS[platform], "*")
+                                  if type(entry.get("platforms", {}).get(key)) is dict), (None, None))
+                if info is None:
+                    continue
+                require(selected.setdefault((name, metadata, key), info) == info, f"conflicting universal descriptor: {name} ({key})")
+                target = merged["external"][name]
+                if metadata:
+                    contract = {k: v for k, v in entry.items() if k != "platforms"}
+                    target = target.setdefault("capsule_metadata", {**contract, "platforms": {}})
+                    require({k: v for k, v in target.items() if k != "platforms"} == contract,
+                            "conflicting provider metadata contract: " + name)
+                target.setdefault("platforms", {})[key] = copy.deepcopy(info)
+    require(pins and all(pin == pins[0] for pin in pins), "platform model catalogue pins differ")
+    if pins[0] is None:
+        merged.pop("model_catalog", None)
+    else:
+        merged["model_catalog"] = copy.deepcopy(pins[0])
+    # A publication advertises only the platforms it admitted.
+    unselected = {keys[0] for platform, keys in COMPONENT_KEYS.items() if platform not in manifests}
+    for component in merged["external"].values():
+        for entry in (component, component.get("capsule_metadata")):
+            if isinstance(entry, dict):
+                for setup in unselected:
+                    entry.get("platforms", {}).pop(setup, None)
+    return merged
+
+
+def bind_component_cids(manifest, cids):
+    manifest = copy.deepcopy(manifest)
+    for component in manifest["external"].values():
+        for entry in (component, component.get("capsule_metadata", {})):
+            for info in entry.get("platforms", {}).values():
+                if info.get("release_path"):
+                    require(info["release_path"] in cids, "component release file is not admitted: " + str(info["release_path"]))
+                    info["cid"] = cids[info["release_path"]]
+    return manifest
+
+
+def approved_release(path, input_root=None, expected_hash=None):
+    path = Path(path)
+    require(path.is_absolute() and path == path.resolve(), "approval requires a canonical absolute path")
+    require(input_root is None or not path.is_relative_to(input_root), "approval must be outside candidate inputs")
+    data = regular_bytes(path, MAX_JSON, trusted=True)
+    require(expected_hash is None or sha256(data) == checked_hash(expected_hash), "independent approval changed")
+    approval = parse_json(data)
+    require(type(approval) is dict and set(approval) == {"schema", "repository", "source", "workflow", "delivery", "gh"}
+            and approval["schema"] == APPROVAL_SCHEMA and approval["repository"] == REPOSITORY,
+            "independent release approval required")
+    require(type(approval["source"]) is dict and set(approval["source"]) == {"commit", "tree"}, "approved source required")
+    require(type(approval["workflow"]) is dict and set(approval["workflow"]) == {"commit", "tree", "ref"}, "approved producer required")
+    for identity in (approval["source"], approval["workflow"]):
+        oid(identity["commit"])
+        oid(identity["tree"])
+    require(approval["workflow"]["ref"] == PACKAGE_REF, "approved develop producer ref required")
+    validate_delivery(approval["delivery"])
+    pin = approval["gh"]
+    require(type(pin) is dict and set(pin) == {"path", "sha256"}, "trusted attestation verifier required")
+    executable = Path(pin["path"])
+    require(executable.is_absolute() and executable == executable.resolve()
+            and (input_root is None or not executable.is_relative_to(input_root)), "trusted verifier must be outside inputs")
+    require(sha256(regular_bytes(executable, MAX_FILE, trusted=True)) == checked_hash(pin["sha256"]), "attestation verifier pin differs")
+    return approval, sha256(data)
+
+
+def validate_delivery(stamps):
+    require(type(stamps) is dict and set(stamps) == STAMPS, "exact approved delivery tuple required")
+    check_did(stamps["MAINTAINER_DID"])
+    require(re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?", stamps["PUBLISHER_GATEWAY"] or ""), "approved HTTPS gateway required")
+    node = stamps["PUBLISHER_NODE_ID"]
+    require(type(node) is str and re.fullmatch(r"[0-9a-f]{64}", node), "approved Carrier node required")
+    ticket = stamps["SOURCE_CONNECT_TICKET"]
+    require(type(ticket) is str and re.fullmatch(r"[a-z2-7]{1,16384}", ticket), "approved Carrier ticket required")
+    try:
+        ticket_data = parse_json(base64.b32decode(ticket.upper() + "=" * (-len(ticket) % 8)))
+    except (ValueError, base64.binascii.Error) as error:
+        raise ValueError("approved Carrier ticket is invalid") from error
+    endpoints = ticket_data.get("endpoints") if type(ticket_data) is dict else None
+    require(type(endpoints) is list and endpoints and len(endpoints) <= 64
+            and all(type(endpoint) is dict and endpoint.get("id") == node for endpoint in endpoints),
+            "every approved ticket endpoint must match the publisher node")
+    require(type(stamps["IPNS_NAME"]) is str and re.fullmatch(r"[A-Za-z0-9._-]{0,240}", stamps["IPNS_NAME"]), "approved IPNS value required")
+
+
+def checked_package_run(approval, run_id, fetch):
+    require(type(run_id) is int and run_id > 0, "package run id required")
+    workflow = approval["workflow"]
+    prefix = f"/repos/{REPOSITORY}"
+    run = fetch(f"{prefix}/actions/runs/{run_id}")
+    require(type(run) is dict and run.get("id") == run_id
+            and run.get("path") == PACKAGE_WORKFLOW and run.get("event") == "workflow_dispatch"
+            and run.get("status") == "completed" and run.get("conclusion") == "success"
+            and run.get("head_sha") == workflow["commit"] and "refs/heads/" + str(run.get("head_branch")) == workflow["ref"]
+            and type(run.get("repository")) is dict and run["repository"].get("full_name") == REPOSITORY
+            and type(run["repository"].get("id")) is int and run["repository"]["id"] > 0
+            and type(run.get("head_repository")) is dict and run["head_repository"].get("full_name") == REPOSITORY
+            and run["head_repository"].get("id") == run["repository"]["id"],
+            "package run differs from independently approved producer")
+    require(type(run.get("run_attempt")) is int and run["run_attempt"] > 0, "package run attempt required")
+    for identity in (approval["workflow"], approval["source"]):
+        commit = fetch(f"{prefix}/git/commits/{identity['commit']}")
+        require(commit.get("sha") == identity["commit"] and commit.get("tree", {}).get("sha") == identity["tree"],
+                "approved producer/source tree differs")
+    develop = ref_object(fetch(f"{prefix}/git/ref/heads/develop"), "heads/develop")
+    require(develop["type"] == "commit", "develop commit required")
+    develop_commit = fetch(f"{prefix}/git/commits/{develop['sha']}")
+    require(develop_commit.get("sha") == develop["sha"] and type(develop_commit.get("tree")) is dict, "typed develop commit required")
+    require(tree_blob(workflow["tree"], PACKAGE_WORKFLOW, fetch) == tree_blob(oid(develop_commit["tree"].get("sha")), PACKAGE_WORKFLOW, fetch),
+            "package workflow differs from develop")
+    return run
+
+
+def package_artifact(approval, run, prefix, fetch):
+    require(re.fullmatch(r"release-(?:proof-)?(?:mac|x86_64-linux|aarch64-linux|seed)", prefix), "package artifact prefix refused")
+    pattern = re.compile(rf"{prefix}-{approval['source']['commit']}-([1-9][0-9]*)\Z")
+    matches = []
+    for page in range(1, 11):
+        response = fetch(f"/repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts?per_page=100&page={page}")
+        artifacts = response.get("artifacts")
+        require(type(artifacts) is list and len(artifacts) <= 100, "package artifact list refused")
+        for artifact in artifacts:
+            match = pattern.fullmatch(str(artifact.get("name")))
+            if match and int(match[1]) <= run["run_attempt"] and artifact.get("expired") is False:
+                matches.append({**artifact, "attempt": int(match[1])})
+        if len(artifacts) < 100:
+            break
+    else:
+        raise ValueError("package artifact inventory exceeds its bound")
+    require(matches, "live artifact for an accepted package attempt required")
+    latest = max(artifact["attempt"] for artifact in matches)
+    matches = [artifact for artifact in matches if artifact["attempt"] == latest]
+    require(len(matches) == 1, "one artifact for the exact package attempt required")
+    artifact = matches[0]
+    require(type(artifact.get("id")) is int and artifact["id"] > 0
+            and type(artifact.get("digest")) is str and artifact["digest"].startswith("sha256:"), "package artifact identity required")
+    checked_hash(artifact["digest"][7:])
+    origin = artifact.get("workflow_run", {})
+    require(origin.get("id") == run["id"] and origin.get("head_sha") == approval["workflow"]["commit"]
+            and origin.get("head_branch") == run["head_branch"], "artifact producer differs")
+    return {field: artifact[field] for field in ("id", "name", "digest", "attempt")}
+
+
+def attestation_result(approval, run, receipt_path, bundle_path, scratch):
+    workflow = approval["workflow"]
+    identity = f"https://github.com/{REPOSITORY}/{PACKAGE_WORKFLOW}@{workflow['ref']}"
+    # gh makes cert-identity and signer-workflow mutually exclusive. The exact
+    # SAN owns the workflow path and ref; immutable signer claims are checked
+    # below as well. Only the pinned verifier runs; candidate bytes remain data.
+    try:
+        result = subprocess.run([approval["gh"]["path"], "attestation", "verify", str(receipt_path),
+                                 "--bundle", str(bundle_path), "--repo", REPOSITORY,
+                                 "--cert-identity", identity, "--cert-oidc-issuer", "https://token.actions.githubusercontent.com",
+                                 "--signer-digest", workflow["commit"], "--source-digest", workflow["commit"],
+                                 "--source-ref", workflow["ref"], "--deny-self-hosted-runners", "--format", "json"],
+                                env={"PATH": "/usr/bin:/bin", "HOME": str(scratch), "GH_CONFIG_DIR": str(scratch / "gh"),
+                                     "GH_HOST": "github.com", "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"},
+                                capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired as error:
+        raise unavailable("attestation verification timed out") from error
+    if result.returncode != 0 and UNAVAILABLE_OUTPUT.search(result.stderr):
+        raise unavailable("attestation verification could not reach its trust services")
+    require(result.returncode == 0 and len(result.stdout) <= 8 * MAX_JSON, "approved build attestation verification failed")
+    return json.loads(result.stdout, object_pairs_hook=pairs,
+                      parse_constant=lambda _: (_ for _ in ()).throw(ValueError("JSON constant refused")))
+
+
+def verify_attested_receipt(approval, run, receipt_data, bundle_data, scratch):
+    with tempfile.TemporaryDirectory(prefix="provenance-", dir=scratch) as directory:
+        directory = Path(directory)
+        receipt_path, bundle_path = directory / "receipt.json", directory / "bundle.jsonl"
+        receipt_path.write_bytes(receipt_data)
+        bundle_path.write_bytes(bundle_data)
+        verified = attestation_result(approval, run, receipt_path, bundle_path, directory)
+    require(type(verified) is list and verified, "verified build attestation required")
+    workflow = approval["workflow"]
+    uri = f"https://github.com/{REPOSITORY}/{PACKAGE_WORKFLOW}@{workflow['ref']}"
+    invocation = f"https://github.com/{REPOSITORY}/actions/runs/{run['id']}/attempts/{run['run_attempt']}"
+    expected = {"issuer": "https://token.actions.githubusercontent.com", "subjectAlternativeName": uri,
+                "buildSignerURI": uri, "buildSignerDigest": workflow["commit"], "runnerEnvironment": "github-hosted",
+                "sourceRepositoryURI": f"https://github.com/{REPOSITORY}", "sourceRepositoryDigest": workflow["commit"],
+                "sourceRepositoryIdentifier": str(run["repository"]["id"]),
+                "sourceRepositoryRef": workflow["ref"], "buildConfigURI": uri, "buildConfigDigest": workflow["commit"],
+                "buildTrigger": "workflow_dispatch", "runInvocationURI": invocation}
+    for entry in verified:
+        require(type(entry) is dict and type(entry.get("verificationResult")) is dict, "verified attestation result refused")
+        result = entry.get("verificationResult", {})
+        require(type(result.get("signature")) is dict and type(result["signature"].get("certificate")) is dict
+                and type(result.get("statement")) is dict, "verified certificate/statement required")
+        certificate = result.get("signature", {}).get("certificate", {})
+        statement = result.get("statement", {})
+        if (all(certificate.get(key) == value for key, value in expected.items())
+                and result.get("verifiedTimestamps") and statement.get("predicateType") == "https://slsa.dev/provenance/v1"
+                and type(statement.get("subject")) is list
+                and any(type(subject) is dict and type(subject.get("digest")) is dict
+                        and subject["digest"].get("sha256") == sha256(receipt_data) for subject in statement["subject"])):
+            return parse_json(receipt_data)
+    raise ValueError("attestation certificate does not bind the approved producer, run and attempt")
+
+
+def verify_release_provenance(policy, manifest, records, root_fd, fetch, scratch, input_root):
+    pin = policy.get("approval")
+    require(type(pin) is dict and set(pin) == {"path", "sha256"}, "independent approval pin required")
+    approval, digest = approved_release(pin["path"], input_root=input_root, expected_hash=pin["sha256"])
+    require(approval["source"] == {field: policy[field] for field in ("commit", "tree")}, "source differs from independent approval")
+    require(manifest["installer"]["stamps"] == approval["delivery"]
+            and policy["publisher_did"] == approval["delivery"]["MAINTAINER_DID"], "delivery differs from independent approval")
+    provenance = manifest.get("provenance")
+    require(type(provenance) is dict and set(provenance) == {"schema", "run_id", "run_attempt", "approval_sha256", "receipts"}
+            and provenance["schema"] == PROVENANCE_SCHEMA and provenance["approval_sha256"] == digest, "approved package provenance required")
+    run = checked_package_run(approval, provenance["run_id"], fetch)
+    require(type(provenance["run_attempt"]) is int and provenance["run_attempt"] == run["run_attempt"], "package attempt differs")
+    receipts = provenance["receipts"]
+    platforms = set(manifest["release"]["platforms"])
+    require(type(receipts) is list and len(receipts) == len(platforms), "each release platform needs producer proof")
+    covered, seen, platform_components, templates = {}, set(), {}, set()
+    for entry in receipts:
+        require(type(entry) is dict and set(entry) == {"platform", "receipt", "bundle", "components", "artifact", "proof_artifact"},
+                "platform provenance refused")
+        platform = entry["platform"]
+        require(platform in platforms and platform not in seen, "duplicate or foreign platform provenance")
+        seen.add(platform)
+        artifact = package_artifact(approval, run, "release-mac" if platform == "aarch64-darwin" else "release-" + platform, fetch)
+        require(entry["artifact"] == artifact, "platform artifact differs from GitHub")
+        proof = package_artifact(approval, run, "release-proof-mac" if platform == "aarch64-darwin" else "release-proof-" + platform, fetch)
+        require(entry["proof_artifact"] == proof and artifact["attempt"] <= proof["attempt"], "platform proof artifact differs")
+        receipt_data = regular_bytes(relative_path(entry["receipt"]), MAX_JSON, root_fd=root_fd)
+        bundle_data = regular_bytes(relative_path(entry["bundle"]), 8 * MAX_JSON, root_fd=root_fd)
+        receipt = verify_attested_receipt(approval, {**run, "run_attempt": proof["attempt"]}, receipt_data, bundle_data, scratch)
+        require(receipt.get("producer") == {"artifact": artifact, "run_id": run["id"], "workflow_commit": approval["workflow"]["commit"],
+                                            "attestation_attempt": proof["attempt"]}, "attested build artifact differs")
+        require(receipt.get("schema") == "elastos.release-platform-input/v1" and receipt.get("platform") == platform
+                and receipt.get("version") == policy["version"] and receipt.get("source", {}).get("clean") is True
+                and {field: receipt.get("source", {}).get(field) for field in ("commit", "tree")} == approval["source"],
+                "attested platform source/version differs")
+        require(type(receipt.get("files")) is dict, "attested artifact inventory required")
+        for name, record in receipt["files"].items():
+            if name.startswith("artifacts/"):
+                name = relative_path(name[len("artifacts/"):])
+                value = (checked_hash(record.get("sha256")), record.get("size"))
+                require(type(value[1]) is int and value[1] > 0 and (name not in covered or covered[name] == value), "attested artifact record differs")
+                covered[name] = value
+        require(f"elastos-{platform}" in covered, "attested native Runtime required")
+        components_data = regular_bytes(relative_path(entry["components"]), MAX_JSON, root_fd=root_fd)
+        require(attested_file(receipt, "components.json") == (sha256(components_data), len(components_data)),
+                "platform components differ from attested receipt")
+        platform_components[platform] = parse_json(components_data)
+        templates.add(attested_file(receipt, "components-template.json"))
+    # Generated components are re-derived from the approved source template and
+    # the attested platform manifests; every other file is attested bytes.
+    template = git_blob(tree_blob(approval["source"]["tree"], "components.json", fetch), fetch)
+    require(templates == {(sha256(template), len(template))}, "attested components template differs from approved source")
+    derived = json_bytes(bind_component_cids(merge_components(parse_json(template), platform_components),
+                                             {name: record["cid"] for name, record in records.items()}))
+    generated = {f"components-{platform}.json" for platform in platforms}
+    for name in generated:
+        require(name in records, "release components required: " + name)
+        data = regular_bytes(relative_path(name), MAX_JSON, root_fd=root_fd)
+        require(sha256(data) == records[name]["sha256"] and json_bytes(parse_json(data)) == derived,
+                "release components differ from attested inputs: " + name)
+    for name, record in records.items():
+        require(name in generated or covered.get(name) == (record["sha256"], record["size"]), "publication bytes lack approved producer proof: " + name)
+    for platform, descriptor in manifest["release"]["platforms"].items():
+        name = f"elastos-{platform}"
+        require(name in records and descriptor["binary"]["sha256"] == records[name]["sha256"], "release Runtime differs from attested platform")
+    return approval
+
+
+def attested_file(receipt, name):
+    record = receipt["files"].get(name)
+    require(type(record) is dict and type(record.get("size")) is int, "attested receipt lacks " + name)
+    return checked_hash(record.get("sha256")), record["size"]
 
 
 def render_installer(template, stamps, did):
@@ -461,7 +809,7 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
     manifest_data = regular_bytes(relative_path(manifest_name), MAX_JSON, root_fd=held_root)
     require(sha256(manifest_data) == checked_hash(policy.get("manifest_sha256")), "manifest differs from operator approval")
     manifest = parse_json(manifest_data)
-    require(set(manifest) == {"source", "version", "channel", "files", "installer", "release", "head"}, "signing input fields refused")
+    require(set(manifest) == {"source", "version", "channel", "files", "installer", "release", "head", "provenance"}, "signing input fields refused")
     source = {field: policy[field] for field in ("commit", "tree")}
     require(manifest["source"] == source and manifest["version"] == policy["version"] and manifest["channel"] == policy["channel"], "input source/version/channel differs")
     records = manifest["files"]
@@ -482,6 +830,7 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
     usage = shutil.disk_usage(snapshot_root)
     require(usage.free >= total + 3 * MAX_JSON,
             "snapshot needs more free space than the volume has")
+    verify_release_provenance(policy, manifest, records, held_root, fetch, snapshot_root, root)
     for name, record in sorted(records.items()):
         destination = snapshot_root / name
         snapshot_artifact(Path(name), destination, record, root_fd=held_root)
@@ -850,9 +1199,16 @@ def main():
             print(f"Signed model catalogue. Pin model_catalog.head_cid: {raw_cid(catalog)}")
             return
         prepared = prepare(policy, args.input_root, args.manifest, github_json, Path(scratch))
+        approval, digest = approved_release(policy["approval"]["path"], args.input_root, policy["approval"]["sha256"])
+        delivery = approval["delivery"]
+        print(f"Approved source: {approval['source']['commit']} tree {approval['source']['tree']}\n"
+              f"Approved builder: {approval['workflow']['commit']} {approval['workflow']['ref']} tree {approval['workflow']['tree']}\n"
+              f"Approved delivery: {delivery['PUBLISHER_GATEWAY']} node {delivery['PUBLISHER_NODE_ID']} IPNS {delivery['IPNS_NAME']}\n"
+              f"Independent approval SHA-256: {digest}", file=sys.stderr)
         require(confirmed(prepared.publisher_did, "approved release", sys.stdin, sys.stderr), "signing cancelled")
         # Recheck canonical source authority after confirmation, before backend use.
         verify_source(policy, github_json)
+        approved_release(policy["approval"]["path"], args.input_root, policy["approval"]["sha256"])
         backend = OpenSSLBackend(policy, args.input_root, Path(scratch))
         try:
             publication = sign_publication(prepared, backend)

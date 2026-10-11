@@ -341,6 +341,10 @@ pub(super) async fn system_update_apply(
 pub(super) fn system_update_failure(error: &anyhow::Error) -> Response {
     let (status, message) = if error.is::<crate::update::UpdateSourceUnavailable>() {
         (StatusCode::FAILED_DEPENDENCY, "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again.")
+    } else if error.is::<crate::update_controller::UpdateInProgress>() {
+        (StatusCode::LOCKED, "Another update was started on this Home. Wait for it to finish, then check the update again.")
+    } else if error.is::<crate::update_controller::ApprovalReplaced>() {
+        (StatusCode::GONE, "This approval is no longer valid. Check for the update again and approve it once more.")
     } else if error.is::<crate::update::InvalidInstalledVersion>() {
         return (
             StatusCode::CONFLICT,

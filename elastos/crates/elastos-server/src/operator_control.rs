@@ -10,7 +10,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, Watcher};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::sync::Mutex;
 
 use crate::carrier::decode_ticket_endpoints;
@@ -45,6 +45,14 @@ const OPERATOR_REQUEST_LOG_FILE: &str = "operator-control-requests.jsonl";
 const OPERATOR_CONNECT_TIMEOUT_SECS: u64 = 10;
 const OPERATOR_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_UPDATE_METADATA_BYTES: usize = 256 * 1024;
+/// A signed operator request is an action, a request id and small arguments.
+/// It is read before the signature is checked, so it stays small and quick.
+const OPERATOR_REQUEST_MAX_BYTES: u64 = 64 * 1024;
+const OPERATOR_REQUEST_WAIT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
+/// The largest answer carries update metadata, escaped and signed.
+const OPERATOR_RESPONSE_MAX_BYTES: u64 = 4 * MAX_UPDATE_METADATA_BYTES as u64;
+/// `update.apply` answers after the install finishes.
+const OPERATOR_RESPONSE_WAIT: Duration = Duration::from_secs(60 * 60);
 const OPERATOR_TS_SKEW_SECS: u64 = 5 * 60;
 const REQUEST_STATE_RESERVED: &str = "reserved";
 const REQUEST_STATE_COMPLETED: &str = "completed";
@@ -119,8 +127,6 @@ pub struct OperatorUpdateCheck {
     pub latest_version: String,
     pub update_available: bool,
     pub discovery: String,
-    #[serde(default)]
-    pub working_gateway: Option<String>,
     #[serde(default)]
     pub head_cid: Option<String>,
     #[serde(default)]
@@ -685,7 +691,6 @@ fn verified_update_check(
         latest_version: latest_version.to_owned(),
         update_available,
         discovery: "Carrier".to_string(),
-        working_gateway: None,
         head_cid: discovered.head_cid.clone(),
         release_cid: Some(release_cid.to_owned()),
         publisher_did: publisher_did.clone(),
@@ -721,14 +726,14 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
         .await
         .with_context(|| {
             format!(
-                "Carrier connection to trusted source '{}' failed. Remote operator apply stays Carrier-only; use a local explicit transport override if you intentionally need web transport.",
+                "Carrier connection to trusted source '{}' failed. Remote operator apply stays Carrier-only.",
                 source.name
             )
         })?,
     );
 
     let carrier_for_fetch = session.client.clone();
-    let fetch_fn: crate::update::FetchFn = Box::new(move |cid, _gateways| {
+    let fetch_fn: crate::update::FetchFn = Box::new(move |cid| {
         let client = carrier_for_fetch.clone();
         Box::pin(async move { client.fetch_content(&cid, None).await })
     });
@@ -745,8 +750,6 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
         Some(&try_p2p),
         false,
         None,
-        false,
-        Vec::new(),
         env!("ELASTOS_VERSION"),
         true,
         false,
@@ -1255,9 +1258,12 @@ async fn handle_operator_stream(
     recv: iroh::endpoint::RecvStream,
     ctx: &OperatorRuntimeContext,
 ) -> Result<()> {
-    let mut reader = BufReader::new(recv);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let line = crate::carrier::read_peer_line(
+        &mut BufReader::new(recv),
+        OPERATOR_REQUEST_MAX_BYTES,
+        OPERATOR_REQUEST_WAIT,
+    )
+    .await?;
 
     let request_meta = extract_request_meta(line.as_bytes());
     let request_id = request_meta
@@ -1547,9 +1553,7 @@ async fn deny_local_room_request(
 
 pub async fn start_local_room_gateway(data_dir: &Path, addr: &str) -> Result<OperatorRoomOpen> {
     if !room_capsule_installed(data_dir) {
-        anyhow::bail!(
-            "Room browser capsule is not installed. Run `elastos setup --profile demo` first."
-        );
+        anyhow::bail!("Room browser capsule is not installed. Run `elastos setup` first.");
     }
 
     let coords = read_runtime_coords(data_dir).await.ok_or_else(|| {
@@ -1840,9 +1844,12 @@ impl OperatorClient {
         send.write_all(&bytes).await?;
         send.finish()?;
 
-        let mut reader = BufReader::new(recv);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = crate::carrier::read_peer_line(
+            &mut BufReader::new(recv),
+            OPERATOR_RESPONSE_MAX_BYTES,
+            OPERATOR_RESPONSE_WAIT,
+        )
+        .await?;
         if line.trim().is_empty() {
             anyhow::bail!("operator peer returned an empty response");
         }
@@ -2396,6 +2403,55 @@ mod tests {
         let data = std::fs::read_to_string(log_path).unwrap();
         assert!(data.contains(REQUEST_STATE_RESERVED));
         assert!(data.contains(REQUEST_STATE_COMPLETED));
+    }
+
+    #[tokio::test]
+    async fn operator_stream_drops_oversized_and_stalled_requests_before_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [13u8; 32];
+        write_test_device_key(dir.path(), &key);
+        let (sk, did) = elastos_identity::derive_did(&key);
+        let node = start_carrier_node(&sk, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let ticket = local_endpoint_ticket(&node.endpoint).unwrap();
+        let addr = decode_ticket_endpoints(&ticket).remove(0);
+        let client = OperatorClient::connect_endpoint_addr(addr, 10)
+            .await
+            .unwrap();
+
+        // An endless line is cut at the cap: the handler answers nothing and
+        // the stream closes long before the client stops writing.
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        let writer = tokio::spawn(async move {
+            let chunk = vec![b'a'; 16 * 1024];
+            for _ in 0..1024 {
+                if send.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            panic!("handler kept reading an oversized operator request");
+        });
+        let answer = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(1024))
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(answer.is_empty());
+        let _ = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .unwrap();
+
+        // A stalled request is dropped after the request wait.
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        send.write_all(b"{\"payload\":").await.unwrap();
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(1024))
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        assert!(answer.is_empty());
+        assert!(started.elapsed() >= OPERATOR_REQUEST_WAIT - Duration::from_millis(100));
+        drop(send);
     }
 
     #[tokio::test]

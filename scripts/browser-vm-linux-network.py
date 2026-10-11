@@ -21,6 +21,7 @@ HELPER = Path('/usr/local/lib/elastos/browser-vm-linux-network.py')
 SYSFS = Path('/sys/class/net')
 IPV6 = Path('/proc/sys/net/ipv6/conf')
 SLOTS = 4
+RELAY_PORTS = '49152:49215'
 FIREWALL_SERVICES = 'nftables.service firewalld.service ufw.service netfilter-persistent.service'
 
 
@@ -48,7 +49,7 @@ def input_rules(n):
     peer = ['-s', n['guestIp'], '-d', n['hostIp']]
     rules = [peer + ['-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT'],
              peer + ['-p', 'tcp', '--dport', '19091', '-j', 'ACCEPT']]
-    for port in [str(n['turnPort']), '49152:49215']:
+    for port in [str(n['turnPort']), RELAY_PORTS]:
         for protocol in ['tcp', 'udp']:
             rules.append(peer + ['-p', protocol, '--dport', port, '-j', 'ACCEPT'])
     return rules + [['-j', 'DROP']]
@@ -58,33 +59,55 @@ def chain(n):
     return 'EBV_' + n['tapName']
 
 
+def relay_chain(n):
+    return 'EBVR_' + n['tapName']
+
+
+def relay_rules(n):
+    # Session TURN relays from these ports; the only media peers are the relay
+    # ports themselves. The TURN listener stays reachable for a local client
+    # whose ephemeral port falls in this range. Everything else, including host
+    # services on the slot address, is dropped.
+    to_host = ['-d', n['hostIp'], '-p', 'udp', '--dport']
+    return [to_host + [RELAY_PORTS, '-j', 'RETURN'], to_host + [str(n['turnPort']), '-j', 'RETURN'], ['-j', 'DROP']]
+
+
+def relay_hook(n):
+    # Relayed packets are local output, which the TAP input chain never sees.
+    return ['OUTPUT', '-s', n['hostIp'], '-p', 'udp', '--sport', RELAY_PORTS, '-j', relay_chain(n)]
+
+
 def policy(pool):
-    return dict(ipv4=[input_rules(n) for n in pool], ipv6='drop', forward='drop')
+    return dict(ipv4=[input_rules(n) for n in pool], ipv4_relay=[relay_rules(n) for n in pool],
+                ipv6='drop', forward='drop')
+
+
+def own_chain(tool, name, hooks, rules, remove):
+    # Own only this pool's chains and hooks; leave host policy intact.
+    for rule in hooks:
+        while run(tool, '-w', '-C', *rule, optional=True).returncode == 0:
+            run(tool, '-w', '-D', *rule)
+    exists = run(tool, '-w', '-S', name, optional=True).returncode == 0
+    if exists:
+        run(tool, '-w', '-F', name)
+    if remove:
+        if exists:
+            run(tool, '-w', '-X', name)
+        return
+    if not exists:
+        run(tool, '-w', '-N', name)
+    for rule in rules:
+        run(tool, '-w', '-A', name, *rule)
+    for rule in hooks:
+        run(tool, '-w', '-I', *rule)
 
 
 def firewall(n, remove=False):
     tap, name = n['tapName'], chain(n)
     for tool in ['iptables', 'ip6tables']:
-        jump = ['INPUT', '-i', tap, '-j', name]
-        forward = ['FORWARD', '-i', tap, '-j', 'DROP']
-        # Own only this pool's chains and hooks; leave host policy intact.
-        for rule in [jump, forward]:
-            while run(tool, '-w', '-C', *rule, optional=True).returncode == 0:
-                run(tool, '-w', '-D', *rule)
-        exists = run(tool, '-w', '-S', name, optional=True).returncode == 0
-        if exists:
-            run(tool, '-w', '-F', name)
-        if remove:
-            if exists:
-                run(tool, '-w', '-X', name)
-            continue
-        if not exists:
-            run(tool, '-w', '-N', name)
-        rules = input_rules(n) if tool == 'iptables' else [['-j', 'DROP']]
-        for rule in rules:
-            run(tool, '-w', '-A', name, *rule)
-        run(tool, '-w', '-I', *forward)
-        run(tool, '-w', '-I', *jump)
+        own_chain(tool, name, [['FORWARD', '-i', tap, '-j', 'DROP'], ['INPUT', '-i', tap, '-j', name]],
+                  input_rules(n) if tool == 'iptables' else [['-j', 'DROP']], remove)
+    own_chain('iptables', relay_chain(n), [relay_hook(n)], relay_rules(n), remove)
 
 
 def trusted_path(file):
@@ -335,7 +358,7 @@ def main():
         verb = 'Remove' if args.action == 'remove' else 'Create/repair'
         print(f'{verb} four persistent user-owned TAPs, private /30 addresses, IPv4/IPv6 confinement rules, KVM user ACL, a KVM udev rule and a boot service for {user.pw_name}.\nThe host keeps its other firewall rules. Close Browser sessions first.')
         for n in networks(user.pw_uid):
-            print(f"  {n['tapName']}: host {n['hostIp']}/30, guest {n['guestIp']}; relay TCP 19091, TURN TCP/UDP 41000 and 49152:49215")
+            print(f"  {n['tapName']}: host {n['hostIp']}/30, guest {n['guestIp']}; relay TCP 19091, TURN TCP/UDP 41000 and {RELAY_PORTS}; relayed UDP reaches only those TURN ports")
         if input('Continue? [y/N] ').lower() != 'y':
             return
         configure(user, remove=args.action == 'remove')

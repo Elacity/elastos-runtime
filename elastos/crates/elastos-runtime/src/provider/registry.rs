@@ -18,7 +18,10 @@ use elastos_common::localhost::{parse_localhost_path, parse_localhost_uri};
 fn private_ipfs_operation(op: &str) -> bool {
     matches!(
         op,
-        "runtime_prepare_backend" | "runtime_hash_staged_directory" | "runtime_check_capacity"
+        "runtime_prepare_backend"
+            | "runtime_hash_staged_directory"
+            | "runtime_check_capacity"
+            | "runtime_add_local_object"
     )
 }
 
@@ -55,19 +58,27 @@ struct LocalStagedDirectory<'a> {
     total_bytes: u64,
 }
 
+fn checked_local_root(root: &std::path::Path) -> Result<&str, ProviderError> {
+    let root = root.to_str().ok_or_else(private_ipfs_unavailable)?;
+    if !root.starts_with('/')
+        || root.len() > 4096
+        || root.contains('\0')
+        || root[1..].split('/').count() > 64
+        || root[1..].split('/').any(|p| matches!(p, "" | "." | ".."))
+    {
+        return Err(private_ipfs_unavailable());
+    }
+    Ok(root)
+}
+
 impl<'a> LocalStagedDirectory<'a> {
     fn checked(
         root: &'a std::path::Path,
         files: &'a [(String, u64)],
         total_bytes: u64,
     ) -> Result<Self, ProviderError> {
-        let root = root.to_str().ok_or_else(private_ipfs_unavailable)?;
-        if !root.starts_with('/')
-            || root.len() > 4096
-            || root.contains('\0')
-            || root[1..].split('/').count() > 64
-            || root[1..].split('/').any(|p| matches!(p, "" | "." | ".."))
-            || files.is_empty()
+        let root = checked_local_root(root)?;
+        if files.is_empty()
             || files.len() > 33
             || total_bytes == 0
             || total_bytes > 16 * 1024 * 1024 * 1024
@@ -119,10 +130,39 @@ impl<'a> LocalStagedDirectory<'a> {
     }
 }
 
+/// One complete local Content object directory: its manifest's files plus
+/// `_elastos_object.json`. The provider validates the full path shape.
+#[derive(serde::Serialize)]
+struct LocalObjectDirectory<'a> {
+    root: &'a str,
+    files: Vec<LocalStagedFile<'a>>,
+}
+
+const MAX_LOCAL_OBJECT_FILES: usize = 4096;
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalDirectoryHashResult {
     cid: String,
+}
+
+impl LocalDirectoryHashResult {
+    /// The wrapped directory root: a CIDv1 dag-pb sha2-256 in base32.
+    fn directory_cid(result: LocalIpfsResult<Self>) -> Result<String, ProviderError> {
+        match result {
+            LocalIpfsResult::Ok {
+                data: Some(Self { cid }),
+            } if cid.len() == 59
+                && cid.starts_with("bafybei")
+                && cid
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)) =>
+            {
+                Ok(cid)
+            }
+            _ => Err(private_ipfs_unavailable()),
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1447,19 +1487,35 @@ impl ProviderRegistry {
                 &serde_json::json!({"op":"runtime_hash_staged_directory","directory":directory}),
             )
             .await?;
-        match result {
-            LocalIpfsResult::Ok {
-                data: Some(LocalDirectoryHashResult { cid }),
-            } if cid.len() == 59
-                && cid.starts_with("bafybei")
-                && cid
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)) =>
-            {
-                Ok(cid)
-            }
-            _ => Err(private_ipfs_unavailable()),
+        LocalDirectoryHashResult::directory_cid(result)
+    }
+
+    /// Stream one complete local Content object directory into the local Kubo,
+    /// unpinned, without loading its files. The provider opens the root below
+    /// its data root and every file without following links. Content compares
+    /// the returned CID before it pins; capsules and Carrier cannot reach this.
+    pub async fn add_local_ipfs_object(
+        &self,
+        root: &std::path::Path,
+        files: &[(String, u64)],
+    ) -> Result<String, ProviderError> {
+        let root = checked_local_root(root)?;
+        if files.is_empty() || files.len() > MAX_LOCAL_OBJECT_FILES {
+            return Err(private_ipfs_unavailable());
         }
+        let object = LocalObjectDirectory {
+            root,
+            files: files
+                .iter()
+                .map(|(path, size)| LocalStagedFile { path, size: *size })
+                .collect(),
+        };
+        let result = self
+            .send_local_ipfs_preparation(
+                &serde_json::json!({"op":"runtime_add_local_object","object":object}),
+            )
+            .await?;
+        LocalDirectoryHashResult::directory_cid(result)
     }
 
     /// Observe the actual Ready backend volume through the exact local provider.
@@ -3218,6 +3274,7 @@ mod tests {
             "runtime_prepare_backend",
             "runtime_hash_staged_directory",
             "runtime_check_capacity",
+            "runtime_add_local_object",
         ] {
             let request = serde_json::json!({"op":op,"directory":{"root":"/private/fixture"}, "config":{"base_path":"/private/fixture", "extra":{"runtime_host_role":"gateway"}}});
             assert!(registry.send_raw("ipfs", &request).await.is_err());

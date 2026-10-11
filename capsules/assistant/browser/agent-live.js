@@ -6,7 +6,7 @@
    Tip: home-20260814a */
 
 import { getHomeGuiLaunchToken } from "./harness-host.js";
-import { catalogModels, selectedModelOffer, readyModelChoices } from "./model-selection.js";
+import { catalogModels, selectedModelOffer, readyModelChoices, downloadingModel } from "./model-selection.js";
 import { yieldToBrowser, YIELD_EVENT_SLICE, YIELD_MS } from "./agent-stream-qos.js";
 import {
   eligibleTextOffers,
@@ -37,6 +37,17 @@ import {
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
+
+/** Runtime derives an admitted local model's offer ID from its verified content
+   binding; such an offer is a choice only through its catalog row. */
+const ADMITTED_OFFER_ID = /^model:[0-9a-f]{64}$/;
+
+/** While Assistant is open, the catalog is read again this often when a model
+   downloads and nothing is selectable yet (progress), or when an admitted
+   model is advertised before its catalog row is bound to its offer (just after
+   Get, or after a failed catalog read). The second case is bounded. */
+const LIVE_REFRESH_MS = 3000;
+const CATALOG_JOIN_RETRIES = 10;
 
 /** PRINCIPLES-safe default — no tools, no capsule authority (UI ≠ authority). */
 export const DEFAULT_LIVE_SYSTEM_PROMPT =
@@ -90,6 +101,41 @@ let liveState = {
 
 let probePromise = null;
 let probeEpoch = 0;
+let watchingLiveModels = false;
+let liveRefreshTimer = null;
+let catalogJoinRetries = 0;
+
+/** Assistant open: re-read as described at LIVE_REFRESH_MS. Closed: no timer
+   runs and a probe still in flight schedules none when it lands. */
+export function watchLiveModels(on) {
+  watchingLiveModels = Boolean(on);
+  catalogJoinRetries = 0;
+  scheduleLiveRefresh();
+}
+
+/** One timer for both re-reads, and none while a probe is already in flight. */
+function scheduleLiveRefresh() {
+  clearTimeout(liveRefreshTimer);
+  liveRefreshTimer = null;
+  const pending = liveCatalogPending();
+  if (!pending) catalogJoinRetries = 0;
+  if (!watchingLiveModels) return;
+  const downloading = !selectedLiveOffer() && liveDownloadingModel();
+  const joining = pending && catalogJoinRetries < CATALOG_JOIN_RETRIES;
+  if (!downloading && !joining) return;
+  if (pending) catalogJoinRetries += 1;
+  liveRefreshTimer = setTimeout(() => {
+    liveRefreshTimer = null;
+    if (watchingLiveModels && !liveState.checking) void probeLiveInference({ force: true });
+  }, LIVE_REFRESH_MS);
+}
+
+/** Every probe result is published: the chip and an open menu follow it. */
+function publishLiveState(next) {
+  liveState = next;
+  scheduleLiveRefresh();
+  window.dispatchEvent(new CustomEvent("assistant:live-models"));
+}
 
 export function getLiveInferenceState() {
   return { ...liveState, models: liveState.models.slice() };
@@ -169,9 +215,8 @@ export function selectLiveOffer(offerId, modelCid = null) {
 // launch hydration continue to use selectLiveOffer without changing retention.
 export async function selectLiveOfferForUse(offerId, modelCid = null) {
   const local = liveContentModels().find(model => model.offerId === offerId && (modelCid == null || model.cid === modelCid));
-  // Runtime derives admitted local offer IDs from the verified content binding.
-  // A missing catalog mapping cannot turn that offer into an operator choice.
-  if (modelCid == null && !local && !/^model:[0-9a-f]{64}$/.test(offerId)) {
+  // A missing catalog mapping cannot turn an admitted offer into an operator choice.
+  if (modelCid == null && !local && !ADMITTED_OFFER_ID.test(offerId)) {
     selectLiveOffer(offerId);
     return true;
   }
@@ -205,6 +250,21 @@ export async function selectLiveOfferForUse(offerId, modelCid = null) {
 export function liveContentChoice() { return selectedContentCid; }
 export function liveContentModels() {
   return readyModelChoices(liveState.catalogModels || [], liveState.models.map(m => ({ ...m, id: m.offerId })));
+}
+/** Offers the menu lists by their offer title. An admitted model is listed only
+   through its catalog row (title and CID), never by its raw offer name. */
+export function liveMenuOffers() {
+  const content = liveContentModels();
+  return liveState.models.filter(m => !ADMITTED_OFFER_ID.test(m.offerId) && !content.some(c => c.offerId === m.offerId));
+}
+/** An admitted model is advertised but its catalog row is not bound to it yet. */
+export function liveCatalogPending() {
+  const content = liveContentModels();
+  return liveState.models.some(m => ADMITTED_OFFER_ID.test(m.offerId) && !content.some(c => c.offerId === m.offerId));
+}
+/** The catalog model a running preparation is downloading, or null. */
+export function liveDownloadingModel() {
+  return downloadingModel(liveState.catalogModels || []);
 }
 function currentChoice(models, content) {
   // Initial empty workspace may use the first offer. An existing choice stays exact.
@@ -271,7 +331,7 @@ export async function probeLiveInference({ force = false } = {}) {
       if (epoch !== probeEpoch) return;
       const models = chatOfferRows(offers);
       if (!models.length) {
-        liveState = {
+        publishLiveState({
           live: false,
           checking: false,
           model: "",
@@ -280,10 +340,10 @@ export async function probeLiveInference({ force = false } = {}) {
           checkedAt: Date.now(),
           models: [],
           catalogModels: content,
-        };
+        });
         return;
       }
-      liveState = {
+      publishLiveState({
         live: Boolean(currentChoice(models, content)),
         checking: false,
         model: currentChoice(models, content)?.label || "Chosen model unavailable",
@@ -292,10 +352,10 @@ export async function probeLiveInference({ force = false } = {}) {
         checkedAt: Date.now(),
         models,
         catalogModels: content,
-      };
+      });
     } catch (error) {
       if (epoch !== probeEpoch) return;
-      liveState = {
+      publishLiveState({
         live: false,
         checking: false,
         model: "",
@@ -304,7 +364,7 @@ export async function probeLiveInference({ force = false } = {}) {
         checkedAt: Date.now(),
         models: [],
         catalogModels: [],
-      };
+      });
     } finally {
       if (epoch === probeEpoch) probePromise = null;
     }
@@ -589,6 +649,7 @@ export async function streamChatViaContract(
       usage: null,
       latencyMs: Date.now() - startedAt,
       aborted: false,
+      stopRequested: run.cancelRequested,
       seq,
       reasoning,
       contextHash: manifest.semanticContextHash || manifest.contextHash,

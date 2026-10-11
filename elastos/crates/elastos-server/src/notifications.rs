@@ -95,6 +95,9 @@ struct NotificationEntryRecord {
     acted: bool,
     #[serde(default)]
     dismissed: bool,
+    /// When the user last dismissed or rejected this entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dismissed_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -198,6 +201,7 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
             read: false,
             acted: false,
             dismissed: false,
+            dismissed_at: None,
         });
         if !existing_ids.contains(&id) {
             record_event(
@@ -369,6 +373,7 @@ pub fn upsert_direct_message_notification(
         read: false,
         acted: false,
         dismissed: false,
+        dismissed_at: None,
     });
     if !already_exists {
         record_event(
@@ -470,6 +475,7 @@ pub fn upsert_external_http_request(
         });
         existing.severity = NotificationSeverity::Attention;
         existing.dismissed = false;
+        existing.dismissed_at = None;
         existing.acted = false;
         write_json_atomic(&path, &store)?;
         return Ok(());
@@ -491,6 +497,7 @@ pub fn upsert_external_http_request(
         read: false,
         acted: false,
         dismissed: false,
+        dismissed_at: None,
     });
     if !already_exists {
         record_event(
@@ -512,6 +519,25 @@ pub fn upsert_external_http_request(
         )?;
     }
     write_json_atomic(&path, &store)
+}
+
+/// Whether the user dismissed or rejected this external HTTP request less than
+/// `quiet_secs` before `now`, so asking again would only nag.
+pub fn external_http_request_recently_dismissed(
+    data_dir: &Path,
+    request_id: &str,
+    now: u64,
+    quiet_secs: u64,
+) -> anyhow::Result<bool> {
+    let id = external_http_request_notification_id(request_id);
+    let store = read_json_or_default::<NotificationStore>(&notifications_path(data_dir)?)?;
+    Ok(store.entries.iter().any(|entry| {
+        entry.id == id
+            && entry.dismissed
+            && entry
+                .dismissed_at
+                .is_some_and(|at| now < at.saturating_add(quiet_secs))
+    }))
 }
 
 pub fn dismiss_external_http_request(data_dir: &Path, request_id: &str) -> anyhow::Result<bool> {
@@ -610,6 +636,7 @@ pub fn dismiss(data_dir: &Path, id: &str) -> anyhow::Result<bool> {
                 },
             )?;
             entry.dismissed = true;
+            entry.dismissed_at = Some(now_ts());
             entry.read = true;
             updated = true;
         }

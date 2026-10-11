@@ -3,6 +3,7 @@ import {
   fetchJson,
   setHomeAuthorityToken,
 } from "./shell-core.js?v=home-update-20261003a";
+import { ownerRecoveryCommand } from "./owner-recovery-command.js?v=home-update-20261003a";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockFace = document.querySelector(".home-unlock-face");
@@ -15,10 +16,6 @@ const unlockPerson = document.querySelector("#home-unlock-person");
 const unlockPersonName = document.querySelector("#home-unlock-person-name");
 const unlockMonogram = document.querySelector("#home-unlock-monogram");
 const unlockPrimary = document.querySelector("#home-unlock-primary");
-const olderKeyAction = document.querySelector("#home-older-key-action");
-const passkeyHintPanel = document.querySelector("#home-passkey-hint-panel");
-const passkeyHintInput = document.querySelector("#home-passkey-hint");
-const passkeyHintCancel = document.querySelector("#home-passkey-hint-cancel");
 const unlockSecondary = document.querySelector("#home-unlock-secondary");
 const unlockStatus = document.querySelector("#home-unlock-status");
 const unlockName = document.querySelector("#home-unlock-name");
@@ -32,6 +29,9 @@ const recoveryKitPanel = document.querySelector("#home-recovery-kit");
 const recoveryFile = document.querySelector("#home-recovery-file");
 const recoveryPassword = document.querySelector("#home-recovery-password");
 const recoveryPasswordLabel = document.querySelector("#home-recovery-password-label");
+const recoverOwner = document.querySelector("#home-recover-owner");
+const ownerRecoveryCode = document.querySelector("#home-owner-recovery-code");
+const ownerRecoveryCodeLabel = document.querySelector("#home-owner-recovery-code-label");
 const MAX_RECOVERY_KIT_BYTES = 1024 * 1024;
 const RECOVERY_SELECTION_MS = 10 * 60 * 1000;
 let recoveryKit = null;
@@ -63,7 +63,6 @@ export function isHomeAuthError(error) {
 }
 
 export async function showHomeUnlock(onUnlocked, options = {}) {
-  clearPasskeyHint();
   unlockCallback = typeof onUnlocked === "function" ? onUnlocked : null;
   unlockPresentation = options && options.presentation === "prompt" ? "prompt" : "modal";
   unlockPersonLabel = readUnlockPersonLabel(options && options.personName);
@@ -123,7 +122,6 @@ export function hideHomeUnlock() {
   if (!unlockPanel) {
     return;
   }
-  clearPasskeyHint();
   clearRecoverySelection();
   recoverySession = null;
   recoveryTerminalToken = "";
@@ -154,7 +152,6 @@ export function hideHomeUnlock() {
 export function bindHomeUnlock() {
   recoveryFile?.addEventListener("change", selectRecoveryKit);
   window.addEventListener("pagehide", () => {
-    clearPasskeyHint();
     clearRecoverySelection();
     recoverySession = null;
     recoveryTerminalToken = "";
@@ -179,28 +176,25 @@ export function bindHomeUnlock() {
       setUnlockStatus("Home cannot clear setup retry data. Check browser storage and try again.", "error");
     }
   });
-  olderKeyAction?.addEventListener("click", () => {
-    if (busy) return;
-    clearPasskeyHint();
-    unlockMode = "older_key";
+  recoverOwner?.addEventListener("click", () => {
+    if (busy || pendingRegistration || recoverySession) return;
+    unlockMode = "recover_owner";
+    enrollmentPurpose = "recover";
+    clearRecoverySelection();
     renderUnlockMode({ registered: true, guestRegistrationEnabled: guestRegistrationAvailable });
-    setUnlockStatus("Paste the private hint from your Home operator, then use your security key.", "muted");
-    passkeyHintInput?.focus();
-  });
-  passkeyHintCancel?.addEventListener("click", () => {
-    if (busy) return;
-    clearPasskeyHint();
-    unlockMode = guestRegistrationAvailable ? "signin_guest_enabled" : "signin";
-    renderUnlockMode({ registered: true, guestRegistrationEnabled: guestRegistrationAvailable });
-    setUnlockStatus("Choose your passkey.", "muted");
-    unlockPerson?.focus();
+    setUnlockStatus("", "muted");
+    ownerRecoveryCode?.focus();
   });
   const startUnlock = () => {
+    if (unlockMode === "recover_owner") {
+      runOwnerRecovery().catch(reportUnlockError);
+      return;
+    }
     if (["create", "create_guest", "resume_owner", "resume_registration"].includes(unlockMode)) {
       runPasskeyCreate().catch(reportUnlockError);
       return;
     }
-    runPasskeySignIn(unlockMode === "older_key").catch(reportUnlockError);
+    runPasskeySignIn().catch(reportUnlockError);
   };
   unlockPrimary?.addEventListener("click", startUnlock);
   unlockPerson?.addEventListener("click", startUnlock);
@@ -208,7 +202,8 @@ export function bindHomeUnlock() {
     clearRecoverySelection();
     recoverySession = null;
     recoveryTerminalToken = "";
-    if (unlockMode === "resume_registration") {
+    if (unlockMode === "resume_registration" || unlockMode === "recover_owner") {
+      if (ownerRecoveryCode) ownerRecoveryCode.value = "";
       unlockMode = guestRegistrationAvailable ? "signin_guest_enabled" : "signin";
       renderUnlockMode({ registered: true, guestRegistrationEnabled: guestRegistrationAvailable });
       return;
@@ -332,8 +327,6 @@ export async function requestPasskeyStepUp(appToken, operation, request) {
 }
 
 function renderUnlockChecking() {
-  if (olderKeyAction) olderKeyAction.hidden = true;
-  if (passkeyHintPanel) passkeyHintPanel.hidden = true;
   if (unlockTitle) {
     unlockTitle.textContent = "Sign in";
   }
@@ -363,21 +356,19 @@ function renderUnlockChecking() {
 }
 
 function renderUnlockMode({ registered, guestRegistrationEnabled }) {
-  const usingOlderKey = unlockMode === "older_key";
   const resumingOwner = unlockMode === "resume_owner";
   const resumingRegistration = unlockMode === "resume_registration";
+  const recoveringOwner = unlockMode === "recover_owner";
   const creatingGuest = unlockMode === "create_guest";
   const creatingAdmin = unlockMode === "create" || resumingOwner;
   const canCreate = (creatingAdmin || creatingGuest) && !resumingOwner;
-  const showFace = registered && !usingOlderKey && !creatingGuest && !resumingOwner && !resumingRegistration && unlockMode !== "unsupported";
-  if (olderKeyAction) olderKeyAction.hidden = !showFace;
-  if (passkeyHintPanel) passkeyHintPanel.hidden = !usingOlderKey;
+  const showFace = registered && !creatingGuest && !resumingOwner && !resumingRegistration && !recoveringOwner && unlockMode !== "unsupported";
   if (unlockTitle) {
-    unlockTitle.textContent = usingOlderKey ? "Use an older security key" : resumingOwner || resumingRegistration ? "Resume setup" : creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
+    unlockTitle.textContent = recoveringOwner ? "Recover this Home" : resumingOwner || resumingRegistration ? "Resume setup" : creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
   }
   if (unlockCopy) {
-    if (usingOlderKey) {
-      unlockCopy.textContent = "Your Home operator can supply a private hint with elastos identity passkey-hint. Use the key already linked to your account.";
+    if (recoveringOwner) {
+      unlockCopy.textContent = `Lost your passkey? On the computer running this Home, run: ${ownerRecoveryCommand(location)}. Enter the code it shows, choose your Recovery Kit, then create a new passkey.`;
     } else if (resumingOwner) {
       unlockCopy.textContent = "Finish the passkey setup already verified by this Home.";
     } else if (creatingGuest) {
@@ -389,15 +380,14 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
     }
   }
   if (unlockPrimary) {
-    unlockPrimary.textContent = usingOlderKey ? "Use security key" : resumingOwner ? "Resume Home setup" : creatingGuest
+    unlockPrimary.textContent = resumingOwner ? "Resume Home setup" : creatingGuest
       ? "Create guest passkey"
       : (registered ? "Use passkey" : "Create admin passkey");
     unlockPrimary.disabled = unlockMode === "unsupported";
   }
   if (unlockSecondary) {
-    unlockSecondary.hidden = !registered || !guestRegistrationEnabled && !resumingRegistration;
-    if (usingOlderKey) unlockSecondary.hidden = true;
-    unlockSecondary.textContent = creatingGuest || resumingRegistration ? "Back to sign in" : "Create guest account";
+    unlockSecondary.hidden = !registered || !guestRegistrationEnabled && !resumingRegistration && !recoveringOwner;
+    unlockSecondary.textContent = creatingGuest || resumingRegistration || recoveringOwner ? "Back to sign in" : "Create guest account";
   }
   if (unlockPanel) {
     unlockPanel.dataset.surface = showFace ? "lock-face" : "neutral";
@@ -420,7 +410,8 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
     unlockPersonName.hidden = !unlockPersonLabel;
   }
   if (unlockMonogram) {
-    unlockMonogram.textContent = "e";
+    // The account's initial; the ElastOS "e" only when no name is known.
+    unlockMonogram.textContent = [...unlockPersonLabel.trim()][0]?.toUpperCase() || "e";
   }
   if (unlockPerson) {
     unlockPerson.disabled = unlockMode === "unsupported";
@@ -443,6 +434,11 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
     if (!publicOwnerSetup) ownerToken.value = "";
   }
   if (ownerTokenLabel) ownerTokenLabel.hidden = !publicOwnerSetup;
+  if (ownerRecoveryCode) {
+    ownerRecoveryCode.hidden = !recoveringOwner;
+    if (!recoveringOwner) ownerRecoveryCode.value = "";
+  }
+  if (ownerRecoveryCodeLabel) ownerRecoveryCodeLabel.hidden = !recoveringOwner;
 }
 
 function unlockStatusCopy(registered, guestRegistrationEnabled) {
@@ -530,7 +526,9 @@ function renderEnrollmentChoice() {
   if (enrolling && unlockCopy) unlockCopy.textContent = purpose === "recover"
     ? "Choose your Recovery Kit first. Home will then use a passkey to restore your signed Profile and its name."
     : "Create a passkey and Profile with the name people will see.";
-  if (recoveryKitPanel) recoveryKitPanel.hidden = !(enrolling && purpose === "recover");
+  const recoveringOwner = unlockMode === "recover_owner";
+  if (recoveryKitPanel) recoveryKitPanel.hidden = !(enrolling && purpose === "recover" || recoveringOwner);
+  if (recoveringOwner && unlockPrimary) unlockPrimary.textContent = recoveryKit ? "Continue with passkey" : "Choose Recovery Kit";
   if (recoveryFile) recoveryFile.disabled = busy;
   if (recoveryPassword) recoveryPassword.disabled = busy;
   if (enrolling && purpose === "recover" && unlockPrimary) unlockPrimary.textContent = recoveryKit
@@ -770,36 +768,88 @@ async function runPasskeyCreate() {
   }
 }
 
-function clearPasskeyHint() {
-  if (passkeyHintInput) passkeyHintInput.value = "";
+// Owner lost every passkey: an operator code from this computer lets one new
+// passkey register, bound in the same step to the owner's Recovery Kit.
+async function runOwnerRecovery() {
+  if (busy || !window.PublicKeyCredential) {
+    return;
+  }
+  const code = (ownerRecoveryCode?.value || "").trim();
+  if (!recoverySession && !code) {
+    ownerRecoveryCode?.focus();
+    setUnlockStatus("Enter the code from the terminal.", "error");
+    return;
+  }
+  if (!recoveryKit) {
+    recoveryFile?.click();
+    return;
+  }
+  if (recoveryKit.schema === "elastos.full-recovery-bundle.package/v1" && !recoveryPassword?.value) {
+    recoveryPassword?.focus();
+    setUnlockStatus("Enter the Recovery Kit password before continuing.", "error");
+    return;
+  }
+  busy = true;
+  setButtonsDisabled(true);
+  renderEnrollmentChoice();
+  setUnlockStatus("Creating passkey", "muted");
+  try {
+    if (recoverySession) {
+      await completeEnrollmentRecovery();
+      return;
+    }
+    const headers = { "content-type": "application/json", "x-elastos-owner-recovery": code };
+    let begin;
+    try {
+      begin = await fetchJson("/api/auth/owner-recovery/begin", { method: "POST", headers });
+    } catch (_) {
+      throw new Error("This code was not accepted. Run the command again and enter the new code.");
+    }
+    if (begin?.schema !== "elastos.auth.passkey.register.begin/v1" || !boundedString(begin.ceremony_id, 128)
+      || !begin.options?.publicKey?.user) {
+      throw new Error("Home recovery returned an invalid response.");
+    }
+    begin.options.publicKey.user.name = "ElastOS Home";
+    begin.options.publicKey.user.displayName = "ElastOS Home";
+    const credential = await navigator.credentials.create(toCreationOptions(begin.options));
+    if (!credential) throw new Error("Passkey creation was cancelled.");
+    const body = { ceremony_id: begin.ceremony_id, response: serializeCreatedCredential(credential) };
+    if (recoveryKit.schema === "elastos.full-recovery-bundle.package/v1") {
+      body.package = recoveryKit;
+      body.password = recoveryPassword.value;
+    } else {
+      body.bundle = recoveryKit;
+    }
+    setUnlockStatus("Checking your Recovery Kit.", "muted");
+    let response;
+    try {
+      response = await fetchJson("/api/auth/owner-recovery/complete", {
+        method: "POST", headers, body: JSON.stringify(body),
+      });
+    } catch (_) {
+      throw new Error("Recovery was not accepted. Use the Recovery Kit of this Home's owner and its password, then try again.");
+    } finally {
+      delete body.password;
+    }
+    if (response?.schema !== "elastos.auth.passkey.verify/v2"
+      || ![response.principal_id, response.session_id, response.home_token].every(value => boundedString(value, 32768))) {
+      throw new Error("Home recovery returned an invalid completion.");
+    }
+    if (ownerRecoveryCode) ownerRecoveryCode.value = "";
+    setHomeAuthorityToken(response.home_token);
+    recoverySession = response;
+    await completeEnrollmentRecovery();
+  } catch (error) {
+    clearRecoverySelection();
+    throw error;
+  } finally {
+    busy = false;
+    setButtonsDisabled(false);
+    renderEnrollmentChoice();
+  }
 }
 
-function readPasskeyHint() {
-  const text = String(passkeyHintInput?.value || "");
-  clearPasskeyHint();
-  if (!text || text.length > 1800) throw new Error("Use a valid private security-key hint from your Home operator.");
-  let hint;
-  try { hint = JSON.parse(text); }
-  catch (_) { throw new Error("Use a valid private security-key hint from your Home operator."); }
-  const rp = hint?.rp_id;
-  const id = hint?.credential_id;
-  if (!exactKeys(hint, ["schema", "credential_id", "rp_id"])
-    || hint.schema !== "elastos.passkey.hint/v1"
-    || typeof id !== "string" || !/^[A-Za-z0-9_-]{1,1366}$/.test(id)
-    || typeof rp !== "string" || !rp || rp.length > 253
-    || !rp.split(".").every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) {
-    throw new Error("Use a valid private security-key hint from your Home operator.");
-  }
-  let decoded;
-  try { decoded = base64UrlToBuffer(id); }
-  catch (_) { throw new Error("Use a valid private security-key hint from your Home operator."); }
-  if (!decoded.byteLength || decoded.byteLength > 1024 || bufferToBase64Url(decoded) !== id) {
-    throw new Error("Use a valid private security-key hint from your Home operator.");
-  }
-  return { rpId: rp, id: decoded };
-}
-
-async function runPasskeySignIn(useHint = false) {
+async function runPasskeySignIn() {
   if (busy || !window.PublicKeyCredential) {
     return;
   }
@@ -807,17 +857,8 @@ async function runPasskeySignIn(useHint = false) {
   setButtonsDisabled(true);
   setUnlockStatus("Choose your passkey.", "muted");
   try {
-    const hint = useHint ? readPasskeyHint() : null;
     const begin = await fetchJson("/api/auth/passkey/authenticate/begin", { method: "POST" });
     const request = toRequestOptions(begin.options);
-    if (hint) {
-      const host = window.location.hostname;
-      if (request.publicKey.rpId !== hint.rpId
-        || !(host === hint.rpId || host?.endsWith(`.${hint.rpId}`))) {
-        throw new Error("Use the private security-key hint for this Home.");
-      }
-      request.publicKey.allowCredentials = [{ type: "public-key", id: hint.id }];
-    }
     const credential = await navigator.credentials.get(request);
     if (!credential) {
       throw new Error("Passkey sign-in was cancelled.");
@@ -831,15 +872,7 @@ async function runPasskeySignIn(useHint = false) {
     });
     setHomeAuthorityToken(response?.home_token);
     await unlockComplete(response);
-  } catch (error) {
-    if (useHint) {
-      throw new Error(isPasskeyNotSelected(error)
-        ? "Security-key sign-in was cancelled. Paste the hint again to retry."
-        : "Security-key sign-in failed. Check the hint and key, then try again.");
-    }
-    throw error;
   } finally {
-    clearPasskeyHint();
     busy = false;
     setButtonsDisabled(false);
   }
@@ -883,9 +916,6 @@ function setButtonsDisabled(disabled) {
   if (unlockSecondary) {
     unlockSecondary.disabled = disabled;
   }
-  if (olderKeyAction) olderKeyAction.disabled = disabled;
-  if (passkeyHintCancel) passkeyHintCancel.disabled = disabled;
-  if (passkeyHintInput) passkeyHintInput.disabled = disabled;
   if (enrollmentDismiss) enrollmentDismiss.disabled = disabled;
 }
 

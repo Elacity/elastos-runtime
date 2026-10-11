@@ -69,6 +69,11 @@ class PrepushTests(unittest.TestCase):
                           "capsules/protected-content-decrypt-provider", "capsules/custody-provider"):
             self.write(workspace + "/Cargo.lock", "version = 4\n# committed fixture lock\n")
         self.write("README.md", "Fixture\n")
+        self.write("scripts/test-behaviour.sh", "#!/bin/sh\nexec node --test --test-timeout=60000\n")
+        (self.root / "scripts/test-behaviour.sh").chmod(0o755)
+        self.write("scripts/test-source-gate.sh", '#!/bin/sh\n[ -z "$PREPUSH_SOURCE_GATE_FAIL" ] || '
+                   '{ echo "✖ fixture source gate"; exit 1; }\n')
+        (self.root / "scripts/test-source-gate.sh").chmod(0o755)
         self.write(".gitignore", "**/target/\n/target-build/\n")
         self.commit()
         self.git("remote", "add", "origin", str(self.origin))
@@ -88,9 +93,14 @@ class PrepushTests(unittest.TestCase):
                                       "cwd": os.getcwd(), "build_dir": os.environ.get("CARGO_BUILD_BUILD_DIR"),
                                       "target_dir": os.environ.get("CARGO_TARGET_DIR"),
                                       "build_target_dir": os.environ.get("CARGO_BUILD_TARGET_DIR"),
+                                      "rustflags": os.environ.get("RUSTFLAGS"),
+                                      "encoded_rustflags": os.environ.get("CARGO_ENCODED_RUSTFLAGS"),
                                       "git_env": [k for k in os.environ if k.startswith("GIT_")],
                                       "provider_env": {k: v for k, v in os.environ.items() if k.startswith("ELASTOS_TEST_")}}) + "\\n")
             if pathlib.Path(sys.argv[0]).name == "node":
+                if "--test" in args and os.environ.get("PREPUSH_BEHAVIOUR_FAIL"):
+                    print("✖ failing tests:\\n✖ fixture behaviour")
+                    sys.exit(1)
                 sys.exit(0)
             if args[0] == "metadata":
                 if os.environ.get("PREPUSH_IGNORE_TERM"):
@@ -153,6 +163,10 @@ class PrepushTests(unittest.TestCase):
                 print(json.dumps({"workspace_root": str(workspace), "workspace_members": members,
                                   "packages": packages}))
             elif args[0] == "check":
+                flags = os.environ.get("CARGO_ENCODED_RUSTFLAGS", os.environ.get("RUSTFLAGS", "")).replace(chr(31), " ")
+                if (os.environ.get("PREPUSH_WARNING") and "-D warnings" in flags
+                        and "--cap-lints allow" not in flags and "-A unused-imports" not in flags):
+                    sys.exit("warning denied")
                 if os.environ.get("PREPUSH_PRODUCT_SENTINEL"):
                     subprocess.run(["git", "-C", os.environ["PREPUSH_PRODUCT_SENTINEL"],
                                     "commit", "--allow-empty", "-qm", "owned product-child fixture"], check=True)
@@ -166,8 +180,17 @@ class PrepushTests(unittest.TestCase):
                     tree = subprocess.check_output(["git", "-C", remote, "rev-parse", old + "^{tree}"], text=True).strip()
                     commit = subprocess.check_output(["git", "-C", remote, "commit-tree", tree, "-p", old, "-m", "base advanced"], text=True).strip()
                     subprocess.run(["git", "-C", remote, "update-ref", "refs/heads/develop", commit], check=True)
+                for dependencies in json.loads(os.environ.get("PREPUSH_GRAPH", "{}")).values():
+                    for dependency in dependencies:
+                        folder = dependency if isinstance(dependency, str) else dependency["path"]
+                        if not (root / folder).exists():
+                            sys.exit("failed to load manifest for dependency " + folder)
                 if os.environ.get("PREPUSH_FAIL"):
                     sys.exit(1)
+            elif args[0] == "clippy":
+                dependent = os.environ.get("PREPUSH_CLIPPY_WARNING")
+                if dependent and any(args[i:i+2] == ["-p", dependent] for i in range(len(args))):
+                    sys.exit("dependent lint denied")
             elif args[0] == "build":
                 binary = pathlib.Path(os.getcwd()) / "target/release" / pathlib.Path(os.getcwd()).name
                 binary.parent.mkdir(parents=True, exist_ok=True)
@@ -334,6 +357,15 @@ class PrepushTests(unittest.TestCase):
                 if "PREPUSH_FAIL" in extra:
                     self.assertFalse(any(c["args"][0] in {"clippy", "test"} for c in self.commands()))
 
+    def test_behaviour_suite_failure_stops_before_cargo(self):
+        result = self.invoke(extra={"PREPUSH_BEHAVIOUR_FAIL": "1"})
+        self.assert_stopped(result, "scripts/test-behaviour.sh")
+        self.assertIn("✖ fixture behaviour", result.stdout)
+        suite, = [c for c in self.commands() if c["tool"] == "node" and "--test" in c["args"]]
+        self.assertIn("--test-timeout=60000", suite["args"])
+        self.assertEqual(suite["cwd"], str(self.root))
+        self.assertFalse(any(c["tool"] == "cargo" for c in self.commands()))
+
     def test_empty_touched_binary_cannot_use_library_tests_as_proof(self):
         self.write("elastos/crates/server/src/lib.rs", "// changed library\n")
         self.write("elastos/crates/server/src/main.rs", "mod release_cmd;\n// changed binary\n")
@@ -342,6 +374,39 @@ class PrepushTests(unittest.TestCase):
         self.assert_stopped(result, "zero unit tests on this host: --bin server")
         self.assertTrue(any(c["args"][:4] == ["test", "-p", "server", "--lib"] and
                             "--nocapture" in c["args"] for c in self.commands()))
+
+    def test_large_file_in_history_stops_before_any_check(self):
+        large = self.root / "output/model.gguf"
+        large.parent.mkdir(parents=True, exist_ok=True)
+        large.write_bytes(b"\0" * (51 * 1024 * 1024))
+        self.git("add", "-f", "output/model.gguf")
+        self.git("commit", "-qm", "accidental large file")
+        self.git("rm", "-q", "output/model.gguf")
+        self.git("commit", "-qm", "delete it again")
+        result = self.invoke()
+        self.assert_stopped(result, "history adds files over 50 MB")
+        self.assertIn("output/model.gguf", result.stdout + result.stderr)
+        self.assertFalse(any(c["tool"] in {"cargo", "node"} for c in self.commands()))
+
+    def test_unchanged_empty_binary_is_skipped_when_a_manifest_changes(self):
+        self.git("reset", "--hard", "HEAD~1")  # the base fixture commit changes Rust source
+        self.write("elastos/crates/server/Cargo.toml", "[package]\nname = \"server\"\n# changed manifest\n")
+        self.commit()
+        result = self.invoke(extra={"PREPUSH_EMPTY_BIN": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(c["args"][:4] == ["test", "-p", "server", "--lib"] and
+                            "--nocapture" in c["args"] for c in self.commands()))
+        self.assertFalse(any(c["args"][:4] == ["test", "-p", "server", "--bin"] and
+                             "--nocapture" in c["args"] for c in self.commands()))
+
+    def test_unchanged_package_without_tests_is_skipped_when_a_manifest_changes(self):
+        # A tool crate with no tests at all, reached only through a manifest change.
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("elastos/crates/server/Cargo.toml", "[package]\nname = \"server\"\n# changed manifest\n")
+        self.commit()
+        result = self.invoke(extra={"PREPUSH_NO_TESTS": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(c["args"][0] == "test" and "--nocapture" in c["args"] for c in self.commands()))
 
     def test_standalone_binary_and_workspace_manifest_scope(self):
         self.write("capsules/chain-provider/src/main.rs", "// changed binary\n")
@@ -373,9 +438,13 @@ class PrepushTests(unittest.TestCase):
         checks = [c for c in commands if c["args"] == ["check", "--workspace", "--all-targets"]]
         self.assertEqual({c["cwd"] for c in checks}, {str(self.root / "elastos"),
                          str(self.root / "capsules/chain-provider"), str(self.root / "capsules/wallet-provider")})
-        clippy, = [c for c in commands if c["args"][0] == "clippy"]
-        self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "common", "--", "-D", "warnings"])
-        self.assertTrue(all(c["args"][2] == "common" for c in commands if c["args"][0] == "test"))
+        clippy, = [c for c in commands if c["args"][0] == "clippy" and c["cwd"] == str(self.root / "elastos")]
+        self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "server", "-p", "common", "--", "-D", "warnings"])
+        self.assertEqual({c["cwd"] for c in commands if c["args"][0] == "clippy"},
+                         {str(self.root / "elastos"), str(self.root / "capsules/chain-provider"),
+                          str(self.root / "capsules/wallet-provider")})
+        self.assertTrue(all(c["args"][2] == "common" for c in commands
+                            if c["args"][0] == "test" and c["cwd"] == str(self.root / "elastos")))
         metadata = [c for c in commands if c["args"][0] == "metadata"]
         self.assertEqual(len(metadata), len({tuple(c["args"]) for c in metadata}))
 
@@ -386,9 +455,68 @@ class PrepushTests(unittest.TestCase):
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         metadata = [c for c in self.commands() if c["args"][0] == "metadata"]
-        self.assertEqual(len(metadata), 2)
+        self.assertEqual(len(metadata), 1)
         self.assertTrue(all(c["args"][-1] == str(self.root / "elastos/Cargo.toml") for c in metadata))
         self.assertEqual(sum("--no-deps" in c["args"] for c in metadata), 1)
+        self.assertFalse(any(c["args"][0] in {"clean", "check", "clippy", "test", "build"}
+                             for c in self.commands()))
+        self.assertEqual(sum(c["args"][0] == "fmt" for c in self.commands()), 2)
+
+    def test_local_rust_warnings_fail_with_plain_and_encoded_caller_flags(self):
+        for extra in ({"RUSTFLAGS": "-A warnings"},
+                      {"RUSTFLAGS": "--cap-lints allow"},
+                      {"RUSTFLAGS": "-A unused-imports"},
+                      {"CARGO_ENCODED_RUSTFLAGS": "-A\x1fwarnings"},
+                      {"CARGO_ENCODED_RUSTFLAGS": "--cap-lints\x1fallow"},
+                      {"CARGO_ENCODED_RUSTFLAGS": "-A\x1funused-imports"},
+                      {"CARGO_ENCODED_RUSTFLAGS": ""}):
+            with self.subTest(extra=extra):
+                result = self.invoke(extra={**extra, "PREPUSH_WARNING": "1"})
+                self.assert_stopped(result, "cargo check")
+                checked = [c for c in self.commands() if c["args"][0] == "check"][-1]
+                self.assertIsNone(checked["encoded_rustflags"])
+                self.assertEqual(checked["rustflags"], "-D warnings")
+
+    def test_capsule_documentation_skips_build_unless_rust_embeds_it(self):
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("capsules/chain-provider/README.md", "Changed documentation\n")
+        self.commit()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(c["args"][0] in {"clean", "check", "clippy", "test", "build"}
+                             for c in self.commands()))
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("capsules/chain-provider/src/main.rs", 'const DOC: &str = include_str!("../README.md");\n')
+        self.write("capsules/chain-provider/README.md", "Original embedded input\n")
+        self.commit()
+        self.git("push", "-q", "origin", "HEAD:develop")
+        self.write("capsules/chain-provider/README.md", "Changed embedded input\n")
+        self.commit()
+        self.log.unlink()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(c["cwd"] == str(self.root / "capsules/chain-provider") and c["args"][0] == "test"
+                            for c in self.commands()))
+
+    def test_same_workspace_dependent_lint_fails_locally(self):
+        graph = {"elastos/crates/other": ["elastos/crates/server"]}
+        result = self.invoke(extra={"PREPUSH_GRAPH": json.dumps(graph), "PREPUSH_CLIPPY_WARNING": "other"})
+        self.assert_stopped(result, "cargo clippy")
+        lint = [c for c in self.commands() if c["args"][0] == "clippy"][-1]
+        self.assertIn("other", lint["args"])
+
+    def test_source_gate_runs_for_any_change_and_failure_stops_before_cargo(self):
+        self.git("reset", "--hard", "HEAD~1")
+        self.write("README.md", "Changed documentation\n")
+        self.commit()
+        result = self.invoke(extra={"PREPUSH_SOURCE_GATE_FAIL": "1"})
+        self.assert_stopped(result, "scripts/test-source-gate.sh")
+        self.assertIn("✖ fixture source gate", result.stdout)
+        self.assertTrue(any(c["tool"] == "node" and "--test" in c["args"] for c in self.commands()))
+        self.assertFalse(any(c["tool"] == "cargo" for c in self.commands()))
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("+ ./scripts/test-source-gate.sh", result.stdout)
 
     def test_shared_runtime_input_seeds_all_members(self):
         self.git("reset", "--hard", "HEAD~1")
@@ -399,10 +527,11 @@ class PrepushTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(c["cwd"] == str(self.root / "capsules/chain-provider") and c["args"][0] == "check"
                             for c in self.commands()))
-        clippy, = [c for c in self.commands() if c["args"][0] == "clippy"]
+        clippy, = [c for c in self.commands() if c["args"][0] == "clippy" and c["cwd"] == str(self.root / "elastos")]
         self.assertEqual(clippy["args"], ["clippy", "--all-targets", "-p", "server", "-p", "other",
                                         "-p", "common", "--", "-D", "warnings"])
-        self.assertEqual({c["args"][2] for c in self.commands() if c["args"][0] == "test"},
+        self.assertEqual({c["args"][2] for c in self.commands()
+                          if c["args"][0] == "test" and c["cwd"] == str(self.root / "elastos")},
                          {"server", "other", "common"})
 
     def test_template_data_and_source_select_runtime_consumer_units(self):
@@ -607,12 +736,13 @@ class PrepushTests(unittest.TestCase):
                                                ["scripts/ci-example.py", "scripts/ci-example.mjs", "scripts/ci-local-prepush.py"])
         self.assertEqual(owners, set())
 
-    def test_broad_runtime_input_refuses_a_selected_target_with_zero_tests(self):
+    def test_broad_runtime_input_checks_but_does_not_refuse_a_package_without_tests(self):
+        # Only a package whose own Rust source changed must have tests (CI refuses neither).
         self.git("reset", "--hard", "HEAD~1")
         self.write("elastos/config/input.json", '{}\n')
         self.commit()
         result = self.invoke(extra={"PREPUSH_EMPTY_PACKAGE": "other"})
-        self.assert_stopped(result, "other has zero unit tests")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(c["args"][0] == "clippy" and "other" in c["args"] for c in self.commands()))
 
     def test_hook_git_environment_cannot_mutate_owned_sentinel_repository(self):
@@ -679,7 +809,30 @@ class PrepushTests(unittest.TestCase):
         self.assertTrue(any(c["args"][:3] == ["test", "-p", "wallet-provider"] for c in self.commands()))
         (self.root / "capsules/wallet-provider/Cargo.toml").unlink()
         self.commit()
-        self.assert_stopped(self.invoke(), "removed Rust package")
+        self.assert_stopped(self.invoke(), "removed Rust package manifest left its directory behind")
+
+    def test_whole_package_removal_checks_every_workspace(self):
+        self.git("rm", "-rq", "capsules/wallet-provider")
+        self.commit()
+        result = self.invoke(extra={"PREPUSH_EMPTY_PACKAGE": "chain-provider"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        checked = {Path(c["cwd"]).relative_to(self.root).as_posix() for c in self.commands()
+                   if c["tool"] == "cargo" and c["args"][0] == "check"}
+        self.assertEqual(checked, {"elastos", "capsules/chain-provider", "capsules/chat-room-ui",
+                                   "capsules/protected-content-protect-provider",
+                                   "capsules/protected-content-decrypt-provider", "capsules/custody-provider"})
+        self.assertFalse(any(c["args"][:3] == ["test", "-p", "chain-provider"]
+                             for c in self.commands()))
+        self.log.unlink()
+        dangling = json.dumps({"capsules/chain-provider": ["capsules/wallet-provider"]})
+        result = self.invoke(extra={"PREPUSH_GRAPH": dangling})
+        self.assert_stopped(result, "command failed: cargo")
+        self.assertIn("capsules/wallet-provider", result.stderr)
+        self.log.unlink()
+        self.write("capsules/chain-provider/src/lib.rs", "// changed provider\n")
+        self.commit()
+        self.assert_stopped(self.invoke(extra={"PREPUSH_EMPTY_PACKAGE": "chain-provider"}),
+                            "chain-provider has zero unit tests")
 
     def test_busy_lease_refuses_and_retains_the_same_inode(self):
         lock = self.root / ".git/local-ai-heavy-build.lock"
@@ -731,18 +884,21 @@ class PrepushTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = self.commands()
         cleans = [c for c in commands if c["args"][0] == "clean"]
-        self.assertEqual(len(cleans), 2)
+        self.assertEqual(len(cleans), 3)
         by_workspace = {c["cwd"]: c["args"] for c in cleans}
         self.assertEqual(by_workspace[str(self.root / "elastos")],
                          ["clean", "--locked", "--offline", "-p", "chain-provider", "-p", "common",
                           "-p", "custody-provider", "-p", "other", "-p", "server"])
         self.assertEqual(by_workspace[str(self.root / "capsules/chain-provider")],
                          ["clean", "--locked", "--offline", "-p", "chain-provider", "-p", "common"])
+        self.assertEqual(by_workspace[str(self.root / "capsules/custody-provider")],
+                         ["clean", "--locked", "--offline", "-p", "chain-provider", "-p", "common",
+                          "-p", "custody-provider"])
         first_build = next(index for index, c in enumerate(commands)
                            if c["args"][0] in {"check", "clippy", "test", "build"})
         self.assertTrue(all(commands.index(c) < first_build for c in cleans))
         resolved = [c for c in commands if c["args"][0] == "metadata" and "--no-deps" not in c["args"]]
-        self.assertEqual(len(resolved), 2)
+        self.assertEqual(len(resolved), 3)
         self.assertTrue(all("--locked" in c["args"] and "--offline" not in c["args"] for c in resolved))
         self.assertTrue(all(c["args"][-1] == str(Path(c["cwd"]) / "Cargo.toml") for c in resolved))
 

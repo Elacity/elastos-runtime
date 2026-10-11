@@ -30,18 +30,22 @@ pub async fn run_identity(cmd: crate::IdentityCommand) -> anyhow::Result<()> {
             println!("Enter this one-use token in Home's owner setup field. It expires in {expires_in} seconds:");
             println!("{}", secret.as_str());
         }
-        crate::IdentityCommand::PasskeyHint {
-            account,
-            principal,
+        crate::IdentityCommand::ArmOwnerRecovery {
+            origin,
             rp_id,
+            expires_in,
         } => {
-            let hint = crate::identity_passkey_hint::read_passkey_hint(
+            if !io::stdout().is_terminal() {
+                anyhow::bail!("owner recovery requires a local operator terminal");
+            }
+            let code = elastos_server::auth::arm_owner_recovery(
                 &default_data_dir(),
-                account.as_deref(),
-                principal.as_deref(),
-                rp_id.as_deref(),
+                &origin,
+                &rp_id,
+                expires_in,
             )?;
-            println!("{}", serde_json::to_string(&hint)?);
+            println!("On the Home sign-in screen, choose \"Recover this Home with your Recovery Kit\" and enter this code. It works once and expires in {expires_in} seconds:");
+            println!("{}", code.as_str());
         }
         crate::IdentityCommand::Show => {
             let profile = load_identity_profile(&default_data_dir()).await?;

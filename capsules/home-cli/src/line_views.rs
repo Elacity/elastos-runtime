@@ -359,9 +359,6 @@ fn handle_shared_line_command(input: &str, snapshot: &HomeSnapshot) -> Result<bo
         "people" => {
             print_cli_people(snapshot);
         }
-        "mywebsite" => {
-            print_cli_mywebsite(snapshot);
-        }
         "wallet" => {
             print_cli_wallet(snapshot);
         }
@@ -436,38 +433,6 @@ fn line_arg_tail(args: &[&str], start: usize) -> Option<String> {
         None
     } else {
         Some(value.to_string())
-    }
-}
-
-fn mywebsite_line_action(input: &str) -> Result<Option<String>> {
-    let mut parts = input.split_whitespace();
-    let Some(raw_name) = parts.next() else {
-        return Ok(None);
-    };
-    if normalize_contract_command(raw_name) != "mywebsite" {
-        return Ok(None);
-    }
-
-    let Some(raw_verb) = parts.next() else {
-        return Ok(None);
-    };
-    let verb = normalize_lookup(raw_verb);
-    match verb.as_str() {
-        "status" => Ok(None),
-        "stage" => {
-            let path = parts.collect::<Vec<_>>().join(" ");
-            let path = path.trim();
-            if path.is_empty() {
-                anyhow::bail!("usage: mywebsite stage <dir>");
-            }
-            Ok(Some(format!("site-stage:{path}")))
-        }
-        "preview" | "serve" => Ok(Some("site-local".to_string())),
-        "publish" | "public" | "go-public" => Ok(Some("site-ephemeral".to_string())),
-        "open" => Ok(Some("site-open".to_string())),
-        _ => anyhow::bail!(
-            "unknown MyWebSite command: {raw_verb}. Try status, stage <dir>, preview, publish, or open"
-        ),
     }
 }
 
@@ -617,7 +582,7 @@ fn normalize_debug_command(input: &str) -> String {
         "affordance" | "interface" | "interfaces" | "ifaces" => "affordances".to_string(),
         "gate" => "gates".to_string(),
         "trust" | "provenance" => "audit".to_string(),
-        "roots" | "places" | "mywebsite" | "public" | "local" | "webspaces" => "spaces".to_string(),
+        "roots" | "places" | "public" | "local" | "webspaces" => "spaces".to_string(),
         "shortcuts" | "keys" => "terminal".to_string(),
         "model" | "interface-contract" => "contract".to_string(),
         other => other.to_string(),
@@ -1201,7 +1166,7 @@ fn print_cli_system_section(snapshot: &HomeSnapshot, title: &str, lines: &[Strin
 fn print_cli_spaces(snapshot: &HomeSnapshot, raw_name: &str, arg: &str) {
     let query = space_query_for_command(raw_name, arg);
     if query.is_empty() {
-        print_cli_section(snapshot, "Spaces", &spaces_summary_lines(snapshot));
+        print_cli_section(snapshot, "Spaces", &spaces_summary_lines());
         return;
     }
 
@@ -1214,12 +1179,12 @@ fn print_cli_spaces(snapshot: &HomeSnapshot, raw_name: &str, arg: &str) {
         print_cli_page_header(snapshot, "Spaces");
         println!("Spaces");
         println!("  Unknown root: {}", query.trim());
-        println!("  Try: MyWebSite, Public, Local, WebSpaces");
+        println!("  Try: Public, Local, WebSpaces");
         return;
     };
 
     let title = format!("Spaces / {}", root.name);
-    print_cli_section(snapshot, &title, &space_detail_lines(root, snapshot, 80));
+    print_cli_section(snapshot, &title, &space_detail_lines(root, 80));
 }
 
 fn space_query_for_command(raw_name: &str, arg: &str) -> String {
@@ -1230,57 +1195,11 @@ fn space_query_for_command(raw_name: &str, arg: &str) -> String {
 
     let normalized = normalize_lookup(raw_name);
     match normalized.as_str() {
-        "mywebsite" => "MyWebSite".to_string(),
         "public" => "Public".to_string(),
         "local" => "Local".to_string(),
         "webspaces" => "WebSpaces".to_string(),
         _ => String::new(),
     }
-}
-
-fn print_cli_mywebsite(snapshot: &HomeSnapshot) {
-    print_cli_section(snapshot, "MyWebSite", &mywebsite_task_lines(snapshot));
-}
-
-fn mywebsite_task_lines(snapshot: &HomeSnapshot) -> Vec<String> {
-    let mut lines = vec![
-        format!("Status   {}", website_summary(snapshot)),
-        "Stage    mywebsite stage <dir>".to_string(),
-        format!(
-            "Preview  mywebsite preview ({})",
-            action_state_label(action_by_id(snapshot, "site-local"))
-        ),
-        format!(
-            "Publish  mywebsite publish ({})",
-            action_state_label(action_by_id(snapshot, "site-ephemeral"))
-        ),
-        format!(
-            "Open     mywebsite open ({})",
-            action_state_label(action_by_id(snapshot, "site-open"))
-        ),
-    ];
-
-    if let Some(url) = snapshot.site.local_url.as_deref() {
-        lines.push(format!("Preview  {}", url.trim_end_matches('/')));
-    }
-    if let Some(release) = snapshot.site.active_release.as_deref() {
-        let live = snapshot
-            .site
-            .active_channel
-            .as_deref()
-            .map(|channel| format!("{} on {}", release, channel))
-            .unwrap_or_else(|| release.to_string());
-        lines.push(format!("Live     {live}"));
-    } else if snapshot.site.release_count > 0 {
-        lines.push(format!("Releases {}", snapshot.site.release_count));
-    }
-    if let Some(cid) = snapshot.site.active_bundle_cid.as_deref() {
-        lines.push(format!("Bundle   elastos://{}", cid));
-    }
-    if !snapshot.site.staged {
-        lines.push("Next     stage a directory containing index.html".to_string());
-    }
-    lines
 }
 
 fn print_cli_inbox(snapshot: &HomeSnapshot) {

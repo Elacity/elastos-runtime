@@ -1,6 +1,5 @@
 //! ElastOS Runtime CLI
 
-mod agent_cmd;
 mod capsule_cmd;
 mod capsule_publish_cmd;
 mod chat_cmd;
@@ -9,7 +8,6 @@ mod content_cmd;
 mod gateway_entry;
 mod home_cmd;
 mod identity_cmd;
-mod identity_passkey_hint;
 mod init_cmd;
 mod node_cmd;
 mod provider_host;
@@ -45,7 +43,7 @@ pub(crate) use elastos_server::binaries::{
     resolve_verified_provider_binary, verify_component_binary,
 };
 use elastos_server::{api, runtime, setup};
-pub(crate) use elastos_server::{runtime_control, shell_cmd, sources};
+pub(crate) use elastos_server::{runtime_control, sources};
 
 use runtime::Runtime;
 
@@ -81,7 +79,6 @@ fn should_isolate_process_group(argv: &[String]) -> bool {
 #[command(name = "elastos")]
 #[command(about = "ElastOS - sovereign Home and runtime\n\n\
     Run `elastos` with no subcommand to open Home.\n\
-    Use `elastos serve` for operator-runtime commands.\n\
     All resource access is capability-gated by the local control plane.")]
 #[command(version = ELASTOS_VERSION)]
 struct Cli {
@@ -116,6 +113,7 @@ enum Commands {
     },
 
     /// Start the runtime daemon with HTTP API
+    #[command(hide = true)]
     Serve {
         /// Address to bind to (use 0.0.0.0:3000 for LAN access)
         #[arg(short, long, default_value = "0.0.0.0:3000")]
@@ -135,7 +133,7 @@ enum Commands {
     },
 
     /// Key management commands
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Keys(KeysCommand),
 
     /// Sign a capsule with a private key
@@ -174,7 +172,7 @@ enum Commands {
     },
 
     /// Publish a signed runtime release
-    #[command(name = "publish-release")]
+    #[command(name = "publish-release", hide = true)]
     PublishRelease {
         /// Semantic version for this release
         #[arg(long)]
@@ -216,12 +214,12 @@ enum Commands {
 
         /// Prepare unsigned native inputs for the separately installed custodian signer
         #[arg(long, value_name = "DIR", requires_all = &["platform_inputs", "publisher_did"],
-              conflicts_with_all = &["key", "public_url", "public_with_sudo", "signed_publication", "allow_signer_rotation"])]
+              conflicts_with_all = &["public_url", "public_with_sudo", "signed_publication", "allow_signer_rotation"])]
         prepare_only: Option<PathBuf>,
 
         /// Frozen output from the separately installed custodian signer
         #[arg(long, value_name = "DIR", requires = "publisher_did",
-              conflicts_with_all = &["prepare_only", "key", "platform_inputs", "preview_platform", "skip_build", "skip_rootfs", "cross", "capsules", "public_url", "public_with_sudo"])]
+              conflicts_with_all = &["prepare_only", "platform_inputs", "preview_platform", "skip_build", "skip_rootfs", "cross", "capsules", "public_url", "public_with_sudo"])]
         signed_publication: Option<PathBuf>,
 
         /// Independently approved public signer DID
@@ -231,10 +229,6 @@ enum Commands {
         /// Confirm an operator-approved change to the saved public signer pin
         #[arg(long, requires = "signed_publication")]
         allow_signer_rotation: bool,
-
-        /// Retired: signing belongs to the separate custodian tool
-        #[arg(long, hide = true)]
-        key: Option<PathBuf>,
 
         /// Show the publish plan without building or uploading
         #[arg(long)]
@@ -263,10 +257,6 @@ enum Commands {
         /// Override ipfs-provider binary path
         #[arg(long)]
         ipfs_provider_bin: Option<PathBuf>,
-
-        /// Retired: the approved signing input owns its public bootstrap
-        #[arg(long, hide = true)]
-        allow_no_bootstrap: bool,
     },
 
     /// Share a file or directory through content availability
@@ -296,14 +286,15 @@ enum Commands {
     },
 
     /// Content availability operator commands
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Content(content_cmd::ContentCommand),
 
     /// TLS certificate management
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Tls(TlsCommand),
 
-    /// Launch native P2P chat
+    /// Legacy native P2P chat (#general gossip topic); developer smoke tests only
+    #[command(hide = true)]
     Chat {
         /// Nickname to use
         #[arg(long)]
@@ -335,39 +326,16 @@ enum Commands {
         receipt: std::path::PathBuf,
     },
 
-    /// Launch an AI agent that joins P2P chat and responds via LLM
-    Agent {
-        /// Agent persona name (defaults to a backend-specific persona like `codex`)
-        #[arg(long)]
-        nick: Option<String>,
-
-        /// Gossip channel to join
-        #[arg(long, default_value = "#general")]
-        channel: String,
-
-        /// AI backend to use (local, venice, codex)
-        #[arg(long, default_value = "local")]
-        backend: String,
-
-        /// Respond to all messages, not just @mentions
-        #[arg(long)]
-        respond_all: bool,
-
-        /// Connect to a peer via ticket (deterministic bootstrap)
-        #[arg(long, short = 'c')]
-        connect: Option<String>,
-    },
-
     /// Manage runtime configuration
     #[command(subcommand)]
     Config(ConfigCommand),
 
     /// Offline signed collaboration-network configuration authority
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     CollaborationConfig(elastos_server::collaboration_config::CollaborationConfigCommand),
 
     /// Offline operator provisioning for protected-content custody and chain prerequisites
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     ProtectedContentConfig(elastos_server::protected_content_config::ProtectedContentConfigCommand),
 
     /// Show and manage the local DID-backed profile
@@ -375,7 +343,7 @@ enum Commands {
     Identity(IdentityCommand),
 
     /// Emergency operations (key compromise response)
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Emergency(EmergencyCommand),
 
     /// Initialize a new capsule project
@@ -402,10 +370,11 @@ enum Commands {
 
     /// Launch a packaged capsule by name
     Capsule {
-        /// Capsule name from components registry (for example: chat, agent, did-provider)
+        /// Name of an installed elastos.component/v1 WASM or microVM capsule. Home apps
+        /// open through Home and native providers start on demand; neither runs here.
         name: String,
 
-        /// JSON config payload passed to the capsule (for example: '{"nick":"alice"}')
+        /// JSON object passed to the capsule as its config (for example: '{"key":"value"}')
         #[arg(long)]
         config: Option<String>,
 
@@ -449,11 +418,11 @@ enum Commands {
     Room(RoomCommand),
 
     /// Manage operator peers and safe remote node actions
-    #[command(subcommand)]
+    #[command(subcommand, hide = true)]
     Node(NodeCommand),
 
     /// Sign a payload from stdin with domain-separated Ed25519
-    #[command(name = "sign-payload")]
+    #[command(name = "sign-payload", hide = true)]
     SignPayload {
         /// Domain separator (e.g. "elastos.release.v1")
         #[arg(long)]
@@ -465,6 +434,7 @@ enum Commands {
     },
 
     /// Start the public ElastOS edge for MyWebSite, publisher objects, and CID content
+    #[command(hide = true)]
     Gateway {
         /// Address to bind to (use 0.0.0.0 for public, or use --public)
         #[arg(short, long, default_value = "127.0.0.1:8090")]
@@ -480,18 +450,18 @@ enum Commands {
         publish: Option<PathBuf>,
     },
 
-    /// Install the default runtime profile or an explicit setup profile
+    /// Install Home
     Setup {
-        /// Profile name. Default is `home`. Use `demo` for extras, `chat` for full-screen chat, or `blockchain` for chain/wallet provider development.
-        #[arg(long)]
+        /// Developer: install a named components.json profile instead of `home`
+        #[arg(long, hide = true)]
         profile: Option<String>,
 
-        /// Additional components to install (comma-separated)
-        #[arg(long, value_delimiter = ',')]
+        /// Developer: additional components to install (comma-separated)
+        #[arg(long, hide = true, value_delimiter = ',')]
         with: Vec<String>,
 
-        /// Components to exclude (comma-separated)
-        #[arg(long, value_delimiter = ',')]
+        /// Developer: components to exclude (comma-separated)
+        #[arg(long, hide = true, value_delimiter = ',')]
         without: Vec<String>,
 
         /// List available components and profiles
@@ -520,7 +490,7 @@ enum Commands {
         /// Owner-only secret-free plan with hash-bound object selections
         #[arg(long)]
         plan: PathBuf,
-        /// Fresh directory for owner-only plaintext backups
+        /// Fresh directory for owner-only encrypted rollback copies
         #[arg(long)]
         backup_dir: PathBuf,
     },
@@ -534,6 +504,21 @@ enum Commands {
         /// Fresh owner-only rollback backup under data-dir/backups
         #[arg(long)]
         backup_dir: PathBuf,
+    },
+
+    /// Remove verified migration rollback payload after exact installed Home acceptance
+    #[command(name = "principal-root-cleanup", hide = true)]
+    PrincipalRootCleanup {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        binary: PathBuf,
+        /// Original owner-only plan for a legacy manual backup
+        #[arg(long, requires = "backup_dir")]
+        plan: Option<PathBuf>,
+        /// Exact legacy manual backup directory to reconcile
+        #[arg(long, requires = "plan")]
+        backup_dir: Option<PathBuf>,
     },
 
     /// Admit and install the installer's verified release through the shared writer
@@ -566,47 +551,8 @@ enum Commands {
         #[arg(long)]
         head_cid: Option<String>,
 
-        /// Skip Carrier discovery and require an explicit transport override
-        #[arg(long)]
-        no_p2p: bool,
-
-        /// Explicit transport override URL for HEAD discovery (repeatable, tries in order)
-        #[arg(long = "gateway")]
-        gateways: Vec<String>,
-
         /// Skip confirmation prompt and install immediately
-        #[arg(long, alias = "no-confirm")]
-        yes: bool,
-
-        /// Rollback to a specific release head CID (forces install even if same version)
         #[arg(long)]
-        rollback_to: Option<String>,
-
-        /// Repair an invalid installed version with a verified same or newer release
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Check for and install runtime updates
-    Upgrade {
-        /// Only check for updates, don't install
-        #[arg(long)]
-        check: bool,
-
-        /// HEAD CID (bypasses discovery — operator override)
-        #[arg(long)]
-        head_cid: Option<String>,
-
-        /// Skip Carrier discovery and require an explicit transport override
-        #[arg(long)]
-        no_p2p: bool,
-
-        /// Explicit transport override URL for HEAD discovery (repeatable, tries in order)
-        #[arg(long = "gateway")]
-        gateways: Vec<String>,
-
-        /// Skip confirmation prompt and install immediately
-        #[arg(long, alias = "no-confirm")]
         yes: bool,
 
         /// Rollback to a specific release head CID (forces install even if same version)
@@ -1192,17 +1138,16 @@ pub(crate) enum IdentityCommand {
         #[arg(long, default_value_t = 300)]
         expires_in: u64,
     },
-    /// Print one private hint for an existing older security key (read-only)
-    PasskeyHint {
-        /// Exact public account name; combine with other selectors if ambiguous
+    /// Let the owner of this Home, who lost every passkey, recover it with
+    /// their Recovery Kit and a new passkey (shows a one-time code)
+    ArmOwnerRecovery {
+        /// Exact Home address, as shown on the sign-in screen, e.g. http://localhost:8090
         #[arg(long)]
-        account: Option<String>,
-        /// Exact existing principal ID
+        origin: String,
         #[arg(long)]
-        principal: Option<String>,
-        /// Exact relying-party ID
-        #[arg(long)]
-        rp_id: Option<String>,
+        rp_id: String,
+        #[arg(long, default_value_t = 600)]
+        expires_in: u64,
     },
     /// Manage the profile nickname
     #[command(subcommand)]
@@ -1429,16 +1374,6 @@ async fn run() -> anyhow::Result<()> {
             return elastos_server::update_controller::run(receipt).await;
         }
 
-        Commands::Agent {
-            nick,
-            channel,
-            backend,
-            respond_all,
-            connect,
-        } => {
-            return agent_cmd::run_agent(nick, channel, backend, respond_all, connect).await;
-        }
-
         Commands::Tls(tls_cmd) => {
             security_cmd::run_tls(tls_cmd)?;
         }
@@ -1522,7 +1457,6 @@ async fn run() -> anyhow::Result<()> {
             signed_publication,
             publisher_did,
             allow_signer_rotation,
-            key,
             dry_run,
             preflight_only,
             public_url,
@@ -1530,7 +1464,6 @@ async fn run() -> anyhow::Result<()> {
             gateway_addr,
             public_timeout,
             ipfs_provider_bin,
-            allow_no_bootstrap,
         } => {
             release_cmd::run_publish_release(crate::publish::PublishReleaseOptions {
                 version,
@@ -1546,7 +1479,6 @@ async fn run() -> anyhow::Result<()> {
                 signed_publication,
                 publisher_did,
                 allow_signer_rotation,
-                key,
                 dry_run,
                 preflight_only,
                 public_url,
@@ -1554,7 +1486,6 @@ async fn run() -> anyhow::Result<()> {
                 gateway_addr,
                 public_timeout,
                 ipfs_provider_bin,
-                allow_no_bootstrap,
             })
             .await?;
         }
@@ -1600,7 +1531,7 @@ async fn run() -> anyhow::Result<()> {
         }
 
         Commands::Source(cmd) => {
-            release_cmd::run_source(cmd)?;
+            release_cmd::run_source(cmd).await?;
         }
 
         Commands::PrincipalRootMigrate {
@@ -1627,6 +1558,23 @@ async fn run() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&receipt)?);
         }
 
+        Commands::PrincipalRootCleanup {
+            data_dir,
+            binary,
+            plan,
+            backup_dir,
+        } => {
+            let removed = elastos_server::update_controller::finalize_principal_root_backups(
+                &data_dir,
+                &binary,
+                plan.as_deref().zip(backup_dir.as_deref()),
+            )
+            .await?;
+            println!(
+                "Removed {removed} verified migration backup payload file(s). Receipts retained."
+            );
+        }
+
         Commands::InstallRelease {
             data_dir,
             binary,
@@ -1651,17 +1599,6 @@ async fn run() -> anyhow::Result<()> {
         Commands::Update {
             check,
             head_cid,
-            no_p2p,
-            gateways,
-            yes,
-            rollback_to,
-            force,
-        }
-        | Commands::Upgrade {
-            check,
-            head_cid,
-            no_p2p,
-            gateways,
             yes,
             rollback_to,
             force,
@@ -1669,8 +1606,6 @@ async fn run() -> anyhow::Result<()> {
             release_cmd::run_update_command(
                 check,
                 head_cid,
-                no_p2p,
-                gateways,
                 yes,
                 rollback_to,
                 force,
@@ -1698,8 +1633,8 @@ fn print_first_run_welcome(data_dir: &std::path::Path) {
     );
     println!();
     println!("  Shell policy:    cli (interactive) with TTY, agent (rules) without");
-    println!("  User path:       elastos chat auto-starts after setup");
-    println!("  Operator path:   elastos serve, then elastos run / agent / capsule");
+    println!("  User path:       elastos (opens Home)");
+    println!("  Operator path:   elastos serve, then elastos run / capsule");
     println!();
 }
 
@@ -2311,15 +2246,17 @@ pub(crate) async fn create_runtime(
         }
     }
 
-    let (runtime_config, _) = bootstrap::RuntimeConfig::load(&default_data_dir());
+    let data_dir = default_data_dir();
+    let (runtime_config, _) = bootstrap::RuntimeConfig::load(&data_dir);
     let runtime = Runtime::with_providers_and_component(
         storage,
         compute_providers,
         Some(Arc::new(ComponentProvider::new())),
     );
     runtime
-        .configure_signature_verification(
-            &runtime_config.effective_trusted_keys(),
+        .configure_capsule_admission(
+            &data_dir,
+            &runtime_config.trusted_keys,
             runtime_config.dev_mode,
         )
         .await?;
@@ -2339,17 +2276,14 @@ mod tests {
 
     #[test]
     fn update_cli_accepts_force_only_when_requested() {
-        for command in ["update", "upgrade"] {
+        for command in ["update"] {
             for requested in [false, true] {
                 let mut args = vec!["elastos", command];
                 if requested {
                     args.push("--force");
                 }
                 let cli = super::Cli::try_parse_from(args).unwrap();
-                let Some(
-                    super::Commands::Update { force, .. } | super::Commands::Upgrade { force, .. },
-                ) = cli.command
-                else {
+                let Some(super::Commands::Update { force, .. }) = cli.command else {
                     panic!("expected update command");
                 };
                 assert_eq!(force, requested);
@@ -2521,7 +2455,6 @@ mod tests {
         let Some(super::Commands::PublishRelease {
             prepare_only,
             publisher_did,
-            key,
             ..
         }) = cli.command
         else {
@@ -2529,7 +2462,6 @@ mod tests {
         };
         assert_eq!(prepare_only.unwrap().to_str(), Some("/prepared/unsigned"));
         assert!(publisher_did.unwrap().starts_with("did:key:"));
-        assert!(key.is_none());
         for conflict in [
             vec!["--key", "/custodian/unopened.pem"],
             vec!["--public-url"],
@@ -2561,7 +2493,6 @@ mod tests {
             cli.command,
             Some(super::Commands::PublishRelease {
                 signed_publication: Some(_),
-                key: None,
                 ..
             })
         ));

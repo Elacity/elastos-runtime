@@ -9,6 +9,8 @@ import io
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import sys
 import tempfile
 import unittest
@@ -928,12 +930,20 @@ class CliFixtureTests(unittest.TestCase):
                                    self.root / self.manifest["publications"]["old"]["head"],
                                    "elastos.release.head.v1", self.manifest["signer_did"], observer.cli_environment(self.root))
         with self.assertRaisesRegex(ValueError, "Mach-O"):
-            observer.cli_macho(self.root / self.manifest["publications"]["old"]["binary"], "aarch64-darwin")
+            observer.cli_native_executable(self.root / self.manifest["publications"]["old"]["binary"], "aarch64-darwin")
         native = self.root / "header-only"
         native.write_bytes(b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16)
-        observer.cli_macho(native, "aarch64-darwin")
+        observer.cli_native_executable(native, "aarch64-darwin")
         with self.assertRaisesRegex(ValueError, "architecture"):
-            observer.cli_macho(native, "x86_64-darwin")
+            observer.cli_native_executable(native, "x86_64-darwin")
+        with self.assertRaisesRegex(ValueError, "ELF"):
+            observer.cli_native_executable(native, "x86_64-linux")
+        elf = self.root / "elf-header-only"
+        elf.write_bytes(b"\x7fELF\x02\x01" + b"\0" * 10 + (3).to_bytes(2, "little") + (0x3e).to_bytes(2, "little") + b"\0" * 44)
+        observer.cli_native_executable(elf, "x86_64-linux")
+        for platform_name, error in (("aarch64-linux", "ELF"), ("x86_64-darwin", "Mach-O")):
+            with self.subTest(platform=platform_name), self.assertRaisesRegex(ValueError, error):
+                observer.cli_native_executable(elf, platform_name)
 
     def test_stamped_real_installer_defaults_are_read_without_execution(self):
         actual = Path(__file__).with_name("install.sh").read_text()
@@ -1073,7 +1083,7 @@ class CliFixtureTests(unittest.TestCase):
         observer.write(self.root / "previous-pin.json", {
             "schema": "elastos.update-hop.previous-release/v1", "version": version, "signer_did": envelope["signer_did"],
             "release_cid": "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(raw).digest()).decode().lower().rstrip("="),
-            "release_sha256": hashlib.sha256(raw).hexdigest()})
+            "release_sha256": hashlib.sha256(raw).hexdigest(), "head_cid": observer.cli_v0_cid(b"published head")})
         pin = patch.object(observer, "CLI_PREVIOUS_PIN", self.root / "previous-pin.json")
         pin.start()
         self.addCleanup(pin.stop)
@@ -1137,7 +1147,7 @@ class CliFixtureTests(unittest.TestCase):
         for path in [*(support / "bin" / name for name in observer.CLI_NATIVE_SETUP), *paths]:
             target = path.relative_to(support).as_posix()
             mapping[target] = self.add("setup/" + target, path.read_bytes(), 0o755 if target.startswith("bin/") else 0o600)
-        mapping["fixture-tools/open"] = self.add("setup/opener", b"fixture no-op utility", 0o700)
+        mapping[observer.CLI_OPENER] = self.add("setup/opener", b"fixture no-op utility", 0o700)
         self.manifest["consumer"]["files"].update(mapping)
         for relative in mapping.values():
             self.manifest["holder"]["content"][self.manifest["files"][relative]["cid"]] = relative
@@ -1419,7 +1429,7 @@ class CliFixtureTests(unittest.TestCase):
             code, _, result = self.fake_run()
         self.assertEqual(code, 0, result)
         self.assertIn("state/value", copied)
-        self.assertIn("fixture-tools/open", copied)
+        self.assertIn(observer.CLI_OPENER, copied)
 
     def test_prepare_refuses_setup_support_drift_before_copying_sentinels(self):
         self.setup_fixture()
@@ -1445,7 +1455,7 @@ class CliFixtureTests(unittest.TestCase):
         for path in [*(support / "bin" / name for name in observer.CLI_NATIVE_SETUP), *paths]:
             target = path.relative_to(support).as_posix()
             mapping[target] = self.add("initial/" + target, path.read_bytes(), 0o755 if target.startswith("bin/") else 0o600)
-        mapping["fixture-tools/open"] = self.add("initial/opener", b"fixture no-op utility", 0o700)
+        mapping[observer.CLI_OPENER] = self.add("initial/opener", b"fixture no-op utility", 0o700)
         self.manifest["consumer"]["files"].update(mapping)
         for relative in mapping.values():
             self.manifest["holder"]["content"][self.manifest["files"][relative]["cid"]] = relative
@@ -2104,7 +2114,8 @@ class CliFixtureTests(unittest.TestCase):
             reads.append(path)
             return served[path]
         cache = self.root / "cache"
-        with patch.object(observer, "cli_origin_bytes", side_effect=origin), patch.object(observer.platform, "machine", return_value="arm64"):
+        with patch.object(observer, "cli_origin_bytes", side_effect=origin), patch.object(observer.sys, "platform", "darwin"), \
+             patch.object(observer.platform, "machine", return_value="arm64"):
             for attempt in ("first", "cached"):
                 with self.subTest(attempt=attempt), self.assertRaisesRegex(ValueError, "elastos differs from its signed hash"):
                     observer.cli_fetch_previous_release(cache, self.root / ("fetched-" + attempt))
@@ -2112,17 +2123,22 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual([path.name for path in cache.iterdir()], [pin["release_sha256"]])
         self.assertEqual(reads, [release, "/ipfs/Qmbinary", "/ipfs/Qmbinary"])
 
-    def test_check_result_requires_the_published_system_update_no_new_provider_warnings_and_undo(self):
+    def test_check_result_requires_the_system_updates_refusals_no_new_provider_warnings_and_undo(self):
         def result(pinned="0.8.0-alpha.8"):
+            refusals = {case: {"status": "passed"} for case in observer.CLI_REFUSALS}
             return {"schema": "elastos.update-hop.result/v1", "status": "passed",
                     "old": {"version": pinned}, "new": {"version": "0.8.0-alpha.9"},
                     "previous_release": {"version": pinned},
-                    "paths": {"m1-install": {"checks": {"initial-home": {
+                    "paths": {"m1-install": {"checks": {**refusals, "initial-home": {
                         "system": {"provider_warnings": {"new": []},
-                                   "published_system": {"phase": "updated", "from": pinned, "to": "0.8.0-alpha.9"}},
+                                   "published_system": {"phase": "updated", "from": pinned, "to": "0.8.0-alpha.9"},
+                                   "stages": {"refused": {"current_version": "0.8.0-alpha.9"},
+                                              "next-updated": {"current_version": "0.8.0-alpha.10"}}},
                         "undo": {"status": "passed", "version": pinned,
-                                 "refused_plain_update": {"exit": 1}, "rollback": {"exit": 0}}}}}}}
-        self.assertEqual(observer.cli_check_result(result())["from"], "0.8.0-alpha.8")
+                                 "refused_plain_update": {"exit": 1}, "rollback": {"exit": 0}}}}},
+                              "m2-discovery": {"checks": json.loads(json.dumps(refusals))}}}
+        verdict = observer.cli_check_result(result())
+        self.assertEqual((verdict["from"], verdict["to"], verdict["next"]), ("0.8.0-alpha.8", "0.8.0-alpha.9", "0.8.0-alpha.10"))
         # From 0.8.0-alpha.7 on, a published System installs changed support (#246), by version
         # precedence rather than text; an older pin cannot pass the journey at all.
         for pinned, installs in (("0.8.0-alpha.7", True), ("0.8.0-alpha.10", True), ("0.8.0", True),
@@ -2153,7 +2169,10 @@ class CliFixtureTests(unittest.TestCase):
                   "no Undo": lambda value: home(value).pop("undo"),
                   "published System installed another release": lambda value: home(value)["system"]["published_system"].update(to="0.8.0-alpha.10"),
                   "Undo to another release": lambda value: home(value)["undo"].update(version="0.8.0-alpha.7"),
-                  "plain downgrade applied": lambda value: home(value)["undo"]["refused_plain_update"].update(exit=0)}
+                  "plain downgrade applied": lambda value: home(value)["undo"]["refused_plain_update"].update(exit=0),
+                  "tampered offer applied": lambda value: home(value)["system"]["stages"]["refused"].update(current_version="0.8.0-alpha.10"),
+                  "next release not applied": lambda value: home(value)["system"]["stages"]["next-updated"].update(current_version="0.8.0-alpha.9"),
+                  "CLI refusal failed": lambda value: value["paths"]["m2-discovery"]["checks"]["wrong-platform"].update(status="failed")}
         for name, fault in faults.items():
             with self.subTest(fault=name), self.assertRaises(ValueError):
                 value = result()
@@ -2161,7 +2180,7 @@ class CliFixtureTests(unittest.TestCase):
                 observer.cli_check_result(value)
 
     def test_generator_refuses_operator_or_non_ci_signing(self):
-        with patch.dict(observer.os.environ, {"CI": "false", "GITHUB_ACTIONS": "false"}), self.assertRaisesRegex(ValueError, "native Mac CI"):
+        with patch.dict(observer.os.environ, {"CI": "false", "GITHUB_ACTIONS": "false"}), self.assertRaisesRegex(ValueError, "native Mac or Linux CI"):
             observer.cli_generate_hop(self.root / "generated", *(self.root / "missing" for _ in range(4)), self.root, self.root / "missing")
 
     def test_hop_builder_preserves_n_and_compiles_n_plus_one_with_version_input(self):
@@ -2225,13 +2244,13 @@ class CliFixtureTests(unittest.TestCase):
         if local_rehearsal is not None:
             self.assertEqual((receipt["proof_scope"], receipt["reference"]), ("local-rehearsal", local_rehearsal))
 
-    def test_hop_builder_refuses_a_published_runtime_that_differs_from_its_pin_or_this_mac(self):
+    def test_hop_builder_refuses_a_published_runtime_that_differs_from_its_pin_or_this_host(self):
         header = b"\xcf\xfa\xed\xfe" + (0x0100000c).to_bytes(4, "little") + b"\0" * 4 + (2).to_bytes(4, "little") + b"\0" * 16
         published = self.root / "published-runtime"
         published.write_bytes(header + b"published")
         previous, _ = self.previous_release(published)
         for machine, substituted, message in (("arm64", True, "previous release Runtime differs from its signed hash"),
-                                              ("x86_64", False, "previous release has no build for this Mac")):
+                                              ("x86_64", False, "previous release has no build for this host")):
             with self.subTest(machine=machine):
                 (previous / "elastos").write_bytes(header + (b"substituted" if substituted else b"published"))
                 with patch.dict(observer.os.environ, {"CI": "true", "GITHUB_ACTIONS": "true"}), patch.object(observer.sys, "platform", "darwin"), \
@@ -2871,6 +2890,148 @@ class CliFixtureTests(unittest.TestCase):
             self.assertEqual(server.fallback_requests, 1)
         finally:
             server.close()
+
+
+class PreviousReleaseInstallTests(unittest.TestCase):
+    """install-previous-release against scripted Runtimes: the published install.sh installs the
+    current Runtime, and only `update --rollback-to` the pinned head lays the pinned release down."""
+
+    PLATFORM = "linux-amd64"
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        for target in (patch.object(observer.sys, "platform", "linux"), patch.object(observer.platform, "machine", return_value="x86_64")):
+            target.start()
+            self.addCleanup(target.stop)
+
+    def published(self, case):
+        """The pinned release as Runtime installs it, its signed release and components, and the pin."""
+        root = self.root / case
+        installed, stage = root / "installed", root / "stage"
+        builder = re.search(r"(?ms)^create_capsule_tar\(\) \{\n.*?^\}\n", Path(__file__).with_name("publish-release.sh").read_text())[0]
+
+        def put(path, raw, mode):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+            path.chmod(mode)
+
+        def entry(raw, release_path, **extra):
+            return {"cid": observer.cli_v0_cid(raw), "checksum": "sha256:" + hashlib.sha256(raw).hexdigest(), "size": len(raw),
+                    "release_path": release_path, **extra}
+        external, archives, natives = {}, {}, {}
+        for name in (*observer.CLI_WEB_CAPSULES, "localhost-provider"):
+            web = name != "localhost-provider"
+            capsule = ({"name": name, "entrypoint": "browser/index.html", "execution": "web-projection"} if web
+                       else {"name": name, "role": "provider", "entrypoint": "rootfs.ext4", "icon": "icons"})
+            files = ({"browser/index.html": b"<html>" + name.encode() + b"</html>", "browser/app.js": b"export {};"} if web
+                     else {"icons/icon-" + str(size) + ".png": b"icon " + str(size).encode() for size in (32, 64, 128, 256)})
+            for relative, raw in {"capsule.json": json.dumps({"schema": "elastos.capsule/v1", **capsule}).encode(), **files}.items():
+                put(stage / name / relative, raw, 0o644)
+                # Runtime extracts under an owner-only umask.
+                put(installed / "capsules" / name / relative, raw, 0o600)
+            archive = root / "published" / (name + ".tar.gz")
+            archive.parent.mkdir(exist_ok=True)
+            subprocess.run(["bash", "-c", builder + 'create_capsule_tar "$@"', "bash", str(archive), str(stage), name], check=True)
+            archives[name] = archive.read_bytes()
+            release_path = name + ".tar.gz" if web else observer.CLI_LOCALHOST_METADATA
+            signed = entry(archives[name], release_path, extract_path=name, install_path="capsules/" + name)
+            for receipt, value in zip(observer.CLI_HOME_CACHE, (signed["cid"], signed["checksum"].removeprefix("sha256:"))):
+                put(installed / "capsules" / name / receipt, value.encode() + b"\n", 0o600)
+            if web:
+                external[name] = {"install_path": "capsules/" + name, "platforms": {"*": signed}}
+            else:
+                metadata = {"install_path": "capsules/" + name, "platforms": {"*": signed}}
+        for name in ("ipfs-provider", "localhost-provider", *observer.CLI_PROTECTED_PROVIDERS, "custody-provider"):
+            natives[name] = b"native " + name.encode()
+            put(installed / "bin" / name, natives[name], 0o755)
+            external[name] = {"install_path": "bin/" + name, "platforms": {self.PLATFORM: entry(
+                natives[name], name + "-" + self.PLATFORM, install_path="bin/" + name)}}
+        external["localhost-provider"]["capsule_metadata"] = metadata
+        # Kubo's upstream archive is not rebuilt; setup's receipts bind what it extracted.
+        natives["kubo"] = b"kubo executable"
+        put(installed / "bin/kubo", natives["kubo"], 0o755)
+        kubo = entry(b"upstream kubo archive", "kubo-" + self.PLATFORM + ".tar.gz")
+        for receipt, value in ((".elastos-cid", kubo["cid"]), (".elastos-artifact-sha256", kubo["checksum"].removeprefix("sha256:")),
+                               (".elastos-executable-sha256", hashlib.sha256(natives["kubo"]).hexdigest()), ("ipfs", natives["kubo"].decode())):
+            put(installed / "capsules/kubo" / receipt, value.encode(), 0o600)
+        external["kubo"] = {"platforms": {self.PLATFORM: {**kubo, "extract_path": "kubo/ipfs", "install_path": "bin/kubo"}},
+                            "capsule_metadata": {"install_path": "capsules/kubo", "platforms": {
+                                self.PLATFORM: {**kubo, "extract_path": "kubo", "install_path": "capsules/kubo"}}}}
+        observer.write(installed / "components.json", {"schema": "elastos.components/v1", "capsules": {}, "external": external,
+                                                       "profiles": {"home": {"components": list(observer.CLI_SETUP_COMPONENTS)}}})
+        pinned, current = root / "pinned-elastos", root / "current-elastos"
+        pinned.write_bytes(b"#!/bin/sh\n# the pinned Runtime\n")
+        source = {key: subprocess.check_output(["git", "rev-parse", ref], cwd=Path(__file__).resolve().parents[1], text=True).strip()
+                  for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))}
+        artifacts = {key: {"cid": observer.cli_v0_cid(path.read_bytes()), "sha256": observer.digest(path), "size": path.stat().st_size}
+                     for key, path in (("binary", pinned), ("components", installed / "components.json"))}
+        envelope = signing_fixture.sign_envelope({"schema": "elastos.release/v1", "channel": "canary", "version": "0.8.0-alpha.8",
+                                                  "source": source, "platforms": {"x86_64-linux": artifacts}}, "elastos.release.v1", b"\x07" * 32)
+        (installed / "installation").mkdir()
+        observer.write(installed / "installation/release.json", envelope)
+        raw = (installed / "installation/release.json").read_bytes()
+        observer.write(root / "pin.json", {"schema": "elastos.update-hop.previous-release/v1", "version": "0.8.0-alpha.8",
+                                           "release_cid": observer.cli_v0_cid(raw), "release_sha256": hashlib.sha256(raw).hexdigest(),
+                                           "head_cid": observer.cli_v0_cid(b"pinned head"), "signer_did": envelope["signer_did"]})
+        data = '"$HOME"/' + shlex.quote(observer.CLI_DATA)
+        current.write_text("#!/bin/bash\nset -eu\ncase $1 in\nsetup) exit ;;\n"
+                           "update) [ \"$2 $3 $4\" = '--rollback-to " + observer.cli_v0_cid(b"pinned head") + " --yes' ] ;;\n*) exit 1 ;;\nesac\n"
+                           "cp -R " + shlex.quote(str(installed)) + "/. " + data + "/\n"
+                           "cp " + shlex.quote(str(pinned)) + ' "$HOME/.local/bin/elastos.new"\n'
+                           'mv -f "$HOME/.local/bin/elastos.new" "$HOME/.local/bin/elastos"\n')
+        installer = ("set -eu\n[ \"$1\" = --install-only ]\nmkdir -p \"$HOME/.local/bin\" " + data + "\n"
+                     "cp " + shlex.quote(str(current)) + ' "$HOME/.local/bin/elastos"\nchmod 755 "$HOME/.local/bin/elastos"\n')
+        return {"root": root, "installed": installed, "archives": archives, "natives": natives, "pinned": pinned,
+                "installer": installer.encode()}
+
+    def install(self, fixture):
+        def origin(path, limit):
+            self.assertEqual(path, "/install.sh")
+            return fixture["installer"]
+        with patch.object(observer, "cli_origin_bytes", side_effect=origin):
+            return observer.cli_install_previous_release(fixture["root"] / "home", fixture["root"] / "previous", fixture["root"] / "pin.json")
+
+    def test_pinned_head_cid_is_the_cidv0_the_seed_serves_the_head_bytes_under(self):
+        # `ipfs add` of "hello world\n"; pin-previous-release derives head_cid the same way.
+        cid = "QmT78zSuBmuS4z925WZfrqQ1qHaJ56DQaTfyMUF7F8ff5o"
+        self.assertEqual(observer.cli_v0_cid(b"hello world\n"), cid)
+        observer.cli_metadata_cid(cid, b"hello world\n")
+        with self.assertRaisesRegex(ValueError, "CID bytes differ"):
+            observer.cli_metadata_cid(cid, b"hello world")
+
+    def test_rollback_yields_the_fetched_layout_with_the_exact_signed_archives(self):
+        fixture = self.published("pinned")
+        self.assertEqual(self.install(fixture)["release"]["version"], "0.8.0-alpha.8")
+        previous, support = fixture["root"] / "previous", fixture["root"] / "previous/support"
+        self.assertEqual(sorted(path.name for path in previous.iterdir()), sorted(
+            ["release.json", "elastos", "components.json", "install.sh", "support", observer.CLI_LOCALHOST_METADATA, "previous.json"]))
+        self.assertEqual((previous / "elastos").read_bytes(), fixture["pinned"].read_bytes())
+        # generate-ci-hop republishes the exact signed metadata archive and qualifies each web capsule.
+        self.assertEqual((previous / observer.CLI_LOCALHOST_METADATA).read_bytes(), fixture["archives"]["localhost-provider"])
+        for name in observer.CLI_WEB_CAPSULES:
+            observer.cli_qualified_home(support, self.PLATFORM, name)
+        self.assertEqual({name: (support / "bin" / name).read_bytes() for name in fixture["natives"]}, fixture["natives"])
+        self.assertFalse((fixture["root"] / "home").exists())
+
+    def test_rollback_refuses_installed_bytes_that_differ_from_the_pin_or_their_signed_hash(self):
+        def tamper(relative):
+            return lambda fixture: (fixture["installed"] / relative).write_bytes(b"tampered")
+        faults = {"release.json differs from its signed hash": tamper("installation/release.json"),
+                  "artifacts/home.tar.gz differs from its signed hash": tamper("capsules/home/browser/app.js"),
+                  "artifacts/ipfs-provider-linux-amd64 differs from its signed hash": tamper("bin/ipfs-provider"),
+                  "installed kubo differs from its signed archive": tamper("capsules/kubo/.elastos-artifact-sha256"),
+                  "support/bin/kubo differs from its signed hash": tamper("bin/kubo"),
+                  "localhost-provider-capsule-metadata.tar.gz differs from its signed hash": tamper("capsules/localhost-provider/icons/icon-32.png"),
+                  "previous release Home step failed: update --rollback-to": lambda fixture: observer.write(
+                      fixture["root"] / "pin.json", {**observer.cli_json(fixture["root"] / "pin.json"), "head_cid": observer.cli_v0_cid(b"other head")})}
+        for index, (message, fault) in enumerate(faults.items()):
+            with self.subTest(fault=message):
+                fixture = self.published("fault-" + str(index))
+                fault(fixture)
+                with self.assertRaisesRegex(ValueError, re.escape(message)):
+                    self.install(fixture)
 
 
 if __name__ == "__main__":

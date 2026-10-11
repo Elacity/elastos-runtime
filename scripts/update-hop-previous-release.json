@@ -1,4 +1,5 @@
 {
+  "head_cid": "QmUjzbkAaxa8StyyqL5qswtvFu2k6b6GqU552KkGLG8omY",
   "release_cid": "QmWMfyHQ3iFKtc2ERUCmhQ8DnWcxQKK7SzME1U2mqQJuYh",
   "release_sha256": "f474477590d2e84b1761144afb70c1449948b2c61f87aa427e4db5fe9146d04b",
   "schema": "elastos.update-hop.previous-release/v1",

@@ -105,7 +105,9 @@ try {
   if (mode === "--home-only") {
     stage = "engine_absent_refusal";
     const recovery = "This source Home needs its local model engine. Install the engine through source setup, then Retry.";
-    await marketplace.getByText(recovery, { exact: true }).waitFor({ state: "visible", timeout: 90000 });
+    // Get returns before model preparation finishes. The first refusal uses
+    // the same bounded preparation window as the model-ready journey.
+    await marketplace.getByText(recovery, { exact: true }).waitFor({ state: "visible", timeout: readyMs });
     const unavailable = (await projection(marketplace, "/api/capsules/catalog")).capsules.find(row => row.cid === cid)?.model_runtime;
     assert.equal(unavailable?.admitted, true, "engine refusal preserves admitted content");
     assert.equal(unavailable?.dispatch_ready, false);

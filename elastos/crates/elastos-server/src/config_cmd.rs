@@ -33,10 +33,10 @@ pub fn run_config(cmd: crate::ConfigCommand) -> anyhow::Result<()> {
 }
 
 fn updated_config(contents: &str, key: &str, value: &str) -> anyhow::Result<String> {
-    if key == "developer_mode" {
+    if key == "developer_mode" || key == "protected_content" {
         value
             .parse::<bool>()
-            .context("developer_mode requires true or false")?;
+            .with_context(|| format!("{key} requires true or false"))?;
     }
     if key == "gateway_public_publisher_bootstrap" {
         value

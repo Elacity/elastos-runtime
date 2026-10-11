@@ -1497,26 +1497,14 @@ impl Supervisor {
             return Ok(dest);
         }
 
-        if platform_info.release_path.is_some() {
-            crate::setup::install_first_party_component_via_carrier(
-                &self.data_dir,
-                name,
-                platform_info,
-                &dest,
-                crate::setup::FirstPartyCarrierContext::Runtime,
-            )
-            .await?;
-            return Ok(dest);
-        }
-
-        let url = platform_info
-            .url
-            .as_deref()
-            .with_context(|| format!("no URL for '{name}' on '{platform}'"))?;
-
-        // Download using existing setup infrastructure
-        crate::setup::run_download(name, url, platform_info, &dest).await?;
-
+        crate::setup::install_first_party_component_via_carrier(
+            &self.data_dir,
+            name,
+            platform_info,
+            &dest,
+            crate::setup::FirstPartyCarrierContext::Runtime,
+        )
+        .await?;
         Ok(dest)
     }
 

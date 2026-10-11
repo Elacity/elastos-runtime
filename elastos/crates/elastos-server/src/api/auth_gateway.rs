@@ -656,6 +656,121 @@ pub async fn passkey_authenticate_complete(
     }
 }
 
+const OWNER_RECOVERY_HEADER: &str = "x-elastos-owner-recovery";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerRecoveryCompleteRequest {
+    pub ceremony_id: String,
+    pub response: RegistrationResponse,
+    #[serde(default)]
+    pub bundle: Option<Value>,
+    #[serde(default)]
+    pub package: Option<Value>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+fn owner_recovery_code(headers: &HeaderMap) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    let code = headers
+        .get(OWNER_RECOVERY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .ok_or(crate::auth::OwnerEnrollmentDenied)?;
+    Ok(zeroize::Zeroizing::new(code.to_string()))
+}
+
+/// Sign-in screen: start a passkey for an operator-armed owner recovery.
+pub async fn owner_recovery_begin(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    match owner_recovery_begin_inner(&state, &headers).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => auth_error_response(err),
+    }
+}
+
+async fn owner_recovery_begin_inner(
+    state: &GatewayState,
+    headers: &HeaderMap,
+) -> anyhow::Result<PasskeyBeginResponse<CreationOptions>> {
+    let ceremony_id = format!("passkey:owner-recovery:{}", random_hex(16));
+    let rp = super::handlers::identity::derive_rp(headers)?;
+    let code = owner_recovery_code(headers)?;
+    let manager = state.identity_manager()?;
+    let mut manager = manager.lock().await;
+    let options = crate::auth::begin_owner_recovery(
+        &state.data_dir,
+        &mut manager,
+        &crate::auth::OwnerRecoveryClient {
+            origin: &rp.origin,
+            rp_id: &rp.id,
+            code: &code,
+        },
+        &ceremony_id,
+    )?;
+    Ok(PasskeyBeginResponse {
+        schema: "elastos.auth.passkey.register.begin/v1".into(),
+        ceremony_id,
+        options,
+        guest_client_cookie: None,
+    })
+}
+
+/// Sign-in screen: bind the new passkey to the admin's Recovery Kit.
+pub async fn owner_recovery_complete(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(input): Json<OwnerRecoveryCompleteRequest>,
+) -> Response {
+    match owner_recovery_complete_inner(&state, &headers, input).await {
+        Ok(response) => passkey_verified_response(&headers, response),
+        Err(err) => auth_error_response(err),
+    }
+}
+
+async fn owner_recovery_complete_inner(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    input: OwnerRecoveryCompleteRequest,
+) -> anyhow::Result<PasskeyVerifyResponse> {
+    let rp = super::handlers::identity::derive_rp(headers)?;
+    let code = owner_recovery_code(headers)?;
+    let client = crate::auth::OwnerRecoveryClient {
+        origin: &rp.origin,
+        rp_id: &rp.id,
+        code: &code,
+    };
+    // Armed, unexpired and the right code before any password or Kit work.
+    crate::auth::check_owner_recovery_code(&state.data_dir, &client)?;
+    let bundle = full_recovery_bundle_from_parts(
+        input.bundle.as_ref(),
+        input.package.as_ref(),
+        input.password.as_deref(),
+    )
+    .map_err(|_| crate::auth::OwnerEnrollmentDenied)?;
+    let kit: RecoveryKitV1 = serde_json::from_value(
+        bundle
+            .get("data_kit")
+            .cloned()
+            .ok_or(crate::auth::OwnerEnrollmentDenied)?,
+    )?;
+    let manager = state.identity_manager()?;
+    let mut manager = manager.lock().await;
+    let grant = crate::auth::complete_owner_recovery(
+        &state.data_dir,
+        &mut manager,
+        &client,
+        &input.ceremony_id,
+        &input.response,
+        &kit,
+    )?;
+    drop(manager);
+    passkey_response_for_grant(state, grant)
+}
+
 pub async fn revoke_session(
     State(state): State<GatewayState>,
     Path(session_id): Path<String>,
@@ -1057,6 +1172,22 @@ pub(in crate::api) fn principal_root_recovery_is_ready(
 pub fn verify_configured_principal_roots_ready(data_dir: &std::path::Path) -> anyhow::Result<()> {
     let declarations = configured_principal_root_upgrade_declarations(data_dir)?;
     crate::auth::verify_declared_principal_roots_ready(data_dir, &declarations)
+}
+
+/// Caller first proves the exact installed Home generation is ready and holds
+/// the installation writer throughout that proof and cleanup.
+pub(crate) fn finalize_configured_principal_root_migrations_with_writer(
+    data_dir: &std::path::Path,
+    binary: &std::path::Path,
+    writer: &crate::install_transaction::InstallationGuard,
+) -> anyhow::Result<usize> {
+    let declarations = configured_principal_root_upgrade_declarations(data_dir)?;
+    crate::auth::finalize_declared_principal_root_migrations(
+        data_dir,
+        &declarations,
+        binary,
+        writer,
+    )
 }
 
 pub fn migrate_configured_principal_roots_offline(
@@ -1709,19 +1840,26 @@ async fn full_recovery_bundle_import_inner(
 fn full_recovery_bundle_from_import_request(
     input: &FullRecoveryBundleImportRequest,
 ) -> anyhow::Result<Value> {
-    if input.bundle.is_some() == input.package.is_some() {
+    full_recovery_bundle_from_parts(
+        input.bundle.as_ref(),
+        input.package.as_ref(),
+        input.password.as_deref(),
+    )
+}
+
+fn full_recovery_bundle_from_parts(
+    bundle: Option<&Value>,
+    package: Option<&Value>,
+    password: Option<&str>,
+) -> anyhow::Result<Value> {
+    if bundle.is_some() == package.is_some() {
         anyhow::bail!("import exactly one full recovery bundle or package");
     }
-    if let Some(bundle) = input.bundle.as_ref() {
+    if let Some(bundle) = bundle {
         return Ok(bundle.clone());
     }
-    let package = input
-        .package
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("missing full recovery bundle package"))?;
-    let password = input
-        .password
-        .as_deref()
+    let package = package.ok_or_else(|| anyhow::anyhow!("missing full recovery bundle package"))?;
+    let password = password
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("full recovery bundle password is required"))?;
@@ -2485,6 +2623,25 @@ async fn recovery_kit_import_inner(
             "recovered principal root is not canonical for the recovered principal",
         );
     }
+    // Prove the Kit against this Home before any key material or protection
+    // activation is written, so a refused reassignment leaves nothing behind.
+    if input.reassign_to_current_principal {
+        if let Err(err) = crate::auth::ensure_recovered_root_reassignable(
+            &state.data_dir,
+            &principal.proof_binding_id,
+            &kit.principal_id,
+            &kit.localhost_root,
+            &kit.data_key_id,
+        ) {
+            return fail_recovery_kit_request(
+                state,
+                &context,
+                &principal,
+                "auth.recovery_kit.import.rejected",
+                format!("recovery root reassignment failed: {err}"),
+            );
+        }
+    }
     let now = crate::auth::now_ts();
     let candidate_data_key = crate::auth::recovery_kit_data_key(&kit)?;
     let mut protection = protection_from_recovery_kit(
@@ -2520,33 +2677,10 @@ async fn recovery_kit_import_inner(
             &candidate_data_key,
             &protected_object_inventory,
         )?;
-    let archive = crate::auth::recovery_archive_from_kit(&state.data_dir, &kit)?;
-    let recovery_protector = protection
-        .protectors
-        .iter_mut()
-        .find(|protector| {
-            protector.kind == elastos_runtime::auth::PrincipalRootProtectorKind::RecoveryKit
-        })
-        .ok_or_else(|| anyhow::anyhow!("candidate protection has no Recovery Kit protector"))?;
-    recovery_protector.archive = Some(archive);
     if let Some(protector) = verified_did_recovery_protector {
         protection.protectors.push(protector);
     }
     if input.reassign_to_current_principal {
-        if let Err(err) = crate::auth::ensure_recovered_root_reassignable(
-            &state.data_dir,
-            &principal.proof_binding_id,
-            &kit.principal_id,
-            &kit.localhost_root,
-        ) {
-            return fail_recovery_kit_request(
-                state,
-                &context,
-                &principal,
-                "auth.recovery_kit.import.rejected",
-                format!("recovery root reassignment failed: {err}"),
-            );
-        }
         let proof_binding_id = principal.proof_binding_id.clone();
         let grant = AuthSessionGrantV1 {
             schema: AuthSessionGrantV1::SCHEMA.to_string(),
@@ -2593,6 +2727,7 @@ async fn recovery_kit_import_inner(
                 recovered_principal_id: kit.principal_id.clone(),
                 recovered_localhost_root: kit.localhost_root.clone(),
                 protection,
+                kit: kit.clone(),
                 replacement_grant: grant,
                 signed_audit_event,
                 updated_at: now,
@@ -2621,6 +2756,7 @@ async fn recovery_kit_import_inner(
         });
     }
 
+    crate::auth::attach_recovery_archive(&state.data_dir, &mut protection, &kit)?;
     crate::auth::store_principal_root_protection(&state.data_dir, protection)?;
     crate::auth::append_audit_event(
         &state.data_dir,
@@ -7580,6 +7716,19 @@ mod tests {
                 1_800_000_000,
             )
             .unwrap();
+            let archive = crate::auth::recovery_archive_from_kit(temp.path(), &kit).unwrap();
+            crate::auth::store_principal_root_protection(
+                temp.path(),
+                protection_from_recovery_kit(
+                    &kit,
+                    Some("Recovered root"),
+                    RecoveryKitDelivery::HandedToPerson,
+                    1_800_000_000,
+                    Some(archive),
+                )
+                .unwrap(),
+            )
+            .unwrap();
             crate::auth::revoke_passkey_binding(
                 temp.path(),
                 &recovered.proof_binding_id,
@@ -7598,6 +7747,15 @@ mod tests {
             let current_principal = crate::auth::load_principal_for_proof_binding(
                 temp.path(),
                 &current.proof_binding_id,
+            )
+            .unwrap();
+            let protection_before = serde_json::to_value(
+                crate::auth::load_principal_root_protection(
+                    temp.path(),
+                    &kit.principal_id,
+                    &kit.localhost_root,
+                )
+                .unwrap(),
             )
             .unwrap();
             crate::auth::inject_recovery_reassignment_test_fault(temp.path(), fault);
@@ -7643,13 +7801,18 @@ mod tests {
                     && stored.grant.proof_binding_id == current.proof_binding_id
                     && stored.grant.principal_id == recovered_principal.principal_id
             }));
-            assert!(crate::auth::load_principal_root_protection(
-                temp.path(),
-                &kit.principal_id,
-                &kit.localhost_root,
-            )
-            .unwrap()
-            .is_none());
+            assert_eq!(
+                serde_json::to_value(
+                    crate::auth::load_principal_root_protection(
+                        temp.path(),
+                        &kit.principal_id,
+                        &kit.localhost_root,
+                    )
+                    .unwrap()
+                )
+                .unwrap(),
+                protection_before
+            );
         }
     }
 
@@ -7686,6 +7849,19 @@ mod tests {
             &old_principal.localhost_root,
             Some("orphaned root"),
             1_800_000_000,
+        )
+        .unwrap();
+        let archive = crate::auth::recovery_archive_from_kit(temp.path(), &kit).unwrap();
+        crate::auth::store_principal_root_protection(
+            temp.path(),
+            protection_from_recovery_kit(
+                &kit,
+                Some("Orphaned root"),
+                RecoveryKitDelivery::HandedToPerson,
+                1_800_000_000,
+                Some(archive),
+            )
+            .unwrap(),
         )
         .unwrap();
         crate::auth::revoke_passkey_binding(
@@ -7788,6 +7964,20 @@ mod tests {
             1_800_000_000,
         )
         .unwrap();
+        // The admin made this Kit on this Home, so the Home holds its root binding.
+        let archive = crate::auth::recovery_archive_from_kit(temp.path(), &kit).unwrap();
+        crate::auth::store_principal_root_protection(
+            temp.path(),
+            protection_from_recovery_kit(
+                &kit,
+                Some("Admin Kit"),
+                RecoveryKitDelivery::HandedToPerson,
+                1_800_000_000,
+                Some(archive),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let current = issue_passkey_session_grant(
             &state,
             "identity-test",
@@ -7828,6 +8018,11 @@ mod tests {
                 .unwrap();
         assert_eq!(recovered.principal_id, active_principal.principal_id);
         assert_eq!(recovered.localhost_root, active_principal.localhost_root);
+        assert_eq!(recovered.role, crate::auth::RuntimePrincipalRole::Admin);
+        assert_eq!(
+            crate::auth::active_admin_passkey_principal_count(temp.path()).unwrap(),
+            1
+        );
         assert!(!crate::auth::is_auth_session_active(
             temp.path(),
             &active.session_id,
@@ -7840,6 +8035,119 @@ mod tests {
             crate::auth::now_ts()
         )
         .unwrap());
+    }
+
+    #[tokio::test]
+    async fn recovery_kit_import_refuses_fabricated_kit_for_admin_principal() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        seed_test_passkey_principal(
+            &state,
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        seed_test_passkey_principal(
+            &state,
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
+        let admin = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            true,
+            "admin passkey grant",
+        )
+        .unwrap();
+        let admin_principal =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &admin.proof_binding_id)
+                .unwrap();
+        let guest = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            true,
+            "guest passkey grant",
+        )
+        .unwrap();
+        let guest_principal =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &guest.proof_binding_id)
+                .unwrap();
+        let archive_key_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), "ElastOS/System/Auth")
+                .unwrap()
+                .join("recovery-archive.key");
+        // Correct admin id and canonical root, the guest's own secret, no root objects.
+        let fabricated = create_recovery_kit_for_principal(
+            &admin_principal.principal_id,
+            &admin_principal.localhost_root,
+            Some("fabricated"),
+            1_800_000_000,
+        )
+        .unwrap();
+        for stored_binding in [false, true] {
+            if stored_binding {
+                let genuine = create_recovery_kit_for_principal(
+                    &admin_principal.principal_id,
+                    &admin_principal.localhost_root,
+                    Some("genuine"),
+                    1_800_000_000,
+                )
+                .unwrap();
+                let archive =
+                    crate::auth::recovery_archive_from_kit(temp.path(), &genuine).unwrap();
+                crate::auth::store_principal_root_protection(
+                    temp.path(),
+                    protection_from_recovery_kit(
+                        &genuine,
+                        Some("Admin Kit"),
+                        RecoveryKitDelivery::HandedToPerson,
+                        1_800_000_000,
+                        Some(archive),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            let key_before = std::fs::read(&archive_key_path).ok();
+            let principals_before = serde_json::to_value(
+                crate::auth::load_auth_state(temp.path())
+                    .unwrap()
+                    .principals,
+            )
+            .unwrap();
+
+            let err = recovery_kit_import_inner(
+                &state,
+                &home_token_headers(&guest.home_token),
+                RecoveryKitMaterialImport {
+                    principal_id: guest_principal.principal_id.clone(),
+                    localhost_root: guest_principal.localhost_root.clone(),
+                    reassign_to_current_principal: true,
+                    kit: fabricated.clone(),
+                    did_recovery_proof: None,
+                },
+            )
+            .await
+            .expect_err("a fabricated Kit must not take over the admin");
+
+            assert!(err.to_string().contains("root key"), "{err}");
+            // Only the denial is recorded; no principal, role or key material changes.
+            let after = crate::auth::load_auth_state(temp.path()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&after.principals).unwrap(),
+                principals_before
+            );
+            assert_eq!(
+                after.audit.last().unwrap().event_type,
+                "auth.recovery_kit.import.rejected"
+            );
+            assert_eq!(std::fs::read(&archive_key_path).ok(), key_before);
+        }
     }
 
     #[tokio::test]

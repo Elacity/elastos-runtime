@@ -4878,52 +4878,23 @@ async function checkShellSwitchJourney(page, homeToken) {
     switchedToCli = true;
     await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
     await waitForSignedHome(page);
-    const chatCliFrame = await waitForCapsuleFrame(page, "home-cli");
-    await chatCliFrame.waitForFunction(() => (
+    const directCliFrame = await waitForCapsuleFrame(page, "home-cli");
+    await directCliFrame.waitForFunction(() => (
       document.body?.dataset?.runtimeTerminal === "attached" &&
       document.querySelector("#xterm-terminal")?.hidden === false
     ), null, { timeout: 20_000 });
 
-    markStage("shell-switch:cli-open-chat");
-    await pressHomeCliKey(chatCliFrame, "1");
-    await chatCliFrame.waitForFunction(() => (
-      (document.querySelector("#xterm-terminal")?.textContent || "").includes("Type /home to return Home")
-    ), null, { timeout: 30_000 });
-    const chatHost = await page.evaluate(() => ({
-      body: { ...document.body.dataset },
-      frame_src: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
-      host_gui_dom_present: Boolean(document.querySelector(
-        "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
-      )),
+    markStage("shell-switch:cli-home-tabs");
+    await directCliFrame.waitForFunction(() => (
+      /Home\s+Inbox\s+People\s+Apps\s+System/.test(document.querySelector("#xterm-terminal")?.textContent || "")
+    ), null, { timeout: 20_000 });
+    const cliHome = await directCliFrame.evaluate(() => ({
+      offers_native_chat: (document.querySelector("#xterm-terminal")?.textContent || "").includes("Chat [ready]"),
     }));
-    const chatTerminal = await chatCliFrame.evaluate(() => {
-      const terminalText = document.querySelector("#xterm-terminal")?.textContent || "";
-      return {
-        terminal_has_chat_prompt: terminalText.includes("Type /home to return Home"),
-        terminal_has_chat_identity: terminalText.includes("Chat #general as "),
-      };
-    });
-    const chatNative = { host: chatHost, terminal: chatTerminal };
-    assert(chatHost.frame_src.includes("/apps/home-cli/"), "CLI Chat replaced the root shell", chatNative);
-    assert(!chatHost.host_gui_dom_present, "CLI Chat instantiated Home GUI DOM", chatNative);
-    assert(!capsuleFrameForTarget(page, "home-gui"), "CLI Chat loaded Home GUI", {
-      frames: page.frames().map((frame) => frame.url()),
-    });
-    assert(chatTerminal.terminal_has_chat_prompt, "Home CLI did not enter CLI Chat", chatNative);
-    assert(chatTerminal.terminal_has_chat_identity, "Home CLI Chat did not show its identity", chatNative);
-
-    markStage("shell-switch:cli-chat-return-home");
-    const cliTextarea = await homeCliXtermTextarea(chatCliFrame);
-    await cliTextarea.pressSequentially("/home");
-    await cliTextarea.press("Enter");
-    await chatCliFrame.waitForFunction(() => {
-      const terminalText = document.querySelector("#xterm-terminal")?.textContent || "";
-      return /Home\s+Inbox\s+People\s+Apps\s+System/.test(terminalText) &&
-        terminalText.includes("Chat [ready]");
-    }, null, { timeout: 20_000 });
+    assert(!cliHome.offers_native_chat, "Home CLI still offers the native #general Chat", cliHome);
 
     markStage("shell-switch:cli-browser-boundary");
-    await pressHomeCliKey(chatCliFrame, "b");
+    await pressHomeCliKey(directCliFrame, "b");
     await page.waitForTimeout(500);
     const browserBoundary = {
       host: await page.evaluate(() => ({
@@ -4933,7 +4904,7 @@ async function checkShellSwitchJourney(page, homeToken) {
           "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
         )),
       })),
-      cli: await chatCliFrame.evaluate(() => ({
+      cli: await directCliFrame.evaluate(() => ({
         runtime_terminal: document.body?.dataset?.runtimeTerminal || "",
         terminal_text_tail: (document.querySelector("#xterm-terminal")?.textContent || "").slice(-2000),
       })),
@@ -4947,7 +4918,7 @@ async function checkShellSwitchJourney(page, homeToken) {
       shell_options: shellOptions,
       cli_root: { fills_viewport: true, origin: cliState.origin, terminal_ready: true },
       restored,
-      chat_cli: chatNative,
+      cli_home: cliHome,
       browser_boundary: browserBoundary,
     };
   } finally {

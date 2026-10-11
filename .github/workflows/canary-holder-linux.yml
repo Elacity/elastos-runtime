@@ -4,7 +4,29 @@ name: Canary Linux holder
 
 on:
   pull_request:
-    paths: [capsules/ipfs-provider/**, elastos/crates/elastos-runtime/src/provider/registry.rs, elastos/crates/elastos-server/src/ipfs.rs, elastos/crates/elastos-server/src/server_infra.rs, elastos/crates/elastos-server/src/gateway_entry.rs, elastos/crates/elastos-server/src/gateway_cmd.rs, scripts/holder-idle-ci.py, .github/workflows/canary-holder-linux.yml]
+    # scripts/ci-release-policy-test.py requires every repository input the
+    # holder job's scripts call to match these paths.
+    paths:
+      - .github/workflows/canary-holder-linux.yml
+      - rust-toolchain.toml
+      - .cargo/config.toml
+      - components.json
+      - capsules/ipfs-provider/**
+      - elastos/capsules/localhost-provider/**
+      - elastos/crates/elastos-common/**
+      - elastos/crates/elastos-guest/**
+      - elastos/Cargo.toml
+      - elastos/Cargo.lock
+      - elastos/crates/elastos-runtime/src/provider/registry.rs
+      - elastos/crates/elastos-server/src/ipfs.rs
+      - elastos/crates/elastos-server/src/server_infra.rs
+      - elastos/crates/elastos-server/src/gateway_entry.rs
+      - elastos/crates/elastos-server/src/gateway_cmd.rs
+      - scripts/holder-idle-ci.py
+      - scripts/update-hop-compare.py
+      - scripts/seed-kubo-cache.sh
+      - scripts/release-upstream-input.py
+      - scripts/release-upstream-recipes.json
   workflow_dispatch:
 
 permissions:

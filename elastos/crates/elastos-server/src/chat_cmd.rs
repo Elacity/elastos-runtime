@@ -261,18 +261,6 @@ pub async fn run_chat(nick: Option<String>, connect: Option<String>) -> anyhow::
     run_native_chat_with_runtime(nick, connect, coords).await
 }
 
-pub(crate) async fn run_chat_from_home(
-    nick: Option<String>,
-    connect: Option<String>,
-    coords: crate::runtime_control::RuntimeCoords,
-) -> anyhow::Result<()> {
-    let data_dir = default_data_dir();
-    let connect = resolve_chat_bootstrap(connect, &data_dir).await;
-    let _logging_guard = LoggingSuppressionGuard::enter();
-
-    run_native_chat_with_runtime(nick, connect, coords).await
-}
-
 async fn run_native_chat_with_runtime(
     requested_nick: Option<String>,
     connect: Option<ChatBootstrap>,

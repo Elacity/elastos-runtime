@@ -257,6 +257,9 @@ fn run_source_command_with_confirmation(
     let mut config = load_trusted_sources(data_dir)?;
 
     match cmd {
+        SourceCommand::FetchFile { .. } => {
+            anyhow::bail!("Carrier file fetch requires the asynchronous source handler")
+        }
         SourceCommand::Add {
             name,
             publisher,
@@ -529,10 +532,144 @@ fn run_source_command_with_confirmation(
     Ok(())
 }
 
+fn validate_file_pins(cid: &str, sha256: &str, size: u64) -> anyhow::Result<()> {
+    let parsed: cid::Cid = cid.parse()?;
+    anyhow::ensure!(
+        parsed.to_string() == cid,
+        "Artifact CID must use its canonical spelling"
+    );
+    anyhow::ensure!(
+        sha256.len() == 64
+            && sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "Artifact SHA-256 must be lowercase hexadecimal"
+    );
+    anyhow::ensure!(
+        size > 0 && size <= 16 * 1024 * 1024 * 1024,
+        "Artifact size must be 1..16 GiB"
+    );
+    Ok(())
+}
+
+async fn admit_file_download(
+    file: &mut tokio::fs::File,
+    sha256: &str,
+    size: u64,
+) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    anyhow::ensure!(
+        file.metadata().await?.len() == size,
+        "Artifact length differs from its pin"
+    );
+    file.rewind().await?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    anyhow::ensure!(
+        hex::encode(digest.finalize()) == sha256,
+        "Artifact checksum differs from its pin"
+    );
+    file.sync_all().await?;
+    Ok(())
+}
+
+/// Build-time artifact acquisition uses the normal bounded Carrier file stream.
+/// Publisher identity and independently supplied bytes pins remain separate inputs.
+pub async fn fetch_source_file(
+    data: &Path,
+    name: &str,
+    cid: &str,
+    sha256: &str,
+    size: u64,
+    output: &Path,
+) -> anyhow::Result<()> {
+    validate_file_pins(cid, sha256, size)?;
+    let config = load_trusted_sources(data)?;
+    let source = config
+        .sources
+        .iter()
+        .find(|source| source.name == name)
+        .ok_or_else(|| anyhow::anyhow!("Named artifact source is absent"))?;
+    let peer: iroh::PublicKey = source.publisher_node_id.parse()?;
+    anyhow::ensure!(
+        peer.to_string() == source.publisher_node_id,
+        "Artifact source requires one canonical Carrier node ID"
+    );
+    anyhow::ensure!(
+        !output.exists() && output.symlink_metadata().is_err(),
+        "Artifact output already exists"
+    );
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    crate::install_transaction::require_controller_update_space(parent, size)?;
+    let temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut file = tokio::fs::File::from_std(temporary.as_file().try_clone()?);
+    let mut displayed = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let mut checked = 0;
+    let mut progress = |received: u64, total: u64| -> anyhow::Result<()> {
+        if received == 0
+            || received == total
+            || received.saturating_sub(checked) >= 16 * 1024 * 1024
+        {
+            crate::install_transaction::require_controller_update_space(
+                parent,
+                total.saturating_sub(received),
+            )?;
+            checked = received;
+        }
+        if received == 0
+            || received == total
+            || displayed.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            eprintln!("Artifact download: {received}/{total} bytes");
+            displayed = std::time::Instant::now();
+        }
+        Ok(())
+    };
+    crate::carrier::fetch_file_from_trusted_source_to_bound(
+        source,
+        cid,
+        &mut file,
+        size,
+        &mut progress,
+        None,
+    )
+    .await?;
+    admit_file_download(&mut file, sha256, size).await?;
+    drop(file);
+    temporary.persist_noclobber(output)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 /// The SourceCommand enum — CLI definition for `elastos source` subcommand.
 /// Kept here so that the handler can reference it directly.
 #[derive(clap::Subcommand)]
 pub enum SourceCommand {
+    /// Stream a pinned immutable artifact from an explicitly trusted Carrier source
+    FetchFile {
+        #[arg(long)]
+        source: String,
+        /// Canonical CID, served as the publisher's immutable artifact filename
+        #[arg(long)]
+        cid: String,
+        #[arg(long)]
+        sha256: String,
+        #[arg(long)]
+        size: u64,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Add or update a trusted release source
     Add {
         /// Source name (unique identifier)
@@ -590,6 +727,52 @@ pub enum SourceCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_pins_require_canonical_content_identity_and_bounded_bytes() {
+        let multihash = cid::multihash::Multihash::<64>::wrap(0x12, &[1u8; 32]).unwrap();
+        let cid = cid::Cid::new_v1(0x55, multihash).to_string();
+        let hash = "ab".repeat(32);
+        validate_file_pins(&cid, &hash, 1).unwrap();
+        for (id, checksum, size) in [
+            ("../file", hash.as_str(), 1),
+            (cid.as_str(), "ABCDEF", 1),
+            (cid.as_str(), hash.as_str(), 0),
+            (cid.as_str(), hash.as_str(), 16 * 1024 * 1024 * 1024 + 1),
+        ] {
+            assert!(validate_file_pins(id, checksum, size).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn file_admission_checks_actual_bytes_and_size_before_publication() {
+        use sha2::{Digest, Sha256};
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temporary.path(), b"verified artifact").unwrap();
+        let mut file = tokio::fs::File::from_std(temporary.as_file().try_clone().unwrap());
+        let hash = hex::encode(Sha256::digest(b"verified artifact"));
+        admit_file_download(&mut file, &hash, 17).await.unwrap();
+        assert!(admit_file_download(&mut file, &hash, 18).await.is_err());
+        assert!(admit_file_download(&mut file, &"00".repeat(32), 17)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn file_fetch_requires_an_explicit_named_source_before_creating_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let multihash = cid::multihash::Multihash::<64>::wrap(0x12, &[1u8; 32]).unwrap();
+        let cid = cid::Cid::new_v1(0x55, multihash).to_string();
+        let output = dir.path().join("artifact");
+        let error = fetch_source_file(dir.path(), "missing", &cid, &"00".repeat(32), 1, &output)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Named artifact source is absent"));
+        assert!(!output.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     // RFC 8032 public DID and a disposable pre-signed envelope from install-bootstrap-test.py.
     // These tests use public verification data only.

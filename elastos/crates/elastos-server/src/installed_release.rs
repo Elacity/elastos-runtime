@@ -666,4 +666,4 @@ fn sync(path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -372,8 +372,12 @@ fn parse_meminfo(text: &str) -> Result<HostMemory, LocalLlamaFault> {
     })
 }
 
-/// Lowers `available` to the tightest `memory.max - memory.current` among the
-/// process's cgroup v2 ancestors. A missing or unreadable level has no limit.
+/// Lowers `available` to the tightest cgroup v2 ancestor headroom: `memory.max`
+/// minus the memory the group cannot reclaim. `memory.current` includes page
+/// cache, which the kernel reclaims before it enforces the limit (a model just
+/// fetched sits there), so reclaimable file pages from `memory.stat` are not used.
+/// A level without both limit files has no limit; without a readable
+/// `memory.stat` all of `memory.current` counts as used.
 #[cfg(any(target_os = "linux", test))]
 fn cgroup_available(
     groups: &str,
@@ -392,14 +396,32 @@ fn cgroup_available(
     }
     while path.starts_with(root) {
         let number = |file: &str| read(&path.join(file))?.trim().parse::<u64>().ok();
-        if let (Some(limit), Some(used)) = (number("memory.max"), number("memory.current")) {
-            available = available.min(limit.saturating_sub(used));
+        if let (Some(limit), Some(current)) = (number("memory.max"), number("memory.current")) {
+            let cache = read(&path.join("memory.stat")).map_or(0, |stat| file_cache(&stat));
+            available = available.min(limit.saturating_sub(current.saturating_sub(cache)));
         }
         if path == root || !path.pop() {
             break;
         }
     }
     available
+}
+
+/// Reclaimable page cache of one cgroup: its `active_file + inactive_file`
+/// LRU pages, as `MemAvailable` counts host page cache, less dirty and
+/// writeback pages, which must reach disk before they can be dropped. The
+/// type-based `file` counter is not used because it also holds tmpfs and
+/// shared memory.
+#[cfg(any(target_os = "linux", test))]
+fn file_cache(stat: &str) -> u64 {
+    let field = |name: &str| {
+        stat.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let lru = field("active_file").saturating_add(field("inactive_file"));
+    lru.saturating_sub(field("file_dirty").saturating_add(field("file_writeback")))
 }
 
 #[cfg(target_os = "macos")]
@@ -611,6 +633,63 @@ mod tests {
             cgroup_available("4:memory:/home\n", &root, 6 * GIB, read),
             6 * GIB
         );
+    }
+
+    #[test]
+    fn cgroup_v2_page_cache_is_not_counted_as_used() {
+        // Linux hop after a Qwen Get: a 7680 MiB limit with 3395 MiB current,
+        // 3274 MiB of it file LRU cache; 64 MiB tmpfs is in `file` but not on
+        // the file LRUs.
+        let root = crate::test_support::temp_root_path("model-provider-memory", "cache");
+        let group = root.join("hop.slice");
+        std::fs::create_dir_all(&group).unwrap();
+        std::fs::write(group.join("memory.max"), format!("{}\n", 7680 * MIB)).unwrap();
+        std::fs::write(group.join("memory.current"), format!("{}\n", 3395 * MIB)).unwrap();
+        let read = |path: &Path| std::fs::read_to_string(path).ok();
+        let groups = "0::/hop.slice\n";
+        // Without memory.stat all of memory.current counts as used.
+        assert_eq!(cgroup_available(groups, &root, 8 * GIB, read), 4285 * MIB);
+        let stat = |extra: &[(&str, u64)]| {
+            [
+                ("anon", 57),
+                ("file", 3338),
+                ("file_mapped", 12),
+                ("shmem", 64),
+                ("inactive_anon", 121),
+                ("active_anon", 0),
+                ("inactive_file", 1321),
+                ("active_file", 1953),
+            ]
+            .iter()
+            .chain(extra)
+            .map(|(key, mib)| format!("{key} {}\n", mib * MIB))
+            .collect::<String>()
+        };
+        std::fs::write(group.join("memory.stat"), stat(&[])).unwrap();
+        // Used is 3395 - (1953 + 1321) = 121 MiB; tmpfs stays used.
+        assert_eq!(
+            cgroup_available(groups, &root, 8 * GIB, read),
+            (7680 - 121) * MIB
+        );
+        // The host MemAvailable reading still caps the cgroup headroom.
+        assert_eq!(
+            cgroup_available(groups, &root, 7098 * MIB, read),
+            7098 * MIB
+        );
+        // Dirty and writeback file pages must be written before reclaim, so
+        // they stay used: 121 + 200 + 56 MiB.
+        std::fs::write(
+            group.join("memory.stat"),
+            stat(&[("file_dirty", 200), ("file_writeback", 56)]),
+        )
+        .unwrap();
+        assert_eq!(
+            cgroup_available(groups, &root, 8 * GIB, read),
+            (7680 - 377) * MIB
+        );
+        // More dirty than LRU pages leaves no reclaimable cache, not a negative one.
+        std::fs::write(group.join("memory.stat"), stat(&[("file_dirty", 4000)])).unwrap();
+        assert_eq!(cgroup_available(groups, &root, 8 * GIB, read), 4285 * MIB);
     }
 
     #[test]

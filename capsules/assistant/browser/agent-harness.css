@@ -1970,6 +1970,20 @@ html[data-agent-reasoning="off"] .agent-thinking {
   text-wrap: balance;
 }
 
+.agent-harness-empty-action {
+  margin-top: 16px;
+  padding: 8px 16px;
+  border: 1px solid color-mix(in srgb, var(--text) 18%, transparent);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
 .agent-msg-meta {
   margin: 4px 2px 0;
   padding: 0 2px;
@@ -3344,6 +3358,10 @@ html[data-agent-reasoning="off"] .agent-thinking {
   place-items: center;
   font-size: 20px;
   font-weight: 300;
+}
+
+.agent-tool-btn[hidden] {
+  display: none;
 }
 
 .agent-tool-btn:hover,

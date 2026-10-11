@@ -1645,16 +1645,21 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert_eq!(wallet["route"], "/apps/wallet/");
     assert_eq!(wallet["attach_kind"], "iframe");
     assert_eq!(wallet["target_kind"], "app");
-    let browser = targets
-        .iter()
-        .find(|target| target["target"] == "browser")
-        .expect("browser target");
-    assert_eq!(browser["role"], "app");
-    assert_eq!(browser["title"], "Browser");
-    assert_eq!(browser["description"], "Browse websites from this device.");
-    assert_eq!(browser["route"], "/apps/browser/");
-    assert_eq!(browser["attach_kind"], "iframe");
-    assert_eq!(browser["target_kind"], "app");
+    let browser = targets.iter().find(|target| target["target"] == "browser");
+    if crate::setup::browser_available(&crate::setup::detect_platform()) {
+        let browser = browser.expect("browser target");
+        assert_eq!(browser["role"], "app");
+        assert_eq!(browser["title"], "Browser");
+        assert_eq!(browser["description"], "Browse websites from this device.");
+        assert_eq!(browser["route"], "/apps/browser/");
+        assert_eq!(browser["attach_kind"], "iframe");
+        assert_eq!(browser["target_kind"], "app");
+    } else {
+        assert!(
+            browser.is_none(),
+            "Browser is hidden on hosts without a local Engine"
+        );
+    }
     assert!(targets
         .iter()
         .all(|target| target["target"] != "wallet-metamask"));
@@ -4375,7 +4380,12 @@ async fn test_recovery_readiness_projects_unavailable_and_first_profile_fails_cl
         .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
-    assert_eq!(file_snapshot(dir.path()), before);
+    let mut after = file_snapshot(dir.path());
+    assert_eq!(
+        after.remove("ElastOS/System/Auth/principal-root-lifecycle.lock"),
+        Some(Vec::new())
+    );
+    assert_eq!(after, before);
     assert!(
         crate::collaboration_profile_authority::load_profile_authority(
             dir.path(),
@@ -6787,8 +6797,70 @@ async fn test_window_policy_survives_discovery_catalog_and_home_launch() {
 }
 
 #[tokio::test]
+async fn test_home_active_shell_without_developer_mode_resets_terminal_to_desktop() {
+    let dir = tempfile::tempdir().unwrap();
+    write_test_browser_capsule(
+        dir.path(),
+        "home-cli",
+        "shell",
+        "Home CLI",
+        Some("<!doctype html><title>Home CLI</title>"),
+    );
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let state_uri = format!("{localhost_root}/.AppData/ElastOS/Home/active-shell.json");
+    let state_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &state_uri).unwrap();
+    write_home_principal_object_json_for_authority(
+        dir.path(),
+        &authority,
+        "active-shell.json",
+        json!({
+            "schema": "elastos.home.active-shell/v1",
+            "principal_id": authority.principal_id.clone(),
+            "localhost_root": localhost_root.clone(),
+            "active": "home-cli"
+        }),
+    );
+
+    let (status, payload) = home_test_get_json(
+        &app,
+        "/api/apps/home/summary",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active_shell"]["active"], HOME_GUI_SHELL_ID);
+    assert!(!payload["active_shell"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate["name"] == "home-cli"));
+    let saved = std::fs::read_to_string(&state_path).unwrap();
+    assert!(saved.contains(r#""active": "home-gui""#), "{saved}");
+
+    let selected = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"active":"home-cli"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
     write_test_browser_capsule(
         dir.path(),
         "home-cli",
@@ -7311,6 +7383,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
 #[tokio::test]
 async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launch_failure() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
     let state = test_state(dir.path());
     std::fs::remove_file(dir.path().join("capsules/home-cli").join("home-cli.wasm")).unwrap();
     let app = gateway_router(state);
@@ -9584,6 +9657,7 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_execution_gr
     assert!(!left.path().join("config/exit-provider.json").exists());
     assert!(alice.exit_provider.requests.lock().await.is_empty());
     let grant = grant.clone();
+    super::remote_engine::config(right.path());
     let status = crate::carrier::probe_browser_engine(&consumer_registry, &grant, "status", None)
         .await
         .unwrap();

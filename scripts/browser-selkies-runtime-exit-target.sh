@@ -316,6 +316,7 @@ container_name="elastos-selkies-runtime-exit-target-$$"
 wheel_container=""
 local_exit_pid=""
 control_pid=""
+owner_watch_pid=""
 terminating=0
 
 dump_diagnostics() {
@@ -331,6 +332,14 @@ cleanup() {
   if [[ "$status" != "0" && "$terminating" != "1" ]]; then
     dump_diagnostics
   fi
+  if [[ -n "$owner_watch_pid" ]]; then
+    kill "$owner_watch_pid" >/dev/null 2>&1 || true
+    wait "$owner_watch_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$control_pid" && -S "$out_dir/selkies-control.sock" ]]; then
+    curl --silent --show-error --max-time 25 --unix-socket "$out_dir/selkies-control.sock" \
+      -H 'Content-Type: application/json' -d '{}' http://localhost/shutdown >/dev/null || true
+  fi
   if [[ -n "$control_pid" ]]; then
     kill "$control_pid" >/dev/null 2>&1 || true
   fi
@@ -344,6 +353,21 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'if [[ "${ELASTOS_BROWSER_DUMP_DIAGNOSTICS_ON_TERM:-0}" == "1" ]]; then dump_diagnostics; fi; terminating=1; exit 143' TERM INT
+if [[ -n "${ELASTOS_UPDATE_PARENT_PIPE:-}" ]]; then
+  # Runtime owns this pipe across the transient Node launcher.
+  owner_pid="$$"
+  owner_fd="${ELASTOS_UPDATE_PARENT_PIPE%%:*}"
+  python3 -c '
+import os, select, signal, sys
+fd, owner = map(int, sys.argv[1:])
+while os.getppid() == owner:
+    if select.select([fd], [], [], 1)[0] and not os.read(fd, 1):
+        if os.getppid() == owner:
+            os.kill(owner, signal.SIGTERM)
+        break
+' "$owner_fd" "$owner_pid" &
+  owner_watch_pid="$!"
+fi
 
 if [[ ! -x "$local_exit_bin" || ! -x "$native_proxy_bin" ]]; then
   cargo_bin="${CARGO:-}"

@@ -138,9 +138,6 @@ cargo build --manifest-path "$ROOT/capsules/chain-provider/Cargo.toml" --release
 cargo build --manifest-path "$ROOT/capsules/net-provider/Cargo.toml" --release >/dev/null
 cargo build --manifest-path "$ROOT/capsules/exit-provider/Cargo.toml" --release >/dev/null
 cargo build --manifest-path "$ROOT/capsules/browser-engine-adapter/Cargo.toml" --release >/dev/null
-cargo build --manifest-path "$ROOT/elastos/tools/browser-engine-supervisor/Cargo.toml" --release >/dev/null
-cargo build --manifest-path "$ROOT/elastos/tools/browser-native-proxy-engine/Cargo.toml" --release >/dev/null
-cargo build --manifest-path "$ROOT/elastos/tools/browser-stream-bridge/Cargo.toml" --release >/dev/null
 cargo build --manifest-path "$ROOT/elastos/tools/browser-local-exit/Cargo.toml" --release >/dev/null
 cargo build --manifest-path "$ROOT/capsules/webspace-provider/Cargo.toml" --release >/dev/null
 cargo build --manifest-path "$ROOT/capsules/wallet-provider/Cargo.toml" --release >/dev/null
@@ -194,7 +191,7 @@ SETUP_PLATFORM="$(host_platform)"
 mkdir -p "$SOURCE_RUNTIME_DATA_DIR/bin"
 install -m 755     "$ROOT/elastos/target/release/localhost-provider"     "$SOURCE_RUNTIME_DATA_DIR/bin/localhost-provider"
 
-COMPONENTS_SRC="$SOURCE_COMPONENTS_MANIFEST" COMPONENTS_DEST="$SOURCE_RUNTIME_DATA_DIR/components.json" DATA_DIR="$SOURCE_RUNTIME_DATA_DIR" PUBLISHER_ROOT="$SOURCE_RUNTIME_DATA_DIR/ElastOS/SystemServices/Publisher" SETUP_PLATFORM="$SETUP_PLATFORM" SHELL_BIN="$ROOT/elastos/target/release/shell" LOCALHOST_PROVIDER_BIN="$ROOT/elastos/target/release/localhost-provider" DID_PROVIDER_BIN="$ROOT/capsules/did-provider/target/release/did-provider" CHAIN_PROVIDER_BIN="$ROOT/capsules/chain-provider/target/release/chain-provider" NET_PROVIDER_BIN="$ROOT/capsules/net-provider/target/release/net-provider" EXIT_PROVIDER_BIN="$ROOT/capsules/exit-provider/target/release/exit-provider" BROWSER_ENGINE_ADAPTER_BIN="$ROOT/capsules/browser-engine-adapter/target/release/browser-engine-adapter" BROWSER_ENGINE_SUPERVISOR_BIN="$ROOT/elastos/tools/browser-engine-supervisor/target/release/browser-engine-supervisor" BROWSER_NATIVE_PROXY_ENGINE_BIN="$ROOT/elastos/tools/browser-native-proxy-engine/target/release/browser-native-proxy-engine" BROWSER_STREAM_BRIDGE_BIN="$ROOT/elastos/tools/browser-stream-bridge/target/release/browser-stream-bridge" BROWSER_LOCAL_EXIT_BIN="$ROOT/elastos/tools/browser-local-exit/target/release/browser-local-exit" WEBSPACE_PROVIDER_BIN="$ROOT/capsules/webspace-provider/target/release/webspace-provider" WALLET_PROVIDER_BIN="$ROOT/capsules/wallet-provider/target/release/wallet-provider" OBJECT_PROVIDER_BIN="$ROOT/capsules/object-provider/target/release/object-provider" CONTENT_BLOCK_GRAPH_PROVIDER_BIN="$ROOT/capsules/content-block-graph-provider/target/release/content-block-graph-provider" HOME_CLI_DIR="$SOURCE_HOME_CLI_DIR" HOME_CAPSULE_DIR="$SOURCE_HOME_DIR" HOME_GUI_CAPSULE_DIR="$SOURCE_HOME_GUI_DIR" SYSTEM_CAPSULE_DIR="$SOURCE_SYSTEM_DIR" SERVICES_CAPSULE_DIR="$SOURCE_SERVICES_DIR" PEOPLE_CAPSULE_DIR="$SOURCE_PEOPLE_DIR" BROWSER_CAPSULE_DIR="$SOURCE_BROWSER_DIR" DOCUMENTS_CAPSULE_DIR="$SOURCE_DOCUMENTS_DIR" LIBRARY_CAPSULE_DIR="$SOURCE_LIBRARY_DIR" MARKETPLACE_CAPSULE_DIR="$SOURCE_MARKETPLACE_DIR" ARCHIVE_MANAGER_CAPSULE_DIR="$SOURCE_ARCHIVE_MANAGER_DIR" INBOX_CAPSULE_DIR="$SOURCE_INBOX_DIR" WALLET_CAPSULE_DIR="$SOURCE_WALLET_DIR" WALLET_METAMASK_CAPSULE_DIR="$SOURCE_WALLET_METAMASK_DIR" WALLET_UNISAT_CAPSULE_DIR="$SOURCE_WALLET_UNISAT_DIR" WALLET_WALLETCONNECT_CAPSULE_DIR="$SOURCE_WALLET_WALLETCONNECT_DIR" python3 - <<'PY2'
+COMPONENTS_SRC="$SOURCE_COMPONENTS_MANIFEST" COMPONENTS_DEST="$SOURCE_RUNTIME_DATA_DIR/components.json" DATA_DIR="$SOURCE_RUNTIME_DATA_DIR" PUBLISHER_ROOT="$SOURCE_RUNTIME_DATA_DIR/ElastOS/SystemServices/Publisher" SETUP_PLATFORM="$SETUP_PLATFORM" SHELL_BIN="$ROOT/elastos/target/release/shell" LOCALHOST_PROVIDER_BIN="$ROOT/elastos/target/release/localhost-provider" DID_PROVIDER_BIN="$ROOT/capsules/did-provider/target/release/did-provider" CHAIN_PROVIDER_BIN="$ROOT/capsules/chain-provider/target/release/chain-provider" NET_PROVIDER_BIN="$ROOT/capsules/net-provider/target/release/net-provider" EXIT_PROVIDER_BIN="$ROOT/capsules/exit-provider/target/release/exit-provider" BROWSER_ENGINE_ADAPTER_BIN="$ROOT/capsules/browser-engine-adapter/target/release/browser-engine-adapter" BROWSER_LOCAL_EXIT_BIN="$ROOT/elastos/tools/browser-local-exit/target/release/browser-local-exit" WEBSPACE_PROVIDER_BIN="$ROOT/capsules/webspace-provider/target/release/webspace-provider" WALLET_PROVIDER_BIN="$ROOT/capsules/wallet-provider/target/release/wallet-provider" OBJECT_PROVIDER_BIN="$ROOT/capsules/object-provider/target/release/object-provider" CONTENT_BLOCK_GRAPH_PROVIDER_BIN="$ROOT/capsules/content-block-graph-provider/target/release/content-block-graph-provider" HOME_CLI_DIR="$SOURCE_HOME_CLI_DIR" HOME_CAPSULE_DIR="$SOURCE_HOME_DIR" HOME_GUI_CAPSULE_DIR="$SOURCE_HOME_GUI_DIR" SYSTEM_CAPSULE_DIR="$SOURCE_SYSTEM_DIR" SERVICES_CAPSULE_DIR="$SOURCE_SERVICES_DIR" PEOPLE_CAPSULE_DIR="$SOURCE_PEOPLE_DIR" BROWSER_CAPSULE_DIR="$SOURCE_BROWSER_DIR" DOCUMENTS_CAPSULE_DIR="$SOURCE_DOCUMENTS_DIR" LIBRARY_CAPSULE_DIR="$SOURCE_LIBRARY_DIR" MARKETPLACE_CAPSULE_DIR="$SOURCE_MARKETPLACE_DIR" ARCHIVE_MANAGER_CAPSULE_DIR="$SOURCE_ARCHIVE_MANAGER_DIR" INBOX_CAPSULE_DIR="$SOURCE_INBOX_DIR" WALLET_CAPSULE_DIR="$SOURCE_WALLET_DIR" WALLET_METAMASK_CAPSULE_DIR="$SOURCE_WALLET_METAMASK_DIR" WALLET_UNISAT_CAPSULE_DIR="$SOURCE_WALLET_UNISAT_DIR" WALLET_WALLETCONNECT_CAPSULE_DIR="$SOURCE_WALLET_WALLETCONNECT_DIR" python3 - <<'PY2'
 import hashlib
 import json
 import os
@@ -226,9 +223,6 @@ mapping = {
     "net-provider": pathlib.Path(os.environ["NET_PROVIDER_BIN"]),
     "exit-provider": pathlib.Path(os.environ["EXIT_PROVIDER_BIN"]),
     "browser-engine-adapter": pathlib.Path(os.environ["BROWSER_ENGINE_ADAPTER_BIN"]),
-    "browser-engine-supervisor": pathlib.Path(os.environ["BROWSER_ENGINE_SUPERVISOR_BIN"]),
-    "browser-native-proxy-engine": pathlib.Path(os.environ["BROWSER_NATIVE_PROXY_ENGINE_BIN"]),
-    "browser-stream-bridge": pathlib.Path(os.environ["BROWSER_STREAM_BRIDGE_BIN"]),
     "browser-local-exit": pathlib.Path(os.environ["BROWSER_LOCAL_EXIT_BIN"]),
     "webspace-provider": pathlib.Path(os.environ["WEBSPACE_PROVIDER_BIN"]),
     "wallet-provider": pathlib.Path(os.environ["WALLET_PROVIDER_BIN"]),
@@ -386,9 +380,6 @@ for installed in \
     "$HOME_DIR/xdg-data/elastos/bin/chain-provider" \
     "$HOME_DIR/xdg-data/elastos/bin/exit-provider" \
     "$HOME_DIR/xdg-data/elastos/bin/browser-engine-adapter" \
-    "$HOME_DIR/xdg-data/elastos/bin/browser-engine-supervisor" \
-    "$HOME_DIR/xdg-data/elastos/bin/browser-native-proxy-engine" \
-    "$HOME_DIR/xdg-data/elastos/bin/browser-stream-bridge" \
     "$HOME_DIR/xdg-data/elastos/bin/browser-local-exit" \
     "$HOME_DIR/xdg-data/elastos/bin/object-provider" \
     "$HOME_DIR/xdg-data/elastos/bin/wallet-provider" \
@@ -474,28 +465,17 @@ def shutdown(master: int, proc: subprocess.Popen) -> None:
     finally:
         os.close(master)
 
-def run_chat_case(label: str, payload: bytes) -> None:
+def run_repeated_action_case() -> None:
+    # Two actions in a row must keep Home open (the second one used to quit
+    # with "provider localhost/delete failed [403 Forbidden]").
     master, proc = launch_pty()
     try:
-        read_until(label, master, lambda text: "ElastOS Home" in text, 10.0)
-        send(master, b"\r\n")
-        chat = read_until(
-            label,
-            master,
-            lambda text: "Chat #general as " in text,
-            20.0,
-        )
-        if "Press Enter again" in chat:
-            raise SystemExit(f"{label}: Chat still requires a second launch confirmation:\n{chat}")
-        send(master, payload, 0.5)
-        after_exit = read_until(
-            label,
-            master,
-            lambda text: "ElastOS Home" in text,
-            8.0,
-        )
-        if "ElastOS Home" not in after_exit:
-            raise SystemExit(f"{label}: exit input did not return Home:\n{after_exit}")
+        read_until("repeat", master, lambda text: "ElastOS Home" in text, 10.0)
+        for attempt in (1, 2):
+            send(master, b"r", 0.5)
+            screen = read_until("repeat", master, lambda text: "ElastOS Home" in text, 8.0)
+            if proc.poll() is not None or "ElastOS Home" not in screen or "Error:" in screen:
+                raise SystemExit(f"repeat: Home did not stay open after action {attempt}:\n{screen}")
     finally:
         shutdown(master, proc)
 
@@ -505,7 +485,7 @@ def run_navigation_case() -> None:
         initial = read_until(
             "nav",
             master,
-            lambda text: "\x1b[30;46;1m Home \x1b[0m" in text and "> 1 Chat [ready]" in text,
+            lambda text: "\x1b[30;46;1m Home \x1b[0m" in text,
             10.0,
         )
         if "\x1b[30;46;1m Home \x1b[0m" not in initial:
@@ -532,78 +512,16 @@ def run_navigation_case() -> None:
         after_tab_again = read_until(
             "nav",
             master,
-            lambda text: "\x1b[30;46;1m Spaces \x1b[0m" in text,
+            lambda text: "\x1b[30;46;1m Apps \x1b[0m" in text,
             4.0,
         )
-        if "\x1b[30;46;1m Spaces \x1b[0m" not in after_tab_again:
-            raise SystemExit(f"nav: second tab did not switch from People to Spaces:\n{after_tab_again}")
+        if "\x1b[30;46;1m Apps \x1b[0m" not in after_tab_again:
+            raise SystemExit(f"nav: second tab did not switch from People to Apps:\n{after_tab_again}")
     finally:
         shutdown(master, proc)
-
-def run_down_navigation_case() -> None:
-    master, proc = launch_pty()
-    try:
-        initial = read_until(
-            "nav-down",
-            master,
-            lambda text: "> 1 Chat [ready]" in text,
-            10.0,
-        )
-        if "> 1 Chat [ready]" not in initial:
-            raise SystemExit(f"nav-down: Home did not highlight Chat first:\n{initial}")
-        send(master, b"\x1b[B", 0.4)
-        after_down = read_until(
-            "nav-down",
-            master,
-            lambda text: "> 2 MyWebSite [" in text,
-            4.0,
-        )
-        if "> 2 MyWebSite [" not in after_down:
-            raise SystemExit(f"nav-down: down arrow did not move selection:\n{after_down}")
-    finally:
-        shutdown(master, proc)
-
-def run_home_case(label: str, payload: bytes, expected_fragments: tuple[str, ...]) -> None:
-    proc = subprocess.run(
-        cmd + ["home"],
-        input=payload,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=env,
-        timeout=20,
-    )
-    output = proc.stdout.decode("utf-8", "replace")
-    if proc.returncode != 0:
-        raise SystemExit(f"{label}: home command failed:\n{output}")
-    if not any(fragment in output for fragment in expected_fragments):
-        joined = "\n".join(expected_fragments)
-        raise SystemExit(f"{label}: expected one of:\n{joined}\n\nactual output:\n{output}")
 
 run_navigation_case()
-run_down_navigation_case()
-run_chat_case("esc", b"\x1b")
-run_chat_case("home", b"/home\r")
-run_chat_case("quit", b"/quit\r")
-run_home_case(
-    "mywebsite",
-    b"2\n\nq\n",
-    (
-        "MyWebSite is empty.",
-        "MyWebSite is staged at localhost://MyWebSite.",
-        "MyWebSite is not ready: missing site-provider",
-    ),
-)
-run_home_case(
-    "updates",
-    b"3\nq\n",
-    (
-        "Returned home from Updates.",
-        "Updates:",
-        "Installed release is up to date.",
-        "Updates could not complete the trusted-source check:",
-    ),
-)
-
+run_repeated_action_case()
 PY
 test -x "$INSTALLED_HOME_CLI_DIR/bin/home-cli"
 cmp "$HOME_CLI_RENDERER" "$INSTALLED_HOME_CLI_DIR/bin/home-cli"

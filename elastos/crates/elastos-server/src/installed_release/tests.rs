@@ -3,9 +3,9 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 
 use serde_json::{json, Value};
 
-struct Fixture {
+pub(crate) struct Fixture {
     _root: tempfile::TempDir,
-    data: std::path::PathBuf,
+    pub(crate) data: std::path::PathBuf,
     binary: std::path::PathBuf,
     source: TrustedSource,
     head: Vec<u8>,
@@ -43,7 +43,7 @@ fn descriptor(bytes: &[u8]) -> Value {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let data = fs::canonicalize(root.path()).unwrap();
         let binary = data.join("runtime");
@@ -85,7 +85,7 @@ impl Fixture {
         self.save_source();
     }
 
-    fn bind_components(&mut self) {
+    pub(crate) fn bind_components(&mut self) {
         let components = fs::read(self.data.join("components.json")).unwrap();
         let mut release: Value = serde_json::from_slice(&self.release).unwrap();
         release["payload"]["platforms"][crate::update::detect_release_platform()]["components"] =

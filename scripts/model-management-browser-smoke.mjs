@@ -181,7 +181,7 @@ try {
     }
     phase = "capacity_pending";
     await frame.getByRole("button", { name: "Refresh models" }).click();
-    await frame.getByText("Waiting for local capacity…", { exact: true }).waitFor();
+    await frame.getByText("Waiting for free space. This model needs 1.02 KB on this Home, plus 2 GB kept free. Free some space and it continues.", { exact: true }).waitFor();
     assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 1);
     assert.equal(calls.filter(c => c.method === "content.use").length, 0, "pending status never starts another Use");
     phase = "reclaimed";
@@ -215,7 +215,13 @@ try {
     await frame.getByRole("button", { name: "Retry", exact: true }).click();
     await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
     phase = "admitted"; activationPending = app === "marketplace"; dispatchPending = true;
-    await frame.getByText("Available on this device. Model service unavailable.", { exact: true }).waitFor();
+    if (app === "marketplace") {
+      // Activation still running: the engine is being set up, so no Retry is offered.
+      await frame.getByText("Finishing setup…", { exact: true }).waitFor();
+      assert.equal(await frame.getByRole("button", { name: "Retry", exact: true }).count(), 0, "finishing setup offers no Retry");
+    } else {
+      await frame.getByText("Available on this device. Model service unavailable.", { exact: true }).waitFor();
+    }
     for (const [reason, explanation] of [
       ["unsupported_host", "Local AI is not supported on this device."],
       ["source_engine_required", "This source Home needs its local model engine. Install the engine through source setup, then Retry."],

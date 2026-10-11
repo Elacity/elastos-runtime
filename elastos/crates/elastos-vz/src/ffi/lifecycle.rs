@@ -10,9 +10,8 @@
 //!   from the dispatch queue and forward their result onto a
 //!   Tokio `oneshot`.
 //! - Read the `state` property on demand.
-//! - Hold the kernel-console host-read fd until [`VzMachineHandle::stop`]
-//!   joins the [`console_forwarder`][super::console_forwarder]
-//!   that drains it.
+//! - Hold the kernel-console host-read fd until explicit native object
+//!   retirement joins the [`console_forwarder`][super::console_forwarder].
 //!
 //! Not handled here:
 //!
@@ -25,7 +24,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Weak};
 use objc2::AnyThread;
 use objc2_foundation::{NSError, NSString, NSURL};
 use objc2_virtualization::{
@@ -116,11 +115,37 @@ unsafe impl Send for SendableVm {}
 // serialises mutations.
 unsafe impl Sync for SendableVm {}
 
+fn release_unique_terminal_vm<T, R>(
+    state: VmState,
+    native: Arc<T>,
+    release: impl FnOnce(T) -> R,
+) -> Result<R, Arc<T>> {
+    if !matches!(state, VmState::Stopped | VmState::Error) {
+        return Err(native);
+    }
+    Arc::try_unwrap(native).map(release)
+}
+
+// The weak reference is loaded/released only on the associated VM queue,
+// under the same ownership rule as SendableVm.
+struct SendableWeakVm(Weak<VZVirtualMachine>);
+impl SendableWeakVm {
+    fn is_absent_on_queue(&self) -> bool {
+        self.0.load().is_none()
+    }
+}
+unsafe impl Send for SendableWeakVm {}
+unsafe impl Sync for SendableWeakVm {}
+
 /// Handle to a running (or stopped) Vz VM. One per loaded
 /// capsule.
 pub(crate) struct VzMachineHandle {
     /// Apple's VZVirtualMachine instance.
-    vm: Arc<SendableVm>,
+    vm: Option<Arc<SendableVm>>,
+
+    // Once the sole native retain is released, observe actual deallocation
+    // on the same queue before certifying object absence.
+    retired_vm: Option<SendableWeakVm>,
 
     /// The dispatch queue this VM is associated with. The same
     /// queue must be used for every call. We `clone()` the
@@ -138,9 +163,9 @@ pub(crate) struct VzMachineHandle {
     /// `VZVirtualMachine` releases the kernel-console
     /// `NSFileHandle`, the pipe's write end closes, the
     /// forwarder's blocking read returns 0, and the task ends
-    /// cleanly. We never `await`/`abort` it directly because
-    /// Apple keeps the write fd open across `stop`, so a forced
-    /// join would block until drop anyway.
+    /// cleanly. Browser's explicit terminal retirement first releases the
+    /// native object on its queue and observes deallocation, then joins this
+    /// retained reader. A stop alone keeps the write fd open.
     ///
     /// `None` for the interactive-stdio variant: in that build
     /// path Vz is wired directly to the operator's
@@ -279,7 +304,8 @@ impl VzMachineHandle {
         });
 
         Ok(Self {
-            vm,
+            vm: Some(vm),
+            retired_vm: None,
             queue,
             vm_id,
             forwarder,
@@ -299,7 +325,7 @@ impl VzMachineHandle {
     /// match without re-parsing log lines.
     pub(crate) async fn start(&self) -> Result<(), VzError> {
         run_completion_handler_on_queue(
-            self.vm.clone(),
+            self.vm.as_ref().expect("active native VM").clone(),
             self.queue.clone(),
             &format!("start (vm_id='{}')", self.vm_id),
             |vm, handler| unsafe { vm.startWithCompletionHandler(handler) },
@@ -320,7 +346,7 @@ impl VzMachineHandle {
             });
         }
         run_completion_handler_on_queue(
-            self.vm.clone(),
+            self.vm.as_ref().expect("active native VM").clone(),
             self.queue.clone(),
             &format!("pause (vm_id='{}')", self.vm_id),
             |vm, handler| unsafe { vm.pauseWithCompletionHandler(handler) },
@@ -341,7 +367,7 @@ impl VzMachineHandle {
             });
         }
         run_completion_handler_on_queue(
-            self.vm.clone(),
+            self.vm.as_ref().expect("active native VM").clone(),
             self.queue.clone(),
             &format!("resume (vm_id='{}')", self.vm_id),
             |vm, handler| unsafe { vm.resumeWithCompletionHandler(handler) },
@@ -356,7 +382,7 @@ impl VzMachineHandle {
         self.ensure_save_restore_supported("save")?;
         let path_text = path.to_string_lossy().to_string();
         run_completion_handler_on_queue(
-            self.vm.clone(),
+            self.vm.as_ref().expect("active native VM").clone(),
             self.queue.clone(),
             &format!("saveMachineState (vm_id='{}')", self.vm_id),
             move |vm, handler| unsafe {
@@ -374,7 +400,7 @@ impl VzMachineHandle {
         self.ensure_save_restore_supported("restore")?;
         let path_text = path.to_string_lossy().to_string();
         run_completion_handler_on_queue(
-            self.vm.clone(),
+            self.vm.as_ref().expect("active native VM").clone(),
             self.queue.clone(),
             &format!("restoreMachineState (vm_id='{}')", self.vm_id),
             move |vm, handler| unsafe {
@@ -404,9 +430,15 @@ impl VzMachineHandle {
     /// drops, at which point `VZVirtualMachine` releases the
     /// config, the `NSFileHandle` deallocs, the write fd closes
     /// and the forwarder exits naturally. Until drop, the
-    /// forwarder's `JoinHandle` sits idle in [`Self::forwarder`]
-    /// (Tokio detaches it on drop, so no leak).
+    /// forwarder's `JoinHandle` sits idle in [`Self::forwarder`]. Browser's
+    /// explicit terminal retirement retains and joins it after native object
+    /// deallocation, before releasing the disk leases.
     pub(crate) async fn stop(&self) -> Result<(), VzError> {
+        if self.vm.is_none() {
+            return Err(VzError::Internal {
+                description: "native VM retirement is pending".to_string(),
+            });
+        }
         // wrap the completion-handler future
         // with a `tokio::time::timeout` so a wedged Apple
         // framework call cannot pin the supervisor's
@@ -422,7 +454,7 @@ impl VzMachineHandle {
         // `VzError::TimedOut`.
         let op_label = format!("stop (vm_id='{}')", self.vm_id);
         let inner = run_completion_handler_on_queue(
-            self.vm.clone(),
+            self.vm.as_ref().expect("active native VM").clone(),
             self.queue.clone(),
             &op_label,
             |vm, handler| unsafe { vm.stopWithCompletionHandler(handler) },
@@ -461,7 +493,16 @@ impl VzMachineHandle {
     /// independently of Apple's `VZVirtioSocketConnection`
     /// lifecycle.
     pub(crate) async fn connect_vsock(&self, port: u32) -> Result<std::os::fd::OwnedFd, String> {
-        super::vsock::connect_vsock(self.vm.clone(), self.queue.clone(), &self.vm_id, port).await
+        if self.vm.is_none() {
+            return Err("native VM retirement is pending".to_string());
+        }
+        super::vsock::connect_vsock(
+            self.vm.as_ref().expect("active native VM").clone(),
+            self.queue.clone(),
+            &self.vm_id,
+            port,
+        )
+        .await
     }
 
     /// Wait for a terminal lifecycle observation and return the
@@ -504,11 +545,63 @@ impl VzMachineHandle {
         }
     }
 
+    /// Retire a terminal native object after every caller worker has joined.
+    /// Error itself is not absence: Apple requires destruction of that object.
+    pub(crate) async fn release_terminal_object(&mut self) -> bool {
+        if let Some(vm) = self.vm.take() {
+            let result = Arc::new(Mutex::new(None));
+            let result_on_queue = result.clone();
+            self.queue.as_raw().exec_sync(move || {
+                // This serial barrier drains prior queued dispatch work. The
+                // caller joined all producers before invoking this method.
+                let state = VmState::from(unsafe { vm.0.state() });
+                let retired = release_unique_terminal_vm(state, vm, |native| {
+                    let weak = SendableWeakVm(Weak::from_retained(&native.0));
+                    drop(native); // Release the sole Rust retain on the VM queue.
+                    weak
+                });
+                *result_on_queue.lock().expect("native retirement result") = Some(retired);
+            });
+            let retirement = result
+                .lock()
+                .expect("native retirement result")
+                .take()
+                .expect("VM queue retirement completed");
+            match retirement {
+                Ok(weak) => self.retired_vm = Some(weak),
+                Err(vm) => {
+                    self.vm = Some(vm);
+                    return false;
+                }
+            }
+        }
+        let Some(retired) = self.retired_vm.as_ref() else {
+            return false;
+        };
+        let weak = SendableWeakVm(retired.0.clone());
+        let absent = Arc::new(Mutex::new(false));
+        let absent_on_queue = absent.clone();
+        self.queue.as_raw().exec_sync(move || {
+            *absent_on_queue
+                .lock()
+                .expect("native deallocation observation") = weak.is_absent_on_queue();
+        });
+        if !*absent.lock().expect("native deallocation observation") {
+            return false;
+        }
+        match self.forwarder.as_mut() {
+            Some(forwarder) => forwarder.join_retained().await,
+            None => true,
+        }
+    }
+
     /// Read the current VM state. Runs on the dispatch queue
     /// because Apple's docs require all VM property reads to be
     /// dispatched through the associated queue.
     pub(crate) fn current_state(&self) -> VmState {
-        let vm = self.vm.clone();
+        let Some(vm) = self.vm.as_ref().cloned() else {
+            return VmState::Unknown(-1);
+        };
         let cell: Arc<Mutex<Option<VZVirtualMachineState>>> = Arc::new(Mutex::new(None));
         let cell_for_closure = cell.clone();
 
@@ -540,7 +633,7 @@ impl VzMachineHandle {
     where
         F: FnOnce(&VZVirtualMachine) -> bool + Send + 'static,
     {
-        let vm = self.vm.clone();
+        let vm = self.vm.as_ref().expect("active native VM").clone();
         let cell: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
         let cell_for_closure = cell.clone();
         self.queue.as_raw().exec_sync(move || {
@@ -696,6 +789,72 @@ fn format_validate_error(raw_apple_message: &str, vm_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_terminal_retirement_requires_exact_state_and_unique_ownership() {
+        for state in [
+            VmState::Running,
+            VmState::Paused,
+            VmState::Starting,
+            VmState::Pausing,
+            VmState::Resuming,
+            VmState::Stopping,
+            VmState::Saving,
+            VmState::Restoring,
+            VmState::Unknown(42),
+        ] {
+            let native = Arc::new(1);
+            assert!(release_unique_terminal_vm(state, native, |_| panic!(
+                "retired live native owner"
+            ))
+            .is_err());
+        }
+        let native = Arc::new(1);
+        let queued_owner = native.clone();
+        let retained = release_unique_terminal_vm(VmState::Error, native, |_| {
+            panic!("retired shared native owner")
+        })
+        .unwrap_err();
+        drop(queued_owner);
+        assert_eq!(
+            release_unique_terminal_vm(VmState::Error, retained, |value| value).unwrap(),
+            1
+        );
+        assert_eq!(
+            release_unique_terminal_vm(VmState::Stopped, Arc::new(2), |value| value).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn native_terminal_retirement_queue_barrier_drains_prior_dispatch_owner() {
+        let queue = VzDispatchQueue::new("elastos-vz-test.retirement");
+        let native = Arc::new(7);
+        let queued_owner = native.clone();
+        queue.as_raw().exec_async(move || drop(queued_owner));
+        let result = Arc::new(Mutex::new(None));
+        let result_on_queue = result.clone();
+        queue.as_raw().exec_sync(move || {
+            *result_on_queue.lock().unwrap() = Some(release_unique_terminal_vm(
+                VmState::Error,
+                native,
+                |value| value,
+            ));
+        });
+        assert_eq!(result.lock().unwrap().take().unwrap().unwrap(), 7);
+    }
+
+    #[test]
+    fn native_terminal_retirement_weak_observer_tracks_actual_object_deallocation() {
+        let queue = VzDispatchQueue::new("elastos-vz-test.weak-retirement");
+        queue.as_raw().exec_sync(|| {
+            let native = objc2_foundation::NSObject::new();
+            let weak = Weak::from_retained(&native);
+            assert!(weak.load().is_some());
+            drop(native);
+            assert!(weak.load().is_none());
+        });
+    }
 
     #[test]
     fn vm_state_translates_from_vz_state_for_every_documented_variant() {

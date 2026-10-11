@@ -8,8 +8,27 @@ pub async fn run_publish_release(
     crate::publish::run_publish_release(options).await
 }
 
-pub fn run_source(cmd: crate::sources::SourceCommand) -> anyhow::Result<()> {
-    crate::sources::run_source_command(cmd, crate::publish::source_discovery_uri)
+pub async fn run_source(cmd: crate::sources::SourceCommand) -> anyhow::Result<()> {
+    match cmd {
+        crate::sources::SourceCommand::FetchFile {
+            source,
+            cid,
+            sha256,
+            size,
+            output,
+        } => {
+            elastos_server::sources::fetch_source_file(
+                &crate::sources::default_data_dir(),
+                &source,
+                &cid,
+                &sha256,
+                size,
+                &output,
+            )
+            .await
+        }
+        other => crate::sources::run_source_command(other, crate::publish::source_discovery_uri),
+    }
 }
 
 pub fn run_version(current_version: &str) {
@@ -20,8 +39,6 @@ pub fn run_version(current_version: &str) {
 pub async fn run_update_command(
     check: bool,
     head_cid: Option<String>,
-    no_p2p: bool,
-    gateways: Vec<String>,
     yes: bool,
     rollback_to: Option<String>,
     force: bool,
@@ -32,8 +49,6 @@ pub async fn run_update_command(
         &data_dir,
         check,
         head_cid,
-        no_p2p,
-        gateways,
         yes,
         rollback_to,
         force,
@@ -47,8 +62,6 @@ async fn run_update_command_for_data_dir(
     data_dir: &std::path::Path,
     check: bool,
     head_cid: Option<String>,
-    no_p2p: bool,
-    gateways: Vec<String>,
     yes: bool,
     rollback_to: Option<String>,
     force: bool,
@@ -62,57 +75,29 @@ async fn run_update_command_for_data_dir(
         .default_source()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("No trusted source configured"))?;
-    let carrier_client = if !no_p2p {
-        match elastos_server::carrier::CarrierClient::connect_trusted_source(&source_config, 10)
+    // Show the repair hint before any network work can mask it.
+    if !force {
+        update::installed_release_version(&source_config.installed_version)?;
+    }
+    let carrier_client = Arc::new(
+        elastos_server::carrier::CarrierClient::connect_trusted_source(&source_config, 10)
             .await
-        {
-            Ok(c) => Some(Arc::new(c)),
-            Err(e) => {
-                anyhow::bail!("Carrier connection failed: {:#}", e);
-            }
-        }
-    } else {
-        None
-    };
+            .map_err(|e| anyhow::anyhow!("Carrier connection failed: {:#}", e))?,
+    );
 
-    let gateway_only_fetch = no_p2p;
     let carrier_for_fetch = carrier_client.clone();
-    let fetch_fn: update::FetchFn = Box::new(move |cid, gateways| {
+    let fetch_fn: update::FetchFn = Box::new(move |cid| {
         let client = carrier_for_fetch.clone();
-        Box::pin(async move {
-            let mut carrier_error: Option<anyhow::Error> = None;
-
-            if !gateway_only_fetch {
-                if let Some(client) = client.as_ref() {
-                    match client.fetch_content(&cid, None).await {
-                        Ok(bytes) => return Ok(bytes),
-                        Err(err) => carrier_error = Some(err),
-                    }
-                } else {
-                    carrier_error = Some(anyhow::anyhow!("No Carrier connection"));
-                }
-            }
-
-            if !gateways.is_empty() {
-                return update::fetch_cid_via_gateways(&cid, &gateways).await;
-            }
-
-            Err(carrier_error.unwrap_or_else(|| {
-                anyhow::anyhow!("No Carrier connection and no gateway configured")
-            }))
-        })
+        Box::pin(async move { client.fetch_content(&cid, None).await })
     });
 
     let carrier_for_discovery = carrier_client.clone();
     let try_p2p: update::TryP2pFn = Box::new(move |source, _publisher_did| {
         let client = carrier_for_discovery.clone();
         Box::pin(async move {
-            match client {
-                Some(client) => update::discover_carrier_release_head(&client, &source)
-                    .await
-                    .map(Some),
-                None => Ok(None),
-            }
+            update::discover_carrier_release_head(&client, &source)
+                .await
+                .map(Some)
         })
     });
 
@@ -124,17 +109,13 @@ async fn run_update_command_for_data_dir(
         Some(&try_p2p),
         check,
         effective_head_cid,
-        no_p2p,
-        gateways,
         current_version,
         yes,
         rollback,
         force,
     )
     .await;
-    if let Some(client) = carrier_client {
-        client.close().await;
-    }
+    carrier_client.close().await;
     result
 }
 
@@ -190,23 +171,35 @@ mod tests {
         let mut sources = TrustedSourcesConfig::empty();
         sources.upsert_source(source);
         save_trusted_sources(fixture.path(), &sources).unwrap();
+        // The fixture source has no reachable Carrier publisher; the hint comes first.
+        let error =
+            run_update_command_for_data_dir(fixture.path(), true, None, true, None, false, "0.7.1")
+                .await
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("elastos update --force"),
+            "{error:#}"
+        );
+        let fetch: update::FetchFn = Box::new(|_| panic!("discovery must fail first"));
         for force in [false, true] {
-            let error = run_update_command_for_data_dir(
+            // release_cmd maps --force to repair_invalid_version.
+            let error = update::run_update_for_data_dir(
                 fixture.path(),
-                true,
+                &fetch,
                 None,
                 true,
-                Vec::new(),
-                true,
                 None,
-                force,
                 "0.7.1",
+                true,
+                false,
+                force,
             )
             .await
             .unwrap_err();
             if force {
+                // Past the version gate, the only failure left is the unreachable source.
                 assert!(
-                    error.to_string().contains("Could not discover updates."),
+                    error.to_string().contains("outgoing UDP to port 4433"),
                     "{error:#}"
                 );
             } else {
@@ -357,8 +350,6 @@ mod tests {
                 fixture.path(),
                 true,
                 None,
-                false,
-                Vec::new(),
                 true,
                 rollback_to,
                 matches!(reply, Reply::OlderForce),
@@ -514,19 +505,9 @@ mod tests {
             "data_dir": data, "binary_basename": "elastos", "phase": "committing", "entries": entries
         })).unwrap()).unwrap();
         std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let error = run_update_command_for_data_dir(
-            &data,
-            false,
-            None,
-            false,
-            Vec::new(),
-            true,
-            None,
-            false,
-            "0.7.0",
-        )
-        .await
-        .unwrap_err();
+        let error = run_update_command_for_data_dir(&data, false, None, true, None, false, "0.7.0")
+            .await
+            .unwrap_err();
         assert!(format!("{error:#}").contains("Carrier connection failed"));
         for (_, destination, old) in destinations {
             assert_eq!(std::fs::read(destination).unwrap(), old);

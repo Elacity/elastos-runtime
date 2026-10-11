@@ -34,11 +34,14 @@ command:
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-That complete flow becomes available at this URL when the candidate installer
-and signed release are published. Developers can use the [Mac source
-guide](MAC.md) for source-home staging and Browser VM work.
+Developers can use the [Mac source guide](MAC.md) for source-home staging and
+Browser VM work.
 
-The candidate installer detects the platform (Linux `x86_64`/`aarch64` or
+The installer needs `curl` and a working `python3`; on a Mac without the
+Command Line Tools it stops first and asks you to run `xcode-select --install`.
+Setup and updates need outgoing UDP to port 4433 for Carrier.
+
+The installer detects the platform (Linux `x86_64`/`aarch64` or
 macOS Apple silicon), verifies the signed release, installs Runtime, and
 fetches the Home profile from the trusted publisher. It
 starts Home at `http://localhost:8090/home/` and opens your browser. Keep the
@@ -46,7 +49,7 @@ terminal open while you use Home; Ctrl+C stops it. With no interactive terminal,
 setup completes and prints the full command for opening Home later. The installer
 uses the installed binary's full path, so editing PATH is optional.
 
-For automated provisioning or a different setup profile, use `--install-only`:
+For automated provisioning, use `--install-only`:
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash -s -- --install-only
@@ -69,13 +72,11 @@ The installer URL bootstraps trust once. Later first-party setup and update
 operations use the trusted Carrier source by default. Users do not manage a
 release-head CID or gateway on the normal path.
 
-The signed manifest determines which setup profiles are available:
-
-- `elastos setup` installs the core Home profile.
-- `elastos setup --profile demo` adds demo Apps and supporting tools.
-- `elastos setup --profile operator` prepares the separate runtime used by
-  `serve`, remote node control, agents, WASM or microVM `run`, and
-  non-interactive capsule work.
+`elastos setup` installs Home: the Runtime, its providers and the Home Apps.
+Components that only some people need, such as the local model engine, arrive
+on demand from the same signed release. The same install also provides the
+separate operator runtime used by `serve`, remote node control, WASM or
+microVM `run`, and non-interactive capsule work.
 
 Data `run` needs no Runtime, and interactive packaged capsules use managed Home.
 Only one live host may own an ElastOS data home at a time. Do not run Home and
@@ -85,9 +86,8 @@ the operator runtime against the same home at the same time. See the
 ### Source checkout note
 
 A clone contains source code and `components.json`. It does not create a
-trusted source relationship. A binary built from the checkout can read its
-setup profiles, but it still needs a trusted source before fetching published
-components.
+trusted source relationship. A binary built from the checkout can read it, but
+it still needs a trusted source before fetching published components.
 
 See [Getting started](GETTING_STARTED.md#source-built-trusted-source-example)
 for an explicit `source add` example. Use the public installer when testing the
@@ -140,27 +140,6 @@ setup-only model downloads remain operator provisioning details. They must not
 be projected as remotely installable Home catalog items. See
 [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
 
-## Manual bootstrap
-
-Use an explicit gateway only when the publisher URL is unavailable or when
-testing release infrastructure:
-
-```bash
-EXPLICIT_GATEWAY=https://publisher.example.com
-
-# Use the installer's published trust anchors.
-curl -fsSL "${EXPLICIT_GATEWAY}/ipfs/INSTALLER_CID/install.sh" | bash
-
-# Or supply the trust anchors explicitly.
-curl -fsSL "${EXPLICIT_GATEWAY}/ipfs/INSTALLER_CID/install.sh" | bash \
-  -s -- --head-cid HEAD_CID --maintainer-did MAINTAINER_DID
-
-```
-
-Replace the uppercase placeholders with the publisher's values. Use one gateway
-and explicit trust anchors. Do not fall back to unrelated transports or
-gateways.
-
 ## Jetson
 
 The installer detects Linux `aarch64`:
@@ -169,11 +148,25 @@ The installer detects Linux `aarch64`:
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 ```
 
-Native Home and chat run without KVM, crosvm, a guest kernel, Kubo, or `sudo`.
-Linux/crosvm Browser has a separate host network setup path that requires
-administrator access. The installed host adapter determines the launch-time
-privileges. The default Home profile omits `crosvm` and `vmlinux`. This release
-publishes them for no platform, so microVM capsules are not available in it.
+Home and chat use the ordinary user account. Browser uses the local Engine's
+virtual machine. When the signed release supplies Browser support, setup obtains
+its matching helpers and verified image before Home starts. The image streams to
+disk with progress; a transfer stops after 30 seconds without data. Runtime keeps
+the committed Browser profile separate from the image during reopen and updates.
+
+On Linux, the installer offers one administrator step to grant this user KVM
+access and prepare the confined Browser network device. It explains the changes
+and asks before applying them. Runtime then uses the ordinary user's access to
+launch and close the Engine. A machine without virtualization receives a plain
+Browser message. The host setup can be removed with:
+
+```sh
+sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user "$(id -un)"
+```
+
+For a piped or unattended install, follow the host setup command printed by the
+installer before opening Browser. The [Browser host setup](BROWSER_VM_TARGET.md)
+describes the installed adapter and its removal boundary.
 
 The [Browser VM target](BROWSER_VM_TARGET.md) documents the target contract and
 maintenance boundary. [Scripts](../scripts/README.md) maps the executable proof
@@ -201,7 +194,7 @@ source saved in `sources.json` during install. It asks for the latest signed
 release head, fetches the head and the release by CID (a source that gives no
 separate head CID sends the head file by name), and checks both signatures, the
 release hash, the channel and the version order. An older
-release is refused. The `gateways`, `discovery_uri` and `ipns_name` fields in
+release is refused. The `discovery_uri` and `ipns_name` fields in
 `sources.json` are shown but not used to find updates. If the Carrier
 connection fails, the check fails.
 
@@ -223,8 +216,10 @@ elastos update --check
 elastos update
 ```
 
-`elastos upgrade` does the same as `elastos update`. HTTP is used only when you
-pass `--gateway` or `--no-p2p`, and by the first download in `install.sh`.
+After install, the web is used only to look up the publisher's current Carrier
+address from the `gateways` in `sources.json`; that answer is accepted only when
+it matches the trusted source. Releases and components come over Carrier and are
+verified by signature and hash.
 
 Runtime keeps the verified signed pair in `installation/release-head.json`
 and `installation/release.json` within its data directory. Publisher owns its
@@ -301,14 +296,8 @@ unavailable.
 Free disk space before updating. An interrupted update or uncertain controller
 ownership keeps its recovery step.
 
-These overrides are for operators:
-
-```bash
-elastos update --head-cid CID
-elastos update --no-p2p --gateway GATEWAY_URL
-```
-
-Replace `CID` and `GATEWAY_URL` with the source values.
+Operators can install one known signed release head with
+`elastos update --head-cid CID`.
 
 ## Compare and change the release signer
 
@@ -346,13 +335,16 @@ of that key exists.
 
 ## Installed files
 
-When XDG variables are unset, the default paths are:
+| What | macOS | Linux |
+| --- | --- | --- |
+| Runtime binary | `~/.local/bin/elastos` | `~/.local/bin/elastos` |
+| Data directory | `~/Library/Application Support/elastos` | `~/.local/share/elastos`, or `$XDG_DATA_HOME/elastos` when set |
+| Components | `bin/`, `capsules/`, `tools/`, `libexec/`, `scripts/`, `browser-vm/image-set/`, `components.json`, `model-catalog.json` and `update-controller/` in the data directory | same |
+| Trusted sources and verified release | `sources.json` and `installation/` in the data directory | same |
 
-| Path | Purpose |
-| --- | --- |
-| `~/.local/bin/elastos` | Runtime binary |
-| `~/.local/share/elastos/components.json` | Installed component registry |
-| `~/.local/share/elastos/sources.json` | Trusted update sources |
+`--install-dir` moves only the binary. Everything else in the data directory is
+yours: identity keys, wallets, recovery material and user files. ElastOS adds
+no login items, launch agents, desktop entries or shell profile changes.
 
 The publisher's signed manifest controls what `elastos setup` installs. Run
 `elastos setup --list` to inspect the selected manifest's current profiles and
@@ -360,6 +352,37 @@ components before installation. The installed `components.json` records what
 the selected profile installed. Do not infer parity with this development tree
 from the version label or a successful setup. [Install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89)
 owns exact public-manifest parity evidence.
+
+## Remove ElastOS
+
+```bash
+curl -fsSL https://elastos.elacitylabs.com/install.sh | bash -s -- --uninstall
+```
+
+The installer stops this installation's Runtime the same way an install does:
+it stops only processes whose ownership records and command match this
+installation, and removes nothing if another process holds them. It then
+removes the binary, the components (including the release scripts and the
+Browser image), the trusted sources and the verified release. Your data
+directory stays, including Browser profiles, so installing again continues with
+the same identity. Pass the same `--install-dir` you installed with. An install
+or update that is running or was interrupted stops the removal; finish it first.
+
+On Linux, the uninstall leaves the one-time Browser host access in place. After
+closing Browser, remove it with:
+
+```sh
+sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user "$(id -un)"
+```
+
+To delete your data as well, add `--remove-data`:
+
+```bash
+curl -fsSL https://elastos.elacitylabs.com/install.sh | bash -s -- --uninstall --remove-data
+```
+
+This deletes your identity, wallets and recovery material on this computer.
+Keep your Recovery Kit first: it is the only way to restore that identity.
 
 ## Data, keys and backups
 
@@ -379,8 +402,23 @@ Passkeys control sign-in. Locking Home stops UI use; the Runtime account and roo
 retain access to stored data and keys. The protection target covers hosted
 operators and root, and other software or OS users while a self-hosted Home is
 locked. An unlocked self-hosted Home trusts its owner and their host software.
-Recovery can restore lost access with valid recovery material. A stolen device
-or profile key requires a new identity.
+A stolen device or profile key requires a new identity.
+
+Lost every passkey? Your Recovery Kit brings your account back on the same
+Home, even when guest accounts are off:
+
+1. On the computer that runs Home, as the user who installed it, run
+   the command shown on the sign-in screen, for example
+   `elastos identity arm-owner-recovery --origin http://localhost:8090 --rp-id localhost`
+   for the installed Home. It prints a
+   code that works once and expires in 10 minutes.
+2. On the Home sign-in screen, choose **Recover this Home with your Recovery
+   Kit**. Enter the code, choose your Recovery Kit (and its password, if it has
+   one), then create a new passkey.
+3. Home accepts only the Recovery Kit this Home saved for its admin. The new
+   passkey becomes the admin and the old passkey stops working. Any other Kit,
+   an expired code or a used code changes nothing. After five wrong codes the
+   code stops working; run the command again for a new one.
 
 ## Capability policy
 
@@ -400,9 +438,10 @@ The installer verifies:
 
 1. the `release-head.json` signature against the maintainer DID
 2. the `release.json` signature against the same DID
-3. the binary and `components.json` SHA-256 checksums
+3. the binary's SHA-256 checksum
 
-Gateways transport bytes. Signatures, hashes, and the maintainer DID establish
+Runtime setup then verifies `components.json` and each component. The web and
+Carrier only carry bytes; signatures, hashes and the maintainer DID establish
 trust.
 
 For release and target handoff commands, see the

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { catalogModels, selectedModelOffer, readyModelChoices, validModelCid } from "../capsules/_shared/model-selection.js";
+import { catalogModels, selectedModelOffer, readyModelChoices, validModelCid, downloadingModel } from "../capsules/_shared/model-selection.js";
 
 const cid = `bafybei${"a".repeat(52)}`;
 const row = { source: "signed-model-catalog", role: "content", installed: false, launchable: false,
@@ -42,4 +42,16 @@ test("catalog rejects duplicate, malformed and noncanonical content identity", (
   }
   assert.throws(() => catalogModels(catalog([{ ...row, model_runtime: { admitted: false, dispatch_ready: true, offer_id: offer.id } }])));
   assert.deepEqual(catalogModels({ ...catalog([row]), model_catalog_state: "unavailable" }), []);
+});
+
+test("a running preparation reports whole-percent download progress until the model is ready", () => {
+  const preparing = { ...row, model_runtime: { admitted: false, dispatch_ready: false, offer_id: null,
+    preparation: { state: "preparing", cancel_requested: false, completed_bytes: 999, total_bytes: 2000 } } };
+  const models = catalogModels(catalog([preparing]));
+  assert.equal(models[0].downloadPercent, 49);
+  assert.equal(downloadingModel(models), models[0]);
+  const cancelling = { ...preparing, model_runtime: { ...preparing.model_runtime,
+    preparation: { ...preparing.model_runtime.preparation, cancel_requested: true } } };
+  assert.equal(downloadingModel(catalogModels(catalog([cancelling]))), null);
+  assert.equal(downloadingModel(catalogModels(catalog([row]))), null);
 });

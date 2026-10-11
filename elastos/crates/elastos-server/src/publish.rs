@@ -41,7 +41,6 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "elacity-player",
     "model-provider",
 ];
-const DEMO_PUBLISH_CAPSULES: &[&str] = &["gba-emulator", "gba-ucity", "tunnel-provider"];
 const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat", "home-agent"];
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
 
@@ -96,7 +95,6 @@ pub(crate) struct PublishReleaseOptions {
     pub(crate) signed_publication: Option<PathBuf>,
     pub(crate) publisher_did: Option<String>,
     pub(crate) allow_signer_rotation: bool,
-    pub(crate) key: Option<PathBuf>,
     pub(crate) dry_run: bool,
     pub(crate) preflight_only: bool,
     pub(crate) public_url: bool,
@@ -104,7 +102,6 @@ pub(crate) struct PublishReleaseOptions {
     pub(crate) gateway_addr: String,
     pub(crate) public_timeout: u64,
     pub(crate) ipfs_provider_bin: Option<PathBuf>,
-    pub(crate) allow_no_bootstrap: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1144,11 +1141,6 @@ fn publish_profile_capsules(profile: &str, available: &[String]) -> anyhow::Resu
             .iter()
             .map(|name| name.to_string())
             .collect::<Vec<_>>(),
-        "demo" => HOME_PUBLISH_CAPSULES
-            .iter()
-            .chain(DEMO_PUBLISH_CAPSULES.iter())
-            .map(|name| name.to_string())
-            .collect::<Vec<_>>(),
         "providers" => vec![
             "availability-provider".to_string(),
             "chain-provider".to_string(),
@@ -1174,7 +1166,7 @@ fn publish_profile_capsules(profile: &str, available: &[String]) -> anyhow::Resu
             .collect(),
         other => {
             anyhow::bail!(
-                "Unknown publish profile '{}'. Available profiles: home, demo, providers, full",
+                "Unknown publish profile '{}'. Available profiles: home, providers, full",
                 other
             );
         }
@@ -1390,12 +1382,6 @@ fn validate_publish_inputs(
 }
 
 fn validate_prepare_options(options: &PublishReleaseOptions) -> anyhow::Result<()> {
-    if options.key.is_some() {
-        anyhow::bail!("The separate custodian tool owns release keys; publish-release accepts public data only");
-    }
-    if options.allow_no_bootstrap {
-        anyhow::bail!("The approved signing input owns the frozen public bootstrap; omit --allow-no-bootstrap");
-    }
     if options.signed_publication.is_some() {
         if options.prepare_only.is_some()
             || !options.platform_inputs.is_empty()
@@ -1422,11 +1408,7 @@ fn validate_prepare_options(options: &PublishReleaseOptions) -> anyhow::Result<(
         anyhow::bail!("--allow-signer-rotation requires --signed-publication");
     }
     if options.prepare_only.is_some() {
-        if options.platform_inputs.is_empty()
-            || options.key.is_some()
-            || options.public_url
-            || options.public_with_sudo
-        {
+        if options.platform_inputs.is_empty() || options.public_url || options.public_with_sudo {
             anyhow::bail!("Unsigned preparation requires native inputs and public signer data; the custodian owns signing");
         }
         let did = options
@@ -2012,7 +1994,7 @@ mod tests {
         resolve_platform_input_paths, save_publish_state, select_capsules,
         validate_platform_input_options, validate_prepare_options, validate_publish_inputs,
         validate_publishable_manifest, PublishReleaseOptions, PublishState, ReleaseLedgerPlatform,
-        DEMO_PUBLISH_CAPSULES, HOME_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
+        HOME_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
     };
     use elastos_common::{
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
@@ -2038,7 +2020,6 @@ mod tests {
             signed_publication: None,
             allow_signer_rotation: false,
             publisher_did: None,
-            key: None,
             dry_run: false,
             preflight_only: false,
             public_url: false,
@@ -2046,7 +2027,6 @@ mod tests {
             gateway_addr: "127.0.0.1:8090".to_string(),
             public_timeout: 60,
             ipfs_provider_bin: None,
-            allow_no_bootstrap: false,
         }
     }
 
@@ -2084,7 +2064,7 @@ mod tests {
                 "skip-rootfs" => options.skip_rootfs = true,
                 "cross" => options.cross = Some("aarch64".to_string()),
                 "capsules" => options.capsules = vec!["home".to_string()],
-                "profile" => options.profile = "demo".to_string(),
+                "profile" => options.profile = "full".to_string(),
                 _ => unreachable!(),
             }
             assert!(validate_platform_input_options(&options).is_err(), "{flag}");
@@ -2110,7 +2090,6 @@ mod tests {
         validate_prepare_options(&options).unwrap();
         validate_platform_input_options(&options).unwrap();
         for refusal in [
-            "key",
             "publisher",
             "invalid-did",
             "noncanonical-did",
@@ -2120,7 +2099,6 @@ mod tests {
         ] {
             let mut invalid = options.clone();
             match refusal {
-                "key" => invalid.key = Some("/custodian/unopened.pem".into()),
                 "publisher" => invalid.publisher_did = None,
                 "invalid-did" => {
                     invalid.publisher_did = Some("did:web:example.invalid".to_string())
@@ -2179,7 +2157,7 @@ mod tests {
                 "skip-rootfs" => invalid.skip_rootfs = true,
                 "cross" => invalid.cross = Some("aarch64".to_string()),
                 "capsules" => invalid.capsules = vec!["home".to_string()],
-                "profile" => invalid.profile = "demo".to_string(),
+                "profile" => invalid.profile = "full".to_string(),
                 _ => unreachable!(),
             }
             assert!(validate_platform_input_options(&invalid).is_err(), "{case}");
@@ -2270,24 +2248,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn key_option_is_refused_before_platform_reads_or_key_creation() {
-        let temp = tempfile::tempdir().unwrap();
-        let key = temp.path().join("publisher/key");
-        for dry_run in [false, true] {
-            let mut options = platform_input_options();
-            options.dry_run = dry_run;
-            options.key = Some(key.clone());
-            options.platform_inputs = ["x86_64-linux", "aarch64-linux", "aarch64-darwin"]
-                .iter()
-                .map(|platform| format!("{platform}={}", temp.path().join(platform).display()))
-                .collect();
-            let error = super::run_publish_release(options).await.unwrap_err();
-            assert!(error.to_string().contains("custodian"), "{error}");
-            assert!(!key.parent().unwrap().exists());
-        }
-    }
-
     fn test_manifest(name: &str, capsule_requires: &[&str]) -> CapsuleManifest {
         CapsuleManifest {
             schema: elastos_common::SCHEMA_V1.to_string(),
@@ -2359,28 +2319,9 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_profile_demo_extends_home_with_demo_capsules() {
-        let mut entries = HOME_PUBLISH_CAPSULES
-            .iter()
-            .chain(DEMO_PUBLISH_CAPSULES.iter())
-            .map(|name| (*name, &[][..]))
-            .collect::<Vec<(&str, &[&str])>>();
-        entries.sort_by_key(|(name, _)| *name);
-        entries.dedup_by_key(|(name, _)| *name);
-        let manifests = test_manifests(&entries);
-        let selected = select_capsules("demo", &[], &manifests).unwrap();
-
-        assert!(selected.contains(&"services".to_string()));
-        assert!(selected.contains(&"content-block-graph-provider".to_string()));
-        assert!(selected.contains(&"chat-room".to_string()));
-        assert!(selected.contains(&"gba-emulator".to_string()));
-        assert!(selected.contains(&"ipfs-provider".to_string()));
-    }
-
-    #[test]
     fn test_select_capsules_rejects_unknown_name() {
         let manifests = test_manifests(&[("sample-app", &[])]);
-        let err = select_capsules("demo", &["missing".to_string()], &manifests).unwrap_err();
+        let err = select_capsules("home", &["missing".to_string()], &manifests).unwrap_err();
         assert!(err.to_string().contains("Unknown capsule"));
     }
 
@@ -2392,7 +2333,7 @@ mod tests {
             ("shell", &[]),
         ]);
         let selected = select_capsules(
-            "demo",
+            "home",
             &["shell".to_string(), "sample-app".to_string()],
             &manifests,
         )
@@ -2410,7 +2351,7 @@ mod tests {
     #[test]
     fn test_select_capsules_rejects_missing_transitive_dependency() {
         let manifests = test_manifests(&[("sample-app", &["ipfs-provider"])]);
-        let err = select_capsules("demo", &["sample-app".to_string()], &manifests).unwrap_err();
+        let err = select_capsules("home", &["sample-app".to_string()], &manifests).unwrap_err();
         assert!(err.to_string().contains("requires capsule 'ipfs-provider'"));
     }
 
@@ -2418,7 +2359,7 @@ mod tests {
     fn test_select_capsules_rejects_retired_product_capsules() {
         let manifests = test_manifests(&[("chat", &[]), ("agent", &[])]);
         for retired in RETIRED_PRODUCT_CAPSULES {
-            let err = select_capsules("demo", &[retired.to_string()], &manifests).unwrap_err();
+            let err = select_capsules("home", &[retired.to_string()], &manifests).unwrap_err();
             assert!(err
                 .to_string()
                 .contains("is retired and cannot be published"));
@@ -3222,7 +3163,7 @@ finally:
         let options = PublishReleaseOptions {
             version: "0.11.0".to_string(),
             channel: "stable".to_string(),
-            profile: "demo".to_string(),
+            profile: "home".to_string(),
             skip_build: false,
             skip_rootfs: true,
             cross: None,
@@ -3233,7 +3174,6 @@ finally:
             signed_publication: None,
             allow_signer_rotation: false,
             publisher_did: None,
-            key: None,
             dry_run: true,
             preflight_only: false,
             public_url: false,
@@ -3241,7 +3181,6 @@ finally:
             gateway_addr: "127.0.0.1:8090".to_string(),
             public_timeout: 60,
             ipfs_provider_bin: None,
-            allow_no_bootstrap: false,
         };
         let err =
             validate_publish_inputs(&options, temp.path(), &["chat".to_string()]).unwrap_err();
@@ -3257,7 +3196,7 @@ finally:
         let options = PublishReleaseOptions {
             version: "0.11.0".to_string(),
             channel: "stable".to_string(),
-            profile: "demo".to_string(),
+            profile: "home".to_string(),
             skip_build: true,
             skip_rootfs: false,
             cross: Some("aarch64".to_string()),
@@ -3268,7 +3207,6 @@ finally:
             signed_publication: None,
             allow_signer_rotation: false,
             publisher_did: None,
-            key: None,
             dry_run: true,
             preflight_only: false,
             public_url: false,
@@ -3276,7 +3214,6 @@ finally:
             gateway_addr: "127.0.0.1:8090".to_string(),
             public_timeout: 60,
             ipfs_provider_bin: None,
-            allow_no_bootstrap: false,
         };
         let err =
             validate_publish_inputs(&options, temp.path(), &["chat".to_string()]).unwrap_err();
@@ -3314,7 +3251,7 @@ finally:
         let options = PublishReleaseOptions {
             version: "0.11.0".to_string(),
             channel: "stable".to_string(),
-            profile: "demo".to_string(),
+            profile: "home".to_string(),
             skip_build: false,
             skip_rootfs: true,
             cross: Some("aarch64".to_string()),
@@ -3325,7 +3262,6 @@ finally:
             signed_publication: None,
             allow_signer_rotation: false,
             publisher_did: None,
-            key: None,
             dry_run: true,
             preflight_only: false,
             public_url: false,
@@ -3333,7 +3269,6 @@ finally:
             gateway_addr: "127.0.0.1:8090".to_string(),
             public_timeout: 60,
             ipfs_provider_bin: None,
-            allow_no_bootstrap: false,
         };
         let err =
             validate_publish_inputs(&options, temp.path(), &["chat".to_string()]).unwrap_err();
@@ -3348,7 +3283,7 @@ finally:
         let options = PublishReleaseOptions {
             version: "0.11.0".to_string(),
             channel: "nightly".to_string(),
-            profile: "demo".to_string(),
+            profile: "home".to_string(),
             skip_build: false,
             skip_rootfs: false,
             cross: None,
@@ -3359,7 +3294,6 @@ finally:
             signed_publication: None,
             allow_signer_rotation: false,
             publisher_did: None,
-            key: None,
             dry_run: false,
             preflight_only: false,
             public_url: false,
@@ -3367,7 +3301,6 @@ finally:
             gateway_addr: "127.0.0.1:8090".to_string(),
             public_timeout: 60,
             ipfs_provider_bin: None,
-            allow_no_bootstrap: false,
         };
         let err =
             validate_publish_inputs(&options, temp.path(), &["chat".to_string()]).unwrap_err();

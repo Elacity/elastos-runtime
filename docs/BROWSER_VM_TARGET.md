@@ -125,7 +125,7 @@ scripts/build/stage-browser-vm-target.sh \
   --control-service /path/to/browser-selkies-control-service.mjs \
   --node-bin /path/to/node \
   --chromium-bin /path/to/chromium \
-  --target-platform linux-amd64
+  --target-platform linux-arm64
 ```
 
 The staging script intentionally does not install Chromium or claim a bootable
@@ -163,8 +163,8 @@ scripts/build/build-browser-vm-rootfs.sh \
   --target-platform linux-arm64
 ```
 
-This script builds the Linux guest binaries for the requested architecture,
-assembles a Debian Browser filesystem with arm64/amd64 Chromium, Node, Xvfb,
+This script builds the locked Linux ARM64 guest binaries and assembles a Debian
+Browser filesystem with ARM64 Chromium, Node, Xvfb,
 Python, GStreamer, PipeWire, WirePlumber, and Selkies through `debootstrap`,
 overlays the ElastOS Browser VM contract, preserves Chromium launcher arguments,
 patches the Selkies caps/relay policy needed by the Runtime-owned WebRTC path,
@@ -449,12 +449,21 @@ The filter policy for each TAP is:
 | Other input from that TAP | Drop |
 | Forwarded IPv4/IPv6 from that TAP | Drop |
 | IPv6 input from that TAP | Drop; interface IPv6 is also disabled |
+| Host output from slot IP, UDP source `49152:49215` | Accept only to the slot IP on UDP `49152:49215` or `41000`; drop all else |
 
 Root inserts per-TAP input chains and forwarding drops ahead of existing host
 filter rules. Runtime keeps its Unix relay and session-local TURN processes;
 launch creates the VM, bridges, media process, sockets and disposable rootfs.
 Guest control stays on TCP `19092` reached from the host. Guest DHCP, host
 forwarding, NAT and host default-route changes are unnecessary.
+Session TURN relays only to its own relay address (the slot host IP), where the
+guest and viewer allocations meet; loopback, private ranges and every other
+peer are denied, and TCP relays are off. coturn checks peer IPs only, so the
+relay output rule above confines relayed UDP to the TURN ports; host services
+on the slot IP stay unreachable. `check` refuses a receipt without that rule.
+`elastos setup` writes the Home's TURN credential to the
+owner-only `$DATA_DIR/runtime-turn/turn-credentials.env` and keeps an
+existing one.
 
 For removal, use the same root shell and helper:
 
@@ -471,7 +480,7 @@ call the exact setup command above as its approved root step.
 
 ### Linux operator proof
 
-Run this proof on both a suitable Linux x86-64 host and the Jetson. Stage the
+Run this proof on both a suitable Linux ARM64 host and the Jetson. Stage the
 candidate launcher, network helper, control service and preflight helper at
 their stable installed paths; record their source tree and SHA-256 parity.
 Use an isolated test Home on an unused port such as `18091`.
@@ -509,10 +518,11 @@ These target steps prove installed behavior. Root-free source tests establish
 command construction and refusal, and leave target media acceptance to this
 operator journey.
 
-`components.json` currently owns the packaged provider binaries such as
-`browser-engine-adapter`, `browser-engine-supervisor`, `browser-stream-bridge`,
-and `browser-local-exit`. It does not currently own the source-home Browser VM
-helper script wrappers or VM guest artifacts.
+`components.json` owns the signed provider binaries, including
+`browser-engine-adapter` and `browser-local-exit`, the VM host helper closure,
+managed dependencies and shared ARM64 guest image. Normal Runtime setup admits
+that closure before launch. The host-native supervisor and stream bridge remain
+test tools; the guest retains its network wrapper through the image recipe.
 
 Full source-home setup installs the Runtime at the stable platform data-root
 path `bin/elastos` and writes
@@ -638,6 +648,10 @@ use their fixed vsock-to-Runtime bridges. VZ NAT, a media NIC, a default guest
 route, legacy ICE boot configuration, and VZ hibernation are not available.
 Missing, stale, disabled, partial, or mixed legacy/VZ configuration fails before
 VM dispatch.
+The VZ TURN server relays only to its relay host, with TCP relays off, and
+allows loopback peers only when that host is loopback. The media bridge then
+refuses any guest TURN peer outside the session relay port range by closing
+the stream.
 
 Source-home config also loads Runtime-owned TURN credentials from
 `$HOME/runtime-turn/turn-credentials.env` or

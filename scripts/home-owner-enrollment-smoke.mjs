@@ -15,7 +15,7 @@ const recoveryBundle = { schema: "elastos.full-recovery-bundle/v1", principal_id
   people_identity: { profile_authority_bundle: { signed_profile: "fixture-profile-material" } } };
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-function fixture({ guest = false, purpose = "create", terminalLoss = false } = {}) {
+function fixture({ guest = false, purpose = "create", terminalLoss = false, ownerRecovery = false } = {}) {
   const values = new Map();
   const requests = [];
   const writes = [];
@@ -65,10 +65,21 @@ function fixture({ guest = false, purpose = "create", terminalLoss = false } = {
           response: { clientDataJSON: new Uint8Array([2]).buffer, authenticatorData: new Uint8Array([3]).buffer,
             signature: new Uint8Array([4]).buffer, userHandle: null } };
       } } },
-      Date: class extends Date { static now() { return now; } }, Uint8Array, ArrayBuffer, TextEncoder, AbortSignal, atob, btoa,
+      Date: class extends Date { static now() { return now; } }, Uint8Array, ArrayBuffer, TextEncoder, AbortController, AbortSignal, atob, btoa,
       setHomeAuthorityToken() {}, clearHomeAuthorityToken() {},
       async fetchJson(path, options = {}) {
         requests.push({ path, options });
+        if (path.startsWith("/api/auth/owner-recovery/")) {
+          assert.equal(options.method, "POST");
+          assert.equal(options.headers["x-elastos-owner-recovery"], "terminal-code");
+          if (path.endsWith("/begin")) return { schema: "elastos.auth.passkey.register.begin/v1", ceremony_id: "recovery",
+            options: { publicKey: { challenge: "AQ", user: { id: "AQ" }, excludeCredentials: [] } } };
+          const request = JSON.parse(options.body);
+          assert.deepEqual(Object.keys(request).sort(), ["bundle", "ceremony_id", "response"]);
+          assert.equal(request.ceremony_id, "recovery");
+          if (responseMode === "rejected") { const error = Error("not accepted"); error.status = 403; throw error; }
+          return grant;
+        }
         if (path === "/api/auth/recovery/status") return { principal_id: "owner", localhost_root: "temporary-root" };
         if (path === "/api/auth/recovery/full-import") {
           assert.equal(options.headers["x-elastos-home-token"], grant.home_token);
@@ -83,7 +94,7 @@ function fixture({ guest = false, purpose = "create", terminalLoss = false } = {
         if (path === "/api/auth/sessions/refresh") return grant;
         if (path === "/api/apps/home/summary") return { authority: { signed_in: true },
           identity: { profile_readiness: { status: "ready" }, profile: { display_name: "Original Person" } } };
-        if (path.endsWith("/status")) return { registered: guest || verified,
+        if (path.endsWith("/status")) return { registered: guest || verified || ownerRecovery,
           owner_setup_pending: !guest && verified && !terminalLoss && !acknowledged, guest_registration_enabled: guest };
         if (path.includes("/authenticate/")) return path.endsWith("/begin")
           ? { options: { publicKey: { challenge: "AQ", allowCredentials: [] } } } : grant;
@@ -114,7 +125,7 @@ function fixture({ guest = false, purpose = "create", terminalLoss = false } = {
         return grant;
       },
     });
-    vm.runInContext(source + "\nglobalThis.fixture = { showHomeUnlock, bindHomeUnlock, runPasskeyCreate, selectRecoveryKit };", context);
+    vm.runInContext(source + "\nglobalThis.fixture = { showHomeUnlock, bindHomeUnlock, runPasskeyCreate, runOwnerRecovery, selectRecoveryKit };", context);
     const api = context.fixture;
     api.bindHomeUnlock();
     const onOpen = (response, flow) => { opened = JSON.parse(JSON.stringify({ response, flow })); };
@@ -461,6 +472,41 @@ for (const peopleStatus of ["absent", "incomplete"]) {
     people_identity_restore: { status: peopleStatus }, wallet_restore: { status: "complete" }, runtime_audit: { status: "complete" } }));
   await assert.rejects(home.api.runPasskeyCreate(), /Profile/);
   assert.equal(home.opened(), null, "missing signed Profile opened a replacement account");
+}
+
+// Owner who lost every passkey, guest registration off: the sign-in screen
+// offers recovery with the terminal code and the Recovery Kit.
+for (const outcome of ["accepted", "rejected"]) {
+  const f = fixture({ purpose: "recover", ownerRecovery: true }), home = f.reload();
+  await home.show();
+  assert.equal(home.element("#home-unlock-secondary").hidden, true, "guest registration stays off");
+  assert.equal(home.element("#home-owner-recovery-code").hidden, true);
+  home.element("#home-recover-owner").emit("click");
+  assert.equal(home.element("#home-unlock-title").textContent, "Recover this Home");
+  assert.match(home.element("#home-unlock-copy").textContent, /elastos identity arm-owner-recovery/);
+  assert.equal(home.element("#home-owner-recovery-code").hidden, false);
+  assert.equal(home.element("#home-owner-recovery-code-label").hidden, false);
+  assert.equal(home.element("#home-recovery-kit").hidden, false);
+  assert.equal(home.element("#home-unlock-primary").textContent, "Choose Recovery Kit");
+  await home.api.runOwnerRecovery();
+  assert.match(home.element("#home-unlock-status").textContent, /code from the terminal/);
+  assert.equal(f.creates(), 0);
+  home.element("#home-owner-recovery-code").value = "terminal-code";
+  await home.selectKit();
+  assert.equal(home.element("#home-unlock-primary").textContent, "Continue with passkey");
+  if (outcome === "rejected") {
+    f.response("rejected");
+    await assert.rejects(home.api.runOwnerRecovery(), /Recovery Kit of this Home's owner/);
+    assert.equal(f.requests.filter(r => r.path === "/api/auth/recovery/full-import").length, 0);
+    assert.equal(home.opened(), null);
+    continue;
+  }
+  await home.api.runOwnerRecovery();
+  assert.equal(f.creates(), 1);
+  assert.ok(f.requests.findIndex(r => r.path === "/api/auth/owner-recovery/complete")
+    < f.requests.findIndex(r => r.path === "/api/auth/recovery/full-import"));
+  assert.equal(home.element("#home-owner-recovery-code").value, "");
+  assert.ok(home.opened());
 }
 
 // Execute the host's actual boot and unlock callback with effects recorded.

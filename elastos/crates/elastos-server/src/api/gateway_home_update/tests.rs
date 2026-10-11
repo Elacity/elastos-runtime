@@ -38,7 +38,6 @@ fn cached_offer() -> crate::operator_control::OperatorUpdateCheck {
         latest_version: intent["new_version"].as_str().unwrap().into(),
         update_available: true,
         discovery: "Carrier".into(),
-        working_gateway: None,
         head_cid: Some(intent["head_cid"].as_str().unwrap().into()),
         release_cid: Some(intent["release_cid"].as_str().unwrap().into()),
         publisher_did: intent["publisher_did"].as_str().unwrap().into(),
@@ -777,6 +776,82 @@ async fn system_update_recovered_approval_keeps_its_preconsumption_intent() {
     }
 }
 
+#[tokio::test]
+async fn system_update_refuses_a_concurrent_tab_and_a_replaced_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let owner = passkey_authority_with_name(dir.path(), Some("owner"));
+    let controller = dir.path().join("update-controller");
+    let approved = |request_id: char| {
+        let mut intent = update_intent();
+        intent["request_id"] = json!(request_id.to_string().repeat(32));
+        let mut body = intent.clone();
+        body["step_up_token"] = json!(step_up_token_for_app_context(
+            dir.path(),
+            SYSTEM_CAPSULE_ID,
+            &owner.system_token,
+            UPDATE_APPLY_OPERATION,
+            &intent,
+        ));
+        (intent, body)
+    };
+    let post = |body: Value| {
+        home_test_post_json(&app, UPDATE_APPLY_ROUTE, &owner.system_token, "null", body)
+    };
+    let in_progress = json!({"error": "Another update was started on this Home. Wait for it to finish, then check the update again."});
+    let replaced = json!({"error": "This approval is no longer valid. Check for the update again and approve it once more."});
+    // Tab A and then tab B each approve their own action. Metadata fails in this
+    // isolated Home after reservation, so each stays retryable until B replaces A.
+    // Nothing is queued then, so A is told to approve again, not to wait.
+    let (_, tab_a) = approved('c');
+    let (intent_b, tab_b) = approved('e');
+    assert_eq!(post(tab_a.clone()).await.0, StatusCode::CONFLICT);
+    assert_eq!(post(tab_b.clone()).await.0, StatusCode::CONFLICT);
+    let receipt = std::fs::read(controller.join("owner-action.json")).unwrap();
+    assert_eq!(post(tab_a.clone()).await, (StatusCode::GONE, replaced));
+    assert_eq!(
+        std::fs::read(controller.join("owner-action.json")).unwrap(),
+        receipt
+    );
+    assert_eq!(
+        post(tab_b).await.0,
+        StatusCode::CONFLICT,
+        "B keeps its exact retry"
+    );
+    // While another owner action holds the lock, a third tab is told to wait.
+    let (_, tab_c) = approved('f');
+    let held = std::fs::File::open(controller.join("owner-action.lock")).unwrap();
+    held.try_lock().unwrap();
+    assert_eq!(
+        post(tab_c.clone()).await,
+        (StatusCode::LOCKED, in_progress.clone())
+    );
+    drop(held);
+    // Once B is queued, neither the replaced approval nor a fresh one can queue.
+    let request_b = crate::update_controller::UpdateRequest {
+        id: intent_b["request_id"].as_str().unwrap().into(),
+        source_name: intent_b["source_name"].as_str().unwrap().into(),
+        channel: intent_b["channel"].as_str().unwrap().into(),
+        publisher_did: intent_b["publisher_did"].as_str().unwrap().into(),
+        current_version: intent_b["current_version"].as_str().unwrap().into(),
+        new_version: intent_b["new_version"].as_str().unwrap().into(),
+        head_cid: intent_b["head_cid"].as_str().unwrap().into(),
+        release_cid: intent_b["release_cid"].as_str().unwrap().into(),
+    };
+    let queued = controller.join("request.json");
+    let bytes = serde_json::to_vec(&request_b).unwrap();
+    std::fs::write(&queued, &bytes).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&queued, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(post(tab_a).await, (StatusCode::LOCKED, in_progress.clone()));
+    assert_eq!(post(tab_c).await, (StatusCode::LOCKED, in_progress));
+    assert_eq!(std::fs::read(&queued).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(controller.join("owner-action.json")).unwrap(),
+        receipt
+    );
+}
+
 #[test]
 fn system_update_choice_matches_every_signed_offer_field() {
     let intent = update_intent();
@@ -797,7 +872,6 @@ fn system_update_choice_matches_every_signed_offer_field() {
         latest_version: request.new_version.clone(),
         update_available: true,
         discovery: "Carrier".into(),
-        working_gateway: None,
         head_cid: Some(request.head_cid.clone()),
         release_cid: Some(request.release_cid.clone()),
         publisher_did: request.publisher_did.clone(),
@@ -966,6 +1040,24 @@ async fn system_update_exact_retry_recovers_both_queue_write_boundaries() {
 #[tokio::test]
 async fn system_update_failures_explain_the_cause_without_private_error_details() {
     for (error, expected_status, expected_cause) in [
+        (
+            anyhow::Error::from(crate::update_controller::UpdateInProgress)
+                .context("private lock detail"),
+            StatusCode::LOCKED,
+            "Wait for it to finish",
+        ),
+        (
+            anyhow::Error::from(crate::update_controller::ApprovalReplaced)
+                .context("private receipt detail"),
+            StatusCode::GONE,
+            "approve it once more",
+        ),
+        (
+            anyhow::Error::from(std::io::Error::other("private lock failure"))
+                .context("Home could not lock the owner action."),
+            StatusCode::CONFLICT,
+            "release was refused or verification failed",
+        ),
         (
             anyhow::Error::from(crate::update::UpdateSourceUnavailable)
                 .context("private source endpoint"),

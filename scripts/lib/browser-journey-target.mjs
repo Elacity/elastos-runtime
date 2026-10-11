@@ -84,7 +84,7 @@ export function browserJourneyProfileBinding(config, summary, pageId, runtimeOri
     rows[0].profile_key_hash === lifecycleHash(`profile-${sha256(principal.trim())}`),
   "Browser profile lifecycle identity mismatch");
   const engineId = owner?.service_selection?.engine_id, adapterId = owner?.engine_page?.adapter;
-  // Runtime preserves an empty requested Engine ID for Automatic selection.
+  // Runtime preserves an empty requested Engine ID for local VM selection.
   assert(typeof engineId === "string" && /^[A-Za-z0-9:_-]{0,128}$/.test(engineId) && typeof adapterId === "string" && adapterId &&
     (!config.engineId || config.engineId === engineId), "Browser profile Engine selection mismatch");
   const route = browserJourneyEngineRoute(summary, { engineId, adapterId }, pageId);

@@ -52,14 +52,6 @@
       "surface": ["home-cli"]
     },
     {
-      "name": "mywebsite",
-      "aliases": ["site", "website", "spaces"],
-      "usage": "mywebsite [status|stage <dir>|preview|publish|open]",
-      "summary": "Advanced MyWebSite tasks",
-      "description": "Advanced command for MyWebSite status, staging a local directory, starting a local preview, publishing a temporary public URL, or explicitly opening the preview in a browser.",
-      "surface": ["home-cli"]
-    },
-    {
       "name": "wallet",
       "aliases": ["wallets"],
       "usage": "wallet",

@@ -34,10 +34,10 @@ install_operator_home() {
         exit 1
     fi
 
-    echo "[public-operator] setup --profile operator in ${home_dir}"
+    echo "[public-operator] setup --with shell,localhost-provider,did-provider in ${home_dir}"
     HOME="${home_dir}" \
     XDG_DATA_HOME="${home_dir}/xdg-data" \
-    "${bin}" setup --profile operator \
+    "${bin}" setup --with shell,localhost-provider,did-provider \
         >"${home_dir}/setup.log"
 }
 

@@ -97,7 +97,7 @@ fn private_file(meta: &Metadata, size: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn open_at(dir: &File, name: &str, directory: bool) -> io::Result<File> {
+pub(super) fn open_at(dir: &File, name: &str, directory: bool) -> io::Result<File> {
     let name = CString::new(name).map_err(|_| invalid("invalid staged name"))?;
     let flags = libc::O_RDONLY
         | libc::O_NOFOLLOW

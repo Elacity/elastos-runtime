@@ -335,6 +335,7 @@ def assert_setup_order():
         main.index("install_content_publish_backend\n"),
         stamps[1],
         main.index("install_app_capsules\n"),
+        main.index("install_browser_runtime_helpers\n"),
         main.index("stamp_source_home_capsule_artifacts_manifest\n"),
         main.index('python3 "${ROOT}/scripts/components-release-integrity-check.py"'),
     ]
@@ -365,8 +366,6 @@ def assert_setup_order():
     )[1]
     if "--profile source-home" not in integrity_call:
         raise AssertionError("source-home integrity must validate the stamped source-home profile")
-    if "--profile demo" in integrity_call:
-        raise AssertionError("source-home integrity must not require prebuilt-only demo artifacts")
 
 
 def run_smoke():
@@ -394,9 +393,8 @@ def run_smoke():
         raise AssertionError(
             "components.json must install Elacity Player from its capsule tree"
         )
-    for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"]:
-        if "elacity-player" not in source_components["profiles"][profile]["components"]:
-            raise AssertionError(f"profile {profile} must include Elacity Player")
+    if "elacity-player" not in source_components["profiles"]["home"]["components"]:
+        raise AssertionError("profile home must include Elacity Player")
 
     with tempfile.TemporaryDirectory() as temp:
         temp_root = Path(temp)

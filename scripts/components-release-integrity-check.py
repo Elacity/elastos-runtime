@@ -9,26 +9,17 @@ import tempfile
 from pathlib import Path
 
 
+# Setup platform -> release platform; Runtime's setup.rs embeds the same file.
+RELEASE_PLATFORMS = json.loads(Path(__file__).with_name("release-platforms.json").read_text())
 ALIASES = {
-    "linux-amd64": ("x86_64-linux",),
-    "x86_64-linux": ("linux-amd64",),
-    "linux-arm64": ("aarch64-linux",),
-    "aarch64-linux": ("linux-arm64",),
-    "darwin-arm64": ("macos-arm64",),
-    "macos-arm64": ("darwin-arm64",),
+    **{setup: (release,) for setup, release in RELEASE_PLATFORMS.items()},
+    **{release: (setup,) for setup, release in RELEASE_PLATFORMS.items()},
 }
 
 CHECKSUM_RE = re.compile(r"^(sha256:[0-9a-fA-F]{64}|sha512:[0-9a-fA-F]{128})$")
 DEV_STRATEGIES = {"source-build", "local-copy"}
 FETCH_FIELDS = ("release_path", "cid", "url")
 PROVIDER_ICON_SIZES = (32, 64, 128, 256)
-RELEASE_PLATFORMS = {
-    "linux-amd64": "x86_64-linux",
-    "linux-arm64": "aarch64-linux",
-    "darwin-arm64": "aarch64-darwin",
-    "macos-arm64": "aarch64-darwin",
-    "darwin-amd64": "x86_64-darwin",
-}
 
 
 def non_empty(value):
@@ -44,7 +35,8 @@ def requires_checksum(info):
 
 
 def checksum_error(name, platform, info, release=False):
-    if release and info.get("strategy") not in (None, "prebuilt"):
+    image_strategy = name == "browser-vm-image" and info.get("strategy") == "browser-vm-image"
+    if release and info.get("strategy") not in (None, "prebuilt") and not image_strategy:
         return f"{name} {platform}: development or unsupported release strategy {info.get('strategy')!r}"
     if not release and not requires_checksum(info):
         return None
@@ -508,6 +500,11 @@ def run_self_test():
         if (checksum_error("fixture", "*", info, release=True) is None) != accepted:
             raise AssertionError(info)
 
+    image = {"strategy": "browser-vm-image", "checksum": f"sha256:{good_hash}"}
+    assert checksum_error("browser-vm-image", "darwin-arm64", image, release=True) is None
+    assert checksum_error("another-component", "darwin-arm64", image, release=True) is not None
+    assert checksum_error("browser-vm-image", "darwin-arm64", {"strategy": "browser-vm-image"}, release=True) is not None
+
     current_platform_errors = audit_manifest(manifest, ["linux-amd64"])
     if current_platform_errors != [
         "bad-format linux-amd64 via * bad.tar.gz: unsupported checksum format 'sha256:not-a-real-hash'"
@@ -536,6 +533,15 @@ def run_self_test():
     }
     if audit_manifest(clean_manifest, ["linux-amd64"]):
         raise AssertionError("alias-resolved stamped manifest should pass")
+    mac_manifest = {
+        "external": {
+            "mac": {"platforms": {"aarch64-darwin": {"cid": "bafy-mac"}}},
+        }
+    }
+    if audit_manifest(mac_manifest, ["darwin-arm64"]) != [
+        "mac darwin-arm64 via aarch64-darwin bafy-mac: missing checksum",
+    ]:
+        raise AssertionError("darwin-arm64 must resolve Runtime's aarch64-darwin entry")
 
     profiled_manifest = {
         "external": {
