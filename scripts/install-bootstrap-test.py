@@ -1522,8 +1522,8 @@ printf '%s\\n' "$PLATFORM"
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
-    def test_new_data_root_is_private_and_existing_root_is_preserved(self):
-        block = SOURCE.split("# New Runtime data is private;", 1)[1].split("\n\n", 1)[0]
+    def test_new_and_existing_data_roots_are_private_and_contents_kept(self):
+        block = SOURCE.split("# Runtime data is private:", 1)[1].split("\n\n", 1)[0]
         block = block.split("\n", 1)[1]
         with tempfile.TemporaryDirectory(prefix="installer-data-mode-") as temp:
             for mask in ("0022", "0002", "0077"):
@@ -1538,8 +1538,15 @@ printf '%s\\n' "$PLATFORM"
                     data.chmod(0o755)
                     result = shell(script, mask, data)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(data.stat().st_mode & 0o777, 0o755)
+                    self.assertEqual(data.stat().st_mode & 0o777, 0o700)
                     self.assertEqual(retained.read_bytes(), b"existing installation")
+                    link = Path(temp) / mask / "linked"
+                    link.symlink_to(data)
+                    data.chmod(0o755)
+                    result = shell('umask "$1"\nDATA_DIR="$2"\n' + block, mask, link)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(data.stat().st_mode & 0o777, 0o755)
+                    data.chmod(0o700)
 
     def test_cleanup_and_publisher_reuse_installer_path_and_keep_overrides(self):
         publisher = INSTALLER.with_name("publish-release.sh").read_text()
