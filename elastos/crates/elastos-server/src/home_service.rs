@@ -330,9 +330,18 @@ impl<'a> Service<'a> {
     /// The definition exists and runs this data directory's Runtime; another
     /// installation's (or a test's) service is never stopped or started.
     pub fn installed(&self) -> bool {
-        let Ok(text) = fs::read_to_string(self.spec.definition()) else {
+        // A definition is a few hundred bytes; read at most 64 KiB, never through a link.
+        let mut text = String::new();
+        let read = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(self.spec.definition())
+            .and_then(|file| {
+                std::io::Read::read_to_string(&mut std::io::Read::take(file, 64 * 1024), &mut text)
+            });
+        if read.is_err() {
             return false;
-        };
+        }
         let binary = self.spec.binary().display().to_string();
         text.contains(&match self.spec.platform {
             Platform::Linux => format!("\nExecStart={} home --browser\n", systemd_quote(&binary)),
