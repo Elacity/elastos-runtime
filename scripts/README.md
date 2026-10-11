@@ -99,6 +99,18 @@ Ambient `ELASTOS_TEST_*_BIN` paths carry no candidate receipt, so the gate clear
 them before checks. Its provider preparation supplies candidate test paths;
 other explicit binary inputs need a source receipt and the owning test contract.
 
+Deletion added to product code since the base (`scripts/removal-guard.py`, in
+the source gate) calls the owned-removal helper of its language, which removes
+one exact path below an owned root without following a link on the way and,
+when given one, only the recorded device+inode:
+`elastos_common::owned_removal::remove_owned` (Rust),
+`scripts/lib/owned_removal.py` (Python, and shell via
+`python3 scripts/lib/owned_removal.py ROOT RELATIVE [--expect DEV:INO]`) and
+`scripts/lib/owned-removal.mjs` (Node). A raw call that is safe for a reason,
+such as a temporary directory the same code created, says so on its line or
+the comment line above: `# removal-ok: <reason>` or `// removal-ok: <reason>`.
+Tests and fixtures are exempt; `--inventory` lists the existing raw calls.
+
 Each worktree and each local heavy operator shares the persistent lock file
 `local-ai-heavy-build.lock` in `git rev-parse --path-format=absolute
 --git-common-dir`. Acquire its exclusive `fcntl.flock` lease before a heavy
