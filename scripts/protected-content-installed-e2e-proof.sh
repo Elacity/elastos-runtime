@@ -299,7 +299,7 @@ VALID_DAYS=365
 POLICY_AUTHORITY_KEY="${HOME}/.elastos-protected-content/policy-authority.key"
 SHARED_DIR="${ROOT}/deploy/custody-host/shared"
 COMPOSE_FILE="${ROOT}/deploy/custody-host/docker-compose.yml"
-PROFILE="home"
+PROFILE="source-home"
 ALLOW_DIRTY=0
 RECEIPT_PATH=""
 CHAIN_RPC_URL="http://127.0.0.1:8545"
@@ -440,7 +440,7 @@ Shared options:
   --policy-authority-key <path>   Owner-only path outside the repo. Default: ~/.elastos-protected-content/policy-authority.key
   --shared-dir <dir>               Custody node descriptor/ticket handoff dir. Default: deploy/custody-host/shared
   --compose-file <path>           Custody-host compose file. Default: deploy/custody-host/docker-compose.yml
-  --profile <name>                 components.json profile for the static audit. Default: home
+  --profile <name>                 components.json profile for the static audit. Default: source-home
   --receipt-out <path>             Evidence receipt path. Default: <client-data-dir>/receipts/protected-content-installed-e2e-proof.json
   --transcript-out <path>          HTTP transcript JSONL path (secrets redacted). Default: <client-data-dir>/receipts/protected-content-installed-e2e-proof-transcript.jsonl
   --commands-out <path>            Full command list (every echoed "+ ..." line). Default: <client-data-dir>/receipts/protected-content-installed-e2e-proof-commands.log

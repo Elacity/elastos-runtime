@@ -22,6 +22,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - `elastos publish-release` drops its `--profile` option and the unused
   `providers` and `full` publish profiles; without `--capsules` it publishes
   the Home capsule set, as before (#89).
+- While protected content is off, the `home` profile leaves out
+  `elacity-player`, `media-tools`, `media-provider` and the protected-content
+  protect and decrypt providers; they still publish and install with
+  `elastos setup --with <name>`, and updates keep copies already installed.
 
 ## [0.8.0-alpha.15]
 

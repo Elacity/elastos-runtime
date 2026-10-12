@@ -5248,41 +5248,19 @@ pub(crate) mod tests {
                 }
             }
         }
-        let protected_home_dependencies = [
-            "chain-provider",
-            "wallet-provider",
-            "kubo",
-            "ipfs-provider",
-            "protected-content-protect-provider",
-            "media-provider",
-            "protected-content-decrypt-provider",
-            "library",
-            "marketplace",
-            "elacity-player",
-        ];
-        {
-            let profile = &manifest.profiles["home"];
-            let profile_name = "home";
-            for dependency in protected_home_dependencies {
-                assert_eq!(
-                    profile
-                        .components
-                        .iter()
-                        .filter(|component| component.as_str() == dependency)
-                        .count(),
-                    1,
-                    "{profile_name} protected-content Home profile must include {dependency} exactly once"
-                );
-            }
-        }
-        // Chain/wallet/DRM development providers stay out of Home and remain
-        // reachable only as an explicit developer `--with`.
+        // Protected content is off: its parts and the chain/wallet/DRM development
+        // providers stay out of Home and remain reachable as an explicit `--with`.
         let developer_providers = [
             "custody-provider",
             "drm-provider",
             "rights-provider",
             "key-provider",
             "decrypt-provider",
+            "protected-content-protect-provider",
+            "protected-content-decrypt-provider",
+            "media-provider",
+            "media-tools",
+            "elacity-player",
         ];
         for provider in developer_providers {
             assert!(
@@ -5549,14 +5527,6 @@ pub(crate) mod tests {
         assert_eq!(
             components["external"]["elacity-player"]["install_path"],
             "capsules/elacity-player"
-        );
-        assert!(
-            components["profiles"]["home"]["components"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "elacity-player"),
-            "home must include the Elacity Player capsule"
         );
     }
 

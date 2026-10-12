@@ -38,7 +38,6 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "inbox",
     "chat-room",
     "assistant",
-    "elacity-player",
     "model-provider",
 ];
 const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat", "home-agent"];

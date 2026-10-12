@@ -821,32 +821,6 @@ class PrepareWorkerTest(unittest.TestCase):
                     with self.assertRaisesRegex(SystemExit, "missing built Home CLI renderer"):
                         scope["write_capsule_archive"]("home-cli", self.repo / "capsules/home-cli")
 
-    def test_development_manifests_bind_the_managed_media_archive(self):
-        archive = self.root / "media-tools.tar.gz"
-        archive.write_bytes(b"already-validated native media archive")
-        for script in ("home-frontdoor-smoke.sh", "local-carrier-setup-smoke.sh"):
-            with self.subTest(script=script):
-                source = (SOURCE / "scripts" / script).read_text()
-                block = 'media_info = platform_info("media-tools")' + source.split(
-                    'media_info = platform_info("media-tools")', 1)[1].split(
-                    "\ndef write_capsule_archive", 1)[0].split(
-                    '\ncache = pathlib.Path', 1)[0].split(
-                    '\nif platform == "linux-arm64":', 1)[0]
-                artifacts = self.root / script
-                artifacts.mkdir()
-                descriptor = {"release_path": "media-tools-darwin-arm64.tar.gz"}
-                scope = {"os": os, "shutil": shutil, "hashlib": hashlib,
-                         "artifacts_dir": artifacts, "platform_info": lambda name: descriptor}
-                with patch.dict(os.environ, {"MEDIA_TOOLS_ARCHIVE": str(archive)}):
-                    exec(compile(block, script, "exec"), scope)
-                staged = artifacts / descriptor["release_path"]
-                self.assertEqual(staged.read_bytes(), archive.read_bytes())
-                self.assertEqual(descriptor["checksum"], "sha256:" + hashlib.sha256(archive.read_bytes()).hexdigest())
-                self.assertEqual(descriptor["size"], archive.stat().st_size)
-                with patch.dict(os.environ, {"MEDIA_TOOLS_ARCHIVE": str(self.root / "missing-archive")}):
-                    with self.assertRaises(FileNotFoundError):
-                        exec(compile(block, script, "exec"), scope)
-
     def test_arm64_carrier_fixture_stages_the_pinned_engine_archive(self):
         script = "local-carrier-setup-smoke.sh"
         source = (SOURCE / "scripts" / script).read_text()
@@ -917,12 +891,6 @@ class PrepareWorkerTest(unittest.TestCase):
         self.assertFalse(output.exists())
         data = json.loads(installed.read_text())
         data["external"]["home-cli"]["platforms"] = {"linux-amd64": native_info}
-        installed.write_text(json.dumps(data))
-        result = subprocess.run(command, input=body, text=True, capture_output=True, env=self.env)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("missing managed media tools", result.stderr)
-        data["external"]["media-tools"] = {"platforms": {"linux-amd64": {
-            "release_path": "media-tools-linux-amd64.tar.gz", "extract_path": "media-tools"}}}
         installed.write_text(json.dumps(data))
         result = subprocess.run(command, input=body, text=True, capture_output=True, env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)

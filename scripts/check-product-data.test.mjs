@@ -200,7 +200,6 @@ for (const [name, mutate, message] of [
 for (const [name, mutate, message] of [
   ["unknown profile component", (value) => value.profiles.home.components.push("missing-provider"), /unknown component/],
   ["missing Wallet dependency", (value) => value.profiles.home.components = value.profiles.home.components.filter((entry) => entry !== "wallet-provider"), /Wallet\/Browser dependency/],
-  ["duplicate protected dependency", (value) => value.profiles.home.components.push("media-provider"), /must occur once/],
   ["default public edge service", (value) => value.profiles.home.components.push("tunnel-provider"), /developer --with component/],
   ["custody in default Home", (value) => value.profiles.home.components.push("custody-provider"), /developer --with component/],
   ["second setup profile", (value) => value.profiles.demo = { components: ["shell"] }, /Setup installs one Home/],

@@ -204,11 +204,6 @@ if (home_cli_info.get("release_path") != f"home-cli-{setup_platform}.tar.gz"
         "rerun after that release is available."
     )
 
-media_info = ((installed.get("external") or {}).get("media-tools", {}).get("platforms") or {}).get(setup_platform, {})
-if (media_info.get("release_path") != f"media-tools-{setup_platform}.tar.gz"
-        or media_info.get("extract_path") != "media-tools"):
-    raise SystemExit("Published Home input is missing managed media tools; rerun after a compatible release is available.")
-
 for name, source_component in data.get("external", {}).items():
     installed_component = (installed.get("external") or {}).get(name)
     if not installed_component:

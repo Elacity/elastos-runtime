@@ -25,12 +25,12 @@ NC='\033[0m'
 
 # Default publish scope: runtime core + first-party Home app surface.
 # Wallet/Browser surfaces require chain-provider and wallet-provider authority.
-# Developer-only capsules such as GBA are published by the release asset
-# loop below and installed with `elastos setup --with <name>`.
+# Developer-only capsules such as GBA and, while protected content is off,
+# Elacity Player are published by the release asset loop below and installed
+# with `elastos setup --with <name>`.
 # availability-provider, drm-provider, rights-provider, key-provider,
 # decrypt-provider, and tunnel-provider are supported direct command assets
-# outside the default managed Home. Runtime-only protected providers are
-# support assets selected by the component profile rather than capsule publish.
+# outside the default managed Home, as are the Runtime-only protected providers.
 DEFAULT_CAPSULES=(
     shell
     localhost-provider
@@ -62,7 +62,6 @@ DEFAULT_CAPSULES=(
     inbox
     chat-room
     assistant
-    elacity-player
     model-provider
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
@@ -97,7 +96,6 @@ REQUIRED_SUPPORTED_CAPSULES=(
     inbox
     chat-room
     assistant
-    elacity-player
     model-provider
 )
 SUPPORT_BINARY_ASSETS=(

@@ -22,9 +22,10 @@ fail-closed rejects any group-writable ancestor of the resolved binaries. If
 setup stops with `ffmpeg prerequisite parent is unsafe`, tighten the Homebrew
 directory on that path (commonly `chmod g-w /opt/homebrew/Cellar`) and rerun.
 
-Ordinary Home setup fetches the signed `media-tools` package and imports its
-managed executable pair. The host tool instructions above apply to source-home
-development.
+Outside source-home, `elastos setup --with media-provider` fetches the signed
+`media-tools` package and imports its managed executable pair; the Home profile
+leaves it out while protected content is off. The host tool instructions above
+apply to source-home development.
 
 Then get the repo and build/install the source-home runtime into an isolated
 Mac test home. Replace `upstream/RELEASE-dev` below with the development ref
