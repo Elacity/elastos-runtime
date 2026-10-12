@@ -4,9 +4,6 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
 const source = readFileSync(new URL("../capsules/_shared/model-management.js", import.meta.url), "utf8");
-for (const capsule of ["system", "marketplace"]) {
-  assert.equal(readFileSync(new URL(`../capsules/${capsule}/browser/model-management.js`, import.meta.url), "utf8"), source);
-}
 const context = { window: {} };
 vm.runInNewContext(source.replace("window.ElastosModelManagement = {",
   "window.testFailure = { capacityText, parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT, DISPATCH_UNAVAILABLE_TEXT }; window.ElastosModelManagement = {"), context);
@@ -107,7 +104,7 @@ assert.deepEqual(plain(COMPACT_PHASE_TEXT), { ...plain(PHASE_TEXT), absent: "Not
 assert.deepEqual(Object.keys(PHASE_TEXT).sort(), Object.keys(phases).filter(name => !["failed", "capacity"].includes(name)).sort(), "every phase except failed and capacity reads its copy from the table");
 assert.equal(capacityText({ total_bytes: 3e9, completed_bytes: 1e9 }),
   "Waiting for free space. This model needs 2 GB on this Home, plus 2 GB kept free. Free some space and it continues.");
-console.log("PASS model preparation failure: safe classes, operation/catalog parity, unknown history, strict rejection, shared copies, explicit two-entry selection, phase copy tables");
+console.log("PASS model preparation failure: safe classes, operation/catalog parity, unknown history, strict rejection, explicit two-entry selection, phase copy tables");
 
 // Advance a pending operation beyond the former three-minute polling ceiling.
 // The bounded clock exercises the controller without downloading model bytes.

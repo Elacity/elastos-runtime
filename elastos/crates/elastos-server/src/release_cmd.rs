@@ -27,7 +27,7 @@ pub async fn run_source(cmd: crate::sources::SourceCommand) -> anyhow::Result<()
             )
             .await
         }
-        other => crate::sources::run_source_command(other, crate::publish::source_discovery_uri),
+        other => crate::sources::run_source_command(other),
     }
 }
 
@@ -92,7 +92,7 @@ async fn run_update_command_for_data_dir(
     });
 
     let carrier_for_discovery = carrier_client.clone();
-    let try_p2p: update::TryP2pFn = Box::new(move |source, _publisher_did| {
+    let discover_head: update::DiscoverHeadFn = Box::new(move |source, _publisher_did| {
         let client = carrier_for_discovery.clone();
         Box::pin(async move {
             update::discover_carrier_release_head(&client, &source)
@@ -106,7 +106,7 @@ async fn run_update_command_for_data_dir(
     let result = update::run_update_for_data_dir(
         data_dir,
         &fetch_fn,
-        Some(&try_p2p),
+        Some(&discover_head),
         check,
         effective_head_cid,
         current_version,

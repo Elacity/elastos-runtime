@@ -1198,12 +1198,11 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         node = "4" * 64
         ticket = base64.b32encode(signer.json_bytes({"endpoints": [{"id": node, "addrs": []}]})).decode().lower().rstrip("=")
         stamps = {"MAINTAINER_DID": did, "SOURCE_CONNECT_TICKET": ticket,
-                  "PUBLISHER_NODE_ID": node, "PUBLISHER_GATEWAY": "https://staging.invalid",
-                  "IPNS_NAME": ""}
+                  "PUBLISHER_NODE_ID": node, "PUBLISHER_GATEWAY": "https://staging.invalid"}
         stamps_path = self.root / "signing-stamps.json"
         self.write_json(stamps_path, stamps)
         template = ("#!/bin/sh\n" + "\n".join(f'{name}="__{name}__"'
-                    for name in sorted(signer.STAMPS | {"HEAD_CID"})) + "\n").encode()
+                    for name in sorted(signer.STAMPS)) + "\n").encode()
         blob_oid = hashlib.sha1(b"blob " + str(len(template)).encode() + b"\0" + template).hexdigest()
         for context in (
                 patch.object(inputs, "installer_source_blob", return_value=(blob_oid, template)),
@@ -1291,7 +1290,6 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
             "## [0.7.1]\n- System shows signed change notes.\n")
         manifest = self.prepare_signing_fixture(fixture)
         rendered = signer.render_installer(fixture.template, fixture.stamps, fixture.stamps["MAINTAINER_DID"])
-        self.assertIn(b'HEAD_CID=""', rendered)
         self.assertEqual(manifest["source"], {"commit": "a" * 40, "tree": "b" * 40})
         self.assertEqual((manifest["version"], manifest["channel"]), ("0.7.1", "canary"))
         self.assertEqual(manifest["installer"], {"blob_oid": fixture.blob_oid, "stamps": fixture.stamps})
@@ -1465,8 +1463,7 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         self.write_json(fixture.cids_path, fixture.cids)
         for stamps in ({**fixture.stamps, "SOURCE_CONNECT_TICKET": "$(touch marker)"},
                        {**fixture.stamps, "PUBLISHER_GATEWAY": "http://staging.invalid"},
-                       {**fixture.stamps, "MAINTAINER_DID": "did:key:invalid"},
-                       {**fixture.stamps, "HEAD_CID": "circular-head"}):
+                       {**fixture.stamps, "MAINTAINER_DID": "did:key:invalid"}):
             self.write_json(fixture.stamps_path, stamps)
             with self.subTest(stamps=stamps), self.assertRaises(ValueError):
                 self.prepare_signing_fixture(fixture)
@@ -1540,8 +1537,7 @@ prepare_release_signing_input "$6/native-inputs" "$7" "$8"
                                  str(self.root), str(fixture.output), did], capture_output=True, text=True,
                                 env={**os.environ, "ELASTOS_SOURCE_CONNECT_TICKET": ticket,
                                      "ELASTOS_PUBLISHER_NODE_ID": node,
-                                     "ELASTOS_PUBLISHER_GATEWAY": "https://staging.invalid/",
-                                     "ELASTOS_IPNS_NAME": "public-ipns"})
+                                     "ELASTOS_PUBLISHER_GATEWAY": "https://staging.invalid/"})
         return did, result
 
     def test_shell_unsigned_helper_passes_complete_public_inputs_without_signing(self):
@@ -1553,8 +1549,7 @@ prepare_release_signing_input "$6/native-inputs" "$7" "$8"
                          {**fixture.cids, "components-aarch64-darwin.json": fixture.components_cid})
         self.assertEqual(json.loads((fixture.scratch / "signing-stamps.json").read_bytes()),
                          {"MAINTAINER_DID": did, "SOURCE_CONNECT_TICKET": "public-ticket",
-                          "PUBLISHER_NODE_ID": "public-node", "PUBLISHER_GATEWAY": "https://staging.invalid",
-                          "IPNS_NAME": "public-ipns"})
+                          "PUBLISHER_NODE_ID": "public-node", "PUBLISHER_GATEWAY": "https://staging.invalid"})
         arguments = fixture.capture.read_text().splitlines()
         self.assertEqual(arguments, ["scripts/release-platform-input.py", "signing-input", str(self.root / "native-inputs"),
                          "--cids", str(fixture.scratch / "signing-cids.json"),

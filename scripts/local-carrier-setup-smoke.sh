@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# The Runtime's media-provider validators require every data-root directory
-# to be owner-only; the default umask (022) stages this smoke's ephemeral
-# tree world-readable and setup fails with "Runtime data root must be
-# owner-only".
+# Keep this smoke's ephemeral tree owner-only, as on an installed Home;
+# Runtime refuses private state that other users can read.
 umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -131,10 +129,7 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/net-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/exit-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/ipfs-provider" && cargo build --release)
-(cd "${REPO_ROOT}/capsules/media-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/model-provider" && cargo build --release)
-(cd "${REPO_ROOT}/capsules/protected-content-protect-provider" && cargo build --release)
-(cd "${REPO_ROOT}/capsules/protected-content-decrypt-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/browser-engine-adapter" && cargo build --release)
 (cd "${REPO_ROOT}/elastos/tools/browser-local-exit" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/webspace-provider" && cargo build --release)
@@ -150,15 +145,6 @@ if len(paths) != 1:
     raise SystemExit("expected one built Home CLI renderer")
 print(paths[0])')
 export HOME_CLI_RENDERER
-MEDIA_TOOLS_ARCHIVE=$(
-    cd "${REPO_ROOT}"
-    source scripts/publish-release.sh
-    TMPDIR="${TEST_ROOT}/media-package"
-    mkdir -p "$TMPDIR"
-    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TEST_ROOT}/media-target}" \
-        build_packaged_media_tools_archive "${SETUP_PLATFORM}"
-)
-export MEDIA_TOOLS_ARCHIVE
 for capsule in \
     home \
     home-cli \
@@ -169,7 +155,6 @@ for capsule in \
     system \
     services \
     documents \
-    elacity-player \
     chat-room \
     inbox \
     library \
@@ -209,10 +194,7 @@ CHAIN_PROVIDER_BIN="$(cargo_release_binary capsules/chain-provider chain-provide
 NET_PROVIDER_BIN="$(cargo_release_binary capsules/net-provider net-provider)" \
 EXIT_PROVIDER_BIN="$(cargo_release_binary capsules/exit-provider exit-provider)" \
 IPFS_PROVIDER_BIN="$(cargo_release_binary capsules/ipfs-provider ipfs-provider)" \
-MEDIA_PROVIDER_BIN="$(cargo_release_binary capsules/media-provider media-provider)" \
 MODEL_PROVIDER_BIN="$(cargo_release_binary capsules/model-provider model-provider)" \
-PROTECTED_CONTENT_PROTECT_PROVIDER_BIN="$(cargo_release_binary capsules/protected-content-protect-provider protected-content-protect-provider)" \
-PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN="$(cargo_release_binary capsules/protected-content-decrypt-provider protected-content-decrypt-provider)" \
 BROWSER_ENGINE_ADAPTER_BIN="$(cargo_release_binary capsules/browser-engine-adapter browser-engine-adapter)" \
 BROWSER_LOCAL_EXIT_BIN="$(cargo_release_binary elastos/tools/browser-local-exit browser-local-exit)" \
 WEBSPACE_PROVIDER_BIN="$(cargo_release_binary capsules/webspace-provider webspace-provider)" \
@@ -231,7 +213,6 @@ LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
 MARKETPLACE_CAPSULE_DIR="${REPO_ROOT}/capsules/marketplace" \
 ARCHIVE_MANAGER_CAPSULE_DIR="${REPO_ROOT}/capsules/archive-manager" \
 ASSISTANT_CAPSULE_DIR="${REPO_ROOT}/capsules/assistant" \
-ELACITY_PLAYER_CAPSULE_DIR="${REPO_ROOT}/capsules/elacity-player" \
 CHAT_ROOM_CAPSULE_DIR="${REPO_ROOT}/capsules/chat-room" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
 WALLET_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet" \
@@ -278,14 +259,7 @@ mapping = {
     "net-provider": pathlib.Path(os.environ["NET_PROVIDER_BIN"]),
     "exit-provider": pathlib.Path(os.environ["EXIT_PROVIDER_BIN"]),
     "ipfs-provider": pathlib.Path(os.environ["IPFS_PROVIDER_BIN"]),
-    "media-provider": pathlib.Path(os.environ["MEDIA_PROVIDER_BIN"]),
     "model-provider": pathlib.Path(os.environ["MODEL_PROVIDER_BIN"]),
-    "protected-content-protect-provider": pathlib.Path(
-        os.environ["PROTECTED_CONTENT_PROTECT_PROVIDER_BIN"]
-    ),
-    "protected-content-decrypt-provider": pathlib.Path(
-        os.environ["PROTECTED_CONTENT_DECRYPT_PROVIDER_BIN"]
-    ),
     "browser-engine-adapter": pathlib.Path(os.environ["BROWSER_ENGINE_ADAPTER_BIN"]),
     "browser-local-exit": pathlib.Path(os.environ["BROWSER_LOCAL_EXIT_BIN"]),
     "webspace-provider": pathlib.Path(os.environ["WEBSPACE_PROVIDER_BIN"]),
@@ -306,12 +280,6 @@ for name, src in mapping.items():
     data = dest.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
-
-media_info = platform_info("media-tools")
-media_archive = artifacts_dir / media_info["release_path"]
-shutil.copyfile(os.environ["MEDIA_TOOLS_ARCHIVE"], media_archive)
-media_info["checksum"] = "sha256:" + hashlib.sha256(media_archive.read_bytes()).hexdigest()
-media_info["size"] = media_archive.stat().st_size
 
 cache = pathlib.Path(os.environ.get('KUBO_CACHE_DIR', str(data_dir.parent.parent / 'kubo-cache')))
 receipt = json.loads((data_dir / 'receipts/kubo-build.json').read_bytes())
@@ -385,7 +353,6 @@ browser_capsules = {
     "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
     "archive-manager": pathlib.Path(os.environ["ARCHIVE_MANAGER_CAPSULE_DIR"]),
     "assistant": pathlib.Path(os.environ["ASSISTANT_CAPSULE_DIR"]),
-    "elacity-player": pathlib.Path(os.environ["ELACITY_PLAYER_CAPSULE_DIR"]),
     "chat-room": pathlib.Path(os.environ["CHAT_ROOM_CAPSULE_DIR"]),
     "wallet": pathlib.Path(os.environ["WALLET_CAPSULE_DIR"]),
     "wallet-metamask": pathlib.Path(os.environ["WALLET_METAMASK_CAPSULE_DIR"]),
@@ -544,10 +511,8 @@ sources = {
             "name": "default",
             "publisher_dids": ["did:key:local-carrier-test"],
             "channel": "stable",
-            "discovery_uri": "elastos://source/stable/local-carrier-test",
             "connect_ticket": os.environ["CONNECT_TICKET"],
             "publisher_node_id": os.environ["NODE_ID"],
-            "ipns_name": "",
             "gateways": [],
             "install_path": "",
             "installed_version": "",

@@ -750,7 +750,7 @@ fn setup_reader_requires_exact_guard_current_source_and_pending_free_binary() {
             "pending file" => write_private(&journal, b"pending malformed journal").unwrap(),
             "pending directory" => fs::create_dir(&journal).unwrap(),
             "pending symlink" => symlink(&fixture.binary, &journal).unwrap(),
-            "changed source input" => fixture.source.discovery_uri = "changed source".into(),
+            "changed source input" => fixture.source.connect_ticket = "changed source".into(),
             "missing publisher pins" => {
                 fixture.source.publisher_dids.clear();
                 fixture.save_source();

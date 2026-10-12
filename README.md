@@ -11,70 +11,13 @@ separate artifact identities and verification records.
 
 ## Current isolation and target boundary
 
-First-party apps run as web projections in the browser's opaque sandboxed
-frames. Runtime checks each app's signed launch token and actor before it performs an effect.
-Home can currently obtain every app's capability, so a compromised Home can
-reach those apps' authority. The target limits Home to delegation and gives each
-app a separate, revocable capability. The WASM Component authoring path runs in
-Wasmtime with memory and fuel limits and Runtime Bus hostcalls.
+[SECURITY.md](SECURITY.md#current-isolation-and-target-boundary) states what
+is isolated today and the target boundary.
 
-Providers run as native operating-system processes with the Runtime user's
-rights. Only the model provider is partly confined. The trusted shell helper
-also runs as a native host process. The web Terminal is disabled by default;
-host developer mode and closed guest registration are required to enable it.
-An enabled Terminal runs commands with the host user's rights.
+## Install
 
-The seed operator can read hosted data, wallet keys and recovery material.
-Passkeys control sign-in; stored data and keys remain accessible to the Runtime
-account and root while Home is locked. Protection against hosted operators and
-root, and against other software or OS users while a self-hosted Home is locked,
-is the target of [hosted protection](https://github.com/Elacity/elastos-runtime/issues/209)
-and [locked Home protection](https://github.com/Elacity/elastos-runtime/issues/210).
-An unlocked self-hosted Home trusts its owner and their host software. Recovery
-from a stolen device or profile key requires a new identity.
-
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
-records the remaining gates. Source checks describe this source tree. Accepted
-installed proof binds the exact Runtime, components and app assets to the
-journeys tested on that device.
-
-## Install from the publisher
-
-The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed.
-
-The maintainer release DID is
-`did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
-installer's `Maintainer DID:` line with this complete DID. Stop if they differ.
-
-The maintainer changed the release signing key because the previous key was
-stored on the public server.
-
-```bash
-curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-```
-
-For an existing Home, re-trust the maintainer once by running the same installer
-over the old installation:
-
-```bash
-curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-```
-
-The installer trusts the new DID, installs the release and keeps your existing
-identity, accounts and user files. Homes that already trust this DID can use
-normal updates. See [release signer recovery](docs/INSTALL.md#compare-and-change-the-release-signer).
-
-The installer installs Runtime, sets up the Home profile, and opens Home. Its
-release acceptance evidence lives in GitHub issues. Keep the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
-later run `elastos` from a new shell. You do not need a separate `elastos serve`
-process for this path. Home is the user-facing front door to the managed
-Runtime.
-
-Only one live host may own an ElastOS data home at a time. Stop Home before
-using the separate operator runtime in the same home. See [Installing
-ElastOS](docs/INSTALL.md) for updates, trust verification, and
-operator setup. See the [Mac staging runbook](docs/MAC.md) for source-home
-staging and Browser VM work.
+[Installing ElastOS](docs/INSTALL.md) covers the publisher install, the
+maintainer DID check, updates and removal.
 
 ## Build from source
 

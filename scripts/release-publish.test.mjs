@@ -25,7 +25,7 @@ const ticketBits = [...Buffer.from(JSON.stringify({ endpoints: [{ id: nodeId, ad
   .map(byte => byte.toString(2).padStart(8, '0')).join('');
 const ticket = ticketBits.match(/.{1,5}/g).map(group => 'abcdefghijklmnopqrstuvwxyz234567'[parseInt(group.padEnd(5, '0'), 2)]).join('');
 const delivery = { MAINTAINER_DID: did, SOURCE_CONNECT_TICKET: ticket, PUBLISHER_GATEWAY: 'https://fixture.invalid',
-  PUBLISHER_NODE_ID: nodeId, IPNS_NAME: 'fixture-ipns' };
+  PUBLISHER_NODE_ID: nodeId };
 const packageRun = { id: 123, run_attempt: 1, head_sha: workflowCommit, head_branch: 'develop', event: 'workflow_dispatch',
   path: '.github/workflows/release-package.yml', status: 'completed', conclusion: 'success',
   head_repository: { id: 1234, full_name: 'Elacity/elastos-runtime' }, repository: { id: 1234, full_name: 'Elacity/elastos-runtime' } };
@@ -213,7 +213,7 @@ if os.environ.get('FAIL_VERIFY') == receipt['platform']:
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 fs.writeFileSync(process.env.ARGUMENT_LOG, JSON.stringify(args));
-fs.writeFileSync(process.env.ARGUMENT_LOG + '.delivery', JSON.stringify({ gateway: process.env.ELASTOS_PUBLISHER_GATEWAY, ipns: process.env.ELASTOS_IPNS_NAME }));
+fs.writeFileSync(process.env.ARGUMENT_LOG + '.delivery', JSON.stringify({ gateway: process.env.ELASTOS_PUBLISHER_GATEWAY }));
 const output = args[args.indexOf('--prepare-only') + 1];
 fs.mkdirSync(output, { recursive: true });
 fs.writeFileSync(output + '/signing-input.json', JSON.stringify({ source: { commit: '${commit}', tree: '${tree}' }, files: [{ size: 1 }], installer: { stamps: ${JSON.stringify(delivery)} } }));
@@ -292,7 +292,7 @@ test('prepare preserves accepted native and proof artifacts from earlier attempt
   assert.equal(record.receipts[0].artifact.attempt, 1);
   assert.equal(record.receipts[0].proof_artifact.attempt, 2);
   assert.deepEqual(JSON.parse(readFileSync(f.env.ARGUMENT_LOG + '.delivery')),
-    { gateway: delivery.PUBLISHER_GATEWAY, ipns: delivery.IPNS_NAME });
+    { gateway: delivery.PUBLISHER_GATEWAY });
 });
 
 test('prepare refuses receipt producer attempt mismatch before source execution', t => {

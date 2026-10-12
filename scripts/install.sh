@@ -47,11 +47,6 @@ MAINTAINER_DID_PLACEHOLDER="__MAINTAINER""_DID__"
 if [[ "$MAINTAINER_DID" == "$MAINTAINER_DID_PLACEHOLDER" ]]; then
     MAINTAINER_DID=""
 fi
-HEAD_CID="${ELASTOS_HEAD_CID:-__HEAD_CID__}"
-HEAD_CID_PLACEHOLDER="__HEAD""_CID__"
-if [[ "$HEAD_CID" == "$HEAD_CID_PLACEHOLDER" ]]; then
-    HEAD_CID=""
-fi
 SOURCE_CONNECT_TICKET="${ELASTOS_SOURCE_CONNECT_TICKET:-__SOURCE_CONNECT_TICKET__}"
 SOURCE_CONNECT_TICKET_PLACEHOLDER="__SOURCE""_CONNECT_TICKET__"
 if [[ "$SOURCE_CONNECT_TICKET" == "$SOURCE_CONNECT_TICKET_PLACEHOLDER" ]]; then
@@ -75,13 +70,8 @@ PUBLISHER_NODE_ID_EXPLICIT=false
 if [[ -n "${ELASTOS_PUBLISHER_NODE_ID:-}" && -n "$PUBLISHER_NODE_ID" ]]; then
     PUBLISHER_NODE_ID_EXPLICIT=true
 fi
-IPNS_NAME="${ELASTOS_IPNS_NAME:-__IPNS_NAME__}"
-IPNS_NAME_PLACEHOLDER="__IPNS""_NAME__"
-if [[ "$IPNS_NAME" == "$IPNS_NAME_PLACEHOLDER" ]]; then
-    IPNS_NAME=""
-fi
 
-ALLOWED_CHANNELS=("stable" "canary" "jetson-test")
+ALLOWED_CHANNELS=("stable" "canary")
 BINARY_DOWNLOAD_RETRY_COUNT="${ELASTOS_BINARY_DOWNLOAD_RETRY_COUNT:-10}"
 BINARY_DOWNLOAD_RETRY_DELAY="${ELASTOS_BINARY_DOWNLOAD_RETRY_DELAY:-2}"
 BINARY_DOWNLOAD_CONNECT_TIMEOUT="${ELASTOS_BINARY_DOWNLOAD_CONNECT_TIMEOUT:-15}"
@@ -138,7 +128,7 @@ show_help() {
     echo "  Fails closed if signatures can't be verified."
     echo ""
     echo -e "${BOLD}Release channels:${NC}"
-    echo "  stable, canary, jetson-test"
+    echo "  stable, canary"
     echo ""
     exit 0
 }
@@ -1383,12 +1373,10 @@ SOURCES_PATH="${INSTALL_SCRATCH}/sources.json"
 PUBLISHER_DID="${SIGNER_DID}" \
 PUBLISHER_GATEWAY="${PUBLISHER_GATEWAY}" \
 INSTALLED_VERSION="${RELEASE_VERSION}" \
-INSTALLED_HEAD_CID="${HEAD_CID}" \
 INSTALLED_CHANNEL="${RELEASE_CHANNEL}" \
 INSTALLED_BINARY_PATH="${INSTALL_DIR}/elastos" \
 SOURCE_CONNECT_TICKET="${SOURCE_CONNECT_TICKET}" \
 PUBLISHER_NODE_ID="${PUBLISHER_NODE_ID}" \
-IPNS_NAME="${IPNS_NAME}" \
 SOURCES_PATH="${SOURCES_PATH}" \
 python3 - <<'PY'
 import json
@@ -1407,7 +1395,6 @@ publisher_hash = hashlib.sha256(publisher_did.encode("utf-8")).hexdigest()[:32]
 discovery_uri = f"elastos://source/{channel}/{publisher_hash}"
 connect_ticket = os.environ.get("SOURCE_CONNECT_TICKET", "")
 publisher_node_id = os.environ.get("PUBLISHER_NODE_ID", "")
-ipns_name = os.environ.get("IPNS_NAME", "")
 
 sources = {
     "schema": "elastos.trusted-sources/v1",
@@ -1420,11 +1407,11 @@ sources = {
             "discovery_uri": discovery_uri,
             "connect_ticket": connect_ticket,
             "publisher_node_id": publisher_node_id,
-            "ipns_name": ipns_name,
             "gateways": gateways,
             "install_path": os.environ["INSTALLED_BINARY_PATH"],
             "installed_version": os.environ["INSTALLED_VERSION"],
-            "head_cid": os.environ["INSTALLED_HEAD_CID"],
+            # Installation consumes no release head; `elastos update` records one.
+            "head_cid": "",
         }
     ],
 }

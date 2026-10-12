@@ -25,12 +25,12 @@ NC='\033[0m'
 
 # Default publish scope: runtime core + first-party Home app surface.
 # Wallet/Browser surfaces require chain-provider and wallet-provider authority.
-# Developer-only capsules such as GBA are published by the release asset
-# loop below and installed with `elastos setup --with <name>`.
+# Developer-only capsules such as GBA and, while protected content is off,
+# Elacity Player are published by the release asset loop below and installed
+# with `elastos setup --with <name>`.
 # availability-provider, drm-provider, rights-provider, key-provider,
 # decrypt-provider, and tunnel-provider are supported direct command assets
-# outside the default managed Home. Runtime-only protected providers are
-# support assets selected by the component profile rather than capsule publish.
+# outside the default managed Home, as are the Runtime-only protected providers.
 DEFAULT_CAPSULES=(
     shell
     localhost-provider
@@ -62,7 +62,6 @@ DEFAULT_CAPSULES=(
     inbox
     chat-room
     assistant
-    elacity-player
     model-provider
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
@@ -97,7 +96,6 @@ REQUIRED_SUPPORTED_CAPSULES=(
     inbox
     chat-room
     assistant
-    elacity-player
     model-provider
 )
 SUPPORT_BINARY_ASSETS=(
@@ -132,7 +130,6 @@ SUPPORT_BINARY_ASSETS=(
 ALLOWED_CHANNELS=(
     stable
     canary
-    jetson-test
 )
 
 # Navigate to project root; relative CLI paths belong to the original caller.
@@ -154,7 +151,7 @@ show_help() {
     echo ""
     echo "Optional:"
     echo "  --ipfs-provider-bin PATH Path to the ipfs-provider binary"
-    echo "  --channel NAME     stable | canary | jetson-test (default: stable)"
+    echo "  --channel NAME     stable | canary (default: stable)"
     echo "  --preview-platform PLATFORM One canary input from that platform's host"
     echo "  --help             Show this help"
     echo ""
@@ -1132,7 +1129,7 @@ publish_prepared_platform_inputs() {
 }
 
 prepare_release_signing_input() {
-    local root="$1" output="$2" publisher="$3" bootstrap ticket node gateway ipns
+    local root="$1" output="$2" publisher="$3" bootstrap ticket node gateway
     local args=() prev
     ticket="${ELASTOS_SOURCE_CONNECT_TICKET:-}"
     node="${ELASTOS_PUBLISHER_NODE_ID:-}"
@@ -1145,10 +1142,9 @@ prepare_release_signing_input() {
     fi
     [[ -n "$ticket" && -n "$node" ]] || die "unsigned preparation requires a Publisher Carrier ticket/node pair"
     gateway="${ELASTOS_PUBLISHER_GATEWAY:-$(canonical_publisher_gateway)}"
-    ipns="${ELASTOS_IPNS_NAME:-}"
     jq -nc --arg did "$publisher" --arg ticket "$ticket" --arg node "$node" \
-        --arg gateway "${gateway%/}" --arg ipns "$ipns" \
-        '{MAINTAINER_DID:$did,SOURCE_CONNECT_TICKET:$ticket,PUBLISHER_NODE_ID:$node,PUBLISHER_GATEWAY:$gateway,IPNS_NAME:$ipns}' \
+        --arg gateway "${gateway%/}" \
+        '{MAINTAINER_DID:$did,SOURCE_CONNECT_TICKET:$ticket,PUBLISHER_NODE_ID:$node,PUBLISHER_GATEWAY:$gateway}' \
         > "${TMPDIR}/signing-stamps.json" || return
     jq --argjson platforms "$PLATFORMS_JSON" '
         reduce ($platforms | to_entries[]) as $p (. ;

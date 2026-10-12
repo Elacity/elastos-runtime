@@ -182,10 +182,6 @@ enum Commands {
         #[arg(long, default_value = "stable")]
         channel: String,
 
-        /// Publish profile name (used when --capsules is not set)
-        #[arg(long, default_value = "home")]
-        profile: String,
-
         /// Skip rebuilding binaries
         #[arg(long)]
         skip_build: bool,
@@ -1446,7 +1442,6 @@ async fn run() -> anyhow::Result<()> {
         Commands::PublishRelease {
             version,
             channel,
-            profile,
             skip_build,
             skip_rootfs,
             cross,
@@ -1468,7 +1463,6 @@ async fn run() -> anyhow::Result<()> {
             release_cmd::run_publish_release(crate::publish::PublishReleaseOptions {
                 version,
                 channel,
-                profile,
                 skip_build,
                 skip_rootfs,
                 cross,
@@ -2348,14 +2342,11 @@ mod tests {
         ];
         let cli = super::Cli::try_parse_from(args).unwrap();
         let Some(super::Commands::PublishRelease {
-            platform_inputs,
-            profile,
-            ..
+            platform_inputs, ..
         }) = cli.command
         else {
             panic!("expected publish-release command");
         };
-        assert_eq!(profile, "home");
         assert_eq!(
             platform_inputs,
             [

@@ -562,7 +562,7 @@ if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"
 export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$1/tmp" FIXTURES="$1" PATH="$1/mocks:$PATH"
 # Apple Python otherwise adds bytecode caches to HOME during file-preservation checks.
 export PYTHONDONTWRITEBYTECODE=1
-export ELASTOS_PUBLISHER_GATEWAY="" ELASTOS_HEAD_CID=""
+export ELASTOS_PUBLISHER_GATEWAY=""
 export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID="" ELASTOS_INSTALL_ONLY=""
 export ELASTOS_TEST_CALLS="$1/calls" ELASTOS_TEST_SETUP_MARKER="$1/setup-marker" MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
 # Feed the complete stamped script through stdin, as curl | bash does.

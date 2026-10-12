@@ -2,26 +2,9 @@
 
 ## Current isolation and target boundary
 
-First-party apps run as web projections in the browser's opaque sandboxed
-frames. Runtime checks each app's signed launch token and actor before it performs an effect.
-Home can currently obtain every app's capability, so a compromised Home can
-reach those apps' authority. The target limits Home to delegation and gives each
-app a separate, revocable capability. The WASM Component authoring path runs in
-Wasmtime with memory and fuel limits and Runtime Bus hostcalls.
-
-Providers run as native operating-system processes with the Runtime user's
-rights. Only the model provider is partly confined. The trusted shell helper
-also runs as a native host process. The web Terminal is disabled by default;
-host developer mode and closed guest registration are required to enable it.
-An enabled Terminal runs commands with the host user's rights.
-
-The [data, keys and backups](#data-keys-and-backups) section explains current
-host access and the protection target for hosted and locked self-hosted Homes.
-
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
-records the remaining gates. Source checks describe this source tree. Accepted
-installed proof binds the exact Runtime, components and app assets to the
-journeys tested on that device.
+[SECURITY.md](../SECURITY.md#current-isolation-and-target-boundary) states what
+is isolated today and the target boundary. [Data, keys and
+backups](#data-keys-and-backups) explains host access to an installed Home.
 
 ## Install from the publisher
 
@@ -81,7 +64,8 @@ microVM `run`, and non-interactive capsule work.
 Data `run` needs no Runtime, and interactive packaged capsules use managed Home.
 Only one live host may own an ElastOS data home at a time. Do not run Home and
 the operator runtime against the same home at the same time. See the
-[command matrix](COMMAND_MATRIX.md) for each command lane.
+[command matrix](COMMAND_MATRIX.md) for each command lane. `elastos home
+--status` prints the local Home state.
 
 ### Source checkout note
 
@@ -193,9 +177,7 @@ source saved in `sources.json` during install. It asks for the latest signed
 release head, fetches the head and the release by CID (a source that gives no
 separate head CID sends the head file by name), and checks both signatures, the
 release hash, the channel and the version order. An older
-release is refused. The `discovery_uri` and `ipns_name` fields in
-`sources.json` are shown but not used to find updates. If the Carrier
-connection fails, the check fails.
+release is refused. If the Carrier connection fails, the check fails.
 
 **What System shows.** System shows the new version and its release notes.
 
@@ -302,8 +284,9 @@ Operators can install one known signed release head with
 
 The maintainer release DID is
 `did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
-installer's `Maintainer DID:` line with the complete DID in the repository
-[README](../README.md#install-from-the-publisher).
+installer's `Maintainer DID:` line with this complete DID. Stop if they differ.
+The maintainer changed the release signing key because the previous key was
+stored on the public server.
 
 An existing Home with the old source pin refuses a release signed by the new
 maintainer. On the Runtimes that still trust the old key, `elastos update`

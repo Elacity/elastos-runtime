@@ -3975,6 +3975,7 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         "catalogue",
         "catalogue restored",
         "catalogue fetch",
+        "profile shrinks",
     ] {
         let fixture = PrivateFixture::new();
         fs::create_dir(fixture.data.join("bin")).unwrap();
@@ -4034,6 +4035,11 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
                     json!("libexec/optional/v1/runner");
             }
             value["external"]["optional"] = optional;
+        }
+        if outcome == "profile shrinks" {
+            // The installed provider leaves the Home profile, as protected content did.
+            old_value["profiles"] = json!({"home":{"components":["fixture-provider"]}});
+            value["profiles"] = json!({"home":{"components":[]}});
         }
         value["external"]["fixture-provider"]["install_path"] = json!(candidate_support);
         let support = if outcome.starts_with("bundle") {
@@ -4259,7 +4265,14 @@ async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restart
         .await;
         owner.controller.publish_apply_result(&result).unwrap();
         let status = status(&fixture.data).unwrap().unwrap();
-        let updated = ["updated", "support path", "moved", "bundle", "catalogue"];
+        let updated = [
+            "updated",
+            "support path",
+            "moved",
+            "bundle",
+            "catalogue",
+            "profile shrinks",
+        ];
         if updated.contains(&outcome) {
             result.unwrap();
             assert_eq!(

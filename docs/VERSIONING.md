@@ -110,7 +110,7 @@ Current rule:
 
 The release channel and the version are related but not identical:
 
-- channels decide where a release head points: `stable`, `canary`, `jetson-test`
+- channels decide where a release head points: `stable`, `canary`
 - the version string describes the release artifact itself
 
 Do not invent ad hoc suffixes. If a new prerelease class is needed, update this policy and the checked publish flow together.
@@ -198,8 +198,7 @@ The approval has these fields:
     "MAINTAINER_DID": "APPROVED_SIGNING_DID",
     "PUBLISHER_GATEWAY": "https://APPROVED_PUBLISHER_ORIGIN",
     "PUBLISHER_NODE_ID": "APPROVED_CARRIER_NODE_ID",
-    "SOURCE_CONNECT_TICKET": "APPROVED_CARRIER_TICKET",
-    "IPNS_NAME": "APPROVED_IPNS_NAME"
+    "SOURCE_CONNECT_TICKET": "APPROVED_CARRIER_TICKET"
   },
   "gh": {"path": "/ABSOLUTE/PATH/TO/INSTALLED/GH", "sha256": "APPROVED_GH_SHA256"}
 }

@@ -154,14 +154,6 @@ if len(paths) != 1:
     raise SystemExit("expected one built Home CLI renderer")
 print(paths[0])')
 export HOME_CLI_RENDERER
-MEDIA_TOOLS_ARCHIVE=$(
-    cd "${ROOT}"
-    source scripts/publish-release.sh
-    TMPDIR="${HOME_DIR}/media-package"
-    mkdir -p "$TMPDIR"
-    build_packaged_media_tools_archive "$(host_platform)"
-)
-export MEDIA_TOOLS_ARCHIVE
 
 echo "[home-frontdoor] verify first-party runtime projection entrypoints"
 for capsule in \
@@ -242,12 +234,6 @@ for name, src in mapping.items():
     data = dest.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
-
-media_info = platform_info("media-tools")
-media_archive = artifacts_dir / media_info["release_path"]
-shutil.copyfile(os.environ["MEDIA_TOOLS_ARCHIVE"], media_archive)
-media_info["checksum"] = "sha256:" + hashlib.sha256(media_archive.read_bytes()).hexdigest()
-media_info["size"] = media_archive.stat().st_size
 
 def write_capsule_archive(name, capsule_dir):
     capsule_manifest = json.loads((capsule_dir / "capsule.json").read_text())

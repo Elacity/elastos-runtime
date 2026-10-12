@@ -19,6 +19,19 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   `ci-release-policy-test.py` checks they use the same runner, Rust toolchain
   and targets, and that the job's path filter covers every file the build
   calls, loads or packages.
+- `elastos publish-release` drops its `--profile` option and the unused
+  `providers` and `full` publish profiles; without `--capsules` it publishes
+  the Home capsule set, as before (#89).
+- While protected content is off, the `home` profile leaves out
+  `elacity-player`, `media-tools`, `media-provider` and the protected-content
+  protect and decrypt providers; they still publish and install with
+  `elastos setup --with <name>`, and updates keep copies already installed.
+- `elastos source add` no longer takes `--discovery-uri` or `--ipns-name`, and
+  `elastos source show` no longer prints them; the Runtime never used either to
+  find updates. A release approval's `delivery` is now exactly `MAINTAINER_DID`,
+  `PUBLISHER_GATEWAY`, `PUBLISHER_NODE_ID` and `SOURCE_CONNECT_TICKET`: the
+  signer refuses one that still has `IPNS_NAME`, and the installer has no
+  `IPNS_NAME` or `HEAD_CID` stamp (#89).
 
 ## [0.8.0-alpha.15]
 
@@ -112,8 +125,7 @@ Test-channel release. Signed releases show these notes in System before you upda
   and `shares` stay operator commands. The Rust `demo` publish profile is gone;
   `scripts/home-demo-local.sh` runs plain `setup`, and the operator smoke and
   pinned-model proof use `--with`.
-- `elastos update` and System Update stage this profile change normally; only
-  the standalone frozen offline path refuses a `profiles` difference.
+- `elastos update` and System Update stage this profile change normally.
 - Home consumes `intent.json` by overwriting it with empty content instead of
   deleting it; the session holds only read and write capabilities. A
   regression test runs two intents against a provider that refuses delete.

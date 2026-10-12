@@ -729,7 +729,7 @@ class CliFixtureTests(unittest.TestCase):
             observer.cli_state(self.manifest, home)
 
     def admit(self, local_rehearsal=None):
-        with patch.object(observer, "cli_installer_metadata", return_value=[self.manifest["signer_did"], ""]), patch.object(observer, "cli_signature") as signatures:
+        with patch.object(observer, "cli_installer_signer", return_value=self.manifest["signer_did"]), patch.object(observer, "cli_signature") as signatures:
             admitted = observer.cli_admit(self.config, local_rehearsal)
             self.assertEqual(signatures.call_count, 3 * len(self.manifest["publications"]))
             return admitted
@@ -765,7 +765,7 @@ class CliFixtureTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "proof scope differs"):
                 self.admit()
             self.assertEqual(self.admit(reference)["proof_scope"], "local-rehearsal")
-            with patch.object(observer, "cli_installer_metadata", return_value=[self.manifest["signer_did"], ""]), patch.object(observer, "cli_signature"):
+            with patch.object(observer, "cli_installer_signer", return_value=self.manifest["signer_did"]), patch.object(observer, "cli_signature"):
                 receipt = observer.cli_inspect(self.config, reference)
             self.assertEqual(receipt["reference"], reference)
             self.assertEqual(receipt["retrieval_reference"], "")
@@ -948,18 +948,24 @@ class CliFixtureTests(unittest.TestCase):
     def test_stamped_real_installer_defaults_are_read_without_execution(self):
         actual = Path(__file__).with_name("install.sh").read_text()
         installer = self.root / "stamped-install.sh"
-        stamped = actual.replace("__MAINTAINER_DID__", self.manifest["signer_did"]).replace("__HEAD_CID__", "")
+        signer = self.manifest["signer_did"]
+        stamped = actual.replace("__MAINTAINER_DID__", signer)
         installer.write_text(stamped)
-        self.assertEqual(observer.cli_installer_metadata(installer, observer.cli_environment(self.root)),
-                         [self.manifest["signer_did"], ""])
-        installer.write_text(stamped.replace('HEAD_CID="${ELASTOS_HEAD_CID:-}"',
-                                            'HEAD_CID="${ELASTOS_HEAD_CID:-pinned-head}"'))
-        self.assertEqual(observer.cli_installer_metadata(installer, {})[1], "pinned-head")
+        self.assertEqual(observer.cli_installer_signer(installer, observer.cli_environment(self.root)), signer)
+        # Installers before #89 also default HEAD_CID; only a previous release's may, and blank.
+        legacy = stamped + '\nHEAD_CID="${ELASTOS_HEAD_CID:-}"\n'
+        installer.write_text(legacy)
+        self.assertEqual(observer.cli_installer_signer(installer, {}, previous=True), signer)
+        with self.assertRaisesRegex(ValueError, "HEAD_CID default"):
+            observer.cli_installer_signer(installer, {})
         with self.assertRaisesRegex(ValueError, "trust override"):
-            observer.cli_installer_metadata(installer, {"ELASTOS_HEAD_CID": ""})
+            observer.cli_installer_signer(installer, {"ELASTOS_HEAD_CID": ""}, previous=True)
+        installer.write_text(legacy.replace('HEAD_CID="${ELASTOS_HEAD_CID:-}"', 'HEAD_CID="${ELASTOS_HEAD_CID:-pinned-head}"'))
+        with self.assertRaisesRegex(ValueError, "HEAD_CID default"):
+            observer.cli_installer_signer(installer, {}, previous=True)
         installer.write_text(stamped + '\nMAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-substituted}"\n')
         with self.assertRaisesRegex(ValueError, "literal trust default"):
-            observer.cli_installer_metadata(installer, {})
+            observer.cli_installer_signer(installer, {})
 
     def test_cleanup_does_not_signal_recycled_historic_process_groups(self):
         class Exited:
@@ -1006,7 +1012,7 @@ class CliFixtureTests(unittest.TestCase):
             self.admit()
 
     def test_wrong_signer_and_receipt_admission_cannot_skip_verification(self):
-        with patch.object(observer, "cli_installer_metadata", return_value=[self.manifest["signer_did"], ""]), patch.object(observer, "cli_signature", side_effect=ValueError("fixture envelope signature invalid")):
+        with patch.object(observer, "cli_installer_signer", return_value=self.manifest["signer_did"]), patch.object(observer, "cli_signature", side_effect=ValueError("fixture envelope signature invalid")):
             with self.assertRaisesRegex(ValueError, "signature invalid"):
                 observer.cli_admit(self.config)
         self.manifest["publications"]["wrong-signer-head"] = self.manifest["publications"]["wrong-version"]
@@ -1071,7 +1077,11 @@ class CliFixtureTests(unittest.TestCase):
             name: {"platforms": {"darwin-arm64": {"cid": "Qm" + name, "release_path": name + "-darwin-arm64", "size": 1,
                                                   "checksum": "sha256:" + observer.digest(support / "bin" / name)}}}
             for name in observer.CLI_NATIVE_SETUP}})
-        (previous / "install.sh").write_text(Path(observer.__file__).with_name("install.sh").read_text())
+        # The published release's installer predates #89, so it keeps the __HEAD_CID__ placeholder.
+        maintainer = 'MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-__MAINTAINER_DID__}"\n'
+        current = Path(observer.__file__).with_name("install.sh").read_text()
+        self.assertEqual(current.count(maintainer), 1)
+        (previous / "install.sh").write_text(current.replace(maintainer, maintainer + 'HEAD_CID="${ELASTOS_HEAD_CID:-__HEAD_CID__}"\n', 1))
         source = {"commit": "9" * 40, "tree": "8" * 40}
         artifacts = {key: {"cid": "Qm" + key, "sha256": observer.digest(previous / name), "size": (previous / name).stat().st_size}
                      for key, name in (("binary", "elastos"), ("components", "components.json"))}
@@ -2037,8 +2047,8 @@ class CliFixtureTests(unittest.TestCase):
         self.assertEqual(generated_manifest["old"]["source"], published_source)
         self.assertEqual(observer.cli_json(generated / publications["old"]["release"])["payload"]["source"], published_source)
         self.assertEqual(generated_manifest["files"][publications["old"]["binary"]]["sha256"], observer.digest(previous / "elastos"))
-        self.assertEqual(observer.cli_installer_metadata(generated / generated_manifest["previous"]["installer"], {}),
-                         [generated_manifest["signer_did"], ""])
+        self.assertEqual(observer.cli_installer_signer(generated / generated_manifest["previous"]["installer"], {}, previous=True),
+                         generated_manifest["signer_did"])
         # Refusals claim the release after new, so an installed new release must refuse them.
         self.assertEqual({observer.cli_json(generated / publications[case]["release"])["payload"]["version"]
                           for case in observer.CLI_REFUSALS}, {"0.7.3"})

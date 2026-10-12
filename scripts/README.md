@@ -460,7 +460,7 @@ policy also pins the repository, exact source `commit` and `tree`, version,
 channel, public DID, file/total quotas and the trusted Python, OpenSSL and
 signer tool paths and SHA-256 hashes. For `canary`, the policy pins the current
 remote `develop` head in `develop_oid`; the source commit must be that head or
-its ancestor. For `stable` and `jetson-test`, the policy pins `tag` as `vVERSION`
+its ancestor. For `stable`, the policy pins `tag` as `vVERSION`
 and `tag_oid` as the remote tag object; the tagged source commit must belong to
 `main`. The signer selects these fixed repository branches from the channel.
 
@@ -483,15 +483,14 @@ env -i GH_TOKEN="$(gh auth token)" /path/to/pinned-python -I -S /path/to/install
 ```
 
 The tool verifies the pinned remote `develop` head and candidate ancestry for
-canary, or the approved remote version tag and `main` ancestry for the other
-channels. A moved `develop` head requires a fresh operator policy approval.
+canary, or the approved remote version tag and `main` ancestry for stable.
+A moved `develop` head requires a fresh operator policy approval.
 GH_TOKEN avoids anonymous API rate limits. A network, outage or rate-limit
 failure refuses with a retry message distinct from a provenance refusal.
 The tool reads candidate files as data and asks the operator to confirm the
 complete public signer DID before signing. It fetches the installer template
-from that approved tree. Its frozen installer keeps `HEAD_CID` empty to avoid
-a hash cycle; the signed head binds the final
-release CID and installer hash. Carrier holder identity and ticket remain
+from that approved tree. The signed head binds the final release CID and
+installer hash. Carrier holder identity and ticket remain
 public transport inputs, separate from the signer identity.
 
 On the publication host, inspect the frozen set before committing it:

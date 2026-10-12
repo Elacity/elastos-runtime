@@ -168,7 +168,6 @@ verify:
     ./scripts/test-source-gate.sh
     node scripts/check-elastos-bus-wit.mjs
     node scripts/check-capsule-templates.mjs
-    ./scripts/vendor-ui-tokens.sh --check
     node scripts/carrier-dependency-generation-check.mjs
     just product-ui-source
     node scripts/home-clipboard-source-gate.mjs

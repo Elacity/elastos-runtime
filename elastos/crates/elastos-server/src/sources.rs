@@ -50,8 +50,6 @@ pub struct TrustedSource {
     #[serde(default)]
     pub channel: String,
     #[serde(default)]
-    pub discovery_uri: String,
-    #[serde(default)]
     pub connect_ticket: String,
     #[serde(default)]
     pub gateways: Vec<String>,
@@ -64,9 +62,6 @@ pub struct TrustedSource {
     /// Stable raw Iroh endpoint ID string for durable P2P transport connections.
     #[serde(default)]
     pub publisher_node_id: String,
-    /// IPNS name for mutable release head pointer (Kubo peer ID or key name).
-    #[serde(default)]
-    pub ipns_name: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -189,19 +184,9 @@ pub fn local_session_owner(data_dir: &std::path::Path) -> anyhow::Result<String>
 }
 
 /// Run a trusted-source subcommand.
-///
-/// `source_discovery_uri_fn` resolves the discovery URI from (publisher_did, channel).
-pub fn run_source_command(
-    cmd: SourceCommand,
-    source_discovery_uri_fn: fn(&str, &str) -> String,
-) -> anyhow::Result<()> {
+pub fn run_source_command(cmd: SourceCommand) -> anyhow::Result<()> {
     let data_dir = default_data_dir();
-    run_source_command_with_confirmation(
-        cmd,
-        source_discovery_uri_fn,
-        &data_dir,
-        confirm_signer_change,
-    )
+    run_source_command_with_confirmation(cmd, &data_dir, confirm_signer_change)
 }
 
 fn confirm_signer_change(
@@ -250,7 +235,6 @@ fn confirm_signer_change_with_io(
 
 fn run_source_command_with_confirmation(
     cmd: SourceCommand,
-    source_discovery_uri_fn: fn(&str, &str) -> String,
     data_dir: &Path,
     confirm: impl FnOnce(&TrustedSource, &TrustedSource) -> anyhow::Result<bool>,
 ) -> anyhow::Result<()> {
@@ -264,13 +248,11 @@ fn run_source_command_with_confirmation(
             name,
             publisher,
             channel,
-            discovery_uri,
             connect_ticket,
             gateways,
             install_path,
             head_cid,
             publisher_node_id,
-            ipns_name,
         } => {
             crate::crypto::decode_did_key(&publisher)?;
             let previous = config.source_named(Some(&name));
@@ -285,30 +267,10 @@ fn run_source_command_with_confirmation(
             } else {
                 &channel
             })?;
-            let resolved_discovery_uri = discovery_uri
-                .filter(|uri| !uri.trim().is_empty())
-                .or_else(|| {
-                    previous
-                        .filter(|source| {
-                            !source.discovery_uri.is_empty()
-                                && source.discovery_uri
-                                    != source_discovery_uri_fn(
-                                        source
-                                            .publisher_dids
-                                            .first()
-                                            .map(String::as_str)
-                                            .unwrap_or(""),
-                                        &source.channel,
-                                    )
-                        })
-                        .map(|source| source.discovery_uri.clone())
-                })
-                .unwrap_or_else(|| source_discovery_uri_fn(&publisher, &channel));
             let source = TrustedSource {
                 name: name.clone(),
                 publisher_dids: vec![publisher],
                 channel,
-                discovery_uri: resolved_discovery_uri,
                 connect_ticket: connect_ticket
                     .or_else(|| previous.map(|source| source.connect_ticket.clone()))
                     .unwrap_or_default(),
@@ -333,8 +295,6 @@ fn run_source_command_with_confirmation(
                         .map(|s| s.publisher_node_id.clone())
                         .unwrap_or_default()
                 }),
-                ipns_name: ipns_name
-                    .unwrap_or_else(|| previous.map(|s| s.ipns_name.clone()).unwrap_or_default()),
             };
             if let Some(previous) = previous {
                 if previous.publisher_dids != source.publisher_dids && !confirm(previous, &source)?
@@ -409,14 +369,6 @@ fn run_source_command_with_confirmation(
                 }
             );
             println!(
-                "Discovery: {}",
-                if source.discovery_uri.is_empty() {
-                    "unknown"
-                } else {
-                    &source.discovery_uri
-                }
-            );
-            println!(
                 "Bootstrap: {}",
                 if source.connect_ticket.is_empty() {
                     "none"
@@ -448,14 +400,6 @@ fn run_source_command_with_confirmation(
                     &source.publisher_node_id
                 }
             );
-            println!(
-                "IPNS:      {}",
-                if source.ipns_name.is_empty() {
-                    "none"
-                } else {
-                    &source.ipns_name
-                }
-            );
             if source.gateways.is_empty() {
                 println!("Gateways:  none");
             } else {
@@ -468,13 +412,6 @@ fn run_source_command_with_confirmation(
                 .source_named_mut(name.as_deref())
                 .ok_or_else(|| anyhow::anyhow!("Trusted source not found"))?;
             source.channel = channel.clone();
-            if source.discovery_uri.is_empty()
-                || source.discovery_uri.starts_with("elastos://source/")
-            {
-                if let Some(publisher) = source.publisher_dids.first() {
-                    source.discovery_uri = source_discovery_uri_fn(publisher, &channel);
-                }
-            }
             let source_name = source.name.clone();
             save_trusted_sources(data_dir, &config)?;
 
@@ -681,9 +618,6 @@ pub enum SourceCommand {
         /// Release channel (keeps the existing channel, or defaults to stable for a new source)
         #[arg(long)]
         channel: Option<String>,
-        /// Explicit ElastOS discovery URI for this source
-        #[arg(long)]
-        discovery_uri: Option<String>,
         /// Peer ticket used to bootstrap directly to the publisher
         #[arg(long)]
         connect_ticket: Option<String>,
@@ -699,9 +633,6 @@ pub enum SourceCommand {
         /// Publisher's stable raw Iroh endpoint ID for durable P2P transport connections
         #[arg(long)]
         publisher_node_id: Option<String>,
-        /// IPNS name for mutable release head pointer
-        #[arg(long)]
-        ipns_name: Option<String>,
     },
     /// List trusted release sources
     List,
@@ -779,23 +710,17 @@ mod tests {
     const OLD_DID: &str = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw";
     const NEW_DID: &str = "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z";
 
-    fn discovery_uri(publisher: &str, channel: &str) -> String {
-        format!("elastos://source/{channel}/{publisher}")
-    }
-
     fn fixture_source() -> TrustedSource {
         TrustedSource {
             name: "fixture".into(),
             publisher_dids: vec![OLD_DID.into()],
             channel: "canary".into(),
-            discovery_uri: discovery_uri(OLD_DID, "canary"),
             connect_ticket: "fixture-ticket".into(),
             gateways: vec!["https://fixture.invalid".into()],
             install_path: "/fixture/bin/elastos".into(),
             installed_version: "0.7.1".into(),
             head_cid: "fixture-head".into(),
             publisher_node_id: "fixture-delivery-node".into(),
-            ipns_name: "fixture-ipns".into(),
         }
     }
 
@@ -804,13 +729,11 @@ mod tests {
             name: "fixture".into(),
             publisher: publisher.into(),
             channel: None,
-            discovery_uri: None,
             connect_ticket: None,
             gateways: Vec::new(),
             install_path: None,
             head_cid: None,
             publisher_node_id: None,
-            ipns_name: None,
         }
     }
 
@@ -829,21 +752,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         save_fixture(dir.path(), fixture_source());
         let before = load_trusted_sources(dir.path()).unwrap();
-        run_source_command_with_confirmation(
-            source_add(NEW_DID),
-            discovery_uri,
-            dir.path(),
-            |old, new| {
-                assert_eq!(old.publisher_dids, [OLD_DID]);
-                assert_eq!(new.publisher_dids, [NEW_DID]);
-                Ok(true)
-            },
-        )
+        run_source_command_with_confirmation(source_add(NEW_DID), dir.path(), |old, new| {
+            assert_eq!(old.publisher_dids, [OLD_DID]);
+            assert_eq!(new.publisher_dids, [NEW_DID]);
+            Ok(true)
+        })
         .unwrap();
         let after = load_trusted_sources(dir.path()).unwrap();
         let mut expected = serde_json::to_value(&before).unwrap();
         expected["sources"][0]["publisher_dids"] = serde_json::json!([NEW_DID]);
-        expected["sources"][0]["discovery_uri"] = discovery_uri(NEW_DID, "canary").into();
         assert_eq!(serde_json::to_value(after).unwrap(), expected);
     }
 
@@ -857,7 +774,6 @@ mod tests {
             let mut output = Vec::new();
             let result = run_source_command_with_confirmation(
                 source_add(NEW_DID),
-                discovery_uri,
                 dir.path(),
                 |old, new| confirm_signer_change_with_io(old, new, &mut input, &mut output),
             );
@@ -877,12 +793,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         save_fixture(dir.path(), fixture_source());
         let mut input = std::io::Cursor::new(format!("{NEW_DID}\n"));
-        run_source_command_with_confirmation(
-            source_add(NEW_DID),
-            discovery_uri,
-            dir.path(),
-            |old, new| confirm_signer_change_with_io(old, new, &mut input, &mut Vec::new()),
-        )
+        run_source_command_with_confirmation(source_add(NEW_DID), dir.path(), |old, new| {
+            confirm_signer_change_with_io(old, new, &mut input, &mut Vec::new())
+        })
         .unwrap();
         assert_eq!(
             load_trusted_sources(dir.path()).unwrap().sources[0].publisher_dids,
@@ -903,7 +816,6 @@ mod tests {
         ] {
             assert!(run_source_command_with_confirmation(
                 source_add(&publisher),
-                discovery_uri,
                 dir.path(),
                 |_, _| panic!("invalid DID reached confirmation")
             )
@@ -918,13 +830,12 @@ mod tests {
             if let SourceCommand::Add { channel, .. } = &mut cmd {
                 *channel = Some(channel_value.into());
             }
-            assert!(run_source_command_with_confirmation(
-                cmd,
-                discovery_uri,
-                dir.path(),
-                |_, _| panic!("invalid channel reached confirmation")
-            )
-            .is_err());
+            assert!(
+                run_source_command_with_confirmation(cmd, dir.path(), |_, _| panic!(
+                    "invalid channel reached confirmation"
+                ))
+                .is_err()
+            );
             assert_eq!(
                 std::fs::read(trusted_sources_path(dir.path())).unwrap(),
                 before
@@ -933,58 +844,41 @@ mod tests {
     }
 
     #[test]
-    fn retrust_preserves_custom_discovery_and_applies_explicit_overrides() {
+    fn retrust_applies_explicit_overrides() {
         let dir = tempfile::tempdir().unwrap();
-        let mut source = fixture_source();
-        source.discovery_uri = "elastos://custom/fixture".into();
-        save_fixture(dir.path(), source);
-        run_source_command_with_confirmation(
-            source_add(NEW_DID),
-            discovery_uri,
-            dir.path(),
-            |_, _| Ok(true),
-        )
-        .unwrap();
-        assert_eq!(
-            load_trusted_sources(dir.path()).unwrap().sources[0].discovery_uri,
-            "elastos://custom/fixture"
-        );
+        save_fixture(dir.path(), fixture_source());
+        run_source_command_with_confirmation(source_add(NEW_DID), dir.path(), |_, _| Ok(true))
+            .unwrap();
         let mut cmd = source_add(NEW_DID);
         if let SourceCommand::Add {
             channel,
-            discovery_uri,
             connect_ticket,
             gateways,
             install_path,
             head_cid,
             publisher_node_id,
-            ipns_name,
             ..
         } = &mut cmd
         {
-            *channel = Some("jetson-test".into());
-            *discovery_uri = Some("elastos://custom/replacement".into());
+            *channel = Some("stable".into());
             *connect_ticket = Some("replacement-ticket".into());
             *gateways = vec![" https://replacement.invalid/ ".into()];
             *install_path = Some(PathBuf::from("/fixture/new/elastos"));
             *head_cid = Some("replacement-head".into());
             *publisher_node_id = Some("replacement-delivery-node".into());
-            *ipns_name = Some("replacement-ipns".into());
         }
-        run_source_command_with_confirmation(cmd, discovery_uri, dir.path(), |_, _| {
+        run_source_command_with_confirmation(cmd, dir.path(), |_, _| {
             panic!("unchanged signer reached confirmation")
         })
         .unwrap();
         let reloaded = load_trusted_sources(dir.path()).unwrap();
         let source = &reloaded.sources[0];
-        assert_eq!(source.channel, "jetson-test");
-        assert_eq!(source.discovery_uri, "elastos://custom/replacement");
+        assert_eq!(source.channel, "stable");
         assert_eq!(source.connect_ticket, "replacement-ticket");
         assert_eq!(source.gateways, ["https://replacement.invalid"]);
         assert_eq!(source.install_path, "/fixture/new/elastos");
         assert_eq!(source.head_cid, "replacement-head");
         assert_eq!(source.publisher_node_id, "replacement-delivery-node");
-        assert_eq!(source.ipns_name, "replacement-ipns");
         assert_eq!(source.installed_version, "0.7.1");
     }
 
@@ -995,23 +889,17 @@ mod tests {
         if let SourceCommand::Add { install_path, .. } = &mut cmd {
             *install_path = Some(dir.path().join("bin/elastos"));
         }
-        run_source_command_with_confirmation(cmd, discovery_uri, dir.path(), |_, _| {
+        run_source_command_with_confirmation(cmd, dir.path(), |_, _| {
             panic!("fresh source reached confirmation")
         })
         .unwrap();
         let source = load_trusted_sources(dir.path()).unwrap().sources.remove(0);
         assert_eq!(source.channel, "stable");
-        assert_eq!(source.discovery_uri, discovery_uri(NEW_DID, "stable"));
         let mut source = fixture_source();
         source.channel.clear();
         save_fixture(dir.path(), source);
-        run_source_command_with_confirmation(
-            source_add(NEW_DID),
-            discovery_uri,
-            dir.path(),
-            |_, _| Ok(true),
-        )
-        .unwrap();
+        run_source_command_with_confirmation(source_add(NEW_DID), dir.path(), |_, _| Ok(true))
+            .unwrap();
         assert_eq!(
             load_trusted_sources(dir.path()).unwrap().sources[0].channel,
             ""
@@ -1024,13 +912,8 @@ mod tests {
         let mut source = fixture_source();
         source.publisher_dids.push(NEW_DID.into());
         save_fixture(dir.path(), source);
-        run_source_command_with_confirmation(
-            source_add(NEW_DID),
-            discovery_uri,
-            dir.path(),
-            |_, _| Ok(true),
-        )
-        .unwrap();
+        run_source_command_with_confirmation(source_add(NEW_DID), dir.path(), |_, _| Ok(true))
+            .unwrap();
         assert_eq!(
             load_trusted_sources(dir.path()).unwrap().sources[0].publisher_dids,
             [NEW_DID]
@@ -1049,13 +932,8 @@ mod tests {
             "signer_did": NEW_DID,
             "signature": "e976be583f98da06863071e4f2006dc2ea97fd77451fbc278ef23fcc3e1f97bad27abe6f617c11b262994838b49896b2ded44b57531f62d3bcea70e2cefd2b06"
         })).unwrap();
-        run_source_command_with_confirmation(
-            source_add(NEW_DID),
-            discovery_uri,
-            dir.path(),
-            |_, _| Ok(true),
-        )
-        .unwrap();
+        run_source_command_with_confirmation(source_add(NEW_DID), dir.path(), |_, _| Ok(true))
+            .unwrap();
         let persisted = std::fs::read(trusted_sources_path(dir.path())).unwrap();
         let config = load_trusted_sources(dir.path()).unwrap();
         let trusted_dids = &config.sources[0].publisher_dids;

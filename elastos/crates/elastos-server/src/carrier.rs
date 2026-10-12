@@ -10922,14 +10922,12 @@ pub(crate) mod tests {
             name: "fixture".into(),
             publisher_dids: vec![],
             channel: "stable".into(),
-            discovery_uri: String::new(),
             connect_ticket: encode_ticket_for(address),
             gateways: vec![],
             install_path: String::new(),
             installed_version: String::new(),
             head_cid: String::new(),
             publisher_node_id: server.id().to_string(),
-            ipns_name: String::new(),
         };
         let mut sources = crate::sources::TrustedSourcesConfig::empty();
         sources.default_source = source.name.clone();
@@ -11020,14 +11018,12 @@ pub(crate) mod tests {
             name: "fixture".into(),
             publisher_dids: vec![],
             channel: "stable".into(),
-            discovery_uri: String::new(),
             connect_ticket: encode_ticket_for(address),
             gateways: vec![],
             install_path: String::new(),
             installed_version: String::new(),
             head_cid: String::new(),
             publisher_node_id: server.id().to_string(),
-            ipns_name: String::new(),
         };
         let mut sources = crate::sources::TrustedSourcesConfig::empty();
         sources.default_source = source.name.clone();
@@ -11125,14 +11121,12 @@ pub(crate) mod tests {
             name: "fixture".into(),
             publisher_dids: vec![],
             channel: "stable".into(),
-            discovery_uri: String::new(),
             connect_ticket: encode_ticket_for(address.clone()),
             gateways: vec![],
             install_path: String::new(),
             installed_version: String::new(),
             head_cid: String::new(),
             publisher_node_id: server.id().to_string(),
-            ipns_name: String::new(),
         };
         let mut sources = crate::sources::TrustedSourcesConfig::empty();
         sources.default_source = source.name.clone();
@@ -15168,7 +15162,6 @@ pub(crate) mod tests {
                     name: "official".to_string(),
                     publisher_dids: vec![catalog_publisher_did.clone()],
                     channel: "stable".to_string(),
-                    discovery_uri: "https://example.invalid/discovery".to_string(),
                     connect_ticket: remote_ticket.clone(),
                     gateways: Vec::new(),
                     install_path: String::new(),
@@ -15177,7 +15170,6 @@ pub(crate) mod tests {
                     publisher_node_id: iroh::SecretKey::from_bytes(&remote_sk.to_bytes())
                         .public()
                         .to_string(),
-                    ipns_name: String::new(),
                 }],
             },
         )
@@ -15546,7 +15538,6 @@ pub(crate) mod tests {
                         "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string(),
                     ],
                     channel: "stable".to_string(),
-                    discovery_uri: String::new(),
                     connect_ticket: dead_ticket.clone(),
                     gateways: Vec::new(),
                     install_path: String::new(),
@@ -15555,7 +15546,6 @@ pub(crate) mod tests {
                     publisher_node_id: iroh::SecretKey::from_bytes(&source_sk.to_bytes())
                         .public()
                         .to_string(),
-                    ipns_name: String::new(),
                 }],
             },
         )
@@ -16366,14 +16356,12 @@ pub(crate) mod tests {
                 "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string()
             ],
             channel: "stable".to_string(),
-            discovery_uri: String::new(),
             connect_ticket: ticket,
             gateways: Vec::new(),
             install_path: String::new(),
             installed_version: String::new(),
             head_cid: String::new(),
             publisher_node_id: secret.public().to_string(),
-            ipns_name: String::new(),
         };
         assert_eq!(
             trusted_source_replica_did(&source).as_deref(),
@@ -16442,14 +16430,12 @@ pub(crate) mod tests {
                 "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string()
             ],
             channel: "stable".to_string(),
-            discovery_uri: String::new(),
             connect_ticket: "stale".to_string(),
             gateways: Vec::new(),
             install_path: String::new(),
             installed_version: String::new(),
             head_cid: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".to_string(),
             publisher_node_id: node_id.clone(),
-            ipns_name: String::new(),
         };
         let matching = SourceCarrierBootstrapDocument {
             schema: "elastos.carrier.bootstrap/v1".to_string(),
@@ -16502,14 +16488,12 @@ pub(crate) mod tests {
                 "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string()
             ],
             channel: "stable".to_string(),
-            discovery_uri: String::new(),
             connect_ticket: ticket,
             gateways: vec![gateway],
             install_path: String::new(),
             installed_version: String::new(),
             head_cid: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".to_string(),
             publisher_node_id: node_id,
-            ipns_name: String::new(),
         };
         assert_eq!(live_source_bootstrap_ticket(&source).await, None);
     }
@@ -16568,14 +16552,12 @@ pub(crate) mod tests {
                     name: "official".to_string(),
                     publisher_dids: vec![catalog_publisher_did],
                     channel: "stable".to_string(),
-                    discovery_uri: "https://example.invalid/discovery".to_string(),
                     connect_ticket: stale_ticket,
                     gateways: vec![gateway],
                     install_path: String::new(),
                     installed_version: String::new(),
                     head_cid: cid.to_string(),
                     publisher_node_id,
-                    ipns_name: String::new(),
                 }],
             },
         )
@@ -16878,14 +16860,12 @@ pub(crate) mod tests {
                     "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA".to_string()
                 ],
                 channel: "stable".to_string(),
-                discovery_uri: String::new(),
                 connect_ticket: encoded,
                 gateways: Vec::new(),
                 install_path: String::new(),
                 installed_version: String::new(),
                 head_cid: String::new(),
                 publisher_node_id: secret.public().to_string(),
-                ipns_name: String::new(),
             })
             .as_deref(),
             Some(public_key_to_did(&secret.public()).unwrap().as_str())
@@ -17220,14 +17200,12 @@ pub(crate) mod tests {
             name: "seed".to_string(),
             publisher_dids: Vec::new(),
             channel: "stable".to_string(),
-            discovery_uri: String::new(),
             connect_ticket: String::new(),
             gateways: Vec::new(),
             install_path: String::new(),
             installed_version: String::new(),
             head_cid: String::new(),
             publisher_node_id: endpoint.to_string(),
-            ipns_name: String::new(),
         };
 
         assert_eq!(
@@ -17245,14 +17223,12 @@ pub(crate) mod tests {
             name: "seed".to_string(),
             publisher_dids: Vec::new(),
             channel: "stable".to_string(),
-            discovery_uri: String::new(),
             connect_ticket: "ticket-would-not-be-used".to_string(),
             gateways: Vec::new(),
             install_path: String::new(),
             installed_version: String::new(),
             head_cid: String::new(),
             publisher_node_id: did,
-            ipns_name: String::new(),
         };
 
         let err = source_transport_endpoint_id(&source)
@@ -17272,14 +17248,12 @@ pub(crate) mod tests {
             name: "fixture".to_string(),
             publisher_dids: Vec::new(),
             channel: "stable".to_string(),
-            discovery_uri: String::new(),
             connect_ticket: encode_ticket_for(iroh::EndpointAddr::from(expected)),
             gateways: Vec::new(),
             install_path: String::new(),
             installed_version: String::new(),
             head_cid: String::new(),
             publisher_node_id: expected.to_string(),
-            ipns_name: String::new(),
         };
         assert_eq!(
             source_transport_endpoint_id(&source).unwrap(),
@@ -17335,14 +17309,12 @@ pub(crate) mod tests {
             name: "fixture".to_string(),
             publisher_dids: Vec::new(),
             channel: "stable".to_string(),
-            discovery_uri: String::new(),
             connect_ticket: encode_ticket_for(route),
             gateways: Vec::new(),
             install_path: String::new(),
             installed_version: String::new(),
             head_cid: String::new(),
             publisher_node_id: publisher.to_string(),
-            ipns_name: String::new(),
         };
         let error = CarrierClient::connect_trusted_source(&source, 1)
             .await

@@ -258,17 +258,13 @@ export function validateComponents(components, manifests) {
     if (["wallet", "wallet-metamask", "wallet-unisat", "wallet-walletconnect", "browser", "inbox"].some((entry) => installed.has(entry))) {
       for (const dependency of ["chain-provider", "wallet-provider"]) assert(installed.has(dependency), `${name}: missing Wallet/Browser dependency ${dependency}`);
     }
-    if (["library", "marketplace", "elacity-player"].every((entry) => installed.has(entry))) {
-      for (const dependency of ["chain-provider", "wallet-provider", "kubo", "ipfs-provider", ...protectedProviders.filter((entry) => entry !== "custody-provider")]) {
-        assert.equal(list.filter((entry) => entry === dependency).length, 1, `${name}: protected-content dependency ${dependency} must occur once`);
-      }
-    }
   }
   // browser-host is the helper set setup adds on supported hosts, not a user profile.
   same(Object.keys(components.profiles).filter((name) => name !== "browser-host"), ["home"], "Setup installs one Home: profiles");
   const home = components.profiles.home.components;
   for (const name of homeCore) assert(home.includes(name), `home: required component ${name}`);
-  for (const name of ["availability-provider", "site-provider", "tunnel-provider", "cloudflared", "drm-provider", "rights-provider", "key-provider", "decrypt-provider", "custody-provider", "gba-emulator", "gba-ucity"]) assert(!home.includes(name), `Home: ${name} is a developer --with component`);
+  // Protected content is off: its providers, media tools and Elacity Player install only with --with.
+  for (const name of ["availability-provider", "site-provider", "tunnel-provider", "cloudflared", "drm-provider", "rights-provider", "key-provider", "decrypt-provider", ...protectedProviders, "media-tools", "elacity-player", "gba-emulator", "gba-ucity"]) assert(!home.includes(name), `Home: ${name} is a developer --with component`);
   // Local AI is optional: Assistant fetches the engine and models from the signed release on demand (#217).
   // model-provider is the Runtime's model broker, not a model.
   const localAi = home.filter((name) => name === "llama-server" || (name.startsWith("model-") && name !== "model-provider"));

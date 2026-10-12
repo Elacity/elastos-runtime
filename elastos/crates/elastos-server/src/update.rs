@@ -18,7 +18,7 @@ use crate::crypto::{verify_release_envelope, verify_release_envelope_against_did
 use crate::install_transaction::{InstallTransaction, ReleaseFile, RestartPhase};
 use crate::install_transaction::{RestartPlan, RestartRecord};
 use crate::sources::{
-    default_data_dir, default_install_path, load_trusted_sources, normalize_gateways, TrustedSource,
+    default_install_path, load_trusted_sources, normalize_gateways, TrustedSource,
 };
 
 /// Async callback for fetching a CID or `release-path:<path>` from the trusted source.
@@ -34,9 +34,9 @@ pub(crate) fn on_heap<F: Future>(build: impl FnOnce() -> F) -> Pin<Box<F>> {
     Box::pin(build())
 }
 
-/// Async callback for attempting P2P release discovery.
+/// Async callback that discovers the signed release head over Carrier.
 /// An unavailable connection returns None; discovery errors remain terminal.
-pub type TryP2pFn = Box<
+pub type DiscoverHeadFn = Box<
     dyn Fn(
             TrustedSource,
             String,
@@ -563,38 +563,12 @@ fn ensure_recorded_install_path(
     Ok(())
 }
 
-/// Main update flow. Discovers the latest release, verifies signatures, and installs.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_update(
-    fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
-    check_only: bool,
-    head_cid_override: Option<String>,
-    version: &str,
-    auto_confirm: bool,
-    force: bool,
-) -> anyhow::Result<()> {
-    let data_dir = default_data_dir();
-    run_update_for_data_dir(
-        &data_dir,
-        fetch_fn,
-        try_p2p_fn,
-        check_only,
-        head_cid_override,
-        version,
-        auto_confirm,
-        force,
-        false,
-    )
-    .await
-}
-
 /// Main update flow using an explicit runtime data dir.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_update_for_data_dir(
     data_dir: &Path,
     fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
+    discover_head: Option<&DiscoverHeadFn>,
     check_only: bool,
     head_cid_override: Option<String>,
     version: &str,
@@ -605,7 +579,7 @@ pub async fn run_update_for_data_dir(
     run_update_for_data_dir_in_context(
         data_dir,
         fetch_fn,
-        try_p2p_fn,
+        discover_head,
         check_only,
         head_cid_override,
         version,
@@ -621,7 +595,7 @@ pub async fn run_update_for_data_dir(
 pub(crate) async fn run_update_for_data_dir_in_context(
     data_dir: &Path,
     fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
+    discover_head: Option<&DiscoverHeadFn>,
     check_only: bool,
     head_cid_override: Option<String>,
     version: &str,
@@ -633,7 +607,7 @@ pub(crate) async fn run_update_for_data_dir_in_context(
     run_update_for_data_dir_with_mode(
         data_dir,
         fetch_fn,
-        try_p2p_fn,
+        discover_head,
         check_only,
         head_cid_override,
         version,
@@ -642,37 +616,6 @@ pub(crate) async fn run_update_for_data_dir_in_context(
         repair_invalid_version,
         carrier_context,
         ApplyMode::Normal,
-    )
-    .await
-}
-
-/// Internal foundation for a Home restart owner that has stopped Runtime.
-/// This uses the normal signed discovery and admission flow, then stages an
-/// offline transaction with unchanged support assets. The caller owns restart
-/// and installed Home acceptance.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_frozen_update_for_data_dir(
-    data_dir: &Path,
-    fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
-    check_only: bool,
-    head_cid_override: Option<String>,
-    version: &str,
-    auto_confirm: bool,
-    force: bool,
-) -> anyhow::Result<()> {
-    run_update_for_data_dir_with_mode(
-        data_dir,
-        fetch_fn,
-        try_p2p_fn,
-        check_only,
-        head_cid_override,
-        version,
-        auto_confirm,
-        force,
-        false,
-        crate::setup::FirstPartyCarrierContext::Setup,
-        ApplyMode::FrozenOffline,
     )
     .await
 }
@@ -782,7 +725,7 @@ pub(crate) async fn run_restarting_update(
 async fn run_update_for_data_dir_with_mode(
     data_dir: &Path,
     fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
+    discover_head: Option<&DiscoverHeadFn>,
     check_only: bool,
     head_cid_override: Option<String>,
     version: &str,
@@ -796,7 +739,7 @@ async fn run_update_for_data_dir_with_mode(
         run_update_with_restart(
             data_dir,
             fetch_fn,
-            try_p2p_fn,
+            discover_head,
             check_only,
             head_cid_override,
             version,
@@ -815,7 +758,7 @@ async fn run_update_for_data_dir_with_mode(
 async fn run_update_with_restart(
     data_dir: &Path,
     fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
+    discover_head: Option<&DiscoverHeadFn>,
     check_only: bool,
     head_cid_override: Option<String>,
     version: &str,
@@ -876,14 +819,14 @@ async fn run_update_with_restart(
     } else {
         // Discover the signed head over Carrier.
         let mut resolved: Option<&str> = None;
-        if let Some(p2p_fn) = try_p2p_fn {
+        if let Some(discover) = discover_head {
             println!("  Checking for updates...");
             if !source.connect_ticket.is_empty() {
                 println!("  Bootstrap: direct publisher ticket configured");
             }
             resolved = match tokio::time::timeout(
                 std::time::Duration::from_secs(20),
-                p2p_fn(source.clone(), primary_publisher.clone()),
+                discover(source.clone(), primary_publisher.clone()),
             )
             .await
             {
@@ -938,7 +881,7 @@ async fn run_update_with_restart(
     let release_object_cid = optional_release_object_cid(&head)?;
 
     on_heap(|| {
-        run_upgrade_with_restart(
+        apply_verified_head(
             fetch_fn,
             &head,
             &head_bytes,
@@ -1003,7 +946,7 @@ pub(crate) fn verify_release_binding(
 /// Execute upgrade from a verified release head.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-async fn run_upgrade_from_head(
+async fn apply_verified_head_without_restart(
     fetch_fn: &FetchFn,
     head: &serde_json::Value,
     head_bytes: &[u8],
@@ -1021,7 +964,7 @@ async fn run_upgrade_from_head(
     carrier_context: crate::setup::FirstPartyCarrierContext,
     apply_mode: ApplyMode,
 ) -> anyhow::Result<()> {
-    run_upgrade_with_restart(
+    apply_verified_head(
         fetch_fn,
         head,
         head_bytes,
@@ -1045,7 +988,7 @@ async fn run_upgrade_from_head(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_upgrade_with_restart(
+async fn apply_verified_head(
     fetch_fn: &FetchFn,
     head: &serde_json::Value,
     head_bytes: &[u8],
@@ -2274,7 +2217,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let discovery: TryP2pFn =
+        let discovery: DiscoverHeadFn =
             Box::new(move |_, _| Box::pin(std::future::ready(Ok(Some(discovered.clone())))));
         for installed in ["0.7.0", "0.7.2"] {
             let data = tempfile::tempdir().unwrap();
@@ -2341,7 +2284,7 @@ mod tests {
         let mut sources = crate::sources::TrustedSourcesConfig::empty();
         sources.upsert_source(source);
         save_trusted_sources(data.path(), &sources).unwrap();
-        let discovery: TryP2pFn = Box::new(move |source, _| {
+        let discovery: DiscoverHeadFn = Box::new(move |source, _| {
             let announcement = announcement.clone();
             let bytes = release.clone();
             Box::pin(async move {
@@ -2527,7 +2470,7 @@ mod tests {
             Box::pin(async move { Ok(bytes) })
         });
         let data = tempfile::tempdir().unwrap();
-        let result = run_upgrade_from_head(
+        let result = apply_verified_head_without_restart(
             &fetch,
             &head,
             &head_bytes,
@@ -2550,7 +2493,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("older than installed"));
-        run_upgrade_from_head(
+        apply_verified_head_without_restart(
             &fetch,
             &head,
             &head_bytes,
@@ -2605,7 +2548,7 @@ mod tests {
             Box::pin(async move { Ok(bytes) })
         });
         let data = tempfile::tempdir().unwrap();
-        let err = run_upgrade_from_head(
+        let err = apply_verified_head_without_restart(
             &fetch,
             &head,
             &head_bytes,
@@ -2741,7 +2684,7 @@ mod tests {
                     })
                 });
                 let data = tempfile::tempdir().unwrap();
-                let result = run_upgrade_from_head(
+                let result = apply_verified_head_without_restart(
                     &fetch,
                     &verified_head,
                     &head_bytes,
@@ -3073,6 +3016,44 @@ mod tests {
         .unwrap();
     }
 
+    /// Every install.sh before #89 wrote `discovery_uri` and `ipns_name` into
+    /// sources.json. This Runtime still updates such a Home, and its rewrite drops
+    /// both keys (earlier Runtimes default the missing fields after an Undo).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_admits_and_rewrites_sources_written_by_earlier_installers() {
+        let components = components_pinning(None);
+        let (_fixture, data, binary, source) = default_apply_fixture(&components);
+        let path = crate::sources::trusted_sources_path(&data);
+        // The source shape 0.8.0-alpha.15's install.sh writes.
+        let earlier = serde_json::json!({
+            "schema": "elastos.trusted-sources/v1", "default_source": source.name,
+            "sources": [{
+                "name": source.name, "publisher_dids": source.publisher_dids,
+                "channel": source.channel,
+                "discovery_uri": "elastos://source/stable/0123456789abcdef0123456789abcdef",
+                "connect_ticket": "", "publisher_node_id": "", "ipns_name": "", "gateways": [],
+                "install_path": source.install_path, "installed_version": source.installed_version,
+                "head_cid": ""
+            }]
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&earlier).unwrap()).unwrap();
+        apply_signed_executable_fixture(
+            &data,
+            &source,
+            b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n",
+            &components,
+        )
+        .await
+        .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let stored = written["sources"][0].as_object().unwrap();
+        assert_eq!(stored["installed_version"], "0.7.1");
+        assert!(!stored.contains_key("discovery_uri") && !stored.contains_key("ipns_name"));
+        admit_installed(&data, &binary);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn terminal_update_installs_the_target_catalogue_and_undo_restores_the_previous_one() {
@@ -3285,6 +3266,49 @@ mod tests {
             admit_installed(&data, &binary);
             assert!(!InstallTransaction::has_pending_recovery(&binary));
         }
+    }
+
+    /// A release whose Home profile drops an installed component (protected
+    /// content left Home) installs normally and keeps that component.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_update_keeps_a_component_the_home_profile_dropped() {
+        use sha2::Digest;
+        let provider = b"installed provider".to_vec();
+        let components = |profile: &[&str]| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema":"elastos.components/v1", "capsules":{},
+                "profiles":{"home":{"components":profile}},
+                "external":{"fixture-provider":{"install_path":"bin/fixture-provider","platforms":{"*":{
+                    "release_path":"fixture-provider","cid":raw_cid(&provider),
+                    "checksum":format!("sha256:{}", hex::encode(sha2::Sha256::digest(&provider))),
+                    "size":provider.len()}}}}
+            }))
+            .unwrap()
+        };
+        let (_fixture, data, binary, source) =
+            default_apply_fixture(&components(&["fixture-provider"]));
+        std::fs::create_dir_all(data.join("bin")).unwrap();
+        std::fs::write(data.join("bin/fixture-provider"), &provider).unwrap();
+        apply_signed_fixture_with_mode(
+            &data,
+            &source,
+            b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n",
+            &components(&[]),
+            ApplyMode::Normal,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(data.join("components.json")).unwrap(),
+            components(&[])
+        );
+        assert_eq!(
+            std::fs::read(data.join("bin/fixture-provider")).unwrap(),
+            provider
+        );
+        admit_installed(&data, &binary);
+        assert!(!InstallTransaction::has_pending_recovery(&binary));
     }
 
     #[cfg(unix)]
