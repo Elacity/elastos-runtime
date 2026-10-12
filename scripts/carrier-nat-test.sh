@@ -110,7 +110,11 @@ done
 PIDS=()
 for log in home-a home-b relay; do
     echo "----- $log"
-    grep -E '^(a|b|relay):|^test |panicked|FAILED|test result' "$WORK/$log.log" || cat "$WORK/$log.log"
+    if [[ $status == 0 ]]; then
+        grep -E '^(a|b|relay):|^test |test result' "$WORK/$log.log"
+    else
+        cat "$WORK/$log.log"
+    fi
 done
 [[ $status == 0 ]] || die "FAILED"
 echo "carrier-nat-test: PASS"
