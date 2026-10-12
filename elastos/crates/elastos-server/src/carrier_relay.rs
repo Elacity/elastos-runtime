@@ -126,11 +126,43 @@ pub(crate) fn peer_dial_addr(peer: EndpointId, hints: &[iroh::EndpointAddr]) -> 
 }
 
 /// Published tickets carry IP addresses only, so Homes that refuse every
-/// relay (0.8.0-alpha.13 to alpha.15) still dial them directly.
+/// relay (0.8.0-alpha.13 to alpha.15) still dial them directly. When the
+/// endpoint has a public address, only public addresses are published:
+/// container bridges, LAN and loopback addresses reach nobody else (#336), and
+/// LAN peers find each other through mDNS. A host with no public address
+/// (a LAN or a test) keeps its private addresses.
 pub(crate) fn published_ticket_addr(addr: iroh::EndpointAddr) -> iroh::EndpointAddr {
     let mut next = addr;
     next.addrs.retain(|transport| transport.is_ip());
+    let public = |transport: &iroh::TransportAddr| match transport {
+        iroh::TransportAddr::Ip(addr) => is_public_ip(addr.ip()),
+        _ => false,
+    };
+    if next.addrs.iter().any(public) {
+        next.addrs.retain(public);
+    }
     next
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let shared = v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64;
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || shared)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80)
+        }
+    }
 }
 
 /// Refuses a dial that names any relay other than the pinned one.
@@ -567,6 +599,98 @@ mod tests {
         assert!(!admission.0.lock().unwrap().contains_key(&late));
         admission.release(others[0]);
         assert_eq!(admission.admit(late), Access::Allow);
+    }
+
+    #[test]
+    fn tickets_publish_only_public_addresses_when_there_are_any() {
+        let peer = SecretKey::from_bytes(&[70u8; 32]).public();
+        let ticket = |addrs: &[&str]| {
+            let addr = iroh::EndpointAddr::from(peer).with_addrs(
+                addrs
+                    .iter()
+                    .map(|addr| iroh::TransportAddr::Ip(addr.parse().unwrap()))
+                    .chain([iroh::TransportAddr::Relay(
+                        "https://seed.example".parse().unwrap(),
+                    )]),
+            );
+            published_ticket_addr(addr)
+                .addrs
+                .into_iter()
+                .map(|transport| match transport {
+                    iroh::TransportAddr::Ip(addr) => addr.to_string(),
+                    other => panic!("tickets carry IP addresses only: {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        // The seed today: public IPv4 and IPv6 beside Docker bridges and loopback.
+        let seed = ticket(&[
+            "77.42.19.31:4433",
+            "172.17.0.1:4433",
+            "172.19.0.1:4433",
+            "127.0.0.1:4433",
+            "[2a01:4f9:c013:e725::1]:4433",
+            "[fe80::9000:7ff:fe23:be66]:4433",
+            "[fd00::1]:4433",
+            "[::ffff:10.0.0.1]:4433",
+            "100.64.0.1:4433",
+            "169.254.1.1:4433",
+        ]);
+        assert_eq!(seed, ["77.42.19.31:4433", "[2a01:4f9:c013:e725::1]:4433"]);
+        // A host with no public address keeps what it has.
+        let lan = ticket(&["192.168.1.20:4433", "10.0.0.2:4433", "127.0.0.1:4433"]);
+        assert_eq!(lan.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_fixed_carrier_port_publishes_the_same_ticket_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, did) = elastos_identity::derive_did(&[71u8; 32]);
+        let port = std::net::UdpSocket::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let bind: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let mut tickets = Vec::new();
+        for _ in 0..2 {
+            // The previous run's sockets close shortly after its shutdown.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let node = loop {
+                match super::super::start_carrier_node_with_registry_bound(
+                    &key,
+                    &did,
+                    dir.path().to_path_buf(),
+                    None,
+                    Some(bind),
+                )
+                .await
+                {
+                    Ok(node) => break node,
+                    Err(error) if tokio::time::Instant::now() < deadline => {
+                        tracing::debug!("restart waits for the port: {error:#}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(error) => panic!("restart on {bind}: {error:#}"),
+                }
+            };
+            let addr = super::super::tests::wait_for_direct_endpoint_addr(&node.endpoint).await;
+            let mut published: Vec<SocketAddr> = published_ticket_addr(addr)
+                .addrs
+                .into_iter()
+                .filter_map(|transport| match transport {
+                    iroh::TransportAddr::Ip(addr) => Some(addr),
+                    _ => None,
+                })
+                .collect();
+            published.sort();
+            assert!(
+                published.iter().all(|addr| addr.port() == port),
+                "every family uses the fixed port: {published:?}"
+            );
+            tickets.push(published);
+            node.shutdown().await;
+        }
+        assert_eq!(tickets[0], tickets[1]);
     }
 
     #[tokio::test]

@@ -1274,6 +1274,18 @@ async fn bind_carrier_endpoint(
     let bound = requested.bind_addr(requested_bind_addr).map_err(|error| {
         anyhow::anyhow!("Invalid Carrier address {requested_bind_addr}: {error}")
     })?;
+    // An IPv4 wildcard on a fixed port also listens on the same IPv6 port, so
+    // a published ticket keeps one address per family across restarts (#336).
+    // A host without IPv6 still starts.
+    let bound = match requested_bind_addr {
+        std::net::SocketAddr::V4(v4) if v4.ip().is_unspecified() && v4.port() != 0 => bound
+            .bind_addr_with_opts(
+                std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, v4.port())),
+                iroh::endpoint::BindOpts::default().set_is_required(false),
+            )
+            .map_err(|error| anyhow::anyhow!("Invalid Carrier IPv6 address: {error}"))?,
+        _ => bound,
+    };
     match bound.bind().await {
         Ok(endpoint) => Ok(endpoint),
         Err(error) if !allow_ephemeral_fallback => Err(error).with_context(|| {

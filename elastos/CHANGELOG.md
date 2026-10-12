@@ -24,6 +24,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   the node ID, tickets stay IP-only for alpha.13 to alpha.15 Homes, and the
   unused public network mode and DHT topic join are gone.
   `scripts/carrier-nat-test.sh` proves two Homes behind separate NATs.
+- Carrier tickets list only public addresses when the host has one (no
+  container bridge, LAN or loopback addresses), and a Runtime on a fixed
+  Carrier port also listens on that port over IPv6, so its ticket stays the
+  same across restarts (#336).
 - CI's `release-upstream-assets` job runs the release's upstream asset build
   (`scripts/release-upstream-assets.py`, including the Browser helper source
   builds) for Linux ARM64 and Apple Silicon on every pull request that changes
