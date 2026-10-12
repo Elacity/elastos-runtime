@@ -19,6 +19,9 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   `ci-release-policy-test.py` checks they use the same runner, Rust toolchain
   and targets, and that the job's path filter covers every file the build
   calls, loads or packages.
+- `elastos publish-release` drops its `--profile` option and the unused
+  `providers` and `full` publish profiles; without `--capsules` it publishes
+  the Home capsule set, as before (#89).
 
 ## [0.8.0-alpha.15]
 
