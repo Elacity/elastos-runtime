@@ -14,43 +14,10 @@ separate artifact identities and verification records.
 [SECURITY.md](SECURITY.md#current-isolation-and-target-boundary) states what
 is isolated today and the target boundary.
 
-## Install from the publisher
+## Install
 
-The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed.
-
-The maintainer release DID is
-`did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
-installer's `Maintainer DID:` line with this complete DID. Stop if they differ.
-
-The maintainer changed the release signing key because the previous key was
-stored on the public server.
-
-```bash
-curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-```
-
-For an existing Home, re-trust the maintainer once by running the same installer
-over the old installation:
-
-```bash
-curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-```
-
-The installer trusts the new DID, installs the release and keeps your existing
-identity, accounts and user files. Homes that already trust this DID can use
-normal updates. See [release signer recovery](docs/INSTALL.md#compare-and-change-the-release-signer).
-
-The installer installs Runtime, sets up the Home profile, and opens Home. Its
-release acceptance evidence lives in GitHub issues. Keep the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
-later run `elastos` from a new shell. You do not need a separate `elastos serve`
-process for this path. Home is the user-facing front door to the managed
-Runtime.
-
-Only one live host may own an ElastOS data home at a time. Stop Home before
-using the separate operator runtime in the same home. See [Installing
-ElastOS](docs/INSTALL.md) for updates, trust verification, and
-operator setup. See the [Mac staging runbook](docs/MAC.md) for source-home
-staging and Browser VM work.
+[Installing ElastOS](docs/INSTALL.md) covers the publisher install, the
+maintainer DID check, updates and removal.
 
 ## Build from source
 

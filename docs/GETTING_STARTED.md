@@ -1,46 +1,9 @@
 # Getting started with ElastOS Runtime
 
-## Install from the publisher
+## Install
 
-The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed. See the [Mac runbook](MAC.md) for source-home staging.
-
-```bash
-curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-```
-
-The installer installs Runtime, sets up the Home profile, and opens Home. Keep
-the terminal open while you use Home. Add `$HOME/.local/bin` to PATH when you
-later run `elastos` from a new shell. The
-[installation guide](INSTALL.md#installed-files) explains how to inspect the
-selected signed manifest and installed component registry. A public install
-receives only the components in that manifest. Source and installed artifacts
-have separate identities. [Install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89)
-owns publication-parity evidence. The normal Home path does not need a separate `elastos serve` process.
-
-The current default Home exposes System, People, Services, Browser, Wallet,
-Documents, Library, Marketplace, Archive, and Inbox.
-
-Only one live host may own an ElastOS data home at a time. Do not run
-`elastos` and `elastos serve` against the same home at the same time. The
-[command matrix](COMMAND_MATRIX.md) shows whether a command owns a Runtime,
-reuses one, or needs none.
-
-Useful next commands:
-
-```bash
-elastos home --status
-elastos update --check
-```
-
-Open Documents or Library from Home to work with your files. The source Home
-profile includes these apps and their content backend. For an installed release,
-its signed manifest determines the available components.
-
-The same install also provides the operator runtime for `serve`, remote node
-control, WASM or microVM `run`, and non-interactive capsule work. Data
-`run` and interactive packaged capsules use the lanes in the command matrix.
-[Installing ElastOS](INSTALL.md) documents setup, trust, and updates.
-[Sites](SITES.md) documents the `elastos site` operator commands.
+[Installing ElastOS](INSTALL.md) covers the publisher install, updates and
+removal. [Sites](SITES.md) documents the `elastos site` operator commands.
 
 ## Build from source
 

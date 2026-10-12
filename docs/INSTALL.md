@@ -64,7 +64,8 @@ microVM `run`, and non-interactive capsule work.
 Data `run` needs no Runtime, and interactive packaged capsules use managed Home.
 Only one live host may own an ElastOS data home at a time. Do not run Home and
 the operator runtime against the same home at the same time. See the
-[command matrix](COMMAND_MATRIX.md) for each command lane.
+[command matrix](COMMAND_MATRIX.md) for each command lane. `elastos home
+--status` prints the local Home state.
 
 ### Source checkout note
 
@@ -285,8 +286,9 @@ Operators can install one known signed release head with
 
 The maintainer release DID is
 `did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
-installer's `Maintainer DID:` line with the complete DID in the repository
-[README](../README.md#install-from-the-publisher).
+installer's `Maintainer DID:` line with this complete DID. Stop if they differ.
+The maintainer changed the release signing key because the previous key was
+stored on the public server.
 
 An existing Home with the old source pin refuses a release signed by the new
 maintainer. On the Runtimes that still trust the old key, `elastos update`
