@@ -8,6 +8,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 SOURCE = Path(__file__).resolve().parent
@@ -112,6 +113,91 @@ class RemovalGuardTest(unittest.TestCase):
             """)
         self.assert_refused(result, "scripts/setup.sh:4")
 
+    def test_aliases_quoted_programs_wrappers_and_comment_prefixed_calls_are_refused(self):
+        self.write("scripts/alias.py", """\
+            from os import remove as drop, getcwd
+            import shutil as sh
+            drop(target)
+            sh.rmtree(folder)
+            os.system("rm -rf " + folder)
+            """)
+        self.write("elastos/crates/demo/src/store.rs", """\
+            use std::fs::{self, remove_dir_all as nuke};
+            use std::fs::remove_file as rm_file;
+            pub fn keep() {}
+            pub fn a(p: &Path) { nuke(p).unwrap(); }
+            pub fn b(p: &Path) { rm_file(p).unwrap(); }
+            pub fn c() { Command::new("rm").arg("-rf"); }
+            """)
+        self.write("scripts/quoted.sh", """\
+            as_root() { sudo "$@"; }
+            "rm" -rf "$dir"
+            \\rm -f "$x"
+            sudo -u owner rm -rf "$x"
+            if rm -f "$x"; then :; fi
+            stale="$(rm -v "$x")"
+            printf '%s' "$x" | xargs -0 rm -f
+            bash -c 'rm -rf "$1"' _ "$x"
+            as_root rm -rf "$x"
+            """)
+        self.write("scripts/prefixed.mjs", """\
+            /* cleanup */ fs.unlinkSync(target);
+            import { rmSync as wipe } from "node:fs";
+            wipe(dir);
+            execSync(`rm -rf ${dir}`);
+            """)
+        self.write("capsules/demo/browser/page.js", "fs.rmSync(dir);\n")
+        self.commit("bypasses")
+        self.assert_refused(
+            self.guard(), "scripts/alias.py:3", "scripts/alias.py:4", "scripts/alias.py:5",
+            "elastos/crates/demo/src/store.rs:4", "elastos/crates/demo/src/store.rs:5",
+            "elastos/crates/demo/src/store.rs:6", *(f"scripts/quoted.sh:{n}" for n in range(2, 10)),
+            "scripts/prefixed.mjs:1", "scripts/prefixed.mjs:3", "scripts/prefixed.mjs:4",
+            "capsules/demo/browser/page.js:1")
+
+    def test_deletion_words_in_strings_comments_and_other_programs_pass(self):
+        self.write("scripts/words.py", '''\
+            print("please call os.unlink(path)")
+            """
+            os.unlink(old) was the bug
+            """
+            items.remove(x)
+            # shutil.rmtree(x)
+            subprocess.run(["docker", "rm", name])
+            ''')
+        self.write("scripts/words.sh", """\
+            echo 'Run rm -rf "$stage"'
+            log "remove it with: rm -rf $x"
+            command -v rm >/dev/null
+            case "$1" in
+              rm) shift ;;
+            esac
+            git rm --cached x
+            docker rm -f "$container"
+            cat <<EOF
+            To clean up, run rm -rf ~/.cache
+            EOF
+            """)
+        self.write("scripts/words.mjs", """\
+            console.log("fs.unlinkSync(x)");
+            const pattern = /rm\\(/;
+            // fs.rmSync(dir)
+            run("docker", ["rm", name]);
+            const text = `${`nested ${"fs.rmSync(dir)"}`}`;
+            """)
+        self.write("elastos/crates/demo/src/store.rs", """\
+            pub fn keep() {}
+            pub fn s() { println!("std::fs::remove_file(p)"); }
+            pub fn d() { Command::new("docker").args(["rm", "-f", "name"]); }
+            """)
+        self.commit("words")
+        self.assert_passed(self.guard())
+
+    def test_a_marker_inside_a_string_is_not_a_marker(self):
+        result = self.change("scripts/tool.py",
+                             'os.unlink(x); print("# removal-ok: in a string, not a comment")\n')
+        self.assert_refused(result, "scripts/tool.py:1")
+
     def test_marker_with_a_reason_passes_and_an_empty_reason_does_not(self):
         self.assert_passed(self.change("scripts/tool.py", """\
             os.unlink(stage)  # removal-ok: mkstemp file this process created and holds open
@@ -199,14 +285,33 @@ class OwnedRemovalTest(unittest.TestCase):
         self.assertFalse(owned_removal.remove_owned(self.root, "owned/file"))
         self.assertFalse(owned_removal.remove_owned(self.root, "missing/file"))
 
-    def test_never_removes_through_a_linked_folder_or_linked_root(self):
+    def test_never_removes_through_a_linked_folder_or_linked_root_however_spelled(self):
         (self.root / "linked").symlink_to(self.outside)
         with self.assertRaises(owned_removal.UnsafeRemoval):
             owned_removal.remove_owned(self.root, "linked/file")
         (self.scratch / "linked-root").symlink_to(self.outside)
+        linked = str(self.scratch / "linked-root")
+        for spelling in (linked, linked + "/", linked + "/.", linked + "/./", linked + "//"):
+            with self.subTest(root=spelling), self.assertRaises(owned_removal.UnsafeRemoval):
+                owned_removal.remove_owned(spelling, "file")
         with self.assertRaises(owned_removal.UnsafeRemoval):
-            owned_removal.remove_owned(self.scratch / "linked-root", "file")
+            owned_removal.remove_owned(linked + "/..", "outside/file")
         self.assertEqual((self.outside / "file").read_text(), "outside")
+        self.assertTrue(owned_removal.remove_owned(str(self.root) + "/.", "owned/file"))
+
+    def test_a_folder_swapped_for_a_link_after_the_walk_is_not_followed(self):
+        real_lstat, owned, moved = os.lstat, self.root / "owned", self.scratch / "moved"
+
+        def swap_then_lstat(*args, **kwargs):
+            if not moved.exists():
+                owned.rename(moved)
+                owned.symlink_to(self.outside)
+            return real_lstat(*args, **kwargs)
+
+        with mock.patch.object(owned_removal.os, "lstat", swap_then_lstat):
+            self.assertTrue(owned_removal.remove_owned(self.root, "owned/file"))
+        self.assertEqual((self.outside / "file").read_text(), "outside")
+        self.assertFalse((moved / "file").exists())
 
     def test_a_linked_leaf_is_removed_itself_and_tree_links_are_not_followed(self):
         (self.root / "owned/nested/to-outside").symlink_to(self.outside)
@@ -216,7 +321,7 @@ class OwnedRemovalTest(unittest.TestCase):
         self.assertFalse((self.root / "owned").exists())
         self.assertEqual((self.outside / "file").read_text(), "outside")
 
-    def test_a_replaced_leaf_is_kept(self):
+    def test_a_leaf_replaced_before_the_identity_check_is_kept(self):
         file = self.root / "owned/file"
         recorded = file.lstat()
         file.rename(self.root / "owned/moved")
@@ -224,8 +329,21 @@ class OwnedRemovalTest(unittest.TestCase):
         with self.assertRaises(owned_removal.UnsafeRemoval):
             owned_removal.remove_owned(self.root, "owned/file", (recorded.st_dev, recorded.st_ino))
         self.assertEqual(file.read_text(), "replacement")
+        file.unlink()
+        file.symlink_to(self.outside / "file")
+        with self.assertRaises(owned_removal.UnsafeRemoval):
+            owned_removal.remove_owned(self.root, "owned/file", (recorded.st_dev, recorded.st_ino))
+        nested = self.root / "owned/nested"
+        folder = nested.lstat()
+        nested.rename(self.root / "owned/nested-moved")
+        nested.mkdir()
+        with self.assertRaises(owned_removal.UnsafeRemoval):
+            owned_removal.remove_owned(self.root, "owned/nested", (folder.st_dev, folder.st_ino))
+        self.assertTrue(nested.is_dir())
+        self.assertEqual((self.outside / "file").read_text(), "outside")
         current = file.lstat()
         self.assertTrue(owned_removal.remove_owned(self.root, "owned/file", (current.st_dev, current.st_ino)))
+        self.assertEqual((self.outside / "file").read_text(), "outside")
 
     def test_only_plain_relative_names_are_accepted(self):
         for relative in ("", "/etc/passwd", "../outside/file", "owned/../owned/file", "./owned/file",

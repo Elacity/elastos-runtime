@@ -3,26 +3,35 @@
 
     remove_owned(root, relative, expected=None) -> bool
 
-`root` is the owned directory. Its own last component must be a real
-directory, not a link; the folders above it are the caller's trust anchor.
+`root` is the owned directory. The folders above it are the caller's trust
+anchor; its own last name must be a real directory, not a link, however the
+root is spelled (`data`, `data/` and `data/.` all name `data` itself).
 `relative` names the exact path below it in plain components (no absolute
 path, "", "." or "..").
 
-The root is opened with O_DIRECTORY|O_NOFOLLOW and every parent below it with
-openat(O_DIRECTORY|O_NOFOLLOW), so a folder swapped for a link fails instead of
-redirecting the removal elsewhere. The leaf is inspected without following it:
-a link is removed itself, a directory is removed entry by entry relative to
-open descriptors (never following a link inside it), anything else is
-unlinked. With `expected` = (st_dev, st_ino) recorded earlier, a leaf with
-another identity is refused.
+The root's parent is opened, then the root's last name with
+openat(O_DIRECTORY|O_NOFOLLOW), then every folder below it the same way, so a
+folder that is a link fails instead of redirecting the removal elsewhere. The
+leaf is inspected with lstat relative to its parent's descriptor: a link is
+removed itself, a directory is emptied through descriptors opened the same way
+(never following a link inside it), anything else is unlinked. Every unlink
+and rmdir is relative to a held directory descriptor, so renaming or linking a
+folder on the path after the walk cannot redirect it. With `expected` =
+(st_dev, st_ino) recorded earlier, a leaf with another identity is refused.
 
-Returns False when the leaf or one of its parents does not exist and True
-after removing it. Raises UnsafeRemoval when a parent is a link or not a
+Accepted limit: POSIX removes a name, not an inode. Between the identity check
+and the unlink, and while a folder is being emptied, a process running as the
+same user can still rename entries inside the owned folder. The owned folder
+is that user's own private (0700) directory, so no other account can; this is
+the same limit recorded for #183.
+
+Returns False when the leaf or one of its folders does not exist and True
+after removing it. Raises UnsafeRemoval when a folder is a link or not a
 folder, the path is not exact, or the identity changed; OSError otherwise.
 
-Shell form, for scripts that cannot import it:
+Shell and Node form, for code that cannot import it:
     python3 scripts/lib/owned_removal.py ROOT RELATIVE [--expect DEV:INO]
-exits 0 after removing or when absent, 1 when refused.
+exits 0 after removing or when absent, 1 when refused or failed, 2 on usage.
 
 scripts/removal-guard.py refuses raw deletion added to product code; this is
 the Python and shell helper it names. Rust: elastos_common::owned_removal.
@@ -49,13 +58,28 @@ def _names(relative):
     return names
 
 
-def _open_directory(name, dir_fd=None):
+def _open_directory(name, dir_fd):
     try:
         return os.open(name, DIRECTORY, dir_fd=dir_fd)
     except OSError as error:
         if error.errno in (errno.ELOOP, errno.ENOTDIR):
             raise UnsafeRemoval(f"{name} is a link or not a folder; nothing was removed") from error
         raise
+
+
+def _open_root(root):
+    """The owned root's descriptor, its last name opened without following it."""
+    text = os.fsdecode(root)
+    names = [name for name in text.split("/") if name not in ("", ".")]
+    if not names or names[-1] == "..":
+        raise UnsafeRemoval(f"{text!r} does not name the owned folder itself")
+    anchor = "/".join(names[:-1])
+    anchor = ("/" + anchor) if text.startswith("/") else (anchor or ".")
+    parent = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        return _open_directory(names[-1], parent)
+    finally:
+        os.close(parent)
 
 
 def _remove_tree(parent, name, identity):
@@ -80,7 +104,7 @@ def _remove_tree(parent, name, identity):
 def remove_owned(root, relative, expected=None):
     names = _names(relative)
     try:
-        directory = _open_directory(os.fspath(root))
+        directory = _open_root(root)
     except FileNotFoundError:
         return False
     try:

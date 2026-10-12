@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { removeOwned, UnsafeRemoval } from "./owned-removal.mjs";
+import { removeOwned } from "./owned-removal.mjs";
 
 function tree(t) {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "owned-removal-"));
@@ -18,49 +18,35 @@ function tree(t) {
   return { scratch, root, outside };
 }
 
-test("removes an exact file and reports absence", (t) => {
+test("removes an exact file; an absent one is not an error", (t) => {
   const { root } = tree(t);
-  assert.equal(removeOwned(root, "owned/file"), true);
+  removeOwned(root, "owned/file");
   assert.equal(fs.existsSync(path.join(root, "owned/file")), false);
-  assert.equal(removeOwned(root, "owned/file"), false);
-  assert.equal(removeOwned(root, "missing/file"), false);
+  removeOwned(root, "owned/file");
+  removeOwned(root, "missing/file");
 });
 
-test("never removes through a linked folder or linked root", (t) => {
+test("never removes through a linked folder or a linked root, however it is spelled", (t) => {
   const { scratch, root, outside } = tree(t);
   fs.symlinkSync(outside, path.join(root, "linked"));
-  assert.throws(() => removeOwned(root, "linked/file"), UnsafeRemoval);
+  assert.throws(() => removeOwned(root, "linked/file"), /link or not a folder/);
   const linkedRoot = path.join(scratch, "linked-root");
   fs.symlinkSync(outside, linkedRoot);
-  assert.throws(() => removeOwned(linkedRoot, "file"), UnsafeRemoval);
+  for (const spelling of [linkedRoot, `${linkedRoot}/`, `${linkedRoot}/.`]) {
+    assert.throws(() => removeOwned(spelling, "file"), /link or not a folder/, spelling);
+  }
   assert.equal(fs.readFileSync(path.join(outside, "file"), "utf8"), "outside");
 });
 
-test("a linked leaf is removed itself and links inside a tree are not followed", (t) => {
+test("a leaf replaced before the identity check is kept", (t) => {
   const { root, outside } = tree(t);
-  fs.symlinkSync(outside, path.join(root, "owned/nested/to-outside"));
-  fs.symlinkSync(outside, path.join(root, "leaf-link"));
-  assert.equal(removeOwned(root, "leaf-link"), true);
-  assert.equal(removeOwned(root, "owned"), true);
-  assert.equal(fs.existsSync(path.join(root, "owned")), false);
-  assert.equal(fs.readFileSync(path.join(outside, "file"), "utf8"), "outside");
-});
-
-test("a replaced leaf is kept", (t) => {
-  const { root } = tree(t);
   const file = path.join(root, "owned/file");
   const recorded = fs.lstatSync(file, { bigint: true });
   fs.renameSync(file, path.join(root, "owned/moved"));
-  fs.writeFileSync(file, "replacement");
-  assert.throws(() => removeOwned(root, "owned/file", recorded), UnsafeRemoval);
-  assert.equal(fs.readFileSync(file, "utf8"), "replacement");
-  assert.equal(removeOwned(root, "owned/file", fs.lstatSync(file, { bigint: true })), true);
-});
-
-test("only plain relative names are accepted", (t) => {
-  const { root } = tree(t);
-  for (const relative of ["", "/etc/passwd", "../outside/file", "owned/../owned/file", "owned//file"]) {
-    assert.throws(() => removeOwned(root, relative), UnsafeRemoval, relative);
-  }
-  assert.equal(fs.existsSync(path.join(root, "owned/file")), true);
+  fs.symlinkSync(path.join(outside, "file"), file);
+  assert.throws(() => removeOwned(root, "owned/file", recorded), /no longer the recorded file/);
+  assert.equal(fs.readFileSync(path.join(outside, "file"), "utf8"), "outside");
+  removeOwned(root, "owned/file", fs.lstatSync(file, { bigint: true }));
+  assert.equal(fs.existsSync(file), false);
+  assert.equal(fs.readFileSync(path.join(outside, "file"), "utf8"), "outside");
 });
