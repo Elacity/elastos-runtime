@@ -220,8 +220,7 @@ Test-channel release. Signed releases show these notes in System before you upda
   and `shares` stay operator commands. The Rust `demo` publish profile is gone;
   `scripts/home-demo-local.sh` runs plain `setup`, and the operator smoke and
   pinned-model proof use `--with`.
-- `elastos update` and System Update stage this profile change normally; only
-  the standalone frozen offline path refuses a `profiles` difference.
+- `elastos update` and System Update stage this profile change normally.
 - Home consumes `intent.json` by overwriting it with empty content instead of
   deleting it; the session holds only read and write capabilities. A
   regression test runs two intents against a provider that refuses delete.

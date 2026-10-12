@@ -18,7 +18,7 @@ use crate::crypto::{verify_release_envelope, verify_release_envelope_against_did
 use crate::install_transaction::{InstallTransaction, ReleaseFile, RestartPhase};
 use crate::install_transaction::{RestartPlan, RestartRecord};
 use crate::sources::{
-    default_data_dir, default_install_path, load_trusted_sources, normalize_gateways, TrustedSource,
+    default_install_path, load_trusted_sources, normalize_gateways, TrustedSource,
 };
 
 /// Async callback for fetching a CID or `release-path:<path>` from the trusted source.
@@ -563,32 +563,6 @@ fn ensure_recorded_install_path(
     Ok(())
 }
 
-/// Main update flow. Discovers the latest release, verifies signatures, and installs.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_update(
-    fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
-    check_only: bool,
-    head_cid_override: Option<String>,
-    version: &str,
-    auto_confirm: bool,
-    force: bool,
-) -> anyhow::Result<()> {
-    let data_dir = default_data_dir();
-    run_update_for_data_dir(
-        &data_dir,
-        fetch_fn,
-        try_p2p_fn,
-        check_only,
-        head_cid_override,
-        version,
-        auto_confirm,
-        force,
-        false,
-    )
-    .await
-}
-
 /// Main update flow using an explicit runtime data dir.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_update_for_data_dir(
@@ -642,37 +616,6 @@ pub(crate) async fn run_update_for_data_dir_in_context(
         repair_invalid_version,
         carrier_context,
         ApplyMode::Normal,
-    )
-    .await
-}
-
-/// Internal foundation for a Home restart owner that has stopped Runtime.
-/// This uses the normal signed discovery and admission flow, then stages an
-/// offline transaction with unchanged support assets. The caller owns restart
-/// and installed Home acceptance.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_frozen_update_for_data_dir(
-    data_dir: &Path,
-    fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
-    check_only: bool,
-    head_cid_override: Option<String>,
-    version: &str,
-    auto_confirm: bool,
-    force: bool,
-) -> anyhow::Result<()> {
-    run_update_for_data_dir_with_mode(
-        data_dir,
-        fetch_fn,
-        try_p2p_fn,
-        check_only,
-        head_cid_override,
-        version,
-        auto_confirm,
-        force,
-        false,
-        crate::setup::FirstPartyCarrierContext::Setup,
-        ApplyMode::FrozenOffline,
     )
     .await
 }
