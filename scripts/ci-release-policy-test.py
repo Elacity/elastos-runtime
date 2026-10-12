@@ -205,6 +205,7 @@ def custody_should_run(source, context, paths):
 
 REPO = WORKFLOW.parents[2]
 CANARY = WORKFLOW.with_name("canary-holder-linux.yml")
+CARRIER_NAT = WORKFLOW.with_name("carrier-nat-linux.yml")
 TRACKED = frozenset(subprocess.check_output(["git", "ls-files"], cwd=REPO, text=True).splitlines())
 CALLED_PATH = re.compile(r"\$\{?(?:ROOT|REPO_ROOT)\}?/([\w./-]+)|\$\{?SCRIPT_DIR\}?/([\w./-]+)"
                          r"|(?<![\w./$}-])((?:scripts|deploy|capsules|elastos)/[\w./-]+|components\.json)")
@@ -1252,6 +1253,8 @@ class ReleasePolicyTests(unittest.TestCase):
         validate_filter_inputs(WORKFLOW, SOURCE, "custody-harness-smoke", custody_filter(SOURCE))
         canary = CANARY.read_text()
         validate_filter_inputs(CANARY, canary, "holder", canary_filter(canary))
+        nat = CARRIER_NAT.read_text()
+        validate_filter_inputs(CARRIER_NAT, nat, "nat", canary_filter(nat))
         for entry in ("'scripts/setup-source-home.sh'", "'capsules/chain-provider/**'", "'elastos/Cargo.lock'",
                       "'rust-toolchain.toml'", "'.github/workflows/ci.yml'", "'.cargo/config.toml'",
                       "'elastos/.cargo/config.toml'", "'elastos/crates/elastos-auth/**'"):

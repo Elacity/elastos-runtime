@@ -6,8 +6,28 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Added
+
+- Any Home reaches any other Home by its DID, also when both sit behind
+  different home routers or mobile networks. Carrier still connects directly
+  when it can (same Wi-Fi, or through the routers) and otherwise goes through
+  the publisher's relay over HTTPS. Your Home accepts only that relay, the
+  publisher address the signed release pins. The relay passes on encrypted
+  traffic it cannot read. Setup and updates also work on networks that block
+  UDP.
+
 ### Developer detail
 
+- The seed's public Home runs the iroh relay (`carrier_relay_bind_addr`,
+  `carrier_relay_tls_cert`, `carrier_relay_tls_key`; public publisher role only).
+  Every Carrier endpoint is built once with the pinned relay, a dial needs only
+  the node ID, tickets stay IP-only for alpha.13 to alpha.15 Homes, and the
+  unused public network mode and DHT topic join are gone.
+  `scripts/carrier-nat-test.sh` proves two Homes behind separate NATs.
+- Carrier tickets list only public addresses when the host has one (no
+  container bridge, LAN or loopback addresses), and a Runtime on a fixed
+  Carrier port also listens on that port over IPv6, so its ticket stays the
+  same across restarts (#336).
 - CI's `release-upstream-assets` job runs the release's upstream asset build
   (`scripts/release-upstream-assets.py`, including the Browser helper source
   builds) for Linux ARM64 and Apple Silicon on every pull request that changes

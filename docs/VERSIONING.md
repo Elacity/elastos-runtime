@@ -216,6 +216,11 @@ Approve the publisher tuple from the existing operator trust record. The Carrier
 its 64-character lower-case transport ID; every endpoint in the base32 JSON ticket
 has that same ID. A new ticket or delivery identity requires a new approval.
 The IPNS field can be empty when the approved delivery uses Carrier alone.
+`PUBLISHER_GATEWAY` also pins the Carrier relay: every Home accepts exactly one
+relay, the publisher origin (its `/relay` endpoint), and refuses any other, so
+approving the gateway approves the relay. There is no separate relay field, and
+Homes installed from earlier releases already hold this origin in `sources.json`.
+A relay at another origin needs a new delivery identity and a new approval.
 The installed `gh` executable has a canonical path outside candidate inputs and
 a SHA-256 pin. It supports the attestation verification flags used by the signer.
 
@@ -306,6 +311,39 @@ exact source at `/opt/elastos/release-source` (the seed Runtime runs its
 release helpers from the path it was built in), install the Runtime and IPFS
 provider, update the provider's pin in the installed `components.json`, verify
 the provider and start the service. The seed needs glibc 2.39 or newer.
+
+The seed's public Home also runs the Carrier relay (issue #345); no other Home
+does. It ships inside the seed Runtime. Before the first seed upgrade that
+carries it, an operator with root on the seed does these once:
+
+1. Retire the earlier standalone relay: `systemctl disable --now elastos-relay`,
+   then delete its `pre_hook` and `post_hook` lines from
+   `/etc/letsencrypt/renewal/elastos.elacitylabs.com.conf`, so certbot's
+   standalone renewal keeps port 80.
+2. Give the service user the origin's certificate for address discovery: a
+   certbot deploy hook in `/etc/letsencrypt/renewal-hooks/deploy/` that runs
+   `install -d -o wau -m 700 $DATA/relay-tls` and
+   `install -o wau -m 600 $RENEWED_LINEAGE/fullchain.pem $RENEWED_LINEAGE/privkey.pem $DATA/relay-tls/`
+   (`$DATA` is the seed data directory); run it once by hand with
+   `RENEWED_LINEAGE=/etc/letsencrypt/live/elastos.elacitylabs.com`. The relay
+   rereads the files daily.
+3. Add to the seed data directory's `config.toml` (next to
+   `gateway_public_publisher_bootstrap = true`, which the relay requires):
+   `carrier_relay_bind_addr = "127.0.0.1:3340"`,
+   `carrier_relay_tls_cert = "$DATA/relay-tls/fullchain.pem"` and
+   `carrier_relay_tls_key = "$DATA/relay-tls/privkey.pem"`.
+4. In nginx, add `limit_conn_zone $binary_remote_addr zone=elastos_relay:10m;`
+   under `http` and, in the origin's `server` block,
+   `location = /relay { limit_conn elastos_relay 16; proxy_pass http://127.0.0.1:3340; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_read_timeout 120s; proxy_buffering off; }`
+   and `location = /ping { proxy_pass http://127.0.0.1:3340; }`, then
+   `nginx -t && systemctl reload nginx`. UDP 7842 (address discovery) must stay
+   open in the firewall.
+
+After the upgrade, `curl -fsS https://elastos.elacitylabs.com/ping` answers from
+the relay and the seed log shows `carrier: relay serving on 127.0.0.1:3340
+(address discovery on)`. The relay limits each Home to 4 connections and 8 MiB/s
+(16 MiB burst), and all Homes to 4096 connections; nginx limits each IP address
+to 16 relay connections.
 
 Both seed sequences check sudo and every path they write before stopping the
 service, and once it is stopped an `EXIT` trap starts it again if any later

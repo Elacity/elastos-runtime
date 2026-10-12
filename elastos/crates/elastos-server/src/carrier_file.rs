@@ -149,9 +149,10 @@ async fn receive_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Retry the existing ticket, relay and direct routes into the same temporary
-/// file. Each attempt starts at byte zero and stays bound to one trusted peer.
+/// Download a trusted-source file over one Carrier connection to the pinned
+/// node (direct when a route answers, otherwise through the pinned relay).
 pub(crate) async fn fetch_file_from_trusted_source_to_bound(
+    data_dir: &std::path::Path,
     source: &TrustedSource,
     path: &str,
     file: &mut tokio::fs::File,
@@ -159,59 +160,16 @@ pub(crate) async fn fetch_file_from_trusted_source_to_bound(
     progress: &mut (impl FnMut(u64, u64) -> Result<()> + Send),
     bind_addr: Option<std::net::SocketAddr>,
 ) -> Result<()> {
-    let peer = super::source_transport_endpoint_id(source)?
-        .context("trusted source has no usable Carrier node id")?;
-    let mut candidates = super::decode_ticket_endpoints(&source.connect_ticket);
-    candidates.extend(super::relay_only_ticket_endpoints(source));
-    ensure!(
-        candidates
-            .iter()
-            .all(|address| address.id.to_string() == peer),
-        "trusted source file routes do not match the configured Carrier identity"
-    );
-    let mut errors = Vec::new();
-    for candidate in candidates
-        .into_iter()
-        .map(Some)
-        .chain(std::iter::once(None))
-    {
-        file.set_len(0).await?;
-        file.rewind().await?;
-        progress(0, expected_size)?;
-        let connected = match candidate {
-            Some(address) => {
-                CarrierClient::connect_endpoint_addr_bound(address, 15, bind_addr).await
-            }
-            None => {
-                CarrierClient::connect_bound(
-                    &peer,
-                    &super::source_carrier_addrs(source),
-                    15,
-                    bind_addr,
-                )
-                .await
-            }
-        };
-        let client = match connected {
-            Ok(client) => client,
-            Err(error) => {
-                errors.push(format!("connect: {error:#}"));
-                continue;
-            }
-        };
-        let result = client
-            .fetch_file_to(path, file, expected_size, progress)
-            .await;
-        client.close().await;
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error) => errors.push(format!("fetch: {error:#}")),
-        }
-    }
-    anyhow::bail!(
-        "trusted source Carrier file download failed: {}",
-        errors.join(" | ")
-    )
+    file.set_len(0).await?;
+    file.rewind().await?;
+    progress(0, expected_size)?;
+    let client =
+        CarrierClient::connect_trusted_source_bound(data_dir, source, 15, bind_addr).await?;
+    let result = client
+        .fetch_file_to(path, file, expected_size, progress)
+        .await;
+    client.close().await;
+    result.context("trusted source Carrier file download failed")
 }
 
 #[cfg(test)]
@@ -484,6 +442,7 @@ mod tests {
             "connect_ticket":super::super::carrier_connect_ticket(&node.endpoint)
         })).unwrap();
         let error = fetch_file_from_trusted_source_to_bound(
+            dir.path(),
             &source,
             "test.bin",
             &mut file,

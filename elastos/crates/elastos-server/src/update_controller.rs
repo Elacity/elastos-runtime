@@ -1207,9 +1207,13 @@ impl Controller {
             "Update choice changed. Check the update again."
         );
         let client = Arc::new(
-            crate::carrier::CarrierClient::connect_trusted_source(&source, 15)
-                .await
-                .context(crate::update::UpdateSourceUnavailable)?,
+            crate::carrier::CarrierClient::connect_trusted_source(
+                &self.receipt.data_dir,
+                &source,
+                15,
+            )
+            .await
+            .context(crate::update::UpdateSourceUnavailable)?,
         );
         self.carrier = Some(client.clone());
         let fetch_client = client.clone();

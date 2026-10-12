@@ -589,7 +589,8 @@ async fn admit_installed_setup_metadata(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("signed components CID is missing"))?;
     // The live source names only its newest release; a signed CID names this one.
-    let client = crate::carrier::CarrierClient::connect_trusted_source(source, 15).await?;
+    let client =
+        crate::carrier::CarrierClient::connect_trusted_source(data_dir, source, 15).await?;
     let result = async {
         let components = client.fetch_content_bounded(cid, size as usize).await?;
         crate::installed_release::admit_descriptor(
@@ -3792,6 +3793,7 @@ pub(crate) async fn fetch_first_party_component_via_carrier(
         .ok_or_else(missing_trusted_source_error)?;
     let bind_addr = first_party_carrier_bind_addr(data_dir, context)?;
     crate::carrier::fetch_file_from_trusted_source_bound(
+        data_dir,
         &source,
         cid,
         release_path,
@@ -3819,6 +3821,7 @@ pub(crate) async fn fetch_model_catalog_via_carrier(
     tokio::time::timeout(
         MODEL_CATALOG_FETCH_DEADLINE,
         crate::carrier::fetch_file_from_trusted_source_bound(
+            data_dir,
             &source,
             Some(cid),
             MODEL_CATALOG_FILE,

@@ -80,9 +80,13 @@ async fn run_update_command_for_data_dir(
         update::installed_release_version(&source_config.installed_version)?;
     }
     let carrier_client = Arc::new(
-        elastos_server::carrier::CarrierClient::connect_trusted_source(&source_config, 10)
-            .await
-            .map_err(|e| anyhow::anyhow!("Carrier connection failed: {:#}", e))?,
+        elastos_server::carrier::CarrierClient::connect_trusted_source(
+            data_dir,
+            &source_config,
+            10,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Carrier connection failed: {:#}", e))?,
     );
 
     let carrier_for_fetch = carrier_client.clone();
@@ -198,10 +202,7 @@ mod tests {
             .unwrap_err();
             if force {
                 // Past the version gate, the only failure left is the unreachable source.
-                assert!(
-                    error.to_string().contains("outgoing UDP to port 4433"),
-                    "{error:#}"
-                );
+                assert!(error.to_string().contains("UDP port 4433"), "{error:#}");
             } else {
                 assert!(
                     error.to_string().contains("elastos update --force"),

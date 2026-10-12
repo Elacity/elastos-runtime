@@ -529,6 +529,7 @@ pub(super) async fn install_via_carrier(
     // The download fails only when no bytes arrive for 30 s (each Carrier
     // read/write has that idle limit); progress keeps it alive.
     crate::carrier::fetch_file_from_trusted_source_to_bound(
+        data,
         &source,
         info.release_path.as_deref().unwrap(),
         &mut download,
