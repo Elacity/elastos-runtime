@@ -137,8 +137,13 @@ def build(recipe, payload, cache, upstream):
                'CPPFLAGS': '-I' + str(prefix / 'include'),
                'LDFLAGS': '-L' + str(prefix / 'lib'), 'LC_ALL': 'C',
                'CFLAGS': '-O2 -g0 -ffile-prefix-map=' + str(work) + '=/usr/src/elastos-browser',
-               # coturn otherwise enables SCTP when the host has glibc's netinet/sctp.h.
-               'TURN_NO_SCTP': '1'}
+               # coturn's configure enables every optional backend whose headers the host
+               # happens to have (GitHub's ARM runner ships MySQL headers, which then fail
+               # under musl). ElastOS TURN uses an in-memory REST secret and no database,
+               # so turn every optional backend off: the build no longer depends on the host.
+               'TURN_NO_SCTP': '1', 'TURN_NO_MYSQL': '1', 'TURN_NO_PQ': '1', 'TURN_NO_MONGO': '1',
+               'TURN_NO_HIREDIS': '1', 'TURN_NO_SQLITE': '1', 'TURN_NO_PROMETHEUS': '1',
+               'TURN_NO_SYSTEMD': '1'}
         uapi = None
         if native.startswith('linux'):
             env['CC'] = 'musl-gcc'
