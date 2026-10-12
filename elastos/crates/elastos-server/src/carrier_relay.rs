@@ -767,11 +767,14 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(30), node.endpoint.online())
             .await
             .expect("the Home reaches its pinned relay through its NAT");
+        // Rename, so the peer never reads a half-written ID.
+        let id_file = shared.join(format!("{name}.id"));
         std::fs::write(
-            shared.join(format!("{name}.id")),
+            id_file.with_extension("partial"),
             node.endpoint.id().to_string(),
         )
         .unwrap();
+        std::fs::rename(id_file.with_extension("partial"), &id_file).unwrap();
         let peer: EndpointId = wait_for_file(&shared.join(format!("{peer_name}.id")), deadline)
             .await
             .parse()
