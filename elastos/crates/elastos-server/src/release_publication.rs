@@ -105,7 +105,7 @@ impl Publication {
         semver::Version::parse(&version).context("release version refused")?;
         let channel = text(r, "channel")?.to_owned();
         ensure!(
-            matches!(channel.as_str(), "stable" | "canary" | "jetson-test"),
+            matches!(channel.as_str(), "stable" | "canary"),
             "release channel refused"
         );
         ensure!(

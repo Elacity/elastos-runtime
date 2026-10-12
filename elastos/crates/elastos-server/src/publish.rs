@@ -41,7 +41,7 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "model-provider",
 ];
 const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat", "home-agent"];
-const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
+const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary"];
 
 pub(crate) fn source_discovery_uri(publisher_did: &str, channel: &str) -> String {
     let channel = normalize_release_channel(channel);

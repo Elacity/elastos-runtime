@@ -81,7 +81,7 @@ if [[ "$IPNS_NAME" == "$IPNS_NAME_PLACEHOLDER" ]]; then
     IPNS_NAME=""
 fi
 
-ALLOWED_CHANNELS=("stable" "canary" "jetson-test")
+ALLOWED_CHANNELS=("stable" "canary")
 BINARY_DOWNLOAD_RETRY_COUNT="${ELASTOS_BINARY_DOWNLOAD_RETRY_COUNT:-10}"
 BINARY_DOWNLOAD_RETRY_DELAY="${ELASTOS_BINARY_DOWNLOAD_RETRY_DELAY:-2}"
 BINARY_DOWNLOAD_CONNECT_TIMEOUT="${ELASTOS_BINARY_DOWNLOAD_CONNECT_TIMEOUT:-15}"
@@ -138,7 +138,7 @@ show_help() {
     echo "  Fails closed if signatures can't be verified."
     echo ""
     echo -e "${BOLD}Release channels:${NC}"
-    echo "  stable, canary, jetson-test"
+    echo "  stable, canary"
     echo ""
     exit 0
 }

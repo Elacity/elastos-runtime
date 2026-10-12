@@ -110,7 +110,7 @@ Current rule:
 
 The release channel and the version are related but not identical:
 
-- channels decide where a release head points: `stable`, `canary`, `jetson-test`
+- channels decide where a release head points: `stable`, `canary`
 - the version string describes the release artifact itself
 
 Do not invent ad hoc suffixes. If a new prerelease class is needed, update this policy and the checked publish flow together.

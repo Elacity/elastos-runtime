@@ -835,7 +835,7 @@ def cli_admit(config, local_rehearsal=None):
     for binding in (manifest["source"], manifest["old"]["source"], manifest["new"]["source"]):
         need(all(re.fullmatch(r"[0-9a-f]{40}", binding[key]) for key in ("commit", "tree")), "exact source commit/tree required")
     need(manifest["old"]["version"] != manifest["new"]["version"], "different old/new versions required")
-    need(manifest["channel"] in ("canary", "jetson-test"), "isolated fixture channel required")
+    need(manifest["channel"] == "canary", "isolated fixture channel required")
     signer = manifest["signer_did"]
     need(isinstance(signer, str) and signer.startswith("did:key:z"), "pinned fixture signer required")
     cli_inventory(root, manifest)

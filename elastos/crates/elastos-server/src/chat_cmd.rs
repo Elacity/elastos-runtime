@@ -1877,7 +1877,7 @@ mod tests {
             sources: vec![TrustedSource {
                 name: "default".to_string(),
                 publisher_dids: vec![],
-                channel: "jetson-test".to_string(),
+                channel: "canary".to_string(),
                 discovery_uri: String::new(),
                 connect_ticket: "seed-ticket".to_string(),
                 gateways: vec![],
@@ -1902,7 +1902,7 @@ mod tests {
             sources: vec![TrustedSource {
                 name: "default".to_string(),
                 publisher_dids: vec![],
-                channel: "jetson-test".to_string(),
+                channel: "canary".to_string(),
                 discovery_uri: String::new(),
                 connect_ticket: "seed-ticket".to_string(),
                 gateways: vec![],
@@ -1933,7 +1933,7 @@ mod tests {
             sources: vec![TrustedSource {
                 name: "default".to_string(),
                 publisher_dids: vec![],
-                channel: "jetson-test".to_string(),
+                channel: "canary".to_string(),
                 discovery_uri: String::new(),
                 connect_ticket: "seed-ticket".to_string(),
                 gateways: vec![],
@@ -2041,7 +2041,7 @@ mod tests {
             sources: vec![TrustedSource {
                 name: "default".to_string(),
                 publisher_dids: vec![],
-                channel: "jetson-test".to_string(),
+                channel: "canary".to_string(),
                 discovery_uri: String::new(),
                 connect_ticket: "   ".to_string(),
                 gateways: vec![],

@@ -130,7 +130,6 @@ SUPPORT_BINARY_ASSETS=(
 ALLOWED_CHANNELS=(
     stable
     canary
-    jetson-test
 )
 
 # Navigate to project root; relative CLI paths belong to the original caller.
@@ -152,7 +151,7 @@ show_help() {
     echo ""
     echo "Optional:"
     echo "  --ipfs-provider-bin PATH Path to the ipfs-provider binary"
-    echo "  --channel NAME     stable | canary | jetson-test (default: stable)"
+    echo "  --channel NAME     stable | canary (default: stable)"
     echo "  --preview-platform PLATFORM One canary input from that platform's host"
     echo "  --help             Show this help"
     echo ""

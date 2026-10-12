@@ -962,7 +962,7 @@ mod tests {
             ..
         } = &mut cmd
         {
-            *channel = Some("jetson-test".into());
+            *channel = Some("stable".into());
             *discovery_uri = Some("elastos://custom/replacement".into());
             *connect_ticket = Some("replacement-ticket".into());
             *gateways = vec![" https://replacement.invalid/ ".into()];
@@ -977,7 +977,7 @@ mod tests {
         .unwrap();
         let reloaded = load_trusted_sources(dir.path()).unwrap();
         let source = &reloaded.sources[0];
-        assert_eq!(source.channel, "jetson-test");
+        assert_eq!(source.channel, "stable");
         assert_eq!(source.discovery_uri, "elastos://custom/replacement");
         assert_eq!(source.connect_ticket, "replacement-ticket");
         assert_eq!(source.gateways, ["https://replacement.invalid"]);
