@@ -529,7 +529,7 @@ async fn run_with_data_dir(
                 }
             };
             let dest = data_dir.join(install_path);
-            line.track(async {
+            line.track(Box::pin(async {
                 download_component(
                     &data_dir,
                     name,
@@ -539,7 +539,7 @@ async fn run_with_data_dir(
                 )
                 .await?;
                 write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)
-            })
+            }))
             .await?;
             changed = true;
         }
@@ -548,13 +548,13 @@ async fn run_with_data_dir(
             metadata_install_state,
             Some(InstallState::Missing | InstallState::Stale(_))
         ) {
-            line.track(ensure_component_capsule_metadata(
+            line.track(Box::pin(ensure_component_capsule_metadata(
                 &data_dir,
                 name,
                 comp,
                 &platform,
                 FirstPartyCarrierContext::Setup,
-            ))
+            )))
             .await?;
             changed = true;
         }
@@ -3246,11 +3246,11 @@ async fn prepare_selected_component_prerequisites(
                 name.chars().count(),
                 info.size,
             );
-            line.track(async {
+            line.track(Box::pin(async {
                 download_component(data_dir, name, info, &dest, FirstPartyCarrierContext::Setup)
                     .await?;
                 write_cache_metadata(manifest, Some(info), platform, name, &dest)
-            })
+            }))
             .await?;
             line.done();
             println!();

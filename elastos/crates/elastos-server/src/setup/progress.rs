@@ -243,19 +243,18 @@ impl ComponentProgress {
 
     /// Runs one fetch with this line as its progress sink. A failure ends the
     /// line as failed and returns the same error.
+    ///
+    /// The caller passes the future already on the heap: a download future is
+    /// large, and a by-value argument would sit inside setup's own future.
     pub(super) async fn track<T>(
         self: &Arc<Self>,
-        future: impl Future<Output = anyhow::Result<T>>,
+        future: std::pin::Pin<Box<dyn Future<Output = anyhow::Result<T>> + '_>>,
     ) -> anyhow::Result<T> {
         let line = Arc::clone(self);
         let sink: crate::carrier::ReplyProgress =
             Arc::new(move |read, declared| line.received(read, declared));
-        // Download futures are large; the heap keeps setup's own future small.
-        let result = Box::pin(REPORTING.scope(
-            (),
-            crate::carrier::with_reply_progress(sink, Box::pin(future)),
-        ))
-        .await;
+        let result =
+            Box::pin(REPORTING.scope((), crate::carrier::with_reply_progress(sink, future))).await;
         if result.is_err() {
             self.finish(Status::Failed);
         }
@@ -544,11 +543,14 @@ mod tests {
     async fn reporting_holds_only_inside_a_tracked_fetch() {
         assert!(!reporting());
         let progress = ComponentProgress::new(OutputMode::Plain, 1, 1, "fixture", 7, None);
-        let inside = progress.track(async { Ok(reporting()) }).await.unwrap();
+        let inside = progress
+            .track(Box::pin(async { Ok(reporting()) }))
+            .await
+            .unwrap();
         assert!(inside);
         assert!(!reporting());
         let error = progress
-            .track(async { Err::<(), _>(anyhow::anyhow!("refused")) })
+            .track(Box::pin(async { Err::<(), _>(anyhow::anyhow!("refused")) }))
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "refused");
