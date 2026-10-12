@@ -41,6 +41,7 @@ pub mod documents;
 pub mod esp_binding;
 pub mod fetcher;
 pub mod gateway_cmd;
+pub mod home_service;
 pub mod host_lock;
 pub mod init;
 pub mod inspect_provider;

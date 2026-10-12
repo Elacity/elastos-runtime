@@ -320,6 +320,10 @@ enum Commands {
         json: bool,
     },
 
+    /// Run Home in the background as this user's service
+    #[command(subcommand)]
+    Service(elastos_server::home_service::ServiceCommand),
+
     #[command(name = "__update-controller", hide = true)]
     UpdateController {
         #[arg(long)]
@@ -530,6 +534,10 @@ enum Commands {
         /// Installed Runtime binary path
         #[arg(long)]
         binary: PathBuf,
+        /// Command path that will point at the binary; an installation that still
+        /// records its Runtime there moves into the binary path
+        #[arg(long)]
+        link: Option<PathBuf>,
         /// Verified candidate Runtime, trusted sources, release head and release
         #[arg(long, num_args = 4, value_names = ["RUNTIME", "SOURCES", "HEAD", "RELEASE"])]
         candidate: Vec<PathBuf>,
@@ -1223,10 +1231,35 @@ fn main() -> anyhow::Result<()> {
         let inherited = libc::umask(0o022);
         libc::umask(inherited | 0o022);
     }
+    #[cfg(target_os = "macos")]
+    exec_canonical_binary();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(run())
+}
+
+/// macOS reports the path a symlink was invoked by (~/.local/bin/elastos), while
+/// the installation records the binary it points to. Re-run under the resolved
+/// path so every check, process listing and update sees the installed binary.
+#[cfg(target_os = "macos")]
+fn exec_canonical_binary() {
+    use std::os::unix::process::CommandExt;
+    let Ok(invoked) = std::env::current_exe() else {
+        return;
+    };
+    let Ok(canonical) = std::fs::canonicalize(&invoked) else {
+        return;
+    };
+    if canonical == invoked {
+        return;
+    }
+    let error = std::process::Command::new(&canonical)
+        .arg0(&canonical)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    eprintln!("Could not run {}: {error}", canonical.display());
+    std::process::exit(1);
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -1295,6 +1328,16 @@ async fn run() -> anyhow::Result<()> {
         status: false,
         json: false,
     });
+    if matches!(&command, Commands::Home { browser: true, .. }) {
+        if elastos_server::home_service::service_mode() {
+            if elastos_server::home_service::start_refused_by_pending_install() {
+                eprintln!("Home did not start: an install or update must finish first. Run the installer or `elastos update` to complete it.");
+                return Ok(());
+            }
+        } else if gateway_entry::reopen_running_home().await? {
+            return Ok(());
+        }
+    }
     if matches!(
         &command,
         Commands::Serve { .. } | Commands::Gateway { .. } | Commands::Home { browser: true, .. }
@@ -1368,6 +1411,10 @@ async fn run() -> anyhow::Result<()> {
                 return gateway_entry::run_browser_home().await;
             }
             return home_cmd::run(status, json).await;
+        }
+
+        Commands::Service(command) => {
+            return elastos_server::home_service::run_service_command(command).await;
         }
 
         Commands::UpdateController { receipt } => {
@@ -1578,6 +1625,7 @@ async fn run() -> anyhow::Result<()> {
         Commands::InstallRelease {
             data_dir,
             binary,
+            link,
             candidate,
             check,
         } => {
@@ -1587,6 +1635,7 @@ async fn run() -> anyhow::Result<()> {
             elastos_server::update::install_release(
                 &data_dir,
                 &binary,
+                link.as_deref(),
                 [runtime, sources, head, release].map(PathBuf::as_path),
                 check,
             )?;
@@ -2193,32 +2242,7 @@ fn find_free_local_addr() -> anyhow::Result<String> {
     Ok(format!("127.0.0.1:{}", addr.port()))
 }
 
-/// Try to open a URL in the default browser.
-pub(crate) fn open_browser(url: &str) {
-    #[cfg(target_os = "linux")]
-    {
-        // Try WSL browser opener first, then xdg-open
-        for cmd in &["wslview", "xdg-open"] {
-            if std::process::Command::new(cmd)
-                .arg(url)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .is_ok()
-            {
-                return;
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open")
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-}
+pub(crate) use elastos_server::home_service::open_browser;
 
 pub(crate) async fn create_runtime(
     storage_path: impl AsRef<std::path::Path>,

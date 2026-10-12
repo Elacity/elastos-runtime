@@ -121,9 +121,13 @@ case "${1:-}" in
         exit 0 ;;
     principal-root-upgrade) echo '{"schema": "fixture-receipt"}'; exit 0 ;;
     home) exit 0 ;;
+    service) echo "Home: http://localhost:8090/home/"; exit 0 ;;
     *) exit 97 ;;
 esac
 '''
+# What an install changes under HOME: the Runtime in the data directory and the
+# elastos command, a link to it.
+INSTALLED_PATHS = {".local/bin/elastos", "xdg-data/elastos/bin", "xdg-data/elastos/bin/elastos"}
 COMPONENTS = json.dumps({"schema": "elastos.components/v1", "capsules": {}, "external": {},
                          "profiles": {}}, sort_keys=True).encode() + b"\n"
 
@@ -505,7 +509,9 @@ class InstallerSandbox:
                                   .replace("__PUBLISHER_NODE_ID__", "fixture-node", 1))
         self.home = self.root / "home"
         self.data = self.home / "xdg-data/elastos"
+        # The elastos command; since 0.8 a link to the Runtime in the data directory.
         self.binary = self.home / ".local/bin/elastos"
+        self.runtime = self.data / "bin/elastos"
         self.calls = self.root / "calls"
         self.responses = self.root / "responses"
         for path in (self.home, self.root / "tmp", self.responses, self.root / "mocks"):
@@ -514,6 +520,10 @@ class InstallerSandbox:
         self.respond("release-head.json", head)
         self.respond("release.json", release)
         mocks = self.root / "mocks"
+        # Service managers only record calls; a developer's real Home is never touched.
+        for manager in ("systemctl", "launchctl"):
+            (mocks / manager).write_text(
+                '#!/bin/sh\nprintf "%s %s\\n" "$(basename "$0")" "$*" >> "$FIXTURES/service-calls"\n')
         (mocks / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo "$MOCK_SYSTEM";; -m) echo "$MOCK_MACHINE";; esac\n')
         # Fixture URLs are https://test.invalid, so every request must carry the
         # HTTPS-only flags; a responses/<name>.redirect file names a redirect target.
@@ -603,7 +613,8 @@ def changed_paths(before, after):
 
 
 class CompletionTests(unittest.TestCase):
-    def run_completion(self, setup_exit=0, home_exit=0, install_only="false", terminal=False, system="Linux"):
+    def run_completion(self, setup_exit=0, home_exit=0, install_only="false", terminal=False, system="Linux",
+                       service_exit=0):
         with tempfile.TemporaryDirectory(prefix="installer-completion-") as directory:
             root = Path(directory)
             # Spaces catch accidental reliance on PATH or unquoted install paths.
@@ -615,6 +626,10 @@ class CompletionTests(unittest.TestCase):
                                'if [[ "${1:-}" == setup ]]; then\n'
                                '  if read -r unexpected; then exit 98; fi\n'
                                '  exit "$SETUP_EXIT"\n'
+                               'fi\n'
+                               'if [[ "${1:-}" == service ]]; then\n'
+                               '  if read -r unexpected; then exit 98; fi\n'
+                               '  exit "$SERVICE_EXIT"\n'
                                'fi\n'
                                '[[ -t 0 ]] || exit 99\n'
                                'exit "$HOME_EXIT"\n')
@@ -631,7 +646,8 @@ class CompletionTests(unittest.TestCase):
             env = dict(os.environ, INSTALL_DIR=str(install_dir), INSTALL_ONLY=install_only,
                        DATA_DIR=str(root / "data"), MOCK_SYSTEM=system,
                        PATH=str(mocks) + os.pathsep + os.environ["PATH"],
-                       CALLS=str(calls), SETUP_EXIT=str(setup_exit), HOME_EXIT=str(home_exit))
+                       CALLS=str(calls), SETUP_EXIT=str(setup_exit), HOME_EXIT=str(home_exit),
+                       SERVICE_EXIT=str(service_exit))
             argv = [OPTIONS.bash, "--noprofile", "--norc", str(script)]
             if terminal:
                 import fcntl
@@ -667,32 +683,42 @@ class CompletionTests(unittest.TestCase):
                 status, output = result.returncode, result.stdout
             return status, calls.read_text().splitlines() if calls.exists() else [], output
 
-    def test_headless_setup_does_not_consume_script_pipe_or_open_renderer(self):
+    def test_headless_install_starts_home_in_the_background_without_reading_the_pipe(self):
         for system in ("Linux", "Darwin"):
             with self.subTest(system=system):
                 status, calls, output = self.run_completion(system=system)
-                self.assertEqual((status, calls), (0, ["setup"]), output)
-                self.assertIn("Home is installed", output)
-                self.assertIn("installed\\ runtime/elastos", output)
-                self.assertIn("home --browser", output)
+                self.assertEqual((status, calls), (0, ["setup", "service install --open"]), output)
+                self.assertIn("keeps running after this terminal closes", output)
+
+    def test_headless_service_failure_prints_the_launch_command(self):
+        status, calls, output = self.run_completion(service_exit=1)
+        self.assertEqual((status, calls), (0, ["setup", "service install --open"]), output)
+        self.assertIn("Home is installed", output)
+        self.assertIn("installed\\ runtime/elastos", output)
+        self.assertIn("home --browser", output)
 
     def test_setup_failure_stops_before_home_and_success_message(self):
         status, calls, output = self.run_completion(setup_exit=23)
         self.assertEqual((status, calls), (23, ["setup"]))
         self.assertNotIn("Home is installed", output)
 
-    def test_install_only_skips_both_setup_and_home(self):
+    def test_install_only_skips_setup_service_and_home(self):
         for value in ["true", "1"]:
             status, calls, _ = self.run_completion(install_only=value)
             self.assertEqual((status, calls), (0, []))
 
-    def test_terminal_install_sets_up_then_opens_home_with_tty(self):
+    def test_terminal_install_with_a_running_service_does_not_hold_the_terminal(self):
         status, calls, _ = self.run_completion(terminal=True)
-        self.assertEqual((status, calls), (0, ["setup", "home --browser"]))
+        self.assertEqual((status, calls), (0, ["setup", "service install --open"]))
+
+    def test_service_failure_falls_back_to_home_in_the_terminal(self):
+        status, calls, output = self.run_completion(terminal=True, service_exit=1)
+        self.assertEqual((status, calls), (0, ["setup", "service install --open", "home --browser"]), output)
+        self.assertIn("in this terminal instead", output)
 
     def test_home_failure_is_reported(self):
-        status, calls, _ = self.run_completion(terminal=True, home_exit=24)
-        self.assertEqual((status, calls), (24, ["setup", "home --browser"]))
+        status, calls, _ = self.run_completion(terminal=True, service_exit=1, home_exit=24)
+        self.assertEqual((status, calls), (24, ["setup", "service install --open", "home --browser"]))
 
 
 class BindingTests(unittest.TestCase):
@@ -881,7 +907,7 @@ class InstallationTests(unittest.TestCase):
                     result, requests = sandbox.run(*(["--install-only"] if install_only else []))
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(requests, self.REQUESTS)
-                    self.assertEqual(changed_paths(before, sandbox.home_state()), {".local/bin/elastos"})
+                    self.assertEqual(changed_paths(before, sandbox.home_state()), INSTALLED_PATHS)
                     candidate = sandbox.root / "candidate"
                     self.assertEqual((candidate / "release-head.json").read_bytes(), head)
                     self.assertEqual((candidate / "release.json").read_bytes(), release)
@@ -896,7 +922,7 @@ class InstallationTests(unittest.TestCase):
                         self.assertIn("Carrier transport is outside this fixture", marker.read_text())
                         # Children see the caller's TMPDIR, not the installer's scratch directory.
                         self.assertIn(f"\nTMPDIR={sandbox.root / 'tmp'}\n", marker.read_text())
-                        self.assertEqual(sandbox.runtime_calls()[-1], "setup")
+                        self.assertEqual(sandbox.runtime_calls()[-2:], ["setup", "service install --open"])
                     self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
     def test_piped_run_prints_plain_numbered_steps_and_ready_summary(self):
@@ -925,7 +951,7 @@ class InstallationTests(unittest.TestCase):
                     self.assertNotIn("is ready", result.stdout)
                 else:
                     ready = result.stdout.index("ElastOS %s is ready" % version)
-                    self.assertLess(ready, result.stdout.index("Home is installed"))
+                    self.assertLess(ready, result.stdout.index("Home keeps running after this terminal closes"))
                     self.assertIn("update", result.stdout[ready:])
                     self.assertIn("export PATH=", result.stdout[ready:])
 
@@ -969,7 +995,6 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertLess(result.stdout.index("[OK] Existing installation found"),
                             result.stdout.index("[3/4] Download ElastOS Runtime"))
-            self.assertIn("Open Home again after installation to reconnect.", result.stdout)
 
     def test_corrupt_artifacts_fail_before_changes_then_clean_rerun_installs(self):
         did, head, release = installable_fixture()
@@ -1001,10 +1026,10 @@ class InstallationTests(unittest.TestCase):
         self.assertIn("Runtime installed:", result.stdout)
         self.assertNotIn("Setting up Home", result.stdout)
         calls = sandbox.runtime_calls()
-        writer = "^install-release --data-dir %s --binary %s --candidate %s/\\.elastos\\.install\\.\\w+ " \
+        writer = "^install-release --data-dir %s --binary %s --link %s --candidate %s/\\.elastos\\.install\\.\\w+ " \
                  "(\\S+)/sources\\.json \\1/release-head\\.json \\1/release\\.json" % (
-                     re.escape(str(sandbox.data)), re.escape(str(sandbox.binary)),
-                     re.escape(str(sandbox.binary.parent)))
+                     re.escape(str(sandbox.data)), re.escape(str(sandbox.runtime)),
+                     re.escape(str(sandbox.binary)), re.escape(str(sandbox.binary.parent)))
         self.assertEqual(calls[0], "--version")
         # Admission runs before this installer stops Runtime; the second call installs.
         self.assertRegex(calls[1], writer + " --check$")
@@ -1027,14 +1052,15 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(sources["schema"], "elastos.trusted-sources/v1")
         source = sources["sources"][0]
         self.assertEqual((source["publisher_dids"], source["channel"], source["installed_version"], source["install_path"]),
-                         ([did], "stable", json.loads(release)["payload"]["version"], str(sandbox.binary)))
+                         ([did], "stable", json.loads(release)["payload"]["version"], str(sandbox.runtime)))
         self.assertEqual(source["discovery_uri"],
                          "elastos://source/stable/" + hashlib.sha256(did.encode()).hexdigest()[:32])
         registration = (source["gateways"], source["head_cid"], source["connect_ticket"], source["publisher_node_id"])
         self.assertEqual(registration, (["https://test.invalid"], "", "fixture-ticket", "fixture-node"))
-        # Apart from the stand-in's Runtime, the shell writes no installation file
-        # itself and removes its staged copy.
-        self.assertEqual(changed_paths(before, sandbox.home_state()), {".local/bin/elastos"})
+        # Apart from the stand-in's Runtime and the command linked to it, the shell
+        # writes no installation file itself and removes its staged copy.
+        self.assertEqual(changed_paths(before, sandbox.home_state()), INSTALLED_PATHS)
+        self.assertEqual(os.readlink(sandbox.binary), str(sandbox.runtime))
         self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
     def test_staged_executable_accepts_exact_signed_version(self):
@@ -1056,7 +1082,9 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual((sandbox.root / "candidate/release-head.json").read_bytes(), head)
             self.assertEqual((sandbox.root / "candidate/release.json").read_bytes(), release)
             self.assertEqual(set(sandbox.home_state()), {
-                ".local", ".local/bin", ".local/bin/elastos", "xdg-data", "xdg-data/elastos"})
+                ".local", ".local/bin", ".local/bin/elastos", "xdg-data", "xdg-data/elastos",
+                "xdg-data/elastos/bin", "xdg-data/elastos/bin/elastos"})
+            self.assertEqual((sandbox.data / "bin").stat().st_mode & 0o777, 0o700)
             self.assertEqual(sandbox.data.stat().st_mode & 0o777, 0o700)
             self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
@@ -1143,7 +1171,8 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(calls[0], "--version")
             self.assertTrue(calls[1].startswith("install-release ") and calls[1].endswith(" --check"), calls)
             self.assertEqual(len(calls), 2)
-            self.assertEqual(sandbox.home_state(), before)
+            # Only the Runtime's empty private directory exists before admission.
+            self.assertEqual(changed_paths(before, sandbox.home_state()), {"xdg-data/elastos/bin"})
             self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
 
     def test_staged_executable_refusal_preserves_installation_then_valid_retry_installs(self):
@@ -1251,11 +1280,16 @@ class UninstallTests(unittest.TestCase):
             "Users/alice/BrowserProfiles/default/profile.ext4": b"browser profile\n",
             "managed-runtimes/home/state.json": b"managed Home state\n"}
 
-    def installed(self, sandbox):
+    def installed(self, sandbox, legacy=False):
         # The files an install plus setup leave; one test also installs for real.
-        sandbox.binary.parent.mkdir(parents=True)
-        sandbox.binary.write_bytes(RUNTIME_STUB)
-        sandbox.binary.chmod(0o755)
+        # A legacy (pre-0.8) install keeps the Runtime itself at the command path.
+        runtime = sandbox.binary if legacy else sandbox.runtime
+        for path in {runtime.parent, sandbox.binary.parent}:
+            path.mkdir(parents=True, exist_ok=True)
+        runtime.write_bytes(RUNTIME_STUB)
+        runtime.chmod(0o755)
+        if not legacy:
+            sandbox.binary.symlink_to(sandbox.runtime)
         for name, data in {**self.RELEASE, **self.DATA}.items():
             (sandbox.data / name).parent.mkdir(parents=True, exist_ok=True)
             (sandbox.data / name).write_bytes(data)
@@ -1274,15 +1308,17 @@ class UninstallTests(unittest.TestCase):
             self.assertEqual((requests, sandbox.runtime_calls()), ([], calls))
             self.assertIn("Stopping this installation's verified Runtime processes", result.stdout)
             self.assertNotIn("Recovery Kit", result.stdout + result.stderr)
-            # Binary, components, sources and the writer lock are gone; data is byte-identical.
+            # Command link, Runtime, components, sources and the writer lock are
+            # gone; data is byte-identical.
             self.assertEqual(self.files(sandbox), kept)
+            self.assertFalse(os.path.lexists(sandbox.binary))
 
             sandbox.respond("binary", RUNTIME_STUB)
             result, _ = sandbox.run("--install-only")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(sandbox.binary.read_bytes(), RUNTIME_STUB)
             self.assertEqual({key: data for key, data in self.files(sandbox).items()
-                              if key.startswith("xdg-data/")}, kept)
+                              if key.startswith("xdg-data/") and not key.startswith("xdg-data/elastos/bin/")}, kept)
 
             result, requests = sandbox.run("--uninstall", "--remove-data")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1296,15 +1332,15 @@ class UninstallTests(unittest.TestCase):
         did, head, release = installable_fixture()
         with InstallerSandbox(head, release, did) as sandbox:
             self.installed(sandbox)
-            lock = sandbox.binary.parent / ".elastos.install.lock"
-            with open(lock, "w") as held:
-                fcntl.flock(held, fcntl.LOCK_EX)
-                before = sandbox.home_state()
-                result, _ = sandbox.run("--uninstall", "--remove-data")
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("an install or update is running", result.stderr)
-                self.assertEqual(sandbox.home_state(), before)
-            journal = sandbox.binary.parent / ".elastos.update-journal.json"
+            for writer in (sandbox.runtime.parent, sandbox.binary.parent):
+                with self.subTest(writer=writer.name), open(writer / ".elastos.install.lock", "w") as held:
+                    fcntl.flock(held, fcntl.LOCK_EX)
+                    before = sandbox.home_state()
+                    result, _ = sandbox.run("--uninstall", "--remove-data")
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("an install or update is running", result.stderr)
+                    self.assertEqual(sandbox.home_state(), before)
+            journal = sandbox.runtime.parent / ".elastos.update-journal.json"
             journal.write_text("{}")
             before = sandbox.home_state()
             for options, reason in [(["--uninstall", "--remove-data"], "run install.sh again to restore it"),
@@ -1314,6 +1350,57 @@ class UninstallTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(reason, result.stderr)
                     self.assertEqual((requests, sandbox.home_state()), ([], before))
+
+    def test_uninstall_removes_a_legacy_runtime_at_the_command_path(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            self.installed(sandbox, legacy=True)
+            result, _ = sandbox.run("--uninstall")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(os.path.lexists(sandbox.binary))
+            self.assertFalse((sandbox.binary.parent / ".elastos.install.lock").exists())
+            self.assertEqual(self.files(sandbox),
+                             {"xdg-data/elastos/" + name: data for name, data in self.DATA.items()})
+
+    def test_uninstall_removes_only_this_data_folders_service(self):
+        did, head, release = installable_fixture()
+        for owner in ("this", "another"):
+            with self.subTest(owner=owner), InstallerSandbox(head, release, did) as sandbox:
+                self.installed(sandbox)
+                runtime = sandbox.runtime if owner == "this" else sandbox.home / "other-data/elastos/bin/elastos"
+                unit = sandbox.home / ".config/systemd/user/elastos-home.service"
+                unit.parent.mkdir(parents=True)
+                unit.write_text(f'[Service]\nExecStart="{runtime}" home --browser\n')
+                result, _ = sandbox.run("--uninstall")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                calls = (sandbox.root / "service-calls").read_text() if (sandbox.root / "service-calls").exists() else ""
+                if owner == "this":
+                    self.assertFalse(unit.exists())
+                    self.assertIn("systemctl --user stop elastos-home.service", calls)
+                    self.assertIn("systemctl --user disable --now elastos-home.service", calls)
+                else:
+                    # Another data folder of this account keeps its running Home.
+                    self.assertTrue(unit.exists())
+                    self.assertNotIn(" stop ", calls)
+                    self.assertNotIn("disable", calls)
+                    self.assertIn("belongs to another ElastOS data folder", result.stdout)
+
+    def test_install_and_uninstall_refuse_while_another_installation_changes_the_service(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            self.installed(sandbox)
+            unit = sandbox.home / ".config/systemd/user/elastos-home.service"
+            unit.parent.mkdir(parents=True)
+            unit.write_text(f'[Service]\nExecStart="{sandbox.runtime}" home --browser\n')
+            with open(unit.parent / ".elastos-home-service.lock", "w") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                before = sandbox.home_state()
+                result, _ = sandbox.run("--uninstall")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("changing Home's background service", result.stderr)
+                self.assertEqual(sandbox.home_state(), before)
+                calls = (sandbox.root / "service-calls").read_text()
+                self.assertNotIn(" stop ", calls)
 
     def test_linked_data_root_or_release_entry_refuses_before_stopping_anything(self):
         did, head, release = installable_fixture()
@@ -1451,7 +1538,8 @@ finish_install
                 calls.unlink(missing_ok=True); ready.unlink(missing_ok=True)
                 result = shell(script, root, browser_result)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(calls.read_text().splitlines(), ['SETUP:setup', 'HOST_READY', 'SETUP:setup', 'HOME_READY'])
+                self.assertEqual(calls.read_text().splitlines(),
+                                 ['SETUP:setup', 'HOST_READY', 'SETUP:setup', 'HOME_READY', 'SETUP:service install --open'])
 
     def test_rerun_with_retained_linux_helper_never_asks_for_sudo_after_setup_retires_it(self):
         # An earlier release left the helper and its check now fails. Setup runs
@@ -1591,8 +1679,14 @@ class NativeProcessTests(unittest.TestCase):
         self.scratch = tempfile.TemporaryDirectory(prefix="elastos installer process ")
         self.root = Path(self.scratch.name)
         self.home = self.root / "home"
-        self.binary = self.home / ".local/bin/elastos"
+        self.data = self.home / ("Library/Application Support/elastos" if platform.system() == "Darwin" else "xdg-data/elastos")
+        # The installed Runtime lives in the data directory.
+        self.binary = self.data / "bin/elastos"
         self.binary.parent.mkdir(parents=True)
+        # The elastos command an install leaves, a link to the Runtime.
+        self.command = self.home / ".local/bin/elastos"
+        self.command.parent.mkdir(parents=True)
+        self.command.symlink_to(self.binary)
         # A private link to native cat blocks opening a FIFO named 'serve'.
         # Keep the system-signed binary intact on macOS, and exercise real
         # command/UID/start checks without starting Runtime.
@@ -1605,8 +1699,6 @@ class NativeProcessTests(unittest.TestCase):
         self.fixture_descendants = []
         time.sleep(0.1)
         self.assertIsNone(self.child.poll(), "Native FIFO fixture must remain alive before cleanup")
-        self.data = self.home / ("Library/Application Support/elastos" if platform.system() == "Darwin" else "xdg-data/elastos")
-        self.data.mkdir(parents=True)
         self.coords = self.data / "runtime-coords.json"
         self.write_coords(self.coords, self.child.pid)
 
@@ -1659,12 +1751,35 @@ class NativeProcessTests(unittest.TestCase):
         start = SOURCE.index('info "Stopping verified Runtime processes')
         block = SOURCE[start:SOURCE.index('info "Installing binary', start)]
         result = shell('HOME="$1"\nXDG_DATA_HOME="$1/xdg-data"\nINSTALL_DIR="$1/.local/bin"\n'
-                       'DATA_DIR="$(installer_data_dir "$HOME" "$XDG_DATA_HOME")"\n' + block, self.home)
+                       'DATA_DIR="$(installer_data_dir "$HOME" "$XDG_DATA_HOME")"\n'
+                       'RUNTIME_BIN="$DATA_DIR/bin/elastos"\n' + block, self.home)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.child.wait(timeout=5)
         self.assertIsNone(PROCESSES["process_snapshot"](self.child.pid))
         self.assertFalse(self.coords.exists())
         self.assertTrue(self.binary.is_file())
+
+    def test_legacy_runtime_at_the_command_path_is_stopped_before_it_moves(self):
+        # A pre-0.8 installation records and runs its Runtime at ~/.local/bin/elastos.
+        self.child.terminate()
+        self.child.wait(timeout=5)
+        legacy = self.command
+        legacy.unlink()
+        legacy.symlink_to("/bin/cat")
+        self.child = subprocess.Popen([str(legacy), "serve"], cwd=self.root, stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.1)
+        self.write_coords(self.coords, self.child.pid)
+        (self.data / "sources.json").write_text(json.dumps({"sources": [{"install_path": str(legacy)}]}))
+        start = SOURCE.index('info "Stopping verified Runtime processes')
+        block = SOURCE[start:SOURCE.index('info "Installing binary', start)]
+        result = shell('HOME="$1"\nXDG_DATA_HOME="$1/xdg-data"\nINSTALL_DIR="$1/.local/bin"\n'
+                       'DATA_DIR="$(installer_data_dir "$HOME" "$XDG_DATA_HOME")"\n'
+                       'RUNTIME_BIN="$DATA_DIR/bin/elastos"\n' + block, self.home)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.child.wait(timeout=5)
+        self.assertIsNone(PROCESSES["process_snapshot"](self.child.pid))
+        self.assertFalse(self.coords.exists())
 
     def test_open_home_stops_through_its_update_controller(self):
         # Installed Home: the update controller (its own Runtime copy in the data
@@ -1699,7 +1814,8 @@ class NativeProcessTests(unittest.TestCase):
         start = SOURCE.index('info "Stopping verified Runtime processes')
         block = SOURCE[start:SOURCE.index('info "Installing binary', start)]
         result = shell('HOME="$1"\nXDG_DATA_HOME="$1/xdg-data"\nINSTALL_DIR="$1/.local/bin"\n'
-                       'DATA_DIR="$(installer_data_dir "$HOME" "$XDG_DATA_HOME")"\n' + block, self.home)
+                       'DATA_DIR="$(installer_data_dir "$HOME" "$XDG_DATA_HOME")"\n'
+                       'RUNTIME_BIN="$DATA_DIR/bin/elastos"\n' + block, self.home)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(controller.wait(timeout=5), 0)
         self.assertIsNone(PROCESSES["process_snapshot"](host))
@@ -1718,9 +1834,21 @@ class NativeProcessTests(unittest.TestCase):
         self.child.wait(timeout=5)
         self.assertIsNone(PROCESSES["process_snapshot"](self.child.pid))
         self.assertFalse(self.coords.exists())
-        self.assertFalse(self.binary.is_symlink())
+        self.assertFalse(self.binary.exists())
         self.assertFalse((self.data / "components.json").exists())
         self.assertEqual((self.data / "identity/device.key").read_bytes(), b"device identity\n")
+
+    def test_uninstall_refused_by_a_running_writer_leaves_home_running(self):
+        # An update holds the writer lock: the uninstall stops nothing.
+        with open(self.binary.parent / ".elastos.install.lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            result = self.uninstall("false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("an install or update is running", result.stderr)
+        self.assertNotIn("Stopping this installation's verified Runtime processes", result.stdout)
+        self.assertIsNone(self.child.poll())
+        self.assertTrue(self.coords.exists())
+        self.assertTrue((self.data / "components.json").exists())
 
     def test_uninstall_with_a_foreign_record_stops_and_removes_nothing(self):
         foreign = subprocess.Popen(["/bin/sleep", "20"])
@@ -1733,7 +1861,7 @@ class NativeProcessTests(unittest.TestCase):
         self.assertIsNone(foreign.poll())
         self.assertTrue(self.binary.is_symlink())
         self.assertEqual(sorted(path.name for path in self.data.iterdir()),
-                         ["components.json", "home-runtime-coords.json", "identity", "runtime-coords.json"])
+                         ["bin", "components.json", "home-runtime-coords.json", "identity", "runtime-coords.json"])
 
     def test_shared_wrapper_cleanup_finishes_before_home_removal(self):
         descendant, _ = self.start_descendant_fixture(stops_child=True)

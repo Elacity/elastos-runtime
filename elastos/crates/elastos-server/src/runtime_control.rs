@@ -741,41 +741,38 @@ pub async fn read_runtime_coords(path: &Path) -> Option<RuntimeCoords> {
 }
 
 async fn validate_runtime_coords(path: &Path, coords: RuntimeCoords) -> Option<RuntimeCoords> {
-    let api_base = match LoopbackHttpBaseUrl::parse(&coords.api_url) {
-        Ok(api_base) => api_base,
-        Err(_) => {
-            let _ = std::fs::remove_file(path);
-            return None;
-        }
-    };
-
-    if !pid_is_alive(coords.pid) {
+    if runtime_answers(&coords).await {
+        Some(coords)
+    } else {
         let _ = std::fs::remove_file(path);
-        return None;
+        None
     }
+}
 
-    let client = reqwest::Client::builder()
+/// The recorded process is alive, answers on its loopback API and accepts its secret.
+async fn runtime_answers(coords: &RuntimeCoords) -> bool {
+    let Ok(api_base) = LoopbackHttpBaseUrl::parse(&coords.api_url) else {
+        return false;
+    };
+    if !pid_is_alive(coords.pid) {
+        return false;
+    }
+    let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
-        .ok()?;
-
+    else {
+        return false;
+    };
+    let Ok(health) = api_base.join("/api/health") else {
+        return false;
+    };
     let healthy = client
-        .get(api_base.join("/api/health").ok()?)
+        .get(health)
         .send()
         .await
         .ok()
         .is_some_and(|r| r.status().is_success());
-    if !healthy {
-        let _ = std::fs::remove_file(path);
-        return None;
-    }
-
-    if !attach_secret_matches(&client, &api_base, &coords.attach_secret).await {
-        let _ = std::fs::remove_file(path);
-        return None;
-    }
-
-    Some(coords)
+    healthy && attach_secret_matches(&client, &api_base, &coords.attach_secret).await
 }
 
 async fn attach_secret_matches(
@@ -871,6 +868,13 @@ pub async fn read_attachable_runtime_coords(
         }
     };
     runtime_kind.matches(&coords).then_some(coords)
+}
+
+/// The gateway that answers now, read without deleting its coordinates: a
+/// gateway that is still starting keeps them for its other clients.
+pub(crate) async fn read_live_gateway_coords(data_dir: &Path) -> Option<RuntimeCoords> {
+    let coords = read_private_runtime_coords(&gateway_runtime_coord_path(data_dir))?;
+    (coords.is_gateway_runtime() && runtime_answers(&coords).await).then_some(coords)
 }
 
 /// Tokens returned by the attach endpoint.
@@ -1183,6 +1187,17 @@ async fn ensure_managed_runtime(
 
     let subordinate_gateway_host = match crate::host_lock::active_host_process(data_dir)? {
         Some(owner) if gateway_owner_allows_subordinate_managed_runtime(&owner) => true,
+        Some(owner)
+            if runtime_kind == RUNTIME_KIND_MANAGED_HOME
+                && matches!(owner.role.as_str(), "gateway" | "gateway-public") =>
+        {
+            // A terminal outside the gateway (Home under its service) uses the
+            // running gateway instead of starting a second Runtime.
+            match read_live_gateway_coords(data_dir).await {
+                Some(coords) if coords.pid == owner.pid => return Ok(coords),
+                _ => anyhow::bail!(managed_runtime_lane_conflict_message(surface_name, &owner)),
+            }
+        }
         Some(owner) => anyhow::bail!(managed_runtime_lane_conflict_message(surface_name, &owner)),
         None => false,
     };
