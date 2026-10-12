@@ -9,6 +9,7 @@ import io
 import json
 import os
 import platform
+import re
 import shutil
 from pathlib import Path
 import struct
@@ -1871,6 +1872,15 @@ class ReleaseSignerInputTest(unittest.TestCase):
             cwd=script.parent.parent, capture_output=True, text=True, timeout=90,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_newest_release_notes_fit_the_signed_release_bounds(self):
+        # Release preparation reads these notes only at the end of a multi-hour run, and
+        # Homes refuse a signed release with more than 32 changes: check them in the gate.
+        text = (inputs.SOURCE_ROOT / "elastos/CHANGELOG.md").read_text(encoding="utf-8")
+        versions = [match for match in re.findall(r"(?m)^## \[([^\]]+)\]", text) if match != "Unreleased"]
+        self.assertTrue(versions, "CHANGELOG has a released version section")
+        changes = inputs.changelog_changes(versions[0])
+        inputs.signer.check_release_changes(changes)
 
 
 class InstallerAdmissionTest(unittest.TestCase):
