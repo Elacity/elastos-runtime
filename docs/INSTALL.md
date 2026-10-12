@@ -2,26 +2,9 @@
 
 ## Current isolation and target boundary
 
-First-party apps run as web projections in the browser's opaque sandboxed
-frames. Runtime checks each app's signed launch token and actor before it performs an effect.
-Home can currently obtain every app's capability, so a compromised Home can
-reach those apps' authority. The target limits Home to delegation and gives each
-app a separate, revocable capability. The WASM Component authoring path runs in
-Wasmtime with memory and fuel limits and Runtime Bus hostcalls.
-
-Providers run as native operating-system processes with the Runtime user's
-rights. Only the model provider is partly confined. The trusted shell helper
-also runs as a native host process. The web Terminal is disabled by default;
-host developer mode and closed guest registration are required to enable it.
-An enabled Terminal runs commands with the host user's rights.
-
-The [data, keys and backups](#data-keys-and-backups) section explains current
-host access and the protection target for hosted and locked self-hosted Homes.
-
-The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
-records the remaining gates. Source checks describe this source tree. Accepted
-installed proof binds the exact Runtime, components and app assets to the
-journeys tested on that device.
+[SECURITY.md](../SECURITY.md#current-isolation-and-target-boundary) states what
+is isolated today and the target boundary. [Data, keys and
+backups](#data-keys-and-backups) explains host access to an installed Home.
 
 ## Install from the publisher
 
