@@ -49,21 +49,24 @@ in_ns wan ip link set br0 up
 index=0
 for side in a b; do
     index=$((index + 1))
-    ip link add up netns "$RUN-nat-$side" type veth peer name "port-$side" netns "$RUN-wan"
+    ip link add name wan0 netns "$RUN-nat-$side" type veth peer name "port-$side" netns "$RUN-wan"
     in_ns wan ip link set "port-$side" master br0 up
-    in_ns "nat-$side" ip addr add "203.0.113.1$index/24" dev up
-    in_ns "nat-$side" ip link set up up
-    ip link add lan netns "$RUN-nat-$side" type veth peer name eth0 netns "$RUN-home-$side"
+    in_ns "nat-$side" ip addr add "203.0.113.1$index/24" dev wan0
+    in_ns "nat-$side" ip link set wan0 up
+    ip link add name lan netns "$RUN-nat-$side" type veth peer name eth0 netns "$RUN-home-$side"
     in_ns "nat-$side" ip addr add "10.0.$index.1/24" dev lan
     in_ns "nat-$side" ip link set lan up
     in_ns "home-$side" ip addr add "10.0.$index.2/24" dev eth0
     in_ns "home-$side" ip link set eth0 up
     in_ns "home-$side" ip route add default via "10.0.$index.1"
     in_ns "nat-$side" sysctl -qw net.ipv4.ip_forward=1
-    in_ns "nat-$side" iptables -t nat -A POSTROUTING -o up -j MASQUERADE
+    in_ns "nat-$side" iptables -t nat -A POSTROUTING -o wan0 -j MASQUERADE
     in_ns "nat-$side" iptables -P FORWARD DROP
-    in_ns "nat-$side" iptables -A FORWARD -i lan -o up -j ACCEPT
-    in_ns "nat-$side" iptables -A FORWARD -i up -o lan -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    in_ns "nat-$side" iptables -P INPUT DROP
+    in_ns "nat-$side" iptables -A INPUT -i lan -j ACCEPT
+    in_ns "nat-$side" iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    in_ns "nat-$side" iptables -A FORWARD -i lan -o wan0 -j ACCEPT
+    in_ns "nat-$side" iptables -A FORWARD -i wan0 -o lan -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 done
 
 # Each Home reaches the internet but neither Home reaches the other directly.
