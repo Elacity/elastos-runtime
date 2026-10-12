@@ -8,6 +8,17 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Developer detail
 
+- CI's `release-upstream-assets` job runs the release's upstream asset build
+  (`scripts/release-upstream-assets.py`, including the Browser helper source
+  builds) for Linux ARM64 and Apple Silicon on every pull request that changes
+  its scripts, recipes, packaged files or `ci.yml`, and on merge groups and
+  manual runs. It requires the build's stdout to be one JSON document, as
+  release preparation does. Before, these builds ran only in a release (#319).
+- `scripts/release-host-prerequisites.sh` is the one list of release host
+  packages; `release-package.yml` and that job both install it, and
+  `ci-release-policy-test.py` checks they use the same runner, Rust toolchain
+  and targets, and that the job's path filter covers every file the build
+  calls, loads or packages.
 - The source gate refuses a file deletion added to product code unless it
   goes through the owned-removal helper of its language (exact path below an
   owned folder, no link followed, optional device+inode check) or carries a
