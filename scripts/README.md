@@ -489,9 +489,8 @@ GH_TOKEN avoids anonymous API rate limits. A network, outage or rate-limit
 failure refuses with a retry message distinct from a provenance refusal.
 The tool reads candidate files as data and asks the operator to confirm the
 complete public signer DID before signing. It fetches the installer template
-from that approved tree. Its frozen installer keeps `HEAD_CID` empty to avoid
-a hash cycle; the signed head binds the final
-release CID and installer hash. Carrier holder identity and ticket remain
+from that approved tree. The signed head binds the final release CID and
+installer hash. Carrier holder identity and ticket remain
 public transport inputs, separate from the signer identity.
 
 On the publication host, inspect the frozen set before committing it:

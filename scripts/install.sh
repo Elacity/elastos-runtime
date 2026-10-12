@@ -47,11 +47,6 @@ MAINTAINER_DID_PLACEHOLDER="__MAINTAINER""_DID__"
 if [[ "$MAINTAINER_DID" == "$MAINTAINER_DID_PLACEHOLDER" ]]; then
     MAINTAINER_DID=""
 fi
-HEAD_CID="${ELASTOS_HEAD_CID:-__HEAD_CID__}"
-HEAD_CID_PLACEHOLDER="__HEAD""_CID__"
-if [[ "$HEAD_CID" == "$HEAD_CID_PLACEHOLDER" ]]; then
-    HEAD_CID=""
-fi
 SOURCE_CONNECT_TICKET="${ELASTOS_SOURCE_CONNECT_TICKET:-__SOURCE_CONNECT_TICKET__}"
 SOURCE_CONNECT_TICKET_PLACEHOLDER="__SOURCE""_CONNECT_TICKET__"
 if [[ "$SOURCE_CONNECT_TICKET" == "$SOURCE_CONNECT_TICKET_PLACEHOLDER" ]]; then
@@ -1378,7 +1373,6 @@ SOURCES_PATH="${INSTALL_SCRATCH}/sources.json"
 PUBLISHER_DID="${SIGNER_DID}" \
 PUBLISHER_GATEWAY="${PUBLISHER_GATEWAY}" \
 INSTALLED_VERSION="${RELEASE_VERSION}" \
-INSTALLED_HEAD_CID="${HEAD_CID}" \
 INSTALLED_CHANNEL="${RELEASE_CHANNEL}" \
 INSTALLED_BINARY_PATH="${INSTALL_DIR}/elastos" \
 SOURCE_CONNECT_TICKET="${SOURCE_CONNECT_TICKET}" \
@@ -1416,7 +1410,8 @@ sources = {
             "gateways": gateways,
             "install_path": os.environ["INSTALLED_BINARY_PATH"],
             "installed_version": os.environ["INSTALLED_VERSION"],
-            "head_cid": os.environ["INSTALLED_HEAD_CID"],
+            # Installation consumes no release head; `elastos update` records one.
+            "head_cid": "",
         }
     ],
 }

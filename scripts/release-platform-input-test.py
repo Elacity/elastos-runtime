@@ -1201,7 +1201,7 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         stamps_path = self.root / "signing-stamps.json"
         self.write_json(stamps_path, stamps)
         template = ("#!/bin/sh\n" + "\n".join(f'{name}="__{name}__"'
-                    for name in sorted(signer.STAMPS | {"HEAD_CID"})) + "\n").encode()
+                    for name in sorted(signer.STAMPS)) + "\n").encode()
         blob_oid = hashlib.sha1(b"blob " + str(len(template)).encode() + b"\0" + template).hexdigest()
         for context in (
                 patch.object(inputs, "installer_source_blob", return_value=(blob_oid, template)),
@@ -1289,7 +1289,6 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
             "## [0.7.1]\n- System shows signed change notes.\n")
         manifest = self.prepare_signing_fixture(fixture)
         rendered = signer.render_installer(fixture.template, fixture.stamps, fixture.stamps["MAINTAINER_DID"])
-        self.assertIn(b'HEAD_CID=""', rendered)
         self.assertEqual(manifest["source"], {"commit": "a" * 40, "tree": "b" * 40})
         self.assertEqual((manifest["version"], manifest["channel"]), ("0.7.1", "canary"))
         self.assertEqual(manifest["installer"], {"blob_oid": fixture.blob_oid, "stamps": fixture.stamps})
@@ -1463,8 +1462,7 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         self.write_json(fixture.cids_path, fixture.cids)
         for stamps in ({**fixture.stamps, "SOURCE_CONNECT_TICKET": "$(touch marker)"},
                        {**fixture.stamps, "PUBLISHER_GATEWAY": "http://staging.invalid"},
-                       {**fixture.stamps, "MAINTAINER_DID": "did:key:invalid"},
-                       {**fixture.stamps, "HEAD_CID": "circular-head"}):
+                       {**fixture.stamps, "MAINTAINER_DID": "did:key:invalid"}):
             self.write_json(fixture.stamps_path, stamps)
             with self.subTest(stamps=stamps), self.assertRaises(ValueError):
                 self.prepare_signing_fixture(fixture)

@@ -110,8 +110,9 @@ bytes before preservation sentinels are copied. A separate M1 Home starts
 through `home --browser` and its signed retained controller. The observer checks
 its live gateway generation, private attach, served Home bytes and owned shutdown.
 This initial-start proof keeps the offline CLI snapshots and refusal checks intact.
-Frozen installer defaults pin signer_did and leave
-HEAD_CID blank. Atomic runtime ticket/node overrides select the local holder.
+Frozen installer defaults pin signer_did; a previous release's installer may
+also keep the blank HEAD_CID default that installers had before #89. Atomic
+runtime ticket/node overrides select the local holder.
 Run performs both selectors, retains private split output and data, and checks
 all owned process groups and verified holder/consumer executable roots during
 cleanup. Self-tests prove the observer only; installed proof needs real-runtime.
@@ -630,19 +631,22 @@ def cli_environment(home_path):
             "ELASTOS_CARRIER_NETWORK": "direct", "ELASTOS_QUIET_RUNTIME_NOTICES": "1"}
 
 
-def cli_installer_metadata(installer, env):
+def cli_installer_signer(installer, env, previous=False):
     # The stamped defaults live inside the executable guard; sourcing skips it.
-    # Read the two literal defaults without running any installer action.
+    # Read the literal defaults without running any installer action. Installers
+    # before #89 also default HEAD_CID; only a previous release's may, and blank.
     text = installer.read_text()
-    values = []
-    for variable in ("MAINTAINER_DID", "HEAD_CID"):
+
+    def defaults(variable):
         need("ELASTOS_" + variable not in env, "fixture trust override is unavailable")
         matches = re.findall(r'^' + variable + r'="\$\{ELASTOS_' + variable +
                              r':-([^$\\"\r\n}]*)\}"$', text, re.M)
-        need(len(matches) == 1, "frozen installer literal trust default unavailable")
-        value = matches[0]
-        values.append("" if value == "__" + variable + "__" else value)
-    return values
+        return ["" if value == "__" + variable + "__" else value for value in matches]
+
+    signer = defaults("MAINTAINER_DID")
+    need(len(signer) == 1, "frozen installer literal trust default unavailable")
+    need(defaults("HEAD_CID") in (([], [""]) if previous else ([],)), "frozen installer HEAD_CID default differs")
+    return signer[0]
 
 
 def cli_signature(installer, envelope, domain, signer, env):
@@ -842,7 +846,7 @@ def cli_admit(config, local_rehearsal=None):
     installer = cli_path(root, manifest["installer"])
     need(manifest["installer"] in manifest["files"], "frozen installer missing from inventory")
     env = cli_environment(root)
-    need(cli_installer_metadata(installer, env) == [signer, ""], "frozen installer signer or blank HEAD_CID differs")
+    need(cli_installer_signer(installer, env) == signer, "frozen installer signer differs")
     selectors = manifest["selectors"]
     need(set(selectors) == {"m1-install", "m2-discovery"}, "fixed CLI selectors required")
     for selector, positive in (("m1-install", "old"), ("m2-discovery", "new")):
@@ -1446,8 +1450,8 @@ def cli_admit_previous(root, manifest, env):
          and system["components"] == new["components"], "System publication is not this source's following release")
     if manifest["proof_kind"] == "real-runtime":
         cli_native_executable(cli_path(root, system["binary"]), manifest["platform"])
-    need(cli_installer_metadata(cli_path(root, previous["installer"]), env) == [manifest["signer_did"], ""],
-         "previous installer signer or blank HEAD_CID differs")
+    need(cli_installer_signer(cli_path(root, previous["installer"]), env, previous=True) == manifest["signer_did"],
+         "previous installer signer differs")
     # Native support is published unpacked, so its signed hash binds the installed bytes;
     # fetch- or install-previous-release checked the archives (Kubo, capsules) by their signed hashes.
     published = cli_json(cli_path(root, previous["published_components"]))
@@ -1758,7 +1762,8 @@ def cli_previous_layout(output, release, component_platform, artifact, executabl
     need(subprocess.check_output(["git", "rev-parse", source["commit"] + "^{tree}"], cwd=repository, text=True).strip() == source["tree"],
          "previous release source tree differs")
     installer = subprocess.check_output(["git", "show", source["commit"] + ":scripts/install.sh"], cwd=repository)
-    need(installer.count(b"__MAINTAINER_DID__") == 1 and installer.count(b"__HEAD_CID__") == 1,
+    # Installers before #89 also carry the __HEAD_CID__ placeholder.
+    need(installer.count(b"__MAINTAINER_DID__") == 1 and installer.count(b"__HEAD_CID__") <= 1,
          "previous installer stamp placeholders differ")
     (output / "install.sh").write_bytes(installer)
     published = cli_json(output / "components.json")
@@ -2115,8 +2120,10 @@ def cli_generate_hop(root, runtime, next_runtime, system_runtime, build_receipt,
         return {"components": components, "setup": setup, "support": mapping,
                 "qualified_capsules": add(prefix + "qualified-capsules.json", capsules)}
 
-    def stamp(installer):
-        need(installer.count('__MAINTAINER_DID__') == 1 and installer.count('__HEAD_CID__') == 1, "installer stamp placeholders differ")
+    def stamp(installer, previous=False):
+        # Only a previous release's installer may keep the __HEAD_CID__ placeholder (before #89).
+        need(installer.count('__MAINTAINER_DID__') == 1 and installer.count('__HEAD_CID__') <= (1 if previous else 0),
+             "installer stamp placeholders differ")
         return installer.replace('__MAINTAINER_DID__', manifest["signer_did"]).replace('__HEAD_CID__', '').encode()
 
     try:
@@ -2159,7 +2166,7 @@ def cli_generate_hop(root, runtime, next_runtime, system_runtime, build_receipt,
         # the installer of its signed source, stamped with this fixture's disposable signer.
         manifest["previous"] = {"release": add("previous/release.json", previous / "release.json"),
                                 "published_components": add("previous/published-components.json", previous / "components.json"),
-                                "installer": add("previous/install.sh", stamp((previous / "install.sh").read_text())),
+                                "installer": add("previous/install.sh", stamp((previous / "install.sh").read_text(), previous=True)),
                                 "components": old["components"], "setup": old["setup"], "support": old["support"],
                                 "qualified_capsules": old["qualified_capsules"]}
         content(runtime_relative)

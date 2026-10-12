@@ -24,8 +24,7 @@ need a new build.
 
 Approved manifest: source {commit, tree}, version, channel, files mapping relative
 paths to {sha256, size, cid}; installer {blob_oid, stamps}; release payload;
-head {updated_at, prev_head_cid}. Stamps are public bootstrap inputs and exclude
-HEAD_CID, which is empty to avoid the installer/release/head hash cycle.
+head {updated_at, prev_head_cid}. Stamps are public bootstrap inputs.
 The renderer obtains scripts/install.sh from the approved tree as inert bytes.
 The release payload includes installer_sha256; artifact {cid, sha256} refs match
 the snapshot records, including component checksum/release_path references.
@@ -726,7 +725,7 @@ def render_installer(template, stamps, did):
     require(re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?", stamps["PUBLISHER_GATEWAY"] or ""), "frozen HTTPS gateway required")
     require(bool(stamps["SOURCE_CONNECT_TICKET"]) and bool(stamps["PUBLISHER_NODE_ID"]), "publisher delivery bootstrap required")
     text = template.decode("utf-8")
-    for name, value in {**stamps, "HEAD_CID": ""}.items():
+    for name, value in stamps.items():
         require(type(value) is str and len(value) <= 16384
                 and "__" not in value and re.fullmatch(r"[A-Za-z0-9:/?&=._+%-]*", value), "unsafe public installer stamp")
         require("__" + name + "__" in text, "installer stamp missing from template")

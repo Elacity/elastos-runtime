@@ -73,7 +73,7 @@ class SignerTests(unittest.TestCase):
         self.source_components = S.json_bytes({"external": {"localhost-provider": {}}, "profiles": {}})
         self.source_components_oid = hashlib.sha1(b"blob " + str(len(self.source_components)).encode() + b"\0" + self.source_components).hexdigest()
         self.platform_components, self.unattested = {}, set()
-        self.template = ("#!/bin/sh\n" + "\n".join(f'{name}="__{name}__"' for name in sorted(S.STAMPS | {"HEAD_CID"})) + f"\ncat /custodian/unopened-signing.pem > {self.marker}\n").encode()
+        self.template = ("#!/bin/sh\n" + "\n".join(f'{name}="__{name}__"' for name in sorted(S.STAMPS)) + f"\ncat /custodian/unopened-signing.pem > {self.marker}\n").encode()
         self.blob_oid = hashlib.sha1(b"blob " + str(len(self.template)).encode() + b"\0" + self.template).hexdigest()
         node = "4" * 64
         ticket = base64.b32encode(S.json_bytes({"endpoints": [{"id": node, "addrs": []}]})).decode().lower().rstrip("=")
@@ -237,7 +237,6 @@ class SignerTests(unittest.TestCase):
         self.assertEqual(release["payload"]["installer_sha256"], S.sha256(publication["install.sh"].read_bytes()))
         self.assertEqual(head["payload"]["release_sha256"], S.sha256(publication["release.json"]))
         self.assertEqual(head["payload"]["latest_release_cid"], S.unixfs_metadata_cid(publication["release.json"]))
-        self.assertIn(b'HEAD_CID=""', publication["install.sh"].read_bytes())
         self.assertFalse(self.marker.exists())
         self.assertEqual(len([call for call in backend.calls if isinstance(call, tuple) and call[0] == "sign"]), 2)
 
@@ -800,7 +799,7 @@ class SignerTests(unittest.TestCase):
         self.api[blob_path]["content"] = base64.b64encode(self.template + b"x").decode()
         with self.assertRaisesRegex(ValueError, "blob hash"):
             self.prepare()
-        for stamp in ('$(touch /tmp/marker)', '`touch /tmp/marker`', '"; exit', "__HEAD_CID__", "x\ny"):
+        for stamp in ('$(touch /tmp/marker)', '`touch /tmp/marker`', '"; exit', "__MAINTAINER_DID__", "x\ny"):
             with self.subTest(stamp=stamp), self.assertRaises(ValueError):
                 S.render_installer(self.template, {**self.stamps, "SOURCE_CONNECT_TICKET": stamp}, DID)
         # Approvals for 0.8.0-alpha.15 and earlier also carried IPNS_NAME (#89).
