@@ -20,6 +20,7 @@ product_ui() {
   node scripts/home-shell-regression-smoke.mjs
   node scripts/home-agent-shell-smoke.mjs
   node scripts/people-discovery-smoke.mjs
+  ./scripts/vendor-ui-tokens.sh --check
 }
 
 release() {
