@@ -1129,7 +1129,7 @@ publish_prepared_platform_inputs() {
 }
 
 prepare_release_signing_input() {
-    local root="$1" output="$2" publisher="$3" bootstrap ticket node gateway ipns
+    local root="$1" output="$2" publisher="$3" bootstrap ticket node gateway
     local args=() prev
     ticket="${ELASTOS_SOURCE_CONNECT_TICKET:-}"
     node="${ELASTOS_PUBLISHER_NODE_ID:-}"
@@ -1142,10 +1142,9 @@ prepare_release_signing_input() {
     fi
     [[ -n "$ticket" && -n "$node" ]] || die "unsigned preparation requires a Publisher Carrier ticket/node pair"
     gateway="${ELASTOS_PUBLISHER_GATEWAY:-$(canonical_publisher_gateway)}"
-    ipns="${ELASTOS_IPNS_NAME:-}"
     jq -nc --arg did "$publisher" --arg ticket "$ticket" --arg node "$node" \
-        --arg gateway "${gateway%/}" --arg ipns "$ipns" \
-        '{MAINTAINER_DID:$did,SOURCE_CONNECT_TICKET:$ticket,PUBLISHER_NODE_ID:$node,PUBLISHER_GATEWAY:$gateway,IPNS_NAME:$ipns}' \
+        --arg gateway "${gateway%/}" \
+        '{MAINTAINER_DID:$did,SOURCE_CONNECT_TICKET:$ticket,PUBLISHER_NODE_ID:$node,PUBLISHER_GATEWAY:$gateway}' \
         > "${TMPDIR}/signing-stamps.json" || return
     jq --argjson platforms "$PLATFORMS_JSON" '
         reduce ($platforms | to_entries[]) as $p (. ;

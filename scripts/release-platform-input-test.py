@@ -1197,8 +1197,7 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
         node = "4" * 64
         ticket = base64.b32encode(signer.json_bytes({"endpoints": [{"id": node, "addrs": []}]})).decode().lower().rstrip("=")
         stamps = {"MAINTAINER_DID": did, "SOURCE_CONNECT_TICKET": ticket,
-                  "PUBLISHER_NODE_ID": node, "PUBLISHER_GATEWAY": "https://staging.invalid",
-                  "IPNS_NAME": ""}
+                  "PUBLISHER_NODE_ID": node, "PUBLISHER_GATEWAY": "https://staging.invalid"}
         stamps_path = self.root / "signing-stamps.json"
         self.write_json(stamps_path, stamps)
         template = ("#!/bin/sh\n" + "\n".join(f'{name}="__{name}__"'
@@ -1539,8 +1538,7 @@ prepare_release_signing_input "$6/native-inputs" "$7" "$8"
                                  str(self.root), str(fixture.output), did], capture_output=True, text=True,
                                 env={**os.environ, "ELASTOS_SOURCE_CONNECT_TICKET": ticket,
                                      "ELASTOS_PUBLISHER_NODE_ID": node,
-                                     "ELASTOS_PUBLISHER_GATEWAY": "https://staging.invalid/",
-                                     "ELASTOS_IPNS_NAME": "public-ipns"})
+                                     "ELASTOS_PUBLISHER_GATEWAY": "https://staging.invalid/"})
         return did, result
 
     def test_shell_unsigned_helper_passes_complete_public_inputs_without_signing(self):
@@ -1552,8 +1550,7 @@ prepare_release_signing_input "$6/native-inputs" "$7" "$8"
                          {**fixture.cids, "components-aarch64-darwin.json": fixture.components_cid})
         self.assertEqual(json.loads((fixture.scratch / "signing-stamps.json").read_bytes()),
                          {"MAINTAINER_DID": did, "SOURCE_CONNECT_TICKET": "public-ticket",
-                          "PUBLISHER_NODE_ID": "public-node", "PUBLISHER_GATEWAY": "https://staging.invalid",
-                          "IPNS_NAME": "public-ipns"})
+                          "PUBLISHER_NODE_ID": "public-node", "PUBLISHER_GATEWAY": "https://staging.invalid"})
         arguments = fixture.capture.read_text().splitlines()
         self.assertEqual(arguments, ["scripts/release-platform-input.py", "signing-input", str(self.root / "native-inputs"),
                          "--cids", str(fixture.scratch / "signing-cids.json"),

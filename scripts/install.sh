@@ -75,11 +75,6 @@ PUBLISHER_NODE_ID_EXPLICIT=false
 if [[ -n "${ELASTOS_PUBLISHER_NODE_ID:-}" && -n "$PUBLISHER_NODE_ID" ]]; then
     PUBLISHER_NODE_ID_EXPLICIT=true
 fi
-IPNS_NAME="${ELASTOS_IPNS_NAME:-__IPNS_NAME__}"
-IPNS_NAME_PLACEHOLDER="__IPNS""_NAME__"
-if [[ "$IPNS_NAME" == "$IPNS_NAME_PLACEHOLDER" ]]; then
-    IPNS_NAME=""
-fi
 
 ALLOWED_CHANNELS=("stable" "canary")
 BINARY_DOWNLOAD_RETRY_COUNT="${ELASTOS_BINARY_DOWNLOAD_RETRY_COUNT:-10}"
@@ -1388,7 +1383,6 @@ INSTALLED_CHANNEL="${RELEASE_CHANNEL}" \
 INSTALLED_BINARY_PATH="${INSTALL_DIR}/elastos" \
 SOURCE_CONNECT_TICKET="${SOURCE_CONNECT_TICKET}" \
 PUBLISHER_NODE_ID="${PUBLISHER_NODE_ID}" \
-IPNS_NAME="${IPNS_NAME}" \
 SOURCES_PATH="${SOURCES_PATH}" \
 python3 - <<'PY'
 import json
@@ -1407,7 +1401,6 @@ publisher_hash = hashlib.sha256(publisher_did.encode("utf-8")).hexdigest()[:32]
 discovery_uri = f"elastos://source/{channel}/{publisher_hash}"
 connect_ticket = os.environ.get("SOURCE_CONNECT_TICKET", "")
 publisher_node_id = os.environ.get("PUBLISHER_NODE_ID", "")
-ipns_name = os.environ.get("IPNS_NAME", "")
 
 sources = {
     "schema": "elastos.trusted-sources/v1",
@@ -1420,7 +1413,6 @@ sources = {
             "discovery_uri": discovery_uri,
             "connect_ticket": connect_ticket,
             "publisher_node_id": publisher_node_id,
-            "ipns_name": ipns_name,
             "gateways": gateways,
             "install_path": os.environ["INSTALLED_BINARY_PATH"],
             "installed_version": os.environ["INSTALLED_VERSION"],

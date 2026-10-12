@@ -194,7 +194,6 @@ prepare() {
         ELASTOS_SOURCE_CONNECT_TICKET="$(jq -er .ticket "$work/bootstrap.json")" \
         ELASTOS_PUBLISHER_NODE_ID="$(jq -er .node_id "$work/bootstrap.json")" \
         ELASTOS_PUBLISHER_GATEWAY="$(jq -er .delivery.PUBLISHER_GATEWAY <<< "$approval_json")" \
-        ELASTOS_IPNS_NAME="$(jq -r .delivery.IPNS_NAME <<< "$approval_json")" \
         scripts/publish-release.sh --version "$version" --channel canary \
         --prepare-only "$work/unsigned" --publisher-did "$did" \
         "${args[@]}")

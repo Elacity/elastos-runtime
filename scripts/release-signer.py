@@ -71,7 +71,7 @@ BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 MAX_JSON = 2 * 1024 * 1024
 MAX_FILE = 512 * 1024 * 1024
 CHANNELS = {"stable", "canary"}
-STAMPS = {"MAINTAINER_DID", "SOURCE_CONNECT_TICKET", "PUBLISHER_GATEWAY", "PUBLISHER_NODE_ID", "IPNS_NAME"}
+STAMPS = {"MAINTAINER_DID", "SOURCE_CONNECT_TICKET", "PUBLISHER_GATEWAY", "PUBLISHER_NODE_ID"}
 PACKAGE_WORKFLOW = ".github/workflows/release-package.yml"
 PACKAGE_REF = "refs/heads/develop"
 APPROVAL_SCHEMA = "elastos.release.approval/v1"
@@ -529,7 +529,6 @@ def validate_delivery(stamps):
     require(type(endpoints) is list and endpoints and len(endpoints) <= 64
             and all(type(endpoint) is dict and endpoint.get("id") == node for endpoint in endpoints),
             "every approved ticket endpoint must match the publisher node")
-    require(type(stamps["IPNS_NAME"]) is str and re.fullmatch(r"[A-Za-z0-9._-]{0,240}", stamps["IPNS_NAME"]), "approved IPNS value required")
 
 
 def checked_package_run(approval, run_id, fetch):
@@ -1203,7 +1202,7 @@ def main():
         delivery = approval["delivery"]
         print(f"Approved source: {approval['source']['commit']} tree {approval['source']['tree']}\n"
               f"Approved builder: {approval['workflow']['commit']} {approval['workflow']['ref']} tree {approval['workflow']['tree']}\n"
-              f"Approved delivery: {delivery['PUBLISHER_GATEWAY']} node {delivery['PUBLISHER_NODE_ID']} IPNS {delivery['IPNS_NAME']}\n"
+              f"Approved delivery: {delivery['PUBLISHER_GATEWAY']} node {delivery['PUBLISHER_NODE_ID']}\n"
               f"Independent approval SHA-256: {digest}", file=sys.stderr)
         require(confirmed(prepared.publisher_did, "approved release", sys.stdin, sys.stderr), "signing cancelled")
         # Recheck canonical source authority after confirmation, before backend use.

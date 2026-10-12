@@ -15,7 +15,6 @@ HOST_HOME="${ELASTOS_HOST_HOME:-$(getent passwd "$(id -un)" | cut -d: -f6)}"
 LOCAL_MANIFEST=""
 HOST_SOURCE_CONNECT_TICKET="${ELASTOS_SOURCE_CONNECT_TICKET:-}"
 HOST_PUBLISHER_NODE_ID="${ELASTOS_PUBLISHER_NODE_ID:-}"
-HOST_IPNS_NAME="${ELASTOS_IPNS_NAME:-}"
 
 host_cargo() {
     HOME="$HOST_HOME" cargo "$@"
@@ -119,12 +118,10 @@ if source is None:
 
 print(source.get("connect_ticket", ""))
 print(source.get("publisher_node_id", ""))
-print(source.get("ipns_name", ""))
 PY
     )
     HOST_SOURCE_CONNECT_TICKET="${HOST_SOURCE_CONNECT_TICKET:-${_source_fields[0]:-}}"
     HOST_PUBLISHER_NODE_ID="${HOST_PUBLISHER_NODE_ID:-${_source_fields[1]:-}}"
-    HOST_IPNS_NAME="${HOST_IPNS_NAME:-${_source_fields[2]:-}}"
 fi
 
 if [[ -z "$HOST_SOURCE_CONNECT_TICKET" || -z "$HOST_PUBLISHER_NODE_ID" ]]; then
@@ -147,7 +144,6 @@ ELASTOS_PUBLISHER_GATEWAY="$PUBLISHER_GATEWAY" \
 ELASTOS_MAINTAINER_DID="$MAINTAINER_DID" \
 ELASTOS_SOURCE_CONNECT_TICKET="$HOST_SOURCE_CONNECT_TICKET" \
 ELASTOS_PUBLISHER_NODE_ID="$HOST_PUBLISHER_NODE_ID" \
-ELASTOS_IPNS_NAME="$HOST_IPNS_NAME" \
 bash "$ROOT/scripts/install.sh"
 
 echo "[home-demo-local] stage host KVM assets when available"

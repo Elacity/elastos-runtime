@@ -78,7 +78,7 @@ class SignerTests(unittest.TestCase):
         node = "4" * 64
         ticket = base64.b32encode(S.json_bytes({"endpoints": [{"id": node, "addrs": []}]})).decode().lower().rstrip("=")
         self.stamps = {"MAINTAINER_DID": DID, "SOURCE_CONNECT_TICKET": ticket,
-                       "PUBLISHER_GATEWAY": "https://publisher.invalid", "PUBLISHER_NODE_ID": node, "IPNS_NAME": "public-ipns"}
+                       "PUBLISHER_GATEWAY": "https://publisher.invalid", "PUBLISHER_NODE_ID": node}
         rendered = S.render_installer(self.template, self.stamps, DID)
         def record(data):
             return {"sha256": S.sha256(data), "size": len(data), "cid": S.raw_cid(data)}
@@ -802,9 +802,10 @@ class SignerTests(unittest.TestCase):
             self.prepare()
         for stamp in ('$(touch /tmp/marker)', '`touch /tmp/marker`', '"; exit', "__HEAD_CID__", "x\ny"):
             with self.subTest(stamp=stamp), self.assertRaises(ValueError):
-                S.render_installer(self.template, {**self.stamps, "IPNS_NAME": stamp}, DID)
-        with self.assertRaises(ValueError):
-            S.render_installer(self.template, {**self.stamps, "HEAD_CID": "circular-head"}, DID)
+                S.render_installer(self.template, {**self.stamps, "SOURCE_CONNECT_TICKET": stamp}, DID)
+        # Approvals for 0.8.0-alpha.15 and earlier also carried IPNS_NAME (#89).
+        with self.assertRaisesRegex(ValueError, "exact public installer stamps"):
+            S.render_installer(self.template, {**self.stamps, "IPNS_NAME": ""}, DID)
 
     def test_unbound_artifact_is_refused(self):
         extra = b"unadvertised"
