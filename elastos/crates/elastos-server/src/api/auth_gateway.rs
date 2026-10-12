@@ -997,8 +997,7 @@ fn session_label_from_user_agent(agent: &str) -> Option<String> {
         Some("Opera")
     } else if agent.contains("Firefox/") || agent.contains("FxiOS/") {
         Some("Firefox")
-    } else if agent.contains("Chrome/") || agent.contains("CriOS/") || agent.contains("Chromium/")
-    {
+    } else if agent.contains("Chrome/") || agent.contains("CriOS/") || agent.contains("Chromium/") {
         Some("Chrome")
     } else if agent.contains("Safari/") {
         Some("Safari")
