@@ -401,17 +401,20 @@ a different address. Carrier may ask your router to forward its UDP port
 (UPnP, NAT-PMP or PCP) so that other Homes can reach it directly; this is
 unchanged in this release.
 
-Kubo, the local IPFS store behind Library and Documents publishing, listens
-only on `127.0.0.1`: its API and its gateway each use a free port chosen at
-start. It has no swarm listener (nothing on port 4001, TCP or UDP), and LAN
-discovery (mDNS), router port mapping (UPnP/NAT-PMP), relays, hole punching and
-Kubo telemetry are off. Publishing does not open it: other Homes receive
-published content over Carrier and shared pages over HTTP, not from other IPFS
-peers. Kubo's API refuses every request without the API secret. ElastOS creates
-a new secret each time Kubo starts and keeps it in `ipfs-coords.json` in the
-data folder (mode 0600). Kubo from an earlier release is restarted with these
-settings the first time it is used. To use Kubo's own command-line tool against
-the running daemon, pass `--api-auth bearer:<secret>`.
+Kubo, the local IPFS store behind sharing and publishing, has its API and
+gateway on `127.0.0.1` only. Kubo is reachable from other computers only while
+you have something published, and then it announces only the published roots:
+it listens on TCP 4001 (or a free port when 4001 is taken), may ask your router
+to forward that port, and joins the public IPFS network so that people you
+share an `elastos://` link with can fetch it. With nothing published it has no
+swarm listener, makes no connections to IPFS peers and announces nothing.
+LAN discovery (mDNS), relays, hole punching, UDP transports and Kubo telemetry
+are always off. Kubo's API refuses every request without the API secret.
+ElastOS creates a new secret each time Kubo starts and keeps it in
+`ipfs-coords.json` in the data folder (mode 0600). Kubo from an earlier release
+is restarted with these settings the first time it is used. To use Kubo's own
+command-line tool against the running daemon, pass
+`--api-auth bearer:<secret>`.
 
 Earlier releases created a local certificate authority (`ca.pem`, `ca.key`,
 `tls.pem`, `tls.key`) in the data folder. Nothing uses it any more: the Runtime

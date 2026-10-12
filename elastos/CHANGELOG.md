@@ -32,11 +32,13 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   loopback. A microVM with a guest network reaches the Runtime on its own link
   address only. Carrier's authenticated UDP port 4433 is the only listener on
   all interfaces; docs/INSTALL.md explains why.
-- Kubo listens only on 127.0.0.1, has no swarm listener and opens no UDP
-  sockets; mDNS, router port mapping, relays and telemetry are off. Its API
-  requires a secret kept in the owner-only `ipfs-coords.json`. Library and
-  Documents publishing work as before; Kubo from an earlier release is
-  restarted with these settings when it is next used.
+- Kubo is reachable from other computers only while you have something
+  published, and then announces only what you published; with nothing
+  published it has no swarm listener and no IPFS peers. mDNS, relays, UDP
+  transports and telemetry are off. Its API requires a secret kept in the
+  owner-only `ipfs-coords.json`. Sharing and publishing work as before; Kubo
+  from an earlier release is restarted with these settings when it is next
+  used.
 - ElastOS no longer creates a local certificate authority, and removes the one
   earlier releases left in the data folder. If you trusted it, you can remove it
   from your trust store.
