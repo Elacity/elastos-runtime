@@ -70,7 +70,6 @@ pub struct ServerConfig {
     /// Optional admitted public data-capsule tree served at `/capsule-data/`.
     /// Runtime data roots stay private and are never mounted here.
     pub data_dir: Option<PathBuf>,
-    pub tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     /// Capsule supervisor for VM-based capsule lifecycle (supervisor path only)
     pub supervisor: Option<Arc<crate::supervisor::Supervisor>>,
     /// Readiness signal — sent after the TCP listener binds successfully.
@@ -139,7 +138,6 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         addr,
         capsule_dir,
         data_dir,
-        tls_config,
         supervisor,
         ready_tx,
         attach_secret,
@@ -148,16 +146,9 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
     let _host_helpers = host_helpers;
     // Runtime keeps this control API on its own configured origin.
     // Browser capsules use the gateway launch boundary.
-    let control_origin = url::Url::parse(&format!(
-        "{}://{addr}",
-        if tls_config.is_some() {
-            "https"
-        } else {
-            "http"
-        }
-    ))?
-    .origin()
-    .ascii_serialization();
+    let control_origin = url::Url::parse(&format!("http://{addr}"))?
+        .origin()
+        .ascii_serialization();
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _| {
             runtime_api_origin_allowed(origin, &control_origin)
@@ -520,32 +511,16 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         app = app.layer(axum_middleware::from_fn(cross_origin_isolation));
     }
 
-    // Start server with or without TLS
-    if let Some(tls_config) = tls_config {
-        let socket_addr: std::net::SocketAddr = addr.parse()?;
-        tracing::info!("API server listening on https://{} (TLS + sessions)", addr);
-        if has_capsule {
-            tracing::info!("Web capsule available at https://{}", addr);
-        }
-        // Signal readiness before blocking on serve (TLS bind is implicit)
-        if let Some(tx) = ready_tx {
-            let _ = tx.send(());
-        }
-        axum_server::bind_rustls(socket_addr, tls_config)
-            .serve(app.into_make_service())
-            .await?;
-    } else {
-        let listener = TcpListener::bind(&addr).await?;
-        tracing::info!("API server listening on http://{} (sessions enabled)", addr);
-        if has_capsule {
-            tracing::info!("Web capsule available at http://{}", addr);
-        }
-        // Signal readiness after successful bind, before blocking on serve
-        if let Some(tx) = ready_tx {
-            let _ = tx.send(());
-        }
-        axum::serve(listener, app).await?;
+    let listener = TcpListener::bind(&addr).await?;
+    tracing::info!("API server listening on http://{} (sessions enabled)", addr);
+    if has_capsule {
+        tracing::info!("Web capsule available at http://{}", addr);
     }
+    // Signal readiness after successful bind, before blocking on serve
+    if let Some(tx) = ready_tx {
+        let _ = tx.send(());
+    }
+    axum::serve(listener, app).await?;
 
     Ok(())
 }

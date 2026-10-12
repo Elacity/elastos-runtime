@@ -15,7 +15,6 @@ elastos-namespace = { path = "../elastos-namespace" }
 elastos-common = { path = "../elastos-common" }
 elastos-storage = { path = "../elastos-storage" }
 elastos-compute = { path = "../elastos-compute" }
-elastos-tls = { path = "../elastos-tls" }
 elastos-identity = { path = "../elastos-identity" }
 elastos-crosvm = { path = "../elastos-crosvm" }
 elastos-wallet-contract = { path = "../elastos-wallet-contract" }
@@ -28,7 +27,7 @@ elastos-model-contract = { path = "../elastos-model-contract" }
 # HTTP server
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
-axum-server = { version = "0.8", features = ["tls-rustls"] }
+axum-server = "0.8"
 
 # TLS (ring crypto provider)
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

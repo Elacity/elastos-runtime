@@ -162,7 +162,14 @@ impl CapabilityManager {
                 SigningKey::generate(&mut rand::thread_rng())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Err(e) = std::fs::create_dir_all(data_dir) {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt as _;
+                    builder.mode(0o700);
+                }
+                if let Err(e) = builder.create(data_dir) {
                     tracing::warn!("Failed to create data directory {:?}: {}", data_dir, e);
                 }
                 Self::generate_and_persist_key(&key_path, &audit_log)
@@ -212,18 +219,40 @@ impl CapabilityManager {
         Ok(SigningKey::from_bytes(&key_bytes))
     }
 
-    fn persist_signing_key_bytes(key_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    fn require_signing_key_parent(key_path: &Path) -> std::io::Result<&Path> {
+        let parent = key_path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "signing key path has no parent",
+            )
+        })?;
+        let metadata = std::fs::symlink_metadata(parent)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "signing key parent must be a real directory",
+            ));
+        }
+        Ok(parent)
+    }
+
+    fn write_new_private_key_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
 
-        if let Some(parent) = key_path.parent() {
-            let metadata = std::fs::symlink_metadata(parent)?;
-            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "signing key parent must be a real directory",
-                ));
-            }
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
+        let mut file = options.open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+
+    fn persist_signing_key_bytes(key_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        Self::require_signing_key_parent(key_path)?;
         if let Ok(metadata) = std::fs::symlink_metadata(key_path) {
             let message = if metadata.file_type().is_symlink() {
                 "signing_key must not be a symlink"
@@ -235,18 +264,30 @@ impl CapabilityManager {
                 message,
             ));
         }
+        Self::write_new_private_key_file(key_path, bytes)
+    }
 
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    /// Replace the signing key atomically: write a fresh 0600 file beside it,
+    /// then rename it over the old key.
+    fn replace_signing_key_bytes(key_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let parent = Self::require_signing_key_parent(key_path)?;
+        if let Ok(metadata) = std::fs::symlink_metadata(key_path) {
+            if !metadata.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "signing_key must be a regular file",
+                ));
+            }
         }
-        let mut file = options.open(key_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        Ok(())
+        let nonce: u128 = rand::random();
+        let temporary = parent.join(format!(".signing_key.{nonce:032x}.tmp"));
+        let result = Self::write_new_private_key_file(&temporary, bytes)
+            .and_then(|()| std::fs::rename(&temporary, key_path))
+            .and_then(|()| std::fs::File::open(parent)?.sync_all());
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
     }
 
     /// Generate a new signing key and persist it to disk
@@ -577,16 +618,11 @@ impl CapabilityManager {
         let new_key = SigningKey::generate(&mut rand::thread_rng());
         let new_pub = new_key.verifying_key();
 
-        // Persist new key with restrictive permissions
+        // Persist the new key atomically: a 0600 temporary file renamed over
+        // the old key, so readers see either the old or the new key.
         let key_path = data_dir.join("signing_key");
-        if let Err(e) = std::fs::write(&key_path, new_key.to_bytes()) {
+        if let Err(e) = Self::replace_signing_key_bytes(&key_path, &new_key.to_bytes()) {
             tracing::error!("Failed to persist rotated key: {}", e);
-        } else {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
-            }
         }
 
         // Advance epoch to invalidate all existing tokens
@@ -1528,5 +1564,62 @@ mod tests {
             )
             .await
             .expect("fresh signing key must issue a valid token");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rotated_signing_key_replaces_a_loose_key_with_an_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let key_path = data_dir.join("signing_key");
+        std::fs::write(&key_path, [7u8; 32]).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut manager = CapabilityManager::load_or_generate(
+            data_dir,
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        );
+
+        let new_public = manager.rotate_signing_key(data_dir, "test");
+
+        let metadata = std::fs::symlink_metadata(&key_path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let stored = std::fs::read(&key_path).unwrap();
+        let stored = SigningKey::from_bytes(&stored.try_into().unwrap());
+        assert_eq!(stored.verifying_key().to_bytes(), new_public);
+        let leftovers: Vec<_> = std::fs::read_dir(data_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "signing_key")
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rotated_signing_key_leaves_a_symlinked_key_path_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let target = data_dir.join("elsewhere");
+        let key_path = data_dir.join("signing_key");
+        std::os::unix::fs::symlink(&target, &key_path).unwrap();
+        let mut manager = CapabilityManager::load_or_generate(
+            data_dir,
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        );
+
+        manager.rotate_signing_key(data_dir, "test");
+
+        assert!(!target.exists());
+        assert!(std::fs::symlink_metadata(&key_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

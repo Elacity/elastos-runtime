@@ -485,12 +485,14 @@ fn bounded_response(response: ureq::Response) -> io::Result<Vec<u8>> {
 fn profile_request(
     agent: &ureq::Agent,
     api: &str,
+    authorization: &str,
     operation: &str,
     key: Option<&str>,
     deadline: Instant,
 ) -> io::Result<serde_json::Value> {
     let mut request = agent
         .post(&format!("{api}/api/v0/{operation}"))
+        .set("Authorization", authorization)
         .set("Accept-Encoding", "identity")
         .set("Connection", "close")
         .timeout(remaining(deadline)?);
@@ -523,15 +525,21 @@ fn check_hamt_value(key: &str, value: &serde_json::Value) -> io::Result<()> {
     Ok(())
 }
 
-fn verify_profile(agent: &ureq::Agent, api: &str, deadline: Instant) -> io::Result<()> {
-    if profile_request(agent, api, "version", None, deadline)?["Version"] != "0.40.1" {
+fn verify_profile(
+    agent: &ureq::Agent,
+    api: &str,
+    authorization: &str,
+    deadline: Instant,
+) -> io::Result<()> {
+    if profile_request(agent, api, authorization, "version", None, deadline)?["Version"] != "0.40.1"
+    {
         return Err(invalid("unsupported directory hash Kubo version"));
     }
     for key in [
         "Import.UnixFSHAMTDirectorySizeThreshold",
         "Import.UnixFSHAMTDirectorySizeEstimation",
     ] {
-        let response = profile_request(agent, api, "config", Some(key), deadline)?;
+        let response = profile_request(agent, api, authorization, "config", Some(key), deadline)?;
         if response["Key"] != key {
             return Err(invalid("directory hash config key mismatch"));
         }
@@ -615,7 +623,14 @@ pub(super) fn verify_backend(provider: &super::IpfsProvider) -> io::Result<()> {
         .max_idle_connections(0)
         .build();
     let deadline = Instant::now() + Duration::from_secs(5);
-    let version = profile_request(&agent, &provider.api_url(), "version", None, deadline)?;
+    let version = profile_request(
+        &agent,
+        &provider.api_url(),
+        &provider.api_authorization(),
+        "version",
+        None,
+        deadline,
+    )?;
     if version["Version"] != "0.40.1" {
         return Err(invalid("unsupported directory hash backend"));
     }
@@ -756,18 +771,22 @@ pub(super) fn check_capacity(
         .build();
     let deadline = Instant::now() + Duration::from_secs(5);
     let api = provider.api_url();
-    if profile_request(&agent, &api, "version", None, deadline)?["Version"] != "0.40.1" {
+    let authorization = provider.api_authorization();
+    if profile_request(&agent, &api, &authorization, "version", None, deadline)?["Version"]
+        != "0.40.1"
+    {
         return Err(invalid("unsupported capacity backend"));
     }
     validate_capacity_datastore(&profile_request(
         &agent,
         &api,
+        &authorization,
         "config",
         Some("Datastore.Spec"),
         deadline,
     )?)?;
     // size-only omits RepoPath. A full stat is still bounded by this call's deadline.
-    let stat = profile_request(&agent, &api, "repo/stat", None, deadline)?;
+    let stat = profile_request(&agent, &api, &authorization, "repo/stat", None, deadline)?;
     let repo = stat
         .get("RepoPath")
         .and_then(serde_json::Value::as_str)
@@ -816,9 +835,11 @@ fn hash_directory_with_timeout(
         .max_idle_connections(0)
         .build();
     let api = provider.api_url();
-    verify_profile(&agent, &api, deadline)?;
+    let authorization = provider.api_authorization();
+    verify_profile(&agent, &api, &authorization, deadline)?;
     let mut request = agent
         .post(&format!("{api}/api/v0/add"))
+        .set("Authorization", &authorization)
         .set(
             "Content-Type",
             &format!("multipart/form-data; boundary={boundary}"),
@@ -837,7 +858,7 @@ fn hash_directory_with_timeout(
         .map_err(|_| invalid("directory hash stream failed"))?;
     let root = parse_root(&bounded_response(response)?)?;
     closure.check(descriptor)?;
-    verify_profile(&agent, &api, deadline)?;
+    verify_profile(&agent, &api, &authorization, deadline)?;
     remaining(deadline)?;
     Ok(root)
 }
@@ -853,6 +874,8 @@ mod tests {
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
+
+    const FIXTURE_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     struct OwnedChild(Child);
 
@@ -1309,8 +1332,10 @@ mod tests {
                 gateway_port: 0,
                 started_at: 1,
                 last_used: 1,
+                api_secret: FIXTURE_SECRET.to_string(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             call(serde_json::json!({"op":"runtime_prepare_backend"})),
             serde_json::json!({"status":"ok"})
@@ -1462,6 +1487,7 @@ mod tests {
             kubo_child: None,
             data_dir: fixture.root.path().into(),
             repo_dir: fixture.repo.clone(),
+            api_secret: FIXTURE_SECRET.to_string(),
         };
         // Exercise the production wire handler from Cold while the fixture owns
         // the real isolated daemon. Readiness must reuse that lifecycle, not Cat/pin.
@@ -1473,8 +1499,10 @@ mod tests {
                 gateway_port: 0,
                 started_at: 1,
                 last_used: 1,
+                api_secret: FIXTURE_SECRET.to_string(),
             },
-        );
+        )
+        .unwrap();
         let ready =
             provider.handle(crate::parse_request(r#"{"op":"runtime_prepare_backend"}"#).unwrap());
         assert!(matches!(ready, crate::Response::Ok { data: None }));
@@ -1590,6 +1618,7 @@ mod tests {
             kubo_child: None,
             data_dir: root.into(),
             repo_dir: root.join("unused-repo"),
+            api_secret: FIXTURE_SECRET.to_string(),
         }
     }
 
@@ -1814,8 +1843,10 @@ mod tests {
                 gateway_port: 0,
                 started_at: 1,
                 last_used: crate::now_unix_secs(),
+                api_secret: FIXTURE_SECRET.to_string(),
             },
-        );
+        )
+        .unwrap();
         // One check every 500 ms, as a download does per window, for three idle limits.
         let checks = 6 * crate::IDLE_TIMEOUT_SECS;
         let server = std::thread::spawn(move || {
@@ -2158,6 +2189,7 @@ mod tests {
             let mut socket = accept_fixture(listener);
             let request = headers(&mut socket);
             assert!(request.starts_with(&format!("POST /api/v0/{operation}")));
+            assert!(request.contains(&format!("\r\nAuthorization: Bearer {FIXTURE_SECRET}\r\n")));
             if operation == "config" {
                 assert!(request.contains(value["Key"].as_str().unwrap()));
             }

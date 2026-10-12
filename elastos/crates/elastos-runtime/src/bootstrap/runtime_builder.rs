@@ -119,7 +119,14 @@ impl RuntimeConfig {
             (base, false)
         } else {
             // First run — create default config file
-            let _ = std::fs::create_dir_all(data_dir);
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            let _ = builder.create(data_dir);
             let default_toml = toml::to_string_pretty(&ConfigFile::default()).unwrap_or_default();
             let _ = std::fs::write(&config_path, default_toml);
             (base, true)

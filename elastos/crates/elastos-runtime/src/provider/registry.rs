@@ -22,6 +22,8 @@ fn private_ipfs_operation(op: &str) -> bool {
             | "runtime_hash_staged_directory"
             | "runtime_check_capacity"
             | "runtime_add_local_object"
+            | "runtime_share_root"
+            | "runtime_unshare_root"
     )
 }
 
@@ -1466,6 +1468,31 @@ impl ProviderRegistry {
     pub async fn prepare_local_ipfs_backend(&self) -> Result<(), ProviderError> {
         let result: LocalIpfsResult<LocalDirectoryHashResult> = self
             .send_local_ipfs_preparation(&serde_json::json!({"op":"runtime_prepare_backend"}))
+            .await?;
+        match result {
+            LocalIpfsResult::Ok { data: None } => Ok(()),
+            _ => Err(private_ipfs_unavailable()),
+        }
+    }
+
+    /// Share or stop sharing one root the owner published with the public IPFS
+    /// network. Kubo keeps its swarm closed while no root is shared and
+    /// announces only shared roots. Capsules and Carrier cannot reach this.
+    pub async fn set_local_ipfs_root_shared(
+        &self,
+        cid: &str,
+        shared: bool,
+    ) -> Result<(), ProviderError> {
+        if cid.is_empty() || cid.len() > 128 || !cid.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(private_ipfs_unavailable());
+        }
+        let op = if shared {
+            "runtime_share_root"
+        } else {
+            "runtime_unshare_root"
+        };
+        let result: LocalIpfsResult<serde_json::Value> = self
+            .send_local_ipfs_preparation(&serde_json::json!({"op":op,"cid":cid}))
             .await?;
         match result {
             LocalIpfsResult::Ok { data: None } => Ok(()),
@@ -3275,6 +3302,8 @@ mod tests {
             "runtime_hash_staged_directory",
             "runtime_check_capacity",
             "runtime_add_local_object",
+            "runtime_share_root",
+            "runtime_unshare_root",
         ] {
             let request = serde_json::json!({"op":op,"directory":{"root":"/private/fixture"}, "config":{"base_path":"/private/fixture", "extra":{"runtime_host_role":"gateway"}}});
             assert!(registry.send_raw("ipfs", &request).await.is_err());

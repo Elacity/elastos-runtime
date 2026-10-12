@@ -14,6 +14,7 @@ pub async fn run_serve(
 ) -> anyhow::Result<()> {
     crate::runtime_control::watch_gateway_owner()?;
     let data_dir = crate::default_data_dir();
+    elastos_server::data_root::require_private_data_root(&data_dir)?;
     let subordinate_host = std::env::var("ELASTOS_ALLOW_SUBORDINATE_RUNTIME_HOST")
         .ok()
         .as_deref()
@@ -95,7 +96,7 @@ pub async fn run_serve(
                 let session_registry = infra.session_registry.clone();
                 let capability_manager = infra.capability_manager.clone();
                 let pending_store = infra.pending_store.clone();
-                let tls_config = infra.tls_config;
+                let mut guest_host_ip: Option<String> = None;
 
                 let handle = vm_provider
                     .load(&capsule_dir, manifest.clone())
@@ -129,6 +130,7 @@ pub async fn run_serve(
                             .await
                             .ok_or_else(|| anyhow::anyhow!("network not configured"))?;
                         let api_addr = format!("http://{}:{}", net.host_ip, api_port);
+                        guest_host_ip = Some(net.host_ip.clone());
                         vm_provider
                             .set_session_for_vm(&handle.id, &shell_session.token, &api_addr)
                             .await
@@ -168,31 +170,13 @@ pub async fn run_serve(
                 };
                 runtime_arc.register_capsule(capsule_info).await;
 
-                if tls_config.is_some() {
-                    tracing::warn!(
-                        "TLS proxy not available on the current VM path. Using plain HTTP."
-                    );
-                }
-
-                let scheme = if tls_config.is_some() {
-                    "https"
-                } else {
-                    "http"
-                };
+                let api_bind_addr = microvm_api_bind_addr(&addr, guest_host_ip.as_deref())?;
+                tracing::info!("API server will bind to {}", api_bind_addr);
                 println!("MicroVM capsule '{}' started", handle.manifest.name);
-                println!("  API server: {}://{}", scheme, addr);
-                println!("  VM service: {}://localhost:{}", scheme, vm_port);
+                println!("  API server: http://{}", api_bind_addr);
+                println!("  VM service: http://localhost:{}", vm_port);
                 println!("  Session: configured (shell mode)");
                 println!("Press Ctrl+C to stop...");
-
-                let api_bind_addr = if addr.starts_with("127.0.0.1:") {
-                    addr.replacen("127.0.0.1", "0.0.0.0", 1)
-                } else if addr.starts_with("localhost:") {
-                    addr.replacen("localhost", "0.0.0.0", 1)
-                } else {
-                    addr.clone()
-                };
-                tracing::info!("API server will bind to {}", api_bind_addr);
 
                 let provider_registry = infra.provider_registry;
                 let namespace_store = infra.namespace_store;
@@ -226,7 +210,6 @@ pub async fn run_serve(
                                 addr: api_bind_addr,
                                 capsule_dir: None,
                                 data_dir: None,
-                                tls_config,
                                 supervisor: None,
                                 ready_tx: None,
                                 attach_secret: None,
@@ -475,7 +458,6 @@ pub async fn run_serve(
             addr,
             capsule_dir: None,
             data_dir: Some(data_dir.clone()),
-            tls_config: None,
             supervisor: sup,
             ready_tx: None,
             attach_secret: Some(attach_secret),
@@ -504,4 +486,49 @@ fn current_binary_sha256() -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("Failed to determine runtime binary: {}", e))?;
     let bytes = std::fs::read(self_exe)?;
     Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
+}
+
+/// The microVM control API listens on the address the owner asked for
+/// (loopback by default). A guest-network capsule reaches it over its TAP
+/// link, so the API binds the TAP host address with the same port instead of
+/// every interface.
+fn microvm_api_bind_addr(addr: &str, guest_host_ip: Option<&str>) -> anyhow::Result<String> {
+    let Some(host_ip) = guest_host_ip else {
+        return Ok(addr.to_string());
+    };
+    let host_ip: std::net::Ipv4Addr = host_ip
+        .parse()
+        .map_err(|_| anyhow::anyhow!("guest network host address is invalid: {host_ip}"))?;
+    let port = addr
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+        .ok_or_else(|| anyhow::anyhow!("Invalid serve address: {addr}"))?;
+    Ok(std::net::SocketAddrV4::new(host_ip, port).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::microvm_api_bind_addr;
+
+    #[test]
+    fn microvm_api_without_guest_network_keeps_the_requested_loopback_bind() {
+        assert_eq!(
+            microvm_api_bind_addr("127.0.0.1:3000", None).unwrap(),
+            "127.0.0.1:3000"
+        );
+    }
+
+    #[test]
+    fn microvm_api_with_guest_network_binds_only_the_tap_host_address() {
+        assert_eq!(
+            microvm_api_bind_addr("127.0.0.1:3000", Some("172.16.7.1")).unwrap(),
+            "172.16.7.1:3000"
+        );
+        assert_eq!(
+            microvm_api_bind_addr("localhost:4100", Some("172.16.7.1")).unwrap(),
+            "172.16.7.1:4100"
+        );
+        assert!(microvm_api_bind_addr("127.0.0.1:3000", Some("0.0.0.0:1")).is_err());
+    }
 }

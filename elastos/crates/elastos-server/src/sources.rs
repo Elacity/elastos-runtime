@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 
 use elastos_common::localhost::installation_release_head_path;
 
-use crate::ownership;
-
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
 
 /// Default data directory: `$XDG_DATA_HOME/elastos` or `$HOME/.local/share/elastos`.
@@ -14,22 +12,6 @@ pub fn default_data_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("elastos")
-}
-
-pub struct OwnershipRepairGuard {
-    path: PathBuf,
-}
-
-impl OwnershipRepairGuard {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for OwnershipRepairGuard {
-    fn drop(&mut self) {
-        let _ = ownership::repair_path_recursive(&self.path);
-    }
 }
 
 pub fn trusted_sources_path(data_dir: &std::path::Path) -> PathBuf {
@@ -137,7 +119,7 @@ pub fn save_trusted_sources(
     config: &TrustedSourcesConfig,
 ) -> anyhow::Result<()> {
     let _writer = crate::install_transaction::acquire_installed_writer(data_dir)?;
-    std::fs::create_dir_all(data_dir)?;
+    crate::data_root::create_private_dir_all(data_dir)?;
     let json = serde_json::to_string_pretty(config)?;
     std::fs::write(trusted_sources_path(data_dir), json)?;
     Ok(())

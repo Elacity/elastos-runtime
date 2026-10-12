@@ -9122,9 +9122,15 @@ server.serve_forever()
             } else {
                 (0, 0)
             };
-            fs::write(data.join("ipfs-coords.json"), serde_json::to_vec(&serde_json::json!({
-                "kubo_pid":daemon.0.id(),"api_port":port,"gateway_port":0,"started_at":now().unwrap(),"last_used":now().unwrap()
+            // The provider trusts only owner-only coordinates that carry the
+            // API secret. This fixture daemon has no API.Authorizations, so
+            // Kubo accepts the provider's bearer header unchecked.
+            let coords = data.join("ipfs-coords.json");
+            fs::write(&coords, serde_json::to_vec(&serde_json::json!({
+                "kubo_pid":daemon.0.id(),"api_port":port,"gateway_port":0,"started_at":now().unwrap(),"last_used":now().unwrap(),
+                "api_secret":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
             })).unwrap()).unwrap();
+            fs::set_permissions(&coords, fs::Permissions::from_mode(0o600)).unwrap();
             let bridge = Arc::new(
                 ProviderBridge::spawn(
                     &native,

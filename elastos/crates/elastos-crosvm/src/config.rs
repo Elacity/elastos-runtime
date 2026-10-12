@@ -81,7 +81,7 @@ impl Default for CrosvmConfig {
 }
 
 fn default_data_dir() -> PathBuf {
-    // Prefer $HOME, fall back to passwd entry (survives setcap/AT_SECURE)
+    // Prefer $HOME, fall back to the passwd entry when HOME is unset.
     let home = std::env::var_os("HOME").map(PathBuf::from).or_else(|| {
         let uid = unsafe { libc::getuid() };
         let pw = unsafe { libc::getpwuid(uid) };

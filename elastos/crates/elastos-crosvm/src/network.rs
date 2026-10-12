@@ -1,7 +1,8 @@
 //! Guest-network compatibility mode for crosvm VMs.
 //!
 //! Creates TAP devices via ioctl (no external commands).
-//! Requires CAP_NET_ADMIN on the runtime binary.
+//! Needs network-admin rights that ElastOS never grants itself (no setuid,
+//! no file capabilities); without them guest-network capsules do not start.
 //! Ordinary app capsules should stay on the serial Carrier bridge and not use this.
 //! No iptables, no ip_forward — guest-network capsules can only reach the host runtime.
 
@@ -158,7 +159,7 @@ impl NetworkConfig {
     }
 
     /// Create the TAP device and configure the network.
-    /// Requires CAP_NET_ADMIN (set via `setcap cap_net_admin+ep` on the binary).
+    /// Needs network-admin rights; fails with an error when they are absent.
     pub fn setup(&self) -> Result<()> {
         // 1. Create TAP device
         let fd = self.create_tap()?;
@@ -219,7 +220,7 @@ impl NetworkConfig {
         let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(ElastosError::Compute(format!(
-                "open(/dev/net/tun) failed: {}. Run: sudo setcap cap_net_admin+ep $(which elastos)",
+                "open(/dev/net/tun) failed: {}. Guest-network capsules need network-admin rights, which ElastOS does not grant; use a capsule without guest_network.",
                 std::io::Error::last_os_error()
             )));
         }
@@ -233,7 +234,7 @@ impl NetworkConfig {
                 libc::close(fd);
             }
             return Err(ElastosError::Compute(format!(
-                "TUNSETIFF failed for '{}': {}. Run: sudo setcap cap_net_admin+ep $(which elastos)",
+                "TUNSETIFF failed for '{}': {}. Guest-network capsules need network-admin rights, which ElastOS does not grant; use a capsule without guest_network.",
                 self.tap_name, err
             )));
         }

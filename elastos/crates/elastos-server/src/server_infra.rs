@@ -21,7 +21,7 @@ use elastos_server::carrier::configured_carrier_bind_addr;
 use elastos_server::content::ContentProvider;
 use elastos_server::documents::DocumentsProvider;
 use elastos_server::sources::{default_data_dir, local_session_owner};
-use elastos_server::{api, fetcher, ownership};
+use elastos_server::{api, fetcher};
 use elastos_wallet_contract::WALLET_PROTOCOL_VERSION;
 
 pub(crate) struct ServerInfrastructure {
@@ -32,7 +32,6 @@ pub(crate) struct ServerInfrastructure {
     pub(crate) provider_registry: Arc<provider::ProviderRegistry>,
     pub(crate) namespace_store: Arc<namespace::NamespaceStore>,
     pub(crate) identity_state: Option<api::handlers::identity::IdentityState>,
-    pub(crate) tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     pub(crate) provider_cid: String,
     pub(crate) shell_cid: Option<String>,
     pub(crate) host_helpers: Vec<api::server::HostHelperProcess>,
@@ -641,7 +640,6 @@ async fn setup_server_infrastructure_impl(
 ) -> anyhow::Result<ServerInfrastructure> {
     let data_dir = default_data_dir();
     let carrier_bind_addr = configured_carrier_bind_addr(&data_dir)?;
-    let _ = ownership::repair_path_recursive(&data_dir);
     let collaboration_configuration =
         elastos_server::collaboration_startup::load_and_accept_collaboration_startup_configuration(
             &data_dir,
@@ -663,17 +661,6 @@ async fn setup_server_infrastructure_impl(
     let pending_store = Arc::new(capability::pending::PendingRequestStore::new(
         audit_log.clone(),
     ));
-
-    let tls_config = match elastos_tls::load_or_create_tls_config(&data_dir).await {
-        Ok(config) => {
-            tracing::info!("TLS enabled (self-signed CA)");
-            Some(config)
-        }
-        Err(e) => {
-            tracing::warn!("TLS disabled: {}. Running without HTTPS.", e);
-            None
-        }
-    };
 
     ensure_file_backed_roots(&data_dir).ok();
     elastos_server::protected_content_runtime::log_unresolved_runtime_releases(&data_dir);
@@ -1681,7 +1668,6 @@ async fn setup_server_infrastructure_impl(
         provider_registry,
         namespace_store,
         identity_state,
-        tls_config,
         provider_cid,
         shell_cid,
         host_helpers: managed_host_processes,

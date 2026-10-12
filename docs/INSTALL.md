@@ -383,6 +383,70 @@ curl -fsSL https://elastos.elacitylabs.com/install.sh | bash -s -- --uninstall -
 This deletes your identity, wallets and recovery material on this computer.
 Keep your Recovery Kit first: it is the only way to restore that identity.
 
+## Network exposure
+
+Home and every other ElastOS web listener bind `127.0.0.1` by default:
+`elastos home`, `elastos gateway` (also with `--public`, whose tunnel connects to
+that loopback address), `elastos serve` and `elastos room open`. Another address
+is used only when you pass it with `--addr`. A microVM capsule that asks for a
+guest network reaches the Runtime API on its own TAP link address, not on every
+interface.
+
+Carrier is the one listener on all interfaces: UDP `0.0.0.0:4433` (or a free
+port when 4433 is taken). It carries authenticated, encrypted QUIC connections; every peer
+proves its key before anything else happens. Updates use it to reach the
+release seed, and direct Chat uses it to reach other Homes, so it cannot be
+limited to loopback. Set `carrier_bind_addr` with `elastos config set` to choose
+a different address. Carrier may ask your router to forward its UDP port
+(UPnP, NAT-PMP or PCP) so that other Homes can reach it directly; this is
+unchanged in this release.
+
+Kubo, the local IPFS store behind sharing and publishing, has its API and
+gateway on `127.0.0.1` only. Kubo is reachable from other computers only while
+you have something published, and then it announces only the published roots:
+it listens on TCP 4001 (or a free port when 4001 is taken), may ask your router
+to forward that port, and joins the public IPFS network so that people you
+share an `elastos://` link with can fetch it. With nothing published it has no
+swarm listener, makes no connections to IPFS peers and announces nothing.
+LAN discovery (mDNS), relays, hole punching, UDP transports and Kubo telemetry
+are always off. Kubo's API refuses every request without the API secret.
+ElastOS creates a new secret each time Kubo starts and keeps it in
+`ipfs-coords.json` in the data folder (mode 0600). Kubo from an earlier release
+is restarted with these settings the first time it is used. To use Kubo's own
+command-line tool against the running daemon, pass
+`--api-auth bearer:<secret>`.
+
+Earlier releases created a local certificate authority (`ca.pem`, `ca.key`,
+`tls.pem`, `tls.key`) in the data folder. Nothing uses it any more: the Runtime
+removes those files when it starts and has no `elastos tls` command. If you
+added that certificate to a trust store, you can remove it there.
+
+## Reach Home from your phone
+
+Passkeys need a secure origin. On the computer that runs Home that is
+`http://localhost:8090`; a phone needs a stable HTTPS address that you control,
+for example `https://home.example.com`. A LAN address over plain HTTP does not
+work for passkeys, and ElastOS does not create certificates for it.
+
+1. Run Home on loopback as usual (`elastos gateway --addr 127.0.0.1:8090` or
+   `elastos home`).
+2. Put your own HTTPS front in front of it: a named tunnel (for example a
+   Cloudflare named tunnel) or a reverse proxy with a certificate for your
+   domain. It forwards to `http://127.0.0.1:8090` and keeps the `Host` header.
+3. Allow that address, then restart Home:
+   `elastos config set gateway_allowed_hosts '["home.example.com"]'`
+   (include the port when it is not 443).
+4. Create the owner passkey at that address. On a new Home run
+   `elastos identity arm-owner --origin https://home.example.com --rp-id home.example.com`
+   on the computer and use the code on the phone. A Home that already has an
+   owner moves its admin passkey to the new address with its Recovery Kit:
+   `elastos identity arm-owner-recovery --origin https://home.example.com --rp-id home.example.com`.
+   The earlier passkey then stops working, so use the HTTPS address on every
+   device from then on.
+
+The quick public tunnel of `elastos gateway --public` gets a new random address
+on every start, so it is not suitable for passkeys.
+
 ## Data, keys and backups
 
 Runtime stores keys next to the data they protect in its data home. A full
@@ -396,6 +460,14 @@ recovery material on your own device until
 its acceptance gate. The seed operator can read hosted data, wallet keys and
 recovery phrases stored on the seed. Host-side encryption with keys stored
 beside the data leaves those secrets accessible to that operator.
+
+The Runtime runs as your own user account; ElastOS creates no separate system
+account. It keeps its data folder private to that account: it creates the folder
+with mode 0700 and narrows an existing folder to 0700 each time it starts. It
+stops only when the folder is a link, belongs to another account or can be
+changed by every account, and then says what to do. Secret files in it
+(coordinates with attach secrets, identity and signing keys) are written 0600 in
+one step. Code running as your user account or as root can still use your keys.
 
 Passkeys control sign-in. Locking Home stops UI use; the Runtime account and root
 retain access to stored data and keys. The protection target covers hosted

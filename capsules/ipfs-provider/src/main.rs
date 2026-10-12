@@ -39,6 +39,12 @@ const BOUNDED_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const BOUNDED_READ_KUBO_TIMEOUT: &str = "100ms";
 const MAX_BOUNDED_READ_BYTES: u64 = 64 * 1024;
 const MAX_CAPACITY_REQUIRED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const KUBO_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_COORD_BYTES: u64 = 64 * 1024;
+const MAX_KUBO_CONFIG_BYTES: u64 = 1024 * 1024;
+/// MFS directory holding exactly the published roots the owner shares with
+/// the public IPFS network; `Provide.Strategy = "mfs"` announces only these.
+const SHARED_ROOTS_DIR: &str = "/elastos-shared";
 
 // The upload reads one opened file. A short read or changed file cannot
 // silently replace missing payload bytes with the multipart footer.
@@ -231,6 +237,12 @@ enum Request {
     },
     RuntimeAddLocalObject {
         object: LocalObject,
+    },
+    RuntimeShareRoot {
+        cid: String,
+    },
+    RuntimeUnshareRoot {
+        cid: String,
     },
     Init {
         #[serde(default)]
@@ -435,6 +447,8 @@ fn parse_request(line: &str) -> Result<Request, Response> {
                             | "runtime_hash_staged_directory"
                             | "runtime_check_capacity"
                             | "runtime_add_local_object"
+                            | "runtime_share_root"
+                            | "runtime_unshare_root"
                     )
                 })
             })
@@ -536,6 +550,8 @@ struct CoordFile {
     gateway_port: u16,
     started_at: u64,
     last_used: u64,
+    /// Bearer secret Kubo's API requires (`API.Authorizations`).
+    api_secret: String,
 }
 
 // ── Provider ────────────────────────────────────────────────────────
@@ -550,6 +566,7 @@ struct IpfsProvider {
     kubo_child: Option<Child>,
     data_dir: PathBuf,
     repo_dir: PathBuf,
+    api_secret: String,
 }
 
 impl IpfsProvider {
@@ -566,11 +583,27 @@ impl IpfsProvider {
             kubo_child: None,
             data_dir,
             repo_dir,
+            api_secret: String::new(),
         }
     }
 
     fn api_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.api_port)
+    }
+
+    /// Kubo answers API calls only with the secret from its coordinates.
+    fn api_authorization(&self) -> String {
+        format!("Bearer {}", self.api_secret)
+    }
+
+    fn api_post(&self, url: &str) -> ureq::Request {
+        ureq::post(url).set("Authorization", &self.api_authorization())
+    }
+
+    fn adopt(&mut self, coord: &CoordFile) {
+        self.api_port = coord.api_port;
+        self.gateway_port = coord.gateway_port;
+        self.api_secret.clone_from(&coord.api_secret);
     }
 
     fn root_cid(arg: &str) -> &str {
@@ -579,7 +612,7 @@ impl IpfsProvider {
 
     fn kubo_cat_bytes(&mut self, arg: &str, timeout: Duration) -> Result<Vec<u8>, String> {
         let url = format!("{}/api/v0/cat?arg={}", self.api_url(), arg);
-        match ureq::post(&url).timeout(timeout).call() {
+        match self.api_post(&url).timeout(timeout).call() {
             Ok(resp) if resp.status() == 200 => {
                 let mut bytes = Vec::new();
                 resp.into_reader()
@@ -600,7 +633,7 @@ impl IpfsProvider {
         timeout: Duration,
     ) -> Result<u64, String> {
         let url = format!("{}/api/v0/cat?arg={}&offline=true", self.api_url(), arg);
-        match ureq::post(&url).timeout(timeout).call() {
+        match self.api_post(&url).timeout(timeout).call() {
             Ok(resp) if resp.status() == 200 => {
                 let written = copy_reader_to_path(resp.into_reader(), dest)?;
                 update_coord_last_used(&self.data_dir);
@@ -613,7 +646,7 @@ impl IpfsProvider {
 
     fn kubo_prefetch_cid(&mut self, cid: &str) -> Result<(), String> {
         let url = format!("{}/api/v0/pin/add?arg={}", self.api_url(), cid);
-        match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
+        match self.api_post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
             Ok(resp) if resp.status() == 200 => {
                 update_coord_last_used(&self.data_dir);
                 Ok(())
@@ -770,6 +803,8 @@ impl IpfsProvider {
                     private_preparation_error()
                 }
             }
+            Request::RuntimeShareRoot { cid } => self.share_root(&cid, true),
+            Request::RuntimeUnshareRoot { cid } => self.share_root(&cid, false),
             Request::Init { config } => self.init(config),
             Request::AddBytes {
                 data,
@@ -876,8 +911,7 @@ impl IpfsProvider {
                     "ipfs-provider: reusing existing Kubo (pid={}, api={})",
                     coord.kubo_pid, coord.api_port
                 );
-                self.api_port = coord.api_port;
-                self.gateway_port = coord.gateway_port;
+                self.adopt(&coord);
                 self.state = KuboState::Ready;
                 update_coord_last_used(&self.data_dir);
             } else {
@@ -887,6 +921,10 @@ impl IpfsProvider {
                 );
                 remove_coord_file(&self.data_dir);
             }
+        } else if fs::symlink_metadata(coord_file_path(&self.data_dir)).is_ok() {
+            eprintln!(
+                "ipfs-provider: coord file is not private or has no API secret; Kubo restarts locked down"
+            );
         }
 
         self.initialized = true;
@@ -921,8 +959,7 @@ impl IpfsProvider {
             // Verify still alive
             if let Some(coord) = read_coord_file(&self.data_dir) {
                 if is_pid_alive(coord.kubo_pid) {
-                    self.api_port = coord.api_port;
-                    self.gateway_port = coord.gateway_port;
+                    self.adopt(&coord);
                     update_coord_last_used(&self.data_dir);
                     return Ok(());
                 }
@@ -966,8 +1003,7 @@ impl IpfsProvider {
             // We got the lock — check coord file again (another process may have finished)
             if let Some(coord) = read_coord_file(&self.data_dir) {
                 if is_pid_alive(coord.kubo_pid) {
-                    self.api_port = coord.api_port;
-                    self.gateway_port = coord.gateway_port;
+                    self.adopt(&coord);
                     self.state = KuboState::Ready;
                     update_coord_last_used(&self.data_dir);
                     // Lock is released on drop
@@ -986,8 +1022,7 @@ impl IpfsProvider {
                 std::thread::sleep(LOCKFILE_POLL_INTERVAL);
                 if let Some(coord) = read_coord_file(&self.data_dir) {
                     if is_pid_alive(coord.kubo_pid) {
-                        self.api_port = coord.api_port;
-                        self.gateway_port = coord.gateway_port;
+                        self.adopt(&coord);
                         self.state = KuboState::Ready;
                         return Ok(());
                     }
@@ -1025,24 +1060,35 @@ impl IpfsProvider {
             }
         }
 
+        // A daemon without trusted coordinates (an earlier release's, or one
+        // whose coordinates are gone) still holds the repository.
+        if let Err(error) = stop_repo_daemon(&self.repo_dir) {
+            self.state = KuboState::Error;
+            return Err(error);
+        }
+
         // Bind free ports
         let api_port = bind_free_port().map_err(|e| format!("Failed to bind API port: {}", e))?;
         let gw_port =
             bind_free_port().map_err(|e| format!("Failed to bind gateway port: {}", e))?;
+        let swarm_port = if repo_has_shared_roots(binary, &self.repo_dir) {
+            Some(swarm_listen_port()?)
+        } else {
+            None
+        };
 
-        // Kubo v0.40.x does not support --gateway CLI flag, so set gateway in repo config.
-        let gw_addr = format!("/ip4/127.0.0.1/tcp/{}", gw_port);
-        let gw_cfg = Command::new(binary)
-            .args(["config", "Addresses.Gateway", &gw_addr])
-            .env("IPFS_PATH", &self.repo_dir)
-            .output()
-            .map_err(|e| format!("Failed to set Kubo gateway address: {}", e))?;
-        if !gw_cfg.status.success() {
-            let stderr = String::from_utf8_lossy(&gw_cfg.stderr);
-            return Err(format!(
-                "kubo config Addresses.Gateway failed: {}",
-                stderr.trim()
-            ));
+        // Every start writes the lockdown and a fresh API secret into the
+        // repository config; existing repositories are converted the same way.
+        let secret = new_api_secret()
+            .and_then(|secret| {
+                lock_down_repo_config(&self.repo_dir, gw_port, &secret, swarm_port).map(|()| secret)
+            })
+            .map_err(|e| {
+                self.state = KuboState::Error;
+                format!("Failed to lock down Kubo config: {}", e)
+            })?;
+        if let Some(port) = swarm_port {
+            eprintln!("ipfs-provider: shared roots present; Kubo swarm listens on TCP {port}");
         }
 
         // Start Kubo daemon
@@ -1071,6 +1117,7 @@ impl IpfsProvider {
         self.kubo_child = Some(child);
         self.api_port = api_port;
         self.gateway_port = gw_port;
+        self.api_secret = secret;
 
         // Health poll until ready
         let health_url = format!("http://127.0.0.1:{}/api/v0/id", api_port);
@@ -1085,7 +1132,7 @@ impl IpfsProvider {
             }
 
             // Check if process died
-            if let Some(ref mut child) = self.kubo_child {
+            if let Some(child) = &mut self.kubo_child {
                 if let Ok(Some(status)) = child.try_wait() {
                     let mut stderr_tail = String::new();
                     if let Some(mut stderr) = child.stderr.take() {
@@ -1103,7 +1150,8 @@ impl IpfsProvider {
                 }
             }
 
-            match ureq::post(&health_url)
+            match self
+                .api_post(&health_url)
                 .timeout(Duration::from_secs(5))
                 .call()
             {
@@ -1121,15 +1169,23 @@ impl IpfsProvider {
             std::thread::sleep(HEALTH_POLL_INTERVAL);
         }
 
-        // Write coord file (atomic)
         let coord = CoordFile {
             kubo_pid: pid,
             api_port,
             gateway_port: gw_port,
             started_at: now_unix_secs(),
             last_used: now_unix_secs(),
+            api_secret: self.api_secret.clone(),
         };
-        write_coord_file(&self.data_dir, &coord);
+        if let Err(error) = write_coord_file(&self.data_dir, &coord) {
+            // Other providers could not find this daemon; do not leave it running.
+            if let Some(mut child) = self.kubo_child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.state = KuboState::Error;
+            return Err(format!("Failed to write Kubo coordinates: {}", error));
+        }
 
         Ok(())
     }
@@ -1161,6 +1217,103 @@ impl IpfsProvider {
             }
             std::thread::sleep(LOCKFILE_POLL_INTERVAL);
         }
+    }
+
+    // ── Shared roots ────────────────────────────────────────────────
+
+    /// Adds or removes one published root in the shared-roots directory. The
+    /// first shared root restarts Kubo with its swarm open; removing the last
+    /// one restarts it closed. A newly shared root is announced right away.
+    fn share_root(&mut self, cid: &str, share: bool) -> Response {
+        match self.update_shared_root(cid, share) {
+            Ok(()) => Response::ok_empty(),
+            Err(error) => {
+                eprintln!("ipfs-provider: shared root update failed: {error}");
+                private_preparation_error()
+            }
+        }
+    }
+
+    fn update_shared_root(&mut self, cid: &str, share: bool) -> Result<(), String> {
+        if cid.is_empty() || cid.len() > 128 || !cid.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err("invalid shared root".into());
+        }
+        self.ensure_kubo()?;
+        let entry = format!("{SHARED_ROOTS_DIR}/{cid}");
+        let present = self.kubo_rpc("files/stat", &[("arg", &entry)]).is_ok();
+        if share && !present {
+            self.kubo_rpc(
+                "files/mkdir",
+                &[("arg", SHARED_ROOTS_DIR), ("parents", "true")],
+            )?;
+            self.kubo_rpc(
+                "files/cp",
+                &[("arg", &format!("/ipfs/{cid}")), ("arg", &entry)],
+            )?;
+        } else if !share && present {
+            self.kubo_rpc("files/rm", &[("arg", &entry), ("recursive", "true")])?;
+        }
+        let listing: serde_json::Value = self
+            .kubo_rpc("files/ls", &[("arg", SHARED_ROOTS_DIR)])
+            .ok()
+            .and_then(|body| serde_json::from_str(&body).ok())
+            .unwrap_or_default();
+        let sharing = listing["Entries"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty());
+        let swarm: serde_json::Value =
+            serde_json::from_str(&self.kubo_rpc("config", &[("arg", "Addresses.Swarm")])?)
+                .map_err(|e| format!("kubo config -> {e}"))?;
+        let open = swarm["Value"]
+            .as_array()
+            .is_some_and(|addresses| !addresses.is_empty());
+        if sharing != open {
+            eprintln!(
+                "ipfs-provider: restarting Kubo with its swarm {}",
+                if sharing { "open" } else { "closed" }
+            );
+            remove_coord_file(&self.data_dir);
+            stop_repo_daemon(&self.repo_dir)?;
+            self.reap_previous_kubo()?;
+            self.state = KuboState::Cold;
+            self.ensure_kubo()?;
+        }
+        if share {
+            self.provide_in_background(cid);
+        }
+        update_coord_last_used(&self.data_dir);
+        Ok(())
+    }
+
+    fn kubo_rpc(&self, path: &str, query: &[(&str, &str)]) -> Result<String, String> {
+        let mut request = self
+            .api_post(&format!("{}/api/v0/{path}", self.api_url()))
+            .timeout(HTTP_TIMEOUT);
+        for (key, value) in query {
+            request = request.query(key, value);
+        }
+        match request.call() {
+            Ok(response) => response
+                .into_string()
+                .map_err(|e| format!("kubo {path} -> {e}")),
+            Err(ureq::Error::Status(status, _)) => Err(format!("kubo {path} -> HTTP {status}")),
+            Err(error) => Err(format!("kubo {path} -> {error}")),
+        }
+    }
+
+    /// Announces a newly shared root and its blocks without holding up the
+    /// caller; the periodic reprovide covers it if this attempt fails.
+    fn provide_in_background(&self, cid: &str) {
+        let request = self
+            .api_post(&format!("{}/api/v0/routing/provide", self.api_url()))
+            .query("arg", cid)
+            .query("recursive", "true")
+            .timeout(LARGE_HTTP_TIMEOUT);
+        std::thread::spawn(move || {
+            if let Err(error) = request.call() {
+                eprintln!("ipfs-provider: announcing a shared root failed: {error}");
+            }
+        });
     }
 
     // ── Write ops ───────────────────────────────────────────────────
@@ -1301,8 +1454,7 @@ impl IpfsProvider {
                 self.state = KuboState::Cold;
                 return Err("bounded read backend is not ready".into());
             };
-            self.api_port = coord.api_port;
-            self.gateway_port = coord.gateway_port;
+            self.adopt(&coord);
             let arg = if path.is_empty() {
                 cid.to_string()
             } else {
@@ -1321,6 +1473,7 @@ impl IpfsProvider {
             // 64 KiB hit still returns the bounded range after Ready.
             let mut request = agent
                 .post(&format!("{}/api/v0/cat", self.api_url()))
+                .set("Authorization", &self.api_authorization())
                 .query("arg", &arg)
                 .query("offline", "true")
                 .query("timeout", BOUNDED_READ_KUBO_TIMEOUT)
@@ -1428,7 +1581,7 @@ impl IpfsProvider {
         // Try Kubo first
         if self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
-            if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
+            if let Ok(resp) = self.api_post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
                     if let Ok(body) = resp.into_string() {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -1498,7 +1651,7 @@ impl IpfsProvider {
 
             let bytes = if self.ensure_kubo().is_ok() {
                 let url = format!("{}/api/v0/cat?arg={}", self.api_url(), arg);
-                match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
+                match self.api_post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
                     Ok(resp) if resp.status() == 200 => {
                         let mut buf = Vec::new();
                         resp.into_reader().read_to_end(&mut buf).ok();
@@ -1553,7 +1706,7 @@ impl IpfsProvider {
             return Response::error("kubo_unavailable", &e);
         }
         let url = format!("{}/api/v0/pin/add?arg={}", self.api_url(), cid);
-        match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
+        match self.api_post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
             Ok(resp) if resp.status() == 200 => Response::ok_empty(),
             Ok(resp) => Response::error("pin_failed", &format!("HTTP {}", resp.status())),
             Err(e) => Response::error("pin_failed", &e.to_string()),
@@ -1565,7 +1718,7 @@ impl IpfsProvider {
             return Response::error("kubo_unavailable", &e);
         }
         let url = format!("{}/api/v0/pin/rm?arg={}", self.api_url(), cid);
-        match ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
+        match self.api_post(&url).timeout(HTTP_TIMEOUT).call() {
             Ok(resp) if resp.status() == 200 => Response::ok_empty(),
             Ok(resp) => Response::error("unpin_failed", &format!("HTTP {}", resp.status())),
             Err(e) => Response::error("unpin_failed", &e.to_string()),
@@ -1583,7 +1736,7 @@ impl IpfsProvider {
         }
 
         let url = format!("{}/api/v0/id", self.api_url());
-        match ureq::post(&url).timeout(Duration::from_secs(5)).call() {
+        match self.api_post(&url).timeout(Duration::from_secs(5)).call() {
             Ok(resp) if resp.status() == 200 => Response::ok(serde_json::json!({
                 "healthy": true,
                 "state": self.state,
@@ -1641,7 +1794,8 @@ impl IpfsProvider {
 
         let url = format!("{}/api/v0/add?pin={}", self.api_url(), pin);
 
-        let resp = ureq::post(&url)
+        let resp = self
+            .api_post(&url)
             .set(
                 "Content-Type",
                 &format!("multipart/form-data; boundary={}", boundary),
@@ -1685,7 +1839,8 @@ impl IpfsProvider {
         let body = io::Cursor::new(prefix)
             .chain(reader)
             .chain(io::Cursor::new(footer));
-        let resp = ureq::post(&format!("{}/api/v0/add?pin={}", self.api_url(), pin))
+        let resp = self
+            .api_post(&format!("{}/api/v0/add?pin={}", self.api_url(), pin))
             .set(
                 "Content-Type",
                 &format!("multipart/form-data; boundary={}", boundary),
@@ -1723,7 +1878,8 @@ impl IpfsProvider {
         }
         write!(body, "--{}--\r\n", boundary).unwrap();
 
-        let resp = ureq::post(&self.add_directory_url(pin))
+        let resp = self
+            .api_post(&self.add_directory_url(pin))
             .set(
                 "Content-Type",
                 &format!("multipart/form-data; boundary={}", boundary),
@@ -1760,7 +1916,8 @@ impl IpfsProvider {
             current: None,
             finished: false,
         };
-        let resp = ureq::post(&self.add_directory_url(false))
+        let resp = self
+            .api_post(&self.add_directory_url(false))
             .set(
                 "Content-Type",
                 &format!("multipart/form-data; boundary={}", boundary),
@@ -1859,7 +2016,7 @@ impl IpfsProvider {
         // Try Kubo API first
         if self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
-            if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
+            if let Ok(resp) = self.api_post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
                     if let Ok(body) = resp.into_string() {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -2012,21 +2169,109 @@ fn coord_file_path(data_dir: &Path) -> PathBuf {
     data_dir.join("ipfs-coords.json")
 }
 
+/// ipfs-coords.json carries the Kubo API secret. It is trusted only when it
+/// is a regular file owned by this user with mode 0600; anything else,
+/// including coordinates written before the secret existed, names no usable
+/// Kubo, so the next use starts a locked-down one.
 fn read_coord_file(data_dir: &Path) -> Option<CoordFile> {
-    let path = coord_file_path(data_dir);
-    let content = fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    #[cfg(unix)]
+    let owner = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let owner = 0;
+    read_private_coord(&coord_file_path(data_dir), owner)
 }
 
-fn write_coord_file(data_dir: &Path, coord: &CoordFile) {
-    let path = coord_file_path(data_dir);
-    let _ = fs::create_dir_all(data_dir);
-    let json = serde_json::to_string_pretty(coord).unwrap_or_default();
-    // Atomic write: tmp + rename
-    let tmp = path.with_extension("tmp");
-    if fs::write(&tmp, &json).is_ok() {
-        let _ = fs::rename(&tmp, &path);
+fn read_private_coord(path: &Path, owner: u32) -> Option<CoordFile> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
     }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let private =
+            |m: &fs::Metadata| m.is_file() && m.mode() & 0o777 == 0o600 && m.uid() == owner;
+        if !private(&metadata) {
+            return None;
+        }
+        let file = options.custom_flags(libc::O_NOFOLLOW).open(path).ok()?;
+        if !private(&file.metadata().ok()?) {
+            return None;
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let _ = owner;
+        options.open(path).ok()?
+    };
+    let mut data = Vec::new();
+    file.take(MAX_COORD_BYTES + 1).read_to_end(&mut data).ok()?;
+    if data.len() as u64 > MAX_COORD_BYTES {
+        return None;
+    }
+    let coord: CoordFile = serde_json::from_slice(&data).ok()?;
+    let secret_ok = coord.api_secret.len() == 64
+        && coord
+            .api_secret
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    secret_ok.then_some(coord)
+}
+
+fn write_coord_file(data_dir: &Path, coord: &CoordFile) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(coord)?;
+    write_private_file_atomically(&coord_file_path(data_dir), &json)
+}
+
+/// Writes a new owner-only file beside `path`, syncs it and renames it over
+/// `path`. Neither the temporary name nor an existing link is followed.
+fn write_private_file_atomically(path: &Path, data: &[u8]) -> io::Result<()> {
+    let refused = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
+    let parent = path
+        .parent()
+        .ok_or_else(|| refused("private file path has no parent"))?;
+    if !fs::symlink_metadata(parent)?.file_type().is_dir() {
+        return Err(refused("private file parent must be a real directory"));
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.file_type().is_file() {
+            return Err(refused("private file target must be a regular file"));
+        }
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| refused("private file name is invalid"))?;
+    let temporary = parent.join(format!(".{name}.{}.tmp", random_hex(16)?));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn random_hex(bytes: usize) -> io::Result<String> {
+    let mut buffer = vec![0u8; bytes];
+    getrandom::getrandom(&mut buffer).map_err(|err| io::Error::other(err.to_string()))?;
+    Ok(buffer.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn remove_coord_file(data_dir: &Path) {
@@ -2036,8 +2281,260 @@ fn remove_coord_file(data_dir: &Path) {
 fn update_coord_last_used(data_dir: &Path) {
     if let Some(mut coord) = read_coord_file(data_dir) {
         coord.last_used = now_unix_secs();
-        write_coord_file(data_dir, &coord);
+        let _ = write_coord_file(data_dir, &coord);
     }
+}
+
+// ── Kubo lockdown ───────────────────────────────────────────────────
+
+/// A fresh 256-bit API secret for one Kubo start.
+fn new_api_secret() -> io::Result<String> {
+    random_hex(32)
+}
+
+/// Reads a bounded regular file without following a link.
+fn read_regular_file(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut data = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds its bound",
+        ));
+    }
+    Ok(data)
+}
+
+/// What Kubo may open toward the network. The API and gateway listen on
+/// loopback only, the API answers only requests with the secret, and LAN
+/// discovery, relays, hole punching, AutoTLS and telemetry are off. Kubo
+/// speaks TCP only and opens no UDP socket.
+///
+/// Without a shared root (`swarm_port` is None) Kubo has no swarm listener,
+/// no bootstrap peers, no routing and no remote configuration, so it makes no
+/// network connection at all. While the owner shares at least one published
+/// root, Kubo listens on `swarm_port` (with router port mapping, as in earlier
+/// releases), joins the public IPFS network and announces only the roots in
+/// its shared-roots MFS directory, so unpeered recipients can fetch them.
+fn apply_kubo_lockdown(
+    config: &mut serde_json::Value,
+    gateway_port: u16,
+    secret: &str,
+    swarm_port: Option<u16>,
+) -> io::Result<()> {
+    let mut settings: Vec<(&[&str], serde_json::Value)> = vec![
+        (
+            &["Addresses", "Gateway"],
+            serde_json::json!(format!("/ip4/127.0.0.1/tcp/{gateway_port}")),
+        ),
+        (&["Discovery", "MDNS", "Enabled"], serde_json::json!(false)),
+        (
+            &["Swarm", "RelayClient", "Enabled"],
+            serde_json::json!(false),
+        ),
+        (
+            &["Swarm", "RelayService", "Enabled"],
+            serde_json::json!(false),
+        ),
+        (&["Swarm", "EnableHolePunching"], serde_json::json!(false)),
+        (
+            &["Swarm", "Transports", "Network"],
+            serde_json::json!({"TCP": true, "Relay": false, "QUIC": false, "Websocket": false,
+                "WebTransport": false, "WebRTCDirect": false}),
+        ),
+        (&["AutoNAT", "ServiceMode"], serde_json::json!("disabled")),
+        (&["AutoTLS", "Enabled"], serde_json::json!(false)),
+        (
+            &["Plugins", "Plugins", "telemetry", "Config", "Mode"],
+            serde_json::json!("off"),
+        ),
+        (&["Provide", "Strategy"], serde_json::json!("mfs")),
+        (&["Import", "FastProvideRoot"], serde_json::json!(false)),
+        (
+            &["API", "Authorizations"],
+            serde_json::json!({"elastos": {"AuthSecret": format!("bearer:{secret}"),
+                "AllowedPaths": ["/api/v0"]}}),
+        ),
+    ];
+    match swarm_port {
+        None => settings.extend([
+            (&["Addresses", "Swarm"][..], serde_json::json!([])),
+            (&["Swarm", "DisableNatPortMap"], serde_json::json!(true)),
+            (&["Bootstrap"], serde_json::json!([])),
+            (&["Routing", "Type"], serde_json::json!("none")),
+            (&["Routing", "DelegatedRouters"], serde_json::json!([])),
+            (&["Ipns", "DelegatedPublishers"], serde_json::json!([])),
+            (&["DNS", "Resolvers"], serde_json::json!({})),
+            (&["AutoConf", "Enabled"], serde_json::json!(false)),
+        ]),
+        Some(port) => settings.extend([
+            (
+                &["Addresses", "Swarm"][..],
+                serde_json::json!([
+                    format!("/ip4/0.0.0.0/tcp/{port}"),
+                    format!("/ip6/::/tcp/{port}")
+                ]),
+            ),
+            (&["Swarm", "DisableNatPortMap"], serde_json::json!(false)),
+            (&["Bootstrap"], serde_json::json!(["auto"])),
+            (&["Routing", "Type"], serde_json::json!("auto")),
+            (
+                &["Routing", "DelegatedRouters"],
+                serde_json::json!(["auto"]),
+            ),
+            (
+                &["Ipns", "DelegatedPublishers"],
+                serde_json::json!(["auto"]),
+            ),
+            (&["DNS", "Resolvers"], serde_json::json!({".": "auto"})),
+            (&["AutoConf", "Enabled"], serde_json::json!(true)),
+        ]),
+    }
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "Kubo config is not an object");
+    for (path, value) in settings {
+        let (last, parents) = path.split_last().ok_or_else(invalid)?;
+        let mut node = &mut *config;
+        for key in parents {
+            node = node
+                .as_object_mut()
+                .ok_or_else(invalid)?
+                .entry(*key)
+                .or_insert(serde_json::Value::Null);
+            if node.is_null() {
+                *node = serde_json::json!({});
+            }
+        }
+        node.as_object_mut()
+            .ok_or_else(invalid)?
+            .insert((*last).to_string(), value);
+    }
+    Ok(())
+}
+
+/// Rewrites the repository config as an owner-only file; Kubo reads it when
+/// the daemon starts.
+fn lock_down_repo_config(
+    repo: &Path,
+    gateway_port: u16,
+    secret: &str,
+    swarm_port: Option<u16>,
+) -> io::Result<()> {
+    let path = repo.join("config");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&read_regular_file(&path, MAX_KUBO_CONFIG_BYTES)?)?;
+    apply_kubo_lockdown(&mut config, gateway_port, secret, swarm_port)?;
+    write_private_file_atomically(&path, &serde_json::to_vec_pretty(&config)?)
+}
+
+/// Whether the repository's shared-roots MFS directory names any root. Read
+/// offline before the daemon starts; a missing directory means no share.
+fn repo_has_shared_roots(binary: &Path, repo: &Path) -> bool {
+    let output = Command::new(binary)
+        .args(["files", "ls", SHARED_ROOTS_DIR])
+        .env("IPFS_PATH", repo)
+        .stdin(Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            output.stdout.iter().any(|byte| !byte.is_ascii_whitespace())
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("does not exist") {
+                eprintln!(
+                    "ipfs-provider: shared roots unreadable, starting without a swarm: {}",
+                    stderr.trim()
+                );
+            }
+            false
+        }
+        Err(error) => {
+            eprintln!("ipfs-provider: shared roots unreadable, starting without a swarm: {error}");
+            false
+        }
+    }
+}
+
+/// The swarm port while sharing: 4001 as in earlier releases, or a free port
+/// when another program already holds 4001, so Kubo still starts.
+fn swarm_listen_port() -> Result<u16, String> {
+    if std::net::TcpListener::bind("0.0.0.0:4001").is_ok() {
+        return Ok(4001);
+    }
+    let listener = std::net::TcpListener::bind("0.0.0.0:0")
+        .map_err(|e| format!("Failed to bind swarm port: {e}"))?;
+    listener
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|e| format!("Failed to bind swarm port: {e}"))
+}
+
+/// The API secret in the repository config, if a locked-down Kubo used it.
+fn repo_api_secret(repo: &Path) -> Option<String> {
+    let config: serde_json::Value = serde_json::from_slice(
+        &read_regular_file(&repo.join("config"), MAX_KUBO_CONFIG_BYTES).ok()?,
+    )
+    .ok()?;
+    config["API"]["Authorizations"]["elastos"]["AuthSecret"]
+        .as_str()?
+        .strip_prefix("bearer:")
+        .map(str::to_owned)
+}
+
+/// Asks a daemon still serving `repo` to shut down and waits until it has
+/// released the repository (Kubo removes its `api` file on exit). A stale
+/// `api` file that no daemon answers needs nothing.
+fn stop_repo_daemon(repo: &Path) -> Result<(), String> {
+    let api_file = repo.join("api");
+    let Some(port) = read_regular_file(&api_file, 256).ok().and_then(|address| {
+        String::from_utf8(address)
+            .ok()?
+            .trim()
+            .strip_prefix("/ip4/127.0.0.1/tcp/")?
+            .parse::<u16>()
+            .ok()
+    }) else {
+        return Ok(());
+    };
+    let mut request = ureq::AgentBuilder::new()
+        .redirects(0)
+        .try_proxy_from_env(false)
+        .build()
+        .post(&format!("http://127.0.0.1:{port}/api/v0/shutdown"))
+        .timeout(KUBO_STOP_TIMEOUT);
+    if let Some(secret) = repo_api_secret(repo) {
+        request = request.set("Authorization", &format!("Bearer {secret}"));
+    }
+    match request.call() {
+        Ok(_) => {}
+        Err(ureq::Error::Status(status, _)) => {
+            return Err(format!("Running Kubo refused shutdown: HTTP {status}"));
+        }
+        Err(_) => return Ok(()),
+    }
+    eprintln!("ipfs-provider: stopping the Kubo that still serves the repository");
+    let deadline = Instant::now() + KUBO_SHUTDOWN_TIMEOUT;
+    while fs::symlink_metadata(&api_file).is_ok() {
+        if Instant::now() >= deadline {
+            return Err("Previous Kubo did not exit; replacement refused".into());
+        }
+        std::thread::sleep(LOCKFILE_POLL_INTERVAL);
+    }
+    Ok(())
 }
 
 // ── Process helpers ─────────────────────────────────────────────────
@@ -2303,7 +2800,7 @@ fn collect_ls_files_recursive(
                                 continue;
                             }
                             let url = format!("{}/api/v0/ls?arg={}", provider.api_url(), hash);
-                            if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
+                            if let Ok(resp) = provider.api_post(&url).timeout(HTTP_TIMEOUT).call() {
                                 if resp.status() == 200 {
                                     if let Ok(body) = resp.into_string() {
                                         if let Ok(sub_json) =
@@ -2819,6 +3316,7 @@ mod tests {
             kubo_child: None,
             data_dir: root.path().join("absent"),
             repo_dir: root.path().join("absent-repo"),
+            api_secret: String::new(),
         };
         for (pointer, value) in [
             ("/directory/root", serde_json::json!("relative")),
@@ -2954,6 +3452,12 @@ mod tests {
         })
     }
 
+    const FIXTURE_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn authorized(headers: &str, secret: &str) -> bool {
+        headers.contains(&format!("\r\nAuthorization: Bearer {secret}\r\n"))
+    }
+
     fn bounded_cat_fixture_provider(root: &Path, port: u16) -> IpfsProvider {
         write_coord_file(
             root,
@@ -2963,8 +3467,10 @@ mod tests {
                 gateway_port: port,
                 started_at: 1,
                 last_used: 1,
+                api_secret: FIXTURE_SECRET.to_string(),
             },
-        );
+        )
+        .unwrap();
         IpfsProvider {
             host_role: HostRole::User,
             initialized: true,
@@ -2975,6 +3481,7 @@ mod tests {
             kubo_child: None,
             data_dir: root.to_path_buf(),
             repo_dir: root.join("unused-repo"),
+            api_secret: FIXTURE_SECRET.to_string(),
         }
     }
 
@@ -2993,7 +3500,7 @@ mod tests {
                 let mut coord = read_coord_file(root.path()).unwrap();
                 coord.kubo_pid = 999999;
                 assert!(!is_pid_alive(coord.kubo_pid));
-                write_coord_file(root.path(), &coord);
+                write_coord_file(root.path(), &coord).unwrap();
             }
             let started = Instant::now();
             let response =
@@ -3018,6 +3525,7 @@ mod tests {
             bounded_cat_fixture_provider(root.path(), listener.local_addr().unwrap().port());
         provider.api_port = 0;
         provider.gateway_port = 0;
+        provider.api_secret.clear();
         let backend = std::thread::spawn(move || {
             let mut socket = accept_bounded_fixture(&listener);
             let headers = read_bounded_fixture_headers(&mut socket);
@@ -3027,10 +3535,9 @@ mod tests {
             headers
         });
         assert_eq!(provider.fetch_bytes("release-cid").unwrap(), b"89ab");
-        assert!(backend
-            .join()
-            .unwrap()
-            .starts_with("POST /api/v0/cat?arg=release-cid"));
+        let headers = backend.join().unwrap();
+        assert!(headers.starts_with("POST /api/v0/cat?arg=release-cid"));
+        assert!(authorized(&headers, FIXTURE_SECRET));
         assert_eq!(provider.state, KuboState::Ready);
         assert!(provider.kubo_child.is_none());
     }
@@ -3062,7 +3569,7 @@ mod tests {
 
         // The replacement fixture exposes only the startup health and cat calls.
         let kubo = root.path().join("kubo-fixture");
-        fs::write(&kubo, "#!/bin/sh\ncase \"$1\" in\ndaemon) printf '%s' \"$3\" > \"$IPFS_PATH.started\"; exec sleep 60;;\n*) exit 0;;\nesac\n").unwrap();
+        fs::write(&kubo, "#!/bin/sh\ncase \"$1\" in\ninit) mkdir -p \"$IPFS_PATH\" && printf '{}' > \"$IPFS_PATH/config\";;\ndaemon) printf '%s' \"$3\" > \"$IPFS_PATH.started\"; exec sleep 60;;\n*) exit 0;;\nesac\n").unwrap();
         fs::set_permissions(&kubo, fs::Permissions::from_mode(0o700)).unwrap();
         provider.kubo_binary = Some(kubo);
         let started_path = provider.repo_dir.with_extension("started");
@@ -3114,8 +3621,12 @@ mod tests {
             previous_reaped,
             "previous Child was replaced before it was reaped"
         );
+        let secret = read_coord_file(root.path()).unwrap().api_secret;
+        assert_ne!(secret, FIXTURE_SECRET, "each start uses a fresh API secret");
         assert!(health_headers.starts_with("POST /api/v0/id"));
+        assert!(authorized(&health_headers, &secret));
         assert!(cat_headers.starts_with("POST /api/v0/cat?arg=release-cid"));
+        assert!(authorized(&cat_headers, &secret));
     }
 
     #[test]
@@ -3611,26 +4122,502 @@ mod tests {
     }
 
     #[test]
-    fn test_coord_file_roundtrip() {
+    #[cfg(unix)]
+    fn coord_file_is_written_private_and_trusted_only_when_private_and_current() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().to_path_buf();
-
+        let data_dir = tmp.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let path = coord_file_path(&data_dir);
         let coord = CoordFile {
             kubo_pid: 12345,
             api_port: 5001,
             gateway_port: 8080,
             started_at: 1000,
             last_used: 2000,
+            api_secret: FIXTURE_SECRET.to_string(),
         };
+        let previous_umask = unsafe { libc::umask(0o022) };
+        let written = write_coord_file(&data_dir, &coord);
+        unsafe { libc::umask(previous_umask) };
+        written.unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::read_dir(&data_dir).unwrap().count(),
+            1,
+            "no temporary file left"
+        );
+        let read = read_coord_file(&data_dir).expect("private coordinates");
+        assert_eq!(
+            (read.kubo_pid, read.api_port, read.gateway_port),
+            (12345, 5001, 8080)
+        );
+        assert_eq!(read.api_secret, FIXTURE_SECRET);
+        // Another account's file is not trusted even when it is private.
+        let owner = unsafe { libc::geteuid() };
+        assert!(read_private_coord(&path, owner + 1).is_none());
 
-        write_coord_file(&data_dir, &coord);
-        let read = read_coord_file(&data_dir).expect("Should read coord file");
-        assert_eq!(read.kubo_pid, 12345);
-        assert_eq!(read.api_port, 5001);
-        assert_eq!(read.gateway_port, 8080);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_coord_file(&data_dir).is_none());
+        update_coord_last_used(&data_dir);
+        assert_eq!(
+            fs::metadata(&path).unwrap().mode() & 0o777,
+            0o644,
+            "untrusted coordinates are not rewritten"
+        );
 
+        let target = tmp.path().join("elsewhere.json");
+        fs::rename(&path, &target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_coord_file(&data_dir).is_none());
+        assert!(write_coord_file(&data_dir, &coord).is_err());
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::remove_file(&path).unwrap();
+
+        // Coordinates written before the API secret existed name no usable Kubo.
+        fs::write(
+            &path,
+            br#"{"kubo_pid":12345,"api_port":5001,"gateway_port":8080,"started_at":1,"last_used":2}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_coord_file(&data_dir).is_none());
         remove_coord_file(&data_dir);
         assert!(read_coord_file(&data_dir).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn coordinates_without_api_secret_restart_kubo_locked_down() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().canonicalize().unwrap();
+        let repo = data.join("ipfs-repo");
+        fs::create_dir(&repo).unwrap();
+        // An earlier release's repository and daemon: an open API with a
+        // swarm listener and mDNS, and coordinates written with the umask
+        // and without a secret. The coordinates name this live test process.
+        fs::write(
+            repo.join("config"),
+            br#"{"Addresses":{"Swarm":["/ip4/0.0.0.0/tcp/4001"]},"Discovery":{"MDNS":{"Enabled":true}},"API":{"HTTPHeaders":{}}}"#,
+        )
+        .unwrap();
+        let old_api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        old_api.set_nonblocking(true).unwrap();
+        let old_port = old_api.local_addr().unwrap().port();
+        fs::write(repo.join("api"), format!("/ip4/127.0.0.1/tcp/{old_port}")).unwrap();
+        fs::write(
+            coord_file_path(&data),
+            format!(
+                r#"{{"kubo_pid":{},"api_port":{old_port},"gateway_port":0,"started_at":1,"last_used":1}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(coord_file_path(&data), fs::Permissions::from_mode(0o644)).unwrap();
+        // Kubo CLI calls other than the daemon fail; start works without them.
+        let kubo = data.join("kubo-fixture");
+        fs::write(&kubo, "#!/bin/sh\ncase \"$1\" in\ndaemon) printf '%s' \"$3\" > \"$IPFS_PATH.started\"; exec sleep 60;;\n*) exit 1;;\nesac\n").unwrap();
+        fs::set_permissions(&kubo, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut provider = IpfsProvider::new();
+        let init = provider.handle(
+            parse_request(
+                &serde_json::json!({"op":"init","config":{"base_path":data}}).to_string(),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(init, Response::Ok { .. }));
+        assert_eq!(provider.state, KuboState::Cold);
+        provider.kubo_binary = Some(kubo);
+        let thread_repo = repo.clone();
+        let backend = std::thread::spawn(move || {
+            let mut old = accept_bounded_fixture(&old_api);
+            let shutdown = read_bounded_fixture_headers(&mut old);
+            // The old daemon exits and removes its api file.
+            fs::remove_file(thread_repo.join("api")).unwrap();
+            old.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            drop(old);
+            let started_path = thread_repo.with_extension("started");
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let port = loop {
+                if let Some(port) = fs::read_to_string(&started_path)
+                    .ok()
+                    .and_then(|address| address.rsplit('/').next()?.parse::<u16>().ok())
+                {
+                    break port;
+                }
+                assert!(Instant::now() < deadline, "replacement was not started");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut health = accept_bounded_fixture(&listener);
+            let health_headers = read_bounded_fixture_headers(&mut health);
+            let secret = repo_api_secret(&thread_repo).unwrap();
+            let response: &[u8] = if authorized(&health_headers, &secret) {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+            } else {
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            };
+            health.write_all(response).unwrap();
+            (shutdown, health_headers)
+        });
+        let started = provider.ensure_kubo();
+        if let Some(mut replacement) = provider.kubo_child.take() {
+            let _ = replacement.kill();
+            replacement.wait().unwrap();
+        }
+        let (shutdown, health) = backend.join().unwrap();
+        started.unwrap();
+        assert!(shutdown.starts_with("POST /api/v0/shutdown "));
+
+        let coord = read_coord_file(&data).expect("new private coordinates");
+        assert_eq!(
+            fs::metadata(coord_file_path(&data)).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_ne!(coord.kubo_pid, std::process::id());
+        assert_eq!(coord.api_secret, provider.api_secret);
+        assert!(authorized(&health, &coord.api_secret));
+
+        let config_path = repo.join("config");
+        assert_eq!(fs::metadata(&config_path).unwrap().mode() & 0o777, 0o600);
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(config["Addresses"]["Swarm"], serde_json::json!([]));
+        assert_eq!(
+            config["Addresses"]["Gateway"],
+            format!("/ip4/127.0.0.1/tcp/{}", coord.gateway_port)
+        );
+        assert_eq!(config["Discovery"]["MDNS"]["Enabled"], false);
+        assert_eq!(config["Swarm"]["DisableNatPortMap"], true);
+        assert_eq!(
+            config["API"]["Authorizations"],
+            serde_json::json!({"elastos": {"AuthSecret": format!("bearer:{}", coord.api_secret),
+                "AllowedPaths": ["/api/v0"]}})
+        );
+        assert_eq!(config["API"]["HTTPHeaders"], serde_json::json!({}));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "requires explicit ELASTOS_TEST_KUBO_PATH; parent runs"]
+    fn real_kubo_replaces_an_open_daemon_and_refuses_api_calls_without_the_secret() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        struct Reaped(Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let kubo = PathBuf::from(
+            std::env::var_os("ELASTOS_TEST_KUBO_PATH")
+                .expect("explicit Kubo prerequisite; a skipped test is not proof"),
+        );
+        assert!(kubo.is_absolute() && kubo.is_file());
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().canonicalize().unwrap().join("data");
+        fs::create_dir_all(data.join("bin")).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&kubo, data.join("bin/kubo")).unwrap();
+        let repo = data.join("ipfs-repo");
+        let kubo_command = |args: &[&str]| {
+            let mut command = Command::new(&kubo);
+            command
+                .args(args)
+                .env_clear()
+                .env("HOME", root.path())
+                .env("IPFS_PATH", &repo)
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::null());
+            command
+        };
+        let previous_umask = unsafe { libc::umask(0o022) };
+
+        // An earlier release: a default repository, a daemon with an open API
+        // and coordinates written with the umask and without a secret.
+        assert!(kubo_command(&["init"]).output().unwrap().status.success());
+        let old_port = bind_free_port().unwrap();
+        let mut old = Reaped(
+            kubo_command(&[
+                "daemon",
+                "--offline",
+                "--api",
+                &format!("/ip4/127.0.0.1/tcp/{old_port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        );
+        let deadline = Instant::now() + KUBO_STARTUP_TIMEOUT;
+        while ureq::post(&format!("http://127.0.0.1:{old_port}/api/v0/version"))
+            .timeout(Duration::from_secs(1))
+            .call()
+            .is_err()
+        {
+            assert!(Instant::now() < deadline, "open fixture daemon readiness");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        fs::write(
+            coord_file_path(&data),
+            serde_json::json!({"kubo_pid":old.0.id(),"api_port":old_port,"gateway_port":0,
+                "started_at":1,"last_used":1})
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut provider = IpfsProvider::new();
+        let init = provider.handle(
+            parse_request(
+                &serde_json::json!({"op":"init","config":{"base_path":data}}).to_string(),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(init, Response::Ok { .. }));
+        assert_eq!(
+            provider.kubo_binary.as_deref(),
+            Some(&*data.join("bin/kubo"))
+        );
+        let started = provider.ensure_kubo();
+        let replacement = provider.kubo_child.take().map(Reaped);
+        unsafe { libc::umask(previous_umask) };
+        started.unwrap();
+        let replacement = replacement.expect("provider owns the replacement daemon");
+        let deadline = Instant::now() + KUBO_STOP_TIMEOUT;
+        while old.0.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "open daemon was not stopped");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let coord = read_coord_file(&data).expect("private coordinates");
+        assert_eq!(
+            fs::metadata(coord_file_path(&data)).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(coord.kubo_pid, replacement.0.id());
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .try_proxy_from_env(false)
+            .build();
+        let call = |path: &str, authorization: Option<&str>| {
+            let mut request = agent
+                .post(&format!("http://127.0.0.1:{}{path}", coord.api_port))
+                .timeout(Duration::from_secs(5));
+            if let Some(authorization) = authorization {
+                request = request.set("Authorization", authorization);
+            }
+            match request.call() {
+                Ok(response) => (response.status(), response.into_string().unwrap()),
+                Err(ureq::Error::Status(status, response)) => {
+                    (status, response.into_string().unwrap())
+                }
+                Err(error) => panic!("Kubo API transport failed: {error}"),
+            }
+        };
+        let bearer = format!("Bearer {}", coord.api_secret);
+        assert_eq!(call("/api/v0/version", None).0, 403);
+        assert_eq!(
+            call("/api/v0/version", Some(&format!("Bearer {FIXTURE_SECRET}"))).0,
+            403
+        );
+        let (status, version) = call("/api/v0/version", Some(&bearer));
+        assert_eq!(status, 200, "{version}");
+        let (status, listen) = call("/api/v0/swarm/addrs/listen", Some(&bearer));
+        assert_eq!(status, 200, "{listen}");
+        let listen: serde_json::Value = serde_json::from_str(&listen).unwrap();
+        assert!(
+            listen["Strings"].is_null() || listen["Strings"] == serde_json::json!([]),
+            "Kubo has a swarm listener: {listen}"
+        );
+        // Publishing imports and reads through the provider keep working.
+        let added = provider.handle(
+            parse_request(
+                &serde_json::json!({"op":"add_bytes","data":BASE64.encode(b"published bytes"),
+                    "filename":"published.txt","pin":true})
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        let Response::Ok { data: Some(added) } = added else {
+            panic!("add through the locked-down Kubo failed");
+        };
+        let cid = added["cid"].as_str().unwrap().to_owned();
+        let read = provider
+            .handle(parse_request(&serde_json::json!({"op":"cat","cid":cid}).to_string()).unwrap());
+        let Response::Ok { data: Some(read) } = read else {
+            panic!("cat through the locked-down Kubo failed");
+        };
+        assert_eq!(
+            BASE64.decode(read["data"].as_str().unwrap()).unwrap(),
+            b"published bytes"
+        );
+        // Kubo's own CLI reaches the daemon only with the secret.
+        assert!(!kubo_command(&["id"]).output().unwrap().status.success());
+        let id = kubo_command(&["id", "--api-auth", &format!("bearer:{}", coord.api_secret)])
+            .output()
+            .unwrap();
+        assert!(
+            id.status.success(),
+            "{}",
+            String::from_utf8_lossy(&id.stderr)
+        );
+
+        let config_path = repo.join("config");
+        assert_eq!(fs::metadata(&config_path).unwrap().mode() & 0o777, 0o600);
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(config["Addresses"]["Swarm"], serde_json::json!([]));
+        assert_eq!(
+            config["Addresses"]["Gateway"],
+            format!("/ip4/127.0.0.1/tcp/{}", coord.gateway_port)
+        );
+        assert_eq!(config["Discovery"]["MDNS"]["Enabled"], false);
+        assert_eq!(config["Swarm"]["DisableNatPortMap"], true);
+        assert_eq!(config["Bootstrap"], serde_json::json!([]));
+        assert_eq!(config["Routing"]["Type"], "none");
+        assert_eq!(
+            config["API"]["Authorizations"]["elastos"]["AuthSecret"],
+            format!("bearer:{}", coord.api_secret)
+        );
+        // Without a shared root Kubo connects to no one.
+        std::thread::sleep(Duration::from_secs(3));
+        let (status, peers) = call("/api/v0/swarm/peers", Some(&bearer));
+        assert_eq!(status, 200, "{peers}");
+        let peers: serde_json::Value = serde_json::from_str(&peers).unwrap();
+        assert!(
+            peers["Peers"].is_null() || peers["Peers"] == serde_json::json!([]),
+            "Kubo has peers without a shared root: {peers}"
+        );
+        drop(replacement);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "requires explicit ELASTOS_TEST_KUBO_PATH and network access; parent runs"]
+    fn real_kubo_opens_its_swarm_only_while_a_root_is_shared_and_announces_only_shared_roots() {
+        let kubo = PathBuf::from(
+            std::env::var_os("ELASTOS_TEST_KUBO_PATH")
+                .expect("explicit Kubo prerequisite; a skipped test is not proof"),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().canonicalize().unwrap().join("data");
+        fs::create_dir_all(data.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&kubo, data.join("bin/kubo")).unwrap();
+        let mut provider = IpfsProvider::new();
+        // The provider owns every daemon it starts; reap the last one on any outcome.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let request = |provider: &mut IpfsProvider, wire: serde_json::Value| {
+                let response = provider.handle(parse_request(&wire.to_string()).unwrap());
+                let Response::Ok { data } = response else {
+                    panic!("{wire} failed");
+                };
+                data
+            };
+            let rpc = |provider: &IpfsProvider, path: &str, arg: Option<&str>| {
+                let query: Vec<(&str, &str)> = arg.into_iter().map(|arg| ("arg", arg)).collect();
+                serde_json::from_str::<serde_json::Value>(&provider.kubo_rpc(path, &query).unwrap())
+                    .unwrap()
+            };
+            request(
+                &mut provider,
+                serde_json::json!({"op":"init","config":{"base_path":data}}),
+            );
+            let mut add = |bytes: &[u8]| {
+                request(
+                    &mut provider,
+                    serde_json::json!({"op":"add_bytes","data":BASE64.encode(bytes),
+                        "filename":"object.txt","pin":true}),
+                )
+                .unwrap()["cid"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            let private_object = add(b"private library object");
+            let published = add(b"published share");
+            assert_ne!(published, private_object);
+            let closed_pid = read_coord_file(&data).unwrap().kubo_pid;
+
+            request(
+                &mut provider,
+                serde_json::json!({"op":"runtime_share_root","cid":published}),
+            );
+            let coord = read_coord_file(&data).unwrap();
+            assert_ne!(coord.kubo_pid, closed_pid, "the first share restarts Kubo");
+            let swarm = rpc(&provider, "config", Some("Addresses.Swarm"))["Value"].clone();
+            let port = swarm[0]
+                .as_str()
+                .unwrap()
+                .strip_prefix("/ip4/0.0.0.0/tcp/")
+                .unwrap()
+                .to_owned();
+            let listen = rpc(&provider, "swarm/addrs/listen", None)["Strings"].clone();
+            assert!(
+                listen
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|address| address.as_str().unwrap().ends_with(&format!("/tcp/{port}"))),
+                "no swarm listener while sharing: {listen}"
+            );
+            assert_eq!(
+                rpc(&provider, "config", Some("Provide.Strategy"))["Value"],
+                "mfs"
+            );
+            assert_eq!(
+                rpc(&provider, "config", Some("Bootstrap"))["Value"],
+                serde_json::json!(["auto"])
+            );
+            assert_eq!(
+                rpc(&provider, "config", Some("Discovery.MDNS.Enabled"))["Value"],
+                false
+            );
+            let shared: Vec<String> = rpc(&provider, "files/ls", Some(SHARED_ROOTS_DIR))["Entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["Name"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(
+                shared,
+                std::slice::from_ref(&published),
+                "only the shared root is announced"
+            );
+
+            request(
+                &mut provider,
+                serde_json::json!({"op":"runtime_unshare_root","cid":published}),
+            );
+            assert_ne!(read_coord_file(&data).unwrap().kubo_pid, coord.kubo_pid);
+            assert_eq!(
+                rpc(&provider, "config", Some("Addresses.Swarm"))["Value"],
+                serde_json::json!([])
+            );
+            let listen = rpc(&provider, "swarm/addrs/listen", None)["Strings"].clone();
+            assert!(
+                listen.is_null() || listen == serde_json::json!([]),
+                "swarm listener after the last share ended: {listen}"
+            );
+            assert_eq!(
+                rpc(&provider, "config", Some("Bootstrap"))["Value"],
+                serde_json::json!([])
+            );
+        }));
+        if let Some(mut child) = provider.kubo_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]

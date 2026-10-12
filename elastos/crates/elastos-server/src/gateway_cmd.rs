@@ -46,6 +46,7 @@ where
     F: Fn() -> Fut + Copy + Send + Sync + 'static,
     Fut: Future<Output = anyhow::Result<GatewayControlPlane>> + Send,
 {
+    crate::data_root::require_private_data_root(&default_data_dir())?;
     if public {
         anyhow::ensure!(
             on_ready.is_none(),
@@ -115,8 +116,6 @@ where
             components_path.display()
         );
     }
-
-    let bind_addr = addr.replace("127.0.0.1", "0.0.0.0");
 
     let components_data = tokio::fs::read_to_string(&components_path).await?;
     let registry: setup::ComponentsManifest = serde_json::from_str(&components_data)?;
@@ -209,7 +208,6 @@ where
         }
 
         let mut handles = Vec::<String>::new();
-        let mut tunnel_host_ip: Option<String> = None;
         for cap in &capsules {
             eprintln!("[gateway] launching infrastructure capsule '{}'", cap);
             let resp = supervisor_require_ok(
@@ -224,30 +222,24 @@ where
             let handle = resp
                 .handle
                 .ok_or_else(|| anyhow::anyhow!("launch response missing handle for '{}'", cap))?;
-            if cap == "tunnel-provider" {
-                tunnel_host_ip = resp.path.clone();
-            }
             handles.push(handle);
         }
 
         let gateway_resp = supervisor_require_ok(
             &sup,
             supervisor::SupervisorRequest::StartGateway {
-                addr: bind_addr.clone(),
+                addr: addr.clone(),
                 cache_dir: cache_dir.map(|p| p.to_string_lossy().to_string()),
             },
         )
         .await?;
-        let effective_addr = gateway_resp.path.unwrap_or(bind_addr);
+        // The gateway listens where the owner asked (loopback by default);
+        // the tunnel provider runs on this host and dials that address.
+        let effective_addr = gateway_resp.path.unwrap_or_else(|| addr.clone());
 
         println!("Gateway: http://{}", effective_addr);
 
-        let port = effective_addr.rsplit(':').next().unwrap_or("8090");
-        let tunnel_target = if let Some(ref host_ip) = tunnel_host_ip {
-            format!("http://{}:{}", host_ip, port)
-        } else {
-            format!("http://{}", effective_addr)
-        };
+        let tunnel_target = format!("http://{}", effective_addr);
 
         eprintln!("[gateway] requesting public tunnel for {}", tunnel_target);
         let tunnel_resp = provider_send_raw_retry(

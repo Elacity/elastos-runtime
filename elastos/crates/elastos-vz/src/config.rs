@@ -254,8 +254,7 @@ fn default_data_dir() -> PathBuf {
     // resolution (which on Mac prefers `dirs::data_dir()`) is handled in
     // elastos-server and is out of scope here.
     let home = std::env::var_os("HOME").map(PathBuf::from).or_else(|| {
-        // Fallback for setcap / AT_SECURE invocations where HOME is
-        // scrubbed. Same fallback path crosvm uses.
+        // Fallback when HOME is unset. Same fallback path crosvm uses.
         // SAFETY: getuid is always safe; getpwuid returns NULL on error
         // and we check for null before dereferencing.
         let uid = unsafe { libc::getuid() };

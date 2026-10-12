@@ -1352,8 +1352,10 @@ sha256_check "${INSTALL_SCRATCH}/elastos" "$BINARY_SHA256"
 # Directories created here are 0755 whatever the caller's umask.
 (umask 022; mkdir -p "$INSTALL_DIR")
 
-# New Runtime data is private; preserve the mode of an existing installation.
+# Runtime data is private: new folders are created 0700 and an existing
+# folder this account owns is narrowed to 0700 (the Runtime does the same).
 (umask 077; mkdir -p "$DATA_DIR")
+if [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" && -O "$DATA_DIR" ]]; then chmod 700 "$DATA_DIR"; fi
 
 require_install_space "$INSTALL_DIR" "$BINARY_SIZE"
 TMP_INSTALL_BIN="$(mktemp "${INSTALL_DIR}/.elastos.install.XXXXXX")"

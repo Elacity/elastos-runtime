@@ -71,7 +71,7 @@ fn managed_runtime_start_lock_path(data_dir: &Path) -> PathBuf {
 }
 
 fn acquire_managed_runtime_start_lock(data_dir: &Path) -> anyhow::Result<ManagedRuntimeStart> {
-    std::fs::create_dir_all(data_dir)?;
+    crate::data_root::create_private_dir_all(data_dir)?;
     let path = managed_runtime_start_lock_path(data_dir);
     match create_managed_runtime_start_marker(&path) {
         Ok(file) => Ok(ManagedRuntimeStart::Owner(ManagedRuntimeStartGuard {
@@ -562,7 +562,7 @@ fn sync_managed_runtime_child_components_manifest(
     }
     let child_data_dir = managed_runtime_child_data_dir(child_home);
     let child_bin_dir = child_data_dir.join("bin");
-    std::fs::create_dir_all(&child_bin_dir)?;
+    crate::data_root::create_private_dir_all(&child_bin_dir)?;
     std::fs::write(child_data_dir.join("components.json"), &manifest_bytes)?;
     let verified_manifest: crate::setup::ComponentsManifest =
         serde_json::from_slice(&manifest_bytes).map_err(|error| {
@@ -589,19 +589,13 @@ fn sync_managed_runtime_child_components_manifest(
     Ok(())
 }
 
+/// Publish runtime coordinates (they carry the attach secret): created 0600
+/// in one atomic rename, never through a symlink.
 pub fn write_runtime_coords(path: &Path, coords: &RuntimeCoords) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::data_root::create_private_dir_all(parent)?;
     }
-    let data = serde_json::to_vec_pretty(coords)?;
-    std::fs::write(path, &data)?;
-    // Restrict to owner-only (contains attach secret).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    write_private_runtime_coords_atomically(path, coords)
 }
 
 pub(crate) struct GatewayRuntimeCoordsGuard {
@@ -681,7 +675,8 @@ fn write_private_runtime_coords_atomically(
     write_result
 }
 
-fn read_private_runtime_coords(path: &Path) -> Option<RuntimeCoords> {
+/// Read coordinates only from a regular 0600 file owned by this account.
+pub(crate) fn read_private_runtime_coords(path: &Path) -> Option<RuntimeCoords> {
     use std::io::Read as _;
 
     let metadata = std::fs::symlink_metadata(path).ok()?;
@@ -691,7 +686,8 @@ fn read_private_runtime_coords(path: &Path) -> Option<RuntimeCoords> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-        if metadata.mode() & 0o777 != 0o600 || metadata.uid() != unsafe { libc::geteuid() } {
+        let euid = unsafe { libc::geteuid() };
+        if metadata.uid() != euid || metadata.nlink() != 1 {
             return None;
         }
         let mut options = std::fs::OpenOptions::new();
@@ -699,8 +695,17 @@ fn read_private_runtime_coords(path: &Path) -> Option<RuntimeCoords> {
         let file = options.open(path).ok()?;
         let opened_metadata = file.metadata().ok()?;
         if !opened_metadata.is_file()
-            || opened_metadata.mode() & 0o777 != 0o600
-            || opened_metadata.uid() != unsafe { libc::geteuid() }
+            || opened_metadata.dev() != metadata.dev()
+            || opened_metadata.ino() != metadata.ino()
+            || opened_metadata.uid() != euid
+            || opened_metadata.nlink() != 1
+        {
+            return None;
+        }
+        // Coordinates this account wrote with a looser mode (older releases
+        // wrote, then narrowed) are made owner-only before use.
+        if opened_metadata.mode() & 0o777 != 0o600
+            && unsafe { libc::fchmod(std::os::fd::AsRawFd::as_raw_fd(&file), 0o600) } != 0
         {
             return None;
         }
@@ -735,8 +740,7 @@ impl Drop for GatewayRuntimeCoordsGuard {
 }
 
 pub async fn read_runtime_coords(path: &Path) -> Option<RuntimeCoords> {
-    let data = std::fs::read(path).ok()?;
-    let coords: RuntimeCoords = serde_json::from_slice(&data).ok()?;
+    let coords = read_private_runtime_coords(path)?;
     validate_runtime_coords(path, coords).await
 }
 
@@ -1192,7 +1196,9 @@ async fn ensure_managed_runtime(
     let child_home_dir =
         subordinate_gateway_host.then(|| managed_runtime_child_home_dir(data_dir, runtime_kind));
     if let Some(child_home_dir) = child_home_dir.as_ref() {
-        std::fs::create_dir_all(managed_runtime_child_xdg_data_home(child_home_dir))?;
+        crate::data_root::create_private_dir_all(&managed_runtime_child_xdg_data_home(
+            child_home_dir,
+        ))?;
     }
 
     if let Some(pid) = current_process_managed_runtime_child(runtime_kind) {
@@ -1492,6 +1498,96 @@ fn reserve_managed_chat_addr() -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn sample_coords() -> RuntimeCoords {
+        RuntimeCoords {
+            api_url: "http://127.0.0.1:3000".to_string(),
+            attach_secret: "secret".to_string(),
+            pid: std::process::id(),
+            runtime_kind: RUNTIME_KIND_MANAGED_HOME.to_string(),
+            binary_sha256: String::new(),
+            policy_sha256: String::new(),
+            dependency_sha256: String::new(),
+            generation: String::new(),
+            home_url: String::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_coords_are_owner_only_under_a_permissive_umask() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested/home-runtime-coords.json");
+        let previous = unsafe { libc::umask(0o022) };
+        let first = write_runtime_coords(&path, &sample_coords());
+        let mut replacement = sample_coords();
+        replacement.attach_secret = "rotated".to_string();
+        let second = write_runtime_coords(&path, &replacement);
+        unsafe { libc::umask(previous) };
+        first.unwrap();
+        second.unwrap();
+
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::symlink_metadata(path.parent().unwrap())
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(read_private_runtime_coords(&path), Some(replacement));
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("home-runtime-coords.json")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_coords_writer_replaces_a_symlink_without_writing_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.json");
+        std::fs::write(&target, b"keep").unwrap();
+        let path = temp.path().join("runtime-coords.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(write_runtime_coords(&path, &sample_coords()).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        assert!(read_private_runtime_coords(&path).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_coords_from_this_account_are_narrowed_and_read() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("runtime-coords.json");
+        std::fs::write(&path, serde_json::to_vec(&sample_coords()).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(read_private_runtime_coords(&path), Some(sample_coords()));
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_coords_are_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("runtime-coords.json");
+        write_runtime_coords(&path, &sample_coords()).unwrap();
+        std::fs::hard_link(&path, temp.path().join("other")).unwrap();
+        assert!(read_private_runtime_coords(&path).is_none());
+    }
     use axum::{routing::get, Json, Router};
 
     #[test]

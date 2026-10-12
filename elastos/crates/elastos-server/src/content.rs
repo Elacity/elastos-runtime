@@ -3504,6 +3504,12 @@ impl ContentProvider {
             )
             .await?;
         let cid = provider_response_cid(&ipfs_response)?;
+        if pin {
+            // Unpeered recipients fetch published roots from the IPFS network.
+            if let Err(error) = registry.set_local_ipfs_root_shared(&cid, true).await {
+                tracing::warn!("content publish could not share {cid} with IPFS peers: {error}");
+            }
+        }
         let local_outcome = AvailabilityOutcome::local_publish(pin);
         let outcome = if pin {
             self.ensure_network_availability(
@@ -4038,6 +4044,11 @@ impl ContentProvider {
         }
 
         let registry = self.registry()?;
+        if let Err(error) = registry.set_local_ipfs_root_shared(cid, false).await {
+            tracing::warn!(
+                "content unpublish could not stop sharing {cid} with IPFS peers: {error}"
+            );
+        }
         let ipfs_response = self
             .invoke_provider(
                 &registry,
@@ -11739,6 +11750,54 @@ mod tests {
         assert_eq!(
             ipfs.unpinned.lock().await.as_slice(),
             [TEST_CID.to_string()]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn content_shares_pinned_publications_with_ipfs_peers_until_unpublished() {
+        let (_data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let ops = |requests: &[Value]| -> Vec<(String, String)> {
+            requests
+                .iter()
+                .map(|request| {
+                    (
+                        request["op"].as_str().unwrap_or_default().to_string(),
+                        request["cid"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .filter(|(op, _)| op.contains("share_root") || op == "unpin")
+                .collect()
+        };
+        for pin in [false, true] {
+            let response = content
+                .send_raw(&json!({
+                    "op": "publish",
+                    "kind": "directory",
+                    "files": [{"path": "index.md", "data": "IyBUZXN0Cg=="}],
+                    "pin": pin,
+                }))
+                .await
+                .unwrap();
+            assert_eq!(response["status"], "ok");
+        }
+        // Only the pinned publication is shared; a local add is not.
+        assert_eq!(
+            ops(&ipfs.requests.lock().await),
+            [("runtime_share_root".to_string(), TEST_CID.to_string())]
+        );
+        ipfs.requests.lock().await.clear();
+        let response = content
+            .send_raw(&json!({"op": "unpublish", "cid": TEST_CID}))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(
+            ops(&ipfs.requests.lock().await),
+            [
+                ("runtime_unshare_root".to_string(), TEST_CID.to_string()),
+                ("unpin".to_string(), TEST_CID.to_string()),
+            ]
         );
     }
 
