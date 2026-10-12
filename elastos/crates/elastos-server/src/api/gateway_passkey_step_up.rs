@@ -1430,6 +1430,7 @@ mod tests {
                 SYSTEM_CAPSULE_ID.to_string(),
                 WALLET_CAPSULE_ID.to_string(),
             ],
+            label: None,
         };
         crate::auth::store_session_grant(data_dir.path(), grant.clone()).unwrap();
         let context = HomeLaunchTokenContext {

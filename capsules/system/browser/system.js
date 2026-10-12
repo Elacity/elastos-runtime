@@ -27,6 +27,10 @@ const dockAutoHideInput = document.querySelector("#dock-autohide");
 const uiSoundsInput = document.querySelector("#ui-sounds");
 const passkeyStatusNode = document.querySelector('[data-field="passkey-status"]');
 const accountListNode = document.querySelector("#account-list");
+const sessionListNode = document.querySelector("#session-list");
+const sessionStatusNode = document.querySelector('[data-field="session-status"]');
+const sessionNoteNode = document.querySelector('[data-field="session-note"]');
+const sessionRevokeOthersButton = document.querySelector("#session-revoke-others");
 const recoveryDownloadButton = document.querySelector("#recovery-download");
 const recoveryProfileSetup = document.querySelector("#recovery-profile-setup");
 const recoveryProfileName = document.querySelector("#recovery-profile-name");
@@ -192,6 +196,7 @@ async function boot() {
   configureGuestAccess();
   configureAiProvider();
   configurePasskeyAccess();
+  configureSessionAccess();
   configureRecoveryAccess();
   configureChainAccess();
   configureActiveShell();
@@ -203,6 +208,7 @@ async function boot() {
     await refreshSystemSummary();
     await refreshActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
     await refreshAccountList().catch(() => {});
+    await refreshSessionList().catch((error) => showSessionStatus(error, "error"));
     await refreshRecoveryStatus();
   })();
   configureHomeRecoverySave();
@@ -309,6 +315,9 @@ function configureSettingsTabs() {
     }
     activateSettingsTab(item.dataset.settings);
     document.querySelector(".settings-sidebar")?.classList.remove("active");
+    if (item.dataset.settings === "account") {
+      refreshSessionList().catch((error) => showSessionStatus(error, "error"));
+    }
   });
   document.querySelector(".sidebar-toggle")?.addEventListener("click", () => {
     document.querySelector(".settings-sidebar")?.classList.toggle("active");
@@ -2794,6 +2803,139 @@ async function onAccountListClick(event) {
     showPasskeyStatus(String(error.message || error), "error");
     button.disabled = false;
   }
+}
+
+function configureSessionAccess() {
+  sessionListNode?.addEventListener("click", onSessionListClick);
+  sessionRevokeOthersButton?.addEventListener("click", onRevokeOtherSessions);
+}
+
+async function refreshSessionList() {
+  if (!sessionListNode || !hasShellAccess()) {
+    return;
+  }
+  const data = await fetchJson("/api/auth/sessions", { headers: shellHeaders() });
+  const days = Math.round(Number(data.max_age_secs) / 86400);
+  if (sessionNoteNode && days > 0) {
+    sessionNoteNode.textContent = `Browsers where your account is signed in. Each sign-in lasts up to ${days} days, then you sign in again with your passkey.`;
+  }
+  renderSessions(Array.isArray(data.sessions) ? data.sessions : []);
+}
+
+function renderSessions(sessions) {
+  sessionListNode.replaceChildren();
+  const others = sessions.filter((session) => !session.current).length;
+  if (sessionRevokeOthersButton) {
+    sessionRevokeOthersButton.hidden = others === 0;
+    sessionRevokeOthersButton.disabled = !hasShellAccess();
+  }
+  if (sessions.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "account-empty";
+    empty.textContent = "No signed-in devices";
+    sessionListNode.append(empty);
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "account-table session-table";
+  table.innerHTML = `
+    <thead>
+      <tr>
+        <th scope="col">Device</th>
+        <th scope="col">Signed in</th>
+        <th scope="col">Last active</th>
+        <th scope="col">Actions</th>
+      </tr>
+    </thead>
+  `;
+  const body = document.createElement("tbody");
+  for (const session of sessions) {
+    body.append(sessionRow(session));
+  }
+  table.append(body);
+  sessionListNode.append(table);
+}
+
+function sessionRow(session) {
+  const row = document.createElement("tr");
+  row.className = "account-row session-row";
+  row.dataset.current = session.current ? "true" : "false";
+  const label = readText(session.label) || "Unknown browser";
+
+  const deviceCell = accountCell("Device", "account-name");
+  const deviceWrap = document.createElement("div");
+  deviceWrap.className = "account-name-wrap";
+  const title = document.createElement("strong");
+  title.textContent = label;
+  deviceWrap.append(title);
+  if (session.current) {
+    const current = document.createElement("small");
+    current.textContent = "This device";
+    deviceWrap.append(current);
+  }
+  deviceCell.append(deviceWrap);
+
+  const signedInCell = accountCell("Signed in", "account-used");
+  signedInCell.textContent = formatTimestamp(session.created_at);
+  const usedCell = accountCell("Last active", "account-used");
+  usedCell.textContent = formatTimestamp(session.last_used_at);
+
+  const actionsCell = accountCell("Actions", "account-actions-cell");
+  if (!session.current) {
+    const revoke = document.createElement("button");
+    revoke.className = "system-button system-button-secondary session-revoke";
+    revoke.type = "button";
+    revoke.textContent = "Sign out";
+    revoke.setAttribute("aria-label", `Sign out ${label}`);
+    revoke.dataset.sessionRevoke = readText(session.session_id);
+    revoke.disabled = !revoke.dataset.sessionRevoke || !hasShellAccess();
+    actionsCell.append(revoke);
+  }
+
+  row.append(deviceCell, signedInCell, usedCell, actionsCell);
+  return row;
+}
+
+async function onSessionListClick(event) {
+  const button = event.target.closest("[data-session-revoke]");
+  const sessionId = readText(button?.dataset.sessionRevoke);
+  if (!button || !sessionId || !hasShellAccess()) {
+    return;
+  }
+  await runSessionAction(button, `/api/auth/sessions/${encodeURIComponent(sessionId)}/revoke`, "Signed out");
+}
+
+async function onRevokeOtherSessions() {
+  if (!sessionRevokeOthersButton || !hasShellAccess()) {
+    return;
+  }
+  await runSessionAction(sessionRevokeOthersButton, "/api/auth/sessions/revoke-others", "Signed out everywhere else");
+}
+
+async function runSessionAction(button, url, doneMessage) {
+  button.disabled = true;
+  showSessionStatus("Signing out", "muted");
+  try {
+    await fetchJson(url, { method: "POST", headers: shellHeaders() });
+    await refreshSessionList();
+    showSessionStatus(doneMessage, "success");
+  } catch (error) {
+    showSessionStatus(error, "error");
+    button.disabled = false;
+  }
+}
+
+function showSessionStatus(message, tone) {
+  if (!sessionStatusNode) {
+    return;
+  }
+  const text = tone === "error"
+    ? publicSystemError(message, "Signed-in devices could not be updated. Refresh System and try again.")
+    : readText(message);
+  sessionStatusNode.hidden = text.length === 0;
+  sessionStatusNode.textContent = text;
+  sessionStatusNode.dataset.tone = tone;
+  sessionStatusNode.classList.toggle("system-value-muted", tone !== "success");
 }
 
 async function refreshRecoveryStatus() {

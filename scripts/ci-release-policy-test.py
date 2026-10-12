@@ -2180,12 +2180,14 @@ class InstalledJourneyTests(unittest.TestCase):
                     if command[1] == "scripts/ci-model-package.mjs":
                         (evidence / "package.json").write_text(json.dumps({"cid": self.PACKAGE_CID}))
                         return
-                    self.assertEqual(command[-1], "--home-only")
+                    self.assertEqual(command[-2], "--home-only")
+                    self.assertRegex(command[-1], r"^http://localhost:\d+$")
                     if appeared == "ui_missing":
                         raise subprocess.CalledProcessError(1, command)
                     (evidence / "home-journey.json").write_text(json.dumps({
                         "dispatch_unavailable_reason": "unknown_reason" if appeared == "reason" else "source_engine_required", "results": {
                         "home_screenshots": "passed", "engine_absent_home": "passed",
+                        **{name: "passed" for name in journey["ACCOUNT_RESULTS"]},
                         "engine_absent_refusal": "failed" if appeared == "refusal" else "passed"}}))
                     if appeared == "alias":
                         (target / "bin/llama-server").write_text("engine appeared during UI")
@@ -2445,7 +2447,7 @@ class InstalledModelTimingTests(unittest.TestCase):
     def test_summary_requires_three_current_candidate_passes_and_preserves_failure(self):
         shell = (WORKFLOW.parents[2] / "scripts/ci-installed-journeys.sh").read_text()
         source = shell.split('python3 - "$EVIDENCE" "$DATA" <<\'PY\'\n', 1)[1].split('\nPY\n', 1)[0]
-        for failure in (None, "missing", "candidate", "reply", "absence", "refusal", "refusal_reason", "engine_process"):
+        for failure in (None, "missing", "candidate", "reply", "absence", "refusal", "refusal_reason", "engine_process", "restore"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 _, data, _, _ = InstalledJourneyTests().fixture(root, "macos")
@@ -2475,8 +2477,10 @@ class InstalledModelTimingTests(unittest.TestCase):
                     "installed_runtime_sha256": hashlib.sha256(runtime.read_bytes()).hexdigest(),
                     "dispatch_unavailable_reason": None if failure == "refusal_reason" else "source_engine_required",
                     "process_cleanup": {"before": {"llama_server": 1 if failure == "engine_process" else 0}},
-                    "results": {name: "failed" if (failure == "absence" and name == "engine_absent_home") or (failure == "refusal" and name == "engine_absent_refusal") else "passed"
-                                for name in ("engine_absent_home", "engine_absent_refusal", "home_screenshots", "process_cleanup", "disk_reserve")}}))
+                    "results": {name: "failed" if (failure == "absence" and name == "engine_absent_home") or (failure == "refusal" and name == "engine_absent_refusal")
+                                or (failure == "restore" and name == "restore_on_new_computer") else "passed"
+                                for name in ("engine_absent_home", "engine_absent_refusal", "home_screenshots", "process_cleanup", "disk_reserve",
+                                             *journey["ACCOUNT_RESULTS"])}}))
                 with mock.patch.object(sys, "argv", ["summary", str(root), str(data)]), \
                         mock.patch.object(sys, "platform", "darwin"), \
                         mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(root / "summary.md")}), \
@@ -2491,7 +2495,7 @@ class InstalledModelTimingTests(unittest.TestCase):
                                  "incomplete" if failure in ("missing", "candidate", "reply") else "complete")
                 if failure == "reply":
                     self.assertEqual(result["results"]["installed_runtime_reply"], "failed or not run")
-                if failure in ("absence", "refusal", "refusal_reason", "engine_process"):
+                if failure in ("absence", "refusal", "refusal_reason", "engine_process", "restore"):
                     self.assertEqual(result["results"]["engine_absent_home"], "failed or not run")
                 summary = (root / "summary.md").read_text()
                 self.assertIn(f"Source tree: `{'d' * 40}`", summary)
@@ -2523,7 +2527,7 @@ class InstalledModelTimingTests(unittest.TestCase):
                     **identities, "engine_absent": True, "dispatch_unavailable_reason": "source_engine_required",
                     "process_cleanup": {"before": {"llama_server": 0}},
                     "results": {name: "passed" for name in ("engine_absent_home", "engine_absent_refusal", "home_screenshots",
-                                                            "process_cleanup", "disk_reserve")}}))
+                                                            "process_cleanup", "disk_reserve", *journey["ACCOUNT_RESULTS"])}}))
                 with mock.patch.object(sys, "argv", ["summary", str(root), str(data)]), \
                         mock.patch.object(sys, "platform", "linux"), \
                         mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(root / "summary.md"), "CI_CARRIER_GET": carrier}), \

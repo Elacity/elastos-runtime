@@ -33,6 +33,9 @@ use crate::host_lock::FileLock;
 
 const AUTH_STATE_SCHEMA: &str = "elastos.auth.state/v1";
 pub(crate) const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
+/// Longest one sign-in lasts. Refresh never extends a session past
+/// `issued_at` plus this age; after it the user signs in again with a passkey.
+pub(crate) const AUTH_SESSION_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 const AUTH_STATE_ROOT: &str = "ElastOS/System/Auth";
 const AUTH_STATE_FILE: &str = "auth-state.json";
 const AUDIT_CHAIN_REQUIRED_FILE: &str = "audit-chain-required.json";
@@ -719,6 +722,9 @@ pub struct StoredAuthSession {
     pub grant: AuthSessionGrantV1,
     #[serde(default)]
     pub revoked_at: Option<u64>,
+    /// Last refresh of this sign-in; older records have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1555,6 +1561,7 @@ pub(crate) fn complete_owner_recovery(
             issued_at: now,
             expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
             apps: vec!["home".into(), "system".into()],
+            label: None,
         };
         let event = sign_audit_event(
             data_dir,
@@ -1607,6 +1614,7 @@ pub(crate) fn complete_owner_recovery(
         state.sessions.push(StoredAuthSession {
             grant: grant.clone(),
             revoked_at: None,
+            last_used_at: None,
         });
         state.owner_recovery = None;
         push_audit_event(data_dir, state, event)?;
@@ -1978,6 +1986,7 @@ pub(crate) fn complete_owner_enrollment_with_intent(
             issued_at: now,
             expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
             apps: vec!["home".into(), "system".into()],
+            label: None,
         };
         let event = sign_audit_event(
             data_dir,
@@ -2011,6 +2020,7 @@ pub(crate) fn complete_owner_enrollment_with_intent(
         state.sessions.push(StoredAuthSession {
             grant: grant.clone(),
             revoked_at: None,
+            last_used_at: None,
         });
         push_audit_event(data_dir, state, event)?;
         let OwnerEnrollmentPhase::Verified { verification } = record.phase else {
@@ -3637,6 +3647,7 @@ fn grant_passkey_session_in_state(
             issued_at: now,
             expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
             apps: vec!["home".into(), "system".into()],
+            label: None,
         };
         let event = sign_audit_event(
             data_dir,
@@ -3659,6 +3670,7 @@ fn grant_passkey_session_in_state(
         state.sessions.push(StoredAuthSession {
             grant: grant.clone(),
             revoked_at: None,
+            last_used_at: None,
         });
         push_audit_event(data_dir, state, event)?;
         Ok(grant)
@@ -4448,6 +4460,7 @@ pub fn store_session_grant(data_dir: &Path, grant: AuthSessionGrantV1) -> anyhow
         state.sessions.push(StoredAuthSession {
             grant,
             revoked_at: None,
+            last_used_at: None,
         });
         Ok(())
     })
@@ -4469,11 +4482,26 @@ fn renew_session_in_state(state: &mut AuthState, grant: AuthSessionGrantV1) -> a
     if stored.grant.grant_id != grant.grant_id
         || stored.grant.principal_id != grant.principal_id
         || stored.grant.proof_binding_id != grant.proof_binding_id
+        || stored.grant.issued_at != grant.issued_at
     {
         anyhow::bail!("auth session authority context mismatch");
     }
+    if grant.expires_at > grant.issued_at.saturating_add(AUTH_SESSION_MAX_AGE_SECS) {
+        anyhow::bail!("auth session expired: sign in again");
+    }
     stored.grant = grant;
+    stored.last_used_at = Some(now_ts());
     Ok(())
+}
+
+/// Expiry for a refresh at `now`: the usual TTL, never past the maximum
+/// sign-in age. Past that age the session cannot be refreshed.
+pub(crate) fn session_refresh_expires_at(issued_at: u64, now: u64) -> anyhow::Result<u64> {
+    let limit = issued_at.saturating_add(AUTH_SESSION_MAX_AGE_SECS);
+    if limit <= now {
+        anyhow::bail!("auth session expired: sign in again");
+    }
+    Ok(now.saturating_add(AUTH_SESSION_TTL_SECS).min(limit))
 }
 
 /// Commit renewal and its signed audit event before the caller issues tokens.
@@ -4523,6 +4551,7 @@ pub fn rotate_session_grant(
         state.sessions.push(StoredAuthSession {
             grant,
             revoked_at: None,
+            last_used_at: None,
         });
         Ok(())
     })
@@ -4541,6 +4570,61 @@ pub fn revoke_session_grant(
             .ok_or_else(|| anyhow!("auth session not found"))?;
         stored.revoked_at = Some(revoked_at);
         Ok(())
+    })
+}
+
+/// Record where a sign-in happened ("Chrome on macOS"). Display text only.
+pub fn set_session_label(data_dir: &Path, session_id: &str, label: &str) -> anyhow::Result<()> {
+    mutate_auth_state(data_dir, |state| {
+        let stored = state
+            .sessions
+            .iter_mut()
+            .find(|stored| stored.grant.session_id == session_id)
+            .ok_or_else(|| anyhow!("auth session not found"))?;
+        stored.grant.label = Some(label.to_string());
+        Ok(())
+    })
+}
+
+/// The principal's own sign-ins that still work, newest first.
+pub fn list_active_principal_sessions(
+    data_dir: &Path,
+    principal_id: &str,
+    now: u64,
+) -> anyhow::Result<Vec<StoredAuthSession>> {
+    let mut sessions = load_auth_state(data_dir)?
+        .sessions
+        .into_iter()
+        .filter(|stored| {
+            stored.grant.principal_id == principal_id
+                && stored.revoked_at.is_none()
+                && stored.grant.expires_at > now
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|a, b| b.grant.issued_at.cmp(&a.grant.issued_at));
+    Ok(sessions)
+}
+
+/// Sign the principal out everywhere except `keep_session_id`. Returns the
+/// sessions this revoked.
+pub fn revoke_other_principal_sessions(
+    data_dir: &Path,
+    principal_id: &str,
+    keep_session_id: &str,
+    revoked_at: u64,
+) -> anyhow::Result<Vec<String>> {
+    mutate_auth_state(data_dir, |state| {
+        let mut revoked = Vec::new();
+        for stored in &mut state.sessions {
+            if stored.grant.principal_id == principal_id
+                && stored.grant.session_id != keep_session_id
+                && stored.revoked_at.is_none()
+            {
+                stored.revoked_at = Some(revoked_at);
+                revoked.push(stored.grant.session_id.clone());
+            }
+        }
+        Ok(revoked)
     })
 }
 
@@ -5716,6 +5800,7 @@ pub fn commit_recovered_root_reassignment(
         state.sessions.push(StoredAuthSession {
             grant: replacement_grant,
             revoked_at: None,
+            last_used_at: None,
         });
         #[cfg(test)]
         consume_recovery_reassignment_test_fault(
@@ -9447,6 +9532,7 @@ mod tests {
             issued_at: now,
             expires_at: now + 3600,
             apps: vec!["home".into(), "system".into()],
+            label: None,
         };
         let mut state = load_auth_state(data_dir).unwrap();
         for index in 0..3 {
@@ -9457,6 +9543,7 @@ mod tests {
             state.sessions.push(StoredAuthSession {
                 grant: session,
                 revoked_at: None,
+                last_used_at: None,
             });
         }
         // Build valid signed fixture links directly, then run the full verifier
@@ -9678,6 +9765,7 @@ mod tests {
             issued_at: updated_at,
             expires_at: updated_at + 3_600,
             apps: vec!["home".to_string(), "system".to_string()],
+            label: None,
         };
         store_session_grant(data_dir, current_grant.clone()).unwrap();
 
@@ -9692,6 +9780,7 @@ mod tests {
             issued_at: updated_at,
             expires_at: updated_at + 3_600,
             apps: vec!["home".to_string(), "system".to_string()],
+            label: None,
         };
         let signed_audit_event = sign_audit_event(
             data_dir,
@@ -10631,6 +10720,7 @@ mod tests {
                         issued_at: now,
                         expires_at: now + 1_000,
                         apps: vec!["home".to_string(), "system".to_string()],
+                        label: None,
                     },
                 )
             }));
@@ -13188,6 +13278,7 @@ mod tests {
             issued_at: now,
             expires_at: now + 100,
             apps: vec!["home".to_string()],
+            label: None,
         };
         store_session_grant(data_dir.path(), grant).unwrap();
 

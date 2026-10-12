@@ -1271,6 +1271,7 @@ async fn home_summary_accepts_gateway_owned_home_cli_token_under_home_owned_gran
             issued_at: now,
             expires_at: now + 300,
             apps: vec![HOME_CAPSULE_ID.to_string()],
+            label: None,
         },
     )
     .unwrap();
@@ -1327,6 +1328,7 @@ async fn direct_home_cli_token_rejects_home_owned_grant_authority() {
             issued_at: now,
             expires_at: now + 300,
             apps: vec![HOME_CAPSULE_ID.to_string()],
+            label: None,
         },
     )
     .unwrap();
@@ -1364,6 +1366,7 @@ async fn gateway_owned_home_cli_issuer_projects_non_cli_capsules_under_home_auth
             issued_at: now,
             expires_at: now + 300,
             apps: vec![HOME_CAPSULE_ID.to_string()],
+            label: None,
         },
     )
     .unwrap();

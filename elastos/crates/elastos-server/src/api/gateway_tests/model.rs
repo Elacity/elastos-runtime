@@ -82,6 +82,7 @@ fn assistant_auth_grant(
         issued_at: now,
         expires_at: now + 12 * 60 * 60,
         apps: vec!["assistant".to_string()],
+        label: None,
     };
     crate::auth::store_session_grant(data_dir, grant.clone()).unwrap();
     grant
@@ -342,6 +343,7 @@ async fn home_agent_capsule_runs_bind_and_audit_to_its_own_capsule_id() {
         issued_at: now,
         expires_at: now + 12 * 60 * 60,
         apps: vec!["home-agent".to_string()],
+        label: None,
     };
     crate::auth::store_session_grant(dir.path(), grant.clone()).unwrap();
     let token = issue_home_launch_token_for_auth_grant(dir.path(), "home-agent", &grant).unwrap();

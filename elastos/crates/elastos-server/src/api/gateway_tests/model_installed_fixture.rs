@@ -507,6 +507,7 @@ fn refresh_model_installed_fixture_assistant_token() {
         issued_at: now,
         expires_at: now + 12 * 60 * 60,
         apps: vec!["assistant".to_string()],
+        label: None,
     };
     crate::auth::store_session_grant(&data, grant.clone()).unwrap();
     let token = issue_home_launch_token_for_auth_grant(&data, "assistant", &grant).unwrap();
@@ -567,6 +568,7 @@ fn refresh_model_installed_fixture_home_tokens() {
             issued_at: now,
             expires_at: now + 12 * 60 * 60,
             apps: vec![app.to_string()],
+            label: None,
         };
         crate::auth::store_session_grant(&data, grant.clone()).unwrap();
         manifest["consumer"]["authority"]["tokens"][app] =

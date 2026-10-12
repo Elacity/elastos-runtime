@@ -209,6 +209,10 @@ pub struct AuthSessionGrantV1 {
     pub issued_at: u64,
     pub expires_at: u64,
     pub apps: Vec<String>,
+    /// Human-readable sign-in place, such as "Chrome on macOS". Older grants
+    /// have none; it is display text only and never grants authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl AuthSessionGrantV1 {

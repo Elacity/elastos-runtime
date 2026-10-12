@@ -1221,6 +1221,7 @@ mod tests {
                 issued_at: now,
                 expires_at: now + HOME_LAUNCH_TOKEN_TTL_SECS,
                 apps: vec![HOME_CAPSULE_ID.to_string()],
+                label: None,
             },
         )
         .unwrap();
@@ -1274,6 +1275,7 @@ mod tests {
                 issued_at: now,
                 expires_at: now + HOME_LAUNCH_TOKEN_TTL_SECS,
                 apps: vec![SYSTEM_CAPSULE_ID.to_string()],
+                label: None,
             },
         )
         .unwrap();
@@ -1439,6 +1441,7 @@ mod tests {
                 issued_at: now,
                 expires_at: now + HOME_LAUNCH_TOKEN_TTL_SECS,
                 apps: vec![SYSTEM_CAPSULE_ID.to_string()],
+                label: None,
             },
         )
         .unwrap();
@@ -1700,6 +1703,7 @@ mod tests {
                 issued_at: now,
                 expires_at: now + HOME_LAUNCH_TOKEN_TTL_SECS,
                 apps: vec!["home".to_string(), "marketplace".to_string()],
+                label: None,
             },
         )
         .unwrap();

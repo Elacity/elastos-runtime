@@ -3802,6 +3802,7 @@ pub(crate) mod tests {
             issued_at: now,
             expires_at: now + 12 * 60 * 60,
             apps: vec!["home".to_string()],
+            label: None,
         };
         crate::auth::store_session_grant(data_dir, grant.clone()).unwrap();
         DurableHomeSessionGrant {

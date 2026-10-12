@@ -1023,6 +1023,16 @@ code {
   padding: 4px 8px;
 }
 
+.session-revoke,
+#session-revoke-others {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.session-actions {
+  margin-top: 10px;
+}
+
 .recovery-actions {
   margin-top: 10px;
 }

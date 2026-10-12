@@ -18,6 +18,8 @@ from pathlib import Path
 TIMING = runpy.run_path(str(Path(__file__).with_name("ci-installed-model-timing.py")))
 UPSTREAM = runpy.run_path(str(Path(__file__).with_name("release-upstream-input.py")))
 DISK_RESERVE_BYTES = 2 * 1024 ** 3
+# The engine-absent Home also proves sign-in, Recovery Kit and restore on a second Home.
+ACCOUNT_RESULTS = ("recovery_kit", "sign_in_again", "signed_in_devices", "restore_on_new_computer")
 
 
 def digest(path):
@@ -237,6 +239,23 @@ def start_holder(home, data, consumer_data, consumer_environment):
     return child, {"holder_did": did, "consumer_holder_route": "operator peer store ticket"}
 
 
+def start_restore_home(home, data):
+    """Start a second fresh Home, the "new computer" that imports the first Home's Recovery Kit."""
+    restore_home = home.parent / f"{home.name}-restore"
+    restore_data = fresh_fixture(home, data, restore_home, include_engine=False)
+    environment = dict(os.environ, HOME=str(restore_home), XDG_DATA_HOME=str(restore_data.parent))
+    number = free_port()
+    with (restore_home / "restore-runtime.private.log").open("wb") as log:
+        child = subprocess.Popen([str(restore_data / "bin/elastos"), "gateway", "--addr", f"127.0.0.1:{number}"],
+                                 env=environment, stdout=log, stderr=log, start_new_session=True)
+    try:
+        wait_healthy(child, f"localhost:{number}", "restore Runtime")
+    except BaseException:
+        cleanup_runtime(child, restore_data)
+        raise
+    return child, restore_data, f"http://localhost:{number}"
+
+
 def consumer_root_block(data, cid):
     """Observe the package root in the consumer's Kubo blockstore after Get.
 
@@ -331,6 +350,7 @@ def run(home, data, evidence, model=True, carrier=False):
         if holder:
             cleanup_runtime(holder, holder_data)
         raise
+    restore = None
     try:
         wait_healthy(child, address, "Runtime")
         command = ["node", "scripts/ci-installed-home-journey.mjs", f"http://{address}", str(evidence), str(data)]
@@ -342,7 +362,9 @@ def run(home, data, evidence, model=True, carrier=False):
             finally:
                 record["model_timing"] = observer.receipt()
         else:
-            subprocess.run([*command, "--home-only"], env=environment, check=True)
+            # The fresh Home saves its Recovery Kit; a second fresh Home restores it.
+            restore = start_restore_home(home, data)
+            subprocess.run([*command, "--home-only", restore[2]], env=environment, check=True)
         ui = json.loads((evidence / "home-journey.json").read_text())
         record["results"].update(ui["results"])
         if not model:
@@ -352,6 +374,7 @@ def run(home, data, evidence, model=True, carrier=False):
             record["engine_absent_after_ui"] = all(not path.exists() and not path.is_symlink() for path in absent_paths)
             assert record["engine_absent_after_ui"]
             assert record["results"]["home_screenshots"] == "passed"
+            assert all(record["results"].get(name) == "passed" for name in ACCOUNT_RESULTS)
             record["results"]["engine_absent_home"] = "passed"
     finally:
         try:
@@ -365,6 +388,11 @@ def run(home, data, evidence, model=True, carrier=False):
                     holder_cleanup = cleanup_runtime(holder, holder_data)
                 except (OSError, ValueError, subprocess.SubprocessError):
                     holder_cleanup = {"status": "failed", "reason": "process census unavailable"}
+            if restore:
+                try:
+                    restore_cleanup = cleanup_runtime(restore[0], restore[1])
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    restore_cleanup = {"status": "failed", "reason": "process census unavailable"}
             log.close()
             if model:
                 timing = record.setdefault("model_timing", {})
@@ -377,6 +405,10 @@ def run(home, data, evidence, model=True, carrier=False):
         if holder:
             record["process_cleanup"]["holder"] = holder_cleanup
             if holder_cleanup["status"] != "passed":
+                record["process_cleanup"]["status"] = "failed"
+        if restore:
+            record["process_cleanup"]["restore"] = restore_cleanup
+            if restore_cleanup["status"] != "passed":
                 record["process_cleanup"]["status"] = "failed"
         record["results"]["process_cleanup"] = record["process_cleanup"]["status"]
         record["disk_after"] = disk_observation(data)

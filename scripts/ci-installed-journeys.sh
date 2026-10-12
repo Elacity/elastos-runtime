@@ -95,7 +95,8 @@ results["engine_absent_home"] = ("passed" if current(absence) and absence.get("e
                                 and absence.get("dispatch_unavailable_reason") == "source_engine_required"
                                 and absence.get("process_cleanup", {}).get("before", {}).get("llama_server") == 0
                                 and all(absence.get("results", {}).get(name) == "passed" for name in
-                                        ("engine_absent_home", "engine_absent_refusal", "home_screenshots", "process_cleanup", "disk_reserve"))
+                                        ("engine_absent_home", "engine_absent_refusal", "home_screenshots", "process_cleanup", "disk_reserve",
+                                         *journey["ACCOUNT_RESULTS"]))
                                 else "failed or not run")
 elapsed += absence.get("elapsed_seconds", 0) + absence.get("fixture_preparation_seconds", 0)
 (root / "core-summary.json").write_text(json.dumps({
@@ -113,7 +114,7 @@ with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
     summary.write("\nEach run uses fresh Home state and a new engine process on the same host. OS file cache can warm between runs.\n")
     if carrier:
         summary.write("\nThe reply package lives only in a separate holder Home's Kubo. The consumer Home knows that holder as one Carrier peer and holds no package, so Get reads every piece over Carrier.\n")
-    summary.write("\nThe reply fixture uses the verified source engine prerequisite. Signed-release engine acquisition has separate acceptance evidence. A separate fresh signed-fixture Home proves Get, controlled Use refusal, Retry and Home usability with the optional engine absent.\n")
+    summary.write("\nThe reply fixture uses the verified source engine prerequisite. Signed-release engine acquisition has separate acceptance evidence. A separate fresh signed-fixture Home proves Get, controlled Use refusal, Retry and Home usability with the optional engine absent. That Home also saves its Recovery Kit and Profile, signs in again, signs out its other devices, and a second fresh Home restores the Kit to the same Profile.\n")
     summary.write(f"\nTiming receipts: {spread['status']} ({spread['recorded_runs']}/{expected_runs} runs).\n")
     if spread["status"] == "complete":
         summary.write("\nEngine readiness starts at endpoint entry; other times start at worker entry. Generation excludes delta Applied waits and includes HTTP/stream handling. Applied waits include coordinator queue, reconciliation and durable storage.\n")
