@@ -615,7 +615,7 @@ impl Drop for LoggingSuppressionGuard {
 }
 
 pub(crate) async fn run(status: bool, json: bool) -> anyhow::Result<()> {
-    let snapshot = gather_snapshot().await?;
+    let snapshot = gather_snapshot(&default_data_dir()).await?;
 
     if json {
         let mut stdout = std::io::stdout().lock();
@@ -665,10 +665,11 @@ async fn run_managed_dashboard() -> anyhow::Result<()> {
     let mut notice = None;
 
     loop {
-        let mut snapshot = gather_snapshot().await?;
+        let mut snapshot = gather_snapshot(&data_dir).await?;
         snapshot.notice = notice.take();
         write_snapshot(&access, &session, &snapshot).await?;
         clear_intent(&access, &session).await?;
+        let updater_data_dir = data_dir.clone();
         let updater_access = access.clone();
         let updater_session = session.clone();
         let updater_notice = snapshot.notice.clone();
@@ -680,7 +681,7 @@ async fn run_managed_dashboard() -> anyhow::Result<()> {
                     _ = sleep(Duration::from_millis(300)) => {}
                 }
 
-                let mut next_snapshot = match gather_snapshot().await {
+                let mut next_snapshot = match gather_snapshot(&updater_data_dir).await {
                     Ok(snapshot) => snapshot,
                     Err(_) => continue,
                 };
@@ -1073,15 +1074,14 @@ fn format_home_cli_invoke_notice(body: &serde_json::Value, invoke: &HomeInvokeIn
     )
 }
 
-async fn gather_snapshot() -> anyhow::Result<HomeSnapshot> {
-    let data_dir = default_data_dir();
+async fn gather_snapshot(data_dir: &Path) -> anyhow::Result<HomeSnapshot> {
     let gateway_owned = gateway_owned_home_terminal();
-    let source = load_default_source(&data_dir)?;
-    let local_runtime = gather_runtime_status(&data_dir).await;
+    let source = load_default_source(data_dir)?;
+    let local_runtime = gather_runtime_status(data_dir).await;
     let home_summary_projection =
-        gather_home_summary_projection(&data_dir, local_runtime.api_url.as_deref()).await?;
+        gather_home_summary_projection(data_dir, local_runtime.api_url.as_deref()).await?;
     gather_snapshot_from_parts(
-        &data_dir,
+        data_dir,
         gateway_owned,
         source,
         local_runtime,
@@ -1097,7 +1097,7 @@ async fn gather_snapshot_from_parts(
     local_runtime: RuntimeStatus,
     home_summary_projection: Option<HomeSummaryFactsProjection>,
 ) -> anyhow::Result<HomeSnapshot> {
-    let session = gather_home_cli_session_status();
+    let session = gather_home_cli_session_status(data_dir);
     let runtime = home_summary_projection
         .as_ref()
         .and_then(|projection| projection.runtime.clone())
@@ -1542,11 +1542,10 @@ fn home_target_title(target: &str) -> String {
         .join(" ")
 }
 
-fn gather_home_cli_session_status() -> HomeCliSessionStatus {
+fn gather_home_cli_session_status(data_dir: &Path) -> HomeCliSessionStatus {
     if gateway_owned_home_terminal() {
-        let data_dir = default_data_dir();
         let passkey_state =
-            if elastos_server::api::gateway::gateway_owned_home_cli_authority_available(&data_dir) {
+            if elastos_server::api::gateway::gateway_owned_home_cli_authority_available(data_dir) {
                 "launch-token authorized browser Home session"
             } else {
                 "browser Home terminal missing launch authority"
@@ -3369,9 +3368,7 @@ mod tests {
     fn gateway_owned_home_cli_authority_helper_reads_gateway_env() {
         let _guard = HOME_CMD_ENV_LOCK.blocking_lock();
         let temp = tempfile::tempdir().unwrap();
-        let _home = ScopedEnvVar::set("HOME", temp.path().join("home"));
-        let _xdg_data_home = ScopedEnvVar::set("XDG_DATA_HOME", temp.path().join("xdg"));
-        let data_dir = default_data_dir();
+        let data_dir = temp.path().join("data");
         let _owned =
             ScopedEnvVar::set(crate::runtime_control::GATEWAY_OWNED_HOME_TERMINAL_ENV, "1");
         let _principal = ScopedEnvVar::set(
@@ -3398,7 +3395,7 @@ mod tests {
         assert!(
             elastos_server::api::gateway::gateway_owned_home_cli_authority_available(&data_dir)
         );
-        let status = gather_home_cli_session_status();
+        let status = gather_home_cli_session_status(&data_dir);
         assert_eq!(status.mode, "browser_pty");
         assert_eq!(
             status.passkey_state,
@@ -3434,8 +3431,6 @@ mod tests {
     async fn gateway_owned_home_snapshot_propagates_summary_failure() {
         let _guard = HOME_CMD_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
-        let _home = ScopedEnvVar::set("HOME", temp.path().join("home"));
-        let _xdg_data_home = ScopedEnvVar::set("XDG_DATA_HOME", temp.path().join("xdg"));
         let _coords = ScopedEnvVar::set(
             "ELASTOS_RUNTIME_COORDS_FILE",
             temp.path().join("missing-runtime-coords.json"),
@@ -3447,7 +3442,10 @@ mod tests {
             "",
         );
 
-        let err = gather_snapshot().await.unwrap_err().to_string();
+        let err = gather_snapshot(&temp.path().join("data"))
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("gateway-owned Home CLI summary unavailable"));
         assert!(err.contains("missing gateway API URL"));
@@ -3889,8 +3887,6 @@ mod tests {
     async fn home_snapshot_uses_native_shell_catalog_and_interface_facts() {
         let _guard = HOME_CMD_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
-        let _home = ScopedEnvVar::set("HOME", temp.path().join("home"));
-        let _xdg_data_home = ScopedEnvVar::set("XDG_DATA_HOME", temp.path().join("xdg"));
         let _coords = ScopedEnvVar::set(
             "ELASTOS_RUNTIME_COORDS_FILE",
             temp.path().join("missing-runtime-coords.json"),
@@ -3901,7 +3897,7 @@ mod tests {
             elastos_server::api::gateway::HOME_CLI_GATEWAY_API_URL_ENV,
             "",
         );
-        let data_dir = default_data_dir();
+        let data_dir = temp.path().join("data");
         write_home_cmd_test_capsule(&data_dir, "home-gui", "shell", Vec::new());
         write_home_cmd_test_capsule(
             &data_dir,
@@ -3923,7 +3919,7 @@ mod tests {
         std::fs::write(data_dir.join("config.toml"), "developer_mode = true\n").unwrap();
         write_home_cmd_active_shell_state(&data_dir, "person:test-home-cli", "home-cli");
 
-        let snapshot = gather_snapshot().await.unwrap();
+        let snapshot = gather_snapshot(&data_dir).await.unwrap();
 
         assert_eq!(
             snapshot.active_shell["schema"],

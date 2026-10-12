@@ -13,6 +13,8 @@ product_data() {
 
 prepush() {
   python3 scripts/ci-local-prepush-test.py
+  python3 scripts/rust-global-env-check.py --self-test
+  python3 scripts/rust-global-env-check.py
 }
 
 product_ui() {
