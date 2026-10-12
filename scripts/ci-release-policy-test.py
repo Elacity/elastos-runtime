@@ -68,7 +68,7 @@ def evaluate(expression, context):
     expression = expression.removeprefix("${{").removesuffix("}}").strip()
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression)
-    expression = re.sub(r"(?:github|inputs|env|steps|matrix)\.[\w.-]+",
+    expression = re.sub(r"(?:github|inputs|env|steps|matrix|needs)\.[\w.-]+",
                         lambda match: repr(context[match[0]]), expression)
     return eval(expression, {"__builtins__": {}},
                 {"startsWith": str.startswith, "true": True, "false": False})
@@ -182,6 +182,11 @@ def job_runs(job, context, workflow_jobs=JOBS):
     return evaluate(guard[1], context) if guard else True
 
 
+def matrix_rows(block):
+    rows = re.match(r"(?:          .*\n)+", block.split("        include:\n", 1)[1])[0]
+    return [dict(re.findall(r"(\w+): (\S+)", row)) for row in re.split(r"(?m)^          - ", rows)[1:]]
+
+
 def custody_should_run(source, context, paths):
     workflow_jobs = jobs(source)
     if not job_runs("custody-harness-smoke", context, workflow_jobs):
@@ -209,6 +214,9 @@ PATH_DEPENDENCY = re.compile(r'(?m)^[\w-]+\s*=\s*\{[^}\n]*\bpath\s*=\s*"([^"]+)"
 # The custody proof driver calls setup-source-home.sh with a mismatched
 # ELASTOS_DATA_DIR on purpose; it refuses before it reads any other input.
 FILTER_LEAVES = {"custody-harness-smoke": {"scripts/setup-source-home.sh"}}
+# The release upstream build loads helper modules and packages every repository
+# file its recipes name; those are inputs too, not leaves.
+FILTER_FOLLOWS = {"release-upstream-assets": {"scripts/release-upstream-assets.py"}}
 
 
 def tracked_under(path):
@@ -273,9 +281,10 @@ def called_inputs(text, directory):
     return found
 
 
-def job_inputs(workflow, source, job, leaves=frozenset()):
+def job_inputs(workflow, source, job, leaves=frozenset(), follows=frozenset()):
     """The workflow file plus every input the job's run steps call, following
-    shell scripts and Dockerfiles; Python and Node callees are leaf inputs."""
+    shell scripts and Dockerfiles; Python and Node callees are leaf inputs,
+    except followed entry points, whose Python and JSON inputs are followed too."""
     texts = []
     for step in steps(job, jobs(source)):
         if "        run: |\n" in step:
@@ -283,13 +292,14 @@ def job_inputs(workflow, source, job, leaves=frozenset()):
         else:
             texts += re.findall(r"(?m)^        run: (.+)$", step)
     inputs = {workflow.relative_to(REPO).as_posix()}
-    queue = [(text, ".") for text in texts]
+    queue = [(text, ".", False) for text in texts]
     while queue:
-        text, directory = queue.pop()
+        text, directory, following = queue.pop()
         for path in sorted(called_inputs(text, directory) - inputs):
             inputs.add(path)
-            if (path.endswith(".sh") or Path(path).name.startswith("Dockerfile")) and path not in leaves:
-                queue.append(((REPO / path).read_text(), Path(path).parent.as_posix()))
+            follow = path in follows or (following and path.endswith((".py", ".json")))
+            if (path.endswith(".sh") or Path(path).name.startswith("Dockerfile") or follow) and path not in leaves:
+                queue.append(((REPO / path).read_text(), Path(path).parent.as_posix(), follow))
     return inputs
 
 
@@ -298,9 +308,26 @@ def glob_regex(pattern):
                               for part in re.split(r"(\*\*|\*)", pattern)) + r"\Z")
 
 
+def paths_filter(source, job, name):
+    step, = [step for step in steps(job, jobs(source)) if "id: filter" in step]
+    return re.findall(r"(?m)^              - '([^']+)'$", step.split(f"            {name}:\n", 1)[1].split("\n\n", 1)[0])
+
+
 def custody_filter(source):
-    step, = [step for step in steps("custody-harness-smoke", jobs(source)) if "id: filter" in step]
-    return re.findall(r"(?m)^              - '([^']+)'$", step.split("            custody:\n", 1)[1])
+    return paths_filter(source, "custody-harness-smoke", "custody")
+
+
+def upstream_filter(source):
+    return paths_filter(source, "release-upstream-paths", "upstream")
+
+
+def upstream_assets_run(source, context, changed):
+    """The path job's output decides the build job's guard, as Actions evaluates them."""
+    workflow_jobs = jobs(source)
+    output = field(workflow_jobs["release-upstream-paths"].split("    outputs:\n", 1)[1], "run")
+    run = evaluate(output, {**context, "steps.filter.outputs.upstream": changed})
+    return job_runs("release-upstream-assets",
+                    {**context, "needs.release-upstream-paths.outputs.run": str(run).lower()}, workflow_jobs)
 
 
 def canary_filter(source):
@@ -311,7 +338,8 @@ def canary_filter(source):
 def validate_filter_inputs(workflow, source, job, patterns):
     """A path filter skips a required check only when none of its inputs changed."""
     matchers = [glob_regex(pattern) for pattern in patterns]
-    missing = sorted(path for path in job_inputs(workflow, source, job, FILTER_LEAVES.get(job, frozenset()))
+    missing = sorted(path for path in job_inputs(workflow, source, job, FILTER_LEAVES.get(job, frozenset()),
+                                                 FILTER_FOLLOWS.get(job, frozenset()))
                      if not any(matcher.match(path) for matcher in matchers))
     if missing:
         raise AssertionError(f"{job} filter misses inputs: {', '.join(missing)}")
@@ -620,7 +648,9 @@ class ReleasePolicyTests(unittest.TestCase):
             if job == "cancel-on-failure":
                 continue
             guard = re.search(r"(?m)^    if: (.*)$", JOBS[job])
-            if guard:
+            if job == "release-upstream-assets":
+                self.assertTrue(upstream_assets_run(SOURCE, context, ""), job)
+            elif guard:
                 self.assertTrue(evaluate(guard[1], context), job)
             checkout, = [step for step in steps(job) if "uses: actions/checkout@" in step]
             self.assertEqual(field(checkout, "ref"),
@@ -636,6 +666,10 @@ class ReleasePolicyTests(unittest.TestCase):
                 with self.subTest(event=event, ref=ref, paths=paths):
                     expected = expected_job and (event != "pull_request" or paths == "true")
                     self.assertEqual(custody_should_run(SOURCE, context, paths), expected)
+                    # Release upstream builds: changed inputs on a PR, every merge group and manual run.
+                    filtered = paths if event == "pull_request" else ""
+                    self.assertEqual(upstream_assets_run(SOURCE, context, filtered),
+                                     event in ("merge_group", "workflow_dispatch") or filtered == "true")
 
     def test_sccache_is_scoped_to_test_jobs(self):
         expected = UNIT_CACHE_JOBS | SOURCE_HOME_CACHE_JOBS
@@ -796,6 +830,34 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertLess(engine.index(restore), engine.index(build))
         self.assertLess(engine.index(build), engine.index(verify))
         self.assertLess(engine.index(verify), engine.index(upload))
+
+    def test_release_upstream_assets_build_every_source_platform_as_the_release_does(self):
+        recipes = json.loads((REPO / "scripts/release-upstream-recipes.json").read_text())["recipes"]
+        rows = matrix_rows(JOBS["release-upstream-assets"])
+        self.assertEqual({row["platform"] for row in rows}, {recipe["platform"] for recipe in recipes if "build" in recipe})
+        release_jobs = jobs((WORKFLOW.parent / "release-package.yml").read_text())
+        release_names = {"aarch64-linux": "linux-arm64", "x86_64-linux": "linux-amd64"}
+        release = {"darwin-arm64": ("mac", {"os": field(release_jobs["mac"], "runs-on")}),
+                   **{release_names[row["platform"]]: ("linux", row) for row in matrix_rows(release_jobs["linux"])}}
+
+        def toolchain(job, workflow_jobs, row):
+            step, = [step for step in steps(job, workflow_jobs) if "uses: dtolnay/rust-toolchain@" in step]
+            version = re.search(r"(?m)^\s+toolchain: (\S+)$", step) or re.search(r" # (\S+)$", field(step, "uses"))
+            return version[1], field(step, "targets").replace("${{ matrix.target }}", row.get("target", ""))
+
+        def host_packages(job, workflow_jobs, row):
+            text = "\n".join(steps(job, workflow_jobs)).replace('"${{ matrix.host }}"', row.get("host", ""))
+            self.assertNotRegex(text, r"apt-get|brew install", job)
+            return re.findall(r"(?m)^\s+(?:run: )?(bash scripts/release-host-prerequisites\.sh \w+)$", text)
+
+        for row in rows:
+            job, release_row = release[row["platform"]]
+            with self.subTest(platform=row["platform"]):
+                self.assertEqual(row["os"], release_row["os"])
+                self.assertEqual(toolchain("release-upstream-assets", JOBS, row), toolchain(job, release_jobs, release_row))
+                packages = host_packages("release-upstream-assets", JOBS, row)
+                self.assertEqual(len(packages), 1)
+                self.assertEqual(packages, host_packages(job, release_jobs, release_row))
 
     def test_sccache_jobs_keep_registry_caches_without_target_artifacts(self):
         for job in ("source-gate", "lint", "test-elastos", "test-capsules"):
@@ -1207,6 +1269,17 @@ class ReleasePolicyTests(unittest.TestCase):
                 self.assertNotEqual(trimmed, canary)
                 with self.assertRaisesRegex(AssertionError, "holder filter misses inputs: .*" + re.escape(entry.rstrip("*/"))):
                     validate_filter_inputs(CANARY, trimmed, "holder", canary_filter(trimmed))
+        upstream = upstream_filter(SOURCE)
+        validate_filter_inputs(WORKFLOW, SOURCE, "release-upstream-assets", upstream)
+        # Following the Python entry point reaches its helper modules, its recipes and the
+        # files they package; the step itself reaches the workflow and the shell script.
+        for entry in ("scripts/release-upstream-input.py", "scripts/release-upstream-recipes.json",
+                      "scripts/browser-upstream-build.py", "scripts/build/licenses/libcap-LICENSE.txt",
+                      "scripts/release-host-prerequisites.sh", ".github/workflows/ci.yml"):
+            with self.subTest(removed=entry):
+                self.assertIn(entry, upstream)
+                with self.assertRaisesRegex(AssertionError, "release-upstream-assets filter misses inputs: .*" + re.escape(entry)):
+                    validate_filter_inputs(WORKFLOW, SOURCE, "release-upstream-assets", [p for p in upstream if p != entry])
         # A new script call joins the job's inputs; one level of `*` stays in its folder.
         called = canary.replace("          python3 -I -S scripts/holder-idle-ci.py\n",
                                 "          python3 -I -S scripts/holder-idle-ci.py\n          scripts/ci-apt-prerequisites.sh\n", 1)
@@ -1450,6 +1523,8 @@ class ReleasePolicyTests(unittest.TestCase):
             "test-behaviour": ("test-behaviour", "ubuntu-24.04"),
             "test-capsules": ("test-capsules", "ubuntu-24.04"),
             "custody-harness-smoke": ("custody-harness-smoke", "ubuntu-24.04"),
+            "release-upstream-paths": ("release-upstream-paths", "ubuntu-24.04"),
+            "release-upstream-assets": ("release-upstream-assets (${{ matrix.platform }})", "${{ matrix.os }}"),
             "source-home-linux": ("source-home-linux (${{ matrix.os }})", "${{ matrix.os }}"),
             "source-home-linux-arm64": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
             "source-home-macos": ("source-home-macos", "macos-14"),
