@@ -322,8 +322,11 @@ fn managed_runtime_lane_conflict_message(
     )
 }
 
+/// `gateway_owned_terminal` is `$ELASTOS_GATEWAY_OWNED_HOME_TERMINAL == "1"`,
+/// passed in so tests never mutate process-global env.
 fn gateway_owner_allows_subordinate_managed_runtime(
     owner: &crate::host_lock::HostProcessInfo,
+    gateway_owned_terminal: bool,
 ) -> bool {
     if !matches!(owner.role.as_str(), "gateway" | "gateway-public") {
         return false;
@@ -331,8 +334,7 @@ fn gateway_owner_allows_subordinate_managed_runtime(
     if owner.pid == std::process::id() {
         return true;
     }
-    std::env::var_os(GATEWAY_OWNED_HOME_TERMINAL_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
-        && parent_process_id() == Some(owner.pid)
+    gateway_owned_terminal && parent_process_id() == Some(owner.pid)
 }
 
 fn parent_process_id() -> Option<u32> {
@@ -412,10 +414,18 @@ impl Drop for TermiosGuard {
 }
 
 pub fn runtime_coord_path(data_dir: &Path) -> PathBuf {
-    if let Some(path) = std::env::var_os("ELASTOS_RUNTIME_COORDS_FILE") {
-        return PathBuf::from(path);
-    }
-    data_dir.join("runtime-coords.json")
+    runtime_coord_path_with_override(data_dir, std::env::var_os("ELASTOS_RUNTIME_COORDS_FILE"))
+}
+
+/// `override_path` is `$ELASTOS_RUNTIME_COORDS_FILE`, passed in so tests never
+/// mutate process-global env.
+fn runtime_coord_path_with_override(
+    data_dir: &Path,
+    override_path: Option<std::ffi::OsString>,
+) -> PathBuf {
+    override_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("runtime-coords.json"))
 }
 
 pub(crate) fn gateway_runtime_coord_path(data_dir: &Path) -> PathBuf {
@@ -479,11 +489,15 @@ fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
-fn managed_runtime_coord_path(data_dir: &Path, runtime_kind: &str) -> PathBuf {
+fn managed_runtime_coord_path(
+    data_dir: &Path,
+    runtime_kind: &str,
+    override_path: Option<std::ffi::OsString>,
+) -> PathBuf {
     if runtime_kind == RUNTIME_KIND_MANAGED_HOME {
         return home_runtime_coord_path(data_dir);
     }
-    runtime_coord_path(data_dir)
+    runtime_coord_path_with_override(data_dir, override_path)
 }
 
 pub(crate) fn home_runtime_coord_path(data_dir: &Path) -> PathBuf {
@@ -1082,7 +1096,11 @@ async fn ensure_managed_runtime(
     allow_resources: &[&str],
     surface_name: &str,
 ) -> anyhow::Result<RuntimeCoords> {
-    let coords_path = managed_runtime_coord_path(data_dir, runtime_kind);
+    let coords_path = managed_runtime_coord_path(
+        data_dir,
+        runtime_kind,
+        std::env::var_os("ELASTOS_RUNTIME_COORDS_FILE"),
+    );
     // Home boot can issue concurrent app/system/browser requests. Serialize the
     // check/start sequence across processes so only one managed runtime can be
     // spawned for a runtime data directory.
@@ -1181,8 +1199,14 @@ async fn ensure_managed_runtime(
         }
     }
 
+    let gateway_owned_terminal = std::env::var_os(GATEWAY_OWNED_HOME_TERMINAL_ENV).as_deref()
+        == Some(std::ffi::OsStr::new("1"));
     let subordinate_gateway_host = match crate::host_lock::active_host_process(data_dir)? {
-        Some(owner) if gateway_owner_allows_subordinate_managed_runtime(&owner) => true,
+        Some(owner)
+            if gateway_owner_allows_subordinate_managed_runtime(&owner, gateway_owned_terminal) =>
+        {
+            true
+        }
         Some(owner) => anyhow::bail!(managed_runtime_lane_conflict_message(surface_name, &owner)),
         None => false,
     };
@@ -1658,62 +1682,30 @@ mod tests {
         );
     }
 
-    /// `ELASTOS_RUNTIME_COORDS_FILE` is process-global, so the tests that set
-    /// it cannot run beside each other: without this they read whichever
-    /// tempdir the other one set, and fail on a path that looks unrelated.
-    static COORDS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct ScopedCoordsEnv {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl ScopedCoordsEnv {
-        fn set(value: impl Into<std::ffi::OsString>) -> Self {
-            let previous = std::env::var_os("ELASTOS_RUNTIME_COORDS_FILE");
-            std::env::set_var("ELASTOS_RUNTIME_COORDS_FILE", value.into());
-            Self { previous }
-        }
-    }
-
-    impl Drop for ScopedCoordsEnv {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var("ELASTOS_RUNTIME_COORDS_FILE", value),
-                None => std::env::remove_var("ELASTOS_RUNTIME_COORDS_FILE"),
-            }
-        }
-    }
-
-    #[test]
-    fn home_runtime_coord_path_uses_data_dir_and_not_env_override() {
-        let _guard = COORDS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _coords = ScopedCoordsEnv::set(tmp.path().join("override.json"));
-
-        assert_eq!(
-            home_runtime_coord_path(tmp.path()),
-            tmp.path().join("home-runtime-coords.json")
-        );
-    }
-
     #[test]
     fn managed_home_runtime_uses_home_coord_path() {
-        let _guard = COORDS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let override_path = tmp.path().join("override.json");
-        let _coords = ScopedCoordsEnv::set(&override_path);
 
         assert_eq!(
-            managed_runtime_coord_path(tmp.path(), RUNTIME_KIND_MANAGED_HOME),
+            managed_runtime_coord_path(
+                tmp.path(),
+                RUNTIME_KIND_MANAGED_HOME,
+                Some(override_path.clone().into())
+            ),
             tmp.path().join("home-runtime-coords.json")
         );
         assert_eq!(
-            managed_runtime_coord_path(tmp.path(), RUNTIME_KIND_MANAGED_CHAT),
+            managed_runtime_coord_path(
+                tmp.path(),
+                RUNTIME_KIND_MANAGED_CHAT,
+                Some(override_path.clone().into())
+            ),
             override_path
+        );
+        assert_eq!(
+            managed_runtime_coord_path(tmp.path(), RUNTIME_KIND_MANAGED_CHAT, None),
+            tmp.path().join("runtime-coords.json")
         );
     }
 
@@ -1900,7 +1892,9 @@ mod tests {
             addr: "127.0.0.1:8090".to_string(),
         };
 
-        assert!(gateway_owner_allows_subordinate_managed_runtime(&owner));
+        assert!(gateway_owner_allows_subordinate_managed_runtime(
+            &owner, false
+        ));
     }
 
     fn write_managed_runtime_parent_support_artifacts(data_dir: &Path) -> Vec<u8> {
@@ -1984,27 +1978,29 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn gateway_owned_terminal_child_allows_parent_gateway_subordinate_runtime() {
-        let _guard = EnvRestore::set(GATEWAY_OWNED_HOME_TERMINAL_ENV, "1");
         let owner = crate::host_lock::HostProcessInfo {
             pid: parent_process_id().expect("test process should have a parent"),
             role: "gateway".to_string(),
             addr: "127.0.0.1:8090".to_string(),
         };
 
-        assert!(gateway_owner_allows_subordinate_managed_runtime(&owner));
+        assert!(gateway_owner_allows_subordinate_managed_runtime(
+            &owner, true
+        ));
     }
 
     #[test]
     #[cfg(unix)]
     fn unmarked_terminal_child_does_not_bypass_foreign_gateway_owner() {
-        let _guard = EnvRestore::remove(GATEWAY_OWNED_HOME_TERMINAL_ENV);
         let owner = crate::host_lock::HostProcessInfo {
             pid: parent_process_id().expect("test process should have a parent"),
             role: "gateway".to_string(),
             addr: "127.0.0.1:8090".to_string(),
         };
 
-        assert!(!gateway_owner_allows_subordinate_managed_runtime(&owner));
+        assert!(!gateway_owner_allows_subordinate_managed_runtime(
+            &owner, false
+        ));
     }
 
     #[test]
@@ -2015,40 +2011,8 @@ mod tests {
             addr: "127.0.0.1:8090".to_string(),
         };
 
-        assert!(!gateway_owner_allows_subordinate_managed_runtime(&owner));
-    }
-
-    struct EnvRestore {
-        key: &'static str,
-        value: Option<std::ffi::OsString>,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self {
-                key,
-                value: previous,
-            }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self {
-                key,
-                value: previous,
-            }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match &self.value {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
+        assert!(!gateway_owner_allows_subordinate_managed_runtime(
+            &owner, true
+        ));
     }
 }
