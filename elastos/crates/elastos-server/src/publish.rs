@@ -1,7 +1,6 @@
 use anyhow::Context;
 use elastos_common::localhost::{publisher_publish_state_path, publisher_root_path};
 use elastos_common::{CapsuleManifest, RequirementKind};
-use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,30 +41,6 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
 ];
 const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat", "home-agent"];
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary"];
-
-pub(crate) fn source_discovery_uri(publisher_did: &str, channel: &str) -> String {
-    let channel = normalize_release_channel(channel);
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(publisher_did.as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    format!("elastos://source/{}/{}", channel, &digest[..32])
-}
-
-fn normalize_release_channel(channel: &str) -> String {
-    let mut normalized = String::new();
-    for ch in channel.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-            normalized.push(ch);
-        } else {
-            normalized.push('-');
-        }
-    }
-    if normalized.is_empty() {
-        "stable".to_string()
-    } else {
-        normalized
-    }
-}
 
 fn validate_release_channel(channel: &str) -> anyhow::Result<()> {
     if ALLOWED_RELEASE_CHANNELS.contains(&channel) {

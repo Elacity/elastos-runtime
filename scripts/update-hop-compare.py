@@ -487,7 +487,7 @@ def run(config, output):
                 stored = read(path)
                 selected = next(s for s in stored["sources"] if s["name"] == stored["default_source"])
                 need(selected["publisher_dids"] == [publisher["did"]], "local publisher identity differs from signed fixture")
-                selected.update(connect_ticket=publisher["connect_ticket"], publisher_node_id="", discovery_uri="", ipns_name="")
+                selected.update(connect_ticket=publisher["connect_ticket"], publisher_node_id="")
                 write(path, stored)
                 if role == "operator":
                     # Read fixture identity before its gateway can hold the lock.
@@ -3012,6 +3012,10 @@ def cli_initial_home(processes, manifest, home_path, evidence=None, publish=None
         need(version["exit"] == 0 and processes.text("undo-version") == "elastos " + manifest["old"]["version"] + "\n",
              "Undo did not restore the previous Runtime")
         expect("old")
+        # This source's Runtime ran Undo and rewrote sources.json without the
+        # discovery_uri and ipns_name keys that installers before #89 wrote.
+        for retired in ("discovery_uri", "ipns_name"):
+            before["sources"]["sources"][0].pop(retired, None)
         need(cli_home_snapshot(manifest, home_path) == before, "Undo changed user data or installed another release")
         cli_verify_setup_support(root, cli_support_view(manifest, "old"), home_path)
         readiness = restart("undo", "undo-home-start", "old")

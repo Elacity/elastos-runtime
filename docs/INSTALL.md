@@ -177,9 +177,7 @@ source saved in `sources.json` during install. It asks for the latest signed
 release head, fetches the head and the release by CID (a source that gives no
 separate head CID sends the head file by name), and checks both signatures, the
 release hash, the channel and the version order. An older
-release is refused. The `discovery_uri` and `ipns_name` fields in
-`sources.json` are shown but not used to find updates. If the Carrier
-connection fails, the check fails.
+release is refused. If the Carrier connection fails, the check fails.
 
 **What System shows.** System shows the new version and its release notes.
 

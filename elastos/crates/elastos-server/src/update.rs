@@ -3016,6 +3016,44 @@ mod tests {
         .unwrap();
     }
 
+    /// Every install.sh before #89 wrote `discovery_uri` and `ipns_name` into
+    /// sources.json. This Runtime still updates such a Home, and its rewrite drops
+    /// both keys (earlier Runtimes default the missing fields after an Undo).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_admits_and_rewrites_sources_written_by_earlier_installers() {
+        let components = components_pinning(None);
+        let (_fixture, data, binary, source) = default_apply_fixture(&components);
+        let path = crate::sources::trusted_sources_path(&data);
+        // The source shape 0.8.0-alpha.15's install.sh writes.
+        let earlier = serde_json::json!({
+            "schema": "elastos.trusted-sources/v1", "default_source": source.name,
+            "sources": [{
+                "name": source.name, "publisher_dids": source.publisher_dids,
+                "channel": source.channel,
+                "discovery_uri": "elastos://source/stable/0123456789abcdef0123456789abcdef",
+                "connect_ticket": "", "publisher_node_id": "", "ipns_name": "", "gateways": [],
+                "install_path": source.install_path, "installed_version": source.installed_version,
+                "head_cid": ""
+            }]
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&earlier).unwrap()).unwrap();
+        apply_signed_executable_fixture(
+            &data,
+            &source,
+            b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n",
+            &components,
+        )
+        .await
+        .unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let stored = written["sources"][0].as_object().unwrap();
+        assert_eq!(stored["installed_version"], "0.7.1");
+        assert!(!stored.contains_key("discovery_uri") && !stored.contains_key("ipns_name"));
+        admit_installed(&data, &binary);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn terminal_update_installs_the_target_catalogue_and_undo_restores_the_previous_one() {

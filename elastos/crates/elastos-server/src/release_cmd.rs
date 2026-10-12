@@ -27,7 +27,7 @@ pub async fn run_source(cmd: crate::sources::SourceCommand) -> anyhow::Result<()
             )
             .await
         }
-        other => crate::sources::run_source_command(other, crate::publish::source_discovery_uri),
+        other => crate::sources::run_source_command(other),
     }
 }
 

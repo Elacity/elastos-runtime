@@ -1809,14 +1809,12 @@ mod tests {
             name: "default".to_string(),
             publisher_dids: vec![],
             channel: "stable".to_string(),
-            discovery_uri: String::new(),
             connect_ticket: ticket.to_string(),
             gateways: vec!["https://seed.example".to_string()],
             install_path: String::new(),
             installed_version: String::new(),
             head_cid: String::new(),
             publisher_node_id: node_id.to_string(),
-            ipns_name: String::new(),
         }
     }
 
@@ -1878,14 +1876,12 @@ mod tests {
                 name: "default".to_string(),
                 publisher_dids: vec![],
                 channel: "canary".to_string(),
-                discovery_uri: String::new(),
                 connect_ticket: "seed-ticket".to_string(),
                 gateways: vec![],
                 install_path: String::new(),
                 installed_version: String::new(),
                 head_cid: String::new(),
                 publisher_node_id: String::new(),
-                ipns_name: String::new(),
             }],
         };
         assert_eq!(
@@ -1903,14 +1899,12 @@ mod tests {
                 name: "default".to_string(),
                 publisher_dids: vec![],
                 channel: "canary".to_string(),
-                discovery_uri: String::new(),
                 connect_ticket: "seed-ticket".to_string(),
                 gateways: vec![],
                 install_path: String::new(),
                 installed_version: String::new(),
                 head_cid: String::new(),
                 publisher_node_id: String::new(),
-                ipns_name: String::new(),
             }],
         };
 
@@ -1934,14 +1928,12 @@ mod tests {
                 name: "default".to_string(),
                 publisher_dids: vec![],
                 channel: "canary".to_string(),
-                discovery_uri: String::new(),
                 connect_ticket: "seed-ticket".to_string(),
                 gateways: vec![],
                 install_path: String::new(),
                 installed_version: String::new(),
                 head_cid: String::new(),
                 publisher_node_id: String::new(),
-                ipns_name: String::new(),
             }],
         };
 
@@ -2042,14 +2034,12 @@ mod tests {
                 name: "default".to_string(),
                 publisher_dids: vec![],
                 channel: "canary".to_string(),
-                discovery_uri: String::new(),
                 connect_ticket: "   ".to_string(),
                 gateways: vec![],
                 install_path: String::new(),
                 installed_version: String::new(),
                 head_cid: String::new(),
                 publisher_node_id: String::new(),
-                ipns_name: String::new(),
             }],
         };
         assert_eq!(bootstrap_ticket_from_config(&config), None);
