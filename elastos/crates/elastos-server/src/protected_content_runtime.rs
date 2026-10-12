@@ -2048,6 +2048,37 @@ fn open_runtime_media_tool(
     anyhow::bail!("owner-only media-provider prerequisite setup is unsupported on this platform")
 }
 
+/// Decide whether a directory on a media tool's path is safe from its owner,
+/// mode and the caller's uid, as `parent_dir_refusal` in scripts/install.sh
+/// does. Refuse directories owned by another user and group- or world-writable
+/// ones, except a root-owned sticky directory such as /tmp, where others cannot
+/// rename or remove entries they do not own. Never advise changing a root-owned
+/// directory: that would change the system for every user.
+#[cfg(unix)]
+fn media_parent_refusal(owner: u32, mode: u32, uid: u32, display: &Path) -> Option<String> {
+    let quoted = crate::install_transaction::shell_quote_path(display);
+    let shown = display.display();
+    if owner != 0 && owner != uid {
+        return Some(format!(
+            "{shown} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}"
+        ));
+    }
+    if mode & 0o022 == 0 {
+        return None;
+    }
+    if owner == 0 {
+        if mode & 0o1000 != 0 {
+            return None;
+        }
+        return Some(format!(
+            "{shown} is owned by root and others can write to it; keep the tools under your own home directory instead"
+        ));
+    }
+    Some(format!(
+        "{shown} is group- or world-writable; fix with: chmod go-w {quoted}"
+    ))
+}
+
 /// Open an absolute source path one directory at a time with `openat` and
 /// `O_NOFOLLOW`, so no link anywhere on the path is followed and every checked
 /// directory is the one the next step opens from. Callers that need a system link
@@ -2078,22 +2109,11 @@ fn open_media_source_no_links(literal: &Path, name: &str) -> anyhow::Result<fs::
         let metadata = dir.metadata().map_err(|_| {
             invalid_media_provider_config(format!("{name} prerequisite parent is unavailable"))
         })?;
-        let quoted = crate::install_transaction::shell_quote_path(display);
-        if metadata.uid() != 0 && metadata.uid() != uid {
+        if let Some(refusal) =
+            media_parent_refusal(metadata.uid(), metadata.permissions().mode(), uid, display)
+        {
             return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite parent is unsafe: {} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}",
-                display.display()
-            )));
-        }
-        if metadata.permissions().mode() & 0o022 != 0 {
-            let sudo = if metadata.uid() == 0 && uid != 0 {
-                "sudo "
-            } else {
-                ""
-            };
-            return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite parent is unsafe: {} is group- or world-writable; fix with: {sudo}chmod go-w {quoted}",
-                display.display()
+                "{name} prerequisite parent is unsafe: {refusal}"
             )));
         }
         Ok(())

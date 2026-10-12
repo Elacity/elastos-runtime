@@ -1109,6 +1109,47 @@ class InstallationTests(unittest.TestCase):
             result, _ = sandbox.run("--install-only")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_data_directory_under_root_owned_sticky_tmp_is_accepted(self):
+        did, head, release = installable_fixture()
+        tmp = Path("/tmp").resolve()
+        self.assertEqual((tmp.stat().st_uid, tmp.stat().st_mode & 0o7777), (0, 0o1777))
+        with InstallerSandbox(head, release, did) as sandbox, \
+                tempfile.TemporaryDirectory(prefix="installer-sticky-", dir=tmp) as outside:
+            (Path(outside) / "xdg-data").mkdir()
+            (sandbox.home / "xdg-data").symlink_to(Path(outside) / "xdg-data")
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, _ = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(tmp.stat().st_mode & 0o7777, 0o1777)
+
+    def test_parent_rule_by_owner_and_mode(self):
+        me = os.getuid() or 501
+        cases = [
+            (0, "1777", None),
+            (0, "41777", None),
+            (0, "755", None),
+            (me, "700", None),
+            (0, "777", "under your own home directory"),
+            (0, "775", "under your own home directory"),
+            (me, "777", "fix with: chmod go-w /x"),
+            (me, "1777", "fix with: chmod go-w /x"),
+            (me + 1, "1777", "is not owned by you"),
+        ]
+        for owner, mode, refusal in cases:
+            with self.subTest(owner=owner, mode=mode):
+                result = subprocess.run(
+                    [OPTIONS.bash, "--noprofile", "--norc", "-c",
+                     'source "$1" && parent_dir_refusal "$2" "$3" "$4" /x',
+                     "-", str(INSTALLER.resolve()), str(owner), mode, str(me)],
+                    capture_output=True, text=True, timeout=10)
+                if refusal is None:
+                    self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+                    continue
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(refusal, result.stdout)
+                if owner == 0:
+                    self.assertNotRegex(result.stdout, "chmod|chown|sudo")
+
     def test_group_writable_data_ancestor_is_refused_before_download_with_exact_fix(self):
         did, head, release = installable_fixture()
         with InstallerSandbox(head, release, did) as sandbox:

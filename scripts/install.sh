@@ -1102,6 +1102,29 @@ uninstall_installation() {
     fi
 }
 
+# Decide whether an existing ancestor of the data directory is safe, from its
+# owner uid, octal mode and the caller's uid. Prints the refusal and fails, or
+# prints nothing. Others must not be able to rename or replace entries on the
+# path: refuse ancestors owned by another user and group- or world-writable
+# ones, except a root-owned sticky directory such as /tmp, where others cannot
+# rename or remove entries they do not own. Never advise changing a
+# root-owned directory: that would change the system for every user.
+parent_dir_refusal() {
+    local owner="$1" mode="$2" uid="$3" quoted="$4"
+    if [[ "$owner" != 0 && "$owner" != "$uid" ]]; then
+        printf '%s\n' "Unsafe parent directory: $quoted is not owned by you; fix with: sudo chown \"\$(id -u)\" $quoted"
+        return 1
+    fi
+    (( 8#$mode & 8#022 )) || return 0
+    if [[ "$owner" == 0 ]]; then
+        (( 8#$mode & 8#1000 )) && return 0
+        printf '%s\n' "Unsafe parent directory: $quoted is owned by root and others can write to it; install under your own home directory instead (set HOME or XDG_DATA_HOME to a directory you own)"
+        return 1
+    fi
+    printf '%s\n' "Unsafe parent directory: $quoted is group- or world-writable; fix with: chmod go-w $quoted"
+    return 1
+}
+
 # ── Main ──────────────────────────────────────────────────────────────
 
 # Every action runs inside main, called on the last line, so `curl | bash`
@@ -1224,33 +1247,24 @@ require_safe_existing_dir() {
     fi
 }
 # The runtime also refuses media tools under a parent others can write, such
-# as a group-writable ~/.local. Apply that rule to every existing ancestor of
-# the data directory now, before any download: owned by you or root, and not
-# group- or world-writable.
+# as a group-writable ~/.local. Apply that rule (parent_dir_refusal) to every
+# existing ancestor of the data directory now, before any download.
 dir_owner_mode() {
     # GNU stat -f reports the filesystem, so pick the syntax by what works.
+    # Both print the mode in octal with its sticky bit.
     if stat -c '%u %a' / >/dev/null 2>&1; then
         stat -c '%u %a' -- "$1"
     else
-        stat -f '%u %Lp' -- "$1"
+        stat -f '%u %Mp%Lp' -- "$1"
     fi
 }
 require_safe_parent_chain() {
-    local dir="$1" real owner mode quoted
+    local dir="$1" real owner mode refusal
     while [[ ! -e "$dir" && "$dir" != "/" ]]; do dir="$(dirname -- "$dir")"; done
     real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve directory: $(printf '%q' "$dir")"
     while :; do
         read -r owner mode < <(dir_owner_mode "$real") || die_exact "Cannot inspect directory: $(printf '%q' "$real")"
-        quoted="$(printf '%q' "$real")"
-        if [[ "$owner" != 0 && "$owner" != "$(id -u)" ]]; then
-            die_exact "Unsafe parent directory: $quoted is not owned by you; fix with: sudo chown \"\$(id -u)\" $quoted"
-        fi
-        if (( 8#$mode & 8#022 )); then
-            if [[ "$owner" == 0 && "$(id -u)" != 0 ]]; then
-                die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: sudo chmod go-w $quoted"
-            fi
-            die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: chmod go-w $quoted"
-        fi
+        refusal="$(parent_dir_refusal "$owner" "$mode" "$(id -u)" "$(printf '%q' "$real")")" || die_exact "$refusal"
         [[ "$real" != "/" ]] || break
         real="$(dirname -- "$real")"
     done

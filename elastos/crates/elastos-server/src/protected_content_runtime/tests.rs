@@ -3746,12 +3746,35 @@ fn write_chain_provider_config(data_dir: &Path, config: &Value) {
 }
 
 #[cfg(unix)]
+#[test]
+fn media_parent_accepts_root_sticky_and_never_advises_changing_root_dirs() {
+    use super::media_parent_refusal;
+    let path = Path::new("/private/tmp");
+    let me = 501;
+    assert_eq!(media_parent_refusal(0, 0o41777, me, path), None);
+    assert_eq!(media_parent_refusal(0, 0o40755, me, path), None);
+    assert_eq!(media_parent_refusal(me, 0o40755, me, path), None);
+
+    let root_open = media_parent_refusal(0, 0o40777, me, path).unwrap();
+    assert!(root_open.contains("under your own home"), "{root_open}");
+    assert!(!root_open.contains("chmod") && !root_open.contains("chown"), "{root_open}");
+
+    let own_open = media_parent_refusal(me, 0o40777, me, path).unwrap();
+    assert!(own_open.contains("fix with: chmod go-w '/private/tmp'"), "{own_open}");
+    // A sticky directory owned by a user still lets that user replace entries.
+    let own_sticky = media_parent_refusal(me, 0o41777, me, path).unwrap();
+    assert!(own_sticky.contains("chmod go-w"), "{own_sticky}");
+    let other_sticky = media_parent_refusal(502, 0o41777, me, path).unwrap();
+    assert!(other_sticky.contains("not owned by you"), "{other_sticky}");
+}
+
+#[cfg(unix)]
 fn safe_ancestor_tempdir() -> tempfile::TempDir {
     // The media prerequisite import walks every ancestor of the source tool
-    // path and rejects group/world-writable directories. std temp lives under
-    // /tmp (mode 1777) on Linux, so fixtures built there are structurally
-    // unsafe; anchor them under the build target dir, whose ancestors are
-    // developer- or runner-owned.
+    // path and rejects group/world-writable directories other than root-owned
+    // sticky ones; anchor fixtures under the build target dir, whose ancestors
+    // are developer- or runner-owned, so their parent modes are what each test
+    // sets.
     let root = option_env!("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target")));

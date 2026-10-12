@@ -6,6 +6,17 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Fixed
+
+- The installer accepts a home or data directory under `/tmp` (on macOS
+  `/private/tmp`). It refused it as world-writable and advised
+  `sudo chmod go-w /private/tmp`, which would break the system. A root-owned
+  directory with the sticky bit is safe on the path, because other users
+  cannot rename or remove entries they do not own. Other group- or
+  world-writable root directories are still refused, and the message now says
+  to install under your own home instead of advising a change to a system
+  directory. The Runtime's media tool path check follows the same rule.
+
 ### Developer detail
 
 - CI's `release-upstream-assets` job runs the release's upstream asset build
