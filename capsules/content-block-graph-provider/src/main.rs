@@ -536,8 +536,7 @@ fn write_private_file_atomically(path: &Path, data: &[u8]) -> io::Result<()> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| refused("private file name is invalid"))?;
     let mut nonce = [0u8; 16];
-    getrandom::getrandom(&mut nonce)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    getrandom::getrandom(&mut nonce).map_err(|err| io::Error::other(err.to_string()))?;
     let nonce: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
     let temporary = parent.join(format!(".{name}.{nonce}.tmp"));
     let result = (|| {
