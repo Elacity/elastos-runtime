@@ -30,10 +30,10 @@ def validate(recipe, upstream):
             if set(dep) != {'name', 'root', 'source'} or '/' in upstream.relative(dep['root']):
                 raise ValueError('invalid source dependency')
             upstream.source_spec(dep['source'])
-        if component == 'crosvm' and (recipe['platform'] != 'linux-arm64'
+        if component == 'crosvm' and (recipe['platform'] not in ('linux-arm64', 'linux-amd64')
                 or not {'licenses/minijail.txt', 'licenses/libcap.txt'} <= {
                     f['name'] for f in recipe['license']['files']}):
-            raise ValueError('crosvm requires its Linux ARM64 recipe and dependency licences')
+            raise ValueError('crosvm requires its Linux recipe and dependency licences')
         return
     if (recipe['component'] != 'turnserver' or build.get('kind') != 'coturn-static-v1'
             or set(build) != {'kind', 'dependencies'} or len(build['dependencies']) != 2):
@@ -316,6 +316,60 @@ def package_python_licenses(recipe, payload, cache, upstream):
     return output
 
 
+def prepare_crosvm_private_params(source):
+    """Keep the guest ABI while passing boot parameters through a private file.
+
+    The pinned CLI has only -p. Apply a bounded, fail-closed extension before
+    compilation; its source and builder hash travel with the native receipt.
+    """
+    path = source / 'src/crosvm/cmdline.rs'
+    text = path.read_text()
+    field = '    pub params: Vec<String>,\n'
+    conversion = '        cfg.params.extend(cmd.params);\n'
+    if text.count(field) != 1 or text.count(conversion) != 1 or 'params_file' in text:
+        raise ValueError('pinned crosvm private parameter CLI changed')
+    text = text.replace(field, field + '''
+    #[argh(option)]
+    /// private file containing extra kernel command line arguments (64 KiB maximum)
+    pub params_file: Option<PathBuf>,
+''')
+    text = text.replace(conversion, conversion + '''
+        if let Some(path) = cmd.params_file {
+            use std::io::Read;
+            let file = std::fs::File::open(path)
+                .map_err(|_| "cannot open private kernel parameters".to_string())?;
+            let mut bytes = Vec::new();
+            file.take(65537).read_to_end(&mut bytes)
+                .map_err(|_| "cannot read private kernel parameters".to_string())?;
+            if bytes.len() > 65536 || bytes.contains(&0) {
+                return Err("invalid private kernel parameters".to_string());
+            }
+            let params = String::from_utf8(bytes)
+                .map_err(|_| "invalid private kernel parameters".to_string())?;
+            cfg.params.push(params);
+        }
+''')
+    path.write_text(text)
+
+
+def prepare_crosvm_musl_vsock_policies(source):
+    # musl sign-extends its signed 32-bit ioctl request to the syscall argument.
+    # These aliases name the same two kernel requests; keep the exact allowlist.
+    updates = []
+    for relative in ('x86_64/vhost_vsock.policy', 'aarch64/vhost_vsock_device.policy'):
+        path = source / 'jail/seccomp' / relative
+        text = path.read_text()
+        for request in ('8008af00', 'c008af12'):
+            canonical = 'arg1 == 0x' + request
+            alias = 'arg1 == 0xffffffff' + request
+            if text.count(canonical) != 1 or alias in text:
+                raise ValueError('pinned crosvm vsock ioctl policy changed: ' + relative)
+            text = text.replace(canonical, canonical + ' || ' + alias)
+        updates.append((path, text))
+    for path, text in updates:
+        path.write_text(text)
+
+
 def build_browser_native(recipe, payload, cache, upstream):
     native = ('darwin' if platform.system() == 'Darwin' else 'linux') + '-' + (
         'arm64' if platform.machine() in ('arm64', 'aarch64') else 'amd64')
@@ -348,6 +402,8 @@ def build_browser_native(recipe, payload, cache, upstream):
                 subprocess.run(['make', '-j' + jobs, *names], cwd=source / directory, env=env, check=True)
                 binaries.update({name: source / directory / name for name in names})
         else:
+            prepare_crosvm_musl_vsock_policies(source)
+            prepare_crosvm_private_params(source)
             dependency_root, dependency = inputs[1]
             minijail = extract(dependency, dependency_root, work / 'dependencies', upstream)
             destination = source / 'third_party/minijail'

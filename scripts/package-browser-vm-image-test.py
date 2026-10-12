@@ -51,6 +51,7 @@ class BrowserImagePackageTest(unittest.TestCase):
         }
         for name, payload in self.payloads.items():
             (self.image / name).write_bytes(payload)
+        self.amd_inputs = guest_inputs.identity(options={**guest_inputs.DEFAULT_OPTIONS, "target_platform": "linux-amd64"})
         self.receipt = {
             "schema": "elastos.browser.vm-rootfs-build/v1", "ok": True,
                    "inputs_sha256": guest_inputs.identity()["sha256"],
@@ -128,11 +129,16 @@ class BrowserImagePackageTest(unittest.TestCase):
         self.package()
         self.assertEqual(sha(self.archive.read_bytes()), checksum)
 
-    def test_x86_local_image_is_refused(self):
+    def test_x86_image_requires_its_own_guest_and_recipe(self):
         self.platform = "linux-amd64"
         with self.assertRaises(ValueError):
             self.package()
         self.assertFalse(self.archive.exists())
+        inputs = self.amd_inputs
+        self.receipt.update(target_platform="linux-amd64", inputs_sha256=inputs["sha256"], recipe_options=inputs["options"])
+        self.write_receipt()
+        self.package()
+        self.assertTrue(self.archive.is_file())
 
     def test_matching_input_cache_reuses_only_unchanged_payloads(self):
         inputs = {"sha256": self.receipt["inputs_sha256"]}
@@ -142,8 +148,8 @@ class BrowserImagePackageTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             guest_inputs.reusable(self.image, inputs)
 
-    def test_recipe_options_must_be_complete_and_arm64(self):
-        for options in ({}, {**guest_inputs.DEFAULT_OPTIONS, "target_platform": "linux-amd64"},
+    def test_recipe_options_must_be_complete_and_supported(self):
+        for options in ({}, {**guest_inputs.DEFAULT_OPTIONS, "target_platform": "linux-riscv64"},
                         {**guest_inputs.DEFAULT_OPTIONS, "cdp_timeout_ms": "0"}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 guest_inputs.identity(options=options)

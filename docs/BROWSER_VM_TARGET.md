@@ -360,9 +360,10 @@ It reports one canonical answer for the current host:
 macOS VZ readiness requires `bin/browser-vz-engine-supervisor`, `bin/vmlinux`,
 the matching `bin/initrd` when initramfs boot is used, and
 `browser-vm/rootfs.ext4` with its matching
-`browser-vm/browser-vm-rootfs-manifest.json`. Linux crosvm readiness requires
-`/dev/kvm`, `bin/crosvm`, `bin/vmlinux`, `browser-vm/initrd`, and the same
-rootfs contract. A gateway without KVM can consume an approved remote Engine.
+`browser-vm/browser-vm-rootfs-manifest.json`. Linux crosvm readiness requires user read/write access to `/dev/kvm` and
+`/dev/vhost-vsock`, the admitted `bin/crosvm` and
+`bin/browser-vz-engine-supervisor`, and the same verified rootfs, kernel and
+initramfs set. A gateway without KVM can consume an approved remote Engine.
 Protocol 2.1 requires that Engine to report readiness; a local socket alone
 provides diagnostic connectivity evidence.
 
@@ -381,142 +382,120 @@ does not establish that its guest was built from the same source. Bind the guest
 build provenance and host installation receipt before product qualification.
 
 Use `scripts/browser-vm-artifact-preflight.sh --verify-image-set` for the
-read-only image-set check, independent of host virtualization. It uses
-`ELASTOS_BROWSER_VM_INITRD` or `browser-vm/initrd` for Linux crosvm, and
-`ELASTOS_BROWSER_VM_INITRAMFS` or `bin/initrd` for Mac VZ, matching each launcher.
+read-only image-set check, independent of host virtualization. The shared local supervisor uses `ELASTOS_BROWSER_VM_INITRAMFS` on both
+Mac VZ and Linux crosvm. Release configuration selects the `initrd` inside the
+admitted image set. Historical launcher preflight can also inspect its
+`ELASTOS_BROWSER_VM_INITRD` projection.
 The control-service readiness cache watches those same files.
 
 ## Source-Home Install Truth
 
-### Linux host network setup
+### Linux host setup
 
-The Home user runs Runtime, crosvm and Browser launch/cleanup as ordinary
-processes. Root owns a pool of four persistent TAP devices for that Linux
-account. Each slot has a private `/30`, a relay listener on TCP `19091`, and
-local TURN on TCP/UDP `41000` with relay ports `49152:49215`. Session ICE
-configuration uses `turn:{host_ip}:{turn_port}` with a username and credential.
-The launcher refuses a different local media port or relay range.
+The Home user runs Runtime, the shared Browser supervisor and crosvm. The guest
+has no network interface. Fixed vsock ports carry control, display and the
+Runtime-owned Exit relay. The supervisor owns each launch's TURN process,
+private credentials, rootfs copy, persistent profile disk and writer locks.
+The guest media bridge limits TURN peers to the session's relay ports. Runtime
+owns website connections and Browser Engine/Exit selection.
 
-After staging and reviewing the helpers, install the setup helper in its
-root-owned location. Run these commands in a root shell. Replace
-`<reviewed-checkout>` and `<home-user>` with the reviewed source directory and
-the ordinary Linux Home account:
+Root grants the ordinary Home account access to KVM and vhost-vsock once.
+Install the reviewed helper in its root-owned location, then run setup in a
+root shell. Replace `<reviewed-checkout>` and `<home-user>` with the reviewed
+source directory and ordinary Linux Home account:
 
 ```sh
 install -D -o root -g root -m 755 <reviewed-checkout>/scripts/browser-vm-linux-network.py /usr/local/lib/elastos/browser-vm-linux-network.py
 python3 /usr/local/lib/elastos/browser-vm-linux-network.py setup --user <home-user>
 ```
 
-The script lists the devices, addresses and policy, then asks for `y` before
-it changes the host. It needs Python 3.8+, iproute2, iptables/ip6tables, ACL
-tools (`setfacl`, `getfacl`), systemd and udev, plus `/dev/kvm` and `/dev/net/tun`.
-It creates TAPs owned by the numeric UID, adds their host addresses and
-confinement rules, grants that user read/write KVM access through a named ACL,
-and installs a KVM udev rule. An existing named KVM ACL is saved for removal.
-This gives `elastos-agent` KVM access without changing its groups.
+The helper lists its changes and asks for `y`. It needs Python, iproute2,
+iptables/ip6tables, ACL tools, systemd, udev and a kernel with KVM and vhost-vsock.
+It loads `vhost_vsock` when the device is absent. Named-user device ACLs and
+late udev rules preserve this account's access after device creation. A
+root-owned boot service repeats module preparation and device grants.
 
-Root stores ACL state in `/var/lib/elastos-browser/<uid>.json`, copies the
-setup helper to `/usr/local/lib/elastos/browser-vm-linux-network.py`, and
-enables `elastos-browser-network-<uid>.service`. This oneshot service restores
-the devices and rules after each boot, following host firewall services. The
-unit shares stop/restart and reload events with `nftables`, `firewalld`, `ufw`
-and `netfilter-persistent`. Before stopping or repairing the network, it
-removes the receipt and brings every TAP down, including active guests. A
-failed repair leaves the TAPs down and Browser unavailable. Active session
-locks can hold repair until the user closes those sessions.
-It writes a root-owned, boot-bound receipt under `/run/elastos-browser` only
-after all changes succeed. The Runtime does read-only checks of that receipt,
-its policy, active unit state, TAP identity/owner/persistence/address, and
-device access on each readiness request and launch. Root owns firewall state:
-direct rule edits or flush commands outside these service events require the
-operator to close Browser sessions and rerun setup. An ordinary process cannot
-inspect the privileged rule set. Repair messages name the root-owned helper;
-if that copy is absent or unsafe, they first require a reviewed installation.
+The helper retains its existing four TAP devices and filter rules for ownership
+checks and removal of earlier installations. The shared Browser supervisor uses
+vsock; these TAPs do not carry its guest traffic. Root stores the previous
+per-account KVM and vhost-vsock ACLs under `/var/lib/elastos-browser`. Each
+account owns its setup record. Other accounts and host firewall rules retain
+their owners.
 
-The launcher leases a slot with an ordinary file lock. It releases that lock
-after the VM and media children stop. A TAP with an active carrier remains
-busy if its VM outlives the launcher. A fifth concurrent session reports that
-the user must close a session. Close all sessions before setup or removal.
-Setup refuses a subnet that overlaps an existing host route.
+Source-Home setup admits the shared supervisor through normal Runtime setup.
+It preserves matching installed dependency pins and image receipts. Migration
+replaces the known Home-owned Linux launcher configuration while keeping custom
+or remote Engine selection. It stops an earlier shared TURN daemon only when
+its UID, managed executable and config arguments match this Home. A pidfd binds
+that stop to the exact process; delayed cleanup gives a repair message.
 
-The filter policy for each TAP is:
-
-| Traffic | Host action |
-| --- | --- |
-| Guest to its host, established/related | Accept |
-| Guest to its host, TCP `19091` | Accept for Runtime Exit relay |
-| Guest to its host, TCP/UDP `41000`, `49152:49215` | Accept for session-local TURN |
-| Other input from that TAP | Drop |
-| Forwarded IPv4/IPv6 from that TAP | Drop |
-| IPv6 input from that TAP | Drop; interface IPv6 is also disabled |
-| Host output from slot IP, UDP source `49152:49215` | Accept only to the slot IP on UDP `49152:49215` or `41000`; drop all else |
-
-Root inserts per-TAP input chains and forwarding drops ahead of existing host
-filter rules. Runtime keeps its Unix relay and session-local TURN processes;
-launch creates the VM, bridges, media process, sockets and disposable rootfs.
-Guest control stays on TCP `19092` reached from the host. Guest DHCP, host
-forwarding, NAT and host default-route changes are unnecessary.
-Session TURN relays only to its own relay address (the slot host IP), where the
-guest and viewer allocations meet; loopback, private ranges and every other
-peer are denied, and TCP relays are off. coturn checks peer IPs only, so the
-relay output rule above confines relayed UDP to the TURN ports; host services
-on the slot IP stay unreachable. `check` refuses a receipt without that rule.
-`elastos setup` writes the Home's TURN credential to the
-owner-only `$DATA_DIR/runtime-turn/turn-credentials.env` and keeps an
-existing one.
-
-For removal, use the same root shell and helper:
+For removal, close Browser and use the same root shell:
 
 ```sh
 python3 /usr/local/lib/elastos/browser-vm-linux-network.py remove --user <home-user>
 ```
 
-After confirmation, removal deletes this account's TAPs, filter hooks/chains,
-boot service, udev rule, locks and receipts. It restores the prior named KVM
-ACL, or removes the grant created by setup. The shared root helper is removed
-when the last account's setup is removed. Other host firewall rules stay with
-their owner. `install.sh` integration is a separate change; the installer can
-call the exact setup command above as its approved root step.
+After confirmation, removal restores previous named-user ACLs and removes this
+account's devices, filter rules, boot service, udev rules and receipts. The
+shared root helper remains while another account owns setup state. Runtime
+launch and cleanup run as the ordinary Home user.
+
+### Home user-service access
+
+The fixed-vsock Linux Engine runs under the ordinary Home account. It needs
+read/write access to `/dev/kvm` and `/dev/vhost-vsock`, with the user ACLs from
+the one-time host setup. Its launch has zero guest network devices. `/dev/net/tun`
+and the retained per-UID TAP/network helper are outside this launch path.
+Runtime keeps an empty capability set and `NoNewPrivileges=yes`.
+
+The unit exposes these two devices through its device namespace; a device
+allowlist alone does not make hidden device nodes visible. Runtime uses
+`AF_UNIX`, `AF_VSOCK`, `AF_INET` and `AF_INET6`. The crosvm jail creates user,
+PID, mount and network namespaces and uses its pinned seccomp policy. Service
+hardening permits these namespaces, process control and device ioctls.
+
+The admitted data directory supplies the executable helpers, libraries,
+capsules, image, kernel and initrd. Runtime writes its `bvm`, `vz-browser` and
+`rootfs-cache` directories, any explicitly configured Browser VM root, and the
+principal-owned `BrowserProfiles/default/profile.ext4` with its lock. A unit
+that hides the user's home binds this exact data directory read/write and
+keeps the remaining home directories hidden. `/proc` supplies owned-process
+checks. Runtime and its descendants share the unit's temporary namespace for
+the control sockets, including `/tmp/evzrc` and the platform control socket;
+`PrivateTmp` can remain enabled.
+
+Unit qualification runs the installed Browser journey under the actual unit,
+then checks Close, profile reopening and absence of owned helper processes.
+The unit's device, namespace and path policy must pass this target run before
+its Browser support is accepted.
 
 ### Linux operator proof
 
-Run this proof on both a suitable Linux ARM64 host and the Jetson. Stage the
-candidate launcher, network helper, control service and preflight helper at
-their stable installed paths; record their source tree and SHA-256 parity.
-Use an isolated test Home on an unused port such as `18091`.
+Use a suitable KVM host and an isolated Home. Bind its installed Runtime,
+supervisor, crosvm, image and managed dependencies to their source and artifact
+receipts. Linux ARM64 and AMD64 use the same contracts; each target retains its
+own installed qualification gate.
 
-1. Run the confirmed setup command as root. As the Home user, run
-   `python3 <data-dir>/scripts/browser-vm-linux-network.py check`. Save the
-   returned slot addresses. After reboot, repeat the check to prove restoration.
-   Restart and reload each installed firewall service. Prove restoration when
-   sessions are closed; with an active session, prove that failed repair keeps
-   the TAPs down and readiness unavailable. Close the session and rerun setup.
-2. Start the test Runtime as that user with a PATH directory containing only
-   the needed ordinary tools (including `node`, `python3`, `ip`, `cp`, `ss`
-   and `turnserver`) and its installed `bin` directory. Record
-   `command -v sudo` returning failure. Trace the Runtime and children with
-   `strace -f -e execve -o <proof-dir>/exec.log` and confirm that the log has
-   zero privilege-escalation commands. Scan the installed runtime/helper files
-   with `find <data-dir>/bin <data-dir>/scripts -type f -perm /6000 -print`
-   and `getcap -r <data-dir>/bin <data-dir>/scripts`; both scans should be empty.
-3. Sign in and open Browser with explicit Browser Engine and Exit selection.
-   Prove page load through Runtime Exit, audio/video, input, reconnect and
-   frame continuity. Open concurrent sessions and prove distinct slots and
-   the four-slot refusal. Capture desktop/phone media and manual UX evidence
-   for `scripts/browser-objective-audit.mjs`.
-4. From the guest, prove TCP `19091` and the configured TURN ports work.
-   Prove other host ports, other host addresses, LAN/internet forwarding and
-   IPv6 fail. Save root `iptables -S`/`ip6tables -S` output and packet evidence.
-5. Close Browser, then stop the test Runtime. Prove its VM, TURN process,
-   listeners and control sockets are gone; all TAP carriers should be `0`.
-   Reopen a session to prove slot reuse, then close it. Run confirmed removal
-   as root and prove the TAPs, per-account rules, service and udev rule are
-   gone and the prior KVM ACL is restored. Run `check` again as the Home user:
-   it should refuse with the single root setup command.
+1. Run confirmed setup as root. As the Home user, run the helper's `check`, open
+   both virtualization devices, and verify KVM API version 12. Repeat after
+   reboot to prove module preparation and access restoration.
+2. Start the source Home through `scripts/setup-source-home.sh`. Verify the
+   stable Runtime installation receipt and installed helper hashes. Trace the
+   Runtime and its children to prove ordinary-user launch and cleanup.
+3. Sign in through Home, click Browser and load a controlled page. Record image
+   preparation and first decoded frame times. Prove navigation, type, scroll,
+   click and actual website Reload, then Close and committed-profile reopening.
+   Repeat after an update to a newer admitted candidate. Audio, continuity,
+   reconnect and manual UX retain their applicable qualification gates.
+4. Prove the guest has no NIC and website traffic uses Runtime Exit. Prove the
+   media bridge accepts only the authorized TURN listener and relay range.
+5. Close Browser and stop the test Runtime. Prove VM workers, TURN processes,
+   listeners and sockets are gone before releasing disk writer locks. Reopen
+   the profile, then close it. Run confirmed removal as root and prove the
+   account's setup is removed and its prior device ACLs are restored.
 
-These target steps prove installed behavior. Root-free source tests establish
-command construction and refusal, and leave target media acceptance to this
-operator journey.
+Root-free fixtures establish command construction and refusal. Installed frame,
+input, lifecycle and isolation proof comes from this target journey.
 
 `components.json` owns the signed provider binaries, including
 `browser-engine-adapter` and `browser-local-exit`, the VM host helper closure,
@@ -535,10 +514,8 @@ generator/stager for:
 
 - `bin/browser-vm-engine-supervisor`
 - `bin/browser-vm-control-service`
-- `bin/browser-vm-local-crosvm-launcher`
 - `bin/browser-vm-remote-vz-launcher`
-- `bin/browser-vm-prepare-rootfs-pool`
-- `bin/browser-vz-engine-supervisor` on macOS after the VZ helper is built
+- `bin/browser-vz-engine-supervisor` on each supported local host after the helper is built
 - verified links to an existing rootfs, kernel, initrd and matching build manifest
 
 For already-provisioned targets, `scripts/browser-vm-target-refresh.sh` is the

@@ -1,0 +1,31 @@
+{
+  "schema": "elastos.browser.debian-lock/v1",
+  "architecture": "amd64",
+  "suite": "bookworm",
+  "debian_snapshot": "20261008T203843Z",
+  "security_snapshot": "20261008T230243Z",
+  "security_index_sha256": "d97872da3ff1a60952a9bf64d2c908b1275b32f67a73beb20ae455dc5bcd8137",
+  "packages": [
+    {
+      "name": "chromium",
+      "version": "154.0.8037.92-1~deb12u1",
+      "filename": "pool/updates/main/c/chromium/chromium_154.0.8037.92-1~deb12u1_amd64.deb",
+      "size": 80290488,
+      "sha256": "cd258a352414714e8027a623c4ff01ef1c565446d8f7206bc4ce085a4aa7bea5"
+    },
+    {
+      "name": "chromium-common",
+      "version": "154.0.8037.92-1~deb12u1",
+      "filename": "pool/updates/main/c/chromium/chromium-common_154.0.8037.92-1~deb12u1_amd64.deb",
+      "size": 30489128,
+      "sha256": "c10056d7f80dcb2a9dc384997ecd5fd3aec9fa5acea472d53063ea6ba1f700d9"
+    },
+    {
+      "name": "chromium-sandbox",
+      "version": "154.0.8037.92-1~deb12u1",
+      "filename": "pool/updates/main/c/chromium/chromium-sandbox_154.0.8037.92-1~deb12u1_amd64.deb",
+      "size": 153784,
+      "sha256": "b48372322890bfb88c32662a94ff3ec7088fb6ce026cf5d238534378a82eb4f8"
+    }
+  ]
+}

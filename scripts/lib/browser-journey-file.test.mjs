@@ -92,7 +92,7 @@ test("served opt-in page handles input/change only once and sends only hash/size
   const output = { textContent: "" };
   const sent = [];
   const context = vm.createContext({ crypto: webcrypto, isSecureContext: true, performance, setTimeout, clearTimeout,
-    document: { querySelector: selector => ({ "#journey-input": textInput, "#journey-file": inputFile, "#journey-observation": output })[selector] },
+    document: { querySelector: selector => ({ "#journey-input": textInput, "#journey-click": textInput, "#journey-file": inputFile, "#journey-observation": output })[selector] },
     scrollX: 0, scrollY: 0, addEventListener: () => {}, requestAnimationFrame: fn => fn(),
     fetch: async (url, config) => { sent.push(JSON.parse(config.body)); return fetch(base + url, config); },
   });

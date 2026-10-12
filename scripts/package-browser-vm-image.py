@@ -62,7 +62,7 @@ def digest(path):
 
 
 def package(image, platform, archive, manifest_output, release_path):
-    if platform not in {"darwin-arm64", "linux-arm64"}:
+    if platform not in {"darwin-arm64", "linux-arm64", "linux-amd64"}:
         raise ValueError(f"unsupported Browser image platform: {platform}")
     if (not release_path.endswith(".tar.gz") or release_path.startswith("/")
             or any(part in {"", ".", ".."} for part in release_path.split("/"))):

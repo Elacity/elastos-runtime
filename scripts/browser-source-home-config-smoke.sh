@@ -68,7 +68,7 @@ function generate(dataDir, platform, name, controlSocket) {
 }
 
 const allDefaults = new Set();
-for (const platform of ["darwin-arm64", "linux-arm64"]) {
+for (const platform of ["darwin-arm64", "linux-arm64", "linux-amd64"]) {
   // Homes can have long paths with spaces and the same final data-dir name.
   const homeRoot = path.join(tmpDir, "Long Home ".repeat(16), "Library", "Application Support");
   const dataDir = path.join(homeRoot, "one", "elastos");
@@ -115,6 +115,7 @@ ELASTOS_BROWSER_VM_TRACE="1" \
 ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS="3000" \
 ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS="60000" \
 ELASTOS_BROWSER_VM_TURNSERVER_BIN="/tmp/elastos-test-turnserver" \
+ELASTOS_BROWSER_VM_TURN_PROGRAM="/tmp/elastos-test-turnserver" \
   "$node_bin" scripts/browser-source-home-config.mjs \
     --data-dir "$tmp_dir/vm-data" \
     --platform linux-arm64 \
@@ -301,47 +302,18 @@ if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS !== "0") {
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_REUSE_IDLE_VMS !== "0") {
   throw new Error("Linux VM adapter must fail closed on profile-keyed idle VM reuse");
 }
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION !== "0") {
-  throw new Error("Linux source-home Browser config must not claim VZ hibernation");
+if ("ELASTOS_BROWSER_VM_HIBERNATION" in (adapter?.supervisor?.env || {})) {
+  throw new Error("Fixed-vsock launch config must close each VM instead of hibernating it");
 }
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE !== "1") {
   throw new Error("VM adapter must prewarm the Browser VM control service during Runtime startup");
 }
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER !== vmAdapterPath.replace(/\/vm-config\/browser-engine-adapter\.json$/, "/vm-data/bin/browser-vm-local-crosvm-launcher")) {
+if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER !== vmAdapterPath.replace(/\/vm-config\/browser-engine-adapter\.json$/, "/vm-data/bin/browser-vz-engine-supervisor")) {
   throw new Error("Linux source-home Browser config must default to the local crosvm VM control launcher");
 }
-if (!adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR?.endsWith("/vm-data/browser-vm/rootfs-pool")) {
-  throw new Error("Linux source-home Browser config must use a prepared rootfs pool");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE !== "pool-required") {
-  throw new Error("Linux source-home Browser config must require prepared rootfs pool copies");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT !== "1") {
-  throw new Error("Linux source-home Browser config must keep one prepared rootfs spare for bounded update capacity");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT !== vmAdapterPath.replace(/\/vm-config\/browser-engine-adapter\.json$/, "/vm-data/bin/browser-vm-prepare-rootfs-pool")) {
-  throw new Error("Linux source-home Browser config must point at the rootfs pool refill wrapper");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ICE_SERVER !== "turn:turn.example.invalid:3478?transport=tcp") {
-  throw new Error("VM source-home config must carry operator TURN relay config to the supervisor env");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ICE_USERNAME !== "source-home-user") {
-  throw new Error("VM source-home config must carry TURN usernames to the supervisor env");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ICE_CREDENTIAL !== "source-home-secret") {
-  throw new Error("VM source-home config must carry TURN credentials to the supervisor env");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY !== "relay") {
-  throw new Error("VM source-home config must keep WebRTC on relay-only ICE policy");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4 !== "10.44.0.1") {
-  throw new Error("VM source-home config must carry operator media relay host IPv4 to the supervisor env");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4 !== "10.44.0.2") {
-  throw new Error("VM source-home config must carry operator media relay guest IPv4 to the supervisor env");
-}
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX !== "24") {
-  throw new Error("VM source-home config must carry operator media relay prefix to the supervisor env");
+assertNoRemoteVzLocalTurnEnv(adapter?.supervisor?.env, "Local Linux fixed-vsock config");
+for (const key of ["ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR", "ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE", "ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT", "ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT"]) {
+  if (key in (adapter?.supervisor?.env || {})) throw new Error(`Fixed-vsock config inherits retired ${key}`);
 }
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_TRACE !== "1") {
   throw new Error("VM source-home config must carry operator diagnostic trace to the supervisor env");
@@ -352,7 +324,7 @@ if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS !== "60000") {
   throw new Error("VM source-home config must carry open-error debug hold diagnostics to the supervisor env");
 }
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_TURNSERVER_BIN !== "/tmp/elastos-test-turnserver") {
+if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_TURN_PROGRAM !== "/tmp/elastos-test-turnserver") {
   throw new Error("VM source-home config must carry the canonical turnserver binary env to the supervisor env");
 }
 if (vmExit.backends?.[0]?.adapter_ipc?.kind !== "unix_socket") throw new Error("VM missing adapter_ipc socket");
@@ -521,18 +493,7 @@ assertNoRemoteVzLocalTurnEnv(
   "Local Mac no-NIC VZ source-home Browser config",
 );
 const linuxTurnEnv = linuxTurnAdapter.adapters?.[0]?.supervisor?.env || {};
-if (!linuxTurnEnv.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON?.includes("{host_ip}")) {
-  throw new Error("Linux source-home Browser config must preserve per-session TURN host placeholder");
-}
-if (!linuxTurnEnv.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON?.includes("{turn_port}")) {
-  throw new Error("Linux source-home Browser config must preserve per-session TURN port placeholder");
-}
-if (!linuxTurnEnv.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON?.includes("linux-runtime-turn-user")) {
-  throw new Error("Linux source-home Browser config must load runtime TURN credentials from data dir");
-}
-if (linuxTurnEnv.ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY !== "relay") {
-  throw new Error("Linux source-home Browser config must carry relay-only ICE policy from runtime TURN credentials");
-}
+assertNoRemoteVzLocalTurnEnv(linuxTurnEnv, "Local Linux fixed-vsock config");
 if (preserveExit.backends?.length !== 1) {
   throw new Error("source-home config must refresh the local Exit backend while preserving remote grants");
 }

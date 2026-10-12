@@ -77,9 +77,9 @@ BROWSER_IMAGE_RESERVE_BYTES = 2 * 1024**3
 
 
 def check_browser_image_archive(path, platform):
-    """Read the complete shared ARM64 image without extracting or booting it."""
-    if platform not in ("darwin-arm64", "linux-arm64"):
-        raise ValueError("This host uses a remote Browser Engine; the shared guest is ARM64")
+    """Verify the host-compatible guest image without extracting or booting it."""
+    if platform not in ("darwin-arm64", "linux-arm64", "linux-amd64"):
+        raise ValueError("Unsupported Browser Engine host")
     records, receipt = {}, None
     files = {"rootfs.ext4", "vmlinux", "initrd", "browser-vm-rootfs-manifest.json"}
     with gzip.open(path, "rb") as compressed, tarfile.open(fileobj=compressed, mode="r|") as archive:
@@ -102,10 +102,11 @@ def check_browser_image_archive(path, platform):
         # Tar ends before the gzip trailer; consume it to verify CRC/truncation.
         while compressed.read(1024 * 1024):
             pass
-    guest = "linux-arm64"
+    guest = "linux-amd64" if platform == "linux-amd64" else "linux-arm64"
     if (set(records) != files or not isinstance(receipt, dict)
             or receipt.get("schema") != "elastos.browser.vm-rootfs-build/v1"
-            or receipt.get("ok") is not True or receipt.get("target_platform") != guest):
+            or receipt.get("ok") is not True or receipt.get("target_platform") != guest
+            or receipt.get("recipe_options", {}).get("target_platform") != guest):
         raise ValueError("Browser image set is incomplete or has the wrong guest platform")
     import importlib.util
     spec = importlib.util.spec_from_file_location("guest_inputs", Path(__file__).with_name("browser-vm-image-inputs.py"))

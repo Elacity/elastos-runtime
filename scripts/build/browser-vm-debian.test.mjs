@@ -44,3 +44,15 @@ with tempfile.TemporaryDirectory() as root:
   const result = spawnSync('python3', ['-c', code], { encoding: 'utf8', timeout: 5000 });
   assert.equal(result.status, 0, result.stderr);
 });
+
+test('each guest architecture selects its own pinned Chromium and Python closure', () => {
+  const amd = JSON.parse(fs.readFileSync(new URL('./browser-vm-debian-amd64-lock.json', import.meta.url), 'utf8'));
+  assert.equal(amd.architecture, 'amd64');
+  assert.equal(amd.security_snapshot, lock.security_snapshot);
+  assert.equal(run('--target-platform', 'linux-amd64', 'validate', 'bookworm', mirror).status, 0);
+  const python = run('--target-platform', 'linux-amd64', 'python-requirements');
+  assert.equal(python.status, 0, python.stderr);
+  const code = `import importlib.util, pathlib\ns=importlib.util.spec_from_file_location('debian', ${JSON.stringify(script)})\nm=importlib.util.module_from_spec(s);s.loader.exec_module(m)\ntry: m.load_lock(m.LOCK, 'amd64')\nexcept ValueError: pass\nelse: raise AssertionError('ARM pins admitted for x86')\na=m.load_lock(m.LOCK.with_name('browser-vm-debian-amd64-lock.json'), 'amd64')\nassert all(p['filename'].endswith('_amd64.deb') for p in a['packages'])\n`;
+  const result = spawnSync('python3', ['-c', code], { encoding: 'utf8', timeout: 5000 });
+  assert.equal(result.status, 0, result.stderr);
+});

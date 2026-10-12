@@ -1075,6 +1075,10 @@ pub async fn ensure_browser_vm_image_for_local_engine(data_dir: &Path) -> anyhow
     ensure_browser_vm_image_in_context(data_dir, FirstPartyCarrierContext::Runtime).await
 }
 
+pub(crate) fn home_browser_available_for(data_dir: &Path, platform: &str) -> bool {
+    browser_config::home_browser_available(data_dir, platform)
+}
+
 async fn ensure_browser_vm_image_in_context(
     data_dir: &Path,
     context: FirstPartyCarrierContext,
@@ -7467,14 +7471,14 @@ pub(crate) mod tests {
                 .unwrap_or_else(|error| panic!("{platform}: {error:#}"));
         }
         // Home obtains Browser VM helpers when it prepares the local Engine.
-        // ARM Linux receives crosvm; the guest archive owns its kernel.
+        // Supported Linux hosts receive crosvm; the guest archive owns its kernel.
         let home = resolve_components(&manifest, Some("home"), &[], &[]).unwrap();
         for name in ["crosvm", "vmlinux"] {
             assert!(!home.iter().any(|selected| selected == name));
             for platform in ["darwin-arm64", "linux-amd64", "linux-arm64"] {
                 assert_eq!(
                     resolve_platform_info(&manifest.external[name], platform).is_some(),
-                    name == "crosvm" && platform == "linux-arm64"
+                    name == "crosvm" && platform.starts_with("linux-")
                 );
             }
         }

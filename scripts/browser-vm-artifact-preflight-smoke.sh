@@ -229,6 +229,32 @@ missing_audio = copy.deepcopy(valid)
 missing_audio["preflight"]["optional_audio"]["pipewire"]["ok"] = False
 check("contradictory audio evidence", missing_audio, False, error="requires pipewire")
 
+# Shared Linux hosts verify the explicit initramfs they will actually boot.
+explicit_initramfs = scratch / 'explicit-initramfs'
+explicit_initramfs.write_bytes(b'verified explicit initramfs')
+image_set = copy.deepcopy(valid)
+for name, artifact in [('kernel', data / 'bin/vmlinux'), ('initrd', explicit_initramfs)]:
+    image_set[name] = {'size': artifact.stat().st_size,
+                       'sha256': hashlib.sha256(artifact.read_bytes()).hexdigest()}
+sidecar.write_text(json.dumps(image_set))
+image_env = {**env, 'ELASTOS_BROWSER_VM_PLATFORM': 'linux-arm64',
+             'ELASTOS_BROWSER_VM_INITRAMFS': str(explicit_initramfs),
+             'ELASTOS_BROWSER_VM_INITRD': str(scratch / 'absent-legacy-initrd'),
+             'ELASTOS_DEBUGFS_BIN': str(scratch / 'absent-debugfs')}
+def image_set_check(expected):
+    proc = subprocess.run([str(repo / 'scripts/browser-vm-artifact-preflight.sh'), '--verify-image-set'],
+                          env=image_env, capture_output=True, text=True, timeout=15)
+    assert proc.returncode == expected, (proc.stdout, proc.stderr)
+image_set_check(0)
+legacy_initrd = scratch / 'valid-legacy-initrd'
+legacy_initrd.write_bytes(explicit_initramfs.read_bytes())
+image_env['ELASTOS_BROWSER_VM_INITRD'] = str(legacy_initrd)
+explicit_initramfs.write_bytes(b'corrupt explicit initramfs')
+image_set_check(1)
+sidecar.write_text(json.dumps(valid))
+checks.extend(['explicit Linux initramfs without legacy alias',
+               'corrupt explicit Linux initramfs refuses valid legacy alias'])
+
 if debugfs and mke2fs:
     image.unlink()
     subprocess.run([mke2fs, "-q", "-t", "ext4", "-d", str(target), "-F", str(image), "64M"],

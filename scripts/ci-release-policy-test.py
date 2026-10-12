@@ -719,7 +719,7 @@ class ReleasePolicyTests(unittest.TestCase):
                 self.assertIn(token, parity)
             build, = [step for step in job_steps if step.startswith("name: build N, then N+1 with N's support, each in fresh Cargo directories\n")]
             script = textwrap.dedent(build.split("        run: |\n", 1)[1])
-            for existing in (None, "target", "build", "target-link", "build-link"):
+            for existing in (None, "target", "build", "target-link", "build-link", "amd64"):
                 with self.subTest(job=job, existing=existing), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     (root / "scripts").mkdir()
@@ -744,7 +744,7 @@ class ReleasePolicyTests(unittest.TestCase):
                     verifier.write_text('#!/bin/bash\n[[ "$1 $2 $3 $4" == "-I -S scripts/release-platform-input.py verify" && -d "$5" ]]\n')
                     verifier.chmod(0o700)
                     target, build_dir = (root / "release-cargo-target", root / "release-cargo-build")
-                    if existing:
+                    if existing and existing != "amd64":
                         output = target if existing.startswith("target") else build_dir
                         if existing.endswith("-link"):
                             output.symlink_to(root / "missing")
@@ -757,7 +757,14 @@ class ReleasePolicyTests(unittest.TestCase):
                            "INSTALL_VERSION": "1.2.3", "UPDATE_VERSION": "1.2.4", "BUILD_CALLS": str(calls),
                            "BROWSER_IMAGE_CID": "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                            "BROWSER_IMAGE_SHA256": "ab" * 32, "BROWSER_IMAGE_SIZE": "1024",
-                           "RELEASE_PLATFORM": "aarch64-darwin" if job == "mac" else "aarch64-linux"}
+                           "BROWSER_AMD64_IMAGE_CID": "bafkreibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                           "BROWSER_AMD64_IMAGE_SHA256": "cd" * 32, "BROWSER_AMD64_IMAGE_SIZE": "2048",
+                           "RELEASE_PLATFORM": "aarch64-darwin" if job == "mac" else "x86_64-linux" if existing == "amd64" else "aarch64-linux"}
+                    if existing == "amd64":
+                        existing = None
+                        if job == "linux":
+                            for field in ("CID", "SHA256", "SIZE"):
+                                env["BROWSER_IMAGE_" + field] = env["BROWSER_AMD64_IMAGE_" + field]
                     result = subprocess.run(["bash", "-c", script], cwd=root, env=env,
                                             capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode == 0, existing is None, result.stderr)

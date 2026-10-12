@@ -31,6 +31,18 @@ on:
         description: Exact archive bytes
         required: true
         type: string
+      browser_amd64_image_cid:
+        description: Qualified Linux x86 guest archive CID
+        required: true
+        type: string
+      browser_amd64_image_sha256:
+        description: SHA-256 of the Linux x86 guest archive
+        required: true
+        type: string
+      browser_amd64_image_size:
+        description: Exact Linux x86 guest archive bytes
+        required: true
+        type: string
       seed_package:
         description: Also build the Linux seed package (only to upgrade the seed Runtime)
         type: boolean
@@ -50,6 +62,9 @@ env:
   BROWSER_IMAGE_CID: ${{ inputs.browser_image_cid }}
   BROWSER_IMAGE_SHA256: ${{ inputs.browser_image_sha256 }}
   BROWSER_IMAGE_SIZE: ${{ inputs.browser_image_size }}
+  BROWSER_AMD64_IMAGE_CID: ${{ inputs.browser_amd64_image_cid }}
+  BROWSER_AMD64_IMAGE_SHA256: ${{ inputs.browser_amd64_image_sha256 }}
+  BROWSER_AMD64_IMAGE_SIZE: ${{ inputs.browser_amd64_image_size }}
   BROWSER_IMAGE_PUBLISHER_DID: ${{ vars.BROWSER_IMAGE_PUBLISHER_DID }}
   BROWSER_IMAGE_PUBLISHER_NODE_ID: ${{ vars.BROWSER_IMAGE_PUBLISHER_NODE_ID }}
   BROWSER_IMAGE_CONNECT_TICKET: ${{ secrets.BROWSER_IMAGE_CONNECT_TICKET }}
@@ -95,6 +110,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -I -S scripts/browser-image-cid-input.py "$BROWSER_IMAGE_CID" "$BROWSER_IMAGE_SHA256" "$BROWSER_IMAGE_SIZE"
+          python3 -I -S scripts/browser-image-cid-input.py "$BROWSER_AMD64_IMAGE_CID" "$BROWSER_AMD64_IMAGE_SHA256" "$BROWSER_AMD64_IMAGE_SIZE"
           [[ "$BROWSER_IMAGE_PUBLISHER_DID" == did:key:* && "$BROWSER_IMAGE_PUBLISHER_NODE_ID" =~ ^[0-9a-f]{64}$ ]] \
             || { echo 'Configure the explicit Browser image publisher DID and Carrier node ID' >&2; exit 1; }
 
@@ -345,6 +361,9 @@ jobs:
           set -euo pipefail
           umask 077
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          if [[ "$RELEASE_PLATFORM" == x86_64-linux ]]; then
+            export BROWSER_IMAGE_CID="$BROWSER_AMD64_IMAGE_CID" BROWSER_IMAGE_SHA256="$BROWSER_AMD64_IMAGE_SHA256" BROWSER_IMAGE_SIZE="$BROWSER_AMD64_IMAGE_SIZE"
+          fi
           export ELASTOS_LLAMA_ARM64_BUNDLE="$RUNNER_TEMP/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"
           inputs="$RELEASE_ROOT/inputs"
           # Fresh Cargo directories for each version; removed after each build.
@@ -355,7 +374,7 @@ jobs:
             reuse=()
             [[ "$name" == N ]] || reuse=(--reuse-support "$inputs/N")
             image=()
-            [[ "$name" != N || "$RELEASE_PLATFORM" != aarch64-linux ]] || image=(--browser-vm-image-cid "$BROWSER_IMAGE_CID" --browser-vm-image-sha256 "$BROWSER_IMAGE_SHA256" --browser-vm-image-size "$BROWSER_IMAGE_SIZE")
+            [[ "$name" != N ]] || image=(--browser-vm-image-cid "$BROWSER_IMAGE_CID" --browser-vm-image-sha256 "$BROWSER_IMAGE_SHA256" --browser-vm-image-size "$BROWSER_IMAGE_SIZE")
             HOME="$RELEASE_ROOT/home" scripts/prepare-release-platform.sh \
               --version "$version" --output "$inputs/$name" ${reuse[@]+"${reuse[@]}"} ${image[@]+"${image[@]}"}
             python3 -I -S scripts/release-platform-input.py verify "$inputs/$name" > /dev/null

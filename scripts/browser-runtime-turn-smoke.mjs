@@ -63,6 +63,17 @@ try {
   if (!conf.includes("lt-cred-mech") || !conf.includes("relay-ip=10.44.0.10")) {
     throw new Error("runtime TURN config did not enable credentialed relay");
   }
+  for (const ip of ["10.44.0.10", "10.44.0.1"]) {
+    if (!conf.includes(`listening-ip=${ip}\n`)) throw new Error("runtime TURN must bind each advertised address");
+  }
+  if (conf.includes("listening-ip=0.0.0.0") || !conf.includes("allowed-peer-ip=10.44.0.10\n") ||
+      !conf.includes("denied-peer-ip=0.0.0.0-255.255.255.255") ||
+      !conf.includes("denied-peer-ip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff") ||
+      !conf.includes("no-tcp-relay") || !conf.includes("no-multicast-peers")) throw new Error("runtime TURN peer policy missing");
+  for (const file of [result.env_file, result.config_file]) {
+    if ((fs.statSync(file).mode & 0o777) !== 0o600) throw new Error("runtime TURN private file permissions changed");
+  }
+  if ((fs.statSync(path.dirname(result.env_file)).mode & 0o777) !== 0o700) throw new Error("runtime TURN directory must be private");
   console.log(JSON.stringify({
     ok: true,
     schema: "elastos.browser.runtime-turn-smoke/v1",

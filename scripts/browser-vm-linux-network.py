@@ -132,7 +132,7 @@ def check(uid):
     if not isinstance(receipt, dict) or receipt.get('uid') != uid or receipt.get('boot_id') != boot_id() or receipt.get('networks') != pool or receipt.get('policy') != policy(pool):
         raise RuntimeError('setup receipt does not match this user, boot or network policy')
     run('systemctl', 'is-active', '--quiet', f'elastos-browser-network-{uid}.service')
-    for device in ['/dev/kvm', '/dev/net/tun']:
+    for device in ['/dev/kvm', '/dev/vhost-vsock', '/dev/net/tun']:
         if not stat.S_ISCHR(os.stat(device).st_mode) or not os.access(device, os.R_OK | os.W_OK):
             raise RuntimeError(f'{device} requires read/write access')
     if not isinstance(receipt.get('ifindices'), list) or len(receipt['ifindices']) != SLOTS:
@@ -211,7 +211,16 @@ def invalidate(user):
             run('ip', 'link', 'set', n['tapName'], 'down')
 
 
+def prepare_vsock_device():
+    # The root-owned boot service repeats module preparation after each reboot.
+    if not Path('/dev/vhost-vsock').exists():
+        if not shutil.which('modprobe'):
+            raise RuntimeError('Install modprobe before Browser vsock setup')
+        run('modprobe', 'vhost_vsock')
+
+
 def restore(user):
+    prepare_vsock_device()
     uid, pool = user.pw_uid, networks(user.pw_uid)
     RUN.mkdir(mode=0o755, exist_ok=True)
     trusted_path(RUN)
@@ -250,7 +259,8 @@ def restore(user):
             run('ip', 'addr', 'flush', 'dev', tap)
             run('ip', 'addr', 'add', f"{n['hostIp']}/30", 'dev', tap)
             run('ip', 'link', 'set', tap, 'up')
-        run('setfacl', '-m', f'u:{uid}:rw', '/dev/kvm')
+        for device in ['/dev/kvm', '/dev/vhost-vsock']:
+            run('setfacl', '-m', f'u:{uid}:rw', device)
         write_json(receipt, dict(uid=uid, boot_id=boot_id(), networks=pool, policy=policy(pool),
                                 ifindices=[int((SYSFS / n['tapName'] / 'ifindex').read_text()) for n in pool]))
 
@@ -259,17 +269,20 @@ def configure(user, remove=False):
     uid = user.pw_uid
     unit = f'elastos-browser-network-{uid}.service'
     unit_path = Path('/etc/systemd/system') / unit
-    udev = Path(f'/etc/udev/rules.d/70-elastos-browser-kvm-{uid}.rules')
+    # Seat access rules clear named-user ACLs. Apply this Home's grant afterwards.
+    udev = Path(f'/etc/udev/rules.d/99-elastos-browser-kvm-{uid}.rules')
+    legacy_udev = Path(f'/etc/udev/rules.d/70-elastos-browser-kvm-{uid}.rules')
     state = STATE / f'{uid}.json'
     trusted_path(unit_path.parent)
     trusted_path(udev.parent)
-    for file in [unit_path, udev]:
+    for file in [unit_path, udev, legacy_udev]:
         if file.exists() or file.is_symlink():
             trusted_path(file)
     if remove:
         if not state.exists():
             raise RuntimeError('Browser network setup state is absent; removal requires its KVM ACL receipt')
-        previous = trusted_json(state)['previous_kvm_acl']
+        saved = trusted_json(state)
+        previous = saved['previous_kvm_acl']
         # Refuse removal while any slot has an active owner.
         with locks(uid, networks(uid)):
             (RUN / f'{uid}.json').unlink(missing_ok=True)
@@ -284,9 +297,16 @@ def configure(user, remove=False):
                 run('setfacl', '-x', f'u:{uid}', '/dev/kvm')
             else:
                 run('setfacl', '-m', previous, '/dev/kvm')
+            if 'previous_vsock_acl' in saved:
+                if saved['previous_vsock_acl'] is None:
+                    run('setfacl', '-x', f'u:{uid}', '/dev/vhost-vsock')
+                else:
+                    run('setfacl', '-m', saved['previous_vsock_acl'], '/dev/vhost-vsock')
             run('systemctl', 'disable', '--now', unit, optional=True)
             unit_path.unlink(missing_ok=True)
             udev.unlink(missing_ok=True)
+            # removal-ok: exact UID legacy rule; trusted_path verifies root-owned parents above.
+            legacy_udev.unlink(missing_ok=True)
             state.unlink()
         for n in networks(uid):
             (RUN / f"{n['tapName']}.lock").unlink(missing_ok=True)
@@ -302,6 +322,14 @@ def configure(user, remove=False):
             acl = run('getfacl', '-cpn', '/dev/kvm').stdout.splitlines()
             previous = next((line.split()[0] for line in acl if line.startswith(f'user:{uid}:')), None)
             write_json(state, dict(previous_kvm_acl=previous))
+        # vhost-vsock belongs to the installer step. Runtime only opens the
+        # admitted device as the Home user, and removal restores this UID's ACL.
+        prepare_vsock_device()
+        saved = trusted_json(state)
+        if 'previous_vsock_acl' not in saved:
+            acl = run('getfacl', '-cpn', '/dev/vhost-vsock').stdout.splitlines()
+            saved['previous_vsock_acl'] = next((line.split()[0] for line in acl if line.startswith(f'user:{uid}:')), None)
+            write_json(state, saved)
         HELPER.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         trusted_path(HELPER.parent)
         if HELPER.exists() or HELPER.is_symlink():
@@ -309,7 +337,9 @@ def configure(user, remove=False):
         if Path(__file__).resolve() != HELPER:
             shutil.copyfile(__file__, HELPER)
         HELPER.chmod(0o755)
-        udev.write_text(f'KERNEL=="kvm", RUN+="{shutil.which("setfacl")} -m u:{uid}:rw /dev/kvm"\n')
+        udev.write_text(''.join(f'KERNEL=="{device}", RUN+="{shutil.which("setfacl")} -m u:{uid}:rw /dev/{device}"\n' for device in ['kvm', 'vhost-vsock']))
+        # removal-ok: exact UID legacy rule; trusted_path verifies root-owned parents above.
+        legacy_udev.unlink(missing_ok=True)
         command = f'{sys.executable} {HELPER}'
         unit_path.write_text(f'[Unit]\nDescription=ElastOS Browser network for UID {uid}\nAfter=network.target {FIREWALL_SERVICES}\nPartOf={FIREWALL_SERVICES}\nReloadPropagatedFrom={FIREWALL_SERVICES}\n\n[Service]\nType=oneshot\nExecStart={command} restore --user {user.pw_name}\nExecReload={command} restore --user {user.pw_name}\nExecStop={command} invalidate --user {user.pw_name}\nExecStopPost={command} invalidate --user {user.pw_name}\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n')
         run('systemctl', 'daemon-reload')
@@ -356,7 +386,7 @@ def main():
         raise RuntimeError('Browser network setup requires a Linux host')
     if args.action in ['setup', 'remove']:
         verb = 'Remove' if args.action == 'remove' else 'Create/repair'
-        print(f'{verb} four persistent user-owned TAPs, private /30 addresses, IPv4/IPv6 confinement rules, KVM user ACL, a KVM udev rule and a boot service for {user.pw_name}.\nThe host keeps its other firewall rules. Close Browser sessions first.')
+        print(f'{verb} four persistent user-owned TAPs, private /30 addresses, IPv4/IPv6 confinement rules, KVM and vhost-vsock user ACLs, device udev rules and a boot service for {user.pw_name}.\nThe host keeps its other firewall rules. Close Browser sessions first.')
         for n in networks(user.pw_uid):
             print(f"  {n['tapName']}: host {n['hostIp']}/30, guest {n['guestIp']}; relay TCP 19091, TURN TCP/UDP 41000 and {RELAY_PORTS}; relayed UDP reaches only those TURN ports")
         if input('Continue? [y/N] ').lower() != 'y':

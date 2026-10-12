@@ -45,7 +45,7 @@ def relative(value, *, source_archive=False):
     if (not isinstance(value, str) or len(value) > 240 or "\\" in value
             or PurePosixPath(value).is_absolute()
             or any(not re.fullmatch(pattern, part)
-                   or part in (".", "..") for part in value.split("/"))):
+                   or part != part.strip() or part in (".", "..") for part in value.split("/"))):
         raise ValueError(f"unsafe package path: {value!r}")
     return value
 

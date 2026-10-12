@@ -10,10 +10,11 @@ LOCK = Path(__file__).with_name("browser-vm-debian-lock.json")
 PYTHON_LOCK = Path(__file__).with_name("browser-vm-python-lock.json")
 
 
-def load_lock(path=LOCK):
+def load_lock(path=LOCK, architecture="arm64"):
     lock = json.loads(path.read_text())
     if (lock.get("schema") != "elastos.browser.debian-lock/v1"
-            or lock.get("architecture") != "arm64" or lock.get("suite") != "bookworm"
+            or architecture not in ("arm64", "amd64")
+            or lock.get("architecture") != architecture or lock.get("suite") != "bookworm"
             or any(not re.fullmatch(r"\d{8}T\d{6}Z", lock.get(key, ""))
                    for key in ("debian_snapshot", "security_snapshot"))):
         raise ValueError("Invalid Browser Debian snapshot lock")
@@ -21,7 +22,7 @@ def load_lock(path=LOCK):
     if {p["name"] for p in packages} != {"chromium", "chromium-common", "chromium-sandbox"} or len(packages) != 3:
         raise ValueError("Browser Chromium package set is incomplete")
     for package in packages:
-        expected = f'pool/updates/main/c/chromium/{package["name"]}_{package["version"]}_arm64.deb'
+        expected = f'pool/updates/main/c/chromium/{package["name"]}_{package["version"]}_{architecture}.deb'
         if (package["filename"] != expected or not re.fullmatch(r"[0-9A-Za-z.+~:-]+", package["version"])
                 or not re.fullmatch(r"[0-9a-f]{64}", package["sha256"])
                 or not isinstance(package["size"], int) or package["size"] <= 0):
@@ -68,20 +69,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("validate", "sources", "packages", "verify-cache", "python-requirements"))
     parser.add_argument("values", nargs="*")
+    parser.add_argument("--target-platform", choices=("linux-arm64", "linux-amd64"), default="linux-arm64")
     args = parser.parse_args()
     try:
-        lock = load_lock()
+        architecture = args.target_platform.removeprefix("linux-")
+        lock = load_lock(LOCK if architecture == "arm64" else LOCK.with_name("browser-vm-debian-amd64-lock.json"), architecture)
+        python_lock = PYTHON_LOCK if architecture == "arm64" else PYTHON_LOCK.with_name("browser-vm-python-amd64-lock.json")
         if args.action == "validate":
             if args.values != [lock["suite"], mirror(lock)]:
                 raise ValueError("Guest suite and mirror must match the committed Debian snapshot lock")
-            python_requirements()
+            python_requirements(python_lock)
         elif args.action == "sources":
             print(f'deb [check-valid-until=no] {mirror(lock)} {lock["suite"]} main')
             print(f'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/{lock["security_snapshot"]}/ {lock["suite"]}-security main')
         elif args.action == "packages":
             print(" ".join(f'{p["name"]}={p["version"]}' for p in lock["packages"]))
         elif args.action == "python-requirements":
-            print(python_requirements())
+            print(python_requirements(python_lock))
         elif len(args.values) == 1:
             verify_cache(Path(args.values[0]), lock)
         else:

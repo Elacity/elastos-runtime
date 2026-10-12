@@ -263,10 +263,18 @@ struct BrowserOpenJobRecord {
     owner_launch_id: String,
     browser_instance: Option<String>,
     intent_hash: String,
+    generation: Option<String>,
     state: BrowserOpenJobState,
     instance_release_proven: bool,
     retains_browser_instance: bool,
     updated_at: Instant,
+}
+
+impl BrowserOpenJobRecord {
+    fn coalesces_open(&self) -> bool {
+        self.state.coalesces_open()
+            && (!self.instance_release_proven || matches!(self.state, BrowserOpenJobState::Pending))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -827,7 +835,7 @@ pub(in crate::api::gateway) async fn create_browser_open_job(
         job.scope == scope
             && job.principal_id == principal_id
             && job.owner_launch_id == owner_launch_id
-            && job.state.coalesces_open()
+            && job.coalesces_open()
     }) {
         if job.intent_hash != intent_hash {
             return Err((
@@ -868,6 +876,7 @@ pub(in crate::api::gateway) async fn create_browser_open_job(
             owner_launch_id: owner_launch_id.to_string(),
             browser_instance: browser_instance.map(str::to_string),
             intent_hash: intent_hash.to_string(),
+            generation: None,
             state: BrowserOpenJobState::Pending,
             instance_release_proven: false,
             retains_browser_instance: browser_instance.is_some(),
@@ -923,10 +932,34 @@ pub(in crate::api::gateway) async fn browser_open_job_for_owner(
     })
 }
 
-pub(in crate::api::gateway) async fn forget_browser_open_job_for_owner(
+pub(in crate::api::gateway) async fn bind_browser_open_job_generation(
+    handle: &BrowserOpenJobHandle,
+    generation: &str,
+) -> bool {
+    let registry = BROWSER_OPEN_JOB_REGISTRY.get_or_init(Default::default);
+    let mut registry = registry.lock().await;
+    let Some(job) = registry.jobs.get_mut(&handle.id) else {
+        return false;
+    };
+    if job.scope != handle.scope
+        || job.principal_id != handle.principal_id
+        || job.owner_launch_id != handle.owner_launch_id
+        || job
+            .generation
+            .as_deref()
+            .is_some_and(|bound| bound != generation)
+    {
+        return false;
+    }
+    job.generation = Some(generation.to_string());
+    true
+}
+
+pub(in crate::api::gateway) async fn retire_browser_open_job_for_page(
     data_dir: &Path,
     principal_id: &str,
     owner_launch_id: &str,
+    page_id: &str,
 ) {
     let scope = browser_session_scope(data_dir);
     let registry = BROWSER_OPEN_JOB_REGISTRY.get_or_init(Default::default);
@@ -934,13 +967,16 @@ pub(in crate::api::gateway) async fn forget_browser_open_job_for_owner(
         job.scope != scope
             || job.principal_id != principal_id
             || job.owner_launch_id != owner_launch_id
+            || !matches!(&job.state, BrowserOpenJobState::Completed(result)
+                if result.pointer("/engine_page/page_id").and_then(serde_json::Value::as_str) == Some(page_id))
     });
 }
 
-pub(in crate::api::gateway) async fn release_browser_open_job_instance_for_owner(
+pub(in crate::api::gateway) async fn release_browser_open_job_instance_for_generation(
     data_dir: &Path,
     principal_id: &str,
     owner_launch_id: &str,
+    generation: &str,
 ) {
     let scope = browser_session_scope(data_dir);
     let registry = BROWSER_OPEN_JOB_REGISTRY.get_or_init(Default::default);
@@ -949,6 +985,7 @@ pub(in crate::api::gateway) async fn release_browser_open_job_instance_for_owner
         if job.scope == scope
             && job.principal_id == principal_id
             && job.owner_launch_id == owner_launch_id
+            && job.generation.as_deref() == Some(generation)
         {
             job.instance_release_proven = true;
             job.retains_browser_instance = false;
@@ -956,7 +993,7 @@ pub(in crate::api::gateway) async fn release_browser_open_job_instance_for_owner
     }
 }
 
-async fn update_browser_open_job(handle: &BrowserOpenJobHandle, state: BrowserOpenJobState) {
+async fn update_browser_open_job(handle: &BrowserOpenJobHandle, mut state: BrowserOpenJobState) {
     let registry = BROWSER_OPEN_JOB_REGISTRY.get_or_init(Default::default);
     let mut registry = registry.lock().await;
     registry.purge_expired(Instant::now());
@@ -965,6 +1002,20 @@ async fn update_browser_open_job(handle: &BrowserOpenJobHandle, state: BrowserOp
             && job.principal_id == handle.principal_id
             && job.owner_launch_id == handle.owner_launch_id
         {
+            if job.instance_release_proven && matches!(state, BrowserOpenJobState::Completed(_)) {
+                state = BrowserOpenJobState::Failed(serde_json::json!({
+                    "schema": "elastos.browser.open-error/v1",
+                    "ok": false,
+                    "http_status": 409,
+                    "code": "browser_closed_during_open",
+                    "message": "Browser was closed before startup completed. Open Browser again.",
+                    "outcome": {
+                        "schema": "elastos.browser.open-outcome/v1",
+                        "state": "terminal_post_effect_cleanup",
+                        "effects": { "page_acquired": true, "vm_acquired": true, "stream_acquired": true }
+                    }
+                }));
+            }
             job.retains_browser_instance = job.browser_instance.is_some()
                 && !job.instance_release_proven
                 && state.coalesces_open();
@@ -2332,8 +2383,7 @@ pub(in crate::api::gateway) async fn browser_gateway_session_status(
             && job.principal_id == principal_id
             && (matches!(job.state, BrowserOpenJobState::Pending)
                 || now.duration_since(job.updated_at) <= OPEN_JOB_TTL)
-            && ((owner_launch_id == Some(job.owner_launch_id.as_str())
-                && job.state.coalesces_open())
+            && ((owner_launch_id == Some(job.owner_launch_id.as_str()) && job.coalesces_open())
                 || (browser_instance
                     .is_some_and(|instance| job.browser_instance.as_deref() == Some(instance))
                     && (job.retains_browser_instance
@@ -4939,7 +4989,6 @@ mod tests {
             .await,
             Some(BrowserOpenJobSnapshot::Pending)
         ));
-        forget_browser_open_job_for_owner(dir.path(), "person:local:test", "launch:pending").await;
         clear_browser_lifecycle_memory_for_restart(dir.path()).await;
     }
 
@@ -4956,6 +5005,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(bind_browser_open_job_generation(&job.handle, "generation:completed").await);
         complete_browser_open_job(&job.handle, serde_json::json!({"ok": true})).await;
         for owner in ["launch:completed", "launch:refreshed"] {
             let status = browser_gateway_session_status(
@@ -4967,10 +5017,11 @@ mod tests {
             .await;
             assert_eq!(status["fresh_start_allowed"], false);
         }
-        release_browser_open_job_instance_for_owner(
+        release_browser_open_job_instance_for_generation(
             dir.path(),
             "person:local:test",
             "launch:completed",
+            "generation:completed",
         )
         .await;
         let status = browser_gateway_session_status(
@@ -5604,6 +5655,240 @@ mod tests {
         );
     }
 
+    async fn bound_open_job(
+        dir: &Path,
+        generation: &str,
+        intent: &str,
+    ) -> BrowserOpenJobReservation {
+        let job =
+            create_browser_open_job(dir, "person:retirement", "launch:retirement", None, intent)
+                .await
+                .unwrap();
+        assert!(bind_browser_open_job_generation(&job.handle, generation).await);
+        job
+    }
+
+    #[tokio::test]
+    async fn browser_open_job_failure_survives_post_effect_page_retirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = bound_open_job(dir.path(), "generation:failed", "intent:failed").await;
+        retire_browser_open_job_for_page(
+            dir.path(),
+            "person:retirement",
+            "launch:retirement",
+            "page:failed",
+        )
+        .await;
+        let failure = serde_json::json!({"message": "invalid Engine receipt", "outcome": {"state": "terminal_post_effect_cleanup"}});
+        fail_browser_open_job(&job.handle, failure.clone()).await;
+        match browser_open_job_for_owner(
+            dir.path(),
+            &job.handle.id,
+            "person:retirement",
+            "launch:retirement",
+        )
+        .await
+        {
+            Some(BrowserOpenJobSnapshot::Failed(value)) => assert_eq!(value, failure),
+            status => panic!("failure settlement was lost: {status:?}"),
+        }
+        assert!(
+            create_browser_open_job(
+                dir.path(),
+                "person:retirement",
+                "launch:retirement",
+                None,
+                "intent:retry"
+            )
+            .await
+            .unwrap()
+            .should_spawn
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_open_job_old_page_cleanup_preserves_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = bound_open_job(dir.path(), "generation:old", "intent:old").await;
+        complete_browser_open_job(
+            &old.handle,
+            serde_json::json!({"engine_page": {"page_id": "page:old"}}),
+        )
+        .await;
+        retire_browser_open_job_for_page(
+            dir.path(),
+            "person:retirement",
+            "launch:retirement",
+            "page:old",
+        )
+        .await;
+        let new = bound_open_job(dir.path(), "generation:new", "intent:new").await;
+        assert!(!bind_browser_open_job_generation(&new.handle, "generation:old").await);
+        retire_browser_open_job_for_page(
+            dir.path(),
+            "person:retirement",
+            "launch:retirement",
+            "page:old",
+        )
+        .await;
+        release_browser_open_job_instance_for_generation(
+            dir.path(),
+            "person:retirement",
+            "launch:retirement",
+            "generation:old",
+        )
+        .await;
+        complete_browser_open_job(
+            &new.handle,
+            serde_json::json!({"engine_page": {"page_id": "page:new"}}),
+        )
+        .await;
+        retire_browser_open_job_for_page(
+            dir.path(),
+            "person:retirement",
+            "launch:retirement",
+            "page:old",
+        )
+        .await;
+        assert!(matches!(
+            browser_open_job_for_owner(
+                dir.path(),
+                &new.handle.id,
+                "person:retirement",
+                "launch:retirement"
+            )
+            .await,
+            Some(BrowserOpenJobSnapshot::Completed(_))
+        ));
+        assert_eq!(
+            create_browser_open_job(
+                dir.path(),
+                "person:retirement",
+                "launch:retirement",
+                None,
+                "intent:other"
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_open_job_terminal_close_before_completion_keeps_readable_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = bound_open_job(dir.path(), "generation:closed", "intent:closed").await;
+        release_browser_open_job_instance_for_generation(
+            dir.path(),
+            "person:retirement",
+            "launch:retirement",
+            "generation:closed",
+        )
+        .await;
+        assert_eq!(
+            create_browser_open_job(
+                dir.path(),
+                "person:retirement",
+                "launch:retirement",
+                None,
+                "intent:retry"
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        complete_browser_open_job(
+            &job.handle,
+            serde_json::json!({"engine_page": {"page_id": "page:closed"}}),
+        )
+        .await;
+        match browser_open_job_for_owner(
+            dir.path(),
+            &job.handle.id,
+            "person:retirement",
+            "launch:retirement",
+        )
+        .await
+        {
+            Some(BrowserOpenJobSnapshot::Failed(value)) => {
+                assert_eq!(value["outcome"]["state"], "terminal_post_effect_cleanup")
+            }
+            status => panic!("terminal close allowed a stale success: {status:?}"),
+        }
+        assert!(
+            create_browser_open_job(
+                dir.path(),
+                "person:retirement",
+                "launch:retirement",
+                None,
+                "intent:retry"
+            )
+            .await
+            .unwrap()
+            .should_spawn
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_open_job_terminal_cleanup_releases_failed_retry_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = bound_open_job(dir.path(), "generation:cleanup", "intent:cleanup").await;
+        fail_browser_open_job(&job.handle, serde_json::json!({"message": "original failure", "outcome": {"state": "cleanup_pending"}})).await;
+        assert_eq!(
+            create_browser_open_job(
+                dir.path(),
+                "person:retirement",
+                "launch:retirement",
+                None,
+                "intent:retry"
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        release_browser_open_job_instance_for_generation(
+            dir.path(),
+            "person:retirement",
+            "launch:retirement",
+            "generation:cleanup",
+        )
+        .await;
+        let status = browser_gateway_session_status(
+            dir.path(),
+            "person:retirement",
+            Some("launch:retirement"),
+            Some("browser:abcdefabcdefabcdefabcdefabcdefab"),
+        )
+        .await;
+        assert_eq!(status["fresh_start_allowed"], true);
+        assert_eq!(status["window_close_ownership"]["state"], "absent");
+        assert!(
+            create_browser_open_job(
+                dir.path(),
+                "person:retirement",
+                "launch:retirement",
+                None,
+                "intent:retry"
+            )
+            .await
+            .unwrap()
+            .should_spawn
+        );
+        assert!(matches!(
+            browser_open_job_for_owner(
+                dir.path(),
+                &job.handle.id,
+                "person:retirement",
+                "launch:retirement"
+            )
+            .await,
+            Some(BrowserOpenJobSnapshot::Failed(_))
+        ));
+    }
+
     #[tokio::test]
     async fn browser_open_jobs_coalesce_matching_pending_and_completed_owner_intent() {
         let dir = tempfile::tempdir().unwrap();
@@ -5765,6 +6050,7 @@ mod tests {
         .unwrap();
         assert!(retry.should_spawn);
 
+        assert!(bind_browser_open_job_generation(&retry.handle, "generation:retry").await);
         fail_browser_open_job(
             &retry.handle,
             serde_json::json!({
@@ -5785,10 +6071,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(retained.0, StatusCode::CONFLICT);
 
-        release_browser_open_job_instance_for_owner(
+        release_browser_open_job_instance_for_generation(
             dir.path(),
             "person:local:test-instance",
             "launch:instance-owner-b",
+            "generation:retry",
         )
         .await;
         let after_terminal_cleanup = create_browser_open_job(
@@ -5812,10 +6099,15 @@ mod tests {
         )
         .await
         .unwrap();
-        release_browser_open_job_instance_for_owner(
+        assert!(
+            bind_browser_open_job_generation(&terminal_before_result.handle, "generation:race")
+                .await
+        );
+        release_browser_open_job_instance_for_generation(
             dir.path(),
             "person:local:test-instance",
             "launch:instance-owner-d",
+            "generation:race",
         )
         .await;
         fail_browser_open_job(

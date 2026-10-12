@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import sys
 import subprocess
 import tarfile
 import tempfile
@@ -213,6 +214,8 @@ class SourceUpstreamTests(unittest.TestCase):
         (self.root / 'scripts').mkdir(mode=0o700)
         for name in ('seed-kubo-cache.sh', 'release-upstream-input.py'):
             shutil.copy2(ROOT / 'scripts' / name, self.root / 'scripts' / name)
+        (self.root / 'scripts/lib').mkdir()
+        shutil.copy2(ROOT / 'scripts/lib/owned_removal.py', self.root / 'scripts/lib/owned_removal.py')
         self.cache, self.data = self.root / 'cache', self.root / 'data'
         self.data.mkdir(mode=0o700)
         self.recipes = [self.recipe('kubo', 'kubo', 'ipfs', '1.2.3', 'bin/kubo'),
@@ -443,6 +446,174 @@ class SourceUpstreamTests(unittest.TestCase):
         receipt = json.loads((self.data / 'receipts/kubo-build.json').read_bytes())
         self.assertEqual(kubo['capsule_metadata']['platforms'][PLATFORM]['checksum'], receipt['checksum'])
         self.assertIn('kubo', installed['profiles']['source-home']['components'])
+
+    def test_source_home_retains_browser_bundle_only_for_matching_inputs_and_receipt(self):
+        source = {'external': {}, 'profiles': {}}
+        for name in ('shell', 'ipfs-provider', 'operator-drive-adapter', 'drm-provider',
+                     'rights-provider', 'key-provider', 'decrypt-provider'):
+            source['external'][name] = {'install_path': 'bin/' + name,
+                'platforms': {PLATFORM: {'install_path': 'bin/' + name}}}
+        info = {'strategy': 'source-build', 'install_path': 'libexec/browser/node/pin',
+                'release_path': 'node-linux-amd64.tar.gz', 'extract_path': 'node-pin',
+                'binary_path': 'bin/node'}
+        source['external']['node'] = {'version': 'pin', 'platforms': {PLATFORM: info}}
+        (self.root / 'components.json').write_text(json.dumps(source))
+        (self.data / 'bin').mkdir()
+        for name in ('shell', 'ipfs-provider'):
+            (self.data / 'bin' / name).write_bytes(('inert ' + name).encode())
+        installed = self.data / info['install_path']
+        installed.mkdir(parents=True)
+        checksum = 'sha256:' + 'a' * 64
+        (installed / '.elastos-artifact-sha256').write_text(checksum + '\n')
+        prior = {**info, 'strategy': 'prebuilt', 'checksum': checksum, 'size': 123}
+        previous = {'external': {'node': {'version': 'pin', 'platforms': {PLATFORM: prior}}}}
+        (self.data / 'components.json').write_text(json.dumps(previous))
+        environment = {'SOURCE_HOME_BINARY_NAMES_JSON': '["ipfs-provider"]', 'APP_CAPSULES_JSON': '[]',
+                       'SOURCE_HOME_KUBO_INSTALLED': '0', 'SOURCE_HOME_LLAMA_INSTALLED': '0'}
+        self.assert_ok(self.source_function('stamp_source_home_components_manifest', environment))
+        result = json.loads((self.data / 'components.json').read_text())
+        self.assertEqual(result['external']['node']['platforms'][PLATFORM]['checksum'], checksum)
+        self.assertEqual(result['external']['node']['platforms'][PLATFORM]['strategy'], 'prebuilt')
+        self.assertIn('node', result['profiles']['source-home']['components'])
+        (installed / '.elastos-artifact-sha256').write_text('b' * 64)
+        failure = self.source_function('stamp_source_home_components_manifest', environment)
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn('archive receipt differs', failure.stderr)
+        (installed / '.elastos-artifact-sha256').write_text(checksum)
+        source['external']['node']['version'] = 'different'
+        (self.root / 'components.json').write_text(json.dumps(source))
+        failure = self.source_function('stamp_source_home_components_manifest', environment)
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn('different source inputs', failure.stderr)
+
+    def test_existing_home_verifies_after_retired_browser_components_leave_manifest(self):
+        source = json.loads((ROOT / 'components.json').read_text())
+        (self.root / 'components.json').write_text(json.dumps(source))
+        (self.data / 'bin').mkdir()
+        (self.data / 'scripts').mkdir()
+        for name in ('shell', 'ipfs-provider'):
+            (self.data / 'bin' / name).write_bytes(('inert ' + name).encode())
+        retired = {
+            'browser-vm-local-crosvm-launcher': 'bin/browser-vm-local-crosvm-launcher',
+            'browser-vm-local-crosvm-launcher-module': 'bin/browser-vm-local-crosvm-launcher.mjs',
+            'browser-vm-prepare-rootfs-pool': 'bin/browser-vm-prepare-rootfs-pool',
+            'browser-vm-prepare-rootfs-pool-module': 'scripts/browser-vm-prepare-rootfs-pool.mjs',
+        }
+        previous = {'external': {}}
+        for name, relative in retired.items():
+            payload = ('old ' + name).encode()
+            (self.data / relative).write_bytes(payload)
+            previous['external'][name] = {'install_path': relative, 'platforms': {PLATFORM: {
+                'checksum': 'sha256:' + hashlib.sha256(payload).hexdigest(), 'size': len(payload)}}}
+        (self.data / 'components.json').write_text(json.dumps(previous))
+        self.assert_ok(self.source_function('stamp_source_home_components_manifest', {
+            'SOURCE_HOME_BINARY_NAMES_JSON': '["ipfs-provider"]', 'APP_CAPSULES_JSON': '[]',
+            'SOURCE_HOME_KUBO_INSTALLED': '0', 'SOURCE_HOME_LLAMA_INSTALLED': '0'}))
+        self.assert_ok(subprocess.run(['bash', str(ROOT / 'scripts/installed-provider-verify.sh')],
+            env={**os.environ, 'ELASTOS_DATA_DIR': str(self.data), 'ELASTOS_SETUP_PLATFORM': PLATFORM},
+            capture_output=True, text=True))
+        for relative in retired.values():
+            self.assertTrue((self.data / relative).is_file())
+
+    def test_legacy_turn_retirement_preserves_records_under_linked_parents(self):
+        outside = self.root / 'outside-turn'
+        outside.mkdir()
+        record = outside / 'turnserver.pid'
+        record.write_text('99999999')
+        (self.data / 'runtime-turn').symlink_to(outside, target_is_directory=True)
+        failure = self.source_function('retire_legacy_browser_runtime_turn')
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn('requires repair', failure.stderr)
+        self.assertEqual(record.read_text(), '99999999')
+        (self.data / 'runtime-turn').unlink()
+        (self.data / 'runtime-turn').mkdir()
+        home_record = self.data / 'runtime-turn/turnserver.pid'
+        home_record.write_text('99999999')
+        linked = self.root / 'linked-parent'
+        linked.symlink_to(self.data.parent, target_is_directory=True)
+        failure = self.source_function('retire_legacy_browser_runtime_turn', {
+            'DATA_DIR': str(linked / self.data.name)})
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn('requires repair', failure.stderr)
+        self.assertEqual(home_record.read_text(), '99999999')
+
+    @unittest.skipUnless(sys.platform == 'linux' and hasattr(os, 'pidfd_open'), 'Linux pidfd ownership')
+    def test_legacy_turn_retirement_keeps_pid_record_replaced_during_shutdown(self):
+        directory = self.data / 'runtime-turn'
+        directory.mkdir()
+        (self.data / 'bin').mkdir()
+        (self.data / 'bin/turnserver').symlink_to(sys.executable)
+        config = directory / 'turnserver.conf'
+        record = directory / 'turnserver.pid'
+        program = textwrap.dedent('''\
+            import os, signal, sys, time
+            from pathlib import Path
+            record = Path(sys.argv[-1]).with_name('turnserver.pid')
+            def replace_record(*_):
+                replacement = record.with_suffix('.new')
+                replacement.write_text('replacement-owner')
+                os.replace(replacement, record)
+                sys.exit(0)
+            signal.signal(signal.SIGTERM, replace_record)
+            print('ready', flush=True)
+            time.sleep(30)
+        ''')
+        child = subprocess.Popen([sys.executable, '-c', program, '-c', str(config)], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), 'ready')
+            record.write_text(str(child.pid))
+            failure = self.source_function('retire_legacy_browser_runtime_turn')
+            child.wait(timeout=5)
+            self.assertNotEqual(failure.returncode, 0)
+            self.assertIn('requires repair', failure.stderr)
+            self.assertEqual(record.read_text(), 'replacement-owner')
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+            child.stdout.close()
+
+    @unittest.skipUnless(sys.platform == 'linux' and hasattr(os, 'pidfd_open'), 'Linux pidfd ownership')
+    def test_legacy_turn_retirement_stops_exact_owner_and_preserves_unrelated_pid(self):
+        directory = self.data / 'runtime-turn'
+        directory.mkdir()
+        (self.data / 'bin').mkdir()
+        (self.data / 'bin/turnserver').symlink_to(sys.executable)
+        config = directory / 'turnserver.conf'
+        pid_file = directory / 'turnserver.pid'
+        program = 'import time; time.sleep(30)'
+        owned = subprocess.Popen([sys.executable, '-c', program, '-c', str(config)])
+        unrelated = subprocess.Popen([sys.executable, '-c', program])
+        try:
+            pid_file.write_text(str(owned.pid))
+            self.assert_ok(self.source_function('retire_legacy_browser_runtime_turn'))
+            owned.wait(timeout=5)
+            self.assertEqual(owned.returncode, -15)
+            self.assertFalse(pid_file.exists())
+            pid_file.write_text(str(unrelated.pid))
+            self.assert_ok(self.source_function('retire_legacy_browser_runtime_turn'))
+            self.assertIsNone(unrelated.poll())
+            self.assertFalse(pid_file.exists())
+            # An explicit old executable with the same Home config needs
+            # repair; retain its owner record and process for that repair.
+            (self.data / 'bin/turnserver').unlink()
+            (self.data / 'bin/turnserver').symlink_to('/bin/true')
+            explicit = subprocess.Popen([sys.executable, '-c', program, '-c', str(config)])
+            try:
+                pid_file.write_text(str(explicit.pid))
+                failure = self.source_function('retire_legacy_browser_runtime_turn')
+                self.assertNotEqual(failure.returncode, 0)
+                self.assertIn('executable requires repair', failure.stderr)
+                self.assertEqual(pid_file.read_text(), str(explicit.pid))
+                self.assertIsNone(explicit.poll())
+            finally:
+                explicit.terminate()
+                explicit.wait(timeout=5)
+        finally:
+            for child in (owned, unrelated):
+                if child.poll() is None:
+                    child.terminate()
+                child.wait(timeout=5)
 
     def test_carrier_fixture_colocates_kubo_capsule_and_starts_unseeded_consumer(self):
         self.assert_ok(self.seed())

@@ -8,6 +8,11 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Developer detail
 
+- The source gate refuses a file deletion added to product code unless it
+  goes through the owned-removal helper of its language (exact path below an
+  owned folder, no link followed, optional device+inode check) or carries a
+  `removal-ok: <reason>` comment. Browser host retirement now uses the Rust
+  helper.
 - CI's `release-upstream-assets` job runs the release's upstream asset build
   (`scripts/release-upstream-assets.py`, including the Browser helper source
   builds) for Linux ARM64 and Apple Silicon on every pull request that changes

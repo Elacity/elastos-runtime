@@ -36,10 +36,12 @@ const VM_ICE_ENV_KEYS = [
 const children = new Set();
 const servers = new Set();
 const cleanupFns = [];
-let exiting = false;
-let guestControlSocket = null;
-let launchSucceeded = false;
-let profileShutdownCommitted = false;
+const privateSessionInputs = new Map();
+const lifecycle = {
+  children, servers, cleanupFns, privateSessionInputs,
+  exiting: false, guestControlSocket: null, launchSucceeded: false,
+  profileShutdownCommitted: false, deferredRootfsPoolRefill: null, sessionDir: null,
+};
 const launchedAtMs = Date.now();
 
 function logPhase(message) {
@@ -291,7 +293,7 @@ function sessionTurnServer(config, network) {
 }
 
 // Linux Browser media uses one session TURN server on the leased network slot.
-function linuxSessionTurn(network) {
+function linuxSessionTurn(network, nowMs = Date.now()) {
   const iceConfig = vmIceEnv(network);
   const turn = sessionTurnServer(iceConfig, network);
   if (!turn) {
@@ -301,7 +303,16 @@ function linuxSessionTurn(network) {
       turn.relay.min !== 49152 || turn.relay.max !== 49215) {
     throw new Error("Linux Browser setup permits local TURN on {turn_port} and relay ports 49152-49215. Use these ports in the Browser ICE configuration.");
   }
-  return { iceConfig, turn };
+  const expiresAt = Math.floor(nowMs / 1000) + 300;
+  const authSecret = crypto.randomBytes(32).toString("hex");
+  const username = `${expiresAt}:${crypto.randomBytes(16).toString("hex")}`;
+  const credential = crypto.createHmac("sha1", authSecret).update(username).digest("base64");
+  const entries = collectIceServerEntries(iceConfig).map(entry => ({ ...entry, username, credential }));
+  delete iceConfig.ELASTOS_BROWSER_VM_ICE_SERVER;
+  delete iceConfig.ELASTOS_BROWSER_VM_ICE_USERNAME;
+  delete iceConfig.ELASTOS_BROWSER_VM_ICE_CREDENTIAL;
+  iceConfig.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON = JSON.stringify(entries);
+  return { iceConfig, turn: { ...turn, username, credential, authSecret, expiresAt } };
 }
 
 function sessionSuffix(value) {
@@ -428,7 +439,7 @@ async function acquireLinuxNetwork(scriptPath) {
     child.once("error", reject);
     child.once("exit", () => {
       if (!settled) reject(new Error(errors.trim() || "Browser network lease ended before allocation"));
-      else if (!exiting) cleanupAndExit(null);
+      else if (!lifecycle.exiting) cleanupAndExit(null);
     });
   });
 }
@@ -549,46 +560,50 @@ async function waitForTcpListener(host, port, child, logPath) {
   throw new Error(`session TURN server did not become visible on ${host}:${port}${source}\n${tailFile(logPath, 12 * 1024)}`);
 }
 
+function writePrivateSessionInput(file, text) {
+  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  try {
+    const stat = fs.fstatSync(fd);
+    privateSessionInputs.set(file, { dev: stat.dev, ino: stat.ino });
+    fs.writeFileSync(fd, text, "utf8");
+    fs.fsyncSync(fd);
+  } finally { fs.closeSync(fd); }
+}
+
+function removePrivateSessionInputs(inputs = privateSessionInputs) {
+  for (const [file, owned] of inputs) {
+    try {
+      const stat = fs.lstatSync(file);
+      // removal-ok: exclusive per-session input; recorded device/inode still match.
+      if (stat.isFile() && stat.dev === owned.dev && stat.ino === owned.ino) fs.unlinkSync(file);
+    } catch (error) { if (error.code !== "ENOENT") logPhase("private session input cleanup failed"); }
+  }
+  inputs.clear();
+}
+
 async function startSessionTurnServer({ network, sessionDir, turn }) {
   if (!turn) return null;
   const logPath = path.join(sessionDir, "turnserver.log");
   const pidPath = path.join(sessionDir, "turnserver.pid");
   const logFd = fs.openSync(logPath, "a");
-  const args = [
-    "-n",
-    "--listening-ip",
-    network.hostIp,
-    "--relay-ip",
-    network.hostIp,
-    "--listening-port",
-    String(turn.port),
-    "--min-port",
-    String(turn.relay.min),
-    "--max-port",
-    String(turn.relay.max),
-    "--fingerprint",
-    "--lt-cred-mech",
-    "--realm",
-    "elastos-browser-vm.local",
-    "--user",
-    `${turn.username}:${turn.credential}`,
-    "--no-cli",
-    "--no-tls",
-    "--no-dtls",
-    "--no-tcp-relay",
-    "--no-multicast-peers",
-    // The guest and viewer meet at this server's relay address. Every other
-    // peer, including loopback (denied by default) and private ranges, is not.
-    // coturn checks peer IPs only; the root network setup (whose receipt
-    // `check` verifies) drops relayed UDP to any port but the TURN ports.
-    `--allowed-peer-ip=${network.hostIp}`,
-    "--denied-peer-ip=0.0.0.0-255.255.255.255",
-    "--denied-peer-ip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-    "--no-software-attribute",
-    `--pidfile=${pidPath}`,
-    `--log-file=${logPath}`,
-    "--simple-log",
-  ];
+  const configPath = path.join(sessionDir, "turnserver.conf");
+  const remaining = turn.expiresAt - Math.floor(Date.now() / 1000);
+  if (!Number.isInteger(remaining) || remaining <= 0 || remaining > 300 || !/^[0-9a-f]{64}$/.test(turn.authSecret)) {
+    throw new Error("session TURN credentials have expired or are invalid");
+  }
+  const config = [
+    `listening-ip=${network.hostIp}`, `relay-ip=${network.hostIp}`,
+    `listening-port=${turn.port}`, `min-port=${turn.relay.min}`, `max-port=${turn.relay.max}`,
+    "fingerprint", "realm=elastos-browser-vm.local", "use-auth-secret",
+    `static-auth-secret=${turn.authSecret}`, `max-allocate-lifetime=${remaining}`,
+    `channel-lifetime=${remaining}`, `permission-lifetime=${remaining}`,
+    "no-cli", "no-tls", "no-dtls", "no-tcp-relay", "no-multicast-peers",
+    `allowed-peer-ip=${network.hostIp}`, "denied-peer-ip=0.0.0.0-255.255.255.255",
+    "denied-peer-ip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+    "no-software-attribute", `pidfile=${pidPath}`, `log-file=${logPath}`, "simple-log", "",
+  ].join("\n");
+  writePrivateSessionInput(configPath, config);
+  const args = ["-c", configPath];
   const child = spawnTracked(turnserverBin(), args, {
     stdio: ["ignore", logFd, logFd],
   });
@@ -684,8 +699,8 @@ function readyRootfsFiles(poolDir, imageSha256) {
   }
 }
 
-function rootfsPoolRefillScript(dataDir, scriptPath) {
-  const configured = process.env[ROOTFS_POOL_REFILL_SCRIPT_ENV];
+function rootfsPoolRefillScript(dataDir, scriptPath, env = process.env) {
+  const configured = env[ROOTFS_POOL_REFILL_SCRIPT_ENV];
   const candidates = [
     configured,
     path.join(dataDir, "scripts/browser-vm-prepare-rootfs-pool.mjs"),
@@ -712,17 +727,17 @@ function availableBytesForPath(targetPath) {
   return Number(stats.bavail) * Number(stats.bsize);
 }
 
-function refillMinFreeBytes() {
-  const configured = Number(process.env[ROOTFS_POOL_REFILL_MIN_FREE_MIB_ENV] || "4096");
+function refillMinFreeBytes(env = process.env) {
+  const configured = Number(env[ROOTFS_POOL_REFILL_MIN_FREE_MIB_ENV] || "4096");
   if (!Number.isFinite(configured) || configured < 0) {
     return 4096 * 1024 * 1024;
   }
   return configured * 1024 * 1024;
 }
 
-async function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, imageSha256, sessionDir, scriptPath, timeoutMs }) {
+async function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, imageSha256, sessionDir, scriptPath, timeoutMs, env = process.env }) {
   if (timeoutMs <= 0) return;
-  const targetCount = Number(process.env[ROOTFS_POOL_REFILL_COUNT_ENV] || "2");
+  const targetCount = Number(env[ROOTFS_POOL_REFILL_COUNT_ENV] || "2");
   if (!Number.isInteger(targetCount) || targetCount < 1) {
     return;
   }
@@ -730,13 +745,13 @@ async function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, imageSh
   if (missingCount <= 0) {
     return;
   }
-  const refillScript = rootfsPoolRefillScript(dataDir, scriptPath);
+  const refillScript = rootfsPoolRefillScript(dataDir, scriptPath, env);
   if (!refillScript) {
     logPhase("prepared rootfs pool refill skipped: browser-vm-prepare-rootfs-pool.mjs not found");
     return;
   }
   const availableBytes = availableBytesForPath(poolDir);
-  const requiredBytes = (fs.statSync(rootfs).size * missingCount) + refillMinFreeBytes();
+  const requiredBytes = (fs.statSync(rootfs).size * missingCount) + refillMinFreeBytes(env);
   if (availableBytes !== null && availableBytes < requiredBytes) {
     logPhase(`prepared rootfs pool refill skipped: free space ${Math.floor(availableBytes / 1048576)}MiB below required ${Math.ceil(requiredBytes / 1048576)}MiB`);
     return;
@@ -756,7 +771,7 @@ async function maybeRefillPreparedRootfsPool({ dataDir, poolDir, rootfs, imageSh
     String(targetCount),
   ], {
     stdio: ["pipe", logFd, logFd],
-    env: { ...process.env, ELASTOS_BROWSER_VM_DATA_DIR: dataDir, ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF: "1" },
+    env: { ...env, ELASTOS_BROWSER_VM_DATA_DIR: dataDir, ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF: "1" },
   });
   fs.closeSync(logFd);
   logPhase(`prepared rootfs pool refill started pid=${child.pid} target=${targetCount} log=${logPath}`);
@@ -885,6 +900,8 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
     "rootfstype=ext4",
     "rw",
     "init=/opt/elastos/bin/browser-vm-init",
+    "elastos.browser_width=1920",
+    "elastos.browser_height=1080",
     "random.trust_cpu=on",
     `elastos.browser_epoch=${Math.floor(Date.now() / 1000)}`,
     `elastos.browser_profile=${profile.profileKey}`,
@@ -899,6 +916,8 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
     "elastos.browser_control_port=19092",
     ...(iceConfigHex ? [`elastos.browser_ice_config_hex=${iceConfigHex}`] : []),
   ].join(" ");
+  const paramsPath = path.join(sessionDir, "boot-params.txt");
+  writePrivateSessionInput(paramsPath, bootArgs);
   const args = [
     "run",
     "--mem",
@@ -917,8 +936,8 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
     process.env.ELASTOS_BROWSER_VM_CROSVM_PIVOT_ROOT || "/tmp/elastos/crosvm-empty",
     "--initrd",
     initrd,
-    "-p",
-    bootArgs,
+    "--params-file",
+    paramsPath,
     kernel,
   ];
   fs.mkdirSync(process.env.ELASTOS_BROWSER_VM_CROSVM_PIVOT_ROOT || "/tmp/elastos/crosvm-empty", { recursive: true });
@@ -941,7 +960,8 @@ function startCrosvm({ crosvm, kernel, initrd, rootfs, sessionDir, network, laun
 function tailFile(file, maxBytes = 24 * 1024) {
   try {
     const data = fs.readFileSync(file);
-    return data.subarray(Math.max(0, data.length - maxBytes)).toString("utf8");
+    return data.subarray(Math.max(0, data.length - maxBytes)).toString("utf8")
+      .replace(/elastos\.(?:token|browser_ice_config_hex)=[^\s]+/g, "elastos.private=[redacted]");
   } catch {
     return "";
   }
@@ -1161,24 +1181,27 @@ function rewriteResult(result, launch, sessionDir, controlSocketPath) {
   };
 }
 
-let deferredRootfsPoolRefill = null;
-
-async function cleanupAndExit(signal = null) {
-  if (exiting) return;
-  exiting = true;
+async function cleanupAndExit(signal = null, owner = lifecycle, {
+  shutdownGuest = httpJsonUnix, log = logPhase, env = process.env,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  exit = (code) => process.exit(code),
+} = {}) {
+  const { children, servers, cleanupFns } = owner;
+  if (owner.exiting) return;
+  owner.exiting = true;
   const cleanupStartedAt = Date.now();
-  if (guestControlSocket && children.size > 0) {
+  if (owner.guestControlSocket && children.size > 0) {
     try {
-      const result = await httpJsonUnix(guestControlSocket, "/shutdown", {
+      const result = await shutdownGuest(owner.guestControlSocket, "/shutdown", {
         method: "POST", body: {},
-        timeoutMs: Number(process.env.ELASTOS_BROWSER_VM_GUEST_SHUTDOWN_TIMEOUT_MS || "25000"),
+        timeoutMs: Number(env.ELASTOS_BROWSER_VM_GUEST_SHUTDOWN_TIMEOUT_MS || "25000"),
       });
       if (result.ok !== true || result.profile_disk_flushed !== true || result.profile_disk_unmounted !== true) {
         throw new Error("guest profile disk flush was unproved");
       }
-      profileShutdownCommitted = true;
+      owner.profileShutdownCommitted = true;
     } catch (error) {
-      logPhase(`guest clean shutdown failed: ${error.message}`);
+      log(`guest clean shutdown failed: ${error.message}`);
     }
   }
   for (const { server, socketPath } of Array.from(servers)) {
@@ -1196,42 +1219,44 @@ async function cleanupAndExit(signal = null) {
       child.kill("SIGTERM");
     } catch {}
   }
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await sleep(500);
   await Promise.all(Array.from(children).map((child) => new Promise((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) return resolve();
     child.once("exit", resolve);
     try { child.kill("SIGKILL"); } catch { resolve(); }
   })));
+  removePrivateSessionInputs(owner.privateSessionInputs);
   // VM teardown finishes before the refill starts. The launcher owns and waits
   // for this copy separately from the children that shutdown terminates.
-  if (deferredRootfsPoolRefill) {
-    const refill = deferredRootfsPoolRefill;
-    deferredRootfsPoolRefill = null;
+  if (owner.deferredRootfsPoolRefill) {
+    const refill = owner.deferredRootfsPoolRefill;
+    owner.deferredRootfsPoolRefill = null;
     try {
       // Reserve five seconds of the service grace for cancelling/reaping a
       // slow copy and removing its partial image.
       const timeoutMs = Math.min(
-        Number(process.env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_TIMEOUT_MS || "15000"),
-        Math.max(0, Number(process.env.ELASTOS_BROWSER_VM_LAUNCHER_SHUTDOWN_TIMEOUT_MS || "30000")
+        Number(env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_TIMEOUT_MS || "15000"),
+        Math.max(0, Number(env.ELASTOS_BROWSER_VM_LAUNCHER_SHUTDOWN_TIMEOUT_MS || "30000")
           - 5000 - (Date.now() - cleanupStartedAt)),
       );
-      await maybeRefillPreparedRootfsPool({ ...refill, timeoutMs });
+      await maybeRefillPreparedRootfsPool({ ...refill, timeoutMs, env });
     } catch (error) {
-      logPhase(`prepared rootfs pool refill failed: ${error.message}`);
+      log(`prepared rootfs pool refill failed: ${error.message}`);
     }
   }
-  if (globalThis.__elastosBrowserVmSessionDir) {
-    discardLaunchRootfs(path.join(globalThis.__elastosBrowserVmSessionDir, "rootfs.ext4"));
+  if (owner.sessionDir) {
+    discardLaunchRootfs(path.join(owner.sessionDir, "rootfs.ext4"));
   }
-  if (process.env[SESSION_KEEP_ENV] !== "1" && globalThis.__elastosBrowserVmSessionDir) {
+  if (env[SESSION_KEEP_ENV] !== "1" && owner.sessionDir) {
     try {
-      fs.rmSync(globalThis.__elastosBrowserVmSessionDir || "", { recursive: true, force: true });
+      // removal-ok: launcher session directory, after all owned VM children are reaped.
+      fs.rmSync(owner.sessionDir, { recursive: true, force: true });
     } catch {}
   }
   for (const cleanup of cleanupFns.reverse()) {
     try { cleanup(); } catch {}
   }
-  process.exit(launchSucceeded && profileShutdownCommitted ? 0 : 1);
+  exit(owner.launchSucceeded && owner.profileShutdownCommitted ? 0 : 1);
 }
 
 async function main() {
@@ -1243,7 +1268,7 @@ async function main() {
   validateAbsolutePath(root, ROOT_ENV);
   const suffix = sessionSuffix(launch.stream_id);
   const sessionDir = path.join(root, suffix);
-  globalThis.__elastosBrowserVmSessionDir = sessionDir;
+  lifecycle.sessionDir = sessionDir;
   fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
 
   const rootfs = process.env.ELASTOS_BROWSER_VM_ROOTFS || path.join(dataDir, "browser-vm/rootfs.ext4");
@@ -1258,21 +1283,16 @@ async function main() {
   const profile = prepareProfileDisk(request.profile, dataDir);
   cleanupFns.push(() => fs.closeSync(profile.lockFd));
   const network = await acquireLinuxNetwork(scriptPath);
-  const { iceConfig, turn } = linuxSessionTurn(network);
   const controlSocketPath = path.join(sessionDir, "control.sock");
   validateAbsolutePath(controlSocketPath, "control socket path");
   const launchRootfs = path.join(sessionDir, "rootfs.ext4");
 
   logPhase(`session dir ${sessionDir}`);
   logPhase(`preparing launch rootfs from ${rootfs} to ${launchRootfs}`);
-  await startSessionTurnServer({ network, sessionDir, turn });
-  logPhase(`allowed guest access to host media relay port ${turn.port} and range ${turn.relay.min}-${turn.relay.max}`);
-  await startTcpToUnixBridge(network.hostIp, 19091, launch.relay_ipc.path);
-  await startUnixToTcpBridge(controlSocketPath, network.guestIp, 19092);
   const rootfsPrep = prepareLaunchRootfs({ rootfs, launchRootfs, dataDir, sessionDir, scriptPath });
   logPhase(`prepared rootfs via ${rootfsPrep.mode} in ${rootfsPrep.elapsed_ms}ms`);
   if (rootfsPrep.mode === "prepared_pool") {
-    deferredRootfsPoolRefill = {
+    lifecycle.deferredRootfsPoolRefill = {
       dataDir,
       poolDir: rootfsPrep.poolDir,
       rootfs,
@@ -1282,6 +1302,12 @@ async function main() {
     };
     logPhase("prepared rootfs pool refill deferred until VM exit");
   }
+
+  const { iceConfig, turn } = linuxSessionTurn(network);
+  await startSessionTurnServer({ network, sessionDir, turn });
+  logPhase(`allowed guest access to host media relay port ${turn.port} and range ${turn.relay.min}-${turn.relay.max}`);
+  await startTcpToUnixBridge(network.hostIp, 19091, launch.relay_ipc.path);
+  await startUnixToTcpBridge(controlSocketPath, network.guestIp, 19092);
 
   const memoryMiB = process.env.ELASTOS_BROWSER_VM_MEMORY_MIB || (os.arch() === "arm64" ? "2048" : "3072");
   const vcpus = process.env.ELASTOS_BROWSER_VM_VCPUS || defaultVmVcpus();
@@ -1308,7 +1334,7 @@ async function main() {
       crosvmLog: vm.crosvmLog,
     });
     logPhase("guest control ready");
-    guestControlSocket = controlSocketPath;
+    lifecycle.guestControlSocket = controlSocketPath;
 
     logPhase("opening Browser page");
     let opened;
@@ -1329,7 +1355,7 @@ async function main() {
     }
     logPhase("Browser page open returned");
     const result = rewriteResult(opened, launch, sessionDir, controlSocketPath);
-    launchSucceeded = true;
+    lifecycle.launchSucceeded = true;
     process.stdout.write(`${JSON.stringify(result)}\n`);
 
     await new Promise((resolve) => {
@@ -1343,13 +1369,18 @@ async function main() {
   }
 }
 
-process.on("SIGTERM", () => cleanupAndExit("SIGTERM"));
-process.on("SIGINT", () => cleanupAndExit("SIGINT"));
-process.on("SIGHUP", () => cleanupAndExit("SIGHUP"));
+export { cleanupAndExit };
 
-main()
-  .then(() => cleanupAndExit(null))
-  .catch((error) => {
-    console.error(error instanceof Error ? error.message : String(error));
-    cleanupAndExit(null);
-  });
+// Imports expose the same lifecycle implementation without starting a VM.
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.on("SIGTERM", () => cleanupAndExit("SIGTERM"));
+  process.on("SIGINT", () => cleanupAndExit("SIGINT"));
+  process.on("SIGHUP", () => cleanupAndExit("SIGHUP"));
+
+  main()
+    .then(() => cleanupAndExit(null))
+    .catch((error) => {
+      console.error(error instanceof Error ? error.message : String(error));
+      cleanupAndExit(null);
+    });
+}

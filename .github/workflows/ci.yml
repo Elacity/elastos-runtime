@@ -46,6 +46,9 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          # The removal guard diffs against the base branch; commits and trees only.
+          fetch-depth: 0
+          filter: blob:none
       - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
         with:
           components: rustfmt
@@ -61,6 +64,10 @@ jobs:
         run: ./scripts/test-source-gate.sh product-data
       - name: local pre-push gate behavior
         run: ./scripts/test-source-gate.sh prepush
+      - name: safe removal
+        env:
+          REMOVAL_GUARD_BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'origin/develop' }}
+        run: ./scripts/test-source-gate.sh removal
       - name: product UI source proofs
         run: ./scripts/test-source-gate.sh product-ui
       - name: release artifact source proofs
@@ -573,6 +580,10 @@ jobs:
             platform: linux-arm64
             host: linux
             target: aarch64-unknown-linux-musl
+          - os: ubuntu-24.04
+            platform: linux-amd64
+            host: linux
+            target: x86_64-unknown-linux-musl
           - os: macos-14
             platform: darwin-arm64
             host: darwin

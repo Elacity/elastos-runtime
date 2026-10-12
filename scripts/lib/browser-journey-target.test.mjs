@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import test from "node:test";
 import { createHash } from "node:crypto";
 import { browserJourneyTargetConfig, readBrowserJourneyHealth, readBrowserJourneyReceipt,
-  browserJourneyEngineChoice, browserJourneyEngineRoute, browserJourneyFixtureUrl,
+  browserJourneyEngineChoice, browserJourneyEngineRoute, browserJourneyLocalVmRoute, browserJourneyFixtureUrl,
   browserJourneyProfileStorage, browserJourneyProfileBinding, browserJourneyProfilePair } from "./browser-journey-target.mjs";
 
 const profileEnv = { HOME_VIRTUAL_AUTH_BROWSER_CONTROLLED_JOURNEY: "1", HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT: "1",
@@ -206,4 +206,25 @@ test("approved Engine selection binds the active Runtime page and concrete adapt
   assert.throws(() => browserJourneyEngineRoute(summary, choice, "page-one"), /different Engine or page/);
   assert.deepEqual(browserJourneyEngineChoice({ engine_adapter: { adapters: [{ ...adapter, id: adapterId }] } }, adapterId),
     { engineId: adapterId, adapterId });
+});
+
+
+test("VM profile opt-in and selected local Engine exclude native and remote execution", () => {
+  assert.equal(browserJourneyTargetConfig({ ...profileEnv, HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VZ_TRANSPORT: "0",
+    HOME_VIRTUAL_AUTH_BROWSER_REQUIRE_VM_TRANSPORT: "1" }).profile.mode, "write");
+  const summary = { engine_adapter: { adapters: [{ id: "vm", engine: "chromium_microvm",
+    backing_substrate: "local_microvm", direct_network: false, wallet_injection: false }] },
+    sessions: { recoverable_page: { schema: "elastos.browser.recoverable-page/v1", state: "active", page_id: "p",
+      service_selection: { schema: "elastos.browser.service-selection/v1", engine_id: "" },
+      engine_page: { page_id: "p", adapter: "vm", provider: "capsule-provider" } } } };
+  assert.equal(browserJourneyLocalVmRoute(summary, "p").adapter_id, "vm");
+  for (const change of [s => { s.engine_adapter.adapters[0].engine = "chromium_native"; },
+    s => { s.engine_adapter.adapters[0].backing_substrate = "remote_microvm"; },
+    s => { s.engine_adapter.adapters[0].direct_network = true; },
+    s => { s.engine_adapter.adapters[0].id = "different"; },
+    s => { s.engine_adapter.adapters.push(s.engine_adapter.adapters[0]); },
+    s => { s.sessions.recoverable_page.engine_page.page_id = "different"; }]) {
+    const bad = structuredClone(summary); change(bad);
+    assert.throws(() => browserJourneyLocalVmRoute(bad, "p"));
+  }
 });

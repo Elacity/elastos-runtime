@@ -223,8 +223,8 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
     def test_official_node_archives_pin_each_platform_and_include_license(self):
         inventory = json.loads(assets.RECIPE_FILE.read_text())
         recipes = [r for r in inventory["recipes"] if r["component"] == "node"]
-        self.assertEqual({r["platform"] for r in recipes}, {"darwin-arm64", "linux-arm64"})
-        self.assertEqual(len({r["source"]["checksum"] for r in recipes}), 2)
+        self.assertEqual({r["platform"] for r in recipes}, {"darwin-arm64", "linux-arm64", "linux-amd64"})
+        self.assertEqual(len({r["source"]["checksum"] for r in recipes}), 3)
         for recipe in recipes:
             upstream.validate_recipe(recipe)
             self.assertTrue(recipe["source"]["url"].startswith("https://nodejs.org/download/release/v24.21.0/"))
@@ -371,7 +371,10 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                 return {'path':str(path), 'checksum':'sha256:'+upstream.digest(path), 'max_bytes':path.stat().st_size}
             recipe['source'] = source(recipe['root'], {
                 'Cargo.lock': b'pinned lock fixture',
-                'vendor/generic/crypto/Cargo.toml': b'workspace path crate'})
+                'src/crosvm/cmdline.rs': b'    pub params: Vec<String>,\n        cfg.params.extend(cmd.params);\n',
+                'vendor/generic/crypto/Cargo.toml': b'workspace path crate',
+                'jail/seccomp/x86_64/vhost_vsock.policy': b'ioctl: arg1 == 0x8008af00 || arg1 == 0xc008af12\n',
+                'jail/seccomp/aarch64/vhost_vsock_device.policy': b'ioctl: arg1 == 0x8008af00 || arg1 == 0xc008af12\n'})
             recipe['build']['dependencies'][0]['source'] = source(recipe['build']['dependencies'][0]['root'], {
                 'rust/minijail-sys/build.rs': b'.arg(&jobs)\n            .status()?;',
                 'tools/compile_seccomp_policy.py': b'pinned compiler fixture'})
@@ -432,6 +435,51 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                     self.assertTrue(all(m.uid == m.gid == 0 and m.uname == m.gname == '' for m in locked.getmembers()))
                 with tarfile.open(fileobj=archive.extractfile(recipe['root'] + '/sources/linux-uapi.tar.gz'), mode='r:gz') as uapi:
                     self.assertEqual(uapi.extractfile('linux-uapi/linux/fixture.h').read(), b'build header fixture')
+
+
+    def test_private_params_cli_is_bounded_and_rejects_pinned_source_drift(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            source = Path(scratch)
+            path = source / 'src/crosvm/cmdline.rs'
+            path.parent.mkdir(parents=True)
+            original = '    pub params: Vec<String>,\n        cfg.params.extend(cmd.params);\n'
+            path.write_text(original)
+            builder.prepare_crosvm_private_params(source)
+            text = path.read_text()
+            self.assertIn('pub params_file: Option<PathBuf>', text)
+            self.assertIn('file.take(65537)', text)
+            self.assertIn('bytes.len() > 65536 || bytes.contains(&0)', text)
+            self.assertIn('String::from_utf8(bytes)', text)
+            with self.assertRaisesRegex(ValueError, 'pinned crosvm'):
+                builder.prepare_crosvm_private_params(source)
+            for changed in (original.replace('Vec<String>', 'String'), original + original):
+                path.write_text(changed)
+                with self.assertRaisesRegex(ValueError, 'pinned crosvm'):
+                    builder.prepare_crosvm_private_params(source)
+                self.assertEqual(path.read_text(), changed)
+
+
+    def test_musl_vsock_policy_keeps_exact_ioctl_requests_and_rejects_pin_drift(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            source = Path(scratch)
+            paths = [source / 'jail/seccomp' / relative for relative in
+                     ('x86_64/vhost_vsock.policy', 'aarch64/vhost_vsock_device.policy')]
+            original = 'ioctl: arg1 == 0x8008af00 || arg1 == 0xc008af12 || arg1 == 0x4004af61\n'
+            for path in paths:
+                path.parent.mkdir(parents=True)
+                path.write_text(original)
+            builder.prepare_crosvm_musl_vsock_policies(source)
+            expected = original.replace('0x8008af00', '0x8008af00 || arg1 == 0xffffffff8008af00').replace(
+                '0xc008af12', '0xc008af12 || arg1 == 0xffffffffc008af12')
+            for path in paths:
+                self.assertEqual(path.read_text(), expected)
+            with self.assertRaisesRegex(ValueError, 'pinned crosvm'):
+                builder.prepare_crosvm_musl_vsock_policies(source)
+            paths[0].write_text(original)
+            paths[1].write_text(original.replace('0xc008af12', '0xc008af13'))
+            with self.assertRaisesRegex(ValueError, 'pinned crosvm'):
+                builder.prepare_crosvm_musl_vsock_policies(source)
+            self.assertEqual(paths[0].read_text(), original)
 
 
 if __name__ == '__main__':

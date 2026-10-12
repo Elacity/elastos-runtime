@@ -683,7 +683,29 @@ async function probeVmControlSocket(controlSocket, timeoutMs = 1000) {
 }
 
 function vmControlStatusMatches(status, expectedFingerprint) {
-  return status?.config_fingerprint === expectedFingerprint;
+  return status?.accepting_launches !== false &&
+    status?.config_fingerprint === expectedFingerprint;
+}
+
+export async function waitForRetiringVmControlService(controlSocket, observed, timeoutMs = STARTUP_LOCK_WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (observed.kind === "verified" && observed.status.accepting_launches === false) {
+    if (Date.now() >= deadline) {
+      throw launchError("cleanup_pending", "Browser VM control service is finishing its owned shutdown");
+    }
+    // The old owner keeps its VM, disk locks and socket until cleanup completes.
+    // Observe that handoff; a new Runtime cannot adopt or force those effects.
+    await sleep(Math.min(100, Math.max(1, deadline - Date.now())));
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw launchError("cleanup_pending", "Browser VM control service is finishing its owned shutdown");
+    }
+    observed = await probeVmControlSocket(controlSocket, Math.min(1000, remainingMs));
+    if (Date.now() >= deadline) {
+      throw launchError("cleanup_pending", "Browser VM control service is finishing its owned shutdown");
+    }
+  }
+  return observed;
 }
 
 function vmControlHasEffects(status) {
@@ -865,7 +887,9 @@ async function ensureVmControlAvailable({ controlSocket, dataDir, platform, root
     root,
   });
 
-  const existing = await probeVmControlSocket(controlSocket, 1200);
+  const existing = await waitForRetiringVmControlService(
+    controlSocket, await probeVmControlSocket(controlSocket, 1200),
+  );
   if (
     existing.kind === "verified" &&
     vmControlStatusMatches(existing.status, expectedFingerprint)
@@ -894,7 +918,9 @@ async function ensureVmControlAvailable({ controlSocket, dataDir, platform, root
       continue;
     }
     try {
-      const lockedExisting = await probeVmControlSocket(controlSocket, 1000);
+      const lockedExisting = await waitForRetiringVmControlService(
+        controlSocket, await probeVmControlSocket(controlSocket, 1000),
+      );
       if (
         lockedExisting.kind === "verified" &&
         vmControlStatusMatches(lockedExisting.status, expectedFingerprint)

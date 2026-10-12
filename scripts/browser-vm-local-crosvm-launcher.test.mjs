@@ -57,9 +57,11 @@ test("existing Browser CI step runs the Linux network tests", () => {
 test("crosvm command consumes the prepared TAP and addresses", () => {
   const calls = [];
   const child = { once() {} };
+  const files = [];
   const context = vm.createContext({ path, os: { arch: () => "arm64" }, process: { env: {} },
-    fs: { openSync: () => 10, mkdirSync() {} }, hasTurnServer: () => true, iceBootConfigHex: () => "",
+    fs: { openSync: () => 10, mkdirSync() {}, writeFileSync(...args) { files.push(args); } }, hasTurnServer: () => true, iceBootConfigHex: () => "private-ice-hex",
     profileKey: () => "profile", defaultVmVcpus: () => "4",
+    writePrivateSessionInput(file, text) { files.push([file, text]); },
     spawnTracked(command, args, options) { calls.push([command, args, options]); return child; },
   });
   const start = source.indexOf("function startCrosvm(");
@@ -75,33 +77,108 @@ test("crosvm command consumes the prepared TAP and addresses", () => {
   const args = calls[0][1];
   assert.equal(args[args.indexOf("--net") + 1], "tap-name=ebv3e9s0,mac=02:eb:00:03:e9:00");
   assert.deepEqual(Array.from(args.entries()).filter(([, v]) => v === "--block").map(([i]) => args[i + 1]), ["path=/fixture/rootfs,root=true", "path=/fixture/profile.ext4"]);
-  assert.match(args[args.indexOf("-p") + 1], /elastos.browser_profile_disk=required/);
-  assert.match(args[args.indexOf("-p") + 1], /elastos.browser_profile_initialize=new/);
-  assert.match(args[args.indexOf("-p") + 1], /elastos.browser_host_ip=192\.168\.200\.1/);
-  assert.match(args[args.indexOf("-p") + 1], /elastos.browser_guest_ip=192\.168\.200\.2/);
+  assert.equal(args.includes("-p"), false);
+  assert.equal(args[args.indexOf("--params-file") + 1], "/fixture/session/boot-params.txt");
+  assert.equal(args.some(arg => arg.includes("private-ice-hex")), false);
+  assert.match(files[0][1], /elastos.browser_ice_config_hex=private-ice-hex/);
+  assert.match(files[0][1], /elastos.browser_profile_disk=required/);
+  assert.match(files[0][1], /elastos.browser_width=1920/);
+  assert.match(files[0][1], /elastos.browser_height=1080/);
+  assert.match(files[0][1], /elastos.browser_profile_initialize=new/);
+  assert.match(files[0][1], /elastos.browser_host_ip=192\.168\.200\.1/);
+  assert.match(files[0][1], /elastos.browser_guest_ip=192\.168\.200\.2/);
 });
 
 test("session TURN relays only to its own relay address on the leased slot", async () => {
   const calls = [];
   const child = { once() {} };
-  const context = vm.createContext({ path, fs: { openSync: () => 10, closeSync() {} }, logPhase() {},
+  const files = [];
+  const context = vm.createContext({ path, Date, fs: { openSync: () => 10, closeSync() {}, writeFileSync(...args) { files.push(args); } }, logPhase() {},
+    writePrivateSessionInput(file, text) { files.push([file, text]); },
     turnserverBin: () => "/fixture/turnserver", waitForTcpListener: async () => {},
     spawnTracked(command, args) { calls.push(args); return child; } });
   const start = source.indexOf("async function startSessionTurnServer(");
   const end = source.indexOf("\nfunction spawnTracked(", start);
   const startSessionTurnServer = vm.runInContext(`${source.slice(start, end)}\nstartSessionTurnServer`, context);
   await startSessionTurnServer({ network: { hostIp: "192.168.200.1" }, sessionDir: "/fixture/session",
-    turn: { port: 41000, relay: { min: 49152, max: 49215 }, username: "u", credential: "c" } });
+    turn: { port: 41000, relay: { min: 49152, max: 49215 }, authSecret: "a".repeat(64), expiresAt: Math.floor(Date.now() / 1000) + 300 } });
   const args = Array.from(calls[0]);
-  // coturn admits an allowed peer before its denied ranges; loopback stays denied.
-  assert.deepEqual(args.filter((arg) => /peer/.test(arg)), [
-    "--no-multicast-peers",
-    "--allowed-peer-ip=192.168.200.1",
-    "--denied-peer-ip=0.0.0.0-255.255.255.255",
-    "--denied-peer-ip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-  ]);
-  assert.ok(args.includes("--no-tcp-relay"), "RFC 6062 TCP relays must stay off");
-  assert.equal(args[args.indexOf("--relay-ip") + 1], "192.168.200.1");
+  assert.deepEqual(args, ["-c", "/fixture/session/turnserver.conf"]);
+  assert.equal(args.some(arg => arg.includes("a".repeat(64))), false);
+  const config = files[0][1];
+  assert.match(config, /use-auth-secret/);
+  assert.match(config, /static-auth-secret=a{64}/);
+  assert.match(config, /max-allocate-lifetime=(?:29[0-9]|300)/);
+  assert.match(config, /no-multicast-peers\nallowed-peer-ip=192\.168\.200\.1\ndenied-peer-ip=0\.0\.0\.0-255\.255\.255\.255/);
+  assert.match(config, /denied-peer-ip=::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/);
+  assert.match(config, /no-tcp-relay/);
+  assert.match(config, /relay-ip=192\.168\.200\.1/);
+});
+
+test("private inputs are removed even when diagnostics are kept and a spawn fails", t => {
+  const root = fs.mkdtempSync("/tmp/ebv-private-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const context = vm.createContext({ fs, privateSessionInputs: new Map(), logPhase() {} });
+  const start = source.indexOf("function writePrivateSessionInput(");
+  const end = source.indexOf("async function startSessionTurnServer(", start);
+  const api = vm.runInContext(`${source.slice(start, end)}\n({writePrivateSessionInput, removePrivateSessionInputs})`, context);
+  const params = path.join(root, "boot-params.txt"), turn = path.join(root, "turnserver.conf");
+  api.writePrivateSessionInput(params, "private ICE");
+  api.writePrivateSessionInput(turn, "private TURN secret");
+  for (const file of [params, turn]) assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.throws(() => api.writePrivateSessionInput(params, "overwrite"), /EEXIST/);
+  // main's rejection path calls cleanupAndExit after a failed spawn.
+  const cleanup = source.slice(source.indexOf("async function cleanupAndExit("), source.indexOf("async function main("));
+  assert.ok(cleanup.indexOf("removePrivateSessionInputs(owner.privateSessionInputs);") > cleanup.indexOf("await Promise.all(Array.from(children)"));
+  assert.ok(cleanup.indexOf("removePrivateSessionInputs(owner.privateSessionInputs);") < cleanup.indexOf("env[SESSION_KEEP_ENV]"));
+  api.removePrivateSessionInputs();
+  assert.equal(fs.existsSync(params), false);
+  assert.equal(fs.existsSync(turn), false);
+  api.writePrivateSessionInput(params, "original");
+  fs.renameSync(params, path.join(root, "original"));
+  fs.writeFileSync(params, "replacement");
+  api.removePrivateSessionInputs();
+  assert.equal(fs.readFileSync(params, "utf8"), "replacement");
+});
+
+test("cold rootfs preparation finishes before session credentials start ageing", () => {
+  const main = source.slice(source.indexOf("async function main("));
+  assert.ok(main.indexOf("prepareLaunchRootfs(") < main.indexOf("linuxSessionTurn(network)"));
+  assert.ok(main.indexOf("linuxSessionTurn(network)") < main.indexOf("startSessionTurnServer("));
+});
+
+test("kernel command line diagnostics redact VM tokens and private ICE", t => {
+  const root = fs.mkdtempSync("/tmp/ebv-console-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "serial.log");
+  fs.writeFileSync(file, "Kernel command line: console=ttyS0 elastos.token=private-token elastos.browser_ice_config_hex=private-ice\nboot failed");
+  const start = source.indexOf("function tailFile("), end = source.indexOf("function headerLines(", start);
+  const tail = vm.runInNewContext(`${source.slice(start, end)}\ntailFile`, { fs });
+  assert.doesNotMatch(tail(file), /private-token|private-ice/);
+  assert.match(tail(file), /boot failed/);
+});
+
+test("Linux TURN mints distinct expiring credentials for each session", () => {
+  const context = vm.createContext({ crypto,
+    vmIceEnv: () => ({ ELASTOS_BROWSER_VM_ICE_USERNAME: "old", ELASTOS_BROWSER_VM_ICE_CREDENTIAL: "old" }),
+    sessionTurnServer: () => ({ relay: { min: 49152, max: 49215 } }),
+    turnServerPorts: () => [41000],
+    collectIceServerEntries: () => [{ urls: ["turn:192.168.200.1:41000"], username: "old", credential: "old" }],
+  });
+  const start = source.indexOf("function linuxSessionTurn(");
+  const end = source.indexOf("\nfunction sessionSuffix(", start);
+  const mint = vm.runInContext(`${source.slice(start, end)}\nlinuxSessionTurn`, context);
+  const first = mint({ turnPort: 41000 }, 1700000000000);
+  const second = mint({ turnPort: 41000 }, 1700000000000);
+  assert.equal(first.turn.expiresAt, 1700000300);
+  assert.match(first.turn.username, /^1700000300:[0-9a-f]{32}$/);
+  assert.notEqual(first.turn.authSecret, second.turn.authSecret);
+  assert.notEqual(first.turn.credential, second.turn.credential);
+  assert.equal(first.turn.credential, crypto.createHmac("sha1", first.turn.authSecret).update(first.turn.username).digest("base64"));
+  const ice = JSON.parse(first.iceConfig.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON)[0];
+  assert.equal(ice.credential, first.turn.credential);
+  assert.equal(ice.username, first.turn.username);
+  assert.equal(first.iceConfig.ELASTOS_BROWSER_VM_ICE_CREDENTIAL, undefined);
 });
 
 test("real launcher stops before VM commands when setup is absent", async t => {
