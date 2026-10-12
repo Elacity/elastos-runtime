@@ -39,154 +39,46 @@ Test-channel release. Signed releases show these notes in System before you upda
 
 ### Added
 
-- You can remove ElastOS with the installer:
-  `curl -fsSL https://elastos.elacitylabs.com/install.sh | bash -s -- --uninstall`.
-  It stops ElastOS and removes the program and its apps but keeps your identity
-  and files, so installing again continues where you were. Add `--remove-data`
-  to delete those too; keep your Recovery Kit first.
-- An owner who lost every passkey can recover their Home with their
-  Recovery Kit, even when guest accounts are off. Before, the sign-in screen
-  offered no way back. Choose "Recover this Home with your Recovery Kit" on the
-  sign-in screen, run the command it shows on the computer that runs Home
-  (`elastos identity arm-owner-recovery --origin … --rp-id …` with that page's
-  address filled in), then enter the code the command prints.
-- Browser installs and runs on Apple Silicon Macs; on other computers,
-  including Linux ARM64 (Jetson) and Linux x86-64, it is hidden until the next
-  release.
+- You can remove ElastOS with `curl -fsSL https://elastos.elacitylabs.com/install.sh | bash -s -- --uninstall`. It keeps your identity and files, so installing again continues where you were; add `--remove-data` to delete them too (keep your Recovery Kit first).
+- An owner who lost every passkey can recover their Home with their Recovery Kit: choose "Recover this Home with your Recovery Kit" on the sign-in screen, run the command it shows on the computer that runs Home, and enter the code it prints.
+- Browser runs on Apple Silicon Macs. On Linux, including the Jetson, it stays hidden until a later release.
 
 ### Changed
 
-- Setup installs one Home; it no longer prints options for other setups.
-- The terminal Home no longer offers the old native Chat, which used a
-  different network from the Chat on the Desktop.
-- People "Message" in the terminal Home no longer opens that old Chat. In the
-  browser terminal it opens Chat on the Desktop at that person's conversation;
-  in a native terminal it says "Open Chat on the Desktop to message <name>."
-- `elastos --help` lists only the everyday commands. Commands for people who
-  run servers or publish releases (such as `serve`, `gateway`, `keys` and
-  `publish-release`) still work and still have their own `--help`.
+- Setup installs one Home, and `elastos --help` lists only everyday commands; commands for servers and publishers still work and have their own `--help`.
+- The terminal Home no longer offers the old native Chat. People "Message" opens Chat on the Desktop, or says "Open Chat on the Desktop to message <name>." in a native terminal.
 
 ### Fixed
 
-- On Linux, Carrier sends one UDP datagram at a time. Some Wi-Fi drivers, such
-  as the Jetson's, dropped batched datagrams, which stalled connections, Chat
-  and downloads.
-- The terminal Home no longer quits with "403 Forbidden" after the first
-  action; you can run actions one after another.
-- In the terminal Inbox, direct messages and service requests say "Open Inbox
-  on the Desktop to answer this" instead of "no longer available".
-- In the terminal Apps tab, Enter on an app that only opens on the Desktop
-  says "Open <App> on the Desktop" instead of doing nothing.
-- Publishing a document (Documents Publish and `elastos share`) works again:
-  it copied a viewer file from a place the Documents app does not ship (#128).
-- Importing your Recovery Kit with a new passkey now keeps your admin role.
-  Before, an owner who added a guest passkey and imported their Kit stayed a
-  guest, and the Home was left with no admin.
-- Home no longer runs out of memory when it starts with Qwen2.5 1.5B on the
-  device. On an 8 GB Linux computer, Home used more than 7 GB within seconds of
-  starting, and the system stopped it.
-- On Linux, a reply right after Get no longer fails with "Not enough free
-  memory" when most of the memory in use is only cached files.
-- `elastos setup` on a Home that imported media tools before 0.8.0-alpha.9
-  stopped with "supplied media tools differ from the private imported pair".
-  On an installed signed release, setup now fetches and verifies the release's
-  media tools again and replaces the private copy, keeping your media limits.
-- While a model downloads, Marketplace and System no longer stop at "Status is
-  unavailable. Refresh to check before trying again." after one missed status
-  check. They show "Checking status…" and keep checking.
-- While a model is being set up after its download, Marketplace and System show
-  "Finishing setup…" instead of "Model service unavailable." with a Retry button.
-  If setup takes more than two minutes, Retry comes back.
-- When no model is ready yet and one is downloading, Assistant shows, for
-  example, "SmolLM2 is downloading (42%)" instead of "No model".
-- System > Shell and Marketplace > Home views no longer offer Terminal unless
-  developer mode is on. If Terminal was chosen and can no longer start, Home
-  opens the Desktop instead of showing an error after every reload.
-- A new Home no longer asks in Inbox for market-price access before you open
-  Wallet.
-- Assistant no longer shows a microphone button that cannot work inside Home.
-- The welcome sheet no longer talks about an "updated" Recovery Kit on a new
-  Home, and the lock screen shows the first letter of your name.
-- Apps that ask for the ElastOS version now get the same version that
-  `elastos --version` and System show.
-- A model download that stopped with "Model content could not be read" now
-  continues from where it stopped when you press Retry. Before, Retry started
-  the download again from 0%.
-- Right after Get, Assistant's model menu no longer lists the new model by its
-  file name, such as "qwen2.5-1.5b-instruct-q4-k-m-local". It shows the model's
-  name from the model list, such as "Qwen2.5 1.5B Instruct", as soon as Home
-  has finished setting it up, without pressing Refresh models.
-- When the installed version record is damaged, `elastos update` now tells you
-  to run `elastos update --force` even if it cannot reach the update source.
-  Before, a connection error hid that advice.
-- When an update is already running, started from a second System window,
-  System now says "Another update was started on this Home. Wait for it to
-  finish, then check the update again." When a later approval has replaced
-  yours and nothing is running, it says "This approval is no longer valid.
-  Check for the update again and approve it once more." Before, both said the
-  release was refused or verification failed.
-- If the connection drops while `curl … | bash` is still sending the
-  installer, nothing happens: no Runtime is stopped and no file changes. Before,
-  bash ran the part that had arrived, which could leave the Runtime stopped.
-- Runtime setup and the first Home started by the installer keep your own
-  temporary folder. Before, they got the installer's temporary folder, which it
-  deleted when it finished.
-- The installer downloads release data over HTTPS only and stops with a clear
-  message if a server redirects it to plain HTTP.
-- Running the installer again while Home is open now works: it closes Home,
-  installs, and opens Home again. Before, it stopped with "Recorded Runtime is
-  foreign or ambiguous".
-- On a Mac without Apple's Command Line Tools, the installer now stops before
-  downloading anything and says: run `xcode-select --install`, then run the
-  installer again. Before, it failed with "Invalid release-head.json format".
-- The installer no longer prints a raw JSON receipt near the end; it prints
-  "Protected roots are ready". A receipt for moved data stays in its backup
-  folder.
-- When setup or an update cannot reach the trusted source, ElastOS now says
-  so in plain words: it needs outgoing UDP to port 4433, so check the firewall
-  or network, then run `elastos setup` again.
-- With no model yet, Assistant now says "Get a model to start. Models run on
-  this Home." and shows a Get a model button that opens Models in Apps. Send
-  says the same when you point at it.
-- Assistant's other no-model message now names the real app: Apps
-  (Marketplace) → Models.
-- Pressing Stop in Assistant now shows "Stopped." instead of "Settlement
-  unknown".
-- If there is not enough free disk space to get a model, Apps now says so and
-  how much space the model needs, instead of "Model action could not be
-  confirmed". While a model waits for space, it shows how much it needs.
-- Assistant's description in Apps now reads "Chat with an AI model that runs
-  on this Home."
+- On Linux, Carrier sends one UDP datagram at a time. Some Wi-Fi drivers, such as the Jetson's, dropped batched datagrams, which stalled connections, Chat and downloads.
+- The terminal Home no longer quits with "403 Forbidden" after the first action, and Inbox and Apps items that only work on the Desktop say "Open … on the Desktop".
+- Publishing a document (Documents Publish and `elastos share`) works again (#128).
+- Importing your Recovery Kit with a new passkey keeps your admin role; before, the Home could be left with no admin.
+- Home no longer runs out of memory when it starts with Qwen2.5 1.5B, and on Linux a reply right after Get no longer fails with "Not enough free memory" when the memory in use is mostly cached files.
+- `elastos setup` on a Home that imported media tools before 0.8.0-alpha.9 no longer stops with "supplied media tools differ"; it fetches and verifies the release's media tools again.
+- Model downloads and setup show "Checking status…" and "Finishing setup…" instead of stopping at an error, Assistant shows progress such as "SmolLM2 is downloading (42%)", and Retry continues a stopped download from where it stopped.
+- Right after Get, Assistant lists the model by its name, such as "Qwen2.5 1.5B Instruct", without Refresh models.
+- If there is not enough disk space for a model, Apps says how much space it needs instead of "Model action could not be confirmed".
+- With no model yet, Assistant says "Get a model to start. Models run on this Home." with a Get a model button; Stop shows "Stopped."
+- Terminal views appear only in developer mode, and Home opens the Desktop if a chosen Terminal can no longer start.
+- A new Home no longer asks for market-price access before you open Wallet, Assistant no longer shows a microphone button that cannot work, and the welcome sheet and lock screen read correctly.
+- Apps that ask for the ElastOS version get the same version as `elastos --version` and System.
+- `elastos update` explains a damaged version record even offline, and System explains an update already running or an approval that was replaced, instead of saying the release was refused.
+- The installer: an interrupted download changes nothing; it uses HTTPS only; it keeps your temporary folder; running it while Home is open works; a Mac without Apple's Command Line Tools is told to run `xcode-select --install` first.
+- When setup or an update cannot reach the trusted source, ElastOS says it needs outgoing UDP to port 4433 and to check the firewall or network.
 
 ### Removed
 
-- The sign-in screen no longer shows "Use an older security key". To replace a
-  passkey, restore your Recovery Kit and create a new one.
-- Protected content is not part of 0.8.0. Elacity Player is no longer listed in
-  Apps or search, Library no longer offers "Protect and List…", and Marketplace
-  no longer has a Media tab. They return in a later release.
-- `elastos agent`. Its app was retired earlier and the command could not work.
-- `elastos upgrade`; use `elastos update`. The `--no-confirm` spelling of
-  `--yes` on `elastos update` is gone too.
-- `elastos update --gateway` and `--no-p2p`, and the installer's IPFS-gateway
-  options (`--gateway`, `--head-cid`, `--publisher-node-id`). Updates come
-  only from your trusted source over Carrier; the installer downloads only
-  from its publisher address. `elastos update --head-cid` and `--rollback-to`
-  stay.
-- ElastOS no longer attaches downloads to GitHub Releases. Install with
-  `install.sh`; it and System fetch the signed release over Carrier.
+- The sign-in screen no longer shows "Use an older security key"; to replace a passkey, restore your Recovery Kit and create a new one.
+- Protected content is not part of 0.8.0: Elacity Player, "Protect and List…" and the Marketplace Media tab return in a later release.
+- `elastos agent`, `elastos upgrade` (use `elastos update`), `--no-confirm`, `elastos update --gateway` and `--no-p2p`, and the installer's IPFS-gateway options. Updates come only from your trusted source over Carrier.
+- ElastOS no longer attaches downloads to GitHub Releases; `install.sh` and System fetch the signed release over Carrier.
 
 ### Security
 
-- An installed Home runs a local capsule only when it comes from the signed
-  release or is signed by the release publisher. Homes built from source keep
-  running unsigned capsules. This needs no action after the update.
-- Recovery Kit import accepts only a Kit made on this Home for that account,
-  and refuses any import that would leave the Home without an admin passkey.
-- Requests and replies from other computers now have limits and deadlines:
-  whole-object fetch replies are limited to two at once and one per peer, and
-  a connection passing data through your computer closes after five minutes
-  with no data in either direction.
+- An installed Home runs a local capsule only when it comes from the signed release or is signed by the release publisher. Homes built from source keep running unsigned capsules.
+- Recovery Kit import accepts only a Kit made on this Home for that account, and refuses any import that would leave the Home without an admin passkey.
+- Requests and replies from other computers now have limits and deadlines: at most two whole-object fetch replies at once and one per peer, and a relayed connection closes after five idle minutes.
 
 ### Developer detail
 
