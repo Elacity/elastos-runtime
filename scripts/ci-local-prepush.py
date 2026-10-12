@@ -149,6 +149,83 @@ def acquire_lease(common, candidate):
     return lease
 
 
+# elastos-remote-check sets this on the Linux box, whose gate produces the receipt.
+RECEIPT_IGNORED = "ELASTOS_PREPUSH_IGNORE_RECEIPT"
+# A change to any Rust or Cargo input since a receipt's commit voids the receipt.
+RUST_INPUT = re.compile(r"\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)\.cargo/|rust-toolchain")
+# Code the Linux build box never compiles or runs.
+MACOS_PATH = re.compile(r"(^|/)elastos-vz/|\.(swift|m|mm)$|(^|/)Info\.plist$|entitlements|darwin|macos",
+                        re.IGNORECASE)
+MACOS_CFG = re.compile(r'target_os\s*=\s*"macos"|target_vendor\s*=\s*"apple"')
+
+
+def quiet_git(root, *args):
+    return subprocess.run(["git", "-c", "core.quotePath=false", *args], cwd=root,
+                          capture_output=True, text=True)
+
+
+def linux_receipt(root, common, head):
+    """The commit of a full PASS receipt (written by elastos-remote-check) for head, or
+    for an ancestor of head with no Rust/Cargo change since; the push queue merges
+    develop after the check. None when no receipt qualifies."""
+    found = []
+    for path in (common / "prepush-receipts").glob("*.json"):
+        try:
+            receipt, written = json.loads(path.read_text()), path.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        if (isinstance(receipt, dict) and receipt.get("result") == "PASS" and receipt.get("full") is True
+                and receipt.get("commit") == path.stem and re.fullmatch(r"[0-9a-f]{40}", path.stem)):
+            found.append((path.stem != head, -written, path.stem))
+    for _, _, commit in sorted(found):
+        if commit == head:
+            return commit
+        if quiet_git(root, "merge-base", "--is-ancestor", commit, head).returncode:
+            continue
+        since = quiet_git(root, "diff", "--name-only", "-z", "--no-renames", commit, head)
+        if not since.returncode and not any(RUST_INPUT.search(path) for path in since.stdout.split("\0") if path):
+            return commit
+    return None
+
+
+def macos_change(root, develop, paths):
+    """The first change in develop...HEAD only a Mac builds, or None: a macOS path, or
+    an added or removed Rust/Cargo line naming a macOS or Apple cfg."""
+    for path in paths:
+        if MACOS_PATH.search(path):
+            return path
+    diff = quiet_git(root, "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames",
+                     develop + "...HEAD", "--", "*.rs", "*Cargo.toml")
+    if diff.returncode:
+        raise GateError("command failed: git diff " + develop + "...HEAD")
+    path, header = None, False
+    for line in diff.stdout.splitlines():
+        if line.startswith("diff --git "):
+            header = True
+        elif header:
+            if line.startswith(("--- a/", "+++ b/")):
+                path = line[6:]
+            header = not line.startswith("@@")
+        elif line[:1] in ("+", "-") and MACOS_CFG.search(line):
+            return path + ": " + line[1:].strip()
+    return None
+
+
+def gate_mode(root, common, head, develop, paths):
+    """(cargo, reason). A Linux receipt replaces the Mac Cargo steps unless the branch
+    changes macOS-only code, which only this Mac compiles and tests."""
+    if os.environ.get(RECEIPT_IGNORED) == "1":
+        return True, RECEIPT_IGNORED + "=1"
+    receipt = linux_receipt(root, common, head)
+    if not receipt:
+        return True, "no full Linux PASS receipt for HEAD or for an ancestor without Rust/Cargo changes since"
+    macos = macos_change(root, develop, paths)
+    if macos:
+        return True, "macOS-specific change " + macos + " (receipt " + receipt + " covers Linux only)"
+    return False, "receipt " + receipt + (" for HEAD" if receipt == head else
+                                          " for an ancestor; no Rust/Cargo change since")
+
+
 def metadata(root, manifest, lease):
     value = json.loads(run([
         "cargo", "metadata", "--no-deps", "--offline", "--format-version", "1",
@@ -558,13 +635,15 @@ def refuse_large_files(root):
                         "remove them from the commits that add them): " + ", ".join(sorted(set(large))[:5]))
 
 
-def gates(root, paths, lease):
+def gates(root, paths, lease, cargo=True):
     refuse_large_files(root)
     run(["git", "diff", "--check", "origin/develop...HEAD"], root)
     # The CI test-behaviour suite (about a minute); its last lines name failures.
     run(["./scripts/test-behaviour.sh"], root)
     # The CI source-gate checks, from the same list CI runs.
     run(["./scripts/test-source-gate.sh"], root)
+    if not cargo:
+        return
     workspaces = touched_workspaces(root, paths, lease)
     formats = {root / "elastos", root / "capsules/chain-provider", *workspaces}
     for workspace in sorted(formats):
@@ -591,6 +670,12 @@ def interrupted(signum, frame):
 
 def main():
     global GIT_LOCAL_ENV_VARS, PRIVATE_BUILD_DIR
+    if sys.argv[1:] == ["--receipt"]:
+        root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
+        common = Path(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        receipt = linux_receipt(root, common, git(root, "rev-parse", "HEAD"))
+        print("receipt=" + (receipt or "none"), flush=True)
+        sys.exit(0 if receipt else 1)
     if len(sys.argv) not in {1, 3}:
         raise GateError("use this gate directly, or pass Git's remote name and URL")
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
@@ -621,7 +706,9 @@ def main():
           flush=True)
     with acquire_lease(common, candidate) as lease:
         paths = paths_from_git(root, "diff", "--name-only", "-z", "--no-renames", develop + "...HEAD")
-        gates(root, paths, lease)
+        cargo, reason = gate_mode(root, common, candidate[1], develop, paths)
+        print("gate-mode={}: {}".format("full" if cargo else "receipt", reason), flush=True)
+        gates(root, paths, lease, cargo)
         if snapshot(root) != candidate:
             raise GateError("source or HEAD changed during checks; check the new candidate")
         if current_develop(root, candidate[1]) != develop:

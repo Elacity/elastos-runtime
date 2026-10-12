@@ -45,6 +45,7 @@ class PrepushTests(unittest.TestCase):
         self.env = {**fixture_environment(self.tmp),
                     "PREPUSH_ROOT": str(self.root), "PREPUSH_LOG": str(self.log)}
         self.env.pop("CARGO_BUILD_BUILD_DIR", None)
+        self.env.pop("ELASTOS_PREPUSH_IGNORE_RECEIPT", None)  # set on the Linux box that runs these fixtures
         self.git("init", "-q", "-b", "develop")
         subprocess.run(["git", "init", "-q", "--bare", str(self.origin)], check=True, env=self.env)
         self.write("elastos/Cargo.toml", "[workspace]\n")
@@ -346,6 +347,111 @@ class PrepushTests(unittest.TestCase):
                 self.git("reset", "-q", "--hard", original)
                 self.git("branch", "-f", "develop", develop)
                 self.git("push", "-q", "-f", "origin", "develop")
+
+    def write_receipt(self, commit=None, **fields):
+        commit = commit or self.git("rev-parse", "HEAD")
+        folder = self.root / ".git/prepush-receipts"
+        folder.mkdir(exist_ok=True)
+        receipt = {"commit": commit, "result": "PASS", "full": True, **fields}
+        (folder / (commit + ".json")).write_text(json.dumps({k: v for k, v in receipt.items() if v is not None}))
+        return commit
+
+    def merge_develop(self, files):
+        self.advance_develop(files)
+        self.git("merge", "-q", "--no-edit", "develop")
+
+    def receipt_query(self):
+        return subprocess.run([sys.executable, str(SCRIPT.with_suffix(".py")), "--receipt"], cwd=self.root,
+                              env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def assert_mode(self, result, mode, reason):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("gate-mode=" + mode + ": " + reason, result.stdout)
+        cargo = [c for c in self.commands() if c["tool"] == "cargo"]
+        if mode == "receipt":
+            self.assertEqual(cargo, [])
+        else:
+            self.assertIn(["fmt", "--all", "--", "--check"], [c["args"] for c in cargo])
+        # The fast checks run in both modes.
+        self.assertTrue(any(c["tool"] == "node" and "--test" in c["args"] for c in self.commands()))
+
+    def test_receipt_for_head_skips_cargo(self):
+        head = self.write_receipt()
+        self.assert_mode(self.invoke(self.push_line()), "receipt", "receipt " + head + " for HEAD")
+
+    def test_receipt_for_ancestor_survives_a_develop_merge_without_rust(self):
+        receipt = self.write_receipt()
+        self.merge_develop({"README.md": "develop moved\n"})
+        self.assertNotEqual(self.git("rev-parse", "HEAD"), receipt)
+        self.assert_mode(self.invoke(self.push_line()), "receipt",
+                         "receipt " + receipt + " for an ancestor; no Rust/Cargo change since")
+        query = self.receipt_query()
+        self.assertEqual((query.returncode, query.stdout.splitlines()[-1]), (0, "receipt=" + receipt))
+
+    def test_rust_or_cargo_change_since_the_receipt_runs_the_full_gate(self):
+        for change in ({"develop": {"elastos/crates/common/src/lib.rs": "// develop moved\n"}},
+                       {"branch": {"elastos/crates/server/Cargo.toml": '[package]\nname = "server"\n# edited\n'}}):
+            with self.subTest(change=change):
+                original, develop = self.git("rev-parse", "HEAD"), self.git("rev-parse", "develop")
+                self.log.unlink(missing_ok=True)
+                self.write_receipt()
+                if "develop" in change:
+                    self.merge_develop(change["develop"])
+                else:
+                    for path, text in change["branch"].items():
+                        self.write(path, text)
+                    self.commit()
+                self.assert_mode(self.invoke(self.push_line()), "full", "no full Linux PASS receipt")
+                self.assertEqual(self.receipt_query().returncode, 1)
+                self.git("reset", "-q", "--hard", original)
+                self.git("branch", "-f", "develop", develop)
+                self.git("push", "-q", "-f", "origin", "develop")
+
+    def test_failed_partial_or_ignored_receipt_runs_the_full_gate(self):
+        for fields, extra in (({"result": "FAIL"}, {}), ({"full": False}, {}), ({"full": None}, {}),
+                              ({}, {"ELASTOS_PREPUSH_IGNORE_RECEIPT": "1"})):
+            with self.subTest(fields=fields, extra=extra):
+                self.log.unlink(missing_ok=True)
+                self.write_receipt(**fields)
+                reason = "ELASTOS_PREPUSH_IGNORE_RECEIPT=1" if extra else "no full Linux PASS receipt"
+                self.assert_mode(self.invoke(self.push_line(), extra), "full", reason)
+
+    def test_missing_receipt_runs_the_full_gate(self):
+        # No receipt at all, then only a receipt for develop: the branch's Rust change is newer.
+        for receipts in ([], [self.git("rev-parse", "develop")]):
+            with self.subTest(receipts=receipts):
+                self.log.unlink(missing_ok=True)
+                for commit in receipts:
+                    self.write_receipt(commit)
+                self.assert_mode(self.invoke(self.push_line()), "full", "no full Linux PASS receipt")
+
+    def test_macos_specific_change_runs_the_full_gate_despite_a_receipt(self):
+        macos_cfg, apple_cfg = '#[cfg(target_os = "macos")]', '#[cfg(any(unix, target_vendor = "apple"))]'
+        cases = [({path: "fixture\n"}, path) for path in (
+            "elastos/crates/elastos-vz/notes.txt", "tools/menu/Bridge.swift", "tools/menu/Bridge.m",
+            "tools/menu/Bridge.mm", "tools/menu/Info.plist", "tools/menu/app.entitlements",
+            "scripts/install-darwin.sh", "docs/MacOS-notes.md")]
+        cases += [({"elastos/crates/server/src/release_cmd.rs": cfg + "\nfn menu() {}\n"},
+                   "elastos/crates/server/src/release_cmd.rs: " + cfg) for cfg in (macos_cfg, apple_cfg)]
+        for files, reason in cases:
+            with self.subTest(reason=reason):
+                original = self.git("rev-parse", "HEAD")
+                self.log.unlink(missing_ok=True)
+                for path, text in files.items():
+                    self.write(path, text)
+                self.commit()
+                head = self.write_receipt()
+                self.assert_mode(self.invoke(self.push_line()), "full",
+                                 "macOS-specific change " + reason + " (receipt " + head + " covers Linux only)")
+                self.git("reset", "-q", "--hard", original)
+        # Removing a macOS cfg line that develop has is a macOS change too.
+        self.merge_develop({"elastos/crates/common/src/lib.rs": macos_cfg + "\nfn menu() {}\n"})
+        self.log.unlink(missing_ok=True)
+        self.write("elastos/crates/common/src/lib.rs", "fn menu() {}\n")
+        self.commit()
+        head = self.write_receipt()
+        self.assert_mode(self.invoke(self.push_line()), "full", "macOS-specific change "
+                         "elastos/crates/common/src/lib.rs: " + macos_cfg + " (receipt " + head + " covers Linux only)")
 
     def test_zero_and_ignored_tests_fail_and_first_cargo_failure_stops(self):
         for extra, message in (({"PREPUSH_NO_TESTS": "1"}, "zero unit tests"),

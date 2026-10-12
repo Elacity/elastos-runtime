@@ -55,6 +55,23 @@ the push. The gate skips `cargo clean -p` for repository packages only when
 `CARGO_BUILD_BUILD_DIR` lies inside this worktree, and keeps it for the shared
 default `target-build` beside the common Git directory.
 
+Every push runs the large-file history check, `git diff --check`, the behaviour
+suite and `scripts/test-source-gate.sh` first. The Cargo steps below then run
+only in full mode. Receipt mode skips them when
+`<git common dir>/prepush-receipts/<commit>.json` holds a full Linux PASS
+(`"result": "PASS"`, `"full": true`, written by `elastos-remote-check --full`)
+for HEAD, or for an ancestor of HEAD with no Rust or Cargo input changed since
+(`*.rs`, `Cargo.toml`, `Cargo.lock`, `.cargo/`, `rust-toolchain`), so a develop
+merge without Rust keeps the receipt. The Linux box never compiles macOS code,
+so a branch that changes any of it since origin/develop runs full mode: paths
+under `elastos-vz/`, `*.swift`, `*.m`, `*.mm`, `Info.plist`, entitlements,
+paths naming darwin or macOS, and added or removed Rust/Cargo lines naming
+`target_os = "macos"` or `target_vendor = "apple"`. The gate prints one
+`gate-mode=` line naming the receipt or the change that forced full mode.
+`ELASTOS_PREPUSH_IGNORE_RECEIPT=1` (set on the Linux box) forces full mode.
+`scripts/ci-local-prepush.py --receipt` prints the qualifying receipt and exits
+0, or exits 1 when none qualifies, so the push queue applies the same rule.
+
 The gate runs the product-data checks, `cargo fmt --all -- --check` for Runtime,
 chain-provider and checked workspaces, then `cargo check --workspace
 --all-targets` for Runtime, touched standalone workspaces and related consumers.

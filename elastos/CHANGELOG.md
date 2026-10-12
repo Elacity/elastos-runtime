@@ -8,6 +8,11 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Developer detail
 
+- The local pre-push gate skips its Mac Cargo fmt, check, Clippy and unit
+  tests when a full Linux `elastos-remote-check` PASS covers HEAD (or an
+  ancestor with no Rust or Cargo change since) and the branch changes no
+  macOS-specific code; it still runs the fast checks and prints which mode ran
+  and why.
 - CI's `release-upstream-assets` job runs the release's upstream asset build
   (`scripts/release-upstream-assets.py`, including the Browser helper source
   builds) for Linux ARM64 and Apple Silicon on every pull request that changes
