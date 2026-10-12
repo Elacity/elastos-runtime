@@ -3230,6 +3230,49 @@ mod tests {
         }
     }
 
+    /// A release whose Home profile drops an installed component (protected
+    /// content left Home) installs normally and keeps that component.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_update_keeps_a_component_the_home_profile_dropped() {
+        use sha2::Digest;
+        let provider = b"installed provider".to_vec();
+        let components = |profile: &[&str]| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema":"elastos.components/v1", "capsules":{},
+                "profiles":{"home":{"components":profile}},
+                "external":{"fixture-provider":{"install_path":"bin/fixture-provider","platforms":{"*":{
+                    "release_path":"fixture-provider","cid":raw_cid(&provider),
+                    "checksum":format!("sha256:{}", hex::encode(sha2::Sha256::digest(&provider))),
+                    "size":provider.len()}}}}
+            }))
+            .unwrap()
+        };
+        let (_fixture, data, binary, source) =
+            default_apply_fixture(&components(&["fixture-provider"]));
+        std::fs::create_dir_all(data.join("bin")).unwrap();
+        std::fs::write(data.join("bin/fixture-provider"), &provider).unwrap();
+        apply_signed_fixture_with_mode(
+            &data,
+            &source,
+            b"#!/bin/sh\nprintf 'elastos 0.7.1\\n'\n",
+            &components(&[]),
+            ApplyMode::Normal,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(data.join("components.json")).unwrap(),
+            components(&[])
+        );
+        assert_eq!(
+            std::fs::read(data.join("bin/fixture-provider")).unwrap(),
+            provider
+        );
+        admit_installed(&data, &binary);
+        assert!(!InstallTransaction::has_pending_recovery(&binary));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn component_admission_refuses_before_replacing_owner_files() {
