@@ -26,6 +26,12 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   `elacity-player`, `media-tools`, `media-provider` and the protected-content
   protect and decrypt providers; they still publish and install with
   `elastos setup --with <name>`, and updates keep copies already installed.
+- `elastos source add` no longer takes `--discovery-uri` or `--ipns-name`, and
+  `elastos source show` no longer prints them; the Runtime never used either to
+  find updates. A release approval's `delivery` is now exactly `MAINTAINER_DID`,
+  `PUBLISHER_GATEWAY`, `PUBLISHER_NODE_ID` and `SOURCE_CONNECT_TICKET`: the
+  signer refuses one that still has `IPNS_NAME`, and the installer has no
+  `IPNS_NAME` or `HEAD_CID` stamp (#89).
 
 ## [0.8.0-alpha.15]
 
