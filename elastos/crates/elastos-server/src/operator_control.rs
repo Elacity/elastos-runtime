@@ -739,15 +739,15 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
     });
 
     let carrier_for_discovery = session.client.clone();
-    let try_p2p: crate::update::TryP2pFn = Box::new(move |source, _publisher_did| {
+    let discover_head: crate::update::DiscoverHeadFn = Box::new(move |source, _publisher_did| {
         let client = carrier_for_discovery.clone();
-        Box::pin(async move { try_operator_p2p_discovery(&client, &source).await })
+        Box::pin(async move { discover_operator_release_head(&client, &source).await })
     });
 
     let result = crate::update::run_update_for_data_dir_in_context(
         data_dir,
         &fetch_fn,
-        Some(&try_p2p),
+        Some(&discover_head),
         false,
         None,
         env!("ELASTOS_VERSION"),
@@ -758,7 +758,7 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
     )
     .await;
     drop(fetch_fn);
-    drop(try_p2p);
+    drop(discover_head);
     let drained = session.finish().await;
     result.and(drained)?;
 
@@ -1095,7 +1095,7 @@ fn normalized_channel(source: &TrustedSource) -> String {
     }
 }
 
-async fn try_operator_p2p_discovery(
+async fn discover_operator_release_head(
     client: &crate::carrier::CarrierClient,
     source: &TrustedSource,
 ) -> Result<Option<crate::update::DiscoveredHead>> {

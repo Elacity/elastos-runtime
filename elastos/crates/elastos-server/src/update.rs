@@ -34,9 +34,9 @@ pub(crate) fn on_heap<F: Future>(build: impl FnOnce() -> F) -> Pin<Box<F>> {
     Box::pin(build())
 }
 
-/// Async callback for attempting P2P release discovery.
+/// Async callback that discovers the signed release head over Carrier.
 /// An unavailable connection returns None; discovery errors remain terminal.
-pub type TryP2pFn = Box<
+pub type DiscoverHeadFn = Box<
     dyn Fn(
             TrustedSource,
             String,
@@ -568,7 +568,7 @@ fn ensure_recorded_install_path(
 pub async fn run_update_for_data_dir(
     data_dir: &Path,
     fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
+    discover_head: Option<&DiscoverHeadFn>,
     check_only: bool,
     head_cid_override: Option<String>,
     version: &str,
@@ -579,7 +579,7 @@ pub async fn run_update_for_data_dir(
     run_update_for_data_dir_in_context(
         data_dir,
         fetch_fn,
-        try_p2p_fn,
+        discover_head,
         check_only,
         head_cid_override,
         version,
@@ -595,7 +595,7 @@ pub async fn run_update_for_data_dir(
 pub(crate) async fn run_update_for_data_dir_in_context(
     data_dir: &Path,
     fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
+    discover_head: Option<&DiscoverHeadFn>,
     check_only: bool,
     head_cid_override: Option<String>,
     version: &str,
@@ -607,7 +607,7 @@ pub(crate) async fn run_update_for_data_dir_in_context(
     run_update_for_data_dir_with_mode(
         data_dir,
         fetch_fn,
-        try_p2p_fn,
+        discover_head,
         check_only,
         head_cid_override,
         version,
@@ -725,7 +725,7 @@ pub(crate) async fn run_restarting_update(
 async fn run_update_for_data_dir_with_mode(
     data_dir: &Path,
     fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
+    discover_head: Option<&DiscoverHeadFn>,
     check_only: bool,
     head_cid_override: Option<String>,
     version: &str,
@@ -739,7 +739,7 @@ async fn run_update_for_data_dir_with_mode(
         run_update_with_restart(
             data_dir,
             fetch_fn,
-            try_p2p_fn,
+            discover_head,
             check_only,
             head_cid_override,
             version,
@@ -758,7 +758,7 @@ async fn run_update_for_data_dir_with_mode(
 async fn run_update_with_restart(
     data_dir: &Path,
     fetch_fn: &FetchFn,
-    try_p2p_fn: Option<&TryP2pFn>,
+    discover_head: Option<&DiscoverHeadFn>,
     check_only: bool,
     head_cid_override: Option<String>,
     version: &str,
@@ -819,14 +819,14 @@ async fn run_update_with_restart(
     } else {
         // Discover the signed head over Carrier.
         let mut resolved: Option<&str> = None;
-        if let Some(p2p_fn) = try_p2p_fn {
+        if let Some(discover) = discover_head {
             println!("  Checking for updates...");
             if !source.connect_ticket.is_empty() {
                 println!("  Bootstrap: direct publisher ticket configured");
             }
             resolved = match tokio::time::timeout(
                 std::time::Duration::from_secs(20),
-                p2p_fn(source.clone(), primary_publisher.clone()),
+                discover(source.clone(), primary_publisher.clone()),
             )
             .await
             {
@@ -881,7 +881,7 @@ async fn run_update_with_restart(
     let release_object_cid = optional_release_object_cid(&head)?;
 
     on_heap(|| {
-        run_upgrade_with_restart(
+        apply_verified_head(
             fetch_fn,
             &head,
             &head_bytes,
@@ -946,7 +946,7 @@ pub(crate) fn verify_release_binding(
 /// Execute upgrade from a verified release head.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
-async fn run_upgrade_from_head(
+async fn apply_verified_head_without_restart(
     fetch_fn: &FetchFn,
     head: &serde_json::Value,
     head_bytes: &[u8],
@@ -964,7 +964,7 @@ async fn run_upgrade_from_head(
     carrier_context: crate::setup::FirstPartyCarrierContext,
     apply_mode: ApplyMode,
 ) -> anyhow::Result<()> {
-    run_upgrade_with_restart(
+    apply_verified_head(
         fetch_fn,
         head,
         head_bytes,
@@ -988,7 +988,7 @@ async fn run_upgrade_from_head(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_upgrade_with_restart(
+async fn apply_verified_head(
     fetch_fn: &FetchFn,
     head: &serde_json::Value,
     head_bytes: &[u8],
@@ -2217,7 +2217,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let discovery: TryP2pFn =
+        let discovery: DiscoverHeadFn =
             Box::new(move |_, _| Box::pin(std::future::ready(Ok(Some(discovered.clone())))));
         for installed in ["0.7.0", "0.7.2"] {
             let data = tempfile::tempdir().unwrap();
@@ -2284,7 +2284,7 @@ mod tests {
         let mut sources = crate::sources::TrustedSourcesConfig::empty();
         sources.upsert_source(source);
         save_trusted_sources(data.path(), &sources).unwrap();
-        let discovery: TryP2pFn = Box::new(move |source, _| {
+        let discovery: DiscoverHeadFn = Box::new(move |source, _| {
             let announcement = announcement.clone();
             let bytes = release.clone();
             Box::pin(async move {
@@ -2470,7 +2470,7 @@ mod tests {
             Box::pin(async move { Ok(bytes) })
         });
         let data = tempfile::tempdir().unwrap();
-        let result = run_upgrade_from_head(
+        let result = apply_verified_head_without_restart(
             &fetch,
             &head,
             &head_bytes,
@@ -2493,7 +2493,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("older than installed"));
-        run_upgrade_from_head(
+        apply_verified_head_without_restart(
             &fetch,
             &head,
             &head_bytes,
@@ -2548,7 +2548,7 @@ mod tests {
             Box::pin(async move { Ok(bytes) })
         });
         let data = tempfile::tempdir().unwrap();
-        let err = run_upgrade_from_head(
+        let err = apply_verified_head_without_restart(
             &fetch,
             &head,
             &head_bytes,
@@ -2684,7 +2684,7 @@ mod tests {
                     })
                 });
                 let data = tempfile::tempdir().unwrap();
-                let result = run_upgrade_from_head(
+                let result = apply_verified_head_without_restart(
                     &fetch,
                     &verified_head,
                     &head_bytes,
