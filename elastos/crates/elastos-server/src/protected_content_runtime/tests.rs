@@ -3757,10 +3757,16 @@ fn media_parent_accepts_root_sticky_and_never_advises_changing_root_dirs() {
 
     let root_open = media_parent_refusal(0, 0o40777, me, path).unwrap();
     assert!(root_open.contains("under your own home"), "{root_open}");
-    assert!(!root_open.contains("chmod") && !root_open.contains("chown"), "{root_open}");
+    assert!(
+        !root_open.contains("chmod") && !root_open.contains("chown"),
+        "{root_open}"
+    );
 
     let own_open = media_parent_refusal(me, 0o40777, me, path).unwrap();
-    assert!(own_open.contains("fix with: chmod go-w '/private/tmp'"), "{own_open}");
+    assert!(
+        own_open.contains("fix with: chmod go-w '/private/tmp'"),
+        "{own_open}"
+    );
     // A sticky directory owned by a user still lets that user replace entries.
     let own_sticky = media_parent_refusal(me, 0o41777, me, path).unwrap();
     assert!(own_sticky.contains("chmod go-w"), "{own_sticky}");
