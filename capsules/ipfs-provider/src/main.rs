@@ -2270,8 +2270,7 @@ fn write_private_file_atomically(path: &Path, data: &[u8]) -> io::Result<()> {
 
 fn random_hex(bytes: usize) -> io::Result<String> {
     let mut buffer = vec![0u8; bytes];
-    getrandom::getrandom(&mut buffer)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    getrandom::getrandom(&mut buffer).map_err(|err| io::Error::other(err.to_string()))?;
     Ok(buffer.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
@@ -4589,7 +4588,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 shared,
-                [published.clone()],
+                std::slice::from_ref(&published),
                 "only the shared root is announced"
             );
 
