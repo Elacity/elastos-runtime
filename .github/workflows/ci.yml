@@ -521,6 +521,98 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # The release's Browser helper source builds (scripts/release-upstream-assets.py)
+  # otherwise run only in release-package.yml. Pull requests that change one of
+  # their inputs run them here; merge groups and workflow_dispatch always do.
+  release-upstream-paths:
+    name: release-upstream-paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # dorny/paths-filter reads a pull request's changed files from the API.
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || steps.filter.outputs.upstream == 'true' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: detect release upstream input changes
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        with:
+          # scripts/ci-release-policy-test.py requires every repository input
+          # the build calls, loads or packages to match this filter.
+          filters: |
+            upstream:
+              - '.github/workflows/ci.yml'
+              - 'scripts/release-host-prerequisites.sh'
+              - 'scripts/release-upstream-assets.py'
+              - 'scripts/release-upstream-input.py'
+              - 'scripts/release-upstream-recipes.json'
+              - 'scripts/browser-upstream-build.py'
+              - 'scripts/build/licenses/libcap-LICENSE.txt'
+
+  # The release command for each platform with Browser helper source builds,
+  # with release-package.yml's toolchain, targets and host packages. Linux ARM64
+  # packages the pinned engine this run's engine-llama-arm64 job provides.
+  release-upstream-assets:
+    name: release-upstream-assets (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    needs: [release-upstream-paths, engine-llama-arm64]
+    if: needs.release-upstream-paths.outputs.run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            host: linux
+            target: aarch64-unknown-linux-musl
+          - os: macos-14
+            platform: darwin-arm64
+            host: darwin
+            target: aarch64-apple-darwin
+    env:
+      UPSTREAM_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
+        with:
+          targets: wasm32-unknown-unknown,${{ matrix.target }}
+      - name: install release host prerequisites
+        timeout-minutes: 20
+        run: bash scripts/release-host-prerequisites.sh "${{ matrix.host }}"
+      - name: download pinned ARM64 engine input
+        if: matrix.platform == 'linux-arm64'
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: llama-arm64-bundle
+          path: ${{ runner.temp }}/llama-arm64-bundle
+      - name: build the release upstream assets
+        timeout-minutes: 75
+        run: |
+          set -euo pipefail
+          # The release build step's umask, isolated HOME, Cargo and rustup.
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          install -d -m 700 "$RUNNER_TEMP/upstream-home"
+          bundle=()
+          [[ "$UPSTREAM_PLATFORM" != linux-arm64 ]] \
+            || bundle=(--llama-arm64-bundle "$RUNNER_TEMP/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz")
+          HOME="$RUNNER_TEMP/upstream-home" python3 scripts/release-upstream-assets.py --platform "$UPSTREAM_PLATFORM" \
+            --cache "$RUNNER_TEMP/upstream-cache" --output "$RUNNER_TEMP/upstream-assets" ${bundle[@]+"${bundle[@]}"} \
+            > "$RUNNER_TEMP/upstream-assets.json"
+          # prepare-release-platform.sh merges this stdout with jq; it must be one JSON document.
+          jq -e '.external | length > 0' "$RUNNER_TEMP/upstream-assets.json" > /dev/null
+
   # The source-home jobs run after the cheap source gate, in parallel
   # with tests across the three architectures. setup-source-home compiles the
   # runtime, shell, home-cli and every provider in --release; ARM also
