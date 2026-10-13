@@ -1472,35 +1472,44 @@ impl Supervisor {
 
     /// Download an external tool (kubo, cloudflared, etc.) by name.
     async fn download_external(&self, name: &str, platform: &str) -> Result<PathBuf> {
-        let component = self
-            .registry
-            .external
-            .get(name)
-            .with_context(|| format!("external component '{name}' not in registry"))?;
-
-        let platform_info = component
-            .platforms
-            .get(platform)
-            .or_else(|| component.platforms.get("*"))
-            .with_context(|| format!("no platform '{platform}' for '{name}'"))?;
-
-        let install_path = platform_info
-            .install_path
-            .as_deref()
-            .or(component.install_path.as_deref())
-            .with_context(|| format!("no install_path for '{name}'"))?;
-
-        let dest = self.data_dir.join(install_path);
+        let row =
+            |registry: &'_ ComponentsManifest| -> Result<(crate::setup::PlatformInfo, PathBuf)> {
+                let component = registry
+                    .external
+                    .get(name)
+                    .with_context(|| format!("external component '{name}' not in registry"))?;
+                let platform_info = component
+                    .platforms
+                    .get(platform)
+                    .or_else(|| component.platforms.get("*"))
+                    .with_context(|| format!("no platform '{platform}' for '{name}'"))?;
+                let install_path = platform_info
+                    .install_path
+                    .as_deref()
+                    .or(component.install_path.as_deref())
+                    .with_context(|| format!("no install_path for '{name}'"))?;
+                Ok((platform_info.clone(), self.data_dir.join(install_path)))
+            };
 
         // Already installed?
+        let (_, dest) = row(&self.registry)?;
         if dest.is_file() {
             return Ok(dest);
         }
 
+        // On a Home with a signed release, the row comes from that release after
+        // its capsule records are admitted, and the writer is held until it is written.
+        let admitted = crate::setup::admit_installed_components(
+            &self.data_dir,
+            crate::setup::FirstPartyCarrierContext::Runtime,
+        )?;
+        let (platform_info, dest) = row(admitted
+            .as_ref()
+            .map_or(&self.registry, |admitted| &admitted.manifest))?;
         crate::setup::install_first_party_component_via_carrier(
             &self.data_dir,
             name,
-            platform_info,
+            &platform_info,
             &dest,
             crate::setup::FirstPartyCarrierContext::Runtime,
         )

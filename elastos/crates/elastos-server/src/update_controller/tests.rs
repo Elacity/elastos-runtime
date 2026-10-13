@@ -3777,7 +3777,12 @@ async fn home_launch_and_browser_paths_refuse_a_release_whose_record_differs_bef
         "{error:#}"
     );
     // The shared check the Browser helper and image downloads run first.
-    let error = crate::setup::admit_installed_capsule_records(&fixture.data).unwrap_err();
+    let error = crate::setup::admit_installed_components(
+        &fixture.data,
+        crate::setup::FirstPartyCarrierContext::Runtime,
+    )
+    .err()
+    .expect("a differing record is refused");
     assert!(error
         .to_string()
         .contains("differs from the release components"));
@@ -3788,10 +3793,17 @@ async fn home_launch_and_browser_paths_refuse_a_release_whose_record_differs_bef
         &components,
         json!({"capsule_records":[record(app.len())]}),
     );
-    assert_eq!(
-        crate::setup::admit_installed_capsule_records(&fixture.data).unwrap(),
-        Some(components)
-    );
+    let admitted = crate::setup::admit_installed_components(
+        &fixture.data,
+        crate::setup::FirstPartyCarrierContext::Runtime,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(admitted.bytes, components);
+    // A Runtime admission holds the installation writer until it is dropped.
+    assert!(crate::install_transaction::acquire_installed_writer(&fixture.data).is_err());
+    drop(admitted);
+    assert!(crate::install_transaction::acquire_installed_writer(&fixture.data).is_ok());
 }
 
 #[tokio::test]

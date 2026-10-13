@@ -1264,32 +1264,67 @@ async fn ensure_browser_vm_image_in_context(
         )
     })
     .await??;
-    let Some(info) = pending else {
+    let Some(pending) = pending else {
         return Ok(());
     };
-    admit_installed_capsule_records(data_dir)?;
+    // The image row comes from the admitted release, not the earlier read; a
+    // Runtime caller holds the writer until the image is written.
+    let platform = detect_platform();
+    let admitted = admit_installed_components(data_dir, context)?;
+    let info = match &admitted {
+        Some(admitted) => {
+            let info = browser_vm_image::component_info(&admitted.manifest, &platform)?;
+            if browser_vm_image::verify_installed(data_dir, info, &platform).is_ok() {
+                return Ok(());
+            }
+            info.clone()
+        }
+        None => pending,
+    };
     let dest = data_dir.join(browser_vm_image::INSTALL_PATH);
     download_component(data_dir, browser_vm_image::NAME, &info, &dest, context).await
 }
 
-/// Before a capsule of this Home's installed signed release is written: every
-/// record the release lists verifies against the publisher DIDs and matches the
-/// installed signed components, row for row. Returns those components; `None`
-/// for a Home without a signed release (a source or CI Home).
-pub(crate) fn admit_installed_capsule_records(data_dir: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+/// The installed signed release's components after every capsule record it lists
+/// verified against the publisher DIDs and matched its row. Downloads take their
+/// rows from `manifest`. A Runtime caller holds the installation writer from
+/// admission until this value is dropped; setup already holds it.
+pub(crate) struct AdmittedComponents {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) manifest: ComponentsManifest,
+    _writer: Option<crate::install_transaction::InstallationGuard>,
+}
+
+/// `None` for a Home without a signed release (a source or CI Home).
+pub(crate) fn admit_installed_components(
+    data_dir: &Path,
+    context: FirstPartyCarrierContext,
+) -> anyhow::Result<Option<AdmittedComponents>> {
     let Some(source) = installed_release_source(data_dir)? else {
         return Ok(None);
     };
+    let writer = match context {
+        FirstPartyCarrierContext::Runtime => Some(
+            crate::install_transaction::acquire_installed_writer(data_dir)?.ok_or_else(|| {
+                anyhow::anyhow!("capsule acquisition requires its installation writer")
+            })?,
+        ),
+        FirstPartyCarrierContext::Setup => None,
+    };
     let binary = fs::canonicalize(&source.install_path)?;
-    let (release, components) =
+    let (release, bytes) =
         crate::installed_release::read_signed_release(data_dir, &binary, &source, false)?;
-    let manifest: ComponentsManifest = serde_json::from_slice(&components)?;
+    let manifest: ComponentsManifest = serde_json::from_slice(&bytes)?;
     let records = crate::capsule_record::CapsuleRecords::from_release(
         &release["payload"],
         &source.publisher_dids,
     )?;
     crate::capsule_record::admit_components(records.as_ref(), &manifest)?;
-    Ok(Some(components))
+    Ok(Some(AdmittedComponents {
+        bytes,
+        manifest,
+        _writer: writer,
+    }))
 }
 
 pub(crate) async fn ensure_capsule_component_for_home_launch(
@@ -1361,8 +1396,13 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
     if platform_info.strategy.as_deref() == Some("local-copy") {
         anyhow::bail!("capsule component '{name}' uses local-copy and cannot be JIT materialized");
     }
+    // The row comes from the admitted bytes; the writer keeps them installed
+    // until this capsule is written.
+    let admitted = admit_installed_components(data_dir, FirstPartyCarrierContext::Runtime)?;
     anyhow::ensure!(
-        admit_installed_capsule_records(data_dir)?.is_none_or(|signed| signed == manifest_bytes),
+        admitted
+            .as_ref()
+            .is_none_or(|admitted| admitted.bytes == manifest_bytes),
         "installed components differ from the signed release; run the installer again"
     );
 
@@ -1376,6 +1416,7 @@ pub(crate) async fn ensure_capsule_component_for_home_launch(
     )
     .await?;
     write_cache_metadata(&manifest, Some(platform_info), &platform, name, &dest)?;
+    drop(admitted);
 
     let installed_manifest = dest.join("capsule.json");
     let manifest_bytes = fs::read(&installed_manifest).map_err(|err| {
@@ -2402,6 +2443,15 @@ pub(crate) async fn ensure_local_model_engine(
                 ["components"],
             &hex::encode(sha2::Sha256::digest(manifest_bytes)),
             manifest_bytes.len() as u64,
+        )?;
+        // The engine row, like every row, has exactly its signed capsule record.
+        crate::capsule_record::admit_components(
+            crate::capsule_record::CapsuleRecords::from_release(
+                &release["payload"],
+                &source.publisher_dids,
+            )?
+            .as_ref(),
+            &manifest,
         )?;
         Some((source, binary, admitted))
     } else {
@@ -8658,6 +8708,37 @@ pub(crate) mod tests {
             components["external"]["llama-server"]["platforms"][&platform]["strategy"] =
                 serde_json::json!(fault);
         }
+        // A release listing records binds the row's CID, as every signed release does.
+        let records_listed = fault.starts_with("record-");
+        if records_listed {
+            components["external"]["llama-server"]["platforms"][&platform]["cid"] =
+                serde_json::json!(catalog_head_cid(&bytes).unwrap());
+        }
+        let publisher = ed25519_dalek::SigningKey::from_bytes(&[217; 32]);
+        let record = |key: &ed25519_dalek::SigningKey, size: usize| {
+            crate::capsule_record::signed_record(
+                key,
+                serde_json::json!({"schema":"elastos.capsule.record/v1", "name":"llama-server",
+                    "platform":platform, "capsule_version":"fixture",
+                    "sha256":format!("{:x}", sha2::Sha256::digest(&bytes)), "size":size,
+                    "cid":catalog_head_cid(&bytes).unwrap(), "release_path":"llama-fixture.tar.gz",
+                    "signer_did":crate::crypto::encode_signing_key_did(key)}),
+            )
+        };
+        let capsule_records = match fault {
+            "record-size" => serde_json::json!([record(&publisher, bytes.len() + 1)]),
+            "record-missing" => serde_json::json!([]),
+            "record-signer" => serde_json::json!([record(
+                &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+                bytes.len()
+            )]),
+            "record-forged" => {
+                let mut forged = record(&publisher, bytes.len());
+                forged["payload"]["size"] = serde_json::json!(bytes.len() + 1);
+                serde_json::json!([forged])
+            }
+            _ => serde_json::Value::Null,
+        };
         let mut components = serde_json::to_vec(&components).unwrap();
         let binary = data.join("elastos");
         fs::write(&binary, b"signed fixture runtime").unwrap();
@@ -8667,17 +8748,17 @@ pub(crate) mod tests {
                 "sha256":hex::encode(sha2::Sha256::digest(bytes)), "size":bytes.len()
             })
         };
-        let release = signed_setup_fixture_envelope(
-            serde_json::json!({
-                "schema":"elastos.release/v1", "version":"0.7.1", "channel":"stable",
-                "platforms":{(crate::update::detect_release_platform()):{
-                    "binary":descriptor(b"signed fixture runtime"),
-                    "components":descriptor(&components)
-                }}
-            }),
-            "elastos.release.v1",
-            217,
-        );
+        let mut release_payload = serde_json::json!({
+            "schema":"elastos.release/v1", "version":"0.7.1", "channel":"stable",
+            "platforms":{(crate::update::detect_release_platform()):{
+                "binary":descriptor(b"signed fixture runtime"),
+                "components":descriptor(&components)
+            }}
+        });
+        if records_listed {
+            release_payload["capsule_records"] = capsule_records;
+        }
+        let release = signed_setup_fixture_envelope(release_payload, "elastos.release.v1", 217);
         let head = signed_setup_fixture_envelope(
             serde_json::json!({
                 "schema":"elastos.release.head/v1", "version":"0.7.1", "channel":"stable",
@@ -8806,6 +8887,14 @@ pub(crate) mod tests {
             ),
             ("pending", "A signed update requires recovery", 0),
             ("tampered", "Checksum mismatch for llama-server", 1),
+            ("record-size", "differs from the release components", 0),
+            (
+                "record-missing",
+                "no signed capsule record for llama-server",
+                0,
+            ),
+            ("record-signer", "not signed by an accepted publisher", 0),
+            ("record-forged", "Capsule record signature refused", 0),
             (
                 "source-build",
                 "This source-checkout Home has no local AI engine",
@@ -8845,6 +8934,45 @@ pub(crate) mod tests {
             server.close().await;
             assert_eq!(serving.await.unwrap(), fetches, "{fault}");
         }
+    }
+
+    #[tokio::test]
+    async fn browser_helpers_download_only_rows_of_the_admitted_release() {
+        let root = tempfile::tempdir().unwrap();
+        // The installed signed release has no Browser host helpers.
+        fs::write(
+            root.path().join("components.json"),
+            br#"{"external":{},"profiles":{}}"#,
+        )
+        .unwrap();
+        let (server, serving, _bundle) = signed_engine_fixture(root.path(), "none").await;
+        let data = root.path().canonicalize().unwrap();
+        // A manifest read before an update finished still names an old helper.
+        let stale: ComponentsManifest = serde_json::from_value(serde_json::json!({
+            "schema":"elastos.components/v1", "capsules":{},
+            "profiles":{"browser-host":{"components":["helper"]}},
+            "external":{"helper":{"install_path":"bin/helper","platforms":{"darwin-arm64":{
+                "release_path":"llama-fixture.tar.gz", "install_path":"bin/helper",
+                "checksum":format!("sha256:{}", "a".repeat(64)), "size":1}}}}
+        }))
+        .unwrap();
+        let error = browser_config::ensure_host_components(
+            &data,
+            &stale,
+            "darwin-arm64",
+            FirstPartyCarrierContext::Runtime,
+        )
+        .await
+        .unwrap_err();
+        // Nothing of the stale row is fetched or written; only the first-selection
+        // notice remains, as for a release without helpers to install.
+        assert!(
+            error.to_string().contains("Close Home, run elastos setup"),
+            "{error:#}"
+        );
+        assert!(!data.join("bin/helper").exists());
+        server.close().await;
+        assert_eq!(serving.await.unwrap(), 0);
     }
 
     #[tokio::test]

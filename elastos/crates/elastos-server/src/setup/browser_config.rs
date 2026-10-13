@@ -24,10 +24,83 @@ pub(super) async fn ensure_host_components(
     if !local_vm_selected(data, platform)? {
         return configure(data, platform, false);
     }
-    let Some(profile) = manifest.profiles.get("browser-host") else {
+    let Some(rows) = host_rows(manifest, platform)? else {
         return Ok(()); // Source Homes and older releases own their existing helpers.
     };
-    let mut records_admitted = false;
+    if rows.iter().any(|row| row.missing(data)) {
+        // Downloads take their rows from the release admitted against its capsule
+        // records; a Runtime caller holds the writer until they are written.
+        let admitted = super::admit_installed_components(data, context)?;
+        let admitted_rows = match &admitted {
+            Some(admitted) => host_rows(&admitted.manifest, platform)?.unwrap_or_default(),
+            None => rows,
+        };
+        for row in &admitted_rows {
+            if row.missing(data) {
+                super::download_component(
+                    data,
+                    row.name,
+                    row.info,
+                    &data.join(row.relative),
+                    context,
+                )
+                .await?;
+            }
+            super::ensure_bundle_executable_link(data, row.name, row.info)?;
+        }
+    } else {
+        for row in &rows {
+            super::ensure_bundle_executable_link(data, row.name, row.info)?;
+        }
+    }
+    // Engine and Exit bridges load the owner's selection when Home starts.
+    // Setup publishes a first selection before that startup. A running Home
+    // can repair helper bytes, but needs setup/restart for its first selection.
+    if matches!(context, super::FirstPartyCarrierContext::Runtime) {
+        anyhow::ensure!(
+            data.join("config/browser-engine-adapter.json").exists()
+                || std::env::var_os("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG").is_some(),
+            "Browser helpers are ready. Close Home, run elastos setup, then start Home again."
+        );
+        return Ok(());
+    }
+    configure(
+        data,
+        platform,
+        manifest
+            .external
+            .contains_key(super::browser_vm_image::NAME),
+    )
+}
+
+/// One Browser host helper row of a release.
+#[derive(Clone, Copy)]
+struct HostRow<'a> {
+    name: &'a str,
+    component: &'a super::Component,
+    info: &'a super::PlatformInfo,
+    relative: &'a str,
+}
+
+impl HostRow<'_> {
+    fn missing(&self, data: &Path) -> bool {
+        !matches!(
+            super::component_install_state(data, self.component, Some(self.info)),
+            super::InstallState::Installed
+        ) || (self.info.extract_path.is_none() && !executable(&data.join(self.relative)))
+    }
+}
+
+/// The release's Browser host helpers for `platform`, each a prepared signed
+/// release artifact. `None` when the release has no `browser-host` profile.
+fn host_rows<'a>(
+    manifest: &'a super::ComponentsManifest,
+    platform: &str,
+) -> anyhow::Result<Option<Vec<HostRow<'a>>>> {
+    let Some(profile) = manifest.profiles.get("browser-host") else {
+        return Ok(None);
+    };
+    let mut rows = Vec::new();
     for name in &profile.components {
         let component = manifest
             .external
@@ -51,38 +124,14 @@ pub(super) async fn ensure_host_components(
                 .is_some_and(|p| !p.trim().is_empty()),
             "Browser host component '{name}' must come from the signed release"
         );
-        if !matches!(
-            super::component_install_state(data, component, Some(info)),
-            super::InstallState::Installed
-        ) || (info.extract_path.is_none() && !executable(&data.join(relative)))
-        {
-            // The release's capsule records are checked once, before the first write.
-            if !records_admitted {
-                super::admit_installed_capsule_records(data)?;
-                records_admitted = true;
-            }
-            super::download_component(data, name, info, &data.join(relative), context).await?;
-        }
-        super::ensure_bundle_executable_link(data, name, info)?;
+        rows.push(HostRow {
+            name,
+            component,
+            info,
+            relative,
+        });
     }
-    // Engine and Exit bridges load the owner's selection when Home starts.
-    // Setup publishes a first selection before that startup. A running Home
-    // can repair helper bytes, but needs setup/restart for its first selection.
-    if matches!(context, super::FirstPartyCarrierContext::Runtime) {
-        anyhow::ensure!(
-            data.join("config/browser-engine-adapter.json").exists()
-                || std::env::var_os("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG").is_some(),
-            "Browser helpers are ready. Close Home, run elastos setup, then start Home again."
-        );
-        return Ok(());
-    }
-    configure(
-        data,
-        platform,
-        manifest
-            .external
-            .contains_key(super::browser_vm_image::NAME),
-    )
+    Ok(Some(rows))
 }
 
 pub(super) fn local_vm_selected(data: &Path, platform: &str) -> anyhow::Result<bool> {
