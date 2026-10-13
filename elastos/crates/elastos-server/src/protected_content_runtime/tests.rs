@@ -3747,40 +3747,72 @@ fn write_chain_provider_config(data_dir: &Path, config: &Value) {
 
 #[cfg(unix)]
 #[test]
-fn media_parent_accepts_root_sticky_and_never_advises_changing_root_dirs() {
+fn media_parent_accepts_root_sticky_and_your_private_group_only() {
     use super::media_parent_refusal;
     let path = Path::new("/private/tmp");
-    let me = 501;
-    assert_eq!(media_parent_refusal(0, 0o41777, me, path), None);
-    assert_eq!(media_parent_refusal(0, 0o40755, me, path), None);
-    assert_eq!(media_parent_refusal(me, 0o40755, me, path), None);
+    let (me, my_group, other_group) = (501, 1000, 20);
+    let refusal = |owner, group, mode, private| {
+        media_parent_refusal(
+            owner,
+            group,
+            mode,
+            me,
+            my_group,
+            |asked| {
+                assert_eq!(asked, my_group);
+                private
+            },
+            path,
+        )
+    };
+    assert_eq!(refusal(0, 0, 0o41777, false), None);
+    assert_eq!(refusal(0, 0, 0o40755, false), None);
+    assert_eq!(refusal(me, my_group, 0o40755, false), None);
+    assert_eq!(refusal(me, my_group, 0o40775, true), None);
+    assert_eq!(refusal(me, my_group, 0o42775, true), None);
 
-    let root_open = media_parent_refusal(0, 0o40777, me, path).unwrap();
+    let root_open = refusal(0, 0, 0o40777, false).unwrap();
     assert!(root_open.contains("under your own home"), "{root_open}");
     assert!(
         !root_open.contains("chmod") && !root_open.contains("chown"),
         "{root_open}"
     );
+    let root_group = refusal(0, my_group, 0o40775, true).unwrap();
+    assert!(!root_group.contains("chmod"), "{root_group}");
 
-    let own_open = media_parent_refusal(me, 0o40777, me, path).unwrap();
-    assert!(
-        own_open.contains("fix with: chmod go-w '/private/tmp'"),
-        "{own_open}"
-    );
-    // A sticky directory owned by a user still lets that user replace entries.
-    let own_sticky = media_parent_refusal(me, 0o41777, me, path).unwrap();
-    assert!(own_sticky.contains("chmod go-w"), "{own_sticky}");
-    let other_sticky = media_parent_refusal(502, 0o41777, me, path).unwrap();
+    let fix = "fix with: chmod go-w '/private/tmp'";
+    for (group, mode, private) in [
+        (my_group, 0o40775, false),
+        (other_group, 0o40775, true),
+        (my_group, 0o40777, true),
+        (my_group, 0o41777, true),
+    ] {
+        let own = refusal(me, group, mode, private).unwrap();
+        assert!(own.contains(fix), "{group} {mode:o} {private}: {own}");
+    }
+    let other_sticky = refusal(502, my_group, 0o41777, true).unwrap();
     assert!(other_sticky.contains("not owned by you"), "{other_sticky}");
+}
+
+#[cfg(unix)]
+#[test]
+fn user_private_group_refuses_unknown_and_shared_groups() {
+    use super::user_private_group;
+    let uid = unsafe { libc::geteuid() };
+    assert!(!user_private_group(0x7fff_fff0, uid));
+    if uid != 0 {
+        // Group 0 is root's primary group on Linux and macOS.
+        assert!(!user_private_group(0, uid));
+    }
 }
 
 #[cfg(unix)]
 fn safe_ancestor_tempdir() -> tempfile::TempDir {
     // The media prerequisite import walks every ancestor of the source tool
     // path and rejects group/world-writable directories other than root-owned
-    // sticky ones; anchor fixtures under the build target dir, whose ancestors
-    // are developer- or runner-owned, so their parent modes are what each test
-    // sets.
+    // sticky ones and yours in your user-private group; anchor fixtures under
+    // the build target dir, whose ancestors are developer- or runner-owned, so
+    // their parent modes are what each test sets.
     let root = option_env!("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target")));
@@ -4059,7 +4091,7 @@ fn media_prerequisite_rejects_missing_unsafe_and_oversized_tools_before_config()
     owner_only_dir(&unsafe_parent_tools);
     write_media_prerequisite(&unsafe_parent_tools.join("ffmpeg"), b"ffmpeg", 0o700);
     write_media_prerequisite(&unsafe_parent_tools.join("ffprobe"), b"ffprobe", 0o700);
-    fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o775)).unwrap();
+    fs::set_permissions(&unsafe_parent_tools, fs::Permissions::from_mode(0o777)).unwrap();
     let refusal = prepare_runtime_media_provider_prerequisite(
         &unsafe_parent_data,
         &unsafe_parent_tools,

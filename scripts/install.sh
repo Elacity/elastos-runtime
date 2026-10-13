@@ -1102,15 +1102,46 @@ uninstall_installation() {
     fi
 }
 
+# Succeed only when group id $1 is the caller's user-private group, as Ubuntu
+# and Fedora create for each user: its record lists no member but the caller
+# and no other account has it as primary group. Fail when the group database
+# cannot be read.
+user_private_group() {
+    local gid="$1" me record members accounts others member
+    me="$(id -un)" || return 1
+    if command -v getent >/dev/null 2>&1; then
+        record="$(getent group "$gid")" || return 1
+        [[ "$record" == *:*:"$gid":* ]] || return 1
+        members="${record##*:}"
+        accounts="$(getent passwd)" || return 1
+        others="$(awk -F: -v g="$gid" -v me="$me" '$4 == g && $1 != me { print $1 }' <<<"$accounts")" || return 1
+    elif command -v dscacheutil >/dev/null 2>&1; then
+        record="$(dscacheutil -q group -a gid "$gid")" || return 1
+        [[ $'\n'"$record"$'\n' == *$'\ngid: '"$gid"$'\n'* ]] || return 1
+        members="$(awk '/^users:/ { $1 = ""; print }' <<<"$record")" || return 1
+        accounts="$(dscacheutil -q user)" || return 1
+        others="$(awk -v g="$gid" -v me="$me" '/^name:/ { n = $2 } /^gid:/ && $2 == g && n != me { print n }' <<<"$accounts")" || return 1
+    else
+        return 1
+    fi
+    [[ -z "$others" ]] || return 1
+    while read -r member; do
+        [[ -z "$member" || "$member" == "$me" ]] || return 1
+    done < <(tr ', ' '\n\n' <<<"$members")
+}
+
 # Decide whether an existing ancestor of the data directory is safe, from its
-# owner uid, octal mode and the caller's uid. Prints the refusal and fails, or
-# prints nothing. Others must not be able to rename or replace entries on the
-# path: refuse ancestors owned by another user and group- or world-writable
-# ones, except a root-owned sticky directory such as /tmp, where others cannot
-# rename or remove entries they do not own. Never advise changing a
-# root-owned directory: that would change the system for every user.
+# owner uid, group id, octal mode and the caller's uid and primary gid. Prints
+# the refusal and fails, or prints nothing. Others must not be able to rename
+# or replace entries on the path: refuse ancestors owned by another user and
+# group- or world-writable ones, except a root-owned sticky directory such as
+# /tmp, where others cannot rename or remove entries they do not own, and a
+# directory of yours writable only by your own user-private group, which has
+# no other members (umask 0002 makes ~/.local/share so on Ubuntu). Never
+# advise changing a root-owned directory: that would change the system for
+# every user.
 parent_dir_refusal() {
-    local owner="$1" mode="$2" uid="$3" quoted="$4"
+    local owner="$1" group="$2" mode="$3" uid="$4" gid="$5" quoted="$6"
     if [[ "$owner" != 0 && "$owner" != "$uid" ]]; then
         printf '%s\n' "Unsafe parent directory: $quoted is not owned by you; fix with: sudo chown \"\$(id -u)\" $quoted"
         return 1
@@ -1120,6 +1151,9 @@ parent_dir_refusal() {
         (( 8#$mode & 8#1000 )) && return 0
         printf '%s\n' "Unsafe parent directory: $quoted is owned by root and others can write to it; install under your own home directory instead (set HOME or XDG_DATA_HOME to a directory you own)"
         return 1
+    fi
+    if (( !(8#$mode & 8#002) )) && [[ "$group" == "$gid" ]] && user_private_group "$group"; then
+        return 0
     fi
     printf '%s\n' "Unsafe parent directory: $quoted is group- or world-writable; fix with: chmod go-w $quoted"
     return 1
@@ -1249,22 +1283,22 @@ require_safe_existing_dir() {
 # The runtime also refuses media tools under a parent others can write, such
 # as a group-writable ~/.local. Apply that rule (parent_dir_refusal) to every
 # existing ancestor of the data directory now, before any download.
-dir_owner_mode() {
+dir_owner_group_mode() {
     # GNU stat -f reports the filesystem, so pick the syntax by what works.
     # Both print the mode in octal with its sticky bit.
-    if stat -c '%u %a' / >/dev/null 2>&1; then
-        stat -c '%u %a' -- "$1"
+    if stat -c '%u %g %a' / >/dev/null 2>&1; then
+        stat -c '%u %g %a' -- "$1"
     else
-        stat -f '%u %Mp%Lp' -- "$1"
+        stat -f '%u %g %Mp%Lp' -- "$1"
     fi
 }
 require_safe_parent_chain() {
-    local dir="$1" real owner mode refusal
+    local dir="$1" real owner group mode refusal
     while [[ ! -e "$dir" && "$dir" != "/" ]]; do dir="$(dirname -- "$dir")"; done
     real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve directory: $(printf '%q' "$dir")"
     while :; do
-        read -r owner mode < <(dir_owner_mode "$real") || die_exact "Cannot inspect directory: $(printf '%q' "$real")"
-        refusal="$(parent_dir_refusal "$owner" "$mode" "$(id -u)" "$(printf '%q' "$real")")" || die_exact "$refusal"
+        read -r owner group mode < <(dir_owner_group_mode "$real") || die_exact "Cannot inspect directory: $(printf '%q' "$real")"
+        refusal="$(parent_dir_refusal "$owner" "$group" "$mode" "$(id -u)" "$(id -g)" "$(printf '%q' "$real")")" || die_exact "$refusal"
         [[ "$real" != "/" ]] || break
         real="$(dirname -- "$real")"
     done
