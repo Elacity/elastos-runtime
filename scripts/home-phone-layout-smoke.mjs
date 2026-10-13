@@ -1028,6 +1028,7 @@ async function runProfile(browser, engineId, profile, origin) {
   let touchMenuProbe = null;
   let homeProbe = null;
   let homeEditProbe = null;
+  let backProbe = null;
   let bootRetries = 0;
   try {
     let booted;
@@ -1086,6 +1087,7 @@ async function runProfile(browser, engineId, profile, origin) {
     }
     if (profile.id.startsWith("phone")) {
       homeEditProbe = await probePhoneHomeEdit(page, frame, dir);
+      backProbe = await probePhoneBack(frame);
     }
     for (const [target] of FIRST_PARTY_APPS) {
       if (target === "assistant") {
@@ -1112,7 +1114,7 @@ async function runProfile(browser, engineId, profile, origin) {
   } finally {
     await context.close();
   }
-  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, link: linkProbe, touchMenu: touchMenuProbe, home: homeProbe, homeEdit: homeEditProbe, bootRetries };
+  return { engine: engineId, profile: profile.id, viewport: profile.viewport, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, link: linkProbe, touchMenu: touchMenuProbe, home: homeProbe, homeEdit: homeEditProbe, back: backProbe, bootRetries };
 }
 
 // Soft keyboard: only the host page sees it, so the host relays its height
@@ -1759,6 +1761,139 @@ function phoneSheetHandleFailures(run) {
   return failures;
 }
 
+// System back on a phone with nothing else on the stage. The Assistant room
+// and the long-press menu each have to close, and Home has to stay. Then an
+// off-Space window that is still the active one must not be the window Back
+// minimises.
+async function openTarget(frame, target) {
+  await frame.evaluate((target) => {
+    const button = document.querySelector(`.taskbar-item[data-target="${target}"]`)
+      || document.querySelector(`.phone-home-app[data-target="${target}"]`);
+    button?.click();
+  }, target);
+  await waitFor(
+    () => frame.locator(`.window[data-target="${target}"]`).count().then((count) => count > 0),
+    BOOT_TIMEOUT_MS,
+    `${target} window`,
+  );
+  await sleep(SHEET_SETTLE_MS);
+}
+
+async function probePhoneBack(frame) {
+  const read = () => frame.evaluate(() => {
+    const menu = document.querySelector("#desktop-context-menu");
+    const space = document.querySelector("#assistant-space");
+    const windows = Array.from(document.querySelectorAll(".window")).map((node) => ({
+      target: node.dataset.target,
+      hidden: node.classList.contains("hidden"),
+      spaceVisible: node.dataset.spaceVisible || "",
+      active: node.classList.contains("window-active"),
+    }));
+    return {
+      home: location.href.includes("/apps/home-gui/"),
+      stageHistory: document.body.dataset.stageHistory || "",
+      menuOpen: Boolean(menu && !menu.hidden),
+      assistantOpen: Boolean(space && !space.hidden),
+      windows,
+    };
+  });
+  const systemBack = async () => {
+    const mode = await frame.evaluate(() => document.body.dataset.stageHistory || "");
+    if (mode === "history") {
+      await frame.evaluate(() => history.back());
+      return;
+    }
+    await frame.evaluate(async () => {
+      const stage = await import(new URL("./shell-phone-stage.js?v=home-20260813a", location.href).href);
+      stage.closeTopStageLayer(document);
+    });
+  };
+
+  await longPressDockApp(frame);
+  await sleep(SURFACE_SETTLE_MS);
+  const menuBefore = await read();
+  await systemBack();
+  await sleep(SHEET_SETTLE_MS);
+  const menuAfter = await read();
+  if (menuAfter.menuOpen) {
+    await pressEscape(frame);
+  }
+
+  const assistantReady = await read();
+  if (!assistantReady.assistantOpen) {
+    await frame.evaluate(() => document.querySelector("#assistant-toggle")?.click());
+    await sleep(ASSISTANT_OPEN_WAIT_MS);
+  }
+  const assistantBefore = await read();
+  await systemBack();
+  await sleep(ASSISTANT_OPEN_WAIT_MS);
+  const assistantAfter = await read();
+  if (assistantAfter.assistantOpen) {
+    await frame.evaluate(() => document.querySelector("#assistant-toggle")?.click());
+    await sleep(ASSISTANT_OPEN_WAIT_MS);
+  }
+
+  await openTarget(frame, "library");
+  await openTarget(frame, "documents");
+  const spaceSetup = await frame.evaluate(() => {
+    const active = document.querySelector(".window.window-active");
+    const other = Array.from(document.querySelectorAll(".window")).find((node) => node !== active);
+    if (!active || !other) {
+      return null;
+    }
+    active.dataset.spaceVisible = "false";
+    other.classList.remove("hidden");
+    other.dataset.spaceVisible = "true";
+    return { active: active.dataset.target, other: other.dataset.target };
+  });
+  await systemBack();
+  await sleep(SHEET_SETTLE_MS);
+  const spaceAfter = await read();
+  await frame.evaluate(() => {
+    for (const node of document.querySelectorAll(".window")) {
+      node.classList.remove("hidden");
+      node.dataset.spaceVisible = "true";
+    }
+  });
+  for (const target of ["documents", "library"]) {
+    if (await frame.locator(`.window[data-target="${target}"]`).count()) {
+      await closeWindow(frame, target);
+    }
+  }
+  return { menuBefore, menuAfter, assistantBefore, assistantAfter, spaceSetup, spaceAfter };
+}
+
+function phoneBackFailures(run) {
+  if (!run.back) {
+    return [];
+  }
+  const { menuBefore, menuAfter, assistantBefore, assistantAfter, spaceSetup, spaceAfter } = run.back;
+  const label = `${run.engine}/${run.profile}/back`;
+  const failures = [];
+  if (!menuBefore.menuOpen) {
+    failures.push(`${label}: a long-press must open the menu before Back. Got ${JSON.stringify(menuBefore)}`);
+  }
+  if (!menuAfter.home || menuAfter.menuOpen) {
+    failures.push(`${label}: Back must close the long-press menu and leave Home. Got ${JSON.stringify(menuAfter)}`);
+  }
+  if (!assistantBefore.assistantOpen) {
+    failures.push(`${label}: Assistant must be open before Back. Got ${JSON.stringify(assistantBefore)}`);
+  }
+  if (!assistantAfter.home || assistantAfter.assistantOpen) {
+    failures.push(`${label}: Back must close Assistant and leave Home. Got ${JSON.stringify(assistantAfter)}`);
+  }
+  if (!spaceSetup) {
+    failures.push(`${label}: two windows are required to check an off-Space Back`);
+    return failures;
+  }
+  const active = spaceAfter.windows.find((entry) => entry.target === spaceSetup.active);
+  const other = spaceAfter.windows.find((entry) => entry.target === spaceSetup.other);
+  if (!spaceAfter.home || !active || active.hidden || !other || !other.hidden) {
+    failures.push(`${label}: Back must minimise the window on this Space, not the hidden one. Got ${JSON.stringify({ spaceSetup, spaceAfter })}`);
+  }
+  return failures;
+}
+
 // Phone stage contract with a window open: a downward drag on the title bar
 // opens Mission Control (cards carry icon + name and a Close on touch);
 // system back goes home and leaves no history entry behind; rotating keeps
@@ -2030,6 +2165,11 @@ const requestedEngines = (process.env.HOME_PHONE_SMOKE_ENGINES || "chromium,webk
   .map((value) => value.trim())
   .filter(Boolean);
 
+const requestedProfiles = (process.env.HOME_PHONE_SMOKE_PROFILES || PROFILES.map((profile) => profile.id).join(","))
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+
 const origin = await listen();
 mkdirSync(outputRoot, { recursive: true });
 const report = { generatedAt: new Date().toISOString(), origin, source: sourceTruths(), runs: [], closedStreamRuns: [] };
@@ -2047,9 +2187,12 @@ try {
     }
     try {
       for (const profile of PROFILES) {
+        if (!requestedProfiles.includes(profile.id)) {
+          continue;
+        }
         const run = await runProfile(browser, engineId, profile, origin);
         report.runs.push(run);
-        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run), ...phoneTouchMenuFailures(run), ...phoneHomeFailures(run), ...phoneHomeEditFailures(run));
+        failures.push(...shellFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run), ...phoneTouchMenuFailures(run), ...phoneHomeFailures(run), ...phoneHomeEditFailures(run), ...phoneBackFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
       const closedStream = await runClosedStream(browser, engineId, origin);

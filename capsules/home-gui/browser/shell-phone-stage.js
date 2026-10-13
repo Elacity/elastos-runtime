@@ -2,12 +2,14 @@
 
    Back: the shell keeps at most one history entry of its own (model in
    shell-phone-stage-history.js). It is pushed when the first layer (a window
-   on the stage, a sheet, Mission Control) opens on a phone and consumed again
+   on the stage, a sheet, Mission Control, the Assistant room, or the
+   long-press menu) opens on a phone and consumed again
    when the last layer closes, so the bare desktop never traps back — the
    host page's own history is left alone. popstate closes the top layer:
    Mission Control, then any open sheet (through the shell's Escape
-   contract), then the window goes home (minimise; the capsule keeps
-   running).
+   contract), then the window that is actually on this Space goes home
+   (minimise; the capsule keeps running). A window parked on another Space
+   is not that window.
 
    Swipe: a downward drag on the title bar opens Mission Control as the app
    switcher. It starts on the title bar only — capsule frames own their own
@@ -23,13 +25,13 @@ import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
 import { minimizeWindow } from "./shell-windows.js?v=home-20260813a";
 import { closeExpose, isExposeOpen, openExpose } from "./shell-expose.js?v=home-20260813a";
 import { handleShellEscape } from "./shell-popovers.js?v=home-20260813a";
-import { hideLauncher } from "./shell-surface.js?v=home-20260813a";
+import { hideDesktopContextMenu, hideLauncher } from "./shell-surface.js?v=home-20260813a";
 import { hideSpotlight } from "./shell-spotlight.js?v=home-20260813a";
 import { hideControlCentre } from "./shell-control-centre.js?v=home-20260813a";
 import { hideNotificationCenter } from "./shell-notifications.js?v=home-20260813a";
 import { hideInboxRail } from "./shell-inbox-rail.js?v=home-20260813a";
 import { hideWalletRail } from "./shell-wallet-rail.js?v=home-20260813a";
-import { hideAssistantFace } from "./shell-assistant-face.js?v=home-20260813a";
+import { dismissAssistantForBack, hideAssistantFace } from "./shell-assistant-face.js?v=home-20260813a";
 
 // A title-bar drag this far down opens the switcher…
 export const TITLE_SWIPE_DOWN_PX = 48;
@@ -39,6 +41,8 @@ export const TITLE_SWIPE_DRIFT_PX = 32;
 // Sheets that count as a layer over the stage, top-most first, each with the
 // closer its module already exposes.
 const SHEETS = Object.freeze([
+  { selector: "#desktop-context-menu", close: () => hideDesktopContextMenu() },
+  { selector: "#assistant-space", close: () => dismissAssistantForBack() },
   { selector: "#control-centre", close: () => hideControlCentre() },
   { selector: "#notification-center", close: () => hideNotificationCenter() },
   { selector: "#spotlight", close: () => hideSpotlight() },
@@ -49,11 +53,16 @@ const SHEETS = Object.freeze([
 ]);
 export const SHEET_SELECTORS = Object.freeze(SHEETS.map((sheet) => sheet.selector));
 
+// On the stage: not minimised, and still in the Space the Dock is showing.
+export function windowOnStage(entry) {
+  const node = entry?.node;
+  return Boolean(node && !node.classList.contains("hidden") && node.dataset.spaceVisible !== "false");
+}
+
 export function visibleWindowCount(windows = shellState.windows) {
   let count = 0;
   for (const entry of windows.values()) {
-    const node = entry?.node;
-    if (node && !node.classList.contains("hidden") && node.dataset.spaceVisible !== "false") {
+    if (windowOnStage(entry)) {
       count += 1;
     }
   }
@@ -71,8 +80,22 @@ export function stageLayerCount(doc = document) {
   return visibleWindowCount() + openSheetCount(doc) + (isExposeOpen() ? 1 : 0);
 }
 
-// Closes the top layer and reports how many remain.
+// Closes the top layer and reports how many remain. The long-press menu and
+// the Assistant room sit above the Escape registry: the Agent room is not a
+// desktop Space, so the fullscreen-stage Escape handler would otherwise take
+// the back and leave the room up.
 export function closeTopStageLayer(doc = document) {
+  const overlay = SHEETS.find((sheet) => {
+    if (sheet.selector !== "#desktop-context-menu" && sheet.selector !== "#assistant-space") {
+      return false;
+    }
+    const node = doc.querySelector(sheet.selector);
+    return node && !node.hidden;
+  });
+  if (overlay) {
+    overlay.close();
+    return stageLayerCount(doc);
+  }
   // The shell's ordered Escape registry first (modal, menus, Mission Control…).
   if (handleShellEscape()) {
     return stageLayerCount(doc);
@@ -89,13 +112,11 @@ export function closeTopStageLayer(doc = document) {
     openSheet.close();
     return stageLayerCount(doc);
   }
-  const activeId = shellState.activeWindowId;
-  const visible = [...shellState.windows.values()].find(
-    (entry) => entry.node && !entry.node.classList.contains("hidden"),
-  );
-  const id = activeId && shellState.windows.has(activeId) ? activeId : visible?.id;
-  if (id) {
-    minimizeWindow(id);
+  const active = shellState.windows.get(shellState.activeWindowId);
+  const visible = [...shellState.windows.values()].find(windowOnStage);
+  const chosen = windowOnStage(active) ? active : visible;
+  if (chosen?.id) {
+    minimizeWindow(chosen.id);
   }
   return stageLayerCount(doc);
 }

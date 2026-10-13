@@ -352,6 +352,18 @@ function closeAssistantSpace({ instant = false } = {}) {
   spaceHideTimer = window.setTimeout(park, ROOM_MS + 40);
 }
 
+/* Back on the phone closes the room immediately. The dock morph can already
+   be leaving, or the room can be up without that morph; either way the
+   space has to go. */
+export function dismissAssistantForBack() {
+  const taskbar = taskbarEl();
+  const wasOpen = assistantFaceActive() || Boolean(taskbar?.dataset.assistantMorph);
+  if (wasOpen) {
+    hideAssistantFace({ instant: true });
+  }
+  closeAssistantSpace({ instant: true });
+}
+
 /* Host retires the GUI surface (sign-out, lock): drop the session with it. */
 export function retireAssistantSpace() {
   retirementGeneration += 1;
