@@ -164,6 +164,8 @@ CASES = [
 SAVING_REFS = {"refs/heads/develop", "refs/heads/main"}
 CACHE_SAVING_REF = "refs/heads/develop"
 RUST_CACHE_KEY = "-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}"
+# rustsec/rustsec release cargo-audit/v0.22.2, x86_64-unknown-linux-musl archive.
+AUDIT_ARCHIVE_SHA256 = "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
 # A restored non-Rust input and the step that checks it against its pinned hash.
 RESTORE_VERIFIERS = {
     "restore pinned ARM64 engine": 'build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"',
@@ -479,12 +481,85 @@ def validate_jetson_package_lifecycle(source):
         raise AssertionError("Jetson verification requires an earlier package step")
     if "scripts/package-release-binaries.sh" not in package:
         raise AssertionError("Jetson verification requires the package producer")
+    # The packaged binaries come from the committed lockfile, never a fresh resolution.
+    if any("--locked" not in build for build in re.findall(r"cargo build[^\n]*", package)):
+        raise AssertionError("release package builds require --locked")
     for event, ref, ref_type, override, _ in CASES:
         for runner in ("ubuntu-24.04", "ubuntu-22.04-arm"):
             context = {"github.event_name": event, "github.ref": ref,
                        "github.ref_type": ref_type, "inputs.ref": override, "matrix.os": runner}
             if evaluate(field(verify, "if"), context) and not evaluate(field(package, "if"), context):
                 raise AssertionError(f"Jetson verification lacks its package on {event} {runner}")
+
+
+def validate_dependency_audit(source):
+    """Every tracked lockfile meets the current RustSec database on every event."""
+    workflow_jobs = jobs(source)
+    if "cargo-audit" not in workflow_jobs:
+        raise AssertionError("missing cargo-audit job")
+    job = workflow_jobs["cargo-audit"]
+    if re.search(r"(?m)^\s+(?:if|needs|continue-on-error):", job):
+        raise AssertionError("cargo-audit runs and fails on every event")
+    if CACHE_RE.search(job):
+        raise AssertionError("cargo-audit restores nothing; its database must be fresh")
+    job_steps = steps("cargo-audit", workflow_jobs)
+    install, = [step for step in job_steps if step.startswith("name: install checksummed cargo-audit\n")]
+    audit, = [step for step in job_steps if step.startswith("name: audit every Cargo.lock\n")]
+    if job_steps.index(install) >= job_steps.index(audit):
+        raise AssertionError("cargo-audit is installed before the audit")
+    digest = '| sha256sum -c -'
+    if not (f"{AUDIT_ARCHIVE_SHA256}  " in install and digest in install
+            and install.index(digest) < install.index("tar -xzf") < install.index("GITHUB_PATH")):
+        raise AssertionError("cargo-audit archive is checked against its pinned digest before use")
+    # Reviewed exceptions live only in elastos/.cargo/audit.toml, read from this directory.
+    if field(audit, "working-directory") != "elastos" or re.search(r"--ignore\b|audit\.toml|CARGO_HOME", audit):
+        raise AssertionError("cargo-audit uses only the reviewed exceptions in elastos/.cargo/audit.toml")
+    script = textwrap.dedent(audit.split("        run: |\n", 1)[1])
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "repo"
+        locks = ["Cargo.lock", "capsules/one/Cargo.lock", "elastos/Cargo.lock", "examples/two/Cargo.lock"]
+        for lock in locks:
+            (root / lock).parent.mkdir(parents=True, exist_ok=True)
+            (root / lock).write_text("")
+        (root / "untracked").mkdir()
+        (root / "untracked/Cargo.lock").write_text("")
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "add", *locks], check=True)
+        tools = Path(directory) / "bin"
+        tools.mkdir()
+        (tools / "cargo-audit").write_text(
+            '#!/bin/sh\nprintf \'%s|%s\\n\' "$(pwd -P)" "$*" >> "$AUDIT_LOG"\n'
+            'case " $* " in *" ../$AUDIT_FAIL "*) exit 1 ;; esac\n')
+        (tools / "cargo-audit").chmod(0o755)
+        for failing in (None, *locks):
+            log = Path(directory) / "audit.log"
+            log.write_text("")
+            env = {**os.environ, "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
+                   "RUNNER_TEMP": directory, "AUDIT_LOG": str(log), "AUDIT_FAIL": failing or "none"}
+            result = subprocess.run(["/bin/bash", "-c", script], cwd=root / "elastos", env=env,
+                                    capture_output=True, text=True, timeout=30)
+            calls = [line.split("|", 1) for line in log.read_text().splitlines()]
+            if sorted(args.split("--file ../", 1)[-1] for _, args in calls) != sorted(locks):
+                raise AssertionError(f"cargo-audit checks every tracked Cargo.lock (failing {failing})")
+            if {cwd for cwd, _ in calls} != {str((root / "elastos").resolve())}:
+                raise AssertionError("cargo-audit runs where elastos/.cargo/audit.toml applies")
+            if ["--no-fetch" in args for _, args in calls] != [False] + [True] * (len(locks) - 1):
+                raise AssertionError("cargo-audit fetches the advisory database once per run")
+            if (result.returncode != 0) != (failing is not None):
+                raise AssertionError(f"cargo-audit result ignores {failing or 'a clean run'}")
+        # A lockfile listing that prints part of the list and then fails must fail the job.
+        broken = Path(directory) / "broken-git"
+        broken.mkdir()
+        (broken / "git").write_text('#!/bin/sh\necho Cargo.lock\nexit 2\n')
+        (broken / "git").chmod(0o755)
+        log = Path(directory) / "audit.log"
+        log.write_text("")
+        env = {**os.environ, "PATH": f"{broken}{os.pathsep}{tools}{os.pathsep}{os.environ['PATH']}",
+               "RUNNER_TEMP": directory, "AUDIT_LOG": str(log), "AUDIT_FAIL": "none"}
+        result = subprocess.run(["/bin/bash", "-c", script], cwd=root / "elastos", env=env,
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            raise AssertionError("cargo-audit fails when the Cargo.lock listing fails")
 
 
 def validate_journey_builds(source, release_source):
@@ -1311,6 +1386,28 @@ class ReleasePolicyTests(unittest.TestCase):
         omitted = SOURCE.replace("scripts/package-release-binaries.sh", "echo package omitted", 1)
         with self.assertRaisesRegex(AssertionError, "requires the package producer"):
             validate_jetson_package_lifecycle(omitted)
+        unlocked = SOURCE.replace("cargo build --locked --manifest-path elastos/Cargo.toml --workspace",
+                                  "cargo build --manifest-path elastos/Cargo.toml --workspace", 1)
+        with self.assertRaisesRegex(AssertionError, "require --locked"):
+            validate_jetson_package_lifecycle(unlocked)
+
+    def test_every_tracked_lockfile_is_audited_on_every_event(self):
+        validate_dependency_audit(SOURCE)
+        audit = "name: audit every Cargo.lock\n        working-directory: elastos\n"
+        for old, new, message in (
+                ("cargo-audit:\n    name: cargo-audit\n",
+                 "cargo-audit:\n    name: cargo-audit\n    if: github.event_name == 'pull_request'\n", "every event"),
+                (audit, audit + "        continue-on-error: true\n", "every event"),
+                (audit, "name: audit every Cargo.lock\n        working-directory: .\n", "reviewed exceptions"),
+                ('--file "../$lock"', '--ignore RUSTSEC-0000-0000 --file "../$lock"', "reviewed exceptions"),
+                ("| sha256sum -c -", "| cat", "pinned digest"),
+                (' || failed=1', '', "every tracked Cargo.lock"),
+                ('exit "$failed"', 'exit 0', "result ignores Cargo.lock"),
+                ("            fetch=(--no-fetch)\n", "", "database once")):
+            with self.subTest(new=new):
+                self.assertIn(old, SOURCE)
+                with self.assertRaisesRegex(AssertionError, message):
+                    validate_dependency_audit(SOURCE.replace(old, new, 1))
 
     def test_only_the_arm_compatibility_gate_packages_and_nothing_publishes_binaries(self):
         # Signed releases over Carrier are the only distribution; CI uploads no release packages.
@@ -1531,6 +1628,8 @@ class ReleasePolicyTests(unittest.TestCase):
             "cancel-on-failure": ("cancel-on-failure", "ubuntu-24.04"),
             # Anders decides whether this becomes a required check (#320).
             "update-hop-linux": ("update-hop-linux", "ubuntu-24.04"),
+            # Anders decides whether this becomes a required check (#311 D2).
+            "cargo-audit": ("cargo-audit", "ubuntu-24.04"),
         }
         self.assertEqual(set(JOBS), set(expected))
         for job, (name, runner) in expected.items():

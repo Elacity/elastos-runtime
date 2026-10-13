@@ -18,7 +18,8 @@
 # Deliberately NOT built via scripts/setup-source-home.sh: that installs
 # ~30 unrelated binaries and 33 app capsules for the full-home topology.
 # Direct `cargo build` of just the 4 workspaces this role needs instead.
-FROM rust:1.91-bookworm AS builder
+# Base images are pinned to their multi-arch index digests (amd64 CI, arm64 dev).
+FROM rust:1.91-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33 AS builder
 
 ARG APP_UID=10001
 ARG APP_GID=10001
@@ -238,7 +239,7 @@ EOF
 # without debian:bookworm-slim's ~75MB of apt/dpkg/coreutils baggage.
 # distroless/cc was considered and rejected: it ships no shell at all, and
 # this stage's job is exactly to run entrypoint.sh.
-FROM busybox:glibc AS runtime
+FROM busybox:glibc@sha256:99813cb178ace2cd9c6c53ee3bddef5d2f5708aa438335111d7a9e3c5e1aaebe AS runtime
 
 ARG APP_UID=10001
 ARG APP_GID=10001

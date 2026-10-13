@@ -95,6 +95,52 @@ jobs:
           path: ${{ runner.temp }}/browser-status-screenshots/
           if-no-files-found: ignore
 
+  # Every tracked Cargo.lock against the current RustSec database. Reviewed
+  # exceptions live only in elastos/.cargo/audit.toml, which cargo-audit
+  # reads from its working directory. No cache: the binary is a checksummed
+  # release and the database must be fresh.
+  cargo-audit:
+    name: cargo-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: install checksummed cargo-audit
+        run: |
+          set -euo pipefail
+          archive=cargo-audit-x86_64-unknown-linux-musl-v0.22.2
+          directory="$RUNNER_TEMP/cargo-audit"
+          mkdir -p "$directory"
+          curl -fsSL --connect-timeout 30 --max-time 120 --retry 3 \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/$archive.tgz" \
+            -o "$directory/$archive.tgz"
+          echo "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428  $directory/$archive.tgz" | sha256sum -c -
+          tar -xzf "$directory/$archive.tgz" -C "$directory" "$archive/cargo-audit"
+          echo "$directory/$archive" >> "$GITHUB_PATH"
+      - name: audit every Cargo.lock
+        working-directory: elastos
+        run: |
+          set -euo pipefail
+          # A failed listing must fail the job, not audit a partial list.
+          listing=$(git -C .. ls-files '*Cargo.lock')
+          locks=()
+          while IFS= read -r lock; do [[ -n "$lock" ]] && locks+=("$lock"); done <<< "$listing"
+          (( ${#locks[@]} > 0 ))
+          db="$RUNNER_TEMP/advisory-db"
+          fetch=()
+          failed=0
+          for lock in "${locks[@]}"; do
+            echo "::group::$lock"
+            cargo-audit audit --db "$db" ${fetch[@]+"${fetch[@]}"} --file "../$lock" || failed=1
+            echo "::endgroup::"
+            # One database fetch per run; every lockfile is checked against it.
+            fetch=(--no-fetch)
+          done
+          exit "$failed"
+
   # One input for every ARM consumer. PRs restore their develop base's cache;
   # only a develop push can save a verified recipe result in this namespace.
   engine-llama-arm64:
@@ -816,7 +862,7 @@ jobs:
         run: |
           set -euo pipefail
           # Incremental on top of setup-source-home's release builds.
-          cargo build --manifest-path elastos/Cargo.toml --workspace --release
+          cargo build --locked --manifest-path elastos/Cargo.toml --workspace --release
           scripts/package-release-binaries.sh
       - name: verify Jetson release compatibility
         if: matrix.os == 'ubuntu-22.04-arm'

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -221,15 +221,13 @@ if (!/SecretKey::from_bytes\(&signing_key\.to_bytes\(\)\)/.test(carrierSource)) 
   fail("Iroh signing must cross the Ed25519 boundary as raw key bytes");
 }
 
-const auditConfig = readFileSync(resolve(repoRoot, "elastos/.cargo/audit.toml"), "utf8");
-for (const closed of ["RUSTSEC-2026-0118", "RUSTSEC-2026-0119"]) {
+// quick-xml 0.41.0 is the patched release for RUSTSEC-2026-0194/0195.
+const closedAdvisories = ["RUSTSEC-2026-0118", "RUSTSEC-2026-0119", "RUSTSEC-2026-0194", "RUSTSEC-2026-0195"];
+const auditConfigPath = resolve(repoRoot, "elastos/.cargo/audit.toml");
+const auditConfig = existsSync(auditConfigPath) ? readFileSync(auditConfigPath, "utf8") : "";
+for (const closed of closedAdvisories) {
   if (auditConfig.includes(closed)) {
-    fail(`closed Hickory advisory ${closed} is still ignored`);
-  }
-}
-for (const accepted of ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]) {
-  if (!auditConfig.includes(accepted)) {
-    fail(`accepted quick-xml advisory ${accepted} is not explicit`);
+    fail(`closed advisory ${closed} is still ignored`);
   }
 }
 
@@ -242,8 +240,8 @@ const report = {
     inspectGraph("capsules/object-provider/Cargo.toml", "object-provider workspace"),
   ],
   advisory_disposition: {
-    closed: ["RUSTSEC-2026-0118", "RUSTSEC-2026-0119"],
-    accepted: ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"],
+    closed: closedAdvisories,
+    accepted: [],
     point_updates: {
       "RUSTSEC-2026-0204": "crossbeam-epoch 0.9.20",
       "RUSTSEC-2026-0185": "quinn-proto 0.11.15",
