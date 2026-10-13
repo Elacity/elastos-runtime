@@ -11,6 +11,11 @@ endpoint-authenticated off-box transport selected below that boundary. It is
 not the capsule API and does not by itself prove application-message
 authorship.
 
+For people, Carrier is how Homes reach each other. Homes connect directly, by
+identity, and a new Home needs one introduction to join the network. Joining
+gives no access to anything: apps on another Home get only what its owner
+grants.
+
 Use these documents as the sources of truth:
 
 - [Principles](../PRINCIPLES.md): stable implementation constraints.

@@ -6,6 +6,17 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Security
+
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in 0.8.1). Web pages and shared files open in a separate sandbox, never as Home; the web Terminal is off by default; Home refuses requests from other origins and hosts; releases are signed with a new key kept off the public server.
+- Isolation status, not done yet: Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls. These stages (S1 and S2 of #173) are planned for 0.8.1.
+
+### Changed
+
+- Known issue: on the Jetson, getting a model is slow (Qwen takes about 43 minutes) and replies run on the CPU (about 25 seconds each).
+- Known issue: on a Mac with a slow connection, getting a model can stop with "Model content could not be read".
+- Known issue: Browser runs only on Apple Silicon Macs.
+
 ### Developer detail
 
 - `scripts/release-publish.sh seed` and `seed-upgrade` require `RELEASE_SEED_DATA`
