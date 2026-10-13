@@ -56,6 +56,59 @@ pinned to the same port. Give each Runtime its own port with
 `config.toml`, so set a second Home's port with that Home's `HOME` or
 `XDG_DATA_HOME`.
 
+### One Home shows Community Live but exchanges no Chat messages
+
+Other Homes' Community messages never appear on this Home, and its own never
+reach them, although Chat shows Community as **Live**. The Home is the network's
+bootstrap: its Carrier node ID is the `node_id` in the head profile's
+`bootstrap_peers`. Runtime keeps a bootstrap to Discovery only, so participants
+refuse Chat to and from it (the refusal logs at debug: `Community bootstrap
+endpoints carry discovery metadata only`). This happens when a test network
+was created from a person's own Home. Progress on letting participants serve
+as bootstrap: [#324](https://github.com/Elacity/elastos-runtime/issues/324).
+
+To confirm, compare the Home's `carrier: isolated <did> (port <port>)` log
+line, whose did:key encodes the node ID, with the `node_id` in the network
+file's last `profile_chain_base64` entry.
+
+To make every person's Home a participant, give the network a separate
+bootstrap Runtime without people, as the release does:
+
+1. Install another Runtime with its own data root and Carrier port
+   (`elastos config set carrier_bind_addr 0.0.0.0:<port>`), on the same
+   network file, and start it.
+2. Export its receipt with `elastos collaboration-config
+   export-local-bootstrap-receipt`, then sign the next revision with the
+   network's authority key (`generate-revision`) and `verify` it. See
+   [operator provisioning](COLLABORATION_NETWORK_PROFILE.md#operator-provisioning).
+3. Stop every Home. A release delivers the revision to installed Homes through
+   update. Source-home setup only installs a network file where none exists,
+   so on source Homes keep a copy of the current file and replace it,
+   owner-only, with the new revision.
+4. Start the new bootstrap Runtime first, then the other Homes. Each Home's
+   accepted-head marker under `collaboration/config` then shows the new
+   revision; a Home never returns to an earlier one.
+
+### Community stays unreachable after the Community node comes back
+
+A Home that kept running while the bootstrap Runtime was down, with no other
+Home connected, still shows **Community unreachable** after the bootstrap is
+back. Reopening Chat does not help; restarting this Home's Runtime does.
+
+This is a known iroh-gossip 0.101.0 issue. Upstream
+[n0-computer/iroh-gossip#161](https://github.com/n0-computer/iroh-gossip/pull/161)
+(merged after 0.101.0, not yet released) reworks this peer lifecycle; check
+this case again when Runtime moves to a release that includes it.
+After a failed dial, iroh-gossip can keep the peer pending with queued
+messages, and it dials again only when that queue is empty. Runtime's
+bootstrap recovery asks to rejoin every second, so the queue never empties
+and the peer is never dialed again. With `iroh_gossip=debug`, the log shows
+one `dial failed: timed out peer=<bootstrap>` and then a `Join` sent to that
+peer every second with no further `start to dial`.
+
+Workaround: restart the Home's Runtime after the bootstrap is back. A Home
+that stayed connected to another participant stays **Live** through it.
+
 ### `discovery relay outbox delivery failed … discovery advertisement is not active`
 
 This debug line means a queued contact request or decision names a Discovery

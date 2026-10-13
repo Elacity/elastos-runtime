@@ -73,6 +73,7 @@ function createEnvironment() {
   const parentMessages = [];
   const windowListeners = new Map();
   const observers = [];
+  const dispatchedEvents = [];
   const participantToggle = new FakeElement("participant-toggle");
   const roomAccessToggle = new FakeElement("room-access-toggle");
   roomAccessToggle.hidden = true;
@@ -143,6 +144,16 @@ function createEnvironment() {
       addEventListener(type, callback) {
         windowListeners.set(type, callback);
       },
+      dispatchEvent(event) {
+        dispatchedEvents.push(event);
+        return true;
+      },
+    },
+    CustomEvent: class {
+      constructor(type, init = {}) {
+        this.type = type;
+        this.detail = init.detail;
+      }
     },
     globalThis: null,
     getComputedStyle(node) {
@@ -160,6 +171,7 @@ function createEnvironment() {
     composerField,
     context,
     conversationSelector,
+    dispatchedEvents,
     messageInput,
     notify(target) {
       for (const observer of observers) {
@@ -295,6 +307,25 @@ function main() {
     data: { type: "elastos:menu-command", cmd: "view-access-settings" },
   });
   assert.equal(env.participantToggle.clickCount, 1, "People must route through the existing toggle button");
+
+  // Home shows a requested conversation in the open Chat window.
+  const navigate = (overrides = {}, query = { conversation_id: "direct:sha256:fixture" }) => ({
+    origin: "null",
+    source: env.parentFrame,
+    data: { type: "elastos.chat.navigate/v1", homeToken: "chat-test-token", query, ...overrides },
+  });
+  onMessage({ ...navigate(), source: env.topFrame });
+  onMessage(navigate({ homeToken: "other-token" }));
+  onMessage(navigate({ extra: true }));
+  onMessage(navigate({}, { conversation_id: "direct:sha256:fixture", extra: "x" }));
+  onMessage(navigate({}, { conversation_id: "" }));
+  assert.equal(env.dispatchedEvents.length, 0, "Chat must ignore a navigate request from the wrong source, token or shape");
+  onMessage(navigate());
+  assert.deepEqual(
+    env.dispatchedEvents.map((event) => [event.type, event.detail]),
+    [["elastos-chat-open-conversation", "direct:sha256:fixture"]],
+    "Chat must open the conversation Home requests",
+  );
   assert.equal(env.roomAccessToggle.clickCount, 1, "Access Settings must route through the existing toggle button");
 
   env.roomAccessToggle.disabled = true;
@@ -325,6 +356,13 @@ function main() {
   env.messageInput.dispatchEvent({ type: "input" });
   assert.equal(env.messageInput.style.height, "34px", "Chat must shrink the current textarea after multiline input clears");
   assert.equal(env.composerField.dataset.multiline, "false", "Chat must clear multiline presentation state after input shrinks");
+  // Chat clears a sent message from code, which raises no input event.
+  env.messageInput.value = "line one\nline two";
+  env.messageInput.dispatchEvent({ type: "input" });
+  env.messageInput.value = "";
+  env.context.elastosChatSyncComposer();
+  assert.equal(env.messageInput.style.height, "34px", "Chat must shrink the textarea when it clears a sent message");
+  assert.equal(env.composerField.dataset.multiline, "false", "Chat must leave multiline presentation when it clears a sent message");
 
   const accessSectionIndex = source.indexOf('id="room-access-section"');
   const inviteIndex = source.indexOf('id="conversation-invite-create"');

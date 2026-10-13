@@ -107,12 +107,34 @@
         return event.origin === "null" && event.source === window.parent;
       }
 
+      // Home asks an already open Chat window to show a conversation, for
+      // example People's Message, instead of opening another window.
+      function openRequestedConversation(message) {
+        const query = message.query;
+        if (Object.keys(message).sort().join(",") !== "homeToken,query,type"
+          || !homeToken || message.homeToken !== homeToken
+          || !query || typeof query !== "object" || Array.isArray(query)
+          || Object.keys(query).join(",") !== "conversation_id"
+          || typeof query.conversation_id !== "string" || !query.conversation_id
+          || query.conversation_id.length > 512) {
+          return;
+        }
+        window.dispatchEvent(new CustomEvent("elastos-chat-open-conversation", {
+          detail: query.conversation_id,
+        }));
+      }
+
       function clickExistingControl(id) {
         const node = document.getElementById(id);
         if (node instanceof HTMLElement) {
           node.click();
         }
       }
+
+      // Chat calls this after it sets the composer text itself (clearing a
+      // sent message, restoring a draft, inserting an emoji); those writes
+      // raise no input event.
+      globalThis.elastosChatSyncComposer = syncComposerPresentation;
 
       announceHomeChrome();
       syncCompactConversationRail();
@@ -183,6 +205,10 @@
           return;
         }
         const message = event.data;
+        if (message?.type === "elastos.chat.navigate/v1") {
+          openRequestedConversation(message);
+          return;
+        }
         if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
           return;
         }

@@ -2352,6 +2352,27 @@ for (const target of hybridTargets) {
     `${target.target}: restore changed a saved selector`);
   }
 }
+// People's Message names a conversation; an open Chat window shows it.
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+await openHybrid("chat-room");
+const chatWindow = [...shellCore.shellState.windows.values()][0];
+const chatFrame = chatWindow.node.querySelector(".window-frame");
+const chatPosted = [];
+chatFrame.contentWindow = { postMessage(message, origin) { chatPosted.push({ message, origin }); } };
+const chatLaunches = restoredBrowserLaunches.length;
+await openHybrid("chat-room", { query: { conversation_id: "direct:sha256:fixture" } });
+assert(shellCore.shellState.windows.size === 1 && restoredBrowserLaunches.length === chatLaunches
+  && shellCore.shellState.activeWindowId === chatWindow.id,
+  "Chat conversation Open created a window instead of using the open one");
+const chatToken = new URLSearchParams(new URL(chatFrame.dataset.route, window.location.href).hash.slice(1)).get("home_token");
+assert(chatToken && JSON.stringify(chatPosted.map((post) => post.message)) === JSON.stringify([{
+  type: "elastos.chat.navigate/v1",
+  homeToken: chatToken,
+  query: { conversation_id: "direct:sha256:fixture" },
+}]), "Chat conversation Open did not ask the open window to show it");
+await openHybrid("chat-room", { query: { conversation_id: "direct:sha256:fixture" }, newWindow: true });
+assert(shellCore.shellState.windows.size === 2, "Chat New Window was reused for a conversation");
 // A Library picker alone is never the destination for ordinary browse Open.
 shellCore.shellState.windows.clear();
 shellCore.shellState.activeWindowId = null;

@@ -85,7 +85,7 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   inbox: "visible-target",
   library: new Set(["archive-manager", "documents", "gba-emulator", "library"]),
   marketplace: "runtime-target",
-  people: new Set(["chat-room", "system"]),
+  people: new Set(["chat-room", "inbox", "system"]),
   services: new Set(["browser", "chat-room"]),
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),

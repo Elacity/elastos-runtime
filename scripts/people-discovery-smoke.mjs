@@ -866,6 +866,16 @@ if (!scenario) {
     );
     assert.equal(child.status, 0, child.stderr || child.stdout);
   }
+  // People's own open-target messages must pass the Home shell's source policy.
+  const shellHost = readFileSync("capsules/home/browser/home-shell-host.js", "utf8");
+  const peoplePolicy = shellHost.match(/^  people: new Set\(\[([^\]]*)\]\),$/m);
+  assert.ok(peoplePolicy, "Home shell has no People open-target policy");
+  const allowed = new Set([...peoplePolicy[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]));
+  const opened = [...peopleUi.matchAll(/type: "home:open-target",\s*target: "([^"]+)"/g)].map((match) => match[1]);
+  assert.ok(opened.includes("inbox") && opened.includes("chat-room"), `People open targets: ${opened}`);
+  for (const target of opened) {
+    assert.ok(allowed.has(target), `Home shell refuses People's ${target} target`);
+  }
   const inboxUi = readFileSync("capsules/inbox/browser/inbox.js", "utf8");
   assert.match(inboxUi, /contact-accept-request:/);
   assert.match(inboxUi, /createActionButton\("Accept", actionId, "primary"\)/);

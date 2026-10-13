@@ -722,6 +722,24 @@ pub fn start() -> Result<(), JsValue> {
 }
 
 impl App {
+    /// Sets the composer text from Chat itself, then lets the Chat chrome
+    /// refit the composer: these writes raise no input event.
+    fn set_composer_text(&self, text: &str) {
+        self.message_input.set_value(text);
+        let sync = web_sys::window()
+            .and_then(|window| {
+                Reflect::get(
+                    window.as_ref(),
+                    &JsValue::from_str("elastosChatSyncComposer"),
+                )
+                .ok()
+            })
+            .and_then(|value| value.dyn_into::<Function>().ok());
+        if let Some(sync) = sync {
+            let _ = sync.call0(&JsValue::UNDEFINED);
+        }
+    }
+
     fn is_shell_mode(&self) -> bool {
         self.config.access_mode == AccessMode::Shell
     }
@@ -1563,7 +1581,7 @@ impl App {
                 } else {
                     format!("{current} {emoji}")
                 };
-                emoji_app.message_input.set_value(&next);
+                emoji_app.set_composer_text(&next);
                 note_composer_edit(&mut emoji_app.state.borrow_mut());
                 let _ = emoji_app.message_input.focus();
             }));
@@ -1811,6 +1829,28 @@ impl App {
                     runtime_events.as_ref().unchecked_ref(),
                 )?;
             runtime_events.forget();
+
+            // The Chat chrome checks Home's request, then names the
+            // conversation to open in this window.
+            let open_conversation_app = Rc::clone(self);
+            let open_conversation =
+                Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
+                    let Some(conversation_id) = Reflect::get(&event, &JsValue::from_str("detail"))
+                        .ok()
+                        .and_then(|detail| detail.as_string())
+                        .filter(|id| !id.is_empty())
+                    else {
+                        return;
+                    };
+                    open_conversation_app.open_direct_conversation(conversation_id);
+                }));
+            window()
+                .ok_or_else(|| JsValue::from_str("window unavailable"))?
+                .add_event_listener_with_callback(
+                    "elastos-chat-open-conversation",
+                    open_conversation.as_ref().unchecked_ref(),
+                )?;
+            open_conversation.forget();
         }
 
         let close_lifecycle_app = Rc::clone(self);
@@ -2568,7 +2608,7 @@ impl App {
             let clear = settle_sent_draft(&mut state, &None, sent_revision);
             drop(state);
             if clear {
-                self.message_input.set_value("");
+                self.set_composer_text("");
             }
         }
         Ok(())
@@ -2684,7 +2724,7 @@ impl App {
             settle_sent_draft(&mut state, &Some(conversation_id.clone()), sent_revision)
         };
         if clear {
-            self.message_input.set_value("");
+            self.set_composer_text("");
         }
         if self.selection_guard_is_current(&selection_guard) {
             let _ = self
@@ -3587,7 +3627,7 @@ impl App {
         let (state, force_message_follow) = {
             let mut state = self.state.borrow_mut();
             if let Some(draft) = switch_composer_draft(&mut state, &self.message_input.value()) {
-                self.message_input.set_value(&draft);
+                self.set_composer_text(&draft);
             }
             let force_message_follow = state.force_message_follow;
             state.force_message_follow = false;
