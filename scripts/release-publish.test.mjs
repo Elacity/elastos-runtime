@@ -33,6 +33,8 @@ const packageRun = { id: 123, run_attempt: 1, head_sha: workflowCommit, head_bra
 const publicHead = 'QmZ9v8LQsW12TgsHKE9KtL5F1Vm3wtBe4BCNP9X6mEHWEh';
 const updatePin = { schema: 'elastos.update-hop.previous-release/v1', version: '1.2.2', release_cid: 'Qm' + 'R'.repeat(44),
   release_sha256: '9'.repeat(64), head_cid: publicHead, signer_did: did };
+const oldestPin = { ...updatePin, schema: 'elastos.update-hop.oldest-release/v1', components_schema: 'elastos.components/v1',
+  component_kinds: [], defers_newer_kinds: false };
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: 'utf8', env: { ...process.env, COPYFILE_DISABLE: '1' }, ...options });
@@ -54,7 +56,7 @@ function fixture(t, changes = {}) {
   cpSync(join(source, 'release-provenance-seal.py'), join(repo, 'scripts/release-provenance-seal.py'));
   const config = { root, repo, commit, tree, artifacts: {}, ciRuns: [ciRun], requiredJobs,
     ciJobs: requiredJobs.map(name => ({ name, status: 'completed', conclusion: 'success' })),
-    packageRun, workflowCommit, workflowTree, delivery, trees: {}, updatePin, ...changes };
+    packageRun, workflowCommit, workflowTree, delivery, trees: {}, updatePin, oldestPin, ...changes };
   for (const [root, blob] of [[tree, '7'.repeat(40)], [config.workflowTree, changes.workflowBlob || '7'.repeat(40)]]) {
     const github = sha(root + '.github').slice(0, 40), workflows = sha(root + 'workflows').slice(0, 40);
     const entry = (path, type, sha) => ({ path, type, mode: type === 'tree' ? '040000' : '100644', sha });
@@ -206,8 +208,10 @@ if (command === 'gh') {
   if (args.includes('add')) fs.cpSync(c.repo, args[args.indexOf('add') + 3], { recursive: true });
   else if (args.includes('rev-parse')) console.log(c.tree);
   else if (args.includes('show')) {
-    if (args.at(-1) !== c.commit + ':scripts/update-hop-previous-release.json' || !c.updatePin) process.exit(91);
-    console.log(JSON.stringify(c.updatePin, null, 2));
+    const pin = { [c.commit + ':scripts/update-hop-previous-release.json']: c.updatePin,
+      [c.commit + ':scripts/update-hop-oldest-release.json']: c.oldestPin }[args.at(-1)];
+    if (!pin) process.exit(91);
+    console.log(JSON.stringify(pin, null, 2));
   } else if (!args.includes('fetch') && !args.includes('prune')) process.exit(91);
 } else if (command === 'curl') {
   const url = args.at(-1);
@@ -371,14 +375,16 @@ for (const [label, changes, error] of [
   });
 }
 
-for (const [label, pin, error] of [
-  ['names the public release head', updatePin, null],
-  ['names an older release head', { ...updatePin, head_cid: 'QmUjzbkAaxa8StyyqL5qswtvFu2k6b6GqU552KkGLG8omY' },
+for (const [label, changes, error] of [
+  ['update journey pin names the public release head', {}, null],
+  ['update journey pin names an older release head', { updatePin: { ...updatePin, head_cid: 'QmUjzbkAaxa8StyyqL5qswtvFu2k6b6GqU552KkGLG8omY' } },
     /update journey did not start from the release users run now \(pinned head QmUjzbk\S+, public head QmZ9v8L\S+\)/],
-  ['is missing', null, /has no update journey pin/],
+  ['update journey pin is missing', { updatePin: null }, /has no update journey pin/],
+  ['oldest System-update pin is missing', { oldestPin: null }, /has no oldest System-update pin/],
+  ['oldest System-update pin is another file', { oldestPin: updatePin }, /has no oldest System-update pin/],
 ]) {
-  test(`prepare ${error ? 'refuses before any download' : 'continues'} when the source's update journey pin ${label}`, t => {
-    const f = fixture(t, { updatePin: pin });
+  test(`prepare ${error ? 'refuses before any download' : 'continues'} when the source's ${label}`, t => {
+    const f = fixture(t, changes);
     const result = f.prepare('1.2.3', ['aarch64-darwin']);
     const calls = readFileSync(join(f.root, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     const downloads = calls.filter(c => c.command === 'gh' && c.args.some(arg => arg.endsWith('/zip')));

@@ -138,11 +138,19 @@ async fn start_gateway_server_with_shutdown(
         None => None,
     };
     // Every Home start, local or public and whoever launched it, publishes its
-    // coordinates here. Cleanup then proves this Home ready before removing files.
-    let backup_cleanup = gateway_local_control.as_ref().map(|_| {
-        tokio::spawn(
-            crate::update_controller::finalize_principal_root_backups_after_start(data_dir.clone()),
-        )
+    // coordinates here. Cleanup then proves this Home ready before removing files,
+    // and this release installs support an older updater left to it.
+    let start_tasks = gateway_local_control.as_ref().map(|_| {
+        [
+            tokio::spawn(
+                crate::update_controller::finalize_principal_root_backups_after_start(
+                    data_dir.clone(),
+                ),
+            ),
+            tokio::spawn(
+                crate::update_controller::repair_deferred_support_after_start(data_dir.clone()),
+            ),
+        ]
     });
     let managed_owner = crate::runtime_control::gateway_children::Owner::read(&data_dir).ok();
     let advertised = advertised_gateway_urls(addr);
@@ -179,7 +187,7 @@ async fn start_gateway_server_with_shutdown(
             (&mut server).await
         }
     };
-    if let Some(task) = backup_cleanup {
+    for task in start_tasks.into_iter().flatten() {
         task.abort();
     }
     connections.shutdown();

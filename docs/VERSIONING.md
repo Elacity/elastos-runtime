@@ -255,7 +255,9 @@ a SHA-256 pin. It supports the attestation verification flags used by the signer
    anything, it refuses unless `scripts/update-hop-previous-release.json` at
    source H names the release head the origin serves now (its `head_cid`), so
    H's CI update journey started from the release users run; step 5 moves that
-   pin. N+1 of a pair keeps N's source and so its pin; it passes once the public
+   pin. It also refuses a source without `scripts/update-hop-oldest-release.json`
+   (see [Skipped releases](#skipped-releases)). N+1 of a pair keeps N's source
+   and so its pin; it passes once the public
    head is the head this Mac signed for N from the same run and that head
    follows the pin. It checks that the run
    succeeded from approved W/ref/event and that source H is on `develop`, downloads
@@ -365,6 +367,31 @@ command writes there) still in `RELEASE_WORK`. The printed seed commands carry
 every value as one shell word; `seed` refuses a signed head whose `signer_did`
 is not a `did:key` or whose `prev_head_cid` is not a canonical CID, and a first
 publication (no `prev_head_cid`) may start without saved publish state.
+
+## Skipped releases
+
+A Home may skip any number of releases. Its updater verifies the signed
+release as always (signer, channel, platform, version order and every signed
+hash), then installs the new Runtime and every component of a kind it knows.
+A component of a kind it does not know belongs to a newer release: the updater
+neither fetches nor installs it, names it in the update output and in
+`deferred-support.json` in the data directory, and the new Runtime's own
+repair installs it when Home starts and then removes that file. A signed
+release in a format the updater cannot read at all is not applied; System and
+`elastos update` say the install command is needed once and print it, from
+the publisher gateway the Home was installed from.
+
+Updaters released before this rule (0.8.0-alpha.15 and older) refuse a release
+with a component kind they do not know. `scripts/update-hop-oldest-release.json`
+names the oldest release that still updates in System, with the component
+kinds its signed releases ship. The source gate
+(`update-hop-compare.py check-oldest-start`, through its test) refuses a
+checkout whose `components.json` that release's updater cannot read or install;
+when it and the previous pin name one release, CI's update journey runs that
+start in full. To ship such a change anyway, decide that Homes on the pinned
+release run install.sh once, say so in the release notes, and move the pin
+with `python3 scripts/update-hop-compare.py pin-oldest-release` (it takes the
+previous pin and reads that release's signed components from the origin).
 
 ## Withdraw a bad release
 

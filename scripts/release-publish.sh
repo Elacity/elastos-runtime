@@ -99,6 +99,10 @@ checked_update_pin() (
     git -C "$ROOT" fetch -q origin "$commit"
     git -C "$ROOT" show "$commit:scripts/update-hop-previous-release.json" > "$scratch/pin.json" \
         || die "source $commit has no update journey pin (scripts/update-hop-previous-release.json)"
+    # Its CI also held the candidate to what the oldest release that updates in System can apply.
+    git -C "$ROOT" show "$commit:scripts/update-hop-oldest-release.json" > "$scratch/oldest.json" \
+        && jq -e '.schema == "elastos.update-hop.oldest-release/v1"' "$scratch/oldest.json" > /dev/null \
+        || die "source $commit has no oldest System-update pin (scripts/update-hop-oldest-release.json)"
     curl -fsS --max-time 20 --max-filesize 262144 "$ORIGIN/release-head.json" > "$scratch/head.json" \
         || die "cannot read the public release head"
     provenance update-pin --run "$run" --version "$version" --pin "$scratch/pin.json" --head "$scratch/head.json" || exit 1

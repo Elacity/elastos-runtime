@@ -474,6 +474,11 @@ fn admit_support(data: &Path, binary: &Path, components: &[u8]) -> Result<()> {
         .get("home")
         .map(|profile| &profile.components);
     for (name, component) in &manifest.external {
+        // A newer release's kind: an older updater admitting it before the new
+        // Runtime starts leaves it to that Runtime's own repair and admission.
+        if crate::setup::newer_kind(component, &platform) {
+            continue;
+        }
         let info = crate::setup::resolve_platform_info(component, &platform);
         let relative = crate::setup::resolve_install_path(component, info);
         if component.provider_runtime.is_some() {

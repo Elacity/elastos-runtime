@@ -1127,7 +1127,15 @@ impl Controller {
             if let Some(request) = self.request.as_ref() {
                 forget_refused_release(&self.directory, request)?;
             }
-            self.publish("updated", "Home is up to date.")
+            // The new release's own repair installs what this updater left to it.
+            self.publish(
+                "updated",
+                if crate::setup::deferred_support_pending(&self.receipt.data_dir) {
+                    "Home is up to date. It is installing the rest of this release's support."
+                } else {
+                    "Home is up to date."
+                },
+            )
         } else if self.host_ready
             && !InstallTransaction::has_pending_recovery(&self.receipt.binary)
             && status(&self.receipt.data_dir)?.is_some_and(|status| {
@@ -1583,22 +1591,25 @@ fn controller_file_digest(path: &Path) -> Result<Option<String>> {
 
 pub(crate) const REFUSED_MESSAGE: &str = "This update was refused because the publisher's signed release is not valid for this Home. Your current version is unchanged.";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ApplyFailure {
     SourceUnavailable,
     NotEnoughSpace,
     DownloadMismatch,
     Refused,
+    /// The updater's own plain words, with the install command to run once.
+    InstallerRequired(String),
     Unknown,
 }
 
 impl ApplyFailure {
-    fn message(self) -> &'static str {
+    fn message(&self) -> &str {
         match self {
             Self::SourceUnavailable => "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again.",
             Self::NotEnoughSpace => "There is not enough free disk space for this update. Your current version is unchanged. Free some space and select Update again.",
             Self::DownloadMismatch => "The downloaded update did not match what the publisher signed. Your current version is unchanged. Select Update again.",
             Self::Refused => REFUSED_MESSAGE,
+            Self::InstallerRequired(message) => message,
             Self::Unknown => "The update could not be completed. Your current version is unchanged. Select Update again.",
         }
     }
@@ -1615,6 +1626,11 @@ fn classify_apply_failure(error: &anyhow::Error) -> ApplyFailure {
         .any(|cause| cause.is::<crate::update::DownloadMismatch>())
     {
         ApplyFailure::DownloadMismatch
+    } else if let Some(installer) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::update::InstallerRequired>())
+    {
+        ApplyFailure::InstallerRequired(installer.to_string())
     } else if error
         .chain()
         .any(|cause| cause.is::<crate::update::ReleaseRefused>())
@@ -2027,19 +2043,8 @@ async fn finalize_after_start_attempt(data_dir: &Path) -> Result<Option<usize>> 
     if !crate::auth::principal_root_migration_cleanup_pending(data_dir).unwrap_or(true) {
         return Ok(Some(0));
     }
-    let binary =
-        crate::install_transaction::installed_binary(data_dir, installed_writer_binary(data_dir)?)?
-            .context("Migration backup cleanup needs an installed Runtime release.")?;
-    let binary = fs::canonicalize(
-        binary
-            .parent()
-            .context("installed Runtime parent is missing")?,
-    )?
-    .join(
-        binary
-            .file_name()
-            .context("installed Runtime name is missing")?,
-    );
+    let binary = installed_runtime_binary(data_dir)?
+        .context("Migration backup cleanup needs an installed Runtime release.")?;
     if InstallTransaction::has_pending_recovery(&binary) {
         return Ok(None);
     }
@@ -2058,6 +2063,84 @@ async fn finalize_after_start_attempt(data_dir: &Path) -> Result<Option<usize>> 
     )
     .await
     .map(Some)
+}
+
+/// The installed Runtime, with its parent resolved as the writer lock names it.
+fn installed_runtime_binary(data_dir: &Path) -> Result<Option<PathBuf>> {
+    let Some(binary) =
+        crate::install_transaction::installed_binary(data_dir, installed_writer_binary(data_dir)?)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        fs::canonicalize(
+            binary
+                .parent()
+                .context("installed Runtime parent is missing")?,
+        )?
+        .join(
+            binary
+                .file_name()
+                .context("installed Runtime name is missing")?,
+        ),
+    ))
+}
+
+/// Every Home gateway runs this beside its server. An older updater left support
+/// of a kind it did not know; this release's own repair installs it once the
+/// release transaction has settled and the installation writer is free.
+pub(crate) async fn repair_deferred_support_after_start(data_dir: PathBuf) {
+    let mut failures = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        match repair_deferred_support_attempt(&data_dir).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                failures += 1;
+                if failures == START_CLEANUP_ATTEMPTS {
+                    tracing::warn!(error = %error,
+                        "Deferred support not installed yet. Home repairs it at its next start or update.");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// `false` while a release transaction still owns the rollback; it may yet record
+/// what it leaves to this release.
+async fn repair_deferred_support_attempt(data_dir: &Path) -> Result<bool> {
+    let installed = fs::canonicalize(data_dir)
+        .map_err(anyhow::Error::from)
+        .and_then(|data| Ok(installed_runtime_binary(&data)?.map(|binary| (data, binary))));
+    let (data_dir, binary) = match installed {
+        Ok(Some(installed)) => installed,
+        Ok(None) => return Ok(true),
+        // Without a readable installed release, only a recorded deferral is an error.
+        Err(_) if !crate::setup::deferred_support_pending(data_dir) => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    let (data_dir, binary) = (data_dir.as_path(), binary.as_path());
+    if InstallTransaction::has_pending_recovery(binary) {
+        return Ok(false);
+    }
+    if !crate::setup::deferred_support_pending(data_dir) {
+        return Ok(true);
+    }
+    let Some(_writer) = crate::install_transaction::acquire_installed_writer(data_dir)? else {
+        return Ok(true);
+    };
+    crate::setup::repair_installed_support(
+        data_dir,
+        binary,
+        &installed_source(data_dir)?,
+        false,
+        crate::setup::CatalogueRepair::Optional,
+        crate::setup::FirstPartyCarrierContext::Runtime,
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn finalize_principal_root_migrations_after_ready(

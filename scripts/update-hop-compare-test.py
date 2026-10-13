@@ -3034,5 +3034,97 @@ class PreviousReleaseInstallTests(unittest.TestCase):
                     self.install(fixture)
 
 
+class OldestStartTests(unittest.TestCase):
+    """The update journey's second start: the oldest release that still updates in System."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name).resolve()
+        self.previous = {"schema": "elastos.update-hop.previous-release/v1", "version": "0.8.0-alpha.15",
+                         "release_cid": "Qm" + "R" * 44, "release_sha256": "9" * 64,
+                         "head_cid": observer.cli_v0_cid(b"alpha.15 head"), "signer_did": public_did(b"\x07" * 32)}
+        observer.write(self.root / "previous.json", self.previous)
+
+    def oldest(self, **changes):
+        oldest = {**self.previous, "schema": "elastos.update-hop.oldest-release/v1", "components_schema": "elastos.components/v1",
+                  "component_kinds": ["browser-vm-image"], "defers_newer_kinds": False, **changes}
+        observer.write(self.root / "oldest.json", oldest)
+
+    def check(self, strategies=("browser-vm-image",), schema="elastos.components/v1", metadata=None):
+        manifest = {"schema": schema, "profiles": {}, "external": {
+            "fixture-" + str(index): {"platforms": {"darwin-arm64": {"strategy": strategy}}}
+            for index, strategy in enumerate(strategies)}}
+        if metadata:
+            manifest["external"]["fixture-0"]["capsule_metadata"] = {"platforms": {"linux-arm64": {"strategy": metadata}}}
+        observer.write(self.root / "components.json", manifest)
+        return observer.cli_check_oldest_start(self.root / "components.json", self.root / "oldest.json", self.root / "previous.json")
+
+    def test_the_checkout_holds_to_what_the_pinned_oldest_release_applies(self):
+        self.assertEqual(observer.cli_check_oldest_start()["status"], "passed")
+        setup = Path(__file__).resolve().parent.parent / "elastos/crates/elastos-server/src/setup.rs"
+        self.assertIn(observer.CLI_DEFERRED_SUPPORT_MARKER, setup.read_bytes())
+
+    def test_a_kind_or_schema_the_oldest_updater_cannot_apply_is_refused(self):
+        self.oldest()
+        self.assertEqual(self.check((None, "prebuilt", "source-build", "local-copy", "browser-vm-image")),
+                         {"status": "passed", "oldest": "0.8.0-alpha.15", "previous": "0.8.0-alpha.15",
+                          "full_journey": True, "defers_newer_kinds": False})
+        # alpha.14 shipped no browser-vm-image, so its updater refused alpha.15 on ARM.
+        self.oldest(component_kinds=[])
+        with self.assertRaisesRegex(ValueError, r"0\.8\.0-alpha\.15's updater refuses the whole release for component kind\(s\) browser-vm-image\. .*pin-oldest-release"):
+            self.check()
+        self.oldest()
+        with self.assertRaisesRegex(ValueError, r"kind\(s\) future-kind\."):
+            self.check(metadata="future-kind")
+        # An updater that leaves newer kinds to their release admits them; the schema stays fixed.
+        self.oldest(defers_newer_kinds=True)
+        self.assertTrue(self.check(("future-kind",))["defers_newer_kinds"])
+        with self.assertRaisesRegex(ValueError, r"components schema 'elastos\.components/v2' is unreadable"):
+            self.check(schema="elastos.components/v2")
+
+    def test_the_oldest_pin_is_well_formed_and_not_newer_than_the_previous_release(self):
+        for changes, message in (({"version": "0.8.0-alpha.16"}, "newer than the release users run now"),
+                                 ({"release_sha256": "8" * 64}, "name one head with different releases"),
+                                 ({"component_kinds": ["b", "a"]}, "oldest release pin differs"),
+                                 ({"defers_newer_kinds": "no"}, "oldest release pin differs"),
+                                 ({"schema": "elastos.update-hop.previous-release/v1"}, "oldest release pin differs")):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, re.escape(message)):
+                self.oldest(**changes)
+                self.check()
+        self.oldest(version="0.8.0-alpha.13", head_cid=observer.cli_v0_cid(b"alpha.13 head"))
+        self.assertFalse(self.check()["full_journey"])
+
+    def test_pin_oldest_release_records_the_signed_components_of_every_platform(self):
+        components = {name: json.dumps({"schema": "elastos.components/v1", "profiles": {}, "external": {
+            "image": {"platforms": {"darwin-arm64": {"strategy": strategy}}}}}).encode()
+            for name, strategy in (("aarch64-darwin", "browser-vm-image"), ("x86_64-linux", "prebuilt"))}
+        served = {"/ipfs/Qm" + name: raw for name, raw in components.items()}
+        release = signing_fixture.sign_envelope({"schema": "elastos.release/v1", "channel": "stable", "version": "0.8.0-alpha.15",
+            "source": {"commit": "9" * 40, "tree": "8" * 40},
+            "platforms": {name: {"components": {"cid": "Qm" + name, "sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}}
+                          for name, raw in components.items()}}, "elastos.release.v1", b"\x07" * 32)
+        observer.write(self.root / "release.json", release)
+        raw = (self.root / "release.json").read_bytes()
+        self.previous.update(signer_did=release["signer_did"], release_sha256=hashlib.sha256(raw).hexdigest(), release_cid="b" + base64.b32encode(
+            b"\x01\x55\x12\x20" + hashlib.sha256(raw).digest()).decode().lower().rstrip("="))
+        observer.write(self.root / "previous.json", self.previous)
+        served["/ipfs/" + self.previous["release_cid"]] = raw
+        for defers in (False, True):
+            with self.subTest(defers=defers), patch.object(observer, "cli_origin_bytes", side_effect=lambda path, limit: served[path]), \
+                 patch.object(observer, "cli_source_defers_newer_kinds", return_value=defers) as source:
+                pin = observer.cli_pin_oldest_release(self.root / "oldest.json", self.root / "previous.json")
+                source.assert_called_once_with("9" * 40)
+                self.assertEqual(pin, {**self.previous, "schema": "elastos.update-hop.oldest-release/v1",
+                                       "components_schema": "elastos.components/v1", "component_kinds": ["browser-vm-image"],
+                                       "defers_newer_kinds": defers})
+                self.assertEqual(observer.cli_oldest_pin(self.root / "oldest.json"), pin)
+        served["/ipfs/Qmx86_64-linux"] = components["x86_64-linux"].replace(b"prebuilt", b"tampered")
+        with patch.object(observer, "cli_origin_bytes", side_effect=lambda path, limit: served[path]), \
+             patch.object(observer, "cli_source_defers_newer_kinds", return_value=False), \
+             self.assertRaisesRegex(ValueError, "x86_64-linux components differ from their signed hash"):
+            observer.cli_pin_oldest_release(self.root / "oldest.json", self.root / "previous.json")
+
+
 if __name__ == "__main__":
     unittest.main()

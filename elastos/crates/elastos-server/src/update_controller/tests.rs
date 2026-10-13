@@ -4034,6 +4034,41 @@ async fn home_starts_offline_without_its_catalogue_and_restores_it_once_reachabl
     );
 }
 
+/// What an older updater left to this release: its Home provider, of a kind that
+/// updater did not know, and the record naming it. This release's start installs
+/// the provider and clears the record; a start with nothing left does nothing.
+#[tokio::test]
+async fn home_start_installs_support_an_older_updater_left_to_this_release() {
+    let fixture = PrivateFixture::new();
+    let (source, provider, _, catalogue) = release_with_provider_and_catalogue(&fixture);
+    fixture.file(&fixture.data.join("model-catalog.json"), &catalogue, 0o600);
+    crate::setup::record_deferred_support(
+        &fixture.data,
+        &source.installed_version,
+        &["fixture-provider".to_string()],
+    )
+    .unwrap();
+    let (_, server, serving) = crate::setup::tests::carrier_cid_source(
+        &fixture.data,
+        &source,
+        std::collections::HashMap::from([(raw_cid(&provider), provider.clone())]),
+    )
+    .await;
+    assert!(repair_deferred_support_attempt(&fixture.data)
+        .await
+        .unwrap());
+    server.close().await;
+    assert_eq!(serving.await.unwrap(), [raw_cid(&provider)]);
+    assert_eq!(
+        fs::read(fixture.data.join("bin/fixture-provider")).unwrap(),
+        provider
+    );
+    assert!(!crate::setup::deferred_support_pending(&fixture.data));
+    assert!(repair_deferred_support_attempt(&fixture.data)
+        .await
+        .unwrap());
+}
+
 #[tokio::test]
 async fn stage_before_stop_preserves_home_on_fetch_or_verify_failure_and_restarts_once() {
     for outcome in [
@@ -4733,6 +4768,19 @@ fn apply_failures_are_classified_only_from_typed_evidence() {
             .unwrap_err()
             .context("staging"),
             ApplyFailure::Refused,
+        ),
+        (
+            // A newer signed format: plain words and the command, never "not valid".
+            crate::update::installer_required::<()>(
+                &serde_json::from_value(json!({"name":"fixture", "publisher_dids":["did:key:fixture"],
+                    "gateways":["https://publisher.example"]}))
+                .unwrap(),
+                "0.9.0",
+                crate::update::refused(Err(anyhow::anyhow!("release components use schema v2"))),
+            )
+            .unwrap_err()
+            .context("staging"),
+            ApplyFailure::InstallerRequired("ElastOS 0.9.0 needs the install command once; this Home cannot apply it itself. Your current version is unchanged. Run this once: curl -fsSL https://publisher.example/install.sh | bash".into()),
         ),
         (
             anyhow::anyhow!("Binary SHA-256 mismatch!"),

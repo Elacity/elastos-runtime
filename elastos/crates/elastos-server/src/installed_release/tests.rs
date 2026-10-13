@@ -434,7 +434,7 @@ fn signed_standalone_support_bytes_and_regular_file_are_required() {
         fs::write(&path, bytes).unwrap();
         let components = json!({"schema":"elastos.components/v1", "external":{"kubo":{
             "version":"fixture", "install_path":"bin/kubo", "platforms":{(crate::setup::detect_platform()):{
-                "strategy":"release", "install_path":"bin/kubo", "cid":raw_cid(bytes), "checksum":format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+                "strategy":"prebuilt", "install_path":"bin/kubo", "cid":raw_cid(bytes), "checksum":format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
             }}
         }}, "capsules":{}, "profiles":{"home":{"components":["kubo"]}}});
         fs::write(
@@ -613,7 +613,7 @@ fn setup_reader_admits_binary_only_installation_without_support_reads_or_writes(
         fs::write(fixture.data.join("model-catalog.json"), &catalogue).unwrap();
         let components = json!({"schema":"elastos.components/v1", "external":{"kubo":{
             "version":"fixture", "install_path":"bin/kubo", "platforms":{(crate::setup::detect_platform()):{
-                "strategy":"release", "install_path":"bin/kubo", "cid":raw_cid(support), "checksum":format!("sha256:{}", hex::encode(Sha256::digest(support)))
+                "strategy":"prebuilt", "install_path":"bin/kubo", "cid":raw_cid(support), "checksum":format!("sha256:{}", hex::encode(Sha256::digest(support)))
             }}
         }}, "capsules":{}, "profiles":{"home":{"components":["kubo"]}},
             "model_catalog":{"head_cid":raw_cid(&catalogue), "publisher_dids":[crate::crypto::encode_signing_key_did(&key(71))]}});

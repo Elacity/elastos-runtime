@@ -63,6 +63,11 @@ install-previous-release installs a disposable Home with the published
 install.sh, rolls it back to the pinned head over Carrier and copies the same
 layout out of it; releases build capsule archives reproducibly, so rebuilt
 archives are checked against their signed hashes.
+update-hop-oldest-release.json pins the oldest release that still updates in
+System (pin-oldest-release sets it to the previous pin, with the component kinds
+its signed releases ship). check-oldest-start, in the source gate, refuses a
+checkout whose components that release's updater cannot read or install; when
+both pins name one release the journey below runs that start in full.
 Old keeps that release's Runtime, Home support and source installer; CI
 republishes them under one disposable key, so this proves the published code and
 data layout, not the maintainer key. build.rs compiles this source twice: as new,
@@ -1638,15 +1643,20 @@ def cli_phase_version(manifest, phase):
     return cli_next_version(manifest["new"]["version"])
 
 
-def cli_previous_pin(path=None):
-    pin = cli_json(path or CLI_PREVIOUS_PIN)
-    need(set(pin) == {"schema", "version", "release_cid", "release_sha256", "head_cid", "signer_did"}
-         and pin["schema"] == "elastos.update-hop.previous-release/v1"
+CLI_PIN_FIELDS = {"version", "release_cid", "release_sha256", "head_cid", "signer_did"}
+
+
+def cli_release_pin_fields(pin, schema, extra, label):
+    need(isinstance(pin, dict) and set(pin) == CLI_PIN_FIELDS | {"schema", *extra} and pin["schema"] == schema
          and re.fullmatch(r"[0-9a-f]{64}", pin["release_sha256"]) and pin["signer_did"].startswith("did:key:z")
          and re.fullmatch(r"Qm[1-9A-HJ-NP-Za-km-z]{44}", pin["head_cid"]),
-         "previous release pin differs")
+         label + " pin differs")
     cli_next_version(pin["version"])
     return pin
+
+
+def cli_previous_pin(path=None):
+    return cli_release_pin_fields(cli_json(path or CLI_PREVIOUS_PIN), "elastos.update-hop.previous-release/v1", (), "previous release")
 
 
 def cli_previous_release(path, pin):
@@ -1689,6 +1699,89 @@ def cli_pin_previous_release(path=None):
         cli_previous_release(scratch / "release.json", pin)
     write(path or CLI_PREVIOUS_PIN, pin)
     return pin
+
+
+# The oldest release still meant to update in System; Homes on an older release run
+# install.sh once. check-oldest-start holds every candidate to what its updater applies.
+CLI_OLDEST_PIN = Path(__file__).with_name("update-hop-oldest-release.json")
+# Strategies every release updater installs. Release preparation replaces source-build and
+# release admission refuses local-copy, so neither reaches an older updater.
+CLI_INSTALLED_KINDS = (None, "prebuilt", "source-build", "local-copy")
+# The record an updater writes when it leaves a kind it does not know to the new release's
+# own repair; a release whose source writes it never refuses a release for a newer kind.
+CLI_DEFERRED_SUPPORT_MARKER = b'"deferred-support.json"'
+
+
+def cli_oldest_pin(path=None):
+    pin = cli_release_pin_fields(cli_json(path or CLI_OLDEST_PIN), "elastos.update-hop.oldest-release/v1",
+                                 ("components_schema", "component_kinds", "defers_newer_kinds"), "oldest release")
+    kinds = pin["component_kinds"]
+    need(isinstance(pin["components_schema"], str) and isinstance(pin["defers_newer_kinds"], bool)
+         and isinstance(kinds, list) and all(isinstance(kind, str) for kind in kinds) and kinds == sorted(set(kinds)),
+         "oldest release pin differs")
+    return pin
+
+
+def cli_component_kinds(manifest):
+    """Every strategy a components manifest names, for artifacts and capsule metadata alike."""
+    return {info.get("strategy") for component in manifest.get("external", {}).values()
+            for descriptor in (component, component.get("capsule_metadata") or {})
+            for info in descriptor.get("platforms", {}).values()}
+
+
+def cli_source_defers_newer_kinds(commit):
+    """Whether the release built from this develop commit leaves a newer kind to its release."""
+    subprocess.run(["git", "fetch", "-q", "origin", commit], cwd=Path(__file__).parent, check=False, timeout=120)
+    source = subprocess.run(["git", "show", commit + ":elastos/crates/elastos-server/src/setup.rs"], cwd=Path(__file__).parent,
+                            capture_output=True, check=True, timeout=60).stdout
+    return CLI_DEFERRED_SUPPORT_MARKER in source
+
+
+def cli_pin_oldest_release(path=None, previous_path=None):
+    """Make the pinned previous release the oldest that updates in System, from its signed
+    components on every platform. Homes on an older release then run install.sh once."""
+    pin = cli_previous_pin(previous_path)
+    with tempfile.TemporaryDirectory() as directory:
+        (Path(directory) / "release.json").write_bytes(cli_origin_bytes("/ipfs/" + pin["release_cid"], 1024 * 1024))
+        release = cli_previous_release(Path(directory) / "release.json", pin)
+    schemas, kinds = set(), set()
+    for platform_name, artifacts in sorted(release["platforms"].items()):
+        signed = artifacts["components"]
+        raw = cli_origin_bytes("/ipfs/" + signed["cid"], signed["size"])
+        need(len(raw) == signed["size"] and hashlib.sha256(raw).hexdigest() == signed["sha256"],
+             platform_name + " components differ from their signed hash")
+        manifest = json.loads(raw)
+        schemas.add(manifest.get("schema"))
+        kinds |= cli_component_kinds(manifest)
+    need(len(schemas) == 1 and isinstance(next(iter(schemas)), str), "oldest release components schemas differ")
+    oldest = {**{key: pin[key] for key in CLI_PIN_FIELDS}, "schema": "elastos.update-hop.oldest-release/v1",
+              "components_schema": schemas.pop(), "component_kinds": sorted(kinds - set(CLI_INSTALLED_KINDS)),
+              "defers_newer_kinds": cli_source_defers_newer_kinds(release["source"]["commit"])}
+    write(path or CLI_OLDEST_PIN, oldest)
+    return oldest
+
+
+def cli_check_oldest_start(manifest_path=None, oldest_path=None, previous_path=None):
+    """The update journey from the oldest release that updates in System, as its admission
+    subset: this checkout's components must be readable by that release's updater, and use only
+    kinds it installs unless it leaves newer kinds to the new release. The full journey starts
+    from the previous pin, so when both pins name one release it runs this start completely."""
+    oldest, previous = cli_oldest_pin(oldest_path), cli_previous_pin(previous_path)
+    need(cli_version_order(oldest["version"]) <= cli_version_order(previous["version"]),
+         "the oldest System-update release is newer than the release users run now")
+    same = oldest["head_cid"] == previous["head_cid"]
+    need(not same or all(oldest[key] == previous[key] for key in CLI_PIN_FIELDS),
+         "the oldest and previous release pins name one head with different releases")
+    manifest = cli_json(manifest_path or Path(__file__).parent.parent / "components.json")
+    remedy = (" Homes on " + oldest["version"] + " would need install.sh: move scripts/update-hop-oldest-release.json"
+              " forward with pin-oldest-release and say so in the release notes, or ship this later.")
+    need(manifest.get("schema") == oldest["components_schema"],
+         "this release's components schema " + repr(manifest.get("schema")) + " is unreadable by " + oldest["version"] + "'s updater." + remedy)
+    unknown = [] if oldest["defers_newer_kinds"] else sorted(
+        cli_component_kinds(manifest) - set(CLI_INSTALLED_KINDS) - set(oldest["component_kinds"]))
+    need(not unknown, oldest["version"] + "'s updater refuses the whole release for component kind(s) " + ", ".join(unknown) + "." + remedy)
+    return {"status": "passed", "oldest": oldest["version"], "previous": previous["version"],
+            "full_journey": same, "defers_newer_kinds": oldest["defers_newer_kinds"]}
 
 
 def cli_platform_entry(descriptor, platform_name):
@@ -3499,7 +3592,8 @@ def cli_check_result(result):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("operation", choices=("inspect", "run", "compare", "prepare-ci-disk", "pin-previous-release", "fetch-previous-release",
-                                              "install-previous-release", "build-ci-hop", "generate-ci-hop", "check-result"))
+                                              "install-previous-release", "build-ci-hop", "generate-ci-hop", "check-result",
+                                              "pin-oldest-release", "check-oldest-start"))
     parser.add_argument("input", type=Path, nargs="?")
     parser.add_argument("output", type=Path, nargs="?")
     parser.add_argument("--root", type=Path, help="physical downloaded CLI fixture root")
@@ -3520,9 +3614,10 @@ def main():
         if args.local_rehearsal is not None:
             need(args.operation in ("build-ci-hop", "generate-ci-hop", "inspect", "run"),
                  "local rehearsal applies only to CLI fixture build, generation, inspect and run")
-        if args.operation in ("prepare-ci-disk", "pin-previous-release"):
+        if args.operation in ("prepare-ci-disk", "pin-previous-release", "pin-oldest-release", "check-oldest-start"):
             need(all(value is None for value in (args.input, args.output, args.root, args.runtime, args.next_runtime, args.system_runtime, args.build_receipt, args.support_home, args.previous)), "this operation has fixed inputs")
-            print(json.dumps(cli_prepare_ci_disk() if args.operation == "prepare-ci-disk" else cli_pin_previous_release()))
+            print(json.dumps({"prepare-ci-disk": cli_prepare_ci_disk, "pin-previous-release": cli_pin_previous_release,
+                              "pin-oldest-release": cli_pin_oldest_release, "check-oldest-start": cli_check_oldest_start}[args.operation]()))
             return 0
         need(args.input is not None, "fixture input required")
         if args.operation == "fetch-previous-release":
