@@ -244,7 +244,13 @@ a SHA-256 pin. It supports the attestation verification flags used by the signer
    and bundles. Candidate scripts and executables stay in the build jobs.
    The job summary records each native artifact's ID and digest.
 2. **Prepare.** On the operator Mac, from a clone of this repository, run
-   `scripts/release-publish.sh prepare RUN_ID VERSION`. It checks that the run
+   `scripts/release-publish.sh prepare RUN_ID VERSION`. Before it downloads
+   anything, it refuses unless `scripts/update-hop-previous-release.json` at
+   source H names the release head the origin serves now (its `head_cid`), so
+   H's CI update journey started from the release users run; step 5 moves that
+   pin. N+1 of a pair keeps N's source and so its pin; it passes once the public
+   head is the head this Mac signed for N from the same run and that head
+   follows the pin. It checks that the run
    succeeded from approved W/ref/event and that source H is on `develop`, downloads
    and verifies all three platform artifacts with their native name suffixes
    and certificate-authenticated proof attempts. A retained native artifact from an earlier attempt can use its original
@@ -289,7 +295,8 @@ a SHA-256 pin. It supports the attestation verification flags used by the signer
 5. **Pin for CI.** Run `python3 scripts/update-hop-compare.py pin-previous-release`
    and merge the updated `scripts/update-hop-previous-release.json` into `develop`.
    It checks the signed head and release the seed now serves. Every pull
-   request's CI update journey then starts from this release.
+   request's CI update journey then starts from this release, and the next
+   `prepare` refuses a source without it.
 
 The seed only answers requests. It serves three Carrier ops: `release_head`
 (the signed head), `content_fetch` (any object by CID, from its Kubo pins) and
@@ -325,9 +332,15 @@ tools is an explicit new approval, rather than preparation-time discovery.
 
 Seed details come from `RELEASE_SEED`, `RELEASE_SEED_DATA`,
 `RELEASE_SEED_UNIT`, `RELEASE_SEED_STAGE`, `RELEASE_SEED_RUNTIME` and
-`RELEASE_SEED_USER`, not from this repository. Publish N first; after N is
+`RELEASE_SEED_USER`, not from this repository. `RELEASE_SEED_DATA` is the
+service's `$XDG_DATA_HOME/elastos` (absolute, ending in `/elastos`); the seed
+scripts export its parent as `XDG_DATA_HOME`. Publish N first; after N is
 accepted on a real install, prepare N+1 from the same run before its artifacts
-expire (14 days).
+expire (14 days), with N's work directory (and the `signed` directory the policy
+command writes there) still in `RELEASE_WORK`. The printed seed commands carry
+every value as one shell word; `seed` refuses a signed head whose `signer_did`
+is not a `did:key` or whose `prev_head_cid` is not a canonical CID, and a first
+publication (no `prev_head_cid`) may start without saved publish state.
 
 ## Withdraw a bad release
 

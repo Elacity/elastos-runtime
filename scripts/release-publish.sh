@@ -34,7 +34,15 @@ SOURCE_ROOT=/opt/elastos/release-source
 
 die() { echo "release-publish: $*" >&2; exit 1; }
 need_env() { local name; for name; do [[ -n "${!name:-}" ]] || die "set $name"; done; }
+# The Runtime reads dirs::data_dir()/elastos, i.e. $XDG_DATA_HOME/elastos; ELASTOS_DATA_DIR alone is not enough.
+need_seed_data() {
+    need_env RELEASE_SEED_DATA
+    [[ "$RELEASE_SEED_DATA" == /*/elastos ]] \
+        || die "RELEASE_SEED_DATA must be an absolute path ending in /elastos, because the Runtime reads \$XDG_DATA_HOME/elastos"
+}
 sha() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
+# One shell word in printed commands, whatever the value holds.
+q() { printf '%q' "$1"; }
 artifact_prefix() {
     case "$1" in aarch64-darwin) echo release-mac ;; *) echo "release-$1" ;; esac
 }
@@ -80,6 +88,20 @@ checked_ci() {
     echo "$ci"
 }
 
+# CI's update journey at the source starts from its pinned release: the head users run now, or for
+# N+1 of a pair the head before N, once the public head is the N this Mac signed from the same run.
+checked_update_pin() (
+    local run="$1" version="$2" commit="$3" scratch
+    scratch=$(realpath "$(mktemp -d)")
+    trap 'rm -rf "$scratch"' EXIT
+    git -C "$ROOT" fetch -q origin "$commit"
+    git -C "$ROOT" show "$commit:scripts/update-hop-previous-release.json" > "$scratch/pin.json" \
+        || die "source $commit has no update journey pin (scripts/update-hop-previous-release.json)"
+    curl -fsS --max-time 20 --max-filesize 262144 "$ORIGIN/release-head.json" > "$scratch/head.json" \
+        || die "cannot read the public release head"
+    provenance update-pin --run "$run" --version "$version" --pin "$scratch/pin.json" --head "$scratch/head.json" || exit 1
+)
+
 # Print the same source and run identities at each operator handoff.
 publication_record() {
     local work="$1" commit run ci_id ci_url
@@ -96,7 +118,7 @@ publication_record() {
 seed_preamble() {
     cat <<EOF
 # On the seed as the service user, with GH_TOKEN allowed to read Actions artifacts:
-set -euo pipefail; umask 077; install -d -m 700 $1; cd $1
+set -euo pipefail; umask 077; install -d -m 700 $(q "$1"); cd $(q "$1")
 get() { curl -fsSL -H "Authorization: Bearer \$GH_TOKEN" -o "\$1.zip" "https://api.github.com/repos/$REPO/actions/artifacts/\$2/zip"
         echo "\$3  \$1.zip" | sha256sum -c --quiet; unzip -q "\$1.zip" -d "\$1"; (cd "\$1" && sha256sum -c --quiet SHA256SUMS); }
 EOF
@@ -119,6 +141,7 @@ prepare() {
     [[ "$seen" == *" aarch64-darwin "* ]] || die "operator Mac inputs must include aarch64-darwin"
     need_env RELEASE_SEED RELEASE_SEED_DATA
     approval_json=$(provenance approval) || die "independent approval refused"
+    checked_update_pin "$run" "$version" "$(jq -r .source.commit <<< "$approval_json")"
     run_attempt=$(provenance run --run "$run") || die "package producer refused"
     work=$(work_dir "$version")
     [[ ! -e "$work" ]] || die "$work exists; remove it to prepare again"
@@ -177,7 +200,6 @@ prepare() {
     ci_run=$(checked_ci "$commit")
     echo "# Develop CI run: $(jq -r '[(.id | tostring), .url] | join(" ")' <<< "$ci_run")"
     [[ ${#platforms[@]} -gt 1 ]] || args+=(--preview-platform aarch64-darwin)
-    git -C "$ROOT" fetch -q origin "$commit"
     git -C "$ROOT" worktree prune  # a removed earlier work folder must not block the add
     git -C "$ROOT" worktree add -q --detach "$work/source" "$commit"
     [[ "$(git -C "$work/source" rev-parse 'HEAD^{tree}')" == "$tree" ]] || die "source tree differs"
@@ -239,11 +261,18 @@ policy() {
 
 seed() {
     [[ $# == 2 ]] || die "usage: seed VERSION SIGNED_DIR"
-    need_env RELEASE_SEED RELEASE_SEED_DATA RELEASE_SEED_UNIT RELEASE_SEED_STAGE RELEASE_SEED_RUNTIME
-    local version="$1" signed work run name did platform id digest stage file artifact_commit artifact_attempt candidate recorded local_files=()
+    need_env RELEASE_SEED RELEASE_SEED_UNIT RELEASE_SEED_STAGE RELEASE_SEED_RUNTIME
+    need_seed_data
+    local version="$1" signed work run name did prev platform id digest stage file artifact_commit artifact_attempt candidate recorded local_files=() state check
     signed=$(realpath "$2") work=$(work_dir "$version")
     run=$(jq -er .run "$work/run.json")
     name=$(jq -er .input "$work/run.json")
+    did=$(jq -er .signer_did "$signed/release-head.json")
+    prev=$(jq -r '.payload.prev_head_cid // ""' "$signed/release-head.json")
+    # Both reach the printed seed commands, which run before the Runtime verifies the signature.
+    [[ "$did" =~ ^did:key:z[1-9A-HJ-NP-Za-km-z]{1,128}$ ]] || die "signed head signer_did is not a did:key"
+    [[ -z "$prev" || "$prev" =~ ^(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{58})$ ]] \
+        || die "signed head prev_head_cid is not a canonical CID"
     # Keep the prepared input identity through the last operator handoff.
     while read -r platform; do
         read -r id digest artifact_commit artifact_attempt <<< "$(checked_artifact "$run" "$(artifact_prefix "$platform")")"
@@ -255,7 +284,6 @@ seed() {
             || die "$platform package changed after preparation; prepare and sign the new candidate"
     done < <(jq -er '.platforms[]' "$work/run.json")
     publication_record "$work"
-    did=$(jq -er .signer_did "$signed/release-head.json")
     stage="$RELEASE_SEED_STAGE/$version"
     (cd "$signed" && shasum -a 256 -- *) > "$work/signed.SHA256SUMS"
     # The seed takes native artifacts from the run; every other signed file is
@@ -265,45 +293,56 @@ seed() {
     done
     cat <<EOF
 # On this Mac: copy every signed file the run does not carry, and the signed hash list.
-ssh $RELEASE_SEED 'install -d -m 700 $stage/signed'
-scp ${local_files[*]} $RELEASE_SEED:$stage/signed/
-scp $work/signed.SHA256SUMS $RELEASE_SEED:$stage/
+ssh $(q "$RELEASE_SEED") install -d -m 700 $(q "$(q "$stage/signed")")
+scp $(for file in "${local_files[@]}"; do printf '%q ' "$file"; done)$(q "$RELEASE_SEED:$stage/signed/")
+scp $(q "$work/signed.SHA256SUMS") $(q "$RELEASE_SEED:$stage/")
 
 EOF
     seed_preamble "$stage"
+    # Same file the Runtime will read; fail in seconds, not after the downloads. Before the first
+    # publication (no prev_head_cid) there may be no saved state, which the Runtime reads as empty.
+    # A rerun of the committed version passes; the Runtime then checks its exact head CID.
+    state="$RELEASE_SEED_DATA/ElastOS/SystemServices/Publisher/publish-state.json"
+    check="jq -e --arg prev $(q "$prev") --arg version $(q "$version") '(.last_head_cid // \"\") == \$prev or .last_version == \$version' $(q "$state") > /dev/null"
+    [[ -n "$prev" ]] || check="[ ! -e $(q "$state") ] || $check"
+    cat <<EOF
+$check \\
+    || { echo 'saved publish state neither precedes the signed head (prev_head_cid) nor holds this version; check RELEASE_SEED_DATA' >&2; exit 1; }
+EOF
     while read -r platform; do
         id=$(jq -er --arg platform "$platform" '.receipts[] | select(.platform == $platform) | .artifact.id' "$work/run.json")
         digest=$(jq -er --arg platform "$platform" '.receipts[] | select(.platform == $platform) | .artifact.digest | sub("^sha256:"; "")' "$work/run.json")
         cat <<EOF
-get $platform $id $digest
-mkdir -p inputs/$platform
-cat $platform/release-inputs.tar.gz.part* | tar -xzf - --strip-components=1 -C inputs/$platform
-(cd inputs/$platform && sha256sum -c --quiet SHA256SUMS)
+get $(q "$platform") $(q "$id") $(q "$digest")
+mkdir -p inputs/$(q "$platform")
+cat $(q "$platform")/release-inputs.tar.gz.part* | tar -xzf - --strip-components=1 -C inputs/$(q "$platform")
+(cd inputs/$(q "$platform") && sha256sum -c --quiet SHA256SUMS)
 EOF
     done < <(jq -er '.platforms[]' "$work/run.json")
     cat <<EOF
 cut -c67- signed.SHA256SUMS | while read -r f; do
     [ -e "signed/\$f" ] && continue
-    for input in inputs/*/$name/artifacts/"\$f"; do [ -f "\$input" ] && { cp "\$input" signed/; break; }; done
+    for input in inputs/*/$(q "$name")/artifacts/"\$f"; do [ -f "\$input" ] && { cp "\$input" signed/; break; }; done
 done
 (cd signed && sha256sum -c --quiet ../signed.SHA256SUMS)
 [ "\$(ls signed | wc -l)" = "\$(wc -l < signed.SHA256SUMS)" ]
-export ELASTOS_DATA_DIR=$RELEASE_SEED_DATA
-publish() { $RELEASE_SEED_RUNTIME publish-release --version $version --channel canary --signed-publication signed \\
-            --publisher-did $did --ipfs-provider-bin $RELEASE_SEED_DATA/bin/ipfs-provider "\$@"; }
-sudo -v; [ -x $RELEASE_SEED_RUNTIME ]; [ -x $RELEASE_SEED_DATA/bin/ipfs-provider ]; [ -w $RELEASE_SEED_DATA ]
-sudo systemctl stop $RELEASE_SEED_UNIT
-trap 'sudo systemctl start $RELEASE_SEED_UNIT' EXIT  # the seed is never left down
+export ELASTOS_DATA_DIR=$(q "$RELEASE_SEED_DATA") XDG_DATA_HOME=$(q "${RELEASE_SEED_DATA%/elastos}")
+publish() { $(q "$RELEASE_SEED_RUNTIME") publish-release --version $(q "$version") --channel canary --signed-publication signed \\
+            --publisher-did $(q "$did") --ipfs-provider-bin $(q "$RELEASE_SEED_DATA/bin/ipfs-provider") "\$@"; }
+sudo -v; [ -x $(q "$RELEASE_SEED_RUNTIME") ]; [ -x $(q "$RELEASE_SEED_DATA/bin/ipfs-provider") ]; [ -w $(q "$RELEASE_SEED_DATA") ]
+unit=$(q "$RELEASE_SEED_UNIT"); sudo systemctl stop "\$unit"
+trap 'sudo systemctl start "\$unit"' EXIT  # the seed is never left down
 publish --preflight-only
 # Seeds on a Runtime older than the announcement removal still end with the old announcement error after commit; remove this once the seed runs a newer Runtime (#174).
 publish 2>&1 | tee import.log || grep -q 'committed; retry publication to announce its head: No running runtime found' import.log
-trap - EXIT; sudo systemctl start $RELEASE_SEED_UNIT
+trap - EXIT; sudo systemctl start "\$unit"
 EOF
 }
 
 seed_upgrade() {
     [[ $# == 1 && "$1" =~ ^[1-9][0-9]*$ ]] || die "usage: seed-upgrade RUN_ID"
-    need_env RELEASE_SEED_USER RELEASE_SEED_DATA RELEASE_SEED_UNIT RELEASE_SEED_STAGE RELEASE_SEED_RUNTIME
+    need_env RELEASE_SEED_USER RELEASE_SEED_UNIT RELEASE_SEED_STAGE RELEASE_SEED_RUNTIME
+    need_seed_data
     local pkg id digest commit ci_run seed_proof_dir receipt source_tree artifact_attempt proof_id proof_digest proof_attempt
     pkg=$(checked_artifact "$1" release-seed)
     read -r id digest commit artifact_attempt <<< "$pkg"
@@ -337,7 +376,7 @@ jq --arg c "sha256:\$(sha256sum seed/ipfs-provider | cut -d ' ' -f 1)" --argjson
    '.external["ipfs-provider"].platforms["linux-amd64"] += {checksum: \$c, size: \$s}' \\
    $RELEASE_SEED_DATA/components.json > components.json
 sudo -v; [ -w /opt/elastos ]; [ -w \$(dirname $RELEASE_SEED_RUNTIME) ]; [ -w $RELEASE_SEED_DATA/bin ]; [ -w $RELEASE_SEED_DATA ]
-export ELASTOS_DATA_DIR=$RELEASE_SEED_DATA
+export ELASTOS_DATA_DIR=$RELEASE_SEED_DATA XDG_DATA_HOME=${RELEASE_SEED_DATA%/elastos}
 sudo systemctl stop $RELEASE_SEED_UNIT
 trap 'sudo systemctl start $RELEASE_SEED_UNIT' EXIT  # the seed is never left down
 rm -rf $SOURCE_ROOT; mv $SOURCE_ROOT.new $SOURCE_ROOT

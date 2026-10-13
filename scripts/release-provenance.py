@@ -104,9 +104,35 @@ def bind(approval_path, approval, digest, work):
         path.chmod(0o400)
 
 
+def update_pin(approval, work_root, run, version, pin_path, head_path):
+    """Admit only a source whose CI update journey started from the release users run now.
+
+    The source's pin must name the public head. N+1 of a pair keeps the pin of the head before
+    N; it passes only if the public head is byte for byte the head this Mac signed for N,
+    prepared as N from the same package run and source, and that head follows the pin."""
+    pinned = S.parse_json(S.regular_bytes(pin_path, 64 * 1024)).get("head_cid")
+    raw = S.regular_bytes(head_path, 256 * 1024)
+    public = S.unixfs_metadata_cid(raw)
+    if public == pinned:
+        return
+    try:
+        payload = S.parse_json(raw).get("payload")
+        other = payload["version"]
+        S.require(type(other) is str and S.VERSION.fullmatch(other) and other != version, "not a paired N")
+        signed = S.regular_bytes(work_root / other / "signed/release-head.json", 256 * 1024)
+        record = S.parse_json(S.regular_bytes(work_root / other / "run.json", S.MAX_JSON))
+        source = S.parse_json(S.regular_bytes(work_root / other / "unsigned/signing-input.json", S.MAX_JSON))["source"]
+        paired = (signed == raw and record["run"] == str(run) and record["input"] == "N"
+                  and source == approval["source"] and payload["prev_head_cid"] == pinned)
+    except (ValueError, OSError, KeyError, TypeError):
+        paired = False
+    S.require(paired, f"the candidate's update journey did not start from the release users run now (pinned head {pinned}, "
+                      f"public head {public}); bump the pin with scripts/update-hop-compare.py pin-previous-release and rerun CI")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("approval", "run", "artifact", "receipt", "seed", "bind"))
+    parser.add_argument("command", choices=("approval", "update-pin", "run", "artifact", "receipt", "seed", "bind"))
     parser.add_argument("--approval", required=True, type=Path)
     parser.add_argument("--work-root", required=True, type=Path)
     parser.add_argument("--run", type=int)
@@ -117,11 +143,16 @@ def main():
     parser.add_argument("--payload-root", type=Path)
     parser.add_argument("--version")
     parser.add_argument("--work", type=Path)
+    parser.add_argument("--pin", type=Path)
+    parser.add_argument("--head", type=Path)
     args = parser.parse_args()
     work_root = args.work_root.resolve()
     approval, digest = S.approved_release(args.approval, input_root=work_root)
     if args.command == "approval":
         print(json.dumps({"sha256": digest, "source": approval["source"], "workflow": approval["workflow"], "delivery": approval["delivery"], "gh": approval["gh"]}))
+        return
+    if args.command == "update-pin":
+        update_pin(approval, work_root, args.run, args.version, args.pin, args.head)
         return
     if args.command == "bind":
         bind(args.approval, approval, digest, args.work.resolve())
