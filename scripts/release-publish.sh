@@ -123,6 +123,15 @@ prepare() {
     work=$(work_dir "$version")
     [[ ! -e "$work" ]] || die "$work exists; remove it to prepare again"
     mkdir -p "$work/state" "$work/data"
+    # Check the delivery identities first: seconds, while the platform inputs below
+    # take hours to download (#319).
+    curl -fsS --max-time 20 "$ORIGIN/.well-known/elastos/carrier-bootstrap.json?role=publisher" > "$work/bootstrap.json"
+    did=$(curl -fsS --max-time 20 "$ORIGIN/release-head.json" | jq -er .signer_did)
+    [[ "$ORIGIN" == "$(jq -r .delivery.PUBLISHER_GATEWAY <<< "$approval_json")" \
+        && "$did" == "$(jq -r .delivery.MAINTAINER_DID <<< "$approval_json")" \
+        && "$(jq -r .node_id "$work/bootstrap.json")" == "$(jq -r .delivery.PUBLISHER_NODE_ID <<< "$approval_json")" \
+        && "$(jq -r .ticket "$work/bootstrap.json")" == "$(jq -r .delivery.SOURCE_CONNECT_TICKET <<< "$approval_json")" ]] \
+        || die "publisher bootstrap differs from independent delivery approval"
     for platform in "${platforms[@]}"; do
         id=$(checked_artifact "$run" "$(artifact_prefix "$platform")")
         read -r id digest artifact_commit artifact_attempt <<< "$id"
@@ -169,19 +178,13 @@ prepare() {
     echo "# Develop CI run: $(jq -r '[(.id | tostring), .url] | join(" ")' <<< "$ci_run")"
     [[ ${#platforms[@]} -gt 1 ]] || args+=(--preview-platform aarch64-darwin)
     git -C "$ROOT" fetch -q origin "$commit"
+    git -C "$ROOT" worktree prune  # a removed earlier work folder must not block the add
     git -C "$ROOT" worktree add -q --detach "$work/source" "$commit"
     [[ "$(git -C "$work/source" rev-parse 'HEAD^{tree}')" == "$tree" ]] || die "source tree differs"
     for platform in "${platforms[@]}"; do
         (cd "$work/source" && python3 -I -S scripts/release-platform-input.py verify "$work/inputs/$platform/$name" > /dev/null)
     done
     tar -xzf "$work/inputs/aarch64-darwin/$name/artifacts/kubo-darwin-arm64.tar.gz" -C "$work" kubo/ipfs
-    curl -fsS --max-time 20 "$ORIGIN/.well-known/elastos/carrier-bootstrap.json?role=publisher" > "$work/bootstrap.json"
-    did=$(curl -fsS --max-time 20 "$ORIGIN/release-head.json" | jq -er .signer_did)
-    [[ "$ORIGIN" == "$(jq -r .delivery.PUBLISHER_GATEWAY <<< "$approval_json")" \
-        && "$did" == "$(jq -r .delivery.MAINTAINER_DID <<< "$approval_json")" \
-        && "$(jq -r .node_id "$work/bootstrap.json")" == "$(jq -r .delivery.PUBLISHER_NODE_ID <<< "$approval_json")" \
-        && "$(jq -r .ticket "$work/bootstrap.json")" == "$(jq -r .delivery.SOURCE_CONNECT_TICKET <<< "$approval_json")" ]] \
-        || die "publisher bootstrap differs from independent delivery approval"
     state="$RELEASE_SEED_DATA/ElastOS/SystemServices/Publisher/publish-state.json"
     scp -q "$RELEASE_SEED:$state" "$work/state/publish-state.json"
     printf '%s\n' "${platforms[@]}" | jq -Rn --arg run "$run" --arg name "$name" --argjson ci_run "$ci_run" \

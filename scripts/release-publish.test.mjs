@@ -184,7 +184,7 @@ if (command === 'gh') {
 } else if (command === 'git') {
   if (args.includes('add')) fs.cpSync(c.repo, args[args.indexOf('add') + 3], { recursive: true });
   else if (args.includes('rev-parse')) console.log(c.tree);
-  else if (!args.includes('fetch')) process.exit(91);
+  else if (!args.includes('fetch') && !args.includes('prune')) process.exit(91);
 } else if (command === 'curl') {
   const url = args.at(-1);
   if (url.endsWith('/zip')) {
@@ -326,6 +326,11 @@ for (const [label, changes, error] of [
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, error);
     assert.throws(() => f.args(), { code: 'ENOENT' });
+    if (label.startsWith('changed bootstrap')) {
+      // The identity check runs before the hours-long input downloads.
+      assert.throws(() => readFileSync(join(f.root, 'work/1.2.3/inputs/aarch64-darwin/N1/platform-input.json')),
+        { code: 'ENOENT' });
+    }
   });
 }
 
