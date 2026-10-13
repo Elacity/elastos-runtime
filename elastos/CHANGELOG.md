@@ -8,26 +8,28 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Fixed
 
-- The installer accepts a home or data directory under `/tmp` (on macOS
-  `/private/tmp`). It refused it as world-writable and advised
-  `sudo chmod go-w /private/tmp`, which would break the system. A root-owned
-  directory with the sticky bit is safe on the path, because other users
-  cannot rename or remove entries they do not own. Other group- or
-  world-writable root directories are still refused, and the message now says
-  to install under your own home instead of advising a change to a system
-  directory. The Runtime's media tool path check follows the same rule.
-- The installer and the Runtime accept an installation folder, data folder
-  or data-folder parent of yours that only your own user-private group can
-  also write, as Ubuntu's default umask 0002 leaves `~/.local/bin` and
-  `~/.local/share`. They refused a fresh Ubuntu account with "fix with:
-  chmod go-w". The group must be your primary group with no other members
-  and no other account using it as primary group; a shared group, a group
-  that cannot be looked up, or a world-writable folder is still refused. One
-  rule (`only_owner_can_write`) serves the folder and parent checks in the
-  installer and in the Runtime's install writer and media tool path check.
+- The installer accepts a home or data folder under `/tmp` (on macOS
+  `/private/tmp`). It refused it and advised `sudo chmod go-w /private/tmp`,
+  which would break the system. For a system folder others can write, the
+  installer now tells you to install under your own home instead.
+- On Ubuntu, the installer no longer refuses `~/.local/bin`, `~/.local/share`
+  or the data folder when your own private group can write them, as the
+  default umask 0002 leaves them. A folder another group or everyone can
+  write is still refused.
 
 ### Developer detail
 
+- A root-owned folder with the sticky bit, such as `/tmp`, is accepted on the
+  data folder's path in the installer and the Runtime's media tool path check:
+  other users cannot rename or remove entries they do not own. Other
+  group- or world-writable root folders are refused without chmod advice.
+- One rule (`only_owner_can_write` in `scripts/install.sh` and
+  `install_transaction.rs`) decides the installer's folder and parent checks,
+  the Runtime install writer and the media tool path check. A group-writable
+  folder of yours is accepted only when its group is your primary group, the
+  group lists no other member and no other account uses it as primary group
+  (`getent`, or `dscacheutil` on macOS; libc in the Runtime). A group that
+  cannot be looked up is refused.
 - CI's `release-upstream-assets` job runs the release's upstream asset build
   (`scripts/release-upstream-assets.py`, including the Browser helper source
   builds) for Linux ARM64 and Apple Silicon on every pull request that changes
