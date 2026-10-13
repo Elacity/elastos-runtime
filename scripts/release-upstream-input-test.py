@@ -274,6 +274,80 @@ class UpstreamTest(unittest.TestCase):
                 upstream.response(source)
             build.return_value.open.return_value.close.assert_called_once()
 
+    def reply(self, data, failure=None):
+        """An HTTP 200 reply whose body yields `data`, then raises `failure` if given."""
+        class Reply(io.BytesIO):
+            status, headers = 200, {}
+
+            def read(inner, size=-1):
+                chunk = super().read(size)
+                if not chunk and failure is not None:
+                    raise failure
+                return chunk
+        return Reply(data)
+
+    def test_transient_upstream_errors_are_retried_and_permanent_ones_are_not(self):
+        source = {"url": "https://upstream.example.test/input", "checksum": "sha256:" + hashlib.sha256(b"inert").hexdigest(), "max_bytes": 10}
+        busy = lambda: urllib.error.HTTPError(source["url"], 504, "Gateway Time-out", {}, io.BytesIO())
+        with patch.object(upstream.urllib.request, "build_opener") as build, \
+                patch.object(upstream.time, "sleep") as sleep:
+            build.return_value.open.side_effect = [busy(), busy(), self.reply(b"inert")]
+            self.assertEqual(upstream.cached_input(source, self.cache).read_bytes(), b"inert")
+            self.assertEqual(build.return_value.open.call_count, 3)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
+        source["checksum"] = "sha256:" + hashlib.sha256(b"other").hexdigest()
+        with patch.object(upstream.urllib.request, "build_opener") as build, \
+                patch.object(upstream.time, "sleep"):
+            build.return_value.open.side_effect = [busy() for _ in range(4)]
+            with self.assertRaises(urllib.error.HTTPError):
+                upstream.cached_input(source, self.cache)
+            self.assertEqual(build.return_value.open.call_count, 4)
+        with patch.object(upstream.urllib.request, "build_opener") as build, \
+                patch.object(upstream.time, "sleep") as sleep:
+            build.return_value.open.side_effect = urllib.error.HTTPError(source["url"], 404, "Not Found", {}, io.BytesIO())
+            with self.assertRaises(urllib.error.HTTPError):
+                upstream.cached_input(source, self.cache)
+            self.assertEqual(build.return_value.open.call_count, 1)
+            sleep.assert_not_called()
+        self.assertEqual(sorted(p.name for p in self.cache.iterdir()), ["sha256-" + hashlib.sha256(b"inert").hexdigest()])
+
+    def test_body_read_failures_restart_the_whole_download(self):
+        data = b"payload bytes"
+        source = {"url": "https://upstream.example.test/input", "checksum": "sha256:" + hashlib.sha256(data).hexdigest(), "max_bytes": 32}
+        for failure in (TimeoutError("read timed out"), ConnectionResetError("reset by peer"),
+                        upstream.http.client.IncompleteRead(b"pay", 10)):
+            with self.subTest(failure=type(failure).__name__):
+                for path in self.cache.glob("*"):
+                    path.unlink()
+                with patch.object(upstream.urllib.request, "build_opener") as build, \
+                        patch.object(upstream.time, "sleep") as sleep:
+                    build.return_value.open.side_effect = [self.reply(data[:7], failure), self.reply(data)]
+                    path = upstream.cached_input(source, self.cache)
+                    self.assertEqual(path.read_bytes(), data)
+                    self.assertEqual(build.return_value.open.call_count, 2)
+                    self.assertEqual([call.args[0] for call in sleep.call_args_list], [2])
+                self.assertEqual([p.name for p in self.cache.iterdir()], [path.name])
+
+    def test_repeated_body_failures_give_up_and_checksum_mismatch_is_not_retried(self):
+        data = b"payload bytes"
+        source = {"url": "https://upstream.example.test/input", "checksum": "sha256:" + hashlib.sha256(data).hexdigest(), "max_bytes": 32}
+        with patch.object(upstream.urllib.request, "build_opener") as build, \
+                patch.object(upstream.time, "sleep") as sleep:
+            build.return_value.open.side_effect = [self.reply(data[:4], ConnectionResetError("reset")) for _ in range(4)]
+            with self.assertRaises(ConnectionResetError):
+                upstream.cached_input(source, self.cache)
+            self.assertEqual(build.return_value.open.call_count, 4)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4, 8])
+        self.assertEqual(list(self.cache.iterdir()), [])
+        with patch.object(upstream.urllib.request, "build_opener") as build, \
+                patch.object(upstream.time, "sleep") as sleep:
+            build.return_value.open.side_effect = [self.reply(b"tampered bytes"), self.reply(data)]
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                upstream.cached_input(source, self.cache)
+            self.assertEqual(build.return_value.open.call_count, 1)
+            sleep.assert_not_called()
+        self.assertEqual(list(self.cache.iterdir()), [])
+
     def test_kubo_recipes_accept_official_asset_redirect_and_refuse_unlisted_host(self):
         inventory = json.loads(Path(__file__).with_name("release-upstream-recipes.json").read_text())
         recipes = [recipe for recipe in inventory["recipes"] if recipe["component"] == "kubo"]

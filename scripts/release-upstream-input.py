@@ -8,6 +8,7 @@ owns the package checksum; release publication supplies its Carrier CID.
 import argparse
 import gzip
 import hashlib
+import http.client
 import io
 import importlib.util
 import json
@@ -19,6 +20,7 @@ import stat
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -135,6 +137,16 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
+
+
+def transient(error):
+    """429/5xx, timeouts, dropped connections and truncated bodies may pass on a retry."""
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in TRANSIENT_HTTP
+    return isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead))
+
+
 def response(source):
     """Only HTTPS redirects to recipe-owned hosts; each response has a bound."""
     url = source["url"]
@@ -167,6 +179,40 @@ def response(source):
     raise ValueError("too many upstream redirects")
 
 
+def copy_into(stream, output, algorithm, maximum):
+    value, size = hashlib.new(algorithm), 0
+    with stream:
+        while chunk := stream.read(CHUNK):
+            size += len(chunk)
+            if size > maximum:
+                raise ValueError("upstream input exceeds its recorded size bound")
+            value.update(chunk)
+            output.write(chunk)
+    output.flush()
+    os.fsync(output.fileno())
+    return value, size
+
+
+def fetch(source, output, algorithm, attempts=4):
+    """A transient failure anywhere in the download (open or body) restarts it from
+    byte zero up to three more times, 2, 4 and 8 s apart: a release build fetches
+    dozens of upstream inputs, and one 504 failed a 60-minute job."""
+    if "path" in source:
+        return copy_into(regular(source["path"]).open("rb"), output, algorithm, source["max_bytes"])
+    for attempt in range(attempts):
+        try:
+            return copy_into(response(source), output, algorithm, source["max_bytes"])
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+            if not transient(error) or attempt == attempts - 1:
+                raise
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+        output.seek(0)
+        output.truncate()
+        time.sleep(2 ** (attempt + 1))
+    raise AssertionError("unreachable")
+
+
 def cached_input(source, cache, limit=MAX_BYTES):
     source_spec(source, limit)
     cache = directory(cache)
@@ -180,18 +226,8 @@ def cached_input(source, cache, limit=MAX_BYTES):
     fd, temporary = tempfile.mkstemp(prefix=".upstream-", dir=cache)
     temporary = Path(temporary)
     try:
-        value, size = hashlib.new(algorithm), 0
         with os.fdopen(fd, "wb") as output:
-            stream = regular(source["path"]).open("rb") if "path" in source else response(source)
-            with stream:
-                while chunk := stream.read(CHUNK):
-                    size += len(chunk)
-                    if size > source["max_bytes"]:
-                        raise ValueError("upstream input exceeds its recorded size bound")
-                    value.update(chunk)
-                    output.write(chunk)
-            output.flush()
-            os.fsync(output.fileno())
+            value, size = fetch(source, output, algorithm)
         if size == 0 or value.hexdigest() != expected:
             raise ValueError("upstream input checksum mismatch")
         if destination.exists() or destination.is_symlink():
