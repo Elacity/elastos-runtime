@@ -343,7 +343,9 @@ fi
 
 echo "[home-frontdoor] setup home profile"
 cp "$SOURCE_RUNTIME_DATA_DIR/components.json" "$HOME_DIR/xdg-data/elastos/components.json"
-HOME="$HOME_DIR" XDG_DATA_HOME="$HOME_DIR/xdg-data" ELASTOS_COMPONENTS_MANIFEST="$SOURCE_RUNTIME_DATA_DIR/components.json" "$ROOT/elastos/target/debug/elastos" setup --profile home >/tmp/elastos-home-frontdoor-setup.log
+# A source-manifest setup manages collaboration itself: a pinned release network in
+# components.json is neither required beside the manifest nor joined (live Community).
+HOME="$HOME_DIR" XDG_DATA_HOME="$HOME_DIR/xdg-data" ELASTOS_COLLABORATION_STARTUP_MODE=isolated ELASTOS_COMPONENTS_MANIFEST="$SOURCE_RUNTIME_DATA_DIR/components.json" "$ROOT/elastos/target/debug/elastos" setup --profile home >/tmp/elastos-home-frontdoor-setup.log
 
 INSTALLED_HOME_CLI_DIR="$HOME_DIR/xdg-data/elastos/capsules/home-cli"
 if [[ ! -d "$INSTALLED_HOME_CLI_DIR" ]]; then

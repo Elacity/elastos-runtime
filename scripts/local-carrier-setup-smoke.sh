@@ -573,6 +573,7 @@ echo "[local-carrier-setup] running Carrier-only setup smoke"
 (
     cd "${ELASTOS_ROOT}"
     XDG_DATA_HOME="${XDG_DATA_HOME}" \
+    ELASTOS_COLLABORATION_STARTUP_MODE=isolated \
     ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
     "${ELASTOS_BIN}" setup
 )
