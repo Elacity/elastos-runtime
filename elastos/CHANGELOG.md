@@ -38,6 +38,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   or the data folder when your own private group can write them, as the
   default umask 0002 leaves them. A folder another group or everyone can
   write is still refused.
+- The publisher's Carrier ticket lists only its public addresses when it has
+  one (no container bridge, LAN or loopback addresses), and a Runtime on a
+  fixed Carrier port also listens on that port over IPv6, so its ticket stays
+  the same across restarts (#336).
 
 ### Developer detail
 

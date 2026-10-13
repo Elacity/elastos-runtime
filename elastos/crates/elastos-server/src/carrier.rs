@@ -1411,6 +1411,45 @@ fn published_direct_endpoint_addr(addr: iroh::EndpointAddr) -> iroh::EndpointAdd
     next
 }
 
+/// The address a ticket shared beyond this host carries (#336). When the
+/// endpoint has a public address, loopback, link-local, container bridge, LAN
+/// and CGNAT addresses are dropped: they reach nobody else, and LAN peers find
+/// each other through mDNS. A host with no public address (a LAN or a test)
+/// keeps its addresses. The shell-scope `get_ticket` keeps every address.
+fn exported_endpoint_addr(addr: iroh::EndpointAddr) -> iroh::EndpointAddr {
+    let public = |transport: &iroh::TransportAddr| match transport {
+        iroh::TransportAddr::Ip(addr) => is_public_ip(addr.ip()),
+        _ => false,
+    };
+    let mut next = addr;
+    if next.addrs.iter().any(public) {
+        next.addrs
+            .retain(|transport| !transport.is_ip() || public(transport));
+    }
+    next
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let shared = v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64;
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || shared)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
 fn direct_only_relay_only_error(endpoints: &[iroh::EndpointAddr]) -> Option<serde_json::Value> {
     let has_relay = endpoints
         .iter()
@@ -1522,6 +1561,18 @@ async fn bind_carrier_endpoint(
     let bound = requested.bind_addr(requested_bind_addr).map_err(|error| {
         anyhow::anyhow!("Invalid Carrier address {requested_bind_addr}: {error}")
     })?;
+    // An IPv4 wildcard on a fixed port also listens on the same IPv6 port, so
+    // a published ticket keeps one address per family across restarts (#336).
+    // A host without IPv6 still starts.
+    let bound = match requested_bind_addr {
+        std::net::SocketAddr::V4(v4) if v4.ip().is_unspecified() && v4.port() != 0 => bound
+            .bind_addr_with_opts(
+                std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, v4.port())),
+                iroh::endpoint::BindOpts::default().set_is_required(false),
+            )
+            .map_err(|error| anyhow::anyhow!("Invalid Carrier IPv6 address: {error}"))?,
+        _ => bound,
+    };
     match bound.bind().await {
         Ok(endpoint) => Ok(endpoint),
         Err(error) if !allow_ephemeral_fallback => Err(error).with_context(|| {
@@ -7549,6 +7600,13 @@ impl Provider for CarrierGossipProvider {
                     published_direct_endpoint_addr(watcher.get())
                 } else {
                     watcher.get()
+                };
+                // The publisher bootstrap asks for the ticket it shares beyond
+                // this host; local callers keep every address (#336).
+                let addr = if request["exported"].as_bool() == Some(true) {
+                    exported_endpoint_addr(addr)
+                } else {
+                    addr
                 };
                 let ticket_json = serde_json::json!({
                     "topic": null,
@@ -16581,6 +16639,44 @@ pub(crate) mod tests {
     fn test_requested_gossip_nonce_prefers_explicit_value() {
         let request = serde_json::json!({ "nonce": 42u64 });
         assert_eq!(requested_gossip_nonce(&request), 42u64);
+    }
+
+    #[test]
+    fn exported_ticket_lists_only_public_addresses() {
+        let peer = SecretKey::from_bytes(&[70u8; 32]).public();
+        let ips = |addrs: &[&str]| {
+            let addr = iroh::EndpointAddr::from(peer).with_addrs(
+                addrs
+                    .iter()
+                    .map(|addr| iroh::TransportAddr::Ip(addr.parse().unwrap())),
+            );
+            exported_endpoint_addr(addr)
+                .addrs
+                .into_iter()
+                .map(|transport| match transport {
+                    iroh::TransportAddr::Ip(addr) => addr.to_string(),
+                    other => panic!("unexpected transport: {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let seed = ips(&[
+            "127.0.0.1:4433",
+            "172.17.0.1:4433",
+            "172.19.0.1:4433",
+            "77.42.19.31:4433",
+        ]);
+        assert_eq!(seed, ["77.42.19.31:4433"]);
+        let mixed = ips(&[
+            "[::1]:4433",
+            "[fe80::1]:4433",
+            "[fd00::1]:4433",
+            "169.254.1.1:4433",
+            "100.64.0.1:4433",
+            "[2a01:4f9:c013:e725::1]:4433",
+        ]);
+        assert_eq!(mixed, ["[2a01:4f9:c013:e725::1]:4433"]);
+        // A host with no public address keeps what it has.
+        assert_eq!(ips(&["192.168.1.20:4433", "127.0.0.1:4433"]).len(), 2);
     }
 
     #[test]

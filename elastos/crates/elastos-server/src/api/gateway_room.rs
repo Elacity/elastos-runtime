@@ -631,7 +631,10 @@ async fn gateway_provider_carrier_bootstrap(
             .into_response());
     };
     let body = match registry
-        .send_raw("peer", &serde_json::json!({ "op": "get_ticket" }))
+        .send_raw(
+            "peer",
+            &serde_json::json!({ "op": "get_ticket", "exported": true }),
+        )
         .await
     {
         Ok(body) => body,
@@ -732,7 +735,7 @@ async fn managed_runtime_carrier_bootstrap_from_coords(
             &client_token,
             &peer_cap,
             "get_ticket",
-            serde_json::json!({}),
+            serde_json::json!({ "exported": true }),
         )
         .ok()?;
         carrier_bootstrap_from_body(&body)
