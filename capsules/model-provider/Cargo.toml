@@ -12,6 +12,7 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+elastos-common = { path = "../../elastos/crates/elastos-common" }
 anyhow = "1.0"
 elastos-model-contract = { path = "../../elastos/crates/elastos-model-contract" }
 libc = "0.2"

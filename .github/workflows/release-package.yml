@@ -206,6 +206,83 @@ jobs:
       - name: record the artifact
         run: echo "Mac inputs artifact ${{ steps.upload.outputs.artifact-id }}, zip sha256:${{ steps.upload.outputs.artifact-digest }}" >> "$GITHUB_STEP_SUMMARY"
 
+  engine-llama-amd64:
+    name: pinned AMD64 CPU engine
+    needs: admit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Match ci.yml's Ubuntu 22.04 engine recipe and glibc 2.35 baseline.
+    container:
+      image: ubuntu@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      SOURCE_TREE: ${{ needs.admit.outputs.source_tree }}
+      DEBIAN_FRONTEND: noninteractive
+      BUILD_CONTAINER_IMAGE: ubuntu@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401
+      ENGINE_BUILD_TOOLS: build-essential cmake git ca-certificates curl binutils file python3
+    steps:
+      - name: install engine build tools
+        working-directory: /tmp
+        run: |
+          apt-get update -qq
+          read -r -a tools <<< "$ENGINE_BUILD_TOOLS"
+          apt-get install -y -qq --no-install-recommends "${tools[@]}"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source_commit }}
+          path: source
+          persist-credentials: false
+      - name: bind the source and approved AMD64 engine
+        id: engine-input
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT/$RUNNER_OS/$RUNNER_ARCH" == github-hosted/Linux/X64 ]]
+          [[ "$(git rev-parse HEAD)/$(git rev-parse 'HEAD^{tree}')" == "$SOURCE_COMMIT/$SOURCE_TREE" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          CI_LLAMA_AMD64_SHA256=$(python3 -I -S - <<'PYTHON'
+          import json
+          recipes = json.load(open("scripts/release-upstream-recipes.json"))["recipes"]
+          print(next(r["source"]["checksum"].removeprefix("sha256:") for r in recipes
+                     if r["component"] == "llama-server" and r["platform"] == "linux-amd64"))
+          PYTHON
+          )
+          echo "CI_LLAMA_AMD64_SHA256=$CI_LLAMA_AMD64_SHA256" >> "$GITHUB_ENV"
+      - name: bind engine cache to build recipe
+        id: engine-recipe
+        run: |
+          recipe_hash=$( {
+            cat scripts/build/build-llama-server-bundle.sh
+            cat scripts/verify-linux-engine.py
+            printf '\n%s\n%s\n' "$BUILD_CONTAINER_IMAGE" "$ENGINE_BUILD_TOOLS"
+          } | sha256sum | cut -d ' ' -f 1)
+          echo "cache-key=develop-llama-amd64-${recipe_hash}" >> "$GITHUB_OUTPUT"
+      - name: restore pinned AMD64 engine
+        id: engine-cache
+        # A miss takes the same verified cold build below.
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/llama-amd64-bundle
+          key: ${{ steps.engine-recipe.outputs.cache-key }}
+      - name: build and validate pinned AMD64 engine
+        id: engine-build
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        run: |
+          export RECIPE_COMMIT="$SOURCE_COMMIT"
+          bash scripts/build/build-llama-server-bundle.sh --platform linux-amd64 "$RUNNER_TEMP/llama-amd64-bundle"
+      - name: verify accepted AMD64 engine archive
+        run: |
+          bash scripts/build/build-llama-server-bundle.sh --platform linux-amd64 --verify-archive "$RUNNER_TEMP/llama-amd64-bundle"
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+        with:
+          name: release-llama-amd64-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/llama-amd64-bundle
+          if-no-files-found: error
+          retention-days: 14
+
   engine-llama-arm64:
     name: pinned Jetson CPU engine
     needs: admit
@@ -255,6 +332,7 @@ jobs:
         run: |
           recipe_hash=$( {
             cat scripts/build/build-llama-server-bundle.sh
+            cat scripts/verify-linux-engine.py
             printf '\n%s\n%s\n' "$BUILD_CONTAINER_IMAGE" "$ENGINE_BUILD_TOOLS"
           } | sha256sum | cut -d ' ' -f 1)
           echo "cache-key=develop-llama-arm64-${recipe_hash}" >> "$GITHUB_OUTPUT"
@@ -284,7 +362,7 @@ jobs:
 
   linux:
     name: ${{ matrix.platform }} N and N+1
-    needs: [admit, engine-llama-arm64]
+    needs: [admit, engine-llama-arm64, engine-llama-amd64]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 300
     permissions:
@@ -333,6 +411,12 @@ jobs:
       - name: install host prerequisites
         timeout-minutes: 15
         run: bash scripts/release-host-prerequisites.sh linux
+      - name: download pinned AMD64 engine input
+        if: matrix.platform == 'x86_64-linux'
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-llama-amd64-${{ inputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/llama-amd64-bundle
       - name: download pinned ARM64 engine input
         if: matrix.platform == 'aarch64-linux'
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -345,6 +429,7 @@ jobs:
           set -euo pipefail
           umask 077
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export ELASTOS_LLAMA_AMD64_BUNDLE="$RUNNER_TEMP/llama-amd64-bundle/llama-b10516-bin-ubuntu22.04-amd64-cpu.tar.gz"
           export ELASTOS_LLAMA_ARM64_BUNDLE="$RUNNER_TEMP/llama-arm64-bundle/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"
           inputs="$RELEASE_ROOT/inputs"
           # Fresh Cargo directories for each version; removed after each build.

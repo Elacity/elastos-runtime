@@ -32,6 +32,7 @@ release() {
   python3 scripts/prepare-release-platform-test.py
   python3 scripts/media-tools-build-test.py
   python3 scripts/verify-linux-arm64-package-test.py
+  python3 scripts/verify-linux-engine-test.py
   python3 scripts/update-hop-compare-test.py
   python3 .github/scripts/release-mac-capacity-test.py
 }

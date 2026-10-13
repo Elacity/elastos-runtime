@@ -15,6 +15,8 @@ import {
   applyRunEventsPage,
   terminalOutputText,
   contractError,
+  newModelRequestId,
+  isExpiredInvocationRefusal,
 } from "./model-contract.js";
 import {
   compileContext,
@@ -196,8 +198,8 @@ export function clearBackendReports() {
   }
 }
 
-/* An existing choice stays exact. Only a workspace with no choice uses the
-   initial first advertised offer; later absence never substitutes another. */
+/* CID intent uses its current verified offer. Service intent stays exact.
+   Only a workspace with no choice uses the initial first advertised offer. */
 let selectedLiveOfferId = "";
 let selectedContentCid = null;
 let selectionEpoch = 0;
@@ -267,13 +269,15 @@ export function liveDownloadingModel() {
   return downloadingModel(liveState.catalogModels || []);
 }
 function currentChoice(models, content) {
-  // Initial empty workspace may use the first offer. An existing choice stays exact.
+  // An empty workspace may use the first offer; saved CID and service intent stay exact.
   const id = selectedLiveOfferId || (selectedContentCid == null ? models[0]?.offerId : "");
   return selectedModelOffer(models.map(m => ({ ...m, id: m.offerId })), id, selectedContentCid, content || []);
 }
 
 export function liveOfferChoice() {
-  return selectedLiveOfferId;
+  return selectedContentCid != null
+    ? currentChoice(liveState.models, liveState.catalogModels)?.offerId || selectedLiveOfferId
+    : selectedLiveOfferId;
 }
 
 export function selectedLiveOffer() {
@@ -499,8 +503,14 @@ export async function modelRunCall(op, body = {}) {
     error.code = data?.code || "model_error";
     error.status = res.status;
     if (data?.code === "approval_required") error.approvalOfferId = body.offer_id;
+    const expiredRefusal = op === "runs_create" && res.status === 409 && isExpiredInvocationRefusal(data, body);
+    if (expiredRefusal) {
+      error.reason = "request_expired";
+      error.message = "This request is no longer valid. Check your device's clock, then try again.";
+    }
     error.preDispatchRefusal =
       data?.code === "approval_required" || data?.code === "approval_denied"
+      || expiredRefusal
       || (op === "runs_create" && res.status === 409
         && /^remote:[A-Za-z0-9_-]{1,128}:[A-Za-z0-9_.:-]{1,160}$/.test(body.offer_id)
         && data?.code === "remote_model_invocation_refused"
@@ -594,7 +604,7 @@ export async function streamChatViaContract(
   const resuming = Boolean(turn.providerRunId);
   let created;
   let runId;
-  const createRequestId = resuming ? null : newRequestId();
+  const createRequestId = resuming ? null : newModelRequestId();
   if (!resuming) {
     backendReportRunId = "";
     forgetBackendReport(offer?.offerId);

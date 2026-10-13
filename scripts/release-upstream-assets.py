@@ -28,7 +28,7 @@ def selected_recipes(platform):
     return selected
 
 
-def resolved_recipe(original, llama_arm64_bundle=None):
+def resolved_recipe(original, llama_arm64_bundle=None, llama_amd64_bundle=None):
     recipe = copy.deepcopy(original)
     sources = [recipe["source"], *[item["source"] for item in recipe["license"]["files"] if "source" in item],
                *[item["source"] for item in recipe.get("notices", []) if "source" in item],
@@ -36,10 +36,11 @@ def resolved_recipe(original, llama_arm64_bundle=None):
     for source in sources:
         if "path" not in source:
             continue
-        if source["path"] == "@llama-arm64-bundle":
-            if llama_arm64_bundle is None:
-                raise ValueError("qualified Linux ARM64 llama bundle is required")
-            source["path"] = str(Path(llama_arm64_bundle).resolve(strict=True))
+        if source["path"] in ("@llama-arm64-bundle", "@llama-amd64-bundle"):
+            bundle = llama_arm64_bundle if source["path"] == "@llama-arm64-bundle" else llama_amd64_bundle
+            if bundle is None:
+                raise ValueError(f"qualified {original['platform']} llama bundle is required")
+            source["path"] = str(Path(bundle).resolve(strict=True))
         else:
             relative = upstream.relative(source["path"])
             path = SOURCE_ROOT / relative
@@ -48,12 +49,12 @@ def resolved_recipe(original, llama_arm64_bundle=None):
     return recipe
 
 
-def prepare(platform, cache, output, llama_arm64_bundle=None):
+def prepare(platform, cache, output, llama_arm64_bundle=None, llama_amd64_bundle=None):
     recipes = selected_recipes(platform)
     output = upstream.directory(output)
     external, receipts = {}, []
     for original in recipes:
-        recipe = resolved_recipe(original, llama_arm64_bundle)
+        recipe = resolved_recipe(original, llama_arm64_bundle, llama_amd64_bundle)
         receipt = upstream.package(recipe, cache, output)
         fields = ("release_path", "checksum", "size", "extract_path", "install_path", "binary_path")
         info = {key: receipt[key] for key in fields if key in receipt}
@@ -82,13 +83,14 @@ def main():
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--llama-arm64-bundle", type=Path)
+    parser.add_argument("--llama-amd64-bundle", type=Path)
     args = parser.parse_args()
     # The caller captures stdout as JSON. Source builds (configure, make) inherit
     # file descriptors, so point fd 1 at stderr while building and write the
     # result to the saved original stdout.
     result_stream = os.fdopen(os.dup(1), "w")
     os.dup2(2, 1)
-    result = prepare(args.platform, args.cache, args.output, args.llama_arm64_bundle)
+    result = prepare(args.platform, args.cache, args.output, args.llama_arm64_bundle, args.llama_amd64_bundle)
     print(json.dumps(result), file=result_stream)
     result_stream.close()
 

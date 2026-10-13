@@ -69,6 +69,7 @@ export function loadFixture(path) {
   return fixture;
 }
 export const SMOL_FIXTURE = loadFixture(new URL("./pinned-smollm2-fixture.json", import.meta.url));
+export const QWEN_FIXTURE = loadFixture(new URL("./pinned-qwen2.5-1.5b-fixture.json", import.meta.url));
 
 function regular(path) {
   for (let current = resolve(path);; current = dirname(current)) {
@@ -195,25 +196,28 @@ export function catalogPayload(entries, publishedAt = Math.floor(Date.now() / 10
   return { schema: "elastos.model.catalog/v1", published_at: publishedAt, entries };
 }
 
-export function signedCatalog(entry, publishedAt = Math.floor(Date.now() / 1000)) {
-  const payload = catalogPayload([entry], publishedAt);
+export function signedCatalog(entry, publishedAt = Math.floor(Date.now() / 1000), maxCacheBytes = 1024 ** 3) {
+  const payload = catalogPayload(Array.isArray(entry) ? entry : [entry], publishedAt);
+  assert(Number.isSafeInteger(maxCacheBytes) && maxCacheBytes > 0);
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const publicBytes = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
   const signer_did = "did:key:z" + encode(Buffer.concat([Buffer.from([0xed, 1]), publicBytes]), "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz");
   const message = createHash("sha256").update("elastos.model.catalog.v1\0").update(canonical(payload)).digest();
   const catalog = Buffer.from(canonical({ payload, signer_did, signature: sign(null, message, privateKey).toString("hex") }));
-  return { catalog, trust: { head_cid: rawCid(catalog), publisher_dids: [signer_did], local_use: { max_cache_bytes: 1024 ** 3, max_model_memory_bytes: 4 * 1024 ** 3 } } };
+  return { catalog, trust: { head_cid: rawCid(catalog), publisher_dids: [signer_did], local_use: { max_cache_bytes: maxCacheBytes, max_model_memory_bytes: 4 * 1024 ** 3 } } };
 }
 
 // Production Kubo import profile; the package CID only reproduces with these flags.
 export const KUBO_ADD_FLAGS = ["--offline", "--recursive=true", "--quieter=true", "--wrap-with-directory=false", "--cid-version=1", "--hash=sha2-256", "--raw-leaves=true", "--chunker=size-262144", "--trickle=false", "--max-file-links=174", "--max-directory-links=0", "--max-hamt-fanout=256", "--inline=false", "--nocopy=false", "--fscache=false", "--preserve-mode=false", "--preserve-mtime=false", "--empty-dirs=false", "--progress=false", "--fast-provide-root=false", "--fast-provide-wait=false"];
 
 // Adds one directory to a fresh offline repo and returns its root CID.
-export function kuboAdd(kubo, repo, dir) {
+export function kuboAdd(kubo, repo, dir, initialize = true) {
   const run = args => execFileSync(kubo, args, { env: { ...process.env, IPFS_PATH: repo }, encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 600000 }).trim();
-  run(["init", "--empty-repo"]);
-  for (const profile of ["test", "autoconf-off", "announce-off"]) run(["config", "profile", "apply", profile]);
-  run(["config", "Addresses.API", "/ip4/127.0.0.1/tcp/0"]);
+  if (initialize) {
+    run(["init", "--empty-repo"]);
+    for (const profile of ["test", "autoconf-off", "announce-off"]) run(["config", "profile", "apply", profile]);
+    run(["config", "Addresses.API", "/ip4/127.0.0.1/tcp/0"]);
+  }
   const cid = run(["add", ...KUBO_ADD_FLAGS, dir]).split("\n").at(-1);
   assert.match(cid, /^bafy[a-z2-7]+$/);
   return cid;
@@ -315,13 +319,20 @@ function catalogCommand(args) {
   console.log(`payload ${join(output, "payload.json")}`);
 }
 
-function main(args) {
+async function main(args) {
+  if (args[0] === "repair-inputs") {
+    assert.equal(args.length, 2, "usage: ci-model-package.mjs repair-inputs <qwen-inputs>");
+    const inputs = ownedDirectory(resolve(args[1]));
+    for (const pin of [QWEN_FIXTURE.model, QWEN_FIXTURE.license]) await download(pin, join(inputs, pin.name));
+    return;
+  }
   if (args[0] === "produce") return produce(args.slice(1));
   if (args[0] === "catalog") return catalogCommand(args.slice(1));
-  assert.equal(args.length, 4, "usage: ci-model-package.mjs <package-data> <consumer-data> <pinned-inputs> <fixture-output> | produce <fixture.json> <output-dir> <publisher-did> <kubo-data> | catalog <output-dir> <publisher-did> <entry.json>...");
+  const repair = args.length === 5 && args[4] === "--model-repair";
+  assert(args.length === 4 || repair, "installed publisher requires four paths and optional --model-repair");
   // The package Home's Kubo holds the package; the consumer receives the signed catalogue.
   // A separate package Home is a Carrier holder, so the consumer's Get crosses Carrier.
-  const [data, consumer, inputs, output] = args.map(arg => resolve(arg));
+  const [data, consumer, inputs, output] = args.slice(0, 4).map(arg => resolve(arg));
   const manifestPath = join(data, "components.json");
   regular(manifestPath);
   const manifestBytes = readFileSync(manifestPath), components = JSON.parse(manifestBytes);
@@ -337,13 +348,24 @@ function main(args) {
   mkdirSync(output, { recursive: true, mode: 0o700 });
   const packageDir = join(output, "package"), entry = buildEntry(inputs, packageDir, null, SMOL_FIXTURE);
   entry.cid = kuboAdd(join(data, "bin/kubo"), join(data, "ipfs-repo"), packageDir);
-  const { catalog, trust } = signedCatalog(entry);
+  const entries = [entry];
+  if (repair) {
+    const qwen = buildEntry(resolve(inputs, "../qwen-inputs"), join(output, "package-qwen"), null, QWEN_FIXTURE);
+    qwen.cid = kuboAdd(join(data, "bin/kubo"), join(data, "ipfs-repo"), join(output, "package-qwen"), false);
+    entries.push(qwen);
+  }
+  // Qwen's three-payload reservation plus the admitted Smol closure exceeds 3 GiB.
+  const { catalog, trust } = signedCatalog(repair ? entries : entry, undefined, repair ? 4 * 1024 ** 3 : 1024 ** 3);
   writeFileSync(join(consumer, "model-catalog.json"), catalog, { mode: 0o600 });
   consumerComponents.model_catalog = trust;
   writeFileSync(consumerManifestPath, JSON.stringify(consumerComponents), { mode: 0o600 });
   const carrier_holder = data !== consumer;
   const delivery = carrier_holder ? "package pinned only in a separate holder Home's Kubo; consumer Get over Carrier bounded reads" : "local pinned Kubo package";
-  writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: SMOL_FIXTURE.model.sha256, publisher: "disposable CI fixture", delivery: `${delivery}; Runtime Use admission`, carrier_holder, kubo: kuboReceipt }, null, 2));
+  writeFileSync(join(output, "package.json"), JSON.stringify({ cid: entry.cid, model_sha256: SMOL_FIXTURE.model.sha256, publisher: "disposable CI fixture", delivery: `${delivery}; Runtime Use admission`, carrier_holder, kubo: kuboReceipt,
+    ...(repair ? { model_repair: true, max_cache_bytes: trust.local_use.max_cache_bytes,
+      models: entries.map((item, index) => ({ cid: item.cid, model_sha256: [SMOL_FIXTURE, QWEN_FIXTURE][index].model.sha256,
+        weights_bytes: [SMOL_FIXTURE, QWEN_FIXTURE][index].model.size, name: item.capsule_manifest.name })) } : {}),
+  }, null, 2));
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main(process.argv.slice(2));

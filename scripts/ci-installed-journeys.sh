@@ -32,12 +32,27 @@ assert journey["engine_receipt"](data)["platform"] == sys.argv[2]
 PY
         # The existing verifier owns the pinned weight and license identities.
         scripts/pinned-model-consumer-proof.sh "${CI_HOME}/model-inputs" --fetch --check-inputs
+        if [[ "${CI_MODEL_REPAIR_JOURNEY:-false}" == true ]]; then
+            timeout --kill-after=30 1200 node scripts/ci-model-package.mjs repair-inputs "${CI_HOME}/model-inputs/qwen-inputs"
+        fi
+        ;;
+    model-repair)
+        python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE/model-repair" --model-repair
         ;;
     home)
         python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE/engine-absent-home" --home-only
+        if [[ "${CI_FINITE_MEMORY:-false}" == true ]]; then
+            python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE/memory-refusal-home" --finite-memory 1
+        fi
         # The workflow names the one job whose reply Get crosses Carrier from a holder Home.
         if [[ "${CI_CARRIER_GET:-false}" == true ]]; then
-            python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE" --carrier-get
+            if [[ "${CI_FINITE_MEMORY:-false}" == true ]]; then
+                python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE" --carrier-get --finite-memory 4
+            else
+                python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE" --carrier-get
+            fi
+        elif [[ "${CI_FINITE_MEMORY:-false}" == true ]]; then
+            python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE" --finite-memory 4
         else
             python3 scripts/ci-installed-journeys.py "$CI_HOME" "$DATA" "$EVIDENCE"
         fi
@@ -66,6 +81,7 @@ try:
 except (OSError, ValueError, AssertionError, KeyError, RuntimeError):
     engine = None
 carrier = os.environ.get("CI_CARRIER_GET") == "true"
+finite = os.environ.get("CI_FINITE_MEMORY") == "true"
 results = {name: "failed or not run" for name in (
     "home_screenshots", "model_package_admission", *(["carrier_get"] if carrier else []),
     "installed_runtime_reply", "model_timing_observer", "process_cleanup", "disk_reserve")}
@@ -89,6 +105,18 @@ current = lambda row: (row.get("candidate") == commit and row.get("source_tree")
                        and row.get("source_components_sha256") == source_manifest_sha)
 if len(records) != expected_runs or engine is None or any(not current(row) or row.get("installed_engine") != engine for row in records):
     spread = {"status": "incomplete", "expected_runs": expected_runs, "recorded_runs": len(records)}
+memory_path = root / "memory-refusal-home/installed-journeys.json"
+memory = json.loads(memory_path.read_text()) if memory_path.exists() else {}
+if finite:
+    results["finite_1gib_refusal"] = ("passed" if current(memory) and memory.get("installed_engine") == engine
+                                     and journey["finite_receipt_valid"](memory, 1)
+                                     and all(memory.get("results", {}).get(name) == "passed" for name in
+                                             ("home_screenshots", "model_package_admission", "process_cleanup", "disk_reserve"))
+                                     else "failed or not run")
+    results["finite_4gib_lifecycle"] = ("passed" if len(records) == 1 and current(records[0])
+                                      and records[0].get("installed_engine") == engine
+                                      and journey["finite_receipt_valid"](records[0], 4) else "failed or not run")
+    elapsed += memory.get("elapsed_seconds", 0) + memory.get("fixture_preparation_seconds", 0)
 absence_path = root / "engine-absent-home/installed-journeys.json"
 absence = json.loads(absence_path.read_text()) if absence_path.exists() else {}
 results["engine_absent_home"] = ("passed" if current(absence) and absence.get("engine_absent") is True
@@ -104,6 +132,7 @@ elapsed += absence.get("elapsed_seconds", 0) + absence.get("fixture_preparation_
     "fixture_policy": "fresh Home state and engine process per run; verified source engine prerequisite; same host with potentially warm OS file cache"
                       + ("; reply package only on a separate holder Home, fetched over Carrier" if carrier else ""),
     "engine_absent_home": absence,
+    **({"finite_memory_refusal": memory} if finite else {}),
 }, indent=2) + "\n")
 with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
     summary.write(f"### Installed journeys\n\nCandidate: `{commit}`\n\nSource tree: `{tree}`\n\nInstalled Runtime SHA-256: `{sha}`\n\n")
@@ -113,6 +142,8 @@ with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
     summary.write("\nEach run uses fresh Home state and a new engine process on the same host. OS file cache can warm between runs.\n")
     if carrier:
         summary.write("\nThe reply package lives only in a separate holder Home's Kubo. The consumer Home knows that holder as one Carrier peer and holds no package, so Get reads every piece over Carrier.\n")
+    if finite:
+        summary.write("\nThe 1 GiB Home admits the signed model, then refuses Assistant Send before engine spawn. The 4 GiB Home proves Busy, Stop, idle closure and engine crash recovery. Runtime and its native children share each finite unit; the browser, holder and observer run outside it. Both units require zero OOM events and confirmed whole-process cleanup.\n")
     summary.write("\nThe reply fixture uses the verified source engine prerequisite. Signed-release engine acquisition has separate acceptance evidence. A separate fresh signed-fixture Home proves Get, controlled Use refusal, Retry and Home usability with the optional engine absent.\n")
     summary.write(f"\nTiming receipts: {spread['status']} ({spread['recorded_runs']}/{expected_runs} runs).\n")
     if spread["status"] == "complete":
@@ -129,5 +160,5 @@ if spread["status"] == "incomplete" or any(result != "passed" for result in resu
     raise SystemExit("installed journey acceptance is incomplete")
 PY
         ;;
-    *) echo "Usage: $0 prepare|home|home-repeat|summary" >&2; exit 2 ;;
+    *) echo "Usage: $0 prepare|home|home-repeat|model-repair|summary" >&2; exit 2 ;;
 esac

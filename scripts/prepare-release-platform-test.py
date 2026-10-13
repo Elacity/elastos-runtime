@@ -154,6 +154,7 @@ class PrepareWorkerTest(unittest.TestCase):
             "publish-release.sh", "prepare-release-platform.sh", "release-platform-input.py",
             "components-release-integrity-check.py", "release-platforms.json", "release-signer.py", "check-versioning.sh", "build-media-tools.sh",
             "release-upstream-assets.py", "release-upstream-input.py", "browser-host-release.py",
+            "verify-linux-engine.py",
             "browser-vm-image-inputs.py", "browser-image-cid-input.py",
         ):
             (scripts / name).write_bytes((SOURCE / "scripts" / name).read_bytes())
@@ -255,6 +256,29 @@ class PrepareWorkerTest(unittest.TestCase):
             "schema": "elastos.release-upstream-recipes/v1", "recipes": [recipe]}))
         external["llama-server"]["platforms"]["linux-arm64"].update(
             strategy="source-build", cid="bafy-stale-fixture", url="https://example.invalid/stale-fixture")
+        self.amd64_engine = self.root / "llama-b10516-bin-ubuntu22.04-amd64-cpu.tar.gz"
+        header[18:20] = (62).to_bytes(2, "little")
+        with tarfile.open(self.amd64_engine, "w:gz") as archive:
+            for name in ("llama-server", "libllama.so"):
+                member = tarfile.TarInfo(f"llama-b10516/{name}")
+                member.mode = 0o755
+                member.size = len(header)
+                archive.addfile(member, io.BytesIO(header))
+        amd64_recipe = json.loads(json.dumps(recipe))
+        amd64_recipe.update(platform="linux-amd64", install_path="libexec/llama.cpp/b10516/linux-amd64")
+        amd64_recipe["source"] = {
+            "path": "@llama-amd64-bundle",
+            "checksum": "sha256:" + hashlib.sha256(self.amd64_engine.read_bytes()).hexdigest(),
+            "max_bytes": self.amd64_engine.stat().st_size}
+        inventory_path = scripts / "release-upstream-recipes.json"
+        inventory = json.loads(inventory_path.read_text())
+        inventory["recipes"].append(amd64_recipe)
+        inventory_path.write_text(json.dumps(inventory))
+        external["llama-server"]["platforms"]["linux-amd64"] = {
+            **external["llama-server"]["platforms"]["linux-arm64"],
+            "release_path": self.amd64_engine.name,
+            "checksum": amd64_recipe["source"]["checksum"], "size": self.amd64_engine.stat().st_size,
+            "install_path": amd64_recipe["install_path"]}
         host_template = json.loads((SOURCE / "components.json").read_text())
         host_profile = host_template["profiles"]["browser-host"]
         for name in host_profile["components"]:
@@ -313,6 +337,13 @@ class PrepareWorkerTest(unittest.TestCase):
         (mock / "uname").write_text(
             '#!/bin/sh\nif [ "$1" = -s ]; then echo "${MOCK_OS:-Darwin}"; '
             'else echo "${MOCK_ARCH:-arm64}"; fi\n')
+        (mock / "readelf").write_text(
+            '#!/bin/sh\ncase "$1" in\n'
+            '-h) echo "Class: ELF64"; if [ "$MOCK_ARCH" = x86_64 ]; then echo "Machine: Advanced Micro Devices X86-64"; '
+            'else echo "Machine: AArch64"; fi ;;\n'
+            '-d) echo \'(RUNPATH) [$ORIGIN]\'; echo "(NEEDED) [libc.so.6]" ;;\n'
+            '--version-info) echo "GLIBC_2.35" ;;\nesac\n')
+        (mock / "ldd").write_text('#!/bin/sh\necho "libc.so.6 => resolved"\n')
         for path in mock.iterdir():
             path.chmod(0o755)
         self.env = {**os.environ, "PATH": str(mock) + os.pathsep + os.environ["PATH"],
@@ -322,7 +353,8 @@ class PrepareWorkerTest(unittest.TestCase):
                     "MOCK_SIGN_LOG": str(self.root / "sign.log"),
                     "MOCK_MEDIA_LOG": str(self.root / "media.log"),
                     "MOCK_AUDIT_LOG": str(self.root / "audit.log"),
-                    "ELASTOS_LLAMA_ARM64_BUNDLE": str(self.arm64_engine)}
+                    "ELASTOS_LLAMA_ARM64_BUNDLE": str(self.arm64_engine),
+                    "ELASTOS_LLAMA_AMD64_BUNDLE": str(self.amd64_engine)}
         self.commit("fixture", init=True)
         (self.repo / "capsules/home/browser/secret.txt").write_text("ignored private input")
 
@@ -850,55 +882,77 @@ class PrepareWorkerTest(unittest.TestCase):
     def test_arm64_carrier_fixture_stages_the_pinned_engine_archive(self):
         script = "local-carrier-setup-smoke.sh"
         source = (SOURCE / "scripts" / script).read_text()
-        block = 'if platform == "linux-arm64":' + source.split(
-            'if platform == "linux-arm64":', 1)[1].split("\ndef write_capsule_archive", 1)[0]
-        artifacts = self.root / "carrier-artifacts"
-        artifacts.mkdir()
-        manifest = json.loads((self.repo / "components.json").read_text())
-        descriptor = manifest["external"]["llama-server"]["platforms"]["linux-arm64"]
+        marker = 'if platform in ("linux-arm64", "linux-amd64"):'
+        block = marker + source.split(marker, 1)[1].split("\ndef write_capsule_archive", 1)[0]
         recipes_path = self.repo / "scripts/release-upstream-recipes.json"
         recipes = json.loads(recipes_path.read_bytes())
-        for item in recipes['recipes'][0]['license']['files']:
-            item['source']['path'] = str(self.repo / item['source']['path'])
+        for recipe in recipes['recipes']:
+            for item in recipe['license']['files']:
+                item['source']['path'] = str(self.repo / item['source']['path'])
         recipes_path.write_text(json.dumps(recipes))
         spec = importlib.util.spec_from_file_location('carrier_fixture_upstream',
                                                     self.repo / "scripts/release-upstream-input.py")
         upstream = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(upstream)
-        scope = {"platform": "linux-arm64", "artifacts_dir": artifacts,
-                 "platform_info": lambda name: descriptor, "os": os, "pathlib": __import__("pathlib"),
-                 "shutil": shutil, "hashlib": hashlib, "json": json, "tempfile": tempfile,
-                 "root": self.repo, "cache": self.root / "upstream-cache", "upstream": upstream,
-                 "manifest": manifest}
-        with patch.dict(os.environ, {"ELASTOS_LLAMA_ARM64_BUNDLE": str(self.arm64_engine)}):
-            exec(compile(block, script, "exec"), scope)
-        staged = artifacts / descriptor["release_path"]
-        self.assertEqual(descriptor['release_path'], 'llama-server-linux-arm64.tar.gz')
-        self.assertEqual(descriptor['checksum'], 'sha256:' + hashlib.sha256(staged.read_bytes()).hexdigest())
-        self.assertNotEqual(staged.read_bytes(), self.arm64_engine.read_bytes())
-        with tarfile.open(staged) as capsule, tarfile.open(self.arm64_engine) as original:
-            for name in ('llama-server', 'libllama.so'):
-                path = 'llama-b10516/' + name
-                self.assertEqual(capsule.extractfile(path).read(), original.extractfile(path).read())
-            self.assertEqual(capsule.extractfile('llama-b10516/LICENSE').read(),
-                             (self.repo / 'scripts/fixture-license.txt').read_bytes())
-            metadata = json.load(capsule.extractfile('llama-b10516/capsule.json'))
-            self.assertEqual((metadata['role'], metadata['type']), ('content', 'data'))
-            self.assertIsNotNone(capsule.getmember('llama-b10516/PROVENANCE.json'))
-        metadata = manifest['external']['llama-server']['capsule_metadata']['platforms']['linux-arm64']
-        self.assertEqual(metadata['checksum'], descriptor['checksum'])
-        self.assertEqual(metadata['size'], staged.stat().st_size)
-        self.assertNotIn('strategy', descriptor)
-        wrong = self.root / "wrong-arm64-engine.tar.gz"
-        data = bytearray(self.arm64_engine.read_bytes())
-        data[-1] ^= 1
-        wrong.write_bytes(data)
-        # A fresh cache exercises admission of the supplied bytes; a populated
-        # cache correctly reuses the already verified input with the same pin.
-        scope['cache'] = self.root / 'wrong-upstream-cache'
-        with patch.dict(os.environ, {"ELASTOS_LLAMA_ARM64_BUNDLE": str(wrong)}):
-            with self.assertRaisesRegex(ValueError, "upstream input checksum mismatch"):
-                exec(compile(block, script, "exec"), scope)
+        for platform, engine, env_key in (
+            ("linux-arm64", self.arm64_engine, "ELASTOS_LLAMA_ARM64_BUNDLE"),
+            ("linux-amd64", self.amd64_engine, "ELASTOS_LLAMA_AMD64_BUNDLE"),
+        ):
+            with self.subTest(platform=platform):
+                artifacts = self.root / ("carrier-artifacts-" + platform)
+                artifacts.mkdir()
+                manifest = json.loads((self.repo / "components.json").read_text())
+                descriptor = manifest["external"]["llama-server"]["platforms"][platform]
+                scope = {"platform": platform, "artifacts_dir": artifacts,
+                         "platform_info": lambda name: descriptor, "os": os, "pathlib": __import__("pathlib"),
+                         "shutil": shutil, "hashlib": hashlib, "json": json, "tempfile": tempfile,
+                         "root": self.repo, "cache": self.root / ("upstream-cache-" + platform), "upstream": upstream,
+                         "manifest": manifest}
+                with patch.dict(os.environ, {env_key: str(engine)}):
+                    exec(compile(block, script, "exec"), scope)
+                staged = artifacts / descriptor["release_path"]
+                self.assertEqual(descriptor['release_path'], 'llama-server-' + platform + '.tar.gz')
+                self.assertEqual(descriptor['checksum'], 'sha256:' + hashlib.sha256(staged.read_bytes()).hexdigest())
+                self.assertNotEqual(staged.read_bytes(), engine.read_bytes())
+                with tarfile.open(staged) as capsule, tarfile.open(engine) as original:
+                    for name in ('llama-server', 'libllama.so'):
+                        path = 'llama-b10516/' + name
+                        self.assertEqual(capsule.extractfile(path).read(), original.extractfile(path).read())
+                    self.assertEqual(capsule.extractfile('llama-b10516/LICENSE').read(),
+                                     (self.repo / 'scripts/fixture-license.txt').read_bytes())
+                    metadata = json.load(capsule.extractfile('llama-b10516/capsule.json'))
+                    self.assertEqual((metadata['role'], metadata['type']), ('content', 'data'))
+                    self.assertIsNotNone(capsule.getmember('llama-b10516/PROVENANCE.json'))
+                metadata = manifest['external']['llama-server']['capsule_metadata']['platforms'][platform]
+                self.assertEqual(metadata['checksum'], descriptor['checksum'])
+                self.assertEqual(metadata['size'], staged.stat().st_size)
+                self.assertNotIn('strategy', descriptor)
+                wrong = self.root / ("wrong-engine-" + platform + ".tar.gz")
+                data = bytearray(engine.read_bytes())
+                data[-1] ^= 1
+                wrong.write_bytes(data)
+                # A fresh cache exercises admission of the supplied bytes.
+                scope['cache'] = self.root / ('wrong-upstream-cache-' + platform)
+                with patch.dict(os.environ, {env_key: str(wrong)}):
+                    with self.assertRaisesRegex(ValueError, "upstream input checksum mismatch"):
+                        exec(compile(block, script, "exec"), scope)
+
+    def test_linux_preparation_refuses_missing_engine_archive_before_recording(self):
+        source = (SOURCE / "scripts/prepare-release-platform.sh").read_text()
+        marker = 'if [[ "$SETUP_PLATFORM" == linux-*'
+        block = marker + source.rsplit(marker, 1)[1].split(
+            '\npython3 scripts/release-platform-input.py record', 1)[0]
+        for platform in ("linux-arm64", "linux-amd64"):
+            for mode in ("fresh", "reuse"):
+                with self.subTest(platform=platform, mode=mode):
+                    staging = self.root / (platform + '-' + mode)
+                    (staging / 'artifacts').mkdir(parents=True)
+                    env = {**self.env, 'SETUP_PLATFORM': platform, 'STAGING': str(staging),
+                           'REUSE_SUPPORT': '' if mode == 'fresh' else str(self.root / 'retained-support')}
+                    result = self.command('/bin/bash', '-e', '-c',
+                                          'die() { echo "$*" >&2; exit 1; }\n' + block, env=env)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('Prepared Linux engine archive is missing', result.stderr)
 
     def test_demo_rejects_old_input_and_overlays_selected_platform(self):
         source = (SOURCE / "scripts/home-demo-local.sh").read_text()

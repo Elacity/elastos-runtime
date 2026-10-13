@@ -342,9 +342,12 @@ Dispatch readiness describes the current binding; an actual run proves
 inference.
 
 When admitted content cannot run, the same projection can report a fixed
-`dispatch_unavailable_reason`: `unsupported_host`, `source_engine_required` or
-`catalog_updated`. Runtime derives this current fact from its host profile,
-engine acquisition policy and catalogue head binding. The UI explains the next
+`dispatch_unavailable_reason`: `unsupported_host`, `source_engine_required`,
+`catalog_updated`, `cache_budget_unavailable` or `memory_budget_unavailable`.
+Runtime derives this current fact from its host profile, engine acquisition
+policy, catalogue head binding and caller budget. Preparation also reports fixed
+`download_interrupted` and `storage_service_unavailable` causes so the caller
+can resume a retained transfer or restart its storage service. The UI explains the next
 action while retaining the admitted content.
 Other failures keep the general service-unavailable state. The projection
 stores no failure cause and exposes no provider error text or host path.
@@ -447,7 +450,9 @@ Implemented source boundaries and remaining acceptance:
    closure succeed; uncertainty blocks replacement. Provider-source tests verify
    retirement by exact offer ID and immutable configuration through private Init,
    preserving operator offers and historical results. Runtime stores the exact
-   activation descriptor and pending retirement in the same inventory. It
+   activation descriptor and pending retirement in the same inventory. A verified
+   engine replacement can rebuild that descriptor while preserving the model,
+   settings and policy. Retained runs keep their original execution binding. It
    withdraws the offer before removing eligible unkept admission files, and
    reconciles withdrawal before startup registration. CapacityPending keeps
    pending Use identity with zero reservation; uncertain closure preserves
@@ -460,8 +465,9 @@ Implemented source boundaries and remaining acceptance:
    Visible in-flight preparation has bounded polling; request and CID ownership
    reject stale replies. An unconfirmed Use keeps its request identity until a
    successful read reconciles it. Keep is a caller retention choice, not deletion.
-   Assistant keeps exact offer/CID intent in existing workspaces and
-   use current unique ready mappings. Missing choices and failed refreshes
+   Assistant keeps the saved CID as model intent in existing workspaces and
+   refreshes its offer hint from the current unique ready mapping. Service
+   selections keep their exact offer identity. Missing choices and failed refreshes
    preserve drafts and accepted runs; new dispatch requires current readiness
    and deliberate Send. Open Models uses the Home handoff to Marketplace Models.
    A ready result can select that exact CID in Assistant;

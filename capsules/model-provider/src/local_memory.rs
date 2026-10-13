@@ -13,25 +13,11 @@ pub(crate) const UBATCH_SIZE: u64 = 128;
 const BASE_SCRATCH: u64 = 512 * MIB;
 const MIN_HEADROOM: u64 = 1024 * MIB;
 
-/// Host memory as seen right now: total RAM, memory the OS can hand out
-/// without compressing or swapping, and whether the kernel reports normal
-/// memory pressure (macOS only; always false elsewhere).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HostMemory {
-    pub total: u64,
-    pub available: u64,
-    pub pressure_normal: bool,
-}
+pub(crate) use elastos_common::host_memory::HostMemory;
 
-impl HostMemory {
-    /// The admission rule: if the free-memory estimate covers `required`,
-    /// admit, whatever the pressure. Otherwise admit only under normal kernel
-    /// pressure (macOS compresses or evicts to make room) and only when
-    /// `required` is at most 40% of physical RAM. Otherwise refuse.
-    fn fits(&self, required: u64) -> bool {
-        required <= self.available
-            || (self.pressure_normal && u128::from(required) * 10 <= u128::from(self.total) * 4)
-    }
+fn fits(host: HostMemory, required: u64) -> bool {
+    required <= host.available
+        || (host.pressure_normal && u128::from(required) * 10 <= u128::from(host.total) * 4)
 }
 
 pub(crate) type HostMemoryReader = fn() -> Result<HostMemory, LocalLlamaFault>;
@@ -53,7 +39,8 @@ impl MemoryPlan {
     }
 }
 
-/// Refuses with `MemoryUnavailable` unless the host fits the model weights,
+/// Refuses with `MemoryObservationUnavailable` when Runtime cannot read the host
+/// limits, or with `MemoryUnavailable` unless the host fits the model weights,
 /// its KV cache at `context`, compute scratch, and a headroom of
 /// max(10% of RAM, 1 GiB) left for the rest of the device.
 pub(crate) fn admit(
@@ -67,7 +54,7 @@ pub(crate) fn admit(
     let weights = file.metadata().map_err(|_| LocalLlamaFault::Failed)?.len();
     let plan = memory_plan(file, weights, context, parallel, host.total)?;
     match plan.required() {
-        Some(required) if host.fits(required) => Ok(()),
+        Some(required) if fits(host, required) => Ok(()),
         _ => Err(LocalLlamaFault::MemoryUnavailable),
     }
 }
@@ -304,11 +291,10 @@ fn metadata(reader: impl Read) -> std::io::Result<Metadata> {
     })
 }
 
-/// Reads the live host memory. Linux: `MemAvailable`, lowered by any cgroup v2
-/// ancestor limit. macOS: free, purgeable and file-backed pages only.
+/// Provider process fixtures may inject a fixed reading in debug builds.
+/// Runtime Get always calls the common observer directly.
+#[cfg(not(test))]
 pub(crate) fn host_memory() -> Result<HostMemory, LocalLlamaFault> {
-    // Debug builds only, for the process tests that run this binary: a fixed
-    // reading keeps them independent of the host's load. Release ignores it.
     #[cfg(debug_assertions)]
     if let Some(bytes) = std::env::var("ELASTOS_MODEL_PROVIDER_TEST_FREE_MEMORY")
         .ok()
@@ -320,200 +306,15 @@ pub(crate) fn host_memory() -> Result<HostMemory, LocalLlamaFault> {
             pressure_normal: false,
         });
     }
-    #[cfg(target_os = "linux")]
-    {
-        let text = std::fs::read_to_string("/proc/meminfo").map_err(|_| LocalLlamaFault::Failed)?;
-        let host = parse_meminfo(&text)?;
-        // cgroup v1 hosts have no `0::` line; they keep plain MemAvailable.
-        let available = match std::fs::read_to_string("/proc/self/cgroup") {
-            Ok(groups) => cgroup_available(
-                &groups,
-                Path::new("/sys/fs/cgroup"),
-                host.available,
-                |path| std::fs::read_to_string(path).ok(),
-            ),
-            Err(_) => host.available,
-        };
-        Ok(HostMemory {
-            total: host.total,
-            available,
-            pressure_normal: false,
-        })
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos_host_memory()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        Err(LocalLlamaFault::Failed)
-    }
+    observed_memory(elastos_common::host_memory::observe_host_memory(
+        std::env::consts::OS,
+    ))
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn parse_meminfo(text: &str) -> Result<HostMemory, LocalLlamaFault> {
-    let field = |name: &str| {
-        text.lines()
-            .find_map(|line| line.strip_prefix(name))
-            .and_then(|value| value.split_whitespace().next())
-            .and_then(|value| value.parse::<u64>().ok())
-            .and_then(|kib| kib.checked_mul(1024))
-            .ok_or(LocalLlamaFault::Failed)
-    };
-    let total = field("MemTotal:")?;
-    let available = field("MemAvailable:")?;
-    if total == 0 || available > total {
-        return Err(LocalLlamaFault::Failed);
-    }
-    Ok(HostMemory {
-        total,
-        available,
-        pressure_normal: false,
-    })
-}
-
-/// Lowers `available` to the tightest cgroup v2 ancestor headroom: `memory.max`
-/// minus the memory the group cannot reclaim. `memory.current` includes page
-/// cache, which the kernel reclaims before it enforces the limit (a model just
-/// fetched sits there), so reclaimable file pages from `memory.stat` are not used.
-/// A level without both limit files has no limit; without a readable
-/// `memory.stat` all of `memory.current` counts as used.
-#[cfg(any(target_os = "linux", test))]
-fn cgroup_available(
-    groups: &str,
-    root: &Path,
-    mut available: u64,
-    read: impl Fn(&Path) -> Option<String>,
-) -> u64 {
-    let Some(group) = groups.lines().find_map(|line| line.strip_prefix("0::")) else {
-        return available;
-    };
-    let mut path = root.to_path_buf();
-    for part in Path::new(group).components() {
-        if let std::path::Component::Normal(name) = part {
-            path.push(name);
-        }
-    }
-    while path.starts_with(root) {
-        let number = |file: &str| read(&path.join(file))?.trim().parse::<u64>().ok();
-        if let (Some(limit), Some(current)) = (number("memory.max"), number("memory.current")) {
-            let cache = read(&path.join("memory.stat")).map_or(0, |stat| file_cache(&stat));
-            available = available.min(limit.saturating_sub(current.saturating_sub(cache)));
-        }
-        if path == root || !path.pop() {
-            break;
-        }
-    }
-    available
-}
-
-/// Reclaimable page cache of one cgroup: its `active_file + inactive_file`
-/// LRU pages, as `MemAvailable` counts host page cache, less dirty and
-/// writeback pages, which must reach disk before they can be dropped. The
-/// type-based `file` counter is not used because it also holds tmpfs and
-/// shared memory.
-#[cfg(any(target_os = "linux", test))]
-fn file_cache(stat: &str) -> u64 {
-    let field = |name: &str| {
-        stat.lines()
-            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(0)
-    };
-    let lru = field("active_file").saturating_add(field("inactive_file"));
-    lru.saturating_sub(field("file_dirty").saturating_add(field("file_writeback")))
-}
-
-#[cfg(target_os = "macos")]
-#[allow(deprecated)]
-fn macos_host_memory() -> Result<HostMemory, LocalLlamaFault> {
-    let fail = LocalLlamaFault::Failed;
-    let mut total = 0_u64;
-    let mut len = std::mem::size_of_val(&total);
-    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
-    let mut count = libc::HOST_VM_INFO64_COUNT;
-    // SAFETY: host_statistics64 writes at most `count` words into `stats`;
-    // the host port is released below.
-    let host = unsafe { libc::mach_host_self() };
-    let result = unsafe {
-        libc::host_statistics64(
-            host,
-            libc::HOST_VM_INFO64,
-            stats.as_mut_ptr().cast(),
-            &mut count,
-        )
-    };
-    unsafe extern "C" {
-        fn mach_port_deallocate(
-            task: libc::mach_port_t,
-            name: libc::mach_port_t,
-        ) -> libc::kern_return_t;
-    }
-    // SAFETY: `host` is a send right owned by this call.
-    unsafe {
-        mach_port_deallocate(libc::mach_task_self(), host);
-    }
-    // SAFETY: hw.memsize is a u64 and `len` is its size.
-    let sysctl = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&mut total as *mut u64).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if result != 0 || sysctl != 0 || page <= 0 || total == 0 {
-        return Err(fail);
-    }
-    // SAFETY: host_statistics64 succeeded.
-    let stats = unsafe { stats.assume_init() };
-    let available = macos_available(
-        u64::from(stats.free_count),
-        u64::from(stats.speculative_count),
-        u64::from(stats.purgeable_count),
-        u64::from(stats.external_page_count),
-        page as u64,
-    )
-    .ok_or(fail)?;
-    // kern.memorystatus_vm_pressure_level: 1 normal, 2 warning, 4 critical.
-    // Unreadable counts as not normal.
-    let mut level: libc::c_int = 0;
-    let mut level_len = std::mem::size_of_val(&level);
-    // SAFETY: the sysctl is an int and `level_len` is its size.
-    let pressure = unsafe {
-        libc::sysctlbyname(
-            c"kern.memorystatus_vm_pressure_level".as_ptr(),
-            (&mut level as *mut libc::c_int).cast(),
-            &mut level_len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    Ok(HostMemory {
-        total,
-        available: available.min(total),
-        pressure_normal: pressure == 0 && level == 1,
-    })
-}
-
-/// Pages macOS can hand out without compressing or swapping: free pages
-/// (whose count includes speculative read-ahead), purgeable pages, and
-/// file-backed pages (speculative pages are file-backed, so counted once).
-/// Inactive anonymous memory is excluded: reclaiming it needs the compressor.
-#[cfg(any(target_os = "macos", test))]
-fn macos_available(
-    free: u64,
-    speculative: u64,
-    purgeable: u64,
-    file_backed: u64,
-    page: u64,
-) -> Option<u64> {
-    free.saturating_sub(speculative)
-        .checked_add(purgeable)?
-        .checked_add(file_backed)?
-        .checked_mul(page)
+fn observed_memory(
+    observation: std::io::Result<HostMemory>,
+) -> Result<HostMemory, LocalLlamaFault> {
+    observation.map_err(|_| LocalLlamaFault::MemoryObservationUnavailable)
 }
 
 /// Ample fixed memory, so test engines never depend on the host's load.
@@ -532,6 +333,33 @@ mod tests {
     use crate::test_support::fake_gguf;
 
     const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn unavailable_memory_refuses_before_opening_model_with_typed_cause() {
+        fn unavailable() -> Result<HostMemory, LocalLlamaFault> {
+            observed_memory(Err(std::io::ErrorKind::PermissionDenied.into()))
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Unsupported,
+        ] {
+            assert_eq!(
+                observed_memory(Err(kind.into())),
+                Err(LocalLlamaFault::MemoryObservationUnavailable)
+            );
+        }
+        assert_eq!(
+            admit(
+                Path::new("memory-refused-unopened-model.gguf"),
+                4096,
+                1,
+                unavailable
+            ),
+            Err(LocalLlamaFault::MemoryObservationUnavailable)
+        );
+    }
 
     #[test]
     fn plan_counts_weights_once_plus_kv_scratch_and_headroom() {
@@ -553,6 +381,29 @@ mod tests {
     }
 
     #[test]
+    fn signed_minimum_still_requires_the_full_execution_memory_plan() {
+        fn one_gib() -> Result<HostMemory, LocalLlamaFault> {
+            Ok(HostMemory {
+                total: GIB,
+                available: GIB,
+                pressure_normal: false,
+            })
+        }
+        let root = crate::test_support::temp_root_path("model-provider-memory", "minimum");
+        std::fs::create_dir_all(&root).unwrap();
+        let model = root.join("weights.gguf");
+        std::fs::write(&model, fake_gguf(28, 1536, 12, 2, 8960, 1000)).unwrap();
+        assert_eq!(
+            elastos_common::host_memory::model_memory_fit(512, Some(one_gib().unwrap())),
+            elastos_common::host_memory::ModelMemoryFit::Fits
+        );
+        assert_eq!(
+            admit(&model, 4096, 1, one_gib),
+            Err(LocalLlamaFault::MemoryUnavailable)
+        );
+    }
+
+    #[test]
     fn malformed_metadata_is_not_admitted() {
         for gguf in [
             fake_gguf(0, 1536, 12, 2, 8960, 10),
@@ -569,23 +420,6 @@ mod tests {
     }
 
     #[test]
-    fn meminfo_reports_mem_available_not_mem_free() {
-        let text = "MemTotal:        8000000 kB\nMemFree:          100000 kB\nMemAvailable:    3000000 kB\n";
-        assert_eq!(
-            parse_meminfo(text),
-            Ok(HostMemory {
-                total: 8_000_000 * 1024,
-                available: 3_000_000 * 1024,
-                pressure_normal: false,
-            })
-        );
-        assert_eq!(
-            parse_meminfo("MemTotal: 8000000 kB\n"),
-            Err(LocalLlamaFault::Failed)
-        );
-    }
-
-    #[test]
     fn normal_pressure_admits_up_to_40_percent_of_ram_when_estimate_is_low() {
         let host = |available, total, pressure_normal| HostMemory {
             total,
@@ -593,108 +427,13 @@ mod tests {
             pressure_normal,
         };
         // 24 GiB Mac, low estimate, normal pressure: Qwen-1.5B's 4.6 GB need fits.
-        assert!(host(3 * GIB, 24 * GIB, true).fits(4_613_050_297));
+        assert!(fits(host(3 * GIB, 24 * GIB, true), 4_613_050_297));
         // 8 GiB host: 40% is 3.2 GiB. A 3.04 GB need fits; a 4 GB need does not.
-        assert!(host(GIB, 8 * GIB, true).fits(3_040_000_000));
-        assert!(!host(GIB, 8 * GIB, true).fits(4_000_000_000));
+        assert!(fits(host(GIB, 8 * GIB, true), 3_040_000_000));
+        assert!(!fits(host(GIB, 8 * GIB, true), 4_000_000_000));
         // Warning, critical or unknown pressure with a low estimate: refused.
-        assert!(!host(3 * GIB, 24 * GIB, false).fits(4_613_050_297));
+        assert!(!fits(host(3 * GIB, 24 * GIB, false), 4_613_050_297));
         // An estimate that covers the need admits regardless of pressure.
-        assert!(host(5 * GIB, 8 * GIB, false).fits(4_000_000_000));
-    }
-
-    #[test]
-    fn macos_estimate_excludes_inactive_anonymous_pages() {
-        // vm_statistics64 fixture: 100 free (20 of them speculative), 5
-        // purgeable, 300 file-backed; inactive anonymous pages are not an input.
-        assert_eq!(macos_available(100, 20, 5, 300, 16384), Some(385 * 16384));
-        assert_eq!(macos_available(10, 20, 0, 0, 16384), Some(0));
-    }
-
-    #[test]
-    fn cgroup_v2_ancestor_limit_lowers_available() {
-        let root = crate::test_support::temp_root_path("model-provider-memory", "cgroup");
-        let leaf = root.join("system.slice/home.service");
-        std::fs::create_dir_all(&leaf).unwrap();
-        let read = |path: &Path| std::fs::read_to_string(path).ok();
-        let groups = "0::/system.slice/home.service\n";
-        // No limit files anywhere: MemAvailable stands.
-        assert_eq!(cgroup_available(groups, &root, 6 * GIB, read), 6 * GIB);
-        // The leaf is unlimited; its parent caps at 2 GiB with 1.5 GiB used.
-        std::fs::write(leaf.join("memory.max"), "max\n").unwrap();
-        std::fs::write(leaf.join("memory.current"), "100\n").unwrap();
-        let parent = root.join("system.slice");
-        std::fs::write(parent.join("memory.max"), format!("{}\n", 2 * GIB)).unwrap();
-        std::fs::write(parent.join("memory.current"), format!("{}\n", 3 * GIB / 2)).unwrap();
-        assert_eq!(cgroup_available(groups, &root, 6 * GIB, read), GIB / 2);
-        // A tighter MemAvailable still wins; cgroup v1 (no 0:: line) is unchanged.
-        assert_eq!(cgroup_available(groups, &root, MIB, read), MIB);
-        assert_eq!(
-            cgroup_available("4:memory:/home\n", &root, 6 * GIB, read),
-            6 * GIB
-        );
-    }
-
-    #[test]
-    fn cgroup_v2_page_cache_is_not_counted_as_used() {
-        // Linux hop after a Qwen Get: a 7680 MiB limit with 3395 MiB current,
-        // 3274 MiB of it file LRU cache; 64 MiB tmpfs is in `file` but not on
-        // the file LRUs.
-        let root = crate::test_support::temp_root_path("model-provider-memory", "cache");
-        let group = root.join("hop.slice");
-        std::fs::create_dir_all(&group).unwrap();
-        std::fs::write(group.join("memory.max"), format!("{}\n", 7680 * MIB)).unwrap();
-        std::fs::write(group.join("memory.current"), format!("{}\n", 3395 * MIB)).unwrap();
-        let read = |path: &Path| std::fs::read_to_string(path).ok();
-        let groups = "0::/hop.slice\n";
-        // Without memory.stat all of memory.current counts as used.
-        assert_eq!(cgroup_available(groups, &root, 8 * GIB, read), 4285 * MIB);
-        let stat = |extra: &[(&str, u64)]| {
-            [
-                ("anon", 57),
-                ("file", 3338),
-                ("file_mapped", 12),
-                ("shmem", 64),
-                ("inactive_anon", 121),
-                ("active_anon", 0),
-                ("inactive_file", 1321),
-                ("active_file", 1953),
-            ]
-            .iter()
-            .chain(extra)
-            .map(|(key, mib)| format!("{key} {}\n", mib * MIB))
-            .collect::<String>()
-        };
-        std::fs::write(group.join("memory.stat"), stat(&[])).unwrap();
-        // Used is 3395 - (1953 + 1321) = 121 MiB; tmpfs stays used.
-        assert_eq!(
-            cgroup_available(groups, &root, 8 * GIB, read),
-            (7680 - 121) * MIB
-        );
-        // The host MemAvailable reading still caps the cgroup headroom.
-        assert_eq!(
-            cgroup_available(groups, &root, 7098 * MIB, read),
-            7098 * MIB
-        );
-        // Dirty and writeback file pages must be written before reclaim, so
-        // they stay used: 121 + 200 + 56 MiB.
-        std::fs::write(
-            group.join("memory.stat"),
-            stat(&[("file_dirty", 200), ("file_writeback", 56)]),
-        )
-        .unwrap();
-        assert_eq!(
-            cgroup_available(groups, &root, 8 * GIB, read),
-            (7680 - 377) * MIB
-        );
-        // More dirty than LRU pages leaves no reclaimable cache, not a negative one.
-        std::fs::write(group.join("memory.stat"), stat(&[("file_dirty", 4000)])).unwrap();
-        assert_eq!(cgroup_available(groups, &root, 8 * GIB, read), 4285 * MIB);
-    }
-
-    #[test]
-    fn live_host_memory_is_readable() {
-        let host = host_memory().unwrap();
-        assert!(host.total > 0 && host.available <= host.total);
+        assert!(fits(host(5 * GIB, 8 * GIB, false), 4_000_000_000));
     }
 }

@@ -41,13 +41,15 @@ export function downloadingModel(models) {
 }
 
 export function selectedModelOffer(offers, offerId, selectedCid, models) {
-  const matches = offers.filter(offer => offer.id === offerId);
-  if (!offerId || matches.length !== 1) return null;
   if (selectedCid != null) {
     if (!validModelCid(selectedCid)) return null;
-    const mapped = models.filter(row => row.cid === selectedCid && row.ready && row.offerId === offerId);
-    if (mapped.length !== 1) return null;
+    const mapped = models.filter(row => row.cid === selectedCid);
+    if (mapped.length !== 1 || !mapped[0].ready) return null;
+    // CID is saved user intent. The current verified row supplies its offer hint.
+    offerId = mapped[0].offerId;
   }
+  const matches = offers.filter(offer => offer.id === offerId);
+  if (!offerId || matches.length !== 1) return null;
   return matches[0];
 }
 

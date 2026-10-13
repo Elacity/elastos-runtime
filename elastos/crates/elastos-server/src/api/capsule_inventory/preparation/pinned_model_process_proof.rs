@@ -415,8 +415,7 @@ impl PinnedModel {
     fn env_path(&self, suffix: &str) -> PathBuf {
         let name = format!("ELASTOS_TEST_{}_{suffix}", self.env_prefix);
         PathBuf::from(
-            std::env::var_os(&name)
-                .unwrap_or_else(|| panic!("explicit {name} proof prerequisite")),
+            std::env::var_os(&name).unwrap_or_else(|| panic!("explicit {name} proof prerequisite")),
         )
     }
 }
@@ -462,7 +461,8 @@ impl PinnedModelProof {
         provenance["quantized_repository"] = serde_json::json!(model.quantized_repository);
         provenance["quantized_revision"] = serde_json::json!(model.quantized_revision);
         let mut files = std::collections::BTreeMap::from([
-            ("LICENSE".into(), self.license.clone()), ("LICENSE.base".into(), self.license.clone()),
+            ("LICENSE".into(), self.license.clone()),
+            ("LICENSE.base".into(), self.license.clone()),
             ("PROVENANCE.md".into(), model.provenance.as_bytes().to_vec()),
             ("capsule.json".into(), serde_json::to_vec(capsule).unwrap()),
         ]);
@@ -749,7 +749,7 @@ async fn pinned_first_reply(
         session_id: ctx.session_id.clone(),
         capsule_id: "assistant".into(),
         grant_id: ctx.grant_id.clone(),
-        request_id: "pinned-proof-reply".into(),
+        request_id: format!("model-v1:{}:pinned-proof-reply", now().unwrap() * 1000),
         offer_id: offer.clone(),
         operation: "text.generate".into(),
         input_hash: model_input_hash(&input).unwrap(),
@@ -819,7 +819,10 @@ fn assert_pinned_reply(model: &PinnedModel, terminal: &serde_json::Value) {
         text.chars().count(),
         text.chars().take(64).collect::<String>()
     );
-    assert!((model.reply_accepts)(text), "reply rejected by pinned model check");
+    assert!(
+        (model.reply_accepts)(text),
+        "reply rejected by pinned model check"
+    );
 }
 
 struct PinnedRunProof {
@@ -848,7 +851,10 @@ async fn pinned_runs_and_active_cancel(
         session_id: ctx.session_id.clone(),
         capsule_id: "assistant".into(),
         grant_id: ctx.grant_id.clone(),
-        request_id: "pinned-proof-active-cancel".into(),
+        request_id: format!(
+            "model-v1:{}:pinned-proof-active-cancel",
+            now().unwrap() * 1000
+        ),
         offer_id: offer.clone(),
         operation: "text.generate".into(),
         input_hash: model_input_hash(&input).unwrap(),

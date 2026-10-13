@@ -549,6 +549,29 @@ mod tests {
     }
 
     #[test]
+    fn model_host_lock_is_data_root_scoped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first_root = temp.path().join("first-home");
+        let second_root = temp.path().join("second-home");
+        let first = acquire_host_process_lock(&first_root, "serve", "127.0.0.1:3100")
+            .expect("first Home owns its data root");
+        let second = acquire_host_process_lock(&second_root, "serve", "127.0.0.1:3101")
+            .expect("a distinct Home in the same process owns a separate data root");
+        for root in [&first_root, &second_root] {
+            assert!(acquire_host_process_lock(root, "serve", "127.0.0.1:3102").is_err());
+        }
+        drop(first);
+        let first = acquire_host_process_lock(&first_root, "serve", "127.0.0.1:3100")
+            .expect("release affects only the first data root");
+        assert!(acquire_host_process_lock(&second_root, "serve", "127.0.0.1:3102").is_err());
+        drop(second);
+        let _second = acquire_host_process_lock(&second_root, "serve", "127.0.0.1:3101")
+            .expect("the second data root can take its own released lock");
+        assert!(acquire_host_process_lock(&first_root, "serve", "127.0.0.1:3102").is_err());
+        drop(first);
+    }
+
+    #[test]
     fn ended_host_lock_is_free_while_a_command_spawned_under_it_runs() {
         let temp = tempfile::tempdir().expect("tempdir");
         let host = acquire_host_process_lock(temp.path(), "update-recovery", "offline")

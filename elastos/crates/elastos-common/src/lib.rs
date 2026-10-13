@@ -5,6 +5,7 @@ pub mod chat_protocol;
 pub mod collaboration_protocol;
 mod error;
 mod free_space;
+pub mod host_memory;
 pub mod localhost;
 mod manifest;
 #[cfg(unix)]

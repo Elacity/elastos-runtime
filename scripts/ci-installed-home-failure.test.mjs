@@ -17,6 +17,10 @@ test("public failures accept only owned stages and fixed failure codes", () => {
     { failure_stage: "installed_runtime_reply", failure: "assertion_failed" });
   assert.deepEqual(publicJourneyFailure({ name: "AssertionError", message: "secret" }, "engine_absent_refusal"),
     { failure_stage: "engine_absent_refusal", failure: "assertion_failed" });
+  for (const stage of ["memory_refusal", "finite_resource_lifecycle", "finite_home_recovery"]) {
+    assert.deepEqual(publicJourneyFailure({ name: "AssertionError", message: "secret" }, stage, "reply_display"),
+      { failure_stage: stage, failure: "assertion_failed" });
+  }
   assert.deepEqual(publicJourneyFailure({ name: "secret", message: "secret" }, "secret"),
     { failure_stage: "journey", failure: "journey_failed" });
   assert.deepEqual(publicJourneyFailure(null, null), { failure_stage: "journey", failure: "journey_failed" });
@@ -40,4 +44,34 @@ test("reply subchecks expose only fixed names while error details stay private",
     { failure_stage: "journey", failure: "journey_failed" });
   assert.deepEqual(publicJourneyFailure({ name: "AssertionError", message: secret }, "engine_absent_refusal", "reply_display"),
     { failure_stage: "engine_absent_refusal", failure: "assertion_failed" });
+});
+
+test("lifecycle subchecks locate the blocked UI phase without disclosing launch authority", () => {
+  const secret = "home_token=fixture-secret /private/operator/home";
+  for (const subcheck of ["owner_configure", "contender_launch", "contender_configure", "owner_start", "busy", "stop", "stop_recovery", "idle", "idle_recovery", "crash", "crash_recovery"]) {
+    assert.deepEqual(publicJourneyFailure({ name: "TimeoutError", message: secret }, "finite_resource_lifecycle", subcheck),
+      { failure_stage: "finite_resource_lifecycle", failure: "timeout", failure_check: subcheck });
+  }
+  for (const subcheck of [secret, "reply_display", "constructor", "toString", "__proto__"]) {
+    assert.deepEqual(publicJourneyFailure({ name: "TimeoutError", message: secret }, "finite_resource_lifecycle", subcheck),
+      { failure_stage: "finite_resource_lifecycle", failure: "timeout" });
+  }
+});
+
+test("model repair failures retain only the fixed journey phase", () => {
+  const secret = "home_token=fixture-secret /private/operator/home";
+  const stages = {
+    model_stop_get_different: ["stop_real_stream", "get_other_model", "other_model_reply"],
+    model_interrupted_get_retry: ["fresh_get_precondition", "partial_get", "restarted_home", "retry_retained_get"],
+  };
+  for (const [stage, checks] of Object.entries(stages)) {
+    for (const check of checks) {
+      assert.deepEqual(publicJourneyFailure({ name: "TimeoutError", message: secret }, stage, check),
+        { failure_stage: stage, failure: "timeout", failure_check: check });
+    }
+    for (const check of [secret, "reply_display", "constructor", "__proto__"]) {
+      assert.deepEqual(publicJourneyFailure({ name: "Error", message: secret }, stage, check),
+        { failure_stage: stage, failure: "journey_failed" });
+    }
+  }
 });

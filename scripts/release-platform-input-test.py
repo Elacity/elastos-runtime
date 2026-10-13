@@ -1081,6 +1081,13 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
                 write_archive(server, library)
                 with self.assertRaises(ValueError):
                     inputs.check_archive(path, "llama-b10516", engine_platform="aarch64-linux")
+        write_archive(x86, x86)
+        inputs.check_archive(path, "llama-b10516", engine_platform="x86_64-linux")
+        for server, library in ((arm64, x86), (x86, arm64), (None, x86), (x86, None)):
+            with self.subTest(platform="x86_64-linux", server=server is not None, library=library == x86):
+                write_archive(server, library)
+                with self.assertRaises(ValueError):
+                    inputs.check_archive(path, "llama-b10516", engine_platform="x86_64-linux")
         path.write_bytes(archive_bytes([
             ("other/llama-server", arm64, None),
             ("llama-b10516/llama-server", arm64, None),

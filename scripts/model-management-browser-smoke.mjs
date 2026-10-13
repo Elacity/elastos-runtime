@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import { once } from "node:events";
-import { chromium, brave, inertSystemApiResponse, makeSystemSummary, makeAppearanceRecord } from "./system-uiux-fixture.mjs";
+import { chromium, inertSystemApiResponse, makeSystemSummary, makeAppearanceRecord } from "./system-uiux-fixture.mjs";
 
 const root = resolve(new URL("../", import.meta.url).pathname);
 const cid = `bafybei${"a".repeat(52)}`;
@@ -13,6 +13,7 @@ const calls = [];
 let phase = "unprepared";
 let kept = false;
 let activationPending = false;
+let activationFailure = false;
 let dispatchPending = false;
 let dispatchUnavailableReason = null;
 let failure = false;
@@ -28,11 +29,15 @@ let malformedRuntime = false;
 let mismatchRetention = false;
 let delayCatalog = null;
 let protectReclaim = false;
+let preparationFailure = null;
+let useRefusal = null;
+let modelMemoryFit = "fits";
 const fixtureErrors = [];
 function preparation() {
   return phase === "unprepared" ? null : { operation_id: operation, cid: selectedCid, state: phase,
     total_bytes: 1024, completed_bytes: phase === "capacity_pending" ? 0 : ["admitted", "reclaimed"].includes(phase) ? 1024 : 256,
-    cancel_requested: false, admitted: phase === "admitted", activation_pending: activationPending };
+    cancel_requested: false, admitted: phase === "admitted", activation_pending: activationPending,
+    failure_class: activationFailure ? "activation_unavailable" : preparationFailure };
 }
 function runtime() {
   return { admitted: phase === "admitted", kept, dispatch_ready: phase === "admitted" && !dispatchPending,
@@ -40,11 +45,11 @@ function runtime() {
     offer_id: malformedRuntime ? "wrong" : phase === "admitted" && !dispatchPending ? `model:${"b".repeat(64)}` : null, preparation: preparation() };
 }
 function catalog() {
-  return { schema: "elastos.capsules.catalog/v1", model_catalog_state: trust, capsules: [
+  return { schema: "elastos.capsules.catalog/v1", policy: { protected_content: true }, model_catalog_state: trust, capsules: [
     { name: "people", title: "People", role: "app", installed: true, launchable: true, interfaces: [], dependencies: [] },
     { name: "fixture-model", title: "Fixture model", role: "content", source: "signed-model-catalog",
       installed: false, launchable: false, cid: selectedCid, publisher_did: "did:key:zFixturePublisher", content_size_bytes: 1024,
-      signature_state: "catalog-signature-verified", model_content: { format: "gguf" }, model_runtime: runtime() },
+      signature_state: "catalog-signature-verified", model_memory_fit: modelMemoryFit, model_content: { format: "gguf" }, model_runtime: runtime() },
   ] };
 }
 const manifests = Object.fromEntries(await Promise.all(["marketplace", "system"].map(async name =>
@@ -82,6 +87,13 @@ const server = createServer(async (req, res) => {
       assert.ok(["use", "status", "cancel", "retention", "reclaim"].includes(method.operation));
       assert.equal(method.risk, method.operation === "status" ? "read" : "write");
       if (failure) { json({ error: "private runtime provider path /secret" }, 503); return; }
+      if (method.operation === "use" && useRefusal) {
+        json({ schema: "elastos.capsules.invoke-result/v1", status: "error", code: useRefusal.code,
+          message: useRefusal.message || "private provider /secret credential", capsule: input.capsule,
+          interface: input.interface, method: input.method,
+          request_id: useRefusal.wrongIdentity ? "wrong-request" : input.request_id }, 409);
+        return;
+      }
       if (method.operation === "use") { assert.deepEqual(input.input, { cid }); phase = "preparing"; kept = true; }
       if (method.operation === "use" && loseUseResponse) { req.socket.destroy(); return; }
       if (["status", "cancel"].includes(method.operation)) assert.deepEqual(input.input, { operation_id: operation });
@@ -128,7 +140,8 @@ const server = createServer(async (req, res) => {
   } catch (error) { fixtureErrors.push(String(error)); json({ fixture_error: String(error) }, 500); }
 });
 server.listen(0, "127.0.0.1"); await once(server, "listening");
-const browser = await chromium.launch({ executablePath: brave, headless: true });
+const browser = await chromium.launch({ headless: true,
+  ...(process.env.BRAVE_BIN ? { executablePath: process.env.BRAVE_BIN } : {}) });
 let activePage;
 try {
   for (const app of ["marketplace", "system"]) {
@@ -139,6 +152,7 @@ try {
       : { absent: "Ready to prepare", reclaimed: "Model removed from local cache." };
     phase = "unprepared"; kept = false; failure = false; calls.length = 0;
     dispatchUnavailableReason = null;
+    preparationFailure = null; useRefusal = null; modelMemoryFit = "fits";
     selectedCid = cid; executable = true; trust = "verified"; protectReclaim = false;
     const page = await browser.newPage({ viewport: { width: 1100, height: 800 } });
     activePage = page;
@@ -146,6 +160,11 @@ try {
     page.on("pageerror", error => pageErrors.push(String(error)));
     await page.goto(`http://127.0.0.1:${server.address().port}/?app=${app}`);
     const frame = page.frameLocator("iframe");
+    async function refreshModels() {
+      await frame.getByRole("button", { name: "Refresh models" }).click();
+      // Repeated state copy can match the old row while this read is pending.
+      await frame.locator('[data-model-control="refresh"]:enabled').waitFor();
+    }
     if (app === "marketplace") {
       for (const title of ["Installed", "Apps", "Models"]) {
         await frame.locator("#store-sections").getByRole("heading", { name: title, exact: true }).waitFor();
@@ -179,20 +198,85 @@ try {
       assert.equal(await frame.getByText("Not on this device yet", { exact: true }).count(), 1);
       assert.equal(await frame.getByRole("button", { name: "Get", exact: true }).isEnabled(), true);
     }
-    phase = "capacity_pending";
-    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await frame.getByText("Meets this model’s minimum memory requirement", { exact: true }).waitFor();
+    for (const [fit, explanation] of [
+      ["insufficient", "This device has less memory than this model requires. Choose a smaller model."],
+      ["unavailable", "This Home could not check the device memory. Ask the Home owner to check the memory limits, then try again."],
+    ]) {
+      modelMemoryFit = fit;
+      await refreshModels();
+      await frame.getByText(explanation, { exact: true }).waitFor();
+      assert.equal(await frame.getByRole("button", { name: acquire, exact: true }).isEnabled(), false);
+      assert.equal(calls.filter(call => call.method === "content.use").length, 0,
+        "device fit refusal sends no new Get request");
+    }
+    modelMemoryFit = "private provider /secret credential";
+    await refreshModels();
+    await frame.getByText("Models are unavailable. Check your connection and trusted catalog, then retry.", { exact: true }).waitFor();
+    assert.doesNotMatch(await frame.locator("body").innerText(), /\/secret|credential|private provider/);
+    modelMemoryFit = "fits";
+    await refreshModels();
+    await frame.getByText("Meets this model’s minimum memory requirement", { exact: true }).waitFor();
+    assert.equal(await frame.getByRole("button", { name: acquire, exact: true }).isEnabled(), true);
+    for (const [state, cause, explanation] of [
+      ["failed", "storage_service_unavailable", "The storage service is unavailable. Retry when it is running."],
+      ["cancelled", "download_interrupted", "The download stopped before it finished. Retry."],
+      ["expired", "download_interrupted", "The download stopped before it finished. Retry."],
+      ["uncertain", "storage_service_unavailable", "The storage service is unavailable. Waiting for preparation to settle."],
+      ["capacity_pending", "cache_budget_unavailable", "Waiting for room in the local cache budget. Remove an unneeded model or increase the budget and it continues."],
+    ]) {
+      phase = state; preparationFailure = cause;
+      await refreshModels();
+      await frame.getByText(explanation, { exact: true }).waitFor();
+      if (["uncertain", "capacity_pending"].includes(state)) {
+        assert.equal(await frame.getByRole("button", { name: "Retry", exact: true }).count(), 0);
+        assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 1);
+      } else assert.equal(await frame.getByRole("button", { name: "Retry", exact: true }).isEnabled(), true);
+    }
+    preparationFailure = null; phase = "capacity_pending";
+    await refreshModels();
     await frame.getByText("Waiting for free space. This model needs 1.02 KB on this Home, plus 2 GB kept free. Free some space and it continues.", { exact: true }).waitFor();
     assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 1);
     assert.equal(calls.filter(c => c.method === "content.use").length, 0, "pending status never starts another Use");
     phase = "reclaimed";
-    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await refreshModels();
     await frame.getByText(copy.reclaimed, { exact: true }).waitFor();
     assert.equal(await frame.getByRole("button", { name: acquire, exact: true }).isEnabled(), true);
     if (app === "system") assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isEnabled(), false);
     else assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).count(), 0);
     phase = "unprepared";
-    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await refreshModels();
     await frame.getByText(copy.absent, { exact: true }).waitFor();
+    for (const [code, explanation] of [
+      ["model_memory_insufficient", "This device has less memory than this model requires. Choose a smaller model."],
+      ["model_memory_observation_unavailable", "This Home could not check the device memory. Ask the Home owner to check the memory limits, then try again."],
+      ["memory_budget_unavailable", "This model exceeds the local model memory budget. Choose a smaller model or increase the budget, then Retry."],
+      ["cache_budget_unavailable", "This model does not fit the local cache budget. Remove an unneeded model, choose a smaller model, or increase the budget, then Retry."],
+      ["request_expired", "This request is no longer valid. Check your device's clock, then try again."],
+      ["not_enough_free_space", "Not enough free disk space on this Home: this needs 3 GB plus 2 GB kept free. Free some space, then select Get again."],
+    ]) {
+      useRefusal = { code, ...(code === "not_enough_free_space" ? { message: explanation } : {}) };
+      await frame.getByRole("button", { name: acquire, exact: true }).click();
+      await frame.getByText(explanation, { exact: true }).waitFor();
+      assert.equal(await frame.getByRole("button", { name: acquire, exact: true }).isEnabled(), true);
+      assert.doesNotMatch(await frame.locator("body").innerText(), /\/secret|credential|private provider/);
+    }
+    for (const refusal of [
+      { code: "memory_budget_unavailable", wrongIdentity: true },
+      { code: "not_enough_free_space", message: "private provider /secret credential" },
+    ]) {
+      useRefusal = refusal;
+      await frame.getByRole("button", { name: acquire, exact: true }).click();
+      await frame.getByText("Model action could not be confirmed. Refresh to check its status.", { exact: true }).waitFor();
+      assert.doesNotMatch(await frame.locator("body").innerText(), /\/secret|credential|private provider/);
+      useRefusal = null; phase = "reclaimed";
+      await refreshModels();
+      await frame.getByText(copy.reclaimed, { exact: true }).waitFor();
+      phase = "unprepared";
+      await refreshModels();
+      await frame.getByText(copy.absent, { exact: true }).waitFor();
+    }
+    useRefusal = null; calls.length = 0;
     let releaseUse;
     const useReceived = new Promise(resolveUse => { delayUse = reply => { releaseUse = reply; resolveUse(); }; });
     await frame.getByRole("button", { name: acquire, exact: true }).evaluate(button => { button.click(); button.click(); });
@@ -205,7 +289,7 @@ try {
     if (app === "system") {
       await frame.getByRole("checkbox", { name: "Keep on this device" }).check();
       await frame.getByText("Keep choice saved for this preparation.", { exact: true }).waitFor();
-      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await refreshModels();
       await frame.locator('[data-model-management] input:enabled:checked').waitFor();
       assert.equal(calls.filter(c => c.method === "content.use").length, 1, "retention never starts another preparation");
     }
@@ -225,18 +309,26 @@ try {
     for (const [reason, explanation] of [
       ["unsupported_host", "Local AI is not supported on this device."],
       ["source_engine_required", "This source Home needs its local model engine. Install the engine through source setup, then Retry."],
+      ["memory_budget_unavailable", "This model exceeds the local model memory budget. Choose a smaller model or increase the budget, then Retry."],
+      ["cache_budget_unavailable", "This model does not fit the local cache budget. Remove an unneeded model, choose a smaller model, or increase the budget, then Retry."],
     ]) {
       dispatchUnavailableReason = reason;
-      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await refreshModels();
       await frame.getByText(explanation, { exact: true }).waitFor();
       assert.equal(await frame.getByRole("button", { name: "Retry", exact: true }).count(), 1);
       assert.equal(await frame.getByRole("button", { name: "Open in Assistant", exact: true }).count(), 0);
       if (app === "system") assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isChecked(), true);
     }
     dispatchUnavailableReason = null;
+    activationFailure = true;
+    await refreshModels();
+    await frame.getByText("Local AI could not start. The model stays on this device. Retry.", { exact: true }).waitFor();
+    assert.equal(await frame.getByRole("button", { name: "Retry", exact: true }).count(), 1);
+    assert.equal(await frame.getByRole("button", { name: "Open in Assistant", exact: true }).count(), 0);
+    if (app === "system") assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isChecked(), true);
     const activationUses = calls.filter(c => c.method === "content.use").length;
     assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 0, "admitted content is not cancellable");
-    activationPending = false; dispatchPending = false;
+    activationPending = false; activationFailure = false; dispatchPending = false;
     await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
     assert.equal(calls.filter(c => c.method === "content.use").length, activationUses, "activation readiness uses status without another Use");
     if (app === "marketplace") {
@@ -249,7 +341,7 @@ try {
       assert.equal((await page.evaluate(() => window.homeMessages)).filter(message => message?.type === "home:open-target").length, 0,
         "invalid Keep acknowledgement preserves the current surface");
       mismatchRetention = false;
-      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await refreshModels();
       await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
       let releaseOpen;
       const openRetention = new Promise(resolveRetention => {
@@ -297,10 +389,10 @@ try {
       await frame.getByText(copy.reclaimed, { exact: true }).waitFor();
       assert.equal(calls.filter(c => c.method === "content.reclaim").length, reclaimBeforeDecline + 2, "Remove now dispatches reclaim once after the busy reject");
       phase = "admitted";
-      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await refreshModels();
       await frame.locator("[data-model-management] p").filter({ hasText: /^Available on this device$/ }).waitFor();
       phase = "preparing";
-      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await refreshModels();
       await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
       const usesBeforeRetentionRace = calls.filter(c => c.method === "content.use").length;
       const statusesBeforeRetentionRace = calls.filter(c => c.method === "content.status").length;
@@ -327,7 +419,7 @@ try {
       await frame.getByText("Model action could not be confirmed. Refresh to check its status.", { exact: true }).waitFor();
       assert.doesNotMatch(await frame.locator("body").innerText(), /\/secret|private runtime provider/);
       failure = false;
-      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await refreshModels();
       await frame.locator('[data-model-management] input:enabled').waitFor();
       mismatchRetention = true;
       await frame.getByRole("checkbox", { name: "Keep on this device" }).click();
@@ -335,7 +427,7 @@ try {
       assert.equal(await frame.getByRole("checkbox", { name: "Keep on this device" }).isChecked(), false, "invalid retention reply leaves prior state intact");
       assert.equal(await frame.getByText("Current status unavailable", { exact: true }).count(), 1);
       mismatchRetention = false;
-      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await refreshModels();
       await frame.locator('[data-model-management] input:enabled:checked').waitFor();
       assert.equal(await frame.getByRole("button", { name: "Refresh models" }).evaluate(n => n === document.activeElement), true, "refresh retains keyboard focus");
     } else {
@@ -360,7 +452,7 @@ try {
     await frame.locator("html").evaluate(node => node.dataset.elTheme = "dark");
     await page.setViewportSize({ width: 1100, height: 800 });
     phase = "unprepared"; kept = false;
-    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await refreshModels();
     await frame.getByRole("button", { name: acquire, exact: true }).waitFor();
     let releaseCatalog;
     const catalogReceived = new Promise(resolveCatalog => { delayCatalog = reply => { releaseCatalog = reply; resolveCatalog(); }; });
@@ -378,28 +470,66 @@ try {
     await frame.getByText("Model action could not be confirmed. Refresh to check its status.", { exact: true }).waitFor();
     assert.equal(await frame.getByRole("button", { name: "Retry", exact: true }).isDisabled(), true);
     loseUseResponse = false;
-    await frame.getByRole("button", { name: "Refresh models" }).click();
+    // A stale catalogue may not show the retained request yet. Retry keeps
+    // its identity even when a fresh device-memory observation is unavailable.
+    phase = "unprepared"; kept = false; modelMemoryFit = "unavailable";
+    await refreshModels();
+    await frame.getByRole("button", { name: "Retry", exact: true }).waitFor();
+    assert.equal(await frame.getByRole("button", { name: "Retry", exact: true }).isEnabled(), true);
+    await frame.getByRole("button", { name: "Retry", exact: true }).click();
     await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
+    await frame.getByText("This Home could not check the device memory. Ask the Home owner to check the memory limits, then try again.", { exact: true }).waitFor();
+    modelMemoryFit = "fits";
     const lostRequests = calls.filter(c => c.method === "content.use").slice(usesBeforeLoss);
     assert.ok(lostRequests.length > 0);
     assert.equal(new Set(lostRequests.map(c => c.request_id)).size, 1, "transport retries and reconciliation preserve the same Use identity");
+    assert.match(lostRequests[0].request_id, /^model-v1:\d+:/);
     phase = "unprepared"; kept = false;
-    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await refreshModels();
     await frame.getByRole("button", { name: acquire, exact: true }).waitFor();
+    for (const recoveredPhase of ["preparing", "unprepared"]) {
+      loseUseResponse = true;
+      const uncertainStart = calls.filter(c => c.method === "content.use").length;
+      await frame.getByRole("button", { name: acquire, exact: true }).click();
+      await frame.getByText("Model action could not be confirmed. Refresh to check its status.", { exact: true }).waitFor();
+      loseUseResponse = false; phase = "unprepared"; kept = false;
+      await refreshModels();
+      useRefusal = { code: "request_expired" };
+      await frame.getByRole("button", { name: "Retry", exact: true }).click();
+      await frame.getByText("This request is no longer valid. Check your device's clock, then try again.", { exact: true }).waitFor();
+      assert.equal(await frame.getByRole("button", { name: "Retry", exact: true }).isDisabled(), true,
+        "a refusal of this invocation keeps the earlier uncertain preparation in recovery");
+      const uncertainRequests = calls.filter(c => c.method === "content.use").slice(uncertainStart);
+      assert.equal(new Set(uncertainRequests.map(c => c.request_id)).size, 1);
+      useRefusal = null; phase = recoveredPhase; kept = recoveredPhase === "preparing";
+      await refreshModels();
+      if (recoveredPhase === "unprepared") {
+        await frame.getByRole("button", { name: acquire, exact: true }).click();
+      }
+      await frame.getByRole("button", { name: "Cancel preparation" }).waitFor();
+      if (recoveredPhase === "unprepared") {
+        const next = calls.filter(c => c.method === "content.use").at(-1);
+        assert.notEqual(next.request_id, uncertainRequests[0].request_id,
+          "a confirmed expiry and successful empty refresh permit a fresh deliberate Get");
+      }
+      phase = "unprepared"; kept = false;
+      await refreshModels();
+      await frame.getByRole("button", { name: acquire, exact: true }).waitFor();
+    }
     wrongIdentity = true;
     await frame.getByRole("button", { name: acquire, exact: true }).click();
     await frame.getByText("Model action could not be confirmed. Refresh to check its status.", { exact: true }).waitFor();
     assert.equal(await frame.getByRole("button", { name: "Cancel preparation" }).count(), 0, "mismatched response cannot install an operation");
     wrongIdentity = false;
     executable = false;
-    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await refreshModels();
     await frame.getByText("Models are unavailable. Check your connection and trusted catalog, then retry.", { exact: true }).waitFor();
     assert.equal(await frame.getByRole("button", { name: acquire, exact: true }).count(), 0);
     executable = true; trust = "unavailable";
-    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await refreshModels();
     await frame.getByText("Models are unavailable. Check your connection and trusted catalog, then retry.", { exact: true }).waitFor();
     trust = "verified"; malformedRuntime = true;
-    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await refreshModels();
     await frame.getByText("Models are unavailable. Check your connection and trusted catalog, then retry.", { exact: true }).waitFor();
     malformedRuntime = false; phase = "preparing";
     await frame.locator("body").evaluate(() => {
@@ -425,7 +555,7 @@ try {
     });
     let releaseStatus;
     const statusReceived = new Promise(resolveStatus => { delayStatus = reply => { releaseStatus = reply; resolveStatus(); }; });
-    await frame.getByRole("button", { name: "Refresh models" }).click();
+    await refreshModels();
     await statusReceived;
     await frame.locator("body").evaluate(() => {
       Object.defineProperty(document, "hidden", { configurable: true, value: true });
@@ -478,7 +608,7 @@ try {
       });
       const mutationsBeforeRotation = calls.filter(c => c.method !== "content.status").length;
       selectedCid = `bafybei${"c".repeat(52)}`;
-      await frame.getByRole("button", { name: "Refresh models" }).click();
+      await refreshModels();
       await frame.getByText("No verified model is available. Ask your administrator to configure a trusted catalog.", { exact: true }).waitFor();
       assert.equal(await frame.locator("[data-model-management]").evaluate(node => node === window.fixtureOpenModelDetail), true, "CID rotation leaves the same detail controller mounted");
       assert.match(await frame.locator(".model-content-identity").innerText(), new RegExp(detailCid), "the open detail keeps its original CID");

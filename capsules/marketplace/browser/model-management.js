@@ -3,20 +3,35 @@
   const CID = /^bafybei[a-z2-7]{52}$/;
   const STATES = new Set(["capacity_pending", "reserved", "preparing", "verifying", "admission_pending", "admitted", "reclaimed", "failed", "uncertain", "cancelled", "expired"]);
   const active = p => p && ["capacity_pending", "reserved", "preparing", "verifying", "admission_pending", "uncertain"].includes(p.state);
+  const MEMORY_FIT_TEXT = Object.freeze({
+    fits: "Meets this model’s minimum memory requirement",
+    insufficient: "This device has less memory than this model requires. Choose a smaller model.",
+    unavailable: "This Home could not check the device memory. Ask the Home owner to check the memory limits, then try again.",
+  });
   const FAILURE_TEXT = Object.freeze({
     authorization_unavailable: "Preparation stopped. Open Models again to check access.",
     policy_unavailable: "Preparation stopped. Model policy is unavailable.",
-    capacity_unavailable: "Preparation stopped. Storage capacity is unavailable.",
+    capacity_unavailable: "Not enough free disk space for this model. Free some space, then Retry.",
+    download_interrupted: "The download stopped before it finished. Retry.",
+    storage_service_unavailable: "The storage service is unavailable. Retry when it is running.",
+    cache_budget_unavailable: "This model does not fit the local cache budget. Remove an unneeded model, choose a smaller model, or increase the budget, then Retry.",
+    memory_budget_unavailable: "This model exceeds the local model memory budget. Choose a smaller model or increase the budget, then Retry.",
+    model_memory_insufficient: MEMORY_FIT_TEXT.insufficient,
+    model_memory_observation_unavailable: MEMORY_FIT_TEXT.unavailable,
+    request_expired: "This request is no longer valid. Check your device's clock, then try again.",
     content_unavailable: "Preparation failed. Model content could not be read.",
     local_storage_unavailable: "Preparation failed. Local storage could not be written.",
     verification_failed: "Preparation failed. Model verification did not pass.",
     preparation_unavailable: "Preparation failed.",
+    activation_unavailable: "Local AI could not start. The model stays on this device. Retry.",
   });
   const failureText = p => FAILURE_TEXT[p.failure_class] || "Preparation failed.";
   const DISPATCH_UNAVAILABLE_TEXT = Object.freeze({
     unsupported_host: "Local AI is not supported on this device.",
     source_engine_required: "This source Home needs its local model engine. Install the engine through source setup, then Retry.",
     catalog_updated: "Model list updated. Press Use to keep using this model.",
+    cache_budget_unavailable: FAILURE_TEXT.cache_budget_unavailable,
+    memory_budget_unavailable: FAILURE_TEXT.memory_budget_unavailable,
   });
   // One phase per Runtime projection. The full view (System) and the compact
   // Marketplace detail read their copy from the same phase.
@@ -25,15 +40,14 @@
     if (r.dispatch_ready) return "ready";
     // Admitted content whose engine is still being activated is finishing,
     // not broken: Runtime clears activation_pending once dispatch can start.
-    // Activation failures are not reported, so a finish that takes longer
-    // than FINISHING_DEADLINE_MS reads as unavailable and offers Retry.
+    // An unresolved finish has a bounded wait before offering Retry.
     if (r.admitted) return activating(r, p) && !finishingExpired ? "finishing" : "service_unavailable";
     if (active(p)) return p.cancel_requested ? "cancelling" : p.state === "capacity_pending" ? "capacity" : p.state === "uncertain" ? "settling" : p.state === "verifying" ? "verifying" : "preparing";
     if (!p) return "absent";
     return p.state;
   }
   const FINISHING_DEADLINE_MS = 120000;
-  const activating = (r, p) => Boolean(r.admitted && p?.activation_pending && !r.dispatch_unavailable_reason);
+  const activating = (r, p) => Boolean(r.admitted && p?.activation_pending && !p.failure_class && !r.dispatch_unavailable_reason);
   const PHASE_TEXT = Object.freeze({
     unavailable: "Current status unavailable", ready: "Available on this device",
     service_unavailable: "Available on this device. Model service unavailable.",
@@ -82,7 +96,8 @@
       check(item.role === "content" && item.installed === false && item.launchable === false
         && CID.test(item.cid) && text(item.title) && text(item.publisher_did, 256)
         && item.publisher_did.startsWith("did:") && item.signature_state === "catalog-signature-verified"
-        && Number.isSafeInteger(item.content_size_bytes) && item.content_size_bytes > 0);
+        && Number.isSafeInteger(item.content_size_bytes) && item.content_size_bytes > 0
+        && typeof item.model_memory_fit === "string" && Object.hasOwn(MEMORY_FIT_TEXT, item.model_memory_fit));
       parseRuntime(item.model_runtime, item.cid);
     }
     return entries;
@@ -100,7 +115,9 @@
     return `${(bytes / 1000 ** rank).toLocaleString(undefined, { maximumFractionDigits: rank ? 2 : 0 })} ${units[rank]}`;
   }
   // Waiting for space names how much this model still needs, so the user knows what to free.
-  const capacityText = p => `Waiting for free space. This model needs ${formatBytes(p.total_bytes - p.completed_bytes)} on this Home, plus 2 GB kept free. Free some space and it continues.`;
+  const capacityText = p => p.failure_class === "cache_budget_unavailable"
+    ? "Waiting for room in the local cache budget. Remove an unneeded model or increase the budget and it continues."
+    : `Waiting for free space. This model needs ${formatBytes(p.total_bytes - p.completed_bytes)} on this Home, plus 2 GB kept free. Free some space and it continues.`;
   function element(tag, value, className) {
     const node = document.createElement(tag);
     if (value) node.textContent = value;
@@ -136,17 +153,21 @@
         const response = await fetch(path, { method: body ? "POST" : "GET", headers: {
           "x-elastos-home-token": token, ...(body ? { "content-type": "application/json" } : {}),
         }, ...(body ? { body: JSON.stringify(body) } : {}), signal });
-        if (!response.ok) {
-          // A disk-space refusal is final and carries its plain reason; show it as is.
-          const refusal = await response.json().catch(() => null);
-          if (refusal?.code === "not_enough_free_space" && text(refusal.message, 300)) {
-            throw Object.assign(new Error(refusal.message), { refusal: refusal.message });
-          }
-          throw new Error("Model request failed");
-        }
         const raw = await response.text();
         check(raw.length <= 2 * 1024 * 1024);
-        return JSON.parse(raw);
+        const result = JSON.parse(raw);
+        if (!response.ok) {
+          // Only the exact invoked operation can return a final typed denial.
+          const bound = body && result?.schema === "elastos.capsules.invoke-result/v1" && result.status === "error"
+            && ["capsule", "interface", "method", "request_id"].every(key => result[key] === body[key]);
+          let denial = bound && ["cache_budget_unavailable", "memory_budget_unavailable", "model_memory_insufficient", "model_memory_observation_unavailable", "request_expired"].includes(result.code)
+            ? FAILURE_TEXT[result.code] : "";
+          if (bound && result.code === "not_enough_free_space" && text(result.message, 300)
+            && /^Not enough free disk space on this Home: this needs \d+(?:\.\d)? GB plus 2 GB kept free\. Free some space, then select Get again\.$/.test(result.message)) denial = result.message;
+          if (denial) throw Object.assign(new Error(denial), { refusal: denial, code: result.code });
+          throw new Error("Model request failed");
+        }
+        return result;
       }
       async function invoke(operation, input, signal, requestId) {
         const method = methods.get(operation);
@@ -199,7 +220,7 @@
           bindMethods(interfaces); model = parseCatalog(catalog);
           reconcileRequired = false;
           reclaimStep = "idle";
-          if (model?.cid !== unresolvedUse?.cid || model?.model_runtime.preparation) unresolvedUse = null;
+          if (model?.cid !== unresolvedUse?.cid || model?.model_runtime.preparation || unresolvedUse?.expiredConfirmed) unresolvedUse = null;
         } catch {
           if (epoch !== generation || !show()) return;
           model = null; choices = []; message = "Models are unavailable. Check your connection and trusted catalog, then retry.";
@@ -237,14 +258,16 @@
       }
       async function act(operation, keep) {
         if (busy || loading || !show() || !model || reconcileRequired) return;
+        if (operation === "use" && !unresolvedUse && model.model_memory_fit !== "fits") return;
         stopRead(); const epoch = ++generation, cid = model.cid;
+        const freshUse = operation === "use" && !unresolvedUse;
         const id = model.model_runtime.preparation?.operation_id;
         busy = true; message = ""; refusal = ""; statusFailures = 0; render();
         const io = controller();
         try {
           const opening = operation === "open";
           const input = opening ? { cid, keep: true } : operation === "retention" ? { cid, keep } : operation === "cancel" ? { operation_id: id } : { cid };
-          if (operation === "use" && !unresolvedUse) unresolvedUse = { cid, id: `model-${crypto.randomUUID()}` };
+          if (freshUse) unresolvedUse = { cid, id: `model-v1:${Date.now()}:${crypto.randomUUID()}` };
           const result = await invoke(opening ? "retention" : operation, input, io.signal, operation === "use" ? unresolvedUse.id : undefined);
           if (epoch !== generation || !show() || model?.cid !== cid) return;
           check(result.cid === cid);
@@ -275,7 +298,11 @@
           }
         } catch (error) {
           if (epoch === generation && show() && operation === "use" && error?.refusal) {
-            unresolvedUse = null;
+            if (error.code === "request_expired" && !freshUse) {
+              unresolvedUse.expiredConfirmed = true;
+              reconcileRequired = true;
+            }
+            else unresolvedUse = null;
             refusal = error.refusal;
           } else if (epoch === generation && show()) {
             if (operation === "reclaim") {
@@ -354,9 +381,13 @@
         if (!activating(r, p)) finishingOperation = "";
         else if (finishingOperation !== p.operation_id) { finishingOperation = p.operation_id; finishingSince = Date.now(); }
         const phase = phaseOf(r, p, message, Boolean(finishingOperation) && Date.now() - finishingSince >= FINISHING_DEADLINE_MS);
-        const label = phase === "failed" ? failureText(p) : phase === "capacity" ? capacityText(p) : phase === "service_unavailable" && r.dispatch_unavailable_reason
-          ? DISPATCH_UNAVAILABLE_TEXT[r.dispatch_unavailable_reason] : (compact ? COMPACT_PHASE_TEXT : PHASE_TEXT)[phase];
+        const label = (phase === "failed" || (["cancelled", "expired"].includes(phase) && p?.failure_class)) ? failureText(p)
+          : phase === "settling" && p?.failure_class === "storage_service_unavailable" ? "The storage service is unavailable. Waiting for preparation to settle."
+          : phase === "capacity" ? capacityText(p) : phase === "service_unavailable" && r.dispatch_unavailable_reason
+          ? DISPATCH_UNAVAILABLE_TEXT[r.dispatch_unavailable_reason] : phase === "service_unavailable" && p?.failure_class
+            ? failureText(p) : (compact ? COMPACT_PHASE_TEXT : PHASE_TEXT)[phase];
         row.append(element("p", label));
+        row.append(element("p", MEMORY_FIT_TEXT[model.model_memory_fit], "model-memory-fit"));
         if (active(p)) {
           const progress = element("progress"); progress.max = p.total_bytes || 1; progress.value = p.completed_bytes;
           progress.setAttribute("aria-label", "Preparation progress"); row.append(progress, element("p", `${formatBytes(p.completed_bytes)} of ${formatBytes(p.total_bytes)} prepared`));
@@ -364,7 +395,8 @@
         const controls = element("div", "", "model-controls");
         const useLabel = r.dispatch_unavailable_reason === "catalog_updated" ? "Use"
           : (p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : compact ? "Get" : "Download";
-        const use = button(useLabel, () => void act("use"), active(p) || reconcileRequired);
+        const use = button(useLabel, () => void act("use"), active(p) || reconcileRequired
+          || (!unresolvedUse && model.model_memory_fit !== "fits"));
         use.dataset.modelControl = "use";
         if (!active(p) && !r.dispatch_ready && phase !== "finishing") controls.append(use);
         if (r.dispatch_ready && typeof onReadyOpen === "function") {

@@ -18,7 +18,11 @@ const runtime = { admitted: false, kept: false, dispatch_ready: false, offer_id:
 for (const [code, message] of Object.entries({
   authorization_unavailable: "Preparation stopped. Open Models again to check access.",
   policy_unavailable: "Preparation stopped. Model policy is unavailable.",
-  capacity_unavailable: "Preparation stopped. Storage capacity is unavailable.",
+  capacity_unavailable: "Not enough free disk space for this model. Free some space, then Retry.",
+  download_interrupted: "The download stopped before it finished. Retry.",
+  storage_service_unavailable: "The storage service is unavailable. Retry when it is running.",
+  cache_budget_unavailable: "This model does not fit the local cache budget. Remove an unneeded model, choose a smaller model, or increase the budget, then Retry.",
+  memory_budget_unavailable: "This model exceeds the local model memory budget. Choose a smaller model or increase the budget, then Retry.",
   content_unavailable: "Preparation failed. Model content could not be read.",
   local_storage_unavailable: "Preparation failed. Local storage could not be written.",
   verification_failed: "Preparation failed. Model verification did not pass.",
@@ -40,7 +44,7 @@ for (const invalid of ["/private/provider?credential=secret", "__proto__", "cons
 preparation.failure_class = null;
 const admitted = { ...preparation, state: "admitted", admitted: true, failure_class: null, activation_pending: true };
 const unavailable = { ...runtime, admitted: true, preparation: admitted };
-for (const reason of ["unsupported_host", "source_engine_required", "catalog_updated"]) {
+for (const reason of ["unsupported_host", "source_engine_required", "catalog_updated", "cache_budget_unavailable", "memory_budget_unavailable"]) {
   const value = { ...unavailable, dispatch_unavailable_reason: reason };
   assert.equal(parseRuntime(value, cid).dispatch_unavailable_reason, reason);
   assert.equal(operationRuntime({ ...value, ...admitted }, cid).dispatch_unavailable_reason, reason);
@@ -51,14 +55,14 @@ for (const invalid of ["/private/provider?credential=secret", "__proto__", "cons
   assert.throws(() => parseRuntime({ ...unavailable, dispatch_unavailable_reason: invalid }, cid), /Invalid model response/);
   assert.throws(() => operationRuntime({ ...unavailable, ...admitted, dispatch_unavailable_reason: invalid }, cid), /Invalid model response/);
 }
-assert.deepEqual(Object.keys(DISPATCH_UNAVAILABLE_TEXT).sort(), ["catalog_updated", "source_engine_required", "unsupported_host"],
+assert.deepEqual(Object.keys(DISPATCH_UNAVAILABLE_TEXT).sort(), ["cache_budget_unavailable", "catalog_updated", "memory_budget_unavailable", "source_engine_required", "unsupported_host"],
   "every Runtime dispatch_unavailable_reason class has copy");
 assert.equal(DISPATCH_UNAVAILABLE_TEXT.unsupported_host, "Local AI is not supported on this device.");
 const otherCid = `bafybei${"c".repeat(51)}e`;
 const catalogRow = (id, title) => ({
   name: title, title, role: "content", source: "signed-model-catalog", installed: false, launchable: false,
   cid: id, publisher_did: "did:key:zFixturePublisher", content_size_bytes: 1024,
-  signature_state: "catalog-signature-verified", model_runtime: {
+  signature_state: "catalog-signature-verified", model_memory_fit: "fits", model_runtime: {
     admitted: false, kept: false, dispatch_ready: false, offer_id: null, preparation: null,
   },
 });
@@ -107,6 +111,8 @@ assert.deepEqual(plain(COMPACT_PHASE_TEXT), { ...plain(PHASE_TEXT), absent: "Not
 assert.deepEqual(Object.keys(PHASE_TEXT).sort(), Object.keys(phases).filter(name => !["failed", "capacity"].includes(name)).sort(), "every phase except failed and capacity reads its copy from the table");
 assert.equal(capacityText({ total_bytes: 3e9, completed_bytes: 1e9 }),
   "Waiting for free space. This model needs 2 GB on this Home, plus 2 GB kept free. Free some space and it continues.");
+assert.equal(capacityText({ total_bytes: 3e9, completed_bytes: 1e9, failure_class: "cache_budget_unavailable" }),
+  "Waiting for room in the local cache budget. Remove an unneeded model or increase the budget and it continues.");
 console.log("PASS model preparation failure: safe classes, operation/catalog parity, unknown history, strict rejection, shared copies, explicit two-entry selection, phase copy tables");
 
 // Advance a pending operation beyond the former three-minute polling ceiling.
@@ -148,7 +154,8 @@ const fixtureContext = {
       })) }, bindings: ["use", "status", "cancel", "retention", "reclaim"].map(operation => ({ method: `content.${operation}`, executable: true })) }] };
     else {
       const request = JSON.parse(options.body);
-      if (request.method === "content.use") return { ok: false, json: async () => ({ status: "error", code: "not_enough_free_space",
+      if (request.method === "content.use") return { ok: false, text: async () => JSON.stringify({
+        ...request, schema: "elastos.capsules.invoke-result/v1", status: "error", code: "not_enough_free_space",
         message: "Not enough free disk space on this Home: this needs 3 GB plus 2 GB kept free. Free some space, then select Get again." }) };
       assert.equal(request.method, "content.status");
       assert.equal(request.input.operation_id, "long-preparation");

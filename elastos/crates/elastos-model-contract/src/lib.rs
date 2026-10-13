@@ -23,6 +23,62 @@ pub const MAX_RUN_ID_BYTES: usize = 75;
 pub const TEXT_INPUT_V1_SCHEMA: &str = "elastos.model.input.text/v1";
 pub const TEXT_INPUT_V2_SCHEMA: &str = "elastos.model.input.text/v2";
 pub const MAX_TEXT_MESSAGES: usize = 256;
+pub const MODEL_REQUEST_MAX_AGE_MS: u64 = 300_000;
+pub const MODEL_REQUEST_FUTURE_SKEW_MS: u64 = 60_000;
+pub const MODEL_REQUEST_MAX_NONCE_BYTES: usize = 128;
+pub const MODEL_REQUEST_EXPIRED_CODE: &str = "request_expired";
+pub const MODEL_REQUEST_EXPIRED_MESSAGE: &str =
+    "This request is no longer valid. Check your device's clock, then try again.";
+pub const MODEL_MEMORY_OBSERVATION_UNAVAILABLE_MESSAGE: &str =
+    "This Home could not check the device memory. Ask the Home owner to check the memory limits, then try again.";
+
+/// New model effects carry a bounded time and nonce. Generic Runtime bindings
+/// remain compatible with legacy IDs retained by an existing owner.
+pub fn model_request_issued_ms(request_id: &str) -> Option<u64> {
+    if request_id.len() > 160 {
+        return None;
+    }
+    let (issued, nonce) = request_id.strip_prefix("model-v1:")?.split_once(':')?;
+    if issued.is_empty()
+        || issued.len() > 20
+        || issued.starts_with('0')
+        || !issued.bytes().all(|byte| byte.is_ascii_digit())
+        || nonce.is_empty()
+        || nonce.len() > MODEL_REQUEST_MAX_NONCE_BYTES
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return None;
+    }
+    issued.parse().ok()
+}
+
+/// Call only after looking up the exact retained binding. The durable floor
+/// keeps a pruned ID refused even if the system clock later moves backwards.
+pub fn validate_new_model_request_id(
+    request_id: &str,
+    now_ms: u64,
+    pruned_issued_floor_ms: u64,
+) -> ContractResult<u64> {
+    let issued = model_request_issued_ms(request_id)
+        .ok_or_else(|| ContractError::new(MODEL_REQUEST_EXPIRED_MESSAGE))?;
+    if issued <= pruned_issued_floor_ms
+        || now_ms.saturating_sub(issued) > MODEL_REQUEST_MAX_AGE_MS
+        || issued.saturating_sub(now_ms) > MODEL_REQUEST_FUTURE_SKEW_MS
+    {
+        return Err(ContractError::new(MODEL_REQUEST_EXPIRED_MESSAGE));
+    }
+    Ok(issued)
+}
+
+/// A binding remains retained through its entire possible freshness window.
+pub fn model_request_replay_deadline_ms(request_id: &str) -> Option<u64> {
+    Some(
+        model_request_issued_ms(request_id)?
+            .saturating_add(MODEL_REQUEST_MAX_AGE_MS + MODEL_REQUEST_FUTURE_SKEW_MS),
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractError(String);
@@ -375,6 +431,49 @@ mod tests {
 
     fn sample_run_id() -> String {
         "run:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()
+    }
+
+    #[test]
+    fn new_model_request_ids_have_bounded_time_nonce_and_freshness() {
+        let now = 1_000_000;
+        for issued in [
+            now - MODEL_REQUEST_MAX_AGE_MS,
+            now,
+            now + MODEL_REQUEST_FUTURE_SKEW_MS,
+        ] {
+            let id = format!("model-v1:{issued}:fixture-nonce");
+            assert_eq!(validate_new_model_request_id(&id, now, 0).unwrap(), issued);
+            assert_eq!(
+                model_request_replay_deadline_ms(&id),
+                Some(issued + 360_000)
+            );
+        }
+        for id in [
+            "request-legacy".to_owned(),
+            "model-v1:0:nonce".to_owned(),
+            "model-v1:01:nonce".to_owned(),
+            "model-v1:18446744073709551616:nonce".to_owned(),
+            "model-v1:1000000:".to_owned(),
+            "model-v1:1000000:unsafe/nonce".to_owned(),
+            format!(
+                "model-v1:1000000:{}",
+                "a".repeat(MODEL_REQUEST_MAX_NONCE_BYTES + 1)
+            ),
+            format!("model-v1:{}:old", now - MODEL_REQUEST_MAX_AGE_MS - 1),
+            format!("model-v1:{}:future", now + MODEL_REQUEST_FUTURE_SKEW_MS + 1),
+        ] {
+            assert!(validate_new_model_request_id(&id, now, 0).is_err(), "{id}");
+        }
+        let id = format!("model-v1:{now}:once");
+        assert!(validate_new_model_request_id(&id, now, now).is_err());
+        assert!(
+            validate_new_model_request_id(&id, now - 1, now).is_err(),
+            "rollback cannot revive a pruned ID"
+        );
+        let binding = sample_create_binding();
+        binding
+            .validate(&binding.offer_id, &binding.operation, &sample_input())
+            .unwrap();
     }
 
     #[test]

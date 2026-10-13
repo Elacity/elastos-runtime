@@ -108,6 +108,18 @@ test("disposable catalog verifies the domain, signed bytes, DID and raw content 
   assert.deepEqual(Object.keys(first).sort(), ["catalog", "trust"]);
 });
 
+test("repair catalog binds two different pinned models and their complete admission budget", () => {
+  const entries = [SMOL_FIXTURE, QWEN_FIXTURE].map((fixture, index) => ({
+    cid: `bafyfixture${index}`, capsule_manifest: fixture.capsule_manifest, object_manifest: contentManifest([]),
+  }));
+  const { catalog, trust } = signedCatalog(entries, 12345, 4 * 1024 ** 3);
+  assert.deepEqual(JSON.parse(catalog).payload.entries, entries);
+  assert.equal(trust.local_use.max_cache_bytes, 4 * 1024 ** 3);
+  assert.notEqual(SMOL_FIXTURE.model.sha256, QWEN_FIXTURE.model.sha256);
+  assert(3 * QWEN_FIXTURE.model.size + SMOL_FIXTURE.model.size + 9 * 1024 ** 2 < trust.local_use.max_cache_bytes);
+  assert.equal(signedCatalog(entries[0], 12345).trust.local_use.max_cache_bytes, 1024 ** 3);
+});
+
 function kuboFixture(t) {
   const data = temporary(t), host = "linux-amd64", capsule = join(data, "capsules/kubo");
   for (const path of [capsule, join(data, "receipts"), join(data, "bin")]) mkdirSync(path, { recursive: true });

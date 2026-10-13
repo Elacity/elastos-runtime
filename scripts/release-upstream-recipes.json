@@ -154,13 +154,9 @@
       "platform": "linux-amd64",
       "version": "0.0.10516",
       "source": {
-        "checksum": "sha256:f263a91280471b4c33c4999d7c76259c0f3a0a53a0b3e692b2c0b84380137a35",
+        "checksum": "sha256:0dee60d855f864aa9e8a7200014baf9419e3a4c9ccb3f3609532aad0ed34f2c0",
         "max_bytes": 536870912,
-        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-ubuntu-x64.tar.gz",
-        "redirect_hosts": [
-          "release-assets.githubusercontent.com",
-          "objects.githubusercontent.com"
-        ]
+        "path": "@llama-amd64-bundle"
       },
       "format": "tar.gz",
       "root": "llama-b10516",

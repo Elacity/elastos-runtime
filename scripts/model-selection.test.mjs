@@ -34,6 +34,20 @@ test("catalog accepts distinct signed entries and exact CID selection", () => {
   assert.equal(selectedModelOffer([offer], offer.id, otherCid, models), null);
 });
 
+test("saved CID follows only its unique current offer while service and content identities stay exact", () => {
+  const current = { id: "verified-engine-successor" };
+  const models = catalogModels(catalog([{ ...row,
+    model_runtime: { admitted: true, dispatch_ready: true, offer_id: current.id } }]));
+  assert.equal(selectedModelOffer([offer, current], offer.id, cid, models), current);
+  assert.equal(selectedModelOffer([current], offer.id, cid, models), current);
+  assert.equal(selectedModelOffer([current], offer.id, null, models), null, "service intent keeps its saved offer ID");
+  assert.equal(selectedModelOffer([offer], offer.id, cid, models), null, "an old offer cannot replace the current mapping");
+  assert.equal(selectedModelOffer([current], offer.id, `bafybei${"c".repeat(51)}e`, models), null);
+  assert.equal(selectedModelOffer([current], offer.id, cid,
+    [models[0], { ...models[0], ready: false, offerId: null }]), null, "every duplicate CID makes the mapping ambiguous");
+  assert.equal(selectedModelOffer([current, current], offer.id, cid, models), null);
+});
+
 test("catalog rejects duplicate, malformed and noncanonical content identity", () => {
   assert.throws(() => catalogModels(catalog([row, row])));
   for (const value of [cid.toUpperCase(), `${cid} `, `bafybei${"a".repeat(51)}b`, "https://model.invalid"]) {

@@ -114,8 +114,20 @@ esac
         scripts = self.root / 'scripts'
         (scripts / 'build').mkdir(parents=True)
         archive_name = 'llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz'
-        payload = b'inert engine bytes'
+        fixture_archive = self.root / 'engine-fixture.tar.gz'
+        with tarfile.open(fixture_archive, 'w:gz', format=tarfile.GNU_FORMAT) as archive:
+            for name in ('llama-server', 'libllama.so'):
+                member = tarfile.TarInfo('llama-b10516/' + name)
+                data = b'\x7fELFinert fixture'
+                member.size, member.mode = len(data), 0o755
+                archive.addfile(member, io.BytesIO(data))
+        payload = fixture_archive.read_bytes()
         checksum = hashlib.sha256(payload).hexdigest()
+        (scripts / 'verify-linux-engine.py').write_bytes((ROOT / 'scripts/verify-linux-engine.py').read_bytes())
+        (self.bin / 'readelf').write_text('#!/bin/sh\ncase "$1" in -h) printf "Class: ELF64\\nMachine: AArch64\\n" ;; -d) echo \'(RUNPATH) [$ORIGIN]\'; echo "(NEEDED) [libc.so.6]" ;; *) echo GLIBC_2.35 ;; esac\n')
+        (self.bin / 'ldd').write_text('#!/bin/sh\necho "resolved dependencies"\n')
+        for name in ('readelf', 'ldd'):
+            (self.bin / name).chmod(0o700)
         (scripts / 'release-upstream-recipes.json').write_text(json.dumps({'recipes': [{
             'component': 'llama-server', 'platform': 'linux-arm64',
             'source': {'checksum': 'sha256:' + checksum}}]}))
@@ -130,7 +142,7 @@ if [[ "${1:-}" == --verify-archive ]]; then
 fi
 printf 'build\\n' >> "$ENGINE_CALLS"
 mkdir "$1"
-printf '%s' 'inert engine bytes' > "$1/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"
+cp "$ENGINE_FIXTURE_ARCHIVE" "$1/llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"
 printf 'recipe_commit=%s\\n' "$RECIPE_COMMIT" > "$1/build-info.txt"
 printf 'fixture ELF and reply receipts\\n' > "$1/elf-verification.txt"
 ''')
@@ -157,6 +169,7 @@ esac
                            'RUNNER_OS': 'Linux', 'RUNNER_ARCH': 'ARM64',
                            'RUNNER_TEMP': str(temporary), 'GITHUB_ENV': str(self.root / 'env'),
                            'REAL_ENGINE_VERIFIER': str(verifier),
+                           'ENGINE_FIXTURE_ARCHIVE': str(fixture_archive),
                            'ENGINE_CALLS': str(self.root / 'engine-calls'),
                            'BUILD_CONTAINER_IMAGE': 'pinned-container',
                            'ENGINE_BUILD_TOOLS': 'pinned-tools'}
@@ -448,7 +461,7 @@ class SourceUpstreamTests(unittest.TestCase):
         self.assert_ok(self.seed())
         source = (ROOT / 'scripts/local-carrier-setup-smoke.sh').read_text()
         staging = source.split("cache = pathlib.Path(os.environ.get('KUBO_CACHE_DIR'", 1)[1]
-        staging = "cache = pathlib.Path(os.environ.get('KUBO_CACHE_DIR'" + staging.split('\nif platform == "linux-arm64":', 1)[0]
+        staging = "cache = pathlib.Path(os.environ.get('KUBO_CACHE_DIR'" + staging.split('\nif platform in ("linux-arm64", "linux-amd64"):', 1)[0]
         import importlib.util
         spec = importlib.util.spec_from_file_location('upstream_fixture', self.root / 'scripts/release-upstream-input.py')
         upstream = importlib.util.module_from_spec(spec)

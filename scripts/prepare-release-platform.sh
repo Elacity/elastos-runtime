@@ -358,6 +358,13 @@ if [[ -f "$SOURCE_ROOT/model-catalog.json" ]]; then
     cp "$SOURCE_ROOT/model-catalog.json" "$STAGING/artifacts/model-catalog.json"
 fi
 fi
+
+if [[ "$SETUP_PLATFORM" == linux-* ]]; then
+    [[ -f "$STAGING/artifacts/llama-server-$SETUP_PLATFORM.tar.gz" ]] \
+        || die "Prepared Linux engine archive is missing: llama-server-$SETUP_PLATFORM.tar.gz"
+    python3 scripts/verify-linux-engine.py --platform "$SETUP_PLATFORM" \
+        --archive "$STAGING/artifacts/llama-server-$SETUP_PLATFORM.tar.gz"
+fi
 python3 scripts/release-platform-input.py record \
     --root "$STAGING" --version "$VERSION" --platform "$PLATFORM" --target "$TARGET" \
     --source-commit "$SOURCE_COMMIT" --source-tree "$SOURCE_TREE" \

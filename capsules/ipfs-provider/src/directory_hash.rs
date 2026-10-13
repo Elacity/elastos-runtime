@@ -643,9 +643,8 @@ fn capacity_observation(
     available_bytes: u64,
     required_bytes: u64,
 ) -> io::Result<CapacityObservation> {
-    if required_bytes > available_bytes {
-        return Err(invalid("insufficient backend capacity"));
-    }
+    // This is an observation. Runtime owns the requested-work admission and
+    // shared reserve, including a volume with fewer bytes than the request.
     if volume_id == 0
         || capacity_bytes == 0
         || available_bytes > capacity_bytes
@@ -1597,7 +1596,15 @@ mod tests {
     fn private_capacity_arithmetic_requires_the_work_to_fit_available_bytes() {
         let exact = capacity_observation(7, 1000, 110, 110).unwrap();
         assert_eq!(exact.available_bytes, exact.required_bytes);
-        assert!(capacity_observation(7, 1000, 110, 111).is_err());
+        let short = capacity_observation(7, 1000, 110, 111).unwrap();
+        assert_eq!((short.available_bytes, short.required_bytes), (110, 111));
+        assert!(short.required_bytes > short.available_bytes);
+        assert_eq!(
+            capacity_observation(7, 1000, 0, 10)
+                .unwrap()
+                .available_bytes,
+            0
+        );
         // Capacity size alone never refuses work that fits the available bytes.
         assert!(capacity_observation(7, 1_000_000, 10, 10).is_ok());
         assert!(capacity_observation(7, 1000, 1000, 1000).is_ok());
@@ -1605,7 +1612,6 @@ mod tests {
             (0, 1000, 110, 10),
             (7, 0, 0, 1),
             (7, 1000, 1001, 1),
-            (7, 1000, 5, 10),
             (7, 1000, 110, 0),
             (7, u64::MAX, u64::MAX, u64::MAX),
         ] {

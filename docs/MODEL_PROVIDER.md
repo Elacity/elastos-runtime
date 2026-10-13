@@ -62,14 +62,28 @@ workspace, and other runs retain their separate access rules. Hosted credentials
 stay in the owning Runtime's secret store; local model artifacts stay in their
 owning boundaries.
 
+Marketplace compares each signed model's declared minimum memory with the
+device's effective physical or cgroup memory capacity before Get. This check
+describes the minimum requirement. Runtime checks current free memory again
+before starting the engine for a reply.
+
+On Linux, Runtime verifies the visible cgroup v2 hierarchy and reads every
+ancestor's memory limit and current usage. Missing or unreadable required files
+make the observation unavailable. File cache credit is bounded by current
+usage; an unreadable cache statistic gives zero credit. An unavailable memory
+observation returns `model_memory_observation_unavailable` and asks the Home
+owner to check the memory limits before trying again.
+
 A local engine is admitted right before it starts: free memory must cover the
 model weights, its KV cache at the configured context, batch scratch and
-headroom of max(10% of RAM, 1 GiB); otherwise the run fails with
-`model_memory_unavailable` before anything is spawned. Each Runtime runs one
-local engine at a time, stops it after 60 s without requests and starts it
-again on the next request. One Runtime per OS account (the installer's layout)
-is the exclusivity boundary; two Runtimes of different accounts each admit
-against the memory that is free when they start.
+headroom of max(10% of effective memory capacity, 1 GiB); otherwise the run fails with
+`model_memory_unavailable` before anything is spawned. Each model-provider
+process runs one local engine at a time, stops it after 60 s without requests
+and starts it again on the next request. Runtime's host lock protects its Home
+data root. Distinct data roots use separate locks and providers, including
+under the same OS account. For supported Local AI operation, run one active
+Home per device. Each provider checks the memory that is free when it starts
+its engine.
 
 The owning Runtime DID signs the service offer, which names the admitted
 provider capability and contains only bounded capability and policy facts. The
@@ -134,6 +148,18 @@ mandates.
 ## Request identity and session facts
 
 Runtime assigns or validates a durable request ID unique within the agent task.
+New preparation and inference requests use `model-v1:<issued_ms>:<nonce>`.
+The client creates a random nonce for each new action and retains that complete
+ID during recovery. Runtime and the provider look up retained bindings first,
+including legacy IDs. An unseen ID needs a valid timestamp within five minutes,
+with at most one minute of future clock skew. An expired or missing legacy ID
+receives the fixed `request_expired` refusal before new work starts.
+
+Retained bindings survive their complete freshness window. Before pruning a
+terminal result, its owner persists the maximum pruned issuance time. This
+floor also refuses the old ID after restart or a backwards clock change.
+Unresolved runs retain their binding. A new action needs a new request ID.
+
 The provider binds these facts before dispatch:
 
 - agent and Runtime session identifiers;
@@ -189,16 +215,56 @@ deduplicate them. Reconnection cannot dispatch the model request again.
 
 ## Cancellation, interruption, and resume
 
+New model runs use compact journals of at most 1 MiB, with a 32 KiB header
+and 4 KiB backend state. Admission allows at most 256 journal entries and
+64 MiB of charged growth. Active runs reserve at least 1 MiB each. Frozen
+terminal records, including unresolved outcomes, use their actual bounded
+size and still count toward the entry limit. Every terminal outcome, including
+`settlement_unknown`, stays truthful through its configured history window and
+the complete request replay window. Runtime commits a monotonic refusal floor
+before expired history is removed, so clock rollback cannot dispatch it again.
+Crash transaction files count toward the limits. Runtime checks
+these limits before it records a new run or dispatches inference.
+
+Recovery reads one record at a time, with ceilings of 512 entries, 32 MiB
+per legacy record and 128 MiB for the complete scan. Existing runs can settle
+with their original binding when new admission is full. An atomic replacement
+temporarily owns one extra file; failed writes remove only that owned file.
+At startup, the coordinator validates the complete bounded journal and
+committed request floor before it removes an abandoned transaction. Removal
+requires the exact private file and parent identities and a confirmed absent
+creator PID. Files with a live or unproven creator, invalid metadata, or changed
+identity remain in place for operator recovery.
+
+When legacy history exceeds the entry or aggregate ceiling, startup moves the
+exact private runs directory into one protected recovery archive and opens a
+fresh bounded journal. Startup preserves the archive without decoding every
+record. The existing run operations validate and read an exact archived record
+for its owner; an archived active run reports `settlement_unknown` without
+contacting its backend. Retained legacy and future-issued request identities
+still resolve before fresh request validation. Home starts with the archived
+facts available for owner inspection. Fresh inference stays gated while the
+owner uses Reclaim in System to retire the admitted local models, then uses them
+again. The active serialized coordinator saves an acknowledgement bound to the
+archive only after its owned execution, artifacts and workers are absent.
+Operator-configured hosted offers keep their configuration when an active
+coordinator receives trusted Init with the existing `owner_reclaim: true` flag;
+the same ownership checks apply. That provider operation remains an operator
+contract. A second recovery preserves the existing archive and requires operator
+recovery instead of replacing it.
+
 Cancellation is a request to stop backend work and settle the request as
 `cancelled`. The provider records the request before closing the backend stream.
 If the backend cannot confirm cancellation, the request enters reconciliation
 rather than being reported as safely cancelled.
 
-The managed local engine and hosted Chat Completions and Responses adapters
-settle cancellation as `settlement_unknown` once dispatch may have happened.
-Closing an HTTP stream does not confirm that the backend stopped. Their terminal
-result and events remain durable across replay and restart without redispatch.
-Installed cancellation and backend-stop proof remain open.
+The managed local engine holds its execution slot while Runtime closes its
+owned engine and process group. Confirmed closure settles the request as
+`cancelled`; an unresolved close settles as `settlement_unknown` and retains
+the engine ownership. Hosted Chat Completions and Responses cancellation settles
+as `settlement_unknown` after dispatch because stream closure alone cannot
+confirm backend stop. Terminal results and events keep their original identity
+across replay and restart. Installed acceptance stays with the owning issue.
 
 Interrupting the presentation layer does not cancel provider work by itself.
 The Agent Host can reconnect to the same request ID and recover durable events.
@@ -235,10 +301,13 @@ ordinary capsules.
 
 For a remote create, Runtime can return a request-bound
 `elastos.model.invocation-refusal/v1` assertion. It states that this invocation
-stopped before provider dispatch. The destination emits it, the consumer checks
+stopped before provider dispatch (`dispatch: not_started`). A closed provider
+`request_expired` fault has a separate phase, `dispatch: provider_refused`:
+provider validation ran and declined new inference. The destination emits it, the consumer checks
 the exact request, offer, input hash and remote binding, and the gateway returns
-HTTP 409. Assistant accepts it only for a fresh remote submission. A retained or
-pending request, provider error, malformed assertion or lost reply keeps its
+HTTP 409. The local gateway binds the same provider expiry fact to its normalized
+request. Assistant checks its fresh request identity, offer, operation and phase.
+A retained or pending request, generic provider error, malformed assertion or lost reply keeps its
 recovery or unknown status. Carrier tries another address after connection
 failure, but stops after a model create invocation error. This assertion settles
 the current invocation only; it does not settle earlier uncertain attempts.
@@ -381,7 +450,11 @@ artifact descriptor for the model provider. Source supports operator offers and
 admitted-content binding through the existing ProviderRegistry and run journal,
 while preserving other configured capabilities. An idle-safe provider refresh
 can expose the newly admitted local offer; a busy
-or unknown-settlement run prevents destructive reconfiguration and removal.
+run or retained unknown outcome prevents destructive reconfiguration and removal.
+The explicit owner Reclaim operation can retire a model while its unknown
+history stays retained, after owned execution closes. Expired history releases
+its model binding; live engine
+and worker ownership remain separate barriers.
 Content preparation status is distinct from a dispatched model run.
 
 Existing `offers_list`, `runs_create`, `runs_get`, `runs_events` and `runs_cancel`

@@ -1242,8 +1242,9 @@ selected = [r for r in recipes if r['component'] == 'llama-server' and r['platfo
 if len(selected) != 1:
     raise SystemExit('llama-server requires one build recipe for the selected platform')
 recipe = selected[0]
-if recipe['source'].get('path') == '@llama-arm64-bundle':
-    recipe['source']['path'] = str(Path(os.environ['ELASTOS_LLAMA_ARM64_BUNDLE']).absolute())
+if recipe['source'].get('path') in ('@llama-arm64-bundle', '@llama-amd64-bundle'):
+    architecture = platform.removeprefix('linux-').upper()
+    recipe['source']['path'] = str(Path(os.environ['ELASTOS_LLAMA_' + architecture + '_BUNDLE']).absolute())
 cache = upstream.directory(cache)
 with tempfile.TemporaryDirectory(prefix='.llama-package-', dir=cache) as temporary:
     receipt = upstream.package(recipe, cache, Path(temporary))

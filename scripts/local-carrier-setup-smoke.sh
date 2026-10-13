@@ -32,21 +32,28 @@ case "$(uname -m)" in
         ;;
 esac
 
-if [[ "${SETUP_PLATFORM}" == linux-arm64 ]]; then
-    [[ -n "${ELASTOS_LLAMA_ARM64_BUNDLE:-}" ]] || {
-        echo "ELASTOS_LLAMA_ARM64_BUNDLE is required for the ARM64 Carrier smoke." >&2
+if [[ "${SETUP_PLATFORM}" == linux-arm64 || "${SETUP_PLATFORM}" == linux-amd64 ]]; then
+    if [[ "${SETUP_PLATFORM}" == linux-arm64 ]]; then
+        ENGINE_BUNDLE="${ELASTOS_LLAMA_ARM64_BUNDLE:-}"
+    else
+        ENGINE_BUNDLE="${ELASTOS_LLAMA_AMD64_BUNDLE:-}"
+    fi
+    [[ -n "$ENGINE_BUNDLE" ]] || {
+        echo "A reviewed ${SETUP_PLATFORM} engine bundle is required for the Carrier smoke." >&2
         exit 1
     }
-    python3 - "${REPO_ROOT}/scripts/release-upstream-recipes.json" "${ELASTOS_LLAMA_ARM64_BUNDLE}" <<'PY'
+    python3 - "${REPO_ROOT}/scripts/release-upstream-recipes.json" "$ENGINE_BUNDLE" "$SETUP_PLATFORM" <<'PY'
 import hashlib, json, pathlib, sys
 info = next(recipe['source'] for recipe in json.loads(pathlib.Path(sys.argv[1]).read_text())['recipes']
-            if recipe['component'] == 'llama-server' and recipe['platform'] == 'linux-arm64')
+            if recipe['component'] == 'llama-server' and recipe['platform'] == sys.argv[3])
 source = pathlib.Path(sys.argv[2])
 if not source.is_file() or source.is_symlink() or not 0 < source.stat().st_size <= info["max_bytes"]:
-    raise SystemExit("ARM64 Carrier smoke engine archive is missing or exceeds its recipe bound")
+    raise SystemExit("Carrier smoke engine archive is missing or exceeds its recipe bound")
 if "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest() != info["checksum"]:
-    raise SystemExit("ARM64 Carrier smoke engine archive checksum differs from its build recipe")
+    raise SystemExit("Carrier smoke engine archive checksum differs from its build recipe")
 PY
+    python3 "$REPO_ROOT/scripts/verify-linux-engine.py" --platform "$SETUP_PLATFORM" \
+        --archive "$ENGINE_BUNDLE"
 fi
 
 SMOKE_TEMP_BASE="${RUNNER_TEMP:-${CARGO_TARGET_DIR:-${REPO_ROOT}/target-build}}"
@@ -328,10 +335,11 @@ manifest['external']['kubo']['capsule_metadata'] = {
 # This local source runs no ipfs-provider, so it serves by name only and its
 # descriptors carry no CID (signed releases fetch by CID; #287).
 
-if platform == "linux-arm64":
+if platform in ("linux-arm64", "linux-amd64"):
     recipe = next(recipe for recipe in json.loads((root / 'scripts/release-upstream-recipes.json').read_bytes())['recipes']
                   if recipe['component'] == 'llama-server' and recipe['platform'] == platform)
-    recipe['source']['path'] = str(pathlib.Path(os.environ['ELASTOS_LLAMA_ARM64_BUNDLE']).absolute())
+    key = 'ELASTOS_LLAMA_ARM64_BUNDLE' if platform == 'linux-arm64' else 'ELASTOS_LLAMA_AMD64_BUNDLE'
+    recipe['source']['path'] = str(pathlib.Path(os.environ[key]).absolute())
     with tempfile.TemporaryDirectory(prefix='.llama-package-', dir=upstream.directory(cache)) as temporary:
         engine = upstream.package(recipe, cache, pathlib.Path(temporary))
         shutil.copyfile(pathlib.Path(temporary) / engine['release_path'], artifacts_dir / engine['release_path'])

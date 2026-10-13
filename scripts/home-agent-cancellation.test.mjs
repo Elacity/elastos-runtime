@@ -26,6 +26,17 @@ const defer = () => { let resolve, reject; const promise = new Promise((r, e) =>
 const terminal = (kind) => ({ events: [{ sequence: 1, kind, terminal: true, data: kind === "output" ? { schema: "elastos.model.output.text/v1", text: "Done" } : {} }], next_cursor: 1, has_more: false });
 const fixtureContext = { context_window_tokens: 4096, max_output_tokens: 1024 };
 
+test("new model request IDs capture a bounded clock and cryptographic nonce", async () => {
+  const { newModelRequestId } = await import("../capsules/assistant/browser/model-contract.js");
+  let nonceCalls = 0;
+  assert.equal(newModelRequestId(1234, { randomUUID: () => { nonceCalls++; return "fixture-uuid"; } }), "model-v1:1234:fixture-uuid");
+  assert.equal(nonceCalls, 1);
+  for (const clock of [0, -1, NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1])
+    assert.throws(() => newModelRequestId(clock, { randomUUID: () => "nonce" }), error => error.code === "request_id_unavailable");
+  for (const cryptoRef of [null, {}, { randomUUID: () => "" }, { randomUUID: () => "/private" }, { randomUUID: () => "a".repeat(129) }])
+    assert.throws(() => newModelRequestId(1234, cryptoRef), error => error.code === "request_id_unavailable");
+});
+
 test("content intent survives missing catalog and overlapping refresh; hosted replacement is deliberate", async t => {
   t.after(() => live.selectLiveOffer(""));
   const cid = `bafybei${"a".repeat(52)}`;
@@ -68,6 +79,60 @@ test("content intent survives missing catalog and overlapping refresh; hosted re
   await Promise.all([fresh, shared]);
   assert.equal(live.selectedLiveOffer().offerId, "other");
   live.selectLiveOffer("");
+});
+
+test("restored CID uses its current engine offer and preserves historical runs, inactive chats and drafts", async t => {
+  t.after(() => { workspace.bindAgentWorkspaceStore(null); live.selectLiveOffer(""); });
+  const cid = `bafybei${"a".repeat(52)}`;
+  const originalId = "original-local-engine", currentId = "current-local-engine";
+  const draft = { text: "Keep my unsent text", parts: [{ type: "text", text: "Keep my attachment" }] };
+  const retainedTurn = { turnId: "old-turn", providerRunId: "original-run", state: "settlement_unknown",
+    contextManifest: { offerId: originalId, selectedModelCid: cid } };
+  const records = [{ id: "active", mode: "chat", messages: [{ role: "assistant", content: "Original reply" }],
+    composerDraft: structuredClone(draft), modelSelection: { liveOfferId: originalId, selectedModelCid: cid },
+    lastTurn: structuredClone(retainedTurn) },
+    { id: "inactive", mode: "chat", messages: [{ role: "user", content: "Another saved chat" }],
+      composerDraft: { text: "Other draft", parts: [] },
+      modelSelection: { liveOfferId: originalId, selectedModelCid: cid }, lastTurn: structuredClone(retainedTurn) }];
+  let currentDraft = structuredClone(draft);
+  workspace.bindAgentWorkspaceStore({ getSessions: () => records, setSessions() {}, getActiveSessionId: () => "active",
+    getReasoningVisible: () => false, setReasoningVisible() {}, setActiveSessionId() {},
+    getSessionMode: () => "chat", setSessionMode() {}, getComposerDraft: () => currentDraft,
+    applyComposerDraft: value => { currentDraft = value; }, getWorkspaceHydrated: () => true, setWorkspaceHydrated() {} });
+  const calls = [];
+  let currentCid = cid;
+  globalThis.fetch = async url => {
+    const path = new URL(url).pathname; calls.push(path);
+    return { ok: true, json: async () => path === "/api/capsules/catalog"
+      ? { schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified", capsules: [{
+        source: "signed-model-catalog", role: "content", installed: false, launchable: false, cid: currentCid,
+        title: "Same saved model", signature_state: "catalog-signature-verified",
+        model_runtime: { admitted: true, dispatch_ready: true, offer_id: currentId } }] }
+      : { offers: [{ id: currentId, title: "Same saved model", operation: "text",
+        input_modalities: ["text/plain"], output_modalities: ["text/plain"] }] } };
+  };
+  workspace.restoreSessionState(records[0]);
+  const inactive = structuredClone(workspace.getAgentWorkspaceSnapshot().sessions[1]);
+  await live.probeLiveInference({ force: true });
+  assert.equal(live.selectedLiveOffer().offerId, currentId);
+  assert.equal(live.liveOfferChoice(), currentId, "workspace persistence refreshes only the execution hint");
+  assert.equal(live.liveContentChoice(), cid);
+  const saved = workspace.getAgentWorkspaceSnapshot();
+  assert.equal(saved.liveOfferId, currentId);
+  assert.equal(saved.sessions[0].modelSelection.liveOfferId, currentId);
+  assert.equal(saved.sessions[0].modelSelection.selectedModelCid, cid);
+  assert.deepEqual(saved.sessions[0].lastTurn, retainedTurn, "the original run and context identity stay historical");
+  assert.deepEqual(saved.sessions[0].messages, records[0].messages);
+  assert.deepEqual(saved.sessions[1], inactive, "inactive saved chats keep their original hints and data");
+  assert.deepEqual(saved.composerDraft, draft);
+  assert.ok(calls.every(path => ["/api/capsules/catalog", "/api/provider/model/offers_list"].includes(path)),
+    "restore and hint refresh remain read-only");
+  currentCid = `bafybei${"c".repeat(51)}e`;
+  await live.probeLiveInference({ force: true });
+  assert.equal(live.selectedLiveOffer(), null, "changed model content requires a new user choice");
+  assert.equal(live.liveContentChoice(), cid);
+  assert.deepEqual(workspace.getAgentWorkspaceSnapshot().sessions[0].lastTurn, retainedTurn);
+  assert.deepEqual(currentDraft, draft);
 });
 
 test("explicit local model selection awaits Keep while restore and nonlocal choices stay read-only", async t => {
@@ -1248,6 +1313,39 @@ test("only a matching fresh invocation refusal settles a failed create", async (
     assert.equal(calls.length, 1);
     assert.equal(states.at(-1).state, mode === "valid" ? "failed" : "settlement_unknown");
     assert.equal(Boolean(states.at(-1).completedAt), mode === "valid");
+  }
+});
+
+test("only an exact provider-refused expired fresh create permits deliberate retry", async () => {
+  for (const mode of ["valid", "remote", "wrong-request", "wrong-offer", "wrong-operation", "wrong-hash", "wrong-scope", "wrong-phase", "generic", "wrong-status"]) {
+    const states = [], calls = [];
+    const offerId = mode === "remote" ? "remote:g:fixture" : "model:local";
+    globalThis.fetch = async (url, init) => {
+      const op = new URL(url).pathname.split("/").pop();
+      if (op === "offers_list") return { ok: true, json: async () => ({ offers: [{ id: offerId, title: "Fixture", operation: "text.generate",
+        input_modalities: ["text/plain"], output_modalities: ["text/plain"], context: fixtureContext }] }) };
+      if (op !== "runs_create") throw new Error(`unexpected ${op}`);
+      const body = JSON.parse(init.body); calls.push(body);
+      const refusal = { schema: "elastos.model.invocation-refusal/v1", scope: "invocation", dispatch: "provider_refused",
+        request_id: body.request_id, offer_id: body.offer_id, operation: body.operation, input_hash: `sha256:${"a".repeat(64)}` };
+      if (mode.startsWith("wrong-") && !["wrong-status", "wrong-phase"].includes(mode))
+        refusal[{ "wrong-request": "request_id", "wrong-offer": "offer_id", "wrong-operation": "operation", "wrong-hash": "input_hash", "wrong-scope": "scope" }[mode]] = "other";
+      if (mode === "wrong-phase") refusal.dispatch = "not_started";
+      return { ok: false, status: mode === "wrong-status" ? 200 : 409, json: async () => ({ status: "error",
+        code: mode === "generic" ? "denied" : mode === "remote" ? "remote_model_invocation_refused" : "model_invocation_refused",
+        reason: "request_expired", message: "This request is no longer valid. Check your device's clock, then try again.", refusal }) };
+    };
+    live.selectLiveOffer(offerId);
+    await live.probeLiveInference({ force: true });
+    const confirmed = ["valid", "remote"].includes(mode);
+    await assert.rejects(live.streamChatViaContract([{ role: "user", content: "fixture" }], { onState: state => states.push(state) }), error => {
+      if (confirmed) assert.equal(controller.formatStreamError(error), "This request is no longer valid. Check your device's clock, then try again.");
+      return error.code === (confirmed ? mode === "remote" ? "remote_model_invocation_refused" : "model_invocation_refused" : "run_acceptance_unknown");
+    });
+    assert.match(calls[0].request_id, /^model-v1:\d+:/);
+    assert.equal(calls.length, 1);
+    assert.equal(states.at(-1).state, confirmed ? "failed" : "settlement_unknown");
+    assert.equal(Boolean(states.at(-1).completedAt), confirmed);
   }
 });
 

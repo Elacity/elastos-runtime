@@ -1,31 +1,46 @@
 #!/usr/bin/env bash
-# Build and smoke-test the pinned CPU engine in Ubuntu 22.04 ARM64.
+# Build and smoke-test the pinned CPU engine in Ubuntu 22.04.
 set -euo pipefail
+
+platform=linux-arm64
+if [[ ${1:-} == --platform ]]; then
+  platform=${2:-}
+  [[ $platform == linux-amd64 || $platform == linux-arm64 ]] || {
+    echo "Select linux-amd64 or linux-arm64." >&2; exit 2;
+  }
+  shift 2
+fi
+architecture=${platform#linux-}
 
 if [[ ${1:-} == --verify-archive ]]; then
   [[ $# == 2 ]] || { echo "Usage: $0 --verify-archive OUTPUT_DIRECTORY" >&2; exit 2; }
-  python3 - "$2" <<'PY'
+  python3 - "$2" "$architecture" <<'PY'
 import hashlib, os, pathlib, re, sys
-checksum = os.environ.get("CI_LLAMA_ARM64_SHA256", "")
+architecture = sys.argv[2]
+checksum = os.environ.get("CI_LLAMA_" + architecture.upper() + "_SHA256", "")
 if not re.fullmatch(r"[0-9a-f]{64}", checksum):
-    raise SystemExit("CI requires a pinned ARM64 engine SHA-256")
-archive = pathlib.Path(sys.argv[1]) / "llama-b10516-bin-ubuntu22.04-arm64-cpu.tar.gz"
+    raise SystemExit(f"CI requires a pinned {architecture} engine SHA-256")
+archive = pathlib.Path(sys.argv[1]) / f"llama-b10516-bin-ubuntu22.04-{architecture}-cpu.tar.gz"
 actual = hashlib.sha256(archive.read_bytes()).hexdigest()
 if actual != checksum:
-    raise SystemExit(f"ARM64 engine SHA-256 mismatch: {actual}")
-print(f"PASS: ARM64 engine archive matches pinned CI SHA-256 {actual}")
+    raise SystemExit(f"{architecture} engine SHA-256 mismatch: {actual}")
+print(f"PASS: {architecture} engine archive matches pinned CI SHA-256 {actual}")
 PY
+  python3 "$(dirname "$0")/../verify-linux-engine.py" --platform "$platform" \
+    --archive "$2/llama-b10516-bin-ubuntu22.04-$architecture-cpu.tar.gz"
   exit 0
 fi
 
 if [[ ${1:-} == --help ]]; then
-  echo "Usage: $0 NEW_OUTPUT_DIRECTORY"
-  echo "Requires Ubuntu 22.04 ARM64, build-essential, cmake, git, curl, binutils, file and python3."
+  echo "Usage: $0 [--platform linux-amd64|linux-arm64] NEW_OUTPUT_DIRECTORY"
+  echo "Requires matching Ubuntu 22.04, build-essential, cmake, git, curl, binutils, file and python3."
   exit 0
 fi
 [[ $# == 1 ]] || { echo "Usage: $0 NEW_OUTPUT_DIRECTORY" >&2; exit 2; }
-[[ $(uname -s) == Linux && $(uname -m) == aarch64 ]] || {
-  echo "Run this build on Linux ARM64." >&2; exit 1;
+machine=aarch64
+[[ $architecture != amd64 ]] || machine=x86_64
+[[ $(uname -s) == Linux && $(uname -m) == "$machine" ]] || {
+  echo "Run this build on $platform." >&2; exit 1;
 }
 [[ $(getconf GNU_LIBC_VERSION) == "glibc 2.35" ]] || {
   echo "The build requires the Ubuntu 22.04 glibc 2.35 baseline." >&2; exit 1;
@@ -69,13 +84,18 @@ cmake_args=(
   -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
   '-DCMAKE_INSTALL_RPATH=$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
   -DLLAMA_BUILD_NUMBER=10516 "-DLLAMA_BUILD_COMMIT=$commit"
-  -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+  -DGGML_NATIVE=OFF
   -DGGML_BACKEND_DL=OFF -DGGML_OPENMP=OFF -DLLAMA_OPENSSL=OFF
   -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF
   -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_APP=OFF
   "-DCMAKE_C_FLAGS=-ffile-prefix-map=$work=."
   "-DCMAKE_CXX_FLAGS=-ffile-prefix-map=$work=."
 )
+if [[ $architecture == arm64 ]]; then
+  cmake_args+=(-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16)
+else
+  cmake_args+=(-DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF)
+fi
 cmake -S "$src" -B "$work/build" "${cmake_args[@]}"
 cmake --build "$work/build" --target llama-server --parallel 4
 
@@ -114,7 +134,7 @@ find "$bundle" -type f -perm /111 -exec chmod 0755 {} +
 find "$bundle" -type f ! -perm /111 -exec chmod 0644 {} +
 find "$bundle" -type d -exec chmod 0755 {} +
 
-archive=llama-$tag-bin-ubuntu22.04-arm64-cpu.tar.gz
+archive=llama-$tag-bin-ubuntu22.04-$architecture-cpu.tar.gz
 tar -C "$work/stage" --sort=name --mtime="@$SOURCE_DATE_EPOCH" \
   --owner=0 --group=0 --numeric-owner --format=gnu -cf - "llama-$tag" \
   | gzip -9n > "$out/$archive"
@@ -123,41 +143,8 @@ mkdir "$work/unpacked"
 tar -xzf "$out/$archive" -C "$work/unpacked"
 bundle=$work/unpacked/llama-$tag
 
-python3 - "$bundle" > "$out/elf-verification.txt" <<'PY'
-import os, pathlib, re, stat, subprocess, sys
-root = pathlib.Path(sys.argv[1])
-limits = {"GLIBC": (2, 35), "GLIBCXX": (3, 4, 30), "CXXABI": (1, 3, 13)}
-host_libraries = {"libc.so.6", "libm.so.6", "libstdc++.so.6", "libgcc_s.so.1", "ld-linux-aarch64.so.1"}
-elf_count = 0
-for path in sorted(root.rglob("*")):
-    mode = path.lstat().st_mode
-    if stat.S_ISLNK(mode):
-        target = pathlib.PurePosixPath(os.readlink(path))
-        assert not target.is_absolute() and ".." not in target.parts, f"unsafe symlink: {path}"
-        assert path.exists() and path.resolve().is_relative_to(root), f"broken symlink: {path}"
-        continue
-    if stat.S_ISDIR(mode):
-        continue
-    assert stat.S_ISREG(mode) and path.stat().st_nlink == 1, f"unsupported file: {path}"
-    with path.open("rb") as stream:
-        if stream.read(4) != b"\x7fELF":
-            continue
-    elf_count += 1
-    header = subprocess.check_output(["readelf", "-h", str(path)], text=True)
-    assert re.search(r"Class:\s+ELF64", header) and re.search(r"Machine:\s+AArch64", header), path
-    dynamic = subprocess.check_output(["readelf", "-d", str(path)], text=True)
-    assert re.search(r"\(RUNPATH\).*\[\$ORIGIN\]", dynamic), f"RUNPATH: {path}"
-    for library in re.findall(r"\(NEEDED\).*\[(.+?)\]", dynamic):
-        assert library in host_libraries or (root / library).is_file(), f"unbundled dependency: {library}"
-    versions = subprocess.check_output(["readelf", "--version-info", str(path)], text=True)
-    for family, number in re.findall(r"\b(GLIBCXX|GLIBC|CXXABI)_([0-9.]+)", versions):
-        assert tuple(map(int, number.split("."))) <= limits[family], f"{path.name}: {family}_{number}"
-    linked = subprocess.check_output(["ldd", str(path)], text=True, stderr=subprocess.STDOUT)
-    assert "not found" not in linked, linked
-    print(path.name, "\n" + dynamic + versions + linked)
-assert elf_count > 1 and (root / "llama-server").is_file(), "engine and shared libraries required"
-print("PASS: ARM64 ELF, relative links, $ORIGIN, dependency allowlist and symbol limits")
-PY
+python3 "$(dirname "$0")/../verify-linux-engine.py" --platform "$platform" \
+  --bundle "$bundle" > "$out/elf-verification.txt"
 env -i PATH=/usr/bin:/bin "$bundle/llama-server" --version > "$out/engine-version.txt" 2>&1
 (cd "$bundle" && sha256sum llama-server) > "$out/engine.sha256"
 

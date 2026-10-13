@@ -1001,6 +1001,9 @@ build_upstream_direct_assets() {
     if [[ -n "${ELASTOS_LLAMA_ARM64_BUNDLE:-}" ]]; then
         args+=(--llama-arm64-bundle "$ELASTOS_LLAMA_ARM64_BUNDLE")
     fi
+    if [[ -n "${ELASTOS_LLAMA_AMD64_BUNDLE:-}" ]]; then
+        args+=(--llama-amd64-bundle "$ELASTOS_LLAMA_AMD64_BUNDLE")
+    fi
     python3 scripts/release-upstream-assets.py --platform "$setup_platform" \
         --cache "$cache" --output "$output" ${args[@]+"${args[@]}"}
 }

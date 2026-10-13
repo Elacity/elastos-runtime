@@ -5,7 +5,10 @@ mod test_support;
 
 use test_support::FIXTURE_EVENT_TIMEOUT;
 
-use elastos_model_contract::{model_input_hash, RUNTIME_CREATE_BINDING_SCHEMA};
+use elastos_model_contract::{
+    model_input_hash, model_run_id, RuntimeAccessBinding, RuntimeCreateBinding,
+    RUNTIME_ACCESS_BINDING_SCHEMA, RUNTIME_CREATE_BINDING_SCHEMA,
+};
 use serde_json::{json, Value};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpListener;
@@ -121,12 +124,21 @@ impl Drop for ProviderProcess {
 }
 
 fn start_local_llama_run(label: &str) -> (ProviderProcess, PathBuf) {
+    let (provider, events, _, _) =
+        start_local_llama_fixture(label, "healthy_with_subtree", "process-lifecycle");
+    (provider, events)
+}
+
+fn start_local_llama_fixture(
+    label: &str,
+    mode: &str,
+    prompt: &str,
+) -> (ProviderProcess, PathBuf, Value, Value) {
     let root = test_support::temp_root_path("model-provider-process", label);
     std::fs::create_dir_all(&root).unwrap();
     let root = std::fs::canonicalize(root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let (engine, model, events) =
-        test_support::write_fake_llama_server(&root, "healthy_with_subtree");
+    let (engine, model, events) = test_support::write_fake_llama_server(&root, mode);
     let offer = json!({
         "id": "local-text",
         "title": "Local Text",
@@ -166,7 +178,7 @@ fn start_local_llama_run(label: &str) -> (ProviderProcess, PathBuf) {
         "enabled": true
     });
     let mut provider = ProviderProcess::start();
-    let init = provider.request(json!({
+    let init_request = json!({
         "op": "init",
         "config": {
             "base_path": root,
@@ -179,14 +191,15 @@ fn start_local_llama_run(label: &str) -> (ProviderProcess, PathBuf) {
                 "offers": [offer]
             }
         }
-    }));
+    });
+    let init = provider.request(init_request.clone());
     assert_eq!(init["status"], "ok", "unexpected init response: {init}");
 
     let input = json!({
         "schema": "elastos.model.input.text/v1",
-        "prompt": "process-lifecycle"
+        "prompt": prompt
     });
-    let create = provider.request(json!({
+    let create_request = json!({
         "op": "runs_create",
         "offer_id": "local-text",
         "operation": "text.generate",
@@ -197,20 +210,53 @@ fn start_local_llama_run(label: &str) -> (ProviderProcess, PathBuf) {
             "session_id": "session:test",
             "capsule_id": "assistant",
             "grant_id": "grant:test",
-            "request_id": format!("request:{label}"),
+            "request_id": test_support::fixture_model_request_id(&format!("request:{label}")),
             "offer_id": "local-text",
             "operation": "text.generate",
             "input_hash": model_input_hash(&input).unwrap()
         }
-    }));
+    });
+    let create = provider.request(create_request.clone());
     assert_eq!(
         create["status"], "ok",
         "unexpected create response: {create}"
     );
     wait_for_event(&events, "start:");
     wait_for_event(&events, "parent:");
-    wait_for_event(&events, "subtree:");
-    (provider, events)
+    if mode.ends_with("with_subtree") {
+        wait_for_event(&events, "subtree:");
+    }
+    (provider, events, init_request, create_request)
+}
+
+fn access_binding(create: &Value) -> Value {
+    let create: RuntimeCreateBinding =
+        serde_json::from_value(create["runtime_binding"].clone()).unwrap();
+    let binding = RuntimeAccessBinding {
+        schema: RUNTIME_ACCESS_BINDING_SCHEMA.into(),
+        run_id: model_run_id(&create),
+        principal_id: create.principal_id,
+        session_id: create.session_id,
+        capsule_id: create.capsule_id,
+        grant_id: create.grant_id,
+        request_id: create.request_id,
+    };
+    binding.validate(&binding.run_id).unwrap();
+    serde_json::to_value(binding).unwrap()
+}
+
+fn wait_for_run_terminal(provider: &mut ProviderProcess, run_id: &str, binding: &Value) -> Value {
+    let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
+    loop {
+        let run =
+            provider.request(json!({"op":"runs_get", "run_id":run_id, "runtime_binding":binding}));
+        assert_eq!(run["status"], "ok", "unexpected run response: {run}");
+        if run["data"]["terminal"].is_object() {
+            return run;
+        }
+        assert!(Instant::now() < deadline, "model run did not settle: {run}");
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn wait_for_event(path: &Path, prefix: &str) {
@@ -321,6 +367,145 @@ fn normal_provider_shutdown_reaps_local_llama_engine() {
         !stderr.contains("local engine closure"),
         "normal shutdown did not confirm engine closure: {stderr}"
     );
+}
+
+#[test]
+fn managed_streaming_stop_reaps_engine_and_activates_different_model_without_restart() {
+    managed_streaming_stop_switch("streaming-stop-switch", "stream_then_stall_with_subtree");
+}
+
+#[test]
+fn managed_streaming_stop_reaps_stubborn_engine_before_different_model_activation() {
+    #[cfg(target_os = "linux")]
+    {
+        const CHILD_FIXTURE: &str = "ELASTOS_MODEL_PROVIDER_SUBREAPER_FIXTURE";
+        if std::env::var_os(CHILD_FIXTURE).is_none() {
+            // Give the orphan a deterministic owner that can keep its zombie
+            // visible. This child runs only this test; other tests keep their
+            // usual process ownership and reaping behavior.
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "managed_streaming_stop_reaps_stubborn_engine_before_different_model_activation", "--nocapture"])
+                .env(CHILD_FIXTURE, "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "stubborn engine owner-close fixture failed"
+            );
+            return;
+        }
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+    }
+    managed_streaming_stop_switch(
+        "stubborn-streaming-stop-switch",
+        "stream_then_stall_ignore_term",
+    );
+}
+
+fn managed_streaming_stop_switch(label: &str, mode: &str) {
+    let (mut provider, events, mut init, create) = start_local_llama_fixture(label, mode, "stall");
+    wait_for_event(&events, "stream_delta");
+    let run_id = provider.request(create.clone())["data"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let binding = access_binding(&create);
+    assert_eq!(binding["run_id"], run_id);
+    let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
+    loop {
+        let page = provider.request(json!({"op":"runs_events", "run_id":run_id, "runtime_binding":binding, "after_sequence":0}));
+        assert_eq!(page["status"], "ok", "unexpected events response: {page}");
+        if page["data"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "text_delta")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "streaming reply did not reach the journal: {page}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let stop =
+        provider.request(json!({"op":"runs_cancel", "run_id":run_id, "runtime_binding":binding}));
+    assert_eq!(stop["status"], "ok");
+    let terminal = wait_for_run_terminal(&mut provider, &run_id, &binding);
+    // This runs the shipped binary and its real process-group guard. Library
+    // fixtures launch the engine directly and cannot prove this close path.
+    if mode.ends_with("with_subtree") {
+        assert_guard_and_engine_stopped(&events);
+    } else {
+        #[cfg(target_os = "linux")]
+        {
+            // Clean the exact adopted fixture child on the fail-before path.
+            // The settled result above already records whether the provider
+            // owner could reap it and establish whole-group absence itself.
+            let _ =
+                unsafe { libc::waitpid(engine_pid(&events), std::ptr::null_mut(), libc::WNOHANG) };
+        }
+        assert!(wait_for_process_exit(guard_pid(&events)));
+        assert!(wait_for_process_exit(engine_pid(&events)));
+    }
+    assert_eq!(terminal["data"]["status"], "cancelled", "{terminal}");
+    let before = event_lines(&events);
+    assert_eq!(
+        provider.request(create.clone())["data"]["terminal"],
+        terminal["data"]["terminal"]
+    );
+    assert_eq!(event_lines(&events), before);
+
+    let root = PathBuf::from(init["config"]["base_path"].as_str().unwrap());
+    let (engine, model, later_events) =
+        test_support::write_fake_llama_server(&root.join("different-model"), "healthy");
+    let mut different = init["config"]["extra"]["offers"][0].clone();
+    different["id"] = json!("different-model");
+    different["adapter"]["engine"] =
+        json!({"path":engine,"sha256":test_support::sha256_file(&engine)});
+    different["adapter"]["model"] =
+        json!({"path":model,"sha256":test_support::sha256_file(&model)});
+    init["config"]["extra"]["offers"]
+        .as_array_mut()
+        .unwrap()
+        .push(different);
+    let deadline = Instant::now() + FIXTURE_EVENT_TIMEOUT;
+    loop {
+        let activated = provider.request(init.clone());
+        if activated["status"] == "ok" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "different model activation refused: {activated}"
+        );
+        assert_eq!(activated["code"], "selection_unavailable");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let input = json!({"schema":"elastos.model.input.text/v1", "prompt":"after stop"});
+    let mut other_create = create;
+    other_create["offer_id"] = json!("different-model");
+    other_create["input"] = input.clone();
+    other_create["runtime_binding"]["offer_id"] = json!("different-model");
+    other_create["runtime_binding"]["request_id"] = json!(test_support::fixture_model_request_id(
+        "request:after-streaming-stop"
+    ));
+    other_create["runtime_binding"]["input_hash"] = json!(model_input_hash(&input).unwrap());
+    let created = provider.request(other_create.clone());
+    assert_eq!(created["status"], "ok", "{created}");
+    let completed = wait_for_run_terminal(
+        &mut provider,
+        created["data"]["run_id"].as_str().unwrap(),
+        &access_binding(&other_create),
+    );
+    assert_eq!(completed["data"]["status"], "completed");
+    assert_eq!(
+        completed["data"]["terminal"]["output"]["text"],
+        "reply:after stop"
+    );
+    provider.shutdown();
+    assert!(wait_for_process_exit(engine_pid(&later_events)));
 }
 
 #[test]
@@ -467,7 +652,9 @@ for (const id of ['chat','responses']) {
         );
         for (id, operation, _) in &adapters {
             let input = json!({});
-            let request_id = format!("request:external-paused:{pass}:{id}");
+            let request_id = test_support::fixture_model_request_id(&format!(
+                "request:external-paused:{pass}:{id}"
+            ));
             let create = json!({"op":"runs_create","offer_id":id,"operation":operation,
             "input":input,"runtime_binding":{
                 "schema":RUNTIME_CREATE_BINDING_SCHEMA,"principal_id":"person:local:test",

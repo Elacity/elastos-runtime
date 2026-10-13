@@ -337,9 +337,9 @@ def check_archive(path, extract_path=None, provider=False, home_cli_platform=Non
     if home_cli_platform is not None and (extract_path != "home-cli" or renderer not in regular):
         raise ValueError(f"{path.name}: Home CLI native renderer is missing")
     if engine_platform is not None and f"{extract_path}/llama-server" not in regular:
-        raise ValueError(f"{path.name}: ARM64 llama-server executable is missing")
+        raise ValueError(f"{path.name}: Linux llama-server executable is missing")
     if engine_platform is not None and engine_libraries == 0:
-        raise ValueError(f"{path.name}: ARM64 llama-server libraries are missing")
+        raise ValueError(f"{path.name}: Linux llama-server libraries are missing")
     if media_platform is not None:
         if extract_path != "media-tools":
             raise ValueError("media-tools extraction root differs from its contract")
@@ -506,10 +506,10 @@ def check_upstream_archive(path, recipe, receipt, platform):
             raise ValueError("upstream model payload has no GGUF header")
     else:
         check_native_header(header, mode, platform, entrypoint)
-        if recipe["component"] == "llama-server" and platform == "aarch64-linux":
+        if recipe["component"] == "llama-server" and platform in ("aarch64-linux", "x86_64-linux"):
             libraries = [name for name in headers if ".so" in PurePosixPath(name).name]
             if not libraries:
-                raise ValueError("upstream ARM64 llama-server libraries are missing")
+                raise ValueError("upstream Linux llama-server libraries are missing")
             for name in libraries:
                 check_native_header(*headers[name], platform, name)
 
@@ -656,7 +656,7 @@ def check_contents(root, platform, omissions):
                 check_archive(path, info["extract_path"], provider=is_provider_metadata,
                               home_cli_platform=platform if name == "home-cli" and not is_provider_metadata else None,
                               media_platform=platform if name == "media-tools" else None,
-                              engine_platform=platform if name == "llama-server" and platform == "aarch64-linux" else None)
+                              engine_platform=platform if name == "llama-server" and platform in ("aarch64-linux", "x86_64-linux") else None)
             elif name in browser_scripts and not is_metadata:
                 original = regular_file(SOURCE_ROOT, browser_scripts[name])
                 if path.read_bytes() != original.read_bytes() or not path.stat().st_mode & 0o111:

@@ -289,6 +289,23 @@ impl Inventory {
     }
 
     pub(super) fn save(&self, state: &PreparationInventory) -> anyhow::Result<()> {
+        self.save_checked(state, false)
+    }
+
+    /// The activation composer verifies the current signed engine and complete
+    /// admitted package before replacing only the owner's engine binding.
+    pub(super) fn save_engine_replacements(
+        &self,
+        state: &PreparationInventory,
+    ) -> anyhow::Result<()> {
+        self.save_checked(state, true)
+    }
+
+    fn save_checked(
+        &self,
+        state: &PreparationInventory,
+        engine_replacements: bool,
+    ) -> anyhow::Result<()> {
         state.validate()?;
         let bytes = serde_json::to_vec(state)?;
         ensure!(
@@ -297,13 +314,36 @@ impl Inventory {
         );
         self.check_loaded()?;
         let previous = self.snapshot()?;
+        ensure!(
+            state.pruned_issued_floor_ms >= previous.pruned_issued_floor_ms,
+            "preparation replay floor moved backwards"
+        );
         for owner in previous.records.iter().filter(|r| r.activation.is_some()) {
+            let next = state
+                .records
+                .iter()
+                .find(|r| r.operation_id == owner.operation_id)
+                .context("original activation owner missing")?;
+            let replacement = if engine_replacements
+                && owner.state == super::PreparationState::Admitted
+                && next.state == super::PreparationState::Admitted
+                && owner.package_cid == next.package_cid
+                && owner.admission_id == next.admission_id
+                && next.activation_pending
+            {
+                match (&owner.activation, &next.activation) {
+                    (Some(old), Some(new)) => {
+                        old.check_root(&self.data_path, owner)?;
+                        new.check_root(&self.data_path, next)?;
+                        new.engine_successor_of(old)
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
             ensure!(
-                state
-                    .records
-                    .iter()
-                    .any(|r| r.operation_id == owner.operation_id
-                        && r.activation == owner.activation),
+                next.activation == owner.activation || replacement,
                 "original activation binding changed"
             );
         }
