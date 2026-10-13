@@ -8126,17 +8126,29 @@ pub(crate) mod tests {
         let new = release(serde_json::json!({"strategy": "future-kind"}));
         let fetch: crate::update::FetchFn =
             Box::new(|cid| Box::pin(async move { panic!("a newer kind was fetched: {cid}") }));
-        let (_, paths) =
-            stage_update_support(temp.path(), &old, &new, &platform, &fetch, &mut UnusedOwner)
-                .await
-                .unwrap();
+        let records = crate::capsule_record::UpdateRecords::default();
+        let (_, paths) = stage_update_support(
+            temp.path(),
+            &old,
+            &new,
+            &platform,
+            &records,
+            &fetch,
+            &mut UnusedOwner,
+        )
+        .await
+        .unwrap();
         assert!(paths.is_empty());
-        assert!(
-            refresh_installed_components_for_update(temp.path(), Some(&old), &new, &platform)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(refresh_installed_components_for_update(
+            temp.path(),
+            Some(&old),
+            &new,
+            &platform,
+            &records
+        )
+        .await
+        .unwrap()
+        .is_empty());
         assert_eq!(fs::read(&installed).unwrap(), b"previous release bytes");
         assert!(!temp.path().join("tools/future").exists());
     }
