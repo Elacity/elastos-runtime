@@ -10,11 +10,6 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::time::Instant;
 
-const SHELL_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
-
 fn forwarded_command_payload() -> Option<String> {
     if let Ok(payload) = std::env::var("ELASTOS_COMMAND") {
         if !payload.is_empty() {
@@ -379,7 +374,10 @@ fn resolve_mode(raw: &str, stdin_is_tty: bool) -> &'static str {
 }
 
 fn main() {
-    eprintln!("shell: starting v{}", SHELL_VERSION);
+    eprintln!(
+        "shell: starting (shell crate v{})",
+        env!("CARGO_PKG_VERSION")
+    );
 
     let api = std::env::var("ELASTOS_API").unwrap_or_else(|_| {
         eprintln!("shell: ELASTOS_API not set");
@@ -412,8 +410,8 @@ fn main() {
     };
 
     eprintln!(
-        "shell: v{} mode={}, polling {}/api/capability/pending",
-        SHELL_VERSION, effective_mode, api
+        "shell: mode={}, polling {}/api/capability/pending",
+        effective_mode, api
     );
     if effective_mode == "auto" {
         eprintln!(

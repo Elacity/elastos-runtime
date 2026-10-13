@@ -1088,6 +1088,11 @@ async fn run_upgrade_with_restart(
         .map_err(new_publisher_key_hint),
     )?;
     refused(verify_release_binding(head, &release_bytes, &release))?;
+    // Each capsule record is verified on its own before any download or write.
+    let next_records = refused(crate::capsule_record::CapsuleRecords::from_release(
+        &release["payload"],
+        &source.publisher_dids,
+    ))?;
     refused(verify_source_channel(
         source,
         head["payload"]["channel"].as_str().unwrap_or(""),
@@ -1309,7 +1314,9 @@ async fn run_upgrade_with_restart(
             "Installed components exceed their byte bound"
         );
         let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(&comp_data)?;
-        crate::setup::admit_release_components(&manifest, &component_platform)
+        crate::setup::admit_release_components(&manifest, &component_platform)?;
+        // Every row of the next release, replaced or kept, has exactly its record.
+        crate::capsule_record::admit_components(next_records.as_ref(), &manifest)
     })())?;
 
     if apply_mode == ApplyMode::Normal {
@@ -1345,6 +1352,11 @@ async fn run_upgrade_with_restart(
         let data_dir = transaction.data_dir();
         let bin_path = transaction.binary_path().to_path_buf();
         let old_components = std::fs::read(data_dir.join("components.json")).ok();
+        let records = crate::capsule_record::UpdateRecords::new(
+            &previous.release,
+            next_records,
+            &source.publisher_dids,
+        );
         let changed_capsules =
             changed_capsule_names(old_components.as_deref(), &comp_data).unwrap_or_default();
         let new_manifest: crate::setup::ComponentsManifest = serde_json::from_slice(&comp_data)?;
@@ -1417,6 +1429,7 @@ async fn run_upgrade_with_restart(
                     old_components.as_deref(),
                     &comp_data,
                     &component_platform,
+                    &records,
                     carrier_context,
                 )
             })
@@ -1527,6 +1540,11 @@ async fn run_upgrade_with_restart(
     let data_dir = transaction.data_dir();
     crate::api::auth_gateway::verify_configured_principal_roots_ready(data_dir)?;
     let old_components = std::fs::read(data_dir.join("components.json"))?;
+    let records = crate::capsule_record::UpdateRecords::new(
+        &previous.release,
+        next_records,
+        &source.publisher_dids,
+    );
     let staged_support = if let Some(owner) = restart_owner.as_mut() {
         Some(
             on_heap(|| {
@@ -1535,6 +1553,7 @@ async fn run_upgrade_with_restart(
                     &old_components,
                     &comp_data,
                     &component_platform,
+                    &records,
                     fetch_fn,
                     *owner,
                 )

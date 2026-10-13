@@ -182,6 +182,10 @@ impl Publication {
                 )?;
             }
         }
+        // Each capsule record is signed on its own by the pinned publisher and
+        // matches its components row; platforms stay limited to binary and components.
+        let capsule_records =
+            crate::capsule_record::CapsuleRecords::from_release(r, &[pinned_did.to_owned()])?;
         let mut visited = BTreeSet::new();
         loop {
             let next = artifacts
@@ -209,6 +213,9 @@ impl Publication {
             {
                 let manifest = serde_json::from_value(component.clone())?;
                 crate::setup::admit_release_components(&manifest, platform)?;
+                if let Some(records) = &capsule_records {
+                    records.admit_manifest(&manifest)?;
+                }
             }
             component_refs(&component, &artifact_directory, &names, &mut artifacts)?;
             if let Some(catalog) = component.get("model_catalog") {
@@ -1471,6 +1478,63 @@ mod tests {
             fixture.write_signed();
             assert!(fixture.open().is_err(), "{field}");
         }
+    }
+
+    #[test]
+    fn signed_capsule_records_are_admitted_only_when_each_matches_its_row() {
+        let support = b"public qualified support archive";
+        let record = |key: &SigningKey, did: &str, change: Value| {
+            let mut payload = json!({"schema":"elastos.capsule.record/v1","name":"home",
+                "platform":"*","capsule_version":null,"sha256":digest(support),
+                "size":support.len(),"cid":raw_cid(support),"release_path":"home.tar.gz",
+                "signer_did":did});
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(change.as_object().unwrap().clone());
+            crate::capsule_record::signed_record(key, payload)
+        };
+        let mut fixture = PublicPublicationFixture::new();
+        fixture.release["capsule_records"] = json!([record(&fixture.key, &fixture.did, json!({}))]);
+        fixture.write_signed();
+        assert_eq!(fixture.open().unwrap().artifacts().len(), 4);
+
+        let (other, _) = generate_keypair();
+        let other_did = crate::crypto::encode_signing_key_did(&other);
+        let extra = json!({"name":"services","release_path":"services.tar.gz"});
+        for (case, records) in [
+            (
+                "size",
+                json!([record(&fixture.key, &fixture.did, json!({"size": 1}))]),
+            ),
+            (
+                "version",
+                json!([record(
+                    &fixture.key,
+                    &fixture.did,
+                    json!({"capsule_version": "2"})
+                )]),
+            ),
+            ("signer", json!([record(&other, &other_did, json!({}))])),
+            ("missing", json!([])),
+            (
+                "unused",
+                json!([
+                    record(&fixture.key, &fixture.did, json!({})),
+                    record(&fixture.key, &fixture.did, extra.clone())
+                ]),
+            ),
+        ] {
+            fixture.release["capsule_records"] = records;
+            fixture.write_signed();
+            assert!(fixture.open().is_err(), "{case}");
+        }
+        // Records belong at the release top level; platform descriptors stay strict.
+        fixture.release["capsule_records"] = json!([record(&fixture.key, &fixture.did, json!({}))]);
+        fixture.release["platforms"]["aarch64-darwin"]["capsule_records"] = json!([]);
+        fixture.write_signed();
+        let error = fixture.open().err().expect("platform records admitted");
+        assert!(format!("{error:#}").contains("platform descriptor fields refused"));
     }
 
     #[test]

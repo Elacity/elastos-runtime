@@ -291,7 +291,15 @@ a SHA-256 pin. It supports the attestation verification flags used by the signer
    hash, stop the service, run the preflight, import, and start the service.
    The import sends no gossip. Older seed Runtimes still print `No running
    runtime found` after the commit; that is expected, and the sequence accepts
-   only that error.
+   only that error. Releases from 0.8.0 list per-capsule records
+   (`capsule_records`, each `elastos.capsule.record/v1` signed under its own
+   domain `elastos.capsule.record.v1`). `release-signer.py` derives one record
+   per released archive from the verified components and signs it; a record
+   names the capsule's bytes and declared version, never the release version,
+   so it stays byte-identical while the capsule is unchanged. Seed Runtimes
+   before 0.8.0 accept these releases and do not check the records; a 0.8.0
+   seed checks each record against its components row. Homes check records when
+   a release lists them; the release after 0.8.0 makes them required.
 5. **Pin for CI.** Run `python3 scripts/update-hop-compare.py pin-previous-release`
    and merge the updated `scripts/update-hop-previous-release.json` into `develop`.
    It checks the signed head and release the seed now serves. Every pull

@@ -56,6 +56,11 @@ impl PrivateFixture {
     }
 
     fn publish_installed_release_with_components(&self, components: &[u8]) -> TrustedSource {
+        self.publish_installed_release_listing(components, json!({}))
+    }
+
+    /// `extra` adds top-level release payload fields, such as `capsule_records`.
+    fn publish_installed_release_listing(&self, components: &[u8], extra: Value) -> TrustedSource {
         self.file(&self.data.join("components.json"), components, 0o600);
         let binary = fs::read(&self.binary).unwrap();
         let descriptor = |bytes: &[u8]| {
@@ -63,15 +68,17 @@ impl PrivateFixture {
                 "cid": raw_cid(bytes), "sha256": digest(bytes), "size": bytes.len()
             })
         };
-        let release = signed(
-            json!({
-                "schema":"elastos.release/v1", "version":"0.7.0", "channel":"stable",
-                "platforms": {(crate::update::detect_release_platform()): {
-                    "binary": descriptor(&binary), "components": descriptor(components)
-                }}
-            }),
-            "elastos.release.v1",
-        );
+        let mut payload = json!({
+            "schema":"elastos.release/v1", "version":"0.7.0", "channel":"stable",
+            "platforms": {(crate::update::detect_release_platform()): {
+                "binary": descriptor(&binary), "components": descriptor(components)
+            }}
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let release = signed(payload, "elastos.release.v1");
         let head = signed(
             json!({
                 "schema":"elastos.release.head/v1", "version":"0.7.0", "channel":"stable",
@@ -3708,6 +3715,58 @@ impl crate::update::RestartOwner for StagingRestartOwner {
 }
 
 #[tokio::test]
+async fn home_launch_and_browser_paths_refuse_a_release_whose_record_differs_before_writing() {
+    let app = b"fixture app archive";
+    let row = json!({"install_path":"capsules/fixture-app", "extract_path":"fixture-app",
+        "release_path":"fixture-app.tar.gz", "cid":raw_cid(app),
+        "checksum":format!("sha256:{}", digest(app)), "size":app.len()});
+    let components = serde_json::to_vec(&json!({
+        "schema":"elastos.components/v1", "capsules":{}, "profiles":{},
+        "external":{"fixture-app":{"install_path":"capsules/fixture-app","platforms":{"*":row}}}
+    }))
+    .unwrap();
+    let did = crate::crypto::encode_signing_key_did(&test_key());
+    let record = |size: usize| {
+        crate::capsule_record::signed_record(
+            &test_key(),
+            json!({"schema":"elastos.capsule.record/v1", "name":"fixture-app", "platform":"*",
+                "capsule_version":null, "sha256":digest(app), "size":size, "cid":raw_cid(app),
+                "release_path":"fixture-app.tar.gz", "signer_did":did}),
+        )
+    };
+    let fixture = PrivateFixture::new();
+    fixture.publish_installed_release_listing(
+        &components,
+        json!({"capsule_records":[record(app.len() + 1)]}),
+    );
+    // The refusal names the record, so it comes before any Carrier fetch.
+    let error =
+        crate::setup::ensure_capsule_component_for_home_launch(&fixture.data, "fixture-app")
+            .await
+            .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("differs from the release components"),
+        "{error:#}"
+    );
+    // The shared check the Browser helper and image downloads run first.
+    let error = crate::setup::admit_installed_capsule_records(&fixture.data).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("differs from the release components"));
+    assert!(!fixture.data.join("capsules/fixture-app").exists());
+
+    let fixture = PrivateFixture::new();
+    fixture.publish_installed_release_listing(
+        &components,
+        json!({"capsule_records":[record(app.len())]}),
+    );
+    assert_eq!(
+        crate::setup::admit_installed_capsule_records(&fixture.data).unwrap(),
+        Some(components)
+    );
+}
+
+#[tokio::test]
 async fn staged_support_skips_linux_only_home_component_on_darwin() {
     let fixture = PrivateFixture::new();
     fixture.publish_installed_release();
@@ -3740,6 +3799,7 @@ async fn staged_support_skips_linux_only_home_component_on_darwin() {
         &fs::read(fixture.data.join("components.json")).unwrap(),
         &components,
         "darwin-arm64",
+        &crate::capsule_record::UpdateRecords::default(),
         &fetch,
         &mut owner,
     )
@@ -3791,6 +3851,7 @@ async fn staged_support_replaces_a_component_left_by_an_interrupted_undo() {
         &components,
         &components,
         &crate::setup::detect_platform(),
+        &crate::capsule_record::UpdateRecords::default(),
         &fetch,
         &mut owner,
     )

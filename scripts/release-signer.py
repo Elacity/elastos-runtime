@@ -79,6 +79,10 @@ PROVENANCE_SCHEMA = "elastos.release.provenance/v1"
 MODEL_CATALOG_DOMAIN = "elastos.model.catalog.v1"
 MODEL_CATALOG_SCHEMA = "elastos.model.catalog/v1"
 MAX_MODEL_CATALOG = 128 * 1024
+CAPSULE_RECORD_DOMAIN = "elastos.capsule.record.v1"
+CAPSULE_RECORD_SCHEMA = "elastos.capsule.record/v1"
+# A release is one UnixFS chunk; Runtime refuses larger release metadata.
+MAX_RELEASE_METADATA = 256 * 1024
 
 
 def require(condition, message):
@@ -487,6 +491,41 @@ def bind_component_cids(manifest, cids):
     return manifest
 
 
+def capsule_record_payloads(manifest, publisher_did, release_version):
+    """One `elastos.capsule.record/v1` payload per released row of an
+    `elastos.components/v1` manifest whose CIDs are bound: each component's own
+    platform rows and its capsule metadata rows. The payload names only the
+    capsule's bytes and declared version, never the release version, so it stays
+    byte-identical while the capsule is unchanged. Sorted by (name, release_path)."""
+    require(type(manifest) is dict and type(manifest.get("external")) is dict, "components refused")
+    records = {}
+    for name, component in manifest["external"].items():
+        require(type(name) is str and name and type(component) is dict, "component refused")
+        version = component.get("version")
+        require(version is None or (type(version) is str and version), "capsule version refused: " + name)
+        require(version != release_version, "capsule version must not be the release version: " + name)
+        for entry in (component, component.get("capsule_metadata")):
+            if entry is None:
+                continue
+            require(type(entry) is dict and type(entry.get("platforms", {})) is dict, "component refused: " + name)
+            for platform, info in entry.get("platforms", {}).items():
+                require(type(info) is dict, "component row refused: " + name)
+                if not info.get("release_path"):
+                    continue
+                checksum = info.get("checksum")
+                require(type(checksum) is str and checksum.startswith("sha256:"), "capsule record checksum refused: " + name)
+                require(type(info.get("size")) is int and info["size"] > 0, "capsule record size refused: " + name)
+                require(type(info.get("cid")) is str, "capsule record CID refused: " + name)
+                cid_info(info["cid"])
+                payload = {"schema": CAPSULE_RECORD_SCHEMA, "name": name, "platform": platform,
+                           "capsule_version": version, "sha256": checked_hash(checksum[len("sha256:"):]),
+                           "size": info["size"], "cid": info["cid"], "release_path": relative_path(info["release_path"]),
+                           "signer_did": publisher_did}
+                key = (name, payload["release_path"])
+                require(records.setdefault(key, payload) == payload, f"conflicting capsule record: {name} ({payload['release_path']})")
+    return tuple(records[key] for key in sorted(records))
+
+
 def approved_release(path, input_root=None, expected_hash=None):
     path = Path(path)
     require(path.is_absolute() and path == path.resolve(), "approval requires a canonical absolute path")
@@ -788,6 +827,7 @@ class Prepared:
     release: bytes
     updated_at: int
     prev_head_cid: object
+    capsule_records: tuple
 
 
 def prepare(policy, root, manifest_name, fetch, snapshot_root):
@@ -881,6 +921,7 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
         require(type(platform) is dict and set(platform) == {"binary", "components"}, "platform fields refused")
         refs(platform)
     # Component/capsule records must also be bound by a snapshotted JSON manifest.
+    capsule_records = {}
     visited = set()
     while True:
         reachable = [(name, data) for name, data in snapshot if name.endswith(".json")
@@ -911,6 +952,10 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
                     for child in value:
                         component_refs(child)
             component_refs(component)
+            for payload in capsule_record_payloads(component, policy["publisher_did"], release["version"]):
+                key = (payload["name"], payload["release_path"])
+                require(capsule_records.setdefault(key, payload) == payload,
+                        f"platform components disagree on capsule record: {key[0]} ({key[1]})")
             catalog = component.get("model_catalog")
             if catalog is not None:
                 require(type(catalog) is dict and type(catalog.get("head_cid")) is str, "model catalog pin refused")
@@ -931,26 +976,52 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
         output.write(rendered)
     install_path.chmod(0o400)
     snapshot.append(("install.sh", install_path))
-    return Prepared(policy["publisher_did"], tuple(snapshot), json_bytes(release), head["updated_at"], head["prev_head_cid"])
+    capsule_records = tuple(capsule_records[key] for key in sorted(capsule_records))
+    return Prepared(policy["publisher_did"], tuple(snapshot), json_bytes(release), head["updated_at"], head["prev_head_cid"],
+                    capsule_records)
 
 
 def signature_digest(domain, payload):
-    require(domain in ("elastos.release.v1", "elastos.release.head.v1", MODEL_CATALOG_DOMAIN), "signing domain refused")
+    require(domain in ("elastos.release.v1", "elastos.release.head.v1", MODEL_CATALOG_DOMAIN, CAPSULE_RECORD_DOMAIN),
+            "signing domain refused")
     return hashlib.sha256(domain.encode() + b"\0" + payload).digest()
 
 
-def signed_envelope(domain, payload, publisher_did, backend):
-    digest = signature_digest(domain, json_bytes(payload))
-    signature = backend.sign(digest)
+def envelope_bytes(domain, payload, publisher_did, sign):
+    signature = sign(domain, payload)
     require(type(signature) is bytes and len(signature) == 64, "Ed25519 signature length differs")
-    require(backend.verify(digest, signature) is True, "signature public verification failed")
     return json_bytes({"payload": payload, "signature": signature.hex(), "signer_did": publisher_did})
 
 
+def backend_signer(backend):
+    def sign(domain, payload):
+        digest = signature_digest(domain, json_bytes(payload))
+        signature = backend.sign(digest)
+        require(type(signature) is bytes and len(signature) == 64, "Ed25519 signature length differs")
+        require(backend.verify(digest, signature) is True, "signature public verification failed")
+        return signature
+    return sign
+
+
+def signed_envelope(domain, payload, publisher_did, backend):
+    return envelope_bytes(domain, payload, publisher_did, backend_signer(backend))
+
+
+def signed_release_bytes(release, capsule_records, publisher_did, sign):
+    """The release envelope; each capsule record is signed on its own, then listed
+    at the release top level under `capsule_records`."""
+    records = [parse_json(envelope_bytes(CAPSULE_RECORD_DOMAIN, payload, publisher_did, sign)) for payload in capsule_records]
+    return envelope_bytes("elastos.release.v1", {**release, "capsule_records": records}, publisher_did, sign)
+
+
 def sign_publication(prepared, backend):
-    require(len(prepared.release) + 300 <= 256 * 1024, "single-chunk release metadata required")
+    # Placeholder signatures have the signed length, so this bound is exact before any key use.
+    placeholder = signed_release_bytes(parse_json(prepared.release), prepared.capsule_records, prepared.publisher_did,
+                                       lambda domain, payload: bytes(64))
+    require(len(placeholder) <= MAX_RELEASE_METADATA, "single-chunk release metadata required")
     require(public_did(backend.public_key()) == prepared.publisher_did, "custodian public DID differs")
-    release = signed_envelope("elastos.release.v1", parse_json(prepared.release), prepared.publisher_did, backend)
+    release = signed_release_bytes(parse_json(prepared.release), prepared.capsule_records, prepared.publisher_did,
+                                   backend_signer(backend))
     head = {"schema": "elastos.release.head/v1", "channel": parse_json(prepared.release)["channel"],
             "version": parse_json(prepared.release)["version"], "latest_release_cid": unixfs_metadata_cid(release),
             "release_sha256": sha256(release), "updated_at": prepared.updated_at,

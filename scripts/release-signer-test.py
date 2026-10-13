@@ -1107,11 +1107,94 @@ class SignerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 S.unixfs_metadata_cid(value)
 
+    def test_each_released_archive_is_signed_on_its_own_and_listed_at_the_release_top_level(self):
+        self.current_shape()
+        backend = FakeBackend()
+        publication = dict(S.sign_publication(self.prepare(), backend))
+        release = S.parse_json(publication["release.json"])["payload"]
+        files = self.manifest["files"]
+        def expected(name):
+            return {"schema": "elastos.capsule.record/v1", "name": "localhost-provider", "platform": platform[name],
+                    "capsule_version": None, "sha256": files[name]["sha256"], "size": files[name]["size"],
+                    "cid": files[name]["cid"], "release_path": name, "signer_did": DID}
+        platform = {"localhost-provider-capsule-metadata.tar.gz": "*", "localhost-provider-linux-amd64": "linux-amd64"}
+        records = release["capsule_records"]
+        self.assertEqual([record["payload"] for record in records], [expected(name) for name in sorted(platform)])
+        self.assertEqual({record["signer_did"] for record in records}, {DID})
+        signed = [call[1] for call in backend.calls if isinstance(call, tuple) and call[0] == "sign"]
+        record_digests = [hashlib.sha256(b"elastos.capsule.record.v1\0" + S.json_bytes(record["payload"])).digest()
+                          for record in records]
+        # Each record has its own signature, made before the release that lists it.
+        self.assertEqual(signed[:2], record_digests)
+        self.assertEqual(len(signed), 4)
+        self.assertEqual(set(release["platforms"]["x86_64-linux"]), {"binary", "components"})
+
+    def test_unchanged_capsule_keeps_byte_identical_record_across_releases(self):
+        self.current_shape()
+        bound = S.parse_json((self.root / "components-x86_64-linux.json").read_bytes())
+        def sign(domain, payload):
+            return hashlib.sha512(domain.encode() + b"\0" + S.json_bytes(payload)).digest()
+        def records(components, version):
+            payloads = S.capsule_record_payloads(components, DID, version)
+            release = S.parse_json(S.signed_release_bytes({"version": version}, payloads, DID, sign))
+            return [S.json_bytes(record) for record in release["payload"]["capsule_records"]]
+        first, second = records(bound, "1.2.3"), records(bound, "1.2.4")
+        self.assertEqual(first, second)
+        changed = copy.deepcopy(bound)
+        data = b"changed provider bytes"
+        changed["external"]["localhost-provider"]["platforms"]["linux-amd64"].update(
+            checksum="sha256:" + S.sha256(data), size=len(data), cid=S.raw_cid(data))
+        third = records(changed, "1.2.4")
+        # Sorted by release path: metadata archive first, then the provider binary.
+        self.assertEqual(third[0], first[0])
+        self.assertNotEqual(third[1], first[1])
+
+    def test_capsule_records_refuse_rows_a_home_could_not_verify(self):
+        self.current_shape()
+        bound = S.parse_json((self.root / "components-x86_64-linux.json").read_bytes())
+        def row(components):
+            return components["external"]["localhost-provider"]["platforms"]["linux-amd64"]
+        cases = (
+            ("must not be the release version", lambda c: c["external"]["localhost-provider"].update(version="1.2.3")),
+            ("checksum refused", lambda c: row(c).update(checksum="sha512:" + "0" * 128)),
+            ("size refused", lambda c: row(c).update(size=True)),
+            ("size refused", lambda c: row(c).update(size=0)),
+            ("CID refused", lambda c: row(c).update(cid=None)),
+            ("unsafe relative path", lambda c: row(c).update(release_path="../escape")),
+            ("conflicting capsule record", lambda c: c["external"]["localhost-provider"]["platforms"].update(
+                {"linux-arm64": {**row(c), "size": row(c)["size"] + 1}})),
+        )
+        for message, change in cases:
+            components = copy.deepcopy(bound)
+            change(components)
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                S.capsule_record_payloads(components, DID, "1.2.3")
+
+    def test_records_beyond_one_chunk_are_refused_before_key_use(self):
+        def payload(index):
+            data = str(index).encode()
+            return {"schema": "elastos.capsule.record/v1", "name": f"content-block-graph-provider-{index:03}",
+                    "platform": "darwin-arm64", "capsule_version": None, "sha256": S.sha256(data), "size": 1,
+                    "cid": "Qm" + "a" * 44, "release_path": f"content-block-graph-provider-{index:03}-capsule-metadata.tar.gz",
+                    "signer_did": DID}
+        release = S.json_bytes(self.manifest["release"])
+        # 0.8.0-alpha.14 published 123 distinct archives; records leave room for twice that.
+        fits = S.Prepared(DID, (), release, 2, None, tuple(payload(index) for index in range(250)))
+        self.assertIn("release.json", dict(S.sign_publication(fits, FakeBackend())))
+        backend = FakeBackend()
+        too_many = S.Prepared(DID, (), release, 2, None, tuple(payload(index) for index in range(450)))
+        with self.assertRaisesRegex(ValueError, "single-chunk release metadata required"):
+            S.sign_publication(too_many, backend)
+        self.assertEqual(backend.calls, [])
+
 # Signed by the --model-catalog mode with a disposable key; the Runtime verifies
 # these exact bytes in capsule_inventory.rs.
 CATALOG_FIXTURE = SOURCE.parent.parent / "elastos/crates/elastos-server/tests/fixtures/model-catalog.json"
 CATALOG_HEAD = "bafkreifmbqk5trnjxqfjiop5bzmml6vl5ybrpoujssrmfqce4wrodn4x4y"
 NOW = 1_760_000_000
+# A capsule record signed with a disposable key; the Runtime verifies these exact
+# bytes in capsule_record.rs.
+RECORD_FIXTURE = SOURCE.parent.parent / "elastos/crates/elastos-server/tests/fixtures/capsule-record.json"
 
 
 def did_public(did):
@@ -1299,6 +1382,23 @@ class ModelCatalogTests(unittest.TestCase):
             verify = subprocess.run([openssl, "pkeyutl", "-verify", "-rawin", "-pubin", "-keyform", "DER", "-inkey", "did.der",
                                      "-in", "digest", "-sigfile", "signature"], cwd=base, capture_output=True)
             self.assertEqual(verify.returncode != 0, bool(expected))
+
+
+class CapsuleRecordTests(unittest.TestCase):
+    def test_signs_runtime_verified_fixture_byte_for_byte(self):
+        fixture = RECORD_FIXTURE.read_bytes()
+        envelope = json.loads(fixture)
+        did, payload = envelope["signer_did"], envelope["payload"]
+        components = {"external": {"system": {"install_path": "capsules/system", "platforms": {"*": {
+            "checksum": "sha256:" + payload["sha256"], "size": payload["size"], "cid": payload["cid"],
+            "release_path": "system.tar.gz", "install_path": "capsules/system", "extract_path": "system"}}}}}
+        self.assertEqual(S.capsule_record_payloads(components, did, "0.8.0"), (payload,))
+        backend = FakeBackend()
+        backend.public = did_public(did)
+        backend.signature = bytes.fromhex(envelope["signature"])
+        self.assertEqual(S.signed_envelope(S.CAPSULE_RECORD_DOMAIN, payload, did, backend), fixture)
+        digest = hashlib.sha256(b"elastos.capsule.record.v1\0" + S.json_bytes(payload)).digest()
+        self.assertEqual(backend.calls, [("sign", digest), ("verify", digest, backend.signature)])
 
 
 if __name__ == "__main__":

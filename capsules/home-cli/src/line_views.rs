@@ -1,10 +1,7 @@
 fn render_line_dashboard(snapshot: &HomeSnapshot) -> Result<()> {
     print_cli_page_header(snapshot, "Home");
     println!("A compact Home shell for working CLI journeys.");
-    println!(
-        "Version: runtime {}  home {}",
-        snapshot.version, DASHBOARD_VERSION
-    );
+    println!("Version: runtime {}", snapshot.version);
 
     println!();
     println!("Now");

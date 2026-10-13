@@ -50,10 +50,6 @@ const MAX_GUEST_CONTROL_ERROR_CHARS: usize = 512;
 const MAX_SETTLEMENT_MESSAGE_CHARS: usize = 2 * 1024;
 const DEFAULT_CONTROL_PROXY_REQUEST_TIMEOUT_MS: u32 = 120_000;
 const DEFAULT_PROFILE_FLUSH_TIMEOUT_MS: u32 = 30_000;
-const BROWSER_VM_TARGET_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
 const DISPLAY_MODE_BOOT_ARG: &str = "elastos.browser_display_mode";
 const DISPLAY_WIDTH_BOOT_ARG: &str = "elastos.browser_width";
 const DISPLAY_HEIGHT_BOOT_ARG: &str = "elastos.browser_height";
@@ -3395,7 +3391,7 @@ fn ensure_sparse_profile_disk(path: &Path, profile_key: &str) -> Result<bool, St
 fn browser_vm_manifest(memory_mib: u32, vcpu_count: u8) -> CapsuleManifest {
     CapsuleManifest {
         schema: SCHEMA_V1.to_string(),
-        version: BROWSER_VM_TARGET_VERSION.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         name: "browser-vm-target".to_string(),
         description: Some("ElastOS Browser VM target".to_string()),
 	        author: Some("elastos".to_string()),

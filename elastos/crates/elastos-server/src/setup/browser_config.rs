@@ -27,6 +27,7 @@ pub(super) async fn ensure_host_components(
     let Some(profile) = manifest.profiles.get("browser-host") else {
         return Ok(()); // Source Homes and older releases own their existing helpers.
     };
+    let mut records_admitted = false;
     for name in &profile.components {
         let component = manifest
             .external
@@ -55,6 +56,11 @@ pub(super) async fn ensure_host_components(
             super::InstallState::Installed
         ) || (info.extract_path.is_none() && !executable(&data.join(relative)))
         {
+            // The release's capsule records are checked once, before the first write.
+            if !records_admitted {
+                super::admit_installed_capsule_records(data)?;
+                records_admitted = true;
+            }
             super::download_component(data, name, info, &data.join(relative), context).await?;
         }
         super::ensure_bundle_executable_link(data, name, info)?;

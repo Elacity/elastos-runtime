@@ -1412,6 +1412,18 @@ printf '%s\n' "$PLATFORMS_JSON" > "$TMPDIR/platforms.json"
             prepared = signer.prepare(policy, fixture.output.resolve(), "signing-input.json", api.__getitem__, snapshot)
             self.assertEqual(prepared.release, signer.json_bytes(manifest["release"]))
             self.assertEqual(dict(prepared.files)["install.sh"].read_bytes(), rendered)
+            # The signing input carries no records; the custodian derives one per
+            # released archive, each naming the approved snapshot bytes.
+            self.assertNotIn("capsule_records", manifest["release"])
+            self.assertTrue(prepared.capsule_records)
+            released = {name for name in manifest["files"]
+                        if not name.startswith(("elastos-", "components-")) and name != "model-catalog.json"}
+            self.assertEqual({record["release_path"] for record in prepared.capsule_records}, released)
+            for record in prepared.capsule_records:
+                approved = manifest["files"][record["release_path"]]
+                self.assertEqual((record["sha256"], record["size"], record["cid"], record["signer_did"]),
+                                 (approved["sha256"], approved["size"], approved["cid"], policy["publisher_did"]))
+                self.assertIsNone(record["capsule_version"])
             self.assertEqual(verifier.call_count, 1)
             self.assertEqual(verifier.call_args.args[0], approval)
             self.assertEqual(verifier.call_args.args[1]["run_attempt"], proof_artifact["attempt"])

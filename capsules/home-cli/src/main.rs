@@ -22,10 +22,6 @@ use terminal::{
     ESCAPE_SEQUENCE_MAX_BYTES,
 };
 
-const DASHBOARD_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
 thread_local! {
     static CLIENT: RefCell<RuntimeClient> = RefCell::new(RuntimeClient::new());
 }

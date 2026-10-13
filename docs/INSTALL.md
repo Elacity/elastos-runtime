@@ -200,10 +200,15 @@ connection fails, the check fails.
 **What System shows.** System shows the new version and its release notes.
 
 **Approve and restart.** You approve the update with your passkey for that
-exact release. The Runtime downloads the binary and components by CID over
-Carrier (a component listed without a CID comes by its release name), stages
-everything beside the running Home and restarts Home. A download fails only
-after 30 seconds without data.
+exact release. The Runtime always downloads the new Runtime binary and
+`components.json` by CID over Carrier. A capsule is downloaded only when its
+signed record changed: the release lists one record per capsule archive
+(name, capsule version, SHA-256, size, CID, signer), each signed on its own by
+the publisher. Before any download the Runtime checks each record's signature
+against the publisher DIDs in `sources.json` and that it matches the
+capsule's entry in `components.json`; downloaded bytes must match the same
+SHA-256 and size. The Runtime stages everything beside the running Home and
+restarts Home. A download fails only after 30 seconds without data.
 
 **If it fails.** If the new release does not start, the previous release is
 restored.

@@ -143,7 +143,7 @@ def pinned_components(catalog=CATALOG):
     return json.dumps(manifest, sort_keys=True).encode() + b"\n"
 
 
-def installable_fixture(runtime=RUNTIME_STUB, components=COMPONENTS, version="0.7.1"):
+def installable_fixture(runtime=RUNTIME_STUB, components=COMPONENTS, version="0.7.1", release_extra=None):
     """Deterministic signed head/release advertising the fixture Runtime stub and manifest."""
     release_payload = {
         "schema": "elastos.release/v1", "version": version, "channel": "stable",
@@ -151,7 +151,8 @@ def installable_fixture(runtime=RUNTIME_STUB, components=COMPONENTS, version="0.
         "platforms": {"x86_64-linux": {
             "binary": {"cid": "binary-a", "sha256": hashlib.sha256(runtime).hexdigest(), "size": len(runtime)},
             "components": {"cid": "components-a", "sha256": hashlib.sha256(components).hexdigest(),
-                           "size": len(components)}}}}
+                           "size": len(components)}}},
+        **(release_extra or {})}
     signed_release = sign_envelope(release_payload, "elastos.release.v1")
     release = encode_envelope(signed_release)
     head_payload = {
@@ -761,7 +762,7 @@ validate_release_identity "$1" "$2"
         backend.sign.return_value = bytes(64)
         backend.verify.return_value = True
         prepared = SimpleNamespace(publisher_did=FIXTURE_DID, files=(), release=signer.json_bytes(payload),
-                                   updated_at=1, prev_head_cid=None)
+                                   updated_at=1, prev_head_cid=None, capsule_records=())
         publication = dict(signer.sign_publication(prepared, backend))
         release = publication["release.json"]
         head = json.loads(publication["release-head.json"])["payload"]
@@ -898,6 +899,22 @@ class InstallationTests(unittest.TestCase):
                         self.assertIn(f"\nTMPDIR={sandbox.root / 'tmp'}\n", marker.read_text())
                         self.assertEqual(sandbox.runtime_calls()[-1], "setup")
                     self.assertEqual(list((sandbox.root / "tmp").iterdir()), [])
+
+    def test_release_listing_capsule_records_installs_unchanged(self):
+        # Installers from 0.8.0-alpha.13 on read named release fields only, so a
+        # release that lists per-capsule records still installs through them.
+        record = sign_envelope({"schema": "elastos.capsule.record/v1", "name": "shell", "platform": "*",
+                                "capsule_version": None, "sha256": "a" * 64, "size": 1,
+                                "cid": "bafkreifixture", "release_path": "shell-linux-amd64"},
+                               "elastos.capsule.record.v1")
+        did, head, release = installable_fixture(release_extra={"capsule_records": [record]})
+        with InstallerSandbox(head, release, did) as sandbox:
+            self.existing_installation(sandbox)
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, requests = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(requests, self.REQUESTS)
+            self.assertEqual((sandbox.root / "candidate" / "release.json").read_bytes(), release)
 
     def test_piped_run_prints_plain_numbered_steps_and_ready_summary(self):
         # curl | bash with captured stdout is the CI and log case: no colour,

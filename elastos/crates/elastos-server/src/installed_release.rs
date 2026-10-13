@@ -169,6 +169,16 @@ pub(crate) fn read_signed_components(
     source: &TrustedSource,
     repair_version: bool,
 ) -> Result<Vec<u8>> {
+    read_signed_release(data, binary, source, repair_version).map(|(_, components)| components)
+}
+
+/// The installed signed release envelope and the components it binds.
+pub(crate) fn read_signed_release(
+    data: &Path,
+    binary: &Path,
+    source: &TrustedSource,
+    repair_version: bool,
+) -> Result<(serde_json::Value, Vec<u8>)> {
     require_no_pending(binary)?;
     require_current_source(data, source)?;
     let private = consumed_present(data)?;
@@ -199,7 +209,7 @@ pub(crate) fn read_signed_components(
         components.len() as u64,
     )
     .context(REPAIR)?;
-    Ok(components)
+    Ok((release, components))
 }
 
 /// Setup holds this guard while it obtains signed support for an installed binary.

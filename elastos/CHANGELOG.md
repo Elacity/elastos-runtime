@@ -34,6 +34,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   whose `scripts/update-hop-previous-release.json` does not name the public
   release head; N+1 of a pair passes once the public head is the N this Mac
   signed from the same run.
+- Only the Runtime binary (`elastos`) compiles in the release version. Home
+  CLI, the shell and the Browser VZ supervisor no longer do, so their bytes
+  stay the same across releases when their code does not change (#194). The
+  terminal Home shows the Runtime version it reads from the Runtime.
 - CI's `release-upstream-assets` job runs the release's upstream asset build
   (`scripts/release-upstream-assets.py`, including the Browser helper source
   builds) for Linux ARM64 and Apple Silicon on every pull request that changes
