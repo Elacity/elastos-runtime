@@ -2048,6 +2048,47 @@ fn open_runtime_media_tool(
     anyhow::bail!("owner-only media-provider prerequisite setup is unsupported on this platform")
 }
 
+/// Decide whether a directory on a media tool's path is safe from its owner,
+/// group, mode and the caller's uid and primary gid, as `parent_dir_refusal` in
+/// scripts/install.sh does. Refuse directories owned by another user and ones
+/// others can write (`only_owner_can_write`; `private_group` decides whether a
+/// group is the caller's user-private group), except a root-owned sticky
+/// directory such as /tmp, where others cannot rename or remove entries they do
+/// not own. Never advise changing a root-owned directory: that would change the
+/// system for every user.
+#[cfg(unix)]
+fn media_parent_refusal(
+    owner: u32,
+    group: u32,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    private_group: impl FnOnce(u32) -> bool,
+    display: &Path,
+) -> Option<String> {
+    let quoted = crate::install_transaction::shell_quote_path(display);
+    let shown = display.display();
+    if owner != 0 && owner != uid {
+        return Some(format!(
+            "{shown} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}"
+        ));
+    }
+    if owner == 0 {
+        if mode & 0o022 == 0 || mode & 0o1000 != 0 {
+            return None;
+        }
+        return Some(format!(
+            "{shown} is owned by root and others can write to it; keep the tools under your own home directory instead"
+        ));
+    }
+    if crate::install_transaction::only_owner_can_write(mode, group, gid, private_group) {
+        return None;
+    }
+    Some(format!(
+        "{shown} is group- or world-writable; fix with: chmod go-w {quoted}"
+    ))
+}
+
 /// Open an absolute source path one directory at a time with `openat` and
 /// `O_NOFOLLOW`, so no link anywhere on the path is followed and every checked
 /// directory is the one the next step opens from. Callers that need a system link
@@ -2059,6 +2100,7 @@ fn open_media_source_no_links(literal: &Path, name: &str) -> anyhow::Result<fs::
     use std::path::Component;
 
     let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
     let open_at = |dir: &fs::File, part: &std::ffi::OsStr, flags: libc::c_int| {
         let part = std::ffi::CString::new(part.as_bytes())
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
@@ -2078,22 +2120,17 @@ fn open_media_source_no_links(literal: &Path, name: &str) -> anyhow::Result<fs::
         let metadata = dir.metadata().map_err(|_| {
             invalid_media_provider_config(format!("{name} prerequisite parent is unavailable"))
         })?;
-        let quoted = crate::install_transaction::shell_quote_path(display);
-        if metadata.uid() != 0 && metadata.uid() != uid {
+        if let Some(refusal) = media_parent_refusal(
+            metadata.uid(),
+            metadata.gid(),
+            metadata.permissions().mode(),
+            uid,
+            gid,
+            |group| crate::install_transaction::user_private_group(group, uid),
+            display,
+        ) {
             return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite parent is unsafe: {} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}",
-                display.display()
-            )));
-        }
-        if metadata.permissions().mode() & 0o022 != 0 {
-            let sudo = if metadata.uid() == 0 && uid != 0 {
-                "sudo "
-            } else {
-                ""
-            };
-            return Err(invalid_media_provider_config(format!(
-                "{name} prerequisite parent is unsafe: {} is group- or world-writable; fix with: {sudo}chmod go-w {quoted}",
-                display.display()
+                "{name} prerequisite parent is unsafe: {refusal}"
             )));
         }
         Ok(())

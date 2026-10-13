@@ -11,12 +11,14 @@ import base64
 import copy
 import fcntl
 import getpass
+import grp
 import hashlib
 import http.server
 import json
 import os
 from pathlib import Path
 import platform
+import pwd
 import re
 import shlex
 import signal
@@ -1100,6 +1102,7 @@ class InstallationTests(unittest.TestCase):
                     (sandbox.home / "alias").symlink_to(bin_dir)
                     options = ["--install-dir", str(sandbox.home / case)]
                 bin_dir.chmod(0o775)
+                self.mock_group_database(sandbox, "{me}:x:{gid}:{me},guest")
                 before = sandbox.home_state()
                 sandbox.respond("binary", RUNTIME_STUB)
                 result, requests = sandbox.run("--install-only", *options)
@@ -1126,23 +1129,147 @@ class InstallationTests(unittest.TestCase):
             result, _ = sandbox.run("--install-only")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_data_directory_under_root_owned_sticky_tmp_is_accepted(self):
+        did, head, release = installable_fixture()
+        tmp = Path("/tmp").resolve()
+        self.assertEqual((tmp.stat().st_uid, tmp.stat().st_mode & 0o7777), (0, 0o1777))
+        with InstallerSandbox(head, release, did) as sandbox, \
+                tempfile.TemporaryDirectory(prefix="installer-sticky-", dir=tmp) as outside:
+            (Path(outside) / "xdg-data").mkdir()
+            (sandbox.home / "xdg-data").symlink_to(Path(outside) / "xdg-data")
+            sandbox.respond("binary", RUNTIME_STUB)
+            result, _ = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(tmp.stat().st_mode & 0o7777, 0o1777)
+
+    def test_parent_rule_by_owner_and_mode(self):
+        me = os.getuid() or 501
+        other_group = os.getgid() + 1
+        cases = [
+            (0, "1777", None),
+            (0, "41777", None),
+            (0, "755", None),
+            (me, "700", None),
+            (0, "777", "under your own home directory"),
+            (0, "775", "under your own home directory"),
+            (me, "777", "fix with: chmod go-w /x"),
+            (me, "775", "fix with: chmod go-w /x"),
+            (me, "1777", "fix with: chmod go-w /x"),
+            (me + 1, "1777", "is not owned by you"),
+        ]
+        for owner, mode, refusal in cases:
+            with self.subTest(owner=owner, mode=mode):
+                result = subprocess.run(
+                    [OPTIONS.bash, "--noprofile", "--norc", "-c",
+                     'source "$1" && parent_dir_refusal "$2" "$3" "$4" "$5" "$6" /x',
+                     "-", str(INSTALLER.resolve()), str(owner), str(other_group), mode, str(me),
+                     str(os.getgid())],
+                    capture_output=True, text=True, timeout=10)
+                if refusal is None:
+                    self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+                    continue
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(refusal, result.stdout)
+                if owner == 0:
+                    self.assertNotRegex(result.stdout, "chmod|chown|sudo")
+
+    @staticmethod
+    def mock_group_database(sandbox, group_record, other_account=False):
+        """A mock getent serving `group_record` for your primary group and a
+        passwd list with you (plus another account whose primary group it is,
+        if other_account)."""
+        me, gid = pwd.getpwuid(os.getuid()).pw_name, os.getgid()
+        (sandbox.root / "getent-group").write_text(group_record.format(me=me, gid=gid) + "\n")
+        accounts = f"{me}:x:{os.getuid()}:{gid}::/home/{me}:/bin/sh\n"
+        if other_account:
+            accounts += f"guest:x:{os.getuid() + 1}:{gid}::/home/guest:/bin/sh\n"
+        (sandbox.root / "getent-passwd").write_text(accounts)
+        getent = sandbox.root / "mocks/getent"
+        getent.write_text('#!/bin/sh\nexec cat "$FIXTURES/getent-$1"\n')
+        getent.chmod(0o755)
+
+    def group_writable_data_ancestor(self, sandbox, mode, group_record=None, other_account=False):
+        """A data-directory ancestor of yours, in your primary group, with `mode`;
+        a group_record mocks the group database (mock_group_database)."""
+        if group_record is not None:
+            self.mock_group_database(sandbox, group_record, other_account)
+        parent = sandbox.root / "a\\b it's"
+        (parent / "xdg-data").mkdir(parents=True)
+        (sandbox.home / "xdg-data").symlink_to(parent / "xdg-data")
+        os.chown(parent, -1, os.getgid())
+        parent.chmod(mode)
+        return parent
+
+    def test_existing_install_and_data_dirs_follow_the_private_group_rule(self):
+        did, head, release = installable_fixture()
+        cases = [
+            (0o775, "{me}:x:{gid}:", True),
+            (0o775, "{me}:x:{gid}:{me}", True),
+            (0o775, "{me}:x:{gid}:{me},guest", False),
+            (0o775, "", False),
+            (0o777, "{me}:x:{gid}:", False),
+        ]
+        for target in ("install", "data"):
+            for mode, record, accepted in cases:
+                with self.subTest(target=target, mode=oct(mode), record=record), \
+                        InstallerSandbox(head, release, did) as sandbox:
+                    self.mock_group_database(sandbox, record)
+                    folder = sandbox.home / ".local/bin" if target == "install" else sandbox.data
+                    folder.mkdir(parents=True)
+                    os.chown(folder, -1, os.getgid())
+                    folder.chmod(mode)
+                    sandbox.respond("binary", RUNTIME_STUB)
+                    result, requests = sandbox.run("--install-only")
+                    if accepted:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        continue
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(requests, [])
+                    self.assertIn("Unsafe installation directory", result.stderr)
+                    self.assertIn("fix with: chmod go-w ", result.stderr)
+                    self.assertEqual(folder.stat().st_mode & 0o777, mode)
+
     def test_group_writable_data_ancestor_is_refused_before_download_with_exact_fix(self):
         did, head, release = installable_fixture()
+        cases = {
+            "shared group": (0o775, "{me}:x:{gid}:{me},guest", False),
+            "others' primary group": (0o775, "{me}:x:{gid}:", True),
+            "unknown group": (0o775, "", False),
+            "world-writable": (0o777, "{me}:x:{gid}:", False),
+        }
+        for case, (mode, record, other_account) in cases.items():
+            with self.subTest(case=case), InstallerSandbox(head, release, did) as sandbox:
+                unsafe = self.group_writable_data_ancestor(sandbox, mode, record, other_account)
+                sandbox.respond("binary", RUNTIME_STUB)
+                result, requests = sandbox.run("--install-only")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(requests, [])
+                command = result.stderr.split("fix with: ", 1)[1].splitlines()[0]
+                self.assertTrue(command.startswith("chmod go-w "), command)
+                fixed = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", "-c", command],
+                                       capture_output=True, text=True)
+                self.assertEqual(fixed.returncode, 0, fixed.stderr)
+                self.assertEqual(unsafe.stat().st_mode & 0o777, 0o755)
+
+    def test_data_ancestor_writable_by_your_user_private_group_is_accepted(self):
+        did, head, release = installable_fixture()
+        for record in ("{me}:x:{gid}:", "{me}:x:{gid}:{me}"):
+            with self.subTest(record=record), InstallerSandbox(head, release, did) as sandbox:
+                self.group_writable_data_ancestor(sandbox, 0o775, record)
+                sandbox.respond("binary", RUNTIME_STUB)
+                result, _ = sandbox.run("--install-only")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_group_writable_data_ancestor_follows_the_real_group_database(self):
+        me, gid = pwd.getpwuid(os.getuid()).pw_name, os.getgid()
+        private = (set(grp.getgrgid(gid).gr_mem) <= {me}
+                   and all(p.pw_name == me for p in pwd.getpwall() if p.pw_gid == gid))
+        did, head, release = installable_fixture()
         with InstallerSandbox(head, release, did) as sandbox:
-            unsafe = sandbox.root / "a\\b it's"
-            (unsafe / "xdg-data").mkdir(parents=True)
-            (sandbox.home / "xdg-data").symlink_to(unsafe / "xdg-data")
-            unsafe.chmod(0o775)
+            self.group_writable_data_ancestor(sandbox, 0o775)
             sandbox.respond("binary", RUNTIME_STUB)
-            result, requests = sandbox.run("--install-only")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(requests, [])
-            command = result.stderr.split("fix with: ", 1)[1].splitlines()[0]
-            self.assertTrue(command.startswith("chmod go-w "), command)
-            fixed = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", "-c", command],
-                                   capture_output=True, text=True)
-            self.assertEqual(fixed.returncode, 0, fixed.stderr)
-            self.assertEqual(unsafe.stat().st_mode & 0o777, 0o755)
+            result, _ = sandbox.run("--install-only")
+            self.assertEqual(result.returncode == 0, private, result.stdout + result.stderr)
 
     def test_writer_refusal_stops_before_runtime_and_changes_nothing(self):
         did, head, release = installable_fixture()

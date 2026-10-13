@@ -28,6 +28,17 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Known issue: on a Mac with a slow connection, getting a model can stop with "Model content could not be read".
 - Known issue: Browser runs only on Apple Silicon Macs.
 
+### Fixed
+
+- The installer accepts a home or data folder under `/tmp` (on macOS
+  `/private/tmp`). It refused it and advised `sudo chmod go-w /private/tmp`,
+  which would break the system. For a system folder others can write, the
+  installer now tells you to install under your own home instead.
+- On Ubuntu, the installer no longer refuses `~/.local/bin`, `~/.local/share`
+  or the data folder when your own private group can write them, as the
+  default umask 0002 leaves them. A folder another group or everyone can
+  write is still refused.
+
 ### Developer detail
 
 - A release names the Community network only when the approved source pins it
@@ -69,6 +80,17 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   CLI, the shell and the Browser VZ supervisor no longer do, so their bytes
   stay the same across releases when their code does not change (#194). The
   terminal Home shows the Runtime version it reads from the Runtime.
+- A root-owned folder with the sticky bit, such as `/tmp`, is accepted on the
+  data folder's path in the installer and the Runtime's media tool path check:
+  other users cannot rename or remove entries they do not own. Other
+  group- or world-writable root folders are refused without chmod advice.
+- One rule (`only_owner_can_write` in `scripts/install.sh` and
+  `install_transaction.rs`) decides the installer's folder and parent checks,
+  the Runtime install writer and the media tool path check. A group-writable
+  folder of yours is accepted only when its group is your primary group, the
+  group lists no other member and no other account uses it as primary group
+  (`getent`, or `dscacheutil` on macOS; libc in the Runtime). A group that
+  cannot be looked up is refused.
 - CI's `release-upstream-assets` job runs the release's upstream asset build
   (`scripts/release-upstream-assets.py`, including the Browser helper source
   builds) for Linux ARM64 and Apple Silicon on every pull request that changes

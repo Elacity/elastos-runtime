@@ -1106,6 +1106,119 @@ uninstall_installation() {
     fi
 }
 
+# Succeed only when group id $1 is the caller's user-private group, as Ubuntu
+# and Fedora create for each user: its record lists no member but the caller
+# and no other account has it as primary group. Fail when the group database
+# cannot be read.
+user_private_group() {
+    local gid="$1" me record members accounts others member
+    me="$(id -un)" || return 1
+    if command -v getent >/dev/null 2>&1; then
+        record="$(getent group "$gid")" || return 1
+        [[ "$record" == *:*:"$gid":* ]] || return 1
+        members="${record##*:}"
+        accounts="$(getent passwd)" || return 1
+        others="$(awk -F: -v g="$gid" -v me="$me" '$4 == g && $1 != me { print $1 }' <<<"$accounts")" || return 1
+    elif command -v dscacheutil >/dev/null 2>&1; then
+        record="$(dscacheutil -q group -a gid "$gid")" || return 1
+        [[ $'\n'"$record"$'\n' == *$'\ngid: '"$gid"$'\n'* ]] || return 1
+        members="$(awk '/^users:/ { $1 = ""; print }' <<<"$record")" || return 1
+        accounts="$(dscacheutil -q user)" || return 1
+        others="$(awk -v g="$gid" -v me="$me" '/^name:/ { n = $2 } /^gid:/ && $2 == g && n != me { print n }' <<<"$accounts")" || return 1
+    else
+        return 1
+    fi
+    [[ -z "$others" ]] || return 1
+    while read -r member; do
+        [[ -z "$member" || "$member" == "$me" ]] || return 1
+    done < <(tr ', ' '\n\n' <<<"$members")
+}
+
+# Succeed when only the owner can write a directory with octal mode $1 and
+# group id $2, for a caller with primary gid $3: no group or world write bit,
+# or only the group bit with the caller's user-private group, which has no
+# other members (umask 0002 makes ~/.local/share and ~/.local/bin so on
+# Ubuntu). The installation directory and parent checks share this rule.
+only_owner_can_write() {
+    local mode="$1" group="$2" gid="$3"
+    (( 8#$mode & 8#022 )) || return 0
+    (( !(8#$mode & 8#002) )) && [[ "$group" == "$gid" ]] && user_private_group "$group"
+}
+
+# Decide whether an existing ancestor of the data directory is safe, from its
+# owner uid, group id, octal mode and the caller's uid and primary gid. Prints
+# the refusal and fails, or prints nothing. Others must not be able to rename
+# or replace entries on the path: refuse ancestors owned by another user and
+# ones others can write (only_owner_can_write), except a root-owned sticky
+# directory such as /tmp, where others cannot rename or remove entries they do
+# not own. Never advise changing a root-owned directory: that would change the
+# system for every user.
+parent_dir_refusal() {
+    local owner="$1" group="$2" mode="$3" uid="$4" gid="$5" quoted="$6"
+    if [[ "$owner" != 0 && "$owner" != "$uid" ]]; then
+        printf '%s\n' "Unsafe parent directory: $quoted is not owned by you; fix with: sudo chown \"\$(id -u)\" $quoted"
+        return 1
+    fi
+    if [[ "$owner" == 0 ]]; then
+        (( !(8#$mode & 8#022) || (8#$mode & 8#1000) )) && return 0
+        printf '%s\n' "Unsafe parent directory: $quoted is owned by root and others can write to it; install under your own home directory instead (set HOME or XDG_DATA_HOME to a directory you own)"
+        return 1
+    fi
+    only_owner_can_write "$mode" "$group" "$gid" && return 0
+    printf '%s\n' "Unsafe parent directory: $quoted is group- or world-writable; fix with: chmod go-w $quoted"
+    return 1
+}
+
+# Decide whether an existing installation or data directory is safe, with the
+# arguments of parent_dir_refusal: owned by you and only_owner_can_write.
+existing_dir_refusal() {
+    local owner="$1" group="$2" mode="$3" uid="$4" gid="$5" quoted="$6"
+    if [[ "$owner" != "$uid" ]]; then
+        printf '%s\n' "Unsafe installation directory: $quoted is not owned by you; fix with: sudo chown \"\$(id -u)\" $quoted"
+        return 1
+    fi
+    only_owner_can_write "$mode" "$group" "$gid" && return 0
+    printf '%s\n' "Unsafe installation directory: $quoted is group- or world-writable; fix with: chmod go-w $quoted"
+    return 1
+}
+
+dir_owner_group_mode() {
+    # GNU stat -f reports the filesystem, so pick the syntax by what works.
+    # Both print the mode in octal with its sticky bit.
+    if stat -c '%u %g %a' / >/dev/null 2>&1; then
+        stat -c '%u %g %a' -- "$1"
+    else
+        stat -f '%u %g %Mp%Lp' -- "$1"
+    fi
+}
+
+# The installation writer refuses directories others can write. Check the real
+# directory, as the writer does after resolving symlinks; say how to fix it and
+# leave it unchanged.
+require_safe_existing_dir() {
+    local dir="$1" real owner group mode refusal
+    [[ -e "$dir" || -L "$dir" ]] || return 0
+    [[ -d "$dir" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
+    real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve installation directory: $(printf '%q' "$dir")"
+    read -r owner group mode < <(dir_owner_group_mode "$real") || die_exact "Cannot inspect directory: $(printf '%q' "$real")"
+    refusal="$(existing_dir_refusal "$owner" "$group" "$mode" "$(id -u)" "$(id -g)" "$(printf '%q' "$real")")" || die_exact "$refusal"
+}
+
+# The runtime also refuses media tools under a parent others can write, such
+# as a group-writable ~/.local. Apply that rule (parent_dir_refusal) to every
+# existing ancestor of the data directory now, before any download.
+require_safe_parent_chain() {
+    local dir="$1" real owner group mode refusal
+    while [[ ! -e "$dir" && "$dir" != "/" ]]; do dir="$(dirname -- "$dir")"; done
+    real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve directory: $(printf '%q' "$dir")"
+    while :; do
+        read -r owner group mode < <(dir_owner_group_mode "$real") || die_exact "Cannot inspect directory: $(printf '%q' "$real")"
+        refusal="$(parent_dir_refusal "$owner" "$group" "$mode" "$(id -u)" "$(id -g)" "$(printf '%q' "$real")")" || die_exact "$refusal"
+        [[ "$real" != "/" ]] || break
+        real="$(dirname -- "$real")"
+    done
+}
+
 # ── Main ──────────────────────────────────────────────────────────────
 
 # Every action runs inside main, called on the last line, so `curl | bash`
@@ -1216,51 +1329,6 @@ fi
 
 [[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="${PWD}/${INSTALL_DIR}"
 
-# The installation writer refuses directories others can write. Check the real
-# directory, as the writer does after resolving symlinks; say how to fix it and
-# leave it unchanged.
-require_safe_existing_dir() {
-    local dir="$1" real
-    [[ -e "$dir" || -L "$dir" ]] || return 0
-    [[ -d "$dir" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
-    real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve installation directory: $(printf '%q' "$dir")"
-    [[ -O "$real" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$real") is not owned by you; fix with: sudo chown \"\$(id -u)\" $(printf '%q' "$real")"
-    if [[ -n "$(find "$real" -maxdepth 0 \( -perm -g+w -o -perm -o+w \))" ]]; then
-        die_exact "Unsafe installation directory: $(printf '%q' "$real") is group- or world-writable; fix with: chmod go-w $(printf '%q' "$real")"
-    fi
-}
-# The runtime also refuses media tools under a parent others can write, such
-# as a group-writable ~/.local. Apply that rule to every existing ancestor of
-# the data directory now, before any download: owned by you or root, and not
-# group- or world-writable.
-dir_owner_mode() {
-    # GNU stat -f reports the filesystem, so pick the syntax by what works.
-    if stat -c '%u %a' / >/dev/null 2>&1; then
-        stat -c '%u %a' -- "$1"
-    else
-        stat -f '%u %Lp' -- "$1"
-    fi
-}
-require_safe_parent_chain() {
-    local dir="$1" real owner mode quoted
-    while [[ ! -e "$dir" && "$dir" != "/" ]]; do dir="$(dirname -- "$dir")"; done
-    real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve directory: $(printf '%q' "$dir")"
-    while :; do
-        read -r owner mode < <(dir_owner_mode "$real") || die_exact "Cannot inspect directory: $(printf '%q' "$real")"
-        quoted="$(printf '%q' "$real")"
-        if [[ "$owner" != 0 && "$owner" != "$(id -u)" ]]; then
-            die_exact "Unsafe parent directory: $quoted is not owned by you; fix with: sudo chown \"\$(id -u)\" $quoted"
-        fi
-        if (( 8#$mode & 8#022 )); then
-            if [[ "$owner" == 0 && "$(id -u)" != 0 ]]; then
-                die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: sudo chmod go-w $quoted"
-            fi
-            die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: chmod go-w $quoted"
-        fi
-        [[ "$real" != "/" ]] || break
-        real="$(dirname -- "$real")"
-    done
-}
 require_safe_existing_dir "$INSTALL_DIR"
 require_safe_existing_dir "$DATA_DIR"
 require_safe_parent_chain "$DATA_DIR"
