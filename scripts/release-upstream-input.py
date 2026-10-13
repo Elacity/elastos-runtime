@@ -188,6 +188,10 @@ def copy_into(stream, output, algorithm, maximum):
                 raise ValueError("upstream input exceeds its recorded size bound")
             value.update(chunk)
             output.write(chunk)
+    declared = getattr(stream, "headers", {}).get("Content-Length")
+    if declared is not None and size < int(declared):
+        # HTTPResponse.read(n) can return EOF short of Content-Length without raising.
+        raise http.client.IncompleteRead(b"", int(declared) - size)
     output.flush()
     os.fsync(output.fileno())
     return value, size

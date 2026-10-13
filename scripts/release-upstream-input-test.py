@@ -328,6 +328,36 @@ class UpstreamTest(unittest.TestCase):
                     self.assertEqual([call.args[0] for call in sleep.call_args_list], [2])
                 self.assertEqual([p.name for p in self.cache.iterdir()], [path.name])
 
+    def http_reply(self, body, declared):
+        """A real http.client.HTTPResponse over an in-memory socket."""
+        class Socket:
+            def makefile(inner, mode):
+                return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % declared + body)
+        reply = upstream.http.client.HTTPResponse(Socket())
+        reply.begin()
+        return reply
+
+    def test_body_short_of_content_length_is_retried_and_full_wrong_body_is_not(self):
+        data = b"payload bytes"
+        source = {"url": "https://upstream.example.test/input", "checksum": "sha256:" + hashlib.sha256(data).hexdigest(), "max_bytes": 32}
+        with patch.object(upstream.urllib.request, "build_opener") as build, \
+                patch.object(upstream.time, "sleep") as sleep:
+            build.return_value.open.side_effect = [self.http_reply(data[:7], len(data)), self.http_reply(data, len(data))]
+            self.assertEqual(upstream.cached_input(source, self.cache).read_bytes(), data)
+            self.assertEqual(build.return_value.open.call_count, 2)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [2])
+        for path in self.cache.glob("*"):
+            path.unlink()
+        with patch.object(upstream.urllib.request, "build_opener") as build, \
+                patch.object(upstream.time, "sleep") as sleep:
+            wrong = b"tampered byte"
+            build.return_value.open.side_effect = [self.http_reply(wrong, len(wrong)), self.http_reply(data, len(data))]
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                upstream.cached_input(source, self.cache)
+            self.assertEqual(build.return_value.open.call_count, 1)
+            sleep.assert_not_called()
+        self.assertEqual(list(self.cache.iterdir()), [])
+
     def test_repeated_body_failures_give_up_and_checksum_mismatch_is_not_retried(self):
         data = b"payload bytes"
         source = {"url": "https://upstream.example.test/input", "checksum": "sha256:" + hashlib.sha256(data).hexdigest(), "max_bytes": 32}
