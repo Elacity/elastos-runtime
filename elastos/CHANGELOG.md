@@ -16,13 +16,15 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   world-writable root directories are still refused, and the message now says
   to install under your own home instead of advising a change to a system
   directory. The Runtime's media tool path check follows the same rule.
-- The installer accepts a data directory under a folder of yours that only
-  your own user-private group can also write, as Ubuntu's default umask 0002
-  leaves `~/.local/share`. It refused a fresh Ubuntu account with "fix with:
+- The installer and the Runtime accept an installation folder, data folder
+  or data-folder parent of yours that only your own user-private group can
+  also write, as Ubuntu's default umask 0002 leaves `~/.local/bin` and
+  `~/.local/share`. They refused a fresh Ubuntu account with "fix with:
   chmod go-w". The group must be your primary group with no other members
   and no other account using it as primary group; a shared group, a group
-  that cannot be looked up, or a world-writable folder is still refused. The
-  Runtime's media tool path check follows the same rule.
+  that cannot be looked up, or a world-writable folder is still refused. One
+  rule (`only_owner_can_write`) serves the folder and parent checks in the
+  installer and in the Runtime's install writer and media tool path check.
 
 ### Developer detail
 

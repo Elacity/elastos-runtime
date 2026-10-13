@@ -1370,6 +1370,129 @@ pub(crate) fn shell_quote_path(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
+/// Whether only the owner can write a directory with `mode` and `group`, for a
+/// caller with primary gid `gid`, as `only_owner_can_write` in
+/// scripts/install.sh: no group or world write bit, or only the group bit with
+/// the caller's user-private group (`private_group` decides), which has no other
+/// members (umask 0002 makes ~/.local/share and ~/.local/bin so on Ubuntu). The
+/// installation directory and media parent checks share this rule.
+pub(crate) fn only_owner_can_write(
+    mode: u32,
+    group: u32,
+    gid: u32,
+    private_group: impl FnOnce(u32) -> bool,
+) -> bool {
+    mode & 0o022 == 0 || (mode & 0o002 == 0 && group == gid && private_group(group))
+}
+
+/// Whether `gid` is the user-private group of account `uid`, as Ubuntu and
+/// Fedora create for each user: its record lists no member but that account
+/// and no other account has it as primary group. False when the account or
+/// group database cannot be read.
+pub(crate) fn user_private_group(gid: libc::gid_t, uid: libc::uid_t) -> bool {
+    use std::ffi::{CStr, CString};
+    // Account and group records are small; one that needs more is refused.
+    const MAX_RECORD: usize = 1 << 20;
+    // getpwent walks process-wide state; one walk at a time in this process.
+    static ACCOUNTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    let mut buffer = vec![0 as libc::c_char; 4096];
+    let me: CString = loop {
+        let mut record: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut record,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        if rc == libc::ERANGE && buffer.len() < MAX_RECORD {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() {
+            return false;
+        }
+        break unsafe { CStr::from_ptr(record.pw_name) }.to_owned();
+    };
+    loop {
+        let mut record: libc::group = unsafe { std::mem::zeroed() };
+        let mut found = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getgrgid_r(
+                gid,
+                &mut record,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        if rc == libc::ERANGE && buffer.len() < MAX_RECORD {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() || record.gr_mem.is_null() {
+            return false;
+        }
+        let mut member = record.gr_mem;
+        while !unsafe { *member }.is_null() {
+            if unsafe { CStr::from_ptr(*member) } != me.as_c_str() {
+                return false;
+            }
+            member = unsafe { member.add(1) };
+        }
+        break;
+    }
+    let _walk = ACCOUNTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut private = true;
+    unsafe { libc::setpwent() };
+    loop {
+        let account = unsafe { libc::getpwent() };
+        if account.is_null() {
+            break;
+        }
+        let account = unsafe { &*account };
+        if account.pw_gid == gid && unsafe { CStr::from_ptr(account.pw_name) } != me.as_c_str() {
+            private = false;
+            break;
+        }
+    }
+    unsafe { libc::endpwent() };
+    private
+}
+
+/// Decide whether an existing installation directory is safe from its owner,
+/// group, mode and the caller's uid and primary gid, as `existing_dir_refusal`
+/// in scripts/install.sh does: owned by you and `only_owner_can_write`.
+fn installation_dir_refusal(
+    owner: u32,
+    group: u32,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    private_group: impl FnOnce(u32) -> bool,
+    path: &Path,
+) -> Option<String> {
+    let quoted = shell_quote_path(path);
+    let shown = path.display();
+    if owner != uid {
+        return Some(format!(
+            "{shown} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}"
+        ));
+    }
+    if only_owner_can_write(mode, group, gid, private_group) {
+        return None;
+    }
+    Some(format!(
+        "{shown} is group- or world-writable; fix with: chmod go-w {quoted}"
+    ))
+}
+
 fn check_directory(path: &Path) -> anyhow::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() {
@@ -1378,18 +1501,17 @@ fn check_directory(path: &Path) -> anyhow::Result<()> {
             path.display()
         );
     }
-    let quoted = shell_quote_path(path);
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "installation directory is unsafe: {} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}",
-            path.display()
-        );
-    }
-    if metadata.mode() & 0o022 != 0 {
-        bail!(
-            "installation directory is unsafe: {} is group- or world-writable; fix with: chmod go-w {quoted}",
-            path.display()
-        );
+    let uid = unsafe { libc::geteuid() };
+    if let Some(refusal) = installation_dir_refusal(
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode(),
+        uid,
+        unsafe { libc::getegid() },
+        |group| user_private_group(group, uid),
+        path,
+    ) {
+        bail!("installation directory is unsafe: {refusal}");
     }
     Ok(())
 }
@@ -2674,7 +2796,9 @@ pub(crate) mod tests {
         assert!(InstallationGuard::acquire(Path::new(".")).is_err());
         let file = fixture.data.join("owner-data");
         assert!(InstallationGuard::acquire(&file).is_err());
-        for mode in [0o770, 0o707] {
+        // Group-only write depends on the account database
+        // (installation_dir_refusal_accepts_only_your_private_group).
+        for mode in [0o777, 0o707] {
             fs::set_permissions(parent, fs::Permissions::from_mode(mode)).unwrap();
             assert!(InstallationGuard::acquire(parent).is_err());
             assert!(!parent.join(INSTALL_LOCK).exists());
@@ -2688,9 +2812,9 @@ pub(crate) mod tests {
         let fixture = Fixture::new();
         let dir = fixture._root.path().join("it's a \"bin\" $dir");
         fs::create_dir(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
         let error = InstallationGuard::acquire(&dir).err().unwrap().to_string();
-        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o775);
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o777);
         let command = error.split_once("fix with: ").expect(&error).1;
         let status = std::process::Command::new("sh")
             .args(["-c", command])
@@ -2699,6 +2823,83 @@ pub(crate) mod tests {
         assert!(status.success(), "{command}");
         assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o755);
         assert!(InstallationGuard::acquire(&dir).is_ok());
+    }
+
+    #[test]
+    fn installation_dir_refusal_accepts_only_your_private_group() {
+        let path = Path::new("/home/me/.local/bin");
+        let (me, my_group, other_group) = (1000, 1000, 27);
+        let refusal = |owner, group, mode, private| {
+            installation_dir_refusal(
+                owner,
+                group,
+                mode,
+                me,
+                my_group,
+                |asked| {
+                    assert_eq!(asked, my_group);
+                    private
+                },
+                path,
+            )
+        };
+        assert_eq!(refusal(me, my_group, 0o40755, false), None);
+        assert_eq!(refusal(me, my_group, 0o40775, true), None);
+        assert_eq!(refusal(me, my_group, 0o42770, true), None);
+        let fix = "fix with: chmod go-w '/home/me/.local/bin'";
+        for (group, mode, private) in [
+            (my_group, 0o40775, false),
+            (other_group, 0o40775, true),
+            (my_group, 0o40777, true),
+            (my_group, 0o40757, true),
+        ] {
+            let refused = refusal(me, group, mode, private).unwrap();
+            assert!(
+                refused.contains(fix),
+                "{group} {mode:o} {private}: {refused}"
+            );
+        }
+        let root = refusal(0, 0, 0o40755, true).unwrap();
+        assert!(root.contains("not owned by you"), "{root}");
+    }
+
+    #[test]
+    fn user_private_group_refuses_unknown_and_shared_groups() {
+        let uid = unsafe { libc::geteuid() };
+        assert!(!user_private_group(0x7fff_fff0, uid));
+        if uid != 0 {
+            // Group 0 is root's primary group on Linux and macOS.
+            assert!(!user_private_group(0, uid));
+        }
+    }
+
+    /// The account database answer for this process matches what `getent`
+    /// (the installer's lookup) reports. Hosts without getent (macOS) skip it.
+    #[test]
+    fn user_private_group_agrees_with_getent() {
+        let getent = |args: &[&str]| {
+            std::process::Command::new("getent")
+                .args(args)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8(output.stdout).unwrap())
+        };
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let Some(me) = getent(&["passwd", &uid.to_string()]) else {
+            return;
+        };
+        let me = me.split(':').next().unwrap().to_owned();
+        let group = getent(&["group", &gid.to_string()]).unwrap();
+        let members = group.trim_end().rsplit(':').next().unwrap();
+        let accounts = getent(&["passwd"]).unwrap();
+        let private = members.split(',').all(|m| m.is_empty() || m == me)
+            && accounts.lines().all(|line| {
+                let fields: Vec<&str> = line.split(':').collect();
+                fields.get(3) != Some(&gid.to_string().as_str()) || fields[0] == me
+            });
+        assert_eq!(user_private_group(gid, uid), private, "{group} {me}");
+        eprintln!("user_private_group({gid}) for {me}: {private}");
     }
 
     #[test]

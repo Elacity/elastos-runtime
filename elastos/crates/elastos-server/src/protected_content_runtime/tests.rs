@@ -3795,18 +3795,6 @@ fn media_parent_accepts_root_sticky_and_your_private_group_only() {
 }
 
 #[cfg(unix)]
-#[test]
-fn user_private_group_refuses_unknown_and_shared_groups() {
-    use super::user_private_group;
-    let uid = unsafe { libc::geteuid() };
-    assert!(!user_private_group(0x7fff_fff0, uid));
-    if uid != 0 {
-        // Group 0 is root's primary group on Linux and macOS.
-        assert!(!user_private_group(0, uid));
-    }
-}
-
-#[cfg(unix)]
 fn safe_ancestor_tempdir() -> tempfile::TempDir {
     // The media prerequisite import walks every ancestor of the source tool
     // path and rejects group/world-writable directories other than root-owned

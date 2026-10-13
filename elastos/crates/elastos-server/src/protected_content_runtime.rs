@@ -2050,12 +2050,12 @@ fn open_runtime_media_tool(
 
 /// Decide whether a directory on a media tool's path is safe from its owner,
 /// group, mode and the caller's uid and primary gid, as `parent_dir_refusal` in
-/// scripts/install.sh does. Refuse directories owned by another user and
-/// group- or world-writable ones, except a root-owned sticky directory such as
-/// /tmp, where others cannot rename or remove entries they do not own, and a
-/// directory of yours writable only by your own user-private group
-/// (`private_group` decides), which has no other members. Never advise changing
-/// a root-owned directory: that would change the system for every user.
+/// scripts/install.sh does. Refuse directories owned by another user and ones
+/// others can write (`only_owner_can_write`; `private_group` decides whether a
+/// group is the caller's user-private group), except a root-owned sticky
+/// directory such as /tmp, where others cannot rename or remove entries they do
+/// not own. Never advise changing a root-owned directory: that would change the
+/// system for every user.
 #[cfg(unix)]
 fn media_parent_refusal(
     owner: u32,
@@ -2073,105 +2073,20 @@ fn media_parent_refusal(
             "{shown} is not owned by you; fix with: sudo chown \"$(id -u)\" {quoted}"
         ));
     }
-    if mode & 0o022 == 0 {
-        return None;
-    }
     if owner == 0 {
-        if mode & 0o1000 != 0 {
+        if mode & 0o022 == 0 || mode & 0o1000 != 0 {
             return None;
         }
         return Some(format!(
             "{shown} is owned by root and others can write to it; keep the tools under your own home directory instead"
         ));
     }
-    if mode & 0o002 == 0 && group == gid && private_group(group) {
+    if crate::install_transaction::only_owner_can_write(mode, group, gid, private_group) {
         return None;
     }
     Some(format!(
         "{shown} is group- or world-writable; fix with: chmod go-w {quoted}"
     ))
-}
-
-/// Whether `gid` is the user-private group of account `uid`, as Ubuntu and
-/// Fedora create for each user: its record lists no member but that account
-/// and no other account has it as primary group. False when the account or
-/// group database cannot be read.
-#[cfg(unix)]
-fn user_private_group(gid: libc::gid_t, uid: libc::uid_t) -> bool {
-    use std::ffi::{CStr, CString};
-    // Account and group records are small; one that needs more is refused.
-    const MAX_RECORD: usize = 1 << 20;
-    // getpwent walks process-wide state; one walk at a time in this process.
-    static ACCOUNTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    let mut buffer = vec![0 as libc::c_char; 4096];
-    let me: CString = loop {
-        let mut record: libc::passwd = unsafe { std::mem::zeroed() };
-        let mut found = std::ptr::null_mut();
-        let rc = unsafe {
-            libc::getpwuid_r(
-                uid,
-                &mut record,
-                buffer.as_mut_ptr(),
-                buffer.len(),
-                &mut found,
-            )
-        };
-        if rc == libc::ERANGE && buffer.len() < MAX_RECORD {
-            buffer.resize(buffer.len() * 2, 0);
-            continue;
-        }
-        if rc != 0 || found.is_null() {
-            return false;
-        }
-        break unsafe { CStr::from_ptr(record.pw_name) }.to_owned();
-    };
-    loop {
-        let mut record: libc::group = unsafe { std::mem::zeroed() };
-        let mut found = std::ptr::null_mut();
-        let rc = unsafe {
-            libc::getgrgid_r(
-                gid,
-                &mut record,
-                buffer.as_mut_ptr(),
-                buffer.len(),
-                &mut found,
-            )
-        };
-        if rc == libc::ERANGE && buffer.len() < MAX_RECORD {
-            buffer.resize(buffer.len() * 2, 0);
-            continue;
-        }
-        if rc != 0 || found.is_null() || record.gr_mem.is_null() {
-            return false;
-        }
-        let mut member = record.gr_mem;
-        while !unsafe { *member }.is_null() {
-            if unsafe { CStr::from_ptr(*member) } != me.as_c_str() {
-                return false;
-            }
-            member = unsafe { member.add(1) };
-        }
-        break;
-    }
-    let _walk = ACCOUNTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut private = true;
-    unsafe { libc::setpwent() };
-    loop {
-        let account = unsafe { libc::getpwent() };
-        if account.is_null() {
-            break;
-        }
-        let account = unsafe { &*account };
-        if account.pw_gid == gid && unsafe { CStr::from_ptr(account.pw_name) } != me.as_c_str() {
-            private = false;
-            break;
-        }
-    }
-    unsafe { libc::endpwent() };
-    private
 }
 
 /// Open an absolute source path one directory at a time with `openat` and
@@ -2211,7 +2126,7 @@ fn open_media_source_no_links(literal: &Path, name: &str) -> anyhow::Result<fs::
             metadata.permissions().mode(),
             uid,
             gid,
-            |group| user_private_group(group, uid),
+            |group| crate::install_transaction::user_private_group(group, uid),
             display,
         ) {
             return Err(invalid_media_provider_config(format!(
