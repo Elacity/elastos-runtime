@@ -19,4 +19,4 @@ Later People/Services separation and IRC packaging remain follow-up work. The [s
 
 ## Other future work
 
-The snapshot also preserves Browser expansion, Component/Bus, WebSpace, storage markets, documents, Inbox, operator hardening and long-term proposals. None has an active target lease from this index. The 0.7.1 release plan remains the authority for any item it marks Required.
+The snapshot also preserves Browser expansion, Component/Bus, WebSpace, storage markets, documents, Inbox, operator hardening and long-term proposals. None has an active target lease from this index. The current GitHub milestone and each owning issue define the required scope.

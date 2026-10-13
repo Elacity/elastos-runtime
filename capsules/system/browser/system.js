@@ -18,6 +18,10 @@ const overlayStatusNode = document.querySelector('[data-field="overlay-status"]'
 const settingsSearchInput = document.querySelector("#settings-search");
 const guestRegistrationInput = document.querySelector("#guest-registration");
 const guestRegistrationStatusNode = document.querySelector('[data-field="guest-registration-status"]');
+const communitySection = document.querySelector("#community-membership");
+const communityButton = document.querySelector("#community-toggle");
+let communityMembership = null;
+let communityBusy = false;
 const themeSegment = document.querySelector("#theme-segment");
 const accentPickerNode = document.querySelector("#accent-picker");
 const accentCustomPopover = document.querySelector("#accent-custom-popover");
@@ -190,6 +194,7 @@ async function boot() {
   configureAppearanceEditor();
   configureAppearancePreferences();
   configureGuestAccess();
+  configureCommunityMembership();
   configureAiProvider();
   configurePasskeyAccess();
   configureRecoveryAccess();
@@ -369,7 +374,10 @@ async function refreshSystemSummary() {
   if (systemSummaryInFlight) return systemSummaryInFlight;
   systemSummaryInFlight = (async () => {
     const systemSummary = await fetchRuntimeUpdateJson({ headers: shellHeaders() });
-    if (runtimeUpdateActive) renderSystemSummary(systemSummary);
+    if (runtimeUpdateActive) {
+      renderSystemSummary(systemSummary);
+      await refreshCommunityMembership();
+    }
   })();
   try { await systemSummaryInFlight; }
   finally { systemSummaryInFlight = null; }
@@ -675,6 +683,60 @@ function configureGuestAccess() {
   guestRegistrationInput.disabled = !hasShellAccess();
   if (hasShellAccess()) {
     guestRegistrationInput.addEventListener("change", onGuestRegistrationChange);
+  }
+}
+
+function configureCommunityMembership() {
+  if (communityButton) communityButton.addEventListener("click", updateCommunityMembership);
+}
+
+function renderCommunityMembership(membership) {
+  if (!membership || membership.schema !== "elastos.community-membership/v1"
+      || typeof membership.configured !== "boolean" || typeof membership.joined !== "boolean") {
+    throw new Error("Community setting is unavailable.");
+  }
+  communityMembership = membership;
+  if (communitySection) communitySection.hidden = !membership.configured;
+  setTextFields("community-detail", readText(membership.detail));
+  if (communityButton) {
+    communityButton.textContent = membership.joined ? "Leave Community" : "Rejoin Community";
+    communityButton.disabled = communityBusy || !membership.configured
+      || currentAccess.role !== "admin" || !hasShellAccess();
+  }
+}
+
+async function refreshCommunityMembership() {
+  if (communityBusy) return;
+  try {
+    renderCommunityMembership(await fetchRuntimeUpdateJson({ headers: shellHeaders() }, "/api/apps/system/community"));
+    setHiddenFields("community-status", true);
+  } catch (error) {
+    if (communityButton) communityButton.disabled = true;
+    setTextFields("community-status", publicSystemError(error, "Community setting is unavailable."));
+    setHiddenFields("community-status", false);
+  }
+}
+
+async function updateCommunityMembership() {
+  if (communityBusy || !communityMembership?.configured || currentAccess.role !== "admin" || !hasShellAccess()) return;
+  communityBusy = true;
+  renderCommunityMembership(communityMembership);
+  setHiddenFields("community-status", true);
+  try {
+    const membership = await fetchRuntimeUpdateJson({
+      method: "POST",
+      headers: shellHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ joined: !communityMembership.joined }),
+    }, "/api/apps/system/community");
+    renderCommunityMembership(membership);
+    setTextFields("community-status", membership.joined ? "Community rejoined. Discovery uses its saved preference." : "Community and Discovery stopped on this Home.");
+    setHiddenFields("community-status", false);
+  } catch (error) {
+    setTextFields("community-status", publicSystemError(error, "Community setting could not be changed."));
+    setHiddenFields("community-status", false);
+  } finally {
+    communityBusy = false;
+    renderCommunityMembership(communityMembership);
   }
 }
 
@@ -3864,12 +3926,12 @@ async function pollRuntimeUpdate() {
   scheduleRuntimeUpdateRefresh();
 }
 
-async function fetchRuntimeUpdateJson(init) {
+async function fetchRuntimeUpdateJson(init, url = "/api/apps/system/summary") {
   const abort = new AbortController();
   runtimeUpdateRequests.add(abort);
   // Carrier admission includes connection, signed metadata checks and transport drain.
-  const timeout = window.setTimeout(() => abort.abort(), init.method === "POST" ? 60_000 : 10_000);
-  try { return await fetchJson("/api/apps/system/summary", { ...init, signal: abort.signal }); }
+  const timeout = window.setTimeout(() => abort.abort(), url === "/api/apps/system/summary" && init.method === "POST" ? 60_000 : 10_000);
+  try { return await fetchJson(url, { ...init, signal: abort.signal }); }
   finally {
     window.clearTimeout(timeout);
     runtimeUpdateRequests.delete(abort);

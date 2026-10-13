@@ -2836,6 +2836,32 @@ for (const [target, entry] of consumerEntries) {
   assert(!shellWindows.acceptHomeNavigation(entry, { ...report, query: {} }), "Changed actor accepted an existing binding");
   entry.targetId = oldTarget;
   assert(JSON.stringify(entry.launchQuery) === before, "Wrong actor/effect altered selector");
+
+  const sessionSaves = () => savedStatePatches.filter((patch) => Object.hasOwn(patch, "session")).length;
+  const settledQuery = { ...entry.launchQuery };
+  const savesBeforeRefresh = sessionSaves();
+  for (let refresh = 0; refresh < 8; refresh += 1) {
+    const hint = { ...report, sequence: record.sequence + 1, query: settledQuery };
+    assert(shellWindows.acceptHomeNavigation(entry, hint), `${target} rejected a fresh unchanged selection`);
+    assert(record.sequence === hint.sequence, `${target} did not advance its navigation guard`);
+    assert(!shellWindows.acceptHomeNavigation(entry, hint), `${target} accepted a replay after an unchanged selection`);
+  }
+  assert(sessionSaves() === savesBeforeRefresh, `${target} saved Home state for an unchanged selection`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: null }),
+    `${target} rejected a loading document hint`);
+  assert(JSON.stringify(entry.launchQuery) === before && sessionSaves() === savesBeforeRefresh,
+    `${target} changed settled selection while loading`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: {} }),
+    `${target} rejected an explicit selection clear`);
+  assert(sessionSaves() === savesBeforeRefresh + 1 && Object.keys(entry.launchQuery).length === 0,
+    `${target} did not persist its selection clear exactly once`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: {} }),
+    `${target} rejected a fresh empty selection`);
+  assert(sessionSaves() === savesBeforeRefresh + 1, `${target} saved the same empty selection twice`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: settledQuery }),
+    `${target} rejected its next settled selection`);
+  assert(sessionSaves() === savesBeforeRefresh + 2 && JSON.stringify(entry.launchQuery) === before,
+    `${target} did not persist its changed selection exactly once`);
 }
 await openHybrid("library", { query: { mode: "attach", returnTarget: "chat-room" } });
 const pickerEntry = [...shellCore.shellState.windows.values()].at(-1);

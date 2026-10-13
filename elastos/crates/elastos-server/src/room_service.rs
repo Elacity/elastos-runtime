@@ -82,6 +82,10 @@ pub struct RoomSummary {
     pub browser_access_block_reason: Option<String>,
     #[serde(default)]
     pub transport: RoomTransportView,
+    /// Sequence number of the newest room object, so Home can signal new
+    /// messages without reading them.
+    #[serde(default)]
+    pub latest_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +166,24 @@ pub struct ConversationObjectView {
     #[serde(default)]
     pub attachment: Option<AttachmentView>,
     pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_state: Option<CommunityDeliveryState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommunityDeliveryState {
+    Sending,
+    /// A verified remote receipt exists; other participants may still be pending.
+    Accepted,
+    Expired,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunityDeliveryView {
+    pub seq: u64,
+    pub state: CommunityDeliveryState,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +347,14 @@ pub struct RoomPollView {
     pub objects: Vec<ConversationObjectView>,
     #[serde(default)]
     pub transport: RoomTransportView,
+    #[serde(default)]
+    pub own_delivery: Vec<CommunityDeliveryView>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoomHistoryView {
+    pub status: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -333,8 +363,12 @@ pub struct RoomTransportView {
     pub configured: bool,
     #[serde(default)]
     pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community_joined: Option<bool>,
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<RoomHistoryView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -765,6 +799,8 @@ struct ConversationObjectRecord {
     #[serde(default)]
     attachment: Option<AttachmentView>,
     created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_state: Option<CommunityDeliveryState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -870,6 +906,7 @@ pub fn load_summary(data_dir: &Path) -> anyhow::Result<RoomSummary> {
             browser_access_allowed: true,
             browser_access_block_reason: None,
             transport: RoomTransportView::default(),
+            latest_seq: state.next_seq.saturating_sub(1),
         })
     })
 }
@@ -2751,6 +2788,7 @@ pub fn room_poll(data_dir: &Path, token: &str, since: u64) -> anyhow::Result<Roo
             .map(|item| object_view_from_record(item, Some(&current_session)))
             .collect::<Vec<_>>();
         Ok(RoomPollView {
+            own_delivery: Vec::new(),
             room_slug,
             display_name,
             expires_at,
@@ -2791,6 +2829,7 @@ pub fn append_object_with_transport(
         let object = push_object(
             state,
             ConversationObjectRecord {
+                delivery_state: None,
                 seq: 0,
                 event_id: new_object_event_id(),
                 collaboration_scope: None,
@@ -2815,6 +2854,15 @@ pub fn append_object_with_transport(
     })
 }
 
+/// Product direction is durable; the local session supplies only UI attribution.
+pub(crate) enum CollaborationTextOrigin<'a> {
+    Incoming,
+    Outgoing {
+        local_session_token: Option<&'a str>,
+    },
+}
+
+/// Outgoing rows keep delivery state independently of a local Chat session.
 pub(crate) fn project_collaboration_text(
     data_dir: &Path,
     scope: (&str, &str),
@@ -2822,27 +2870,22 @@ pub(crate) fn project_collaboration_text(
     sender_profile: &RoomProfileCardView,
     body: &str,
     issued_at: u64,
-    local_session_token: Option<&str>,
+    origin: CollaborationTextOrigin<'_>,
 ) -> anyhow::Result<ConversationObjectView> {
-    let scope = collaboration_object_scope(scope.0, scope.1)?;
-    let event_id = normalize_collaboration_envelope_sha256(envelope_sha256)?;
-    let sender_member_did = normalize_member_did(&sender_profile.profile_id)?;
-    if sender_profile.profile_id != sender_member_did {
-        anyhow::bail!("collaboration sender Profile DID is not canonical");
-    }
-    let sender = normalize_display_name(&sender_profile.display_name)?;
-    let sender_profile = RoomProfileCardView {
-        schema: sender_profile.schema.clone(),
-        profile_id: sender_member_did.clone(),
-        display_name: sender.clone(),
-        handle: sender_profile.handle.clone(),
-        updated_at: sender_profile.updated_at,
+    let (outgoing, local_session_token) = match origin {
+        CollaborationTextOrigin::Incoming => (false, None),
+        CollaborationTextOrigin::Outgoing {
+            local_session_token,
+        } => (true, local_session_token),
     };
-    let normalized_body = normalize_object_body(body)?;
-    if normalized_body != body {
-        anyhow::bail!("collaboration Chat body is not canonical");
-    }
-    let body = normalized_body;
+    let CollaborationTextProjection {
+        scope,
+        event_id,
+        sender_member_did,
+        sender,
+        sender_profile,
+        body,
+    } = collaboration_text_projection(scope, envelope_sha256, sender_profile, body)?;
     with_locked_state(data_dir, |_, state| {
         let current_session = match local_session_token {
             Some(token) => {
@@ -2859,9 +2902,8 @@ pub(crate) fn project_collaboration_text(
 
         if let Some(existing) = state
             .objects
-            .iter()
+            .iter_mut()
             .find(|object| object.event_id == event_id)
-            .cloned()
         {
             if existing.collaboration_scope.as_ref() != Some(&scope)
                 || existing.sender != sender
@@ -2876,12 +2918,19 @@ pub(crate) fn project_collaboration_text(
             {
                 anyhow::bail!("collaboration projection event conflicts with stored Chat object");
             }
-            return Ok(object_view_from_record(existing, current_session.as_ref()));
+            if outgoing && existing.delivery_state.is_none() {
+                existing.delivery_state = Some(CommunityDeliveryState::Sending);
+            }
+            return Ok(object_view_from_record(
+                existing.clone(),
+                current_session.as_ref(),
+            ));
         }
 
         let object = push_object(
             state,
             ConversationObjectRecord {
+                delivery_state: outgoing.then_some(CommunityDeliveryState::Sending),
                 seq: 0,
                 event_id,
                 collaboration_scope: Some(scope),
@@ -2904,6 +2953,84 @@ pub(crate) fn project_collaboration_text(
     })
 }
 
+struct CollaborationTextProjection {
+    scope: CollaborationObjectScope,
+    event_id: String,
+    sender_member_did: String,
+    sender: String,
+    sender_profile: RoomProfileCardView,
+    body: String,
+}
+
+/// Admission and projection share every deterministic Room input check.
+pub(crate) fn validate_collaboration_text(
+    scope: (&str, &str),
+    envelope_sha256: &str,
+    sender_profile: &RoomProfileCardView,
+    body: &str,
+) -> anyhow::Result<()> {
+    collaboration_text_projection(scope, envelope_sha256, sender_profile, body).map(|_| ())
+}
+
+fn collaboration_text_projection(
+    scope: (&str, &str),
+    envelope_sha256: &str,
+    sender_profile: &RoomProfileCardView,
+    body: &str,
+) -> anyhow::Result<CollaborationTextProjection> {
+    let scope = collaboration_object_scope(scope.0, scope.1)?;
+    let event_id = normalize_collaboration_envelope_sha256(envelope_sha256)?;
+    let sender_member_did = normalize_member_did(&sender_profile.profile_id)?;
+    if sender_profile.profile_id != sender_member_did {
+        anyhow::bail!("collaboration sender Profile DID is not canonical");
+    }
+    let sender = normalize_display_name(&sender_profile.display_name)?;
+    let sender_profile = RoomProfileCardView {
+        schema: sender_profile.schema.clone(),
+        profile_id: sender_member_did.clone(),
+        display_name: sender.clone(),
+        handle: sender_profile.handle.clone(),
+        updated_at: sender_profile.updated_at,
+    };
+    let normalized_body = normalize_object_body(body)?;
+    if normalized_body != body {
+        anyhow::bail!("collaboration Chat body is not canonical");
+    }
+    Ok(CollaborationTextProjection {
+        scope,
+        event_id,
+        sender_member_did,
+        sender,
+        sender_profile,
+        body: normalized_body,
+    })
+}
+
+/// Internal metadata reads use the exact Runtime-owned collaboration scope
+/// and verified Profile attribution. They leave the account's read state alone.
+pub(crate) fn collaboration_latest_remote_message_seq(
+    data_dir: &Path,
+    network_id: &str,
+    conversation_id: &str,
+    reader_profile_did: &str,
+) -> anyhow::Result<u64> {
+    let scope = collaboration_object_scope(network_id, conversation_id)?;
+    let reader = normalize_member_did(reader_profile_did)?;
+    with_expired_read_state(data_dir, |state| {
+        Ok(state
+            .objects
+            .iter()
+            .filter(|item| {
+                item.collaboration_scope.as_ref() == Some(&scope)
+                    && item.sender_member_did.as_deref() != Some(reader.as_str())
+                    && verified_collaboration_sender_profile(item).is_some()
+            })
+            .map(|item| item.seq)
+            .max()
+            .unwrap_or(0))
+    })
+}
+
 pub(crate) fn collaboration_room_poll(
     data_dir: &Path,
     token: &str,
@@ -2912,37 +3039,178 @@ pub(crate) fn collaboration_room_poll(
     since: u64,
 ) -> anyhow::Result<RoomPollView> {
     let scope = collaboration_object_scope(network_id, conversation_id)?;
-    with_locked_state(data_dir, |_, state| {
-        let (display_name, expires_at, current_session) = {
-            let session = validate_session(state, token)?;
-            (
-                session.display_name.clone(),
-                session.expires_at,
-                current_session_identity(session),
-            )
-        };
-        let participants =
-            participant_views_from_state(state, Some(&current_session), Some(&scope));
-        let objects = state
-            .objects
+    with_expired_read_state(data_dir, |state| {
+        collaboration_poll_from_state(state, token, &scope, since)
+    })
+}
+
+/// Core records terminal outcomes before it prunes their signed evidence.
+/// Existing Chat rows keep those outcomes while Chat is closed or restarted.
+/// Matching Core originals also repair legacy rows with an empty delivery state.
+pub(crate) fn persist_collaboration_delivery(
+    data_dir: &Path,
+    scope: (&str, &str),
+    sender_profile_did: &str,
+    delivery: &[crate::collaboration_core::OutgoingChatDeliveryEvidence],
+    now: u64,
+) -> anyhow::Result<()> {
+    let scope = collaboration_object_scope(scope.0, scope.1)?;
+    let sender = normalize_member_did(sender_profile_did)?;
+    let paths = storage_paths(data_dir)?;
+    let lockfile = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.lock_path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let lock = lock_state_file(lockfile)?;
+    let result = (|| {
+        let mut state = load_state(&paths)?;
+        let evidence = delivery
             .iter()
-            .filter(|item| {
-                item.collaboration_scope.as_ref() == Some(&scope)
-                    && item.seq > since
-                    && verified_collaboration_sender_profile(item).is_some()
+            .map(|entry| (entry.envelope_sha256.as_str(), entry))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut needs_sync = false;
+        for object in &mut state.objects {
+            if object.collaboration_scope.as_ref() != Some(&scope)
+                || object.sender_member_did.as_deref() != Some(sender.as_str())
+                || verified_collaboration_sender_profile(object).is_none()
+            {
+                continue;
+            }
+            let next = match evidence.get(object.event_id.as_str()) {
+                Some(entry) if entry.accepted => CommunityDeliveryState::Accepted,
+                Some(entry) if entry.expires_at <= now => match object.delivery_state {
+                    Some(CommunityDeliveryState::Accepted) => CommunityDeliveryState::Accepted,
+                    _ => CommunityDeliveryState::Expired,
+                },
+                _ => continue,
+            };
+            object.delivery_state = Some(next);
+            // A prior poll may have written this outcome without syncing it.
+            // Its matching snapshot still needs durability before Core prune.
+            needs_sync = true;
+        }
+        if needs_sync {
+            write_json_atomic_with_sync(&paths.objects_path, &state.objects, true)?;
+        }
+        Ok(())
+    })();
+    unlock_state_file(lock)?;
+    result
+}
+
+/// Refresh only this authenticated Profile's original rows. The snapshot is
+/// independent of the feed cursor, so receipt/expiry changes preserve seq.
+pub(crate) fn collaboration_room_poll_with_delivery(
+    data_dir: &Path,
+    token: &str,
+    scope: (&str, &str),
+    since: u64,
+    reader_profile_did: &str,
+    delivery: &[crate::collaboration_core::OutgoingChatDeliveryEvidence],
+    now: u64,
+) -> anyhow::Result<RoomPollView> {
+    let scope = collaboration_object_scope(scope.0, scope.1)?;
+    let reader = normalize_member_did(reader_profile_did)?;
+    let paths = storage_paths(data_dir)?;
+    let lockfile = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.lock_path)?;
+    let lock = lock_state_file(lockfile)?;
+    let result = (|| {
+        let mut state = load_state(&paths)?;
+        let _ = expire_state_in_place(&mut state);
+        let session = validate_session_for_read(&state, token)?;
+        if session.member_did.as_deref() != Some(reader.as_str()) {
+            anyhow::bail!("Chat delivery reader does not match the room Profile");
+        }
+        let evidence = delivery
+            .iter()
+            .map(|entry| (entry.envelope_sha256.as_str(), entry))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut changed = false;
+        for object in &mut state.objects {
+            if object.collaboration_scope.as_ref() != Some(&scope)
+                || object.sender_member_did.as_deref() != Some(reader.as_str())
+                || verified_collaboration_sender_profile(object).is_none()
+            {
+                continue;
+            }
+            let next = match evidence.get(object.event_id.as_str()) {
+                Some(entry) if entry.accepted => Some(CommunityDeliveryState::Accepted),
+                // Core evidence was read before this Room lock. Preserve the
+                // terminal outcome already saved by another poll or prune.
+                Some(_)
+                    if matches!(
+                        object.delivery_state,
+                        Some(CommunityDeliveryState::Accepted | CommunityDeliveryState::Expired)
+                    ) =>
+                {
+                    object.delivery_state
+                }
+                Some(entry) if entry.expires_at <= now => Some(CommunityDeliveryState::Expired),
+                Some(_) => Some(CommunityDeliveryState::Sending),
+                None if object.delivery_state == Some(CommunityDeliveryState::Sending) => {
+                    Some(CommunityDeliveryState::Unknown)
+                }
+                None => object.delivery_state,
+            };
+            if object.delivery_state != next {
+                object.delivery_state = next;
+                changed = true;
+            }
+        }
+        if changed {
+            write_json_atomic(&paths.objects_path, &state.objects)?;
+        }
+        collaboration_poll_from_state(&state, token, &scope, since)
+    })();
+    unlock_state_file(lock)?;
+    result
+}
+
+fn collaboration_poll_from_state(
+    state: &RoomState,
+    token: &str,
+    scope: &CollaborationObjectScope,
+    since: u64,
+) -> anyhow::Result<RoomPollView> {
+    let session = validate_session_for_read(state, token)?;
+    let current_session = current_session_identity(session);
+    let participants = participant_views_from_state(state, Some(&current_session), Some(scope));
+    let scoped = state.objects.iter().filter(|item| {
+        item.collaboration_scope.as_ref() == Some(scope)
+            && verified_collaboration_sender_profile(item).is_some()
+    });
+    let own_delivery = scoped
+        .clone()
+        .filter(|item| item.sender_member_did.as_deref() == current_session.member_did.as_deref())
+        .filter_map(|item| {
+            item.delivery_state.map(|delivery| CommunityDeliveryView {
+                seq: item.seq,
+                state: delivery,
             })
-            .cloned()
-            .map(|item| object_view_from_record(item, Some(&current_session)))
-            .collect::<Vec<_>>();
-        Ok(RoomPollView {
-            room_slug: state.room_slug.clone(),
-            display_name,
-            expires_at,
-            latest_seq: objects.last().map(|item| item.seq).unwrap_or(since),
-            participants,
-            objects,
-            transport: RoomTransportView::default(),
         })
+        .collect();
+    let objects = scoped
+        .filter(|item| item.seq > since)
+        .cloned()
+        .map(|item| object_view_from_record(item, Some(&current_session)))
+        .collect::<Vec<_>>();
+    Ok(RoomPollView {
+        room_slug: state.room_slug.clone(),
+        display_name: session.display_name.clone(),
+        expires_at: session.expires_at,
+        latest_seq: objects.last().map(|item| item.seq).unwrap_or(since),
+        participants,
+        objects,
+        transport: RoomTransportView::default(),
+        own_delivery,
     })
 }
 
@@ -2991,6 +3259,7 @@ pub fn ingest_room_object_envelope(
         let object = push_object(
             state,
             ConversationObjectRecord {
+                delivery_state: None,
                 seq: 0,
                 event_id,
                 collaboration_scope: None,
@@ -3295,6 +3564,25 @@ fn validate_session<'a>(
         .find(|item| item.token == token)
         .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
     ensure_session_actor_id(session);
+    if !session
+        .capabilities
+        .iter()
+        .any(|capability| capability == ROOM_ACCESS_CAPABILITY)
+    {
+        anyhow::bail!("session is not approved for room access");
+    }
+    Ok(session)
+}
+
+fn validate_session_for_read<'a>(
+    state: &'a RoomState,
+    token: &str,
+) -> anyhow::Result<&'a SessionRecord> {
+    let session = state
+        .sessions
+        .iter()
+        .find(|item| item.token == token && item.expires_at > now_ts())
+        .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
     if !session
         .capabilities
         .iter()
@@ -4166,6 +4454,7 @@ fn append_attachment_record(
     let object = push_object(
         state,
         ConversationObjectRecord {
+            delivery_state: None,
             seq: 0,
             event_id: new_object_event_id(),
             collaboration_scope: None,
@@ -4193,6 +4482,7 @@ fn push_system_object(
     push_object(
         state,
         ConversationObjectRecord {
+            delivery_state: None,
             seq: 0,
             event_id: new_object_event_id(),
             collaboration_scope: None,
@@ -4231,6 +4521,7 @@ fn push_member_system_object_for_actor(
     push_object(
         state,
         ConversationObjectRecord {
+            delivery_state: None,
             seq: 0,
             event_id: new_object_event_id(),
             collaboration_scope: None,
@@ -4301,7 +4592,13 @@ fn object_view_from_record(
     } else {
         object.sender_profile.as_ref().map(|_| true)
     };
+    let delivery_state = current_session
+        .filter(|session| {
+            session.member_did.is_some() && session.member_did == object.sender_member_did
+        })
+        .and(object.delivery_state);
     ConversationObjectView {
+        delivery_state,
         sender_profile_verified,
         seq: object.seq,
         sender: verified_sender_profile
@@ -4647,6 +4944,13 @@ fn write_json_atomic<T>(path: &Path, value: &T) -> anyhow::Result<()>
 where
     T: Serialize,
 {
+    write_json_atomic_with_sync(path, value, false)
+}
+
+fn write_json_atomic_with_sync<T>(path: &Path, value: &T, durable: bool) -> anyhow::Result<()>
+where
+    T: Serialize,
+{
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("path missing parent"))?;
@@ -4658,7 +4962,13 @@ where
             .unwrap_or("state")
     ));
     fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
+    if durable {
+        fs::File::open(&tmp)?.sync_all()?;
+    }
     fs::rename(&tmp, path)?;
+    if durable {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -4696,8 +5006,10 @@ fn normalize_display_name(input: &str) -> anyhow::Result<String> {
     if trimmed.is_empty() {
         anyhow::bail!("display name must not be empty");
     }
-    if trimmed.chars().count() > 48 {
-        anyhow::bail!("display name must be 48 characters or fewer");
+    // Signed Profile names allow 64 bytes. Keep existing Room names readable
+    // and accept every valid Profile name, including at the byte limit.
+    if trimmed.chars().count() > 64 {
+        anyhow::bail!("display name must be 64 characters or fewer");
     }
     Ok(trimmed.to_string())
 }
@@ -5304,6 +5616,29 @@ mod tests {
             }
         }
         snapshot
+    }
+
+    fn room_state_file_metadata(data_dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+        use std::os::unix::fs::MetadataExt;
+
+        let paths = storage_paths(data_dir).unwrap();
+        [
+            paths.room_meta_path,
+            paths.control_path,
+            paths.members_path,
+            paths.invites_path,
+            paths.key_epochs_path,
+            paths.pair_requests_path,
+            paths.sessions_path,
+            paths.objects_path,
+            paths.uploads_path,
+        ]
+        .into_iter()
+        .map(|path| {
+            let metadata = fs::metadata(&path).unwrap();
+            (path, metadata.ino(), metadata.modified().unwrap())
+        })
+        .collect()
     }
 
     fn assert_meaningful_bootstrap_state_rejects_adoption(
@@ -6692,6 +7027,7 @@ mod tests {
                 removed_by: None,
             });
             state.objects.push(ConversationObjectRecord {
+                delivery_state: None,
                 seq: 1,
                 event_id: "evt-admin".to_string(),
                 collaboration_scope: None,
@@ -6707,6 +7043,7 @@ mod tests {
                 created_at: 10,
             });
             state.objects.push(ConversationObjectRecord {
+                delivery_state: None,
                 seq: 2,
                 event_id: "evt-guest".to_string(),
                 collaboration_scope: None,
@@ -7303,6 +7640,131 @@ mod tests {
     }
 
     #[test]
+    fn visible_community_read_clears_an_evicted_remote_row_without_own_send_unread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = room_test_profile(tmp.path(), 121, "Local", None);
+        let remote = room_test_profile(tmp.path(), 122, "Remote", None);
+        let port = crate::collaboration_product::test_chat_product_port(
+            tmp.path(),
+            "unread-network",
+            "unread-conversation",
+        );
+        let session =
+            start_local_runtime_session(tmp.path(), &local.profile_did, "Local", "Unread test")
+                .unwrap();
+        let card = |actor: &RoomTestActor| RoomProfileCardView {
+            schema: "elastos.profile-card/v1".to_string(),
+            profile_id: actor.profile_did.clone(),
+            display_name: actor.profile.document().display_name.clone(),
+            handle: None,
+            updated_at: actor.profile.document().updated_at,
+        };
+        project_collaboration_text(
+            tmp.path(),
+            ("unread-network", "unread-conversation"),
+            &format!("sha256:{}", "e".repeat(64)),
+            &card(&remote),
+            "remote",
+            now_ts(),
+            CollaborationTextOrigin::Incoming,
+        )
+        .unwrap();
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let scope = collaboration_object_scope("unread-network", "unread-conversation").unwrap();
+        // Run the real bounded projection policy once, without 500 disk writes
+        // or relaxing the separate live send limit.
+        with_locked_state(tmp.path(), |_, state| {
+            for index in 0..MAX_OBJECTS {
+                push_object(
+                    state,
+                    ConversationObjectRecord {
+                        delivery_state: None,
+                        seq: 0,
+                        event_id: format!("sha256:{index:064x}"),
+                        collaboration_scope: Some(scope.clone()),
+                        sender: "Local".to_string(),
+                        sender_member_did: Some(local.profile_did.clone()),
+                        sender_profile: Some(card(&local)),
+                        sender_actor_id: String::new(),
+                        kind: ConversationObjectKind::Text,
+                        body: Some(format!("own {index}")),
+                        emoji: None,
+                        link: None,
+                        attachment: None,
+                        created_at: now_ts(),
+                    },
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            collaboration_latest_remote_message_seq(
+                tmp.path(),
+                "unread-network",
+                "unread-conversation",
+                &local.profile_did
+            )
+            .unwrap(),
+            0
+        );
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let hidden = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                0,
+                &local.profile,
+                false,
+                now_ts(),
+            )
+            .unwrap();
+        assert_eq!(hidden.objects.len(), MAX_OBJECTS);
+        assert!(hidden
+            .objects
+            .iter()
+            .all(|object| object.sender_member_did.as_deref() == Some(local.profile_did.as_str())));
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let empty = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                u64::MAX,
+                &local.profile,
+                true,
+                now_ts(),
+            )
+            .unwrap();
+        assert!(empty.objects.is_empty());
+        assert!(port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        let visible = port
+            .conversation_poll_with_read_intent(
+                tmp.path(),
+                &session.token,
+                0,
+                &local.profile,
+                true,
+                now_ts(),
+            )
+            .unwrap();
+        assert_eq!(visible.objects.len(), MAX_OBJECTS);
+        assert!(!port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+        assert!(!port
+            .community_unread(tmp.path(), &local.profile, now_ts())
+            .unwrap());
+    }
+
+    #[test]
     fn collaboration_text_projection_is_scoped_idempotent_and_presentation_only() {
         let tmp = tempfile::tempdir().unwrap();
         let local_actor = room_test_profile(tmp.path(), 118, "Local", Some("local"));
@@ -7335,7 +7797,9 @@ mod tests {
             &local_profile,
             "scoped local message",
             1_800_000_000,
-            Some(&session.token),
+            CollaborationTextOrigin::Outgoing {
+                local_session_token: Some(&session.token),
+            },
         )
         .unwrap();
         assert!(first.from_current_session);
@@ -7346,7 +7810,9 @@ mod tests {
             &local_profile,
             "scoped local message",
             1_800_000_000,
-            Some(&session.token),
+            CollaborationTextOrigin::Outgoing {
+                local_session_token: Some(&session.token),
+            },
         )
         .unwrap();
         assert_eq!(replay.seq, first.seq);
@@ -7358,7 +7824,7 @@ mod tests {
             &remote_profile,
             "other scoped message",
             1_800_000_001,
-            None,
+            CollaborationTextOrigin::Incoming,
         )
         .unwrap();
         assert!(!second.from_current_session);
@@ -7445,7 +7911,9 @@ mod tests {
             &local_profile,
             "changed",
             1_800_000_000,
-            Some(&session.token),
+            CollaborationTextOrigin::Outgoing {
+                local_session_token: Some(&session.token),
+            },
         )
         .is_err());
         assert!(project_collaboration_text(
@@ -7455,7 +7923,9 @@ mod tests {
             &local_profile,
             "scoped local message",
             1_800_000_000,
-            Some(&session.token),
+            CollaborationTextOrigin::Outgoing {
+                local_session_token: Some(&session.token),
+            },
         )
         .is_err());
         assert_eq!(
@@ -7522,7 +7992,7 @@ mod tests {
             &remote_profile,
             "remote first message",
             1_800_000_002,
-            None,
+            CollaborationTextOrigin::Incoming,
         )
         .unwrap();
         let empty_state = load_state(&storage_paths(empty.path()).unwrap()).unwrap();
@@ -7530,6 +8000,150 @@ mod tests {
         assert!(empty_state.invites.is_empty());
         assert!(empty_state.sessions.is_empty());
         assert_eq!(empty_state.objects.len(), 1);
+    }
+
+    #[test]
+    fn configured_collaboration_room_poll_preserves_store_bytes_and_file_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = start_configured_collaboration_principal_session(
+            tmp.path(),
+            "did:key:z6configured",
+            "principal-one",
+            "Alice",
+            "ElastOS shell",
+        )
+        .unwrap();
+        let profile = RoomProfileCardView {
+            schema: "elastos.profile-card/v1".to_string(),
+            profile_id: "did:key:z6configured".to_string(),
+            display_name: "Alice".to_string(),
+            handle: None,
+            updated_at: now_ts(),
+        };
+        let object = project_collaboration_text(
+            tmp.path(),
+            ("network-one", "conversation-one"),
+            &format!("sha256:{}", "c".repeat(64)),
+            &profile,
+            "configured message",
+            now_ts(),
+            CollaborationTextOrigin::Outgoing {
+                local_session_token: Some(&session.token),
+            },
+        )
+        .unwrap();
+        let before = room_state_snapshot(tmp.path());
+        let metadata_before = room_state_file_metadata(tmp.path());
+        assert_eq!(metadata_before.len(), 9);
+        // Keep the original inodes allocated while the poll runs.
+        let _retained_store_files = metadata_before
+            .iter()
+            .map(|(path, _, _)| fs::File::open(path).unwrap())
+            .collect::<Vec<_>>();
+
+        for _ in 0..8 {
+            let feed = collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .unwrap();
+            assert_eq!(feed.display_name, "Alice");
+            assert_eq!(feed.expires_at, session.expires_at);
+            assert_eq!(feed.latest_seq, object.seq);
+            assert_eq!(feed.objects.len(), 1);
+            assert_eq!(feed.objects[0].body.as_deref(), Some("configured message"));
+            assert!(feed.objects[0].from_current_session);
+            assert_eq!(feed.participants.len(), 1);
+            assert_eq!(feed.participants[0].display_name, "Alice");
+        }
+
+        assert_eq!(room_state_snapshot(tmp.path()), before);
+        assert_eq!(room_state_file_metadata(tmp.path()), metadata_before);
+    }
+
+    #[test]
+    fn configured_collaboration_room_poll_rechecks_session_authority_without_writes() {
+        for refusal in ["expired", "unapproved", "left"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = start_configured_collaboration_principal_session(
+                tmp.path(),
+                "did:key:z6configured",
+                "principal-one",
+                "Alice",
+                "ElastOS shell",
+            )
+            .unwrap();
+            assert!(collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .is_ok());
+            if refusal == "left" {
+                leave_configured_collaboration_principal_session(
+                    tmp.path(),
+                    "did:key:z6configured",
+                    "principal-one",
+                )
+                .unwrap();
+            } else {
+                with_locked_state(tmp.path(), |_, state| {
+                    let stored = state
+                        .sessions
+                        .iter_mut()
+                        .find(|item| item.token == session.token)
+                        .unwrap();
+                    if refusal == "expired" {
+                        stored.expires_at = now_ts();
+                    } else {
+                        stored.capabilities.clear();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let before = room_state_snapshot(tmp.path());
+            let metadata_before = room_state_file_metadata(tmp.path());
+            let error = collaboration_room_poll(
+                tmp.path(),
+                &session.token,
+                "network-one",
+                "conversation-one",
+                0,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(if refusal == "unapproved" {
+                    "session is not approved for room access"
+                } else {
+                    "invalid or expired session"
+                }),
+                "{refusal}: {error}"
+            );
+            assert_eq!(room_state_snapshot(tmp.path()), before, "{refusal}");
+            assert_eq!(
+                room_state_file_metadata(tmp.path()),
+                metadata_before,
+                "{refusal}"
+            );
+        }
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(collaboration_room_poll(
+            empty.path(),
+            "unknown-token",
+            "network-one",
+            "conversation-one",
+            0,
+        )
+        .is_err());
+        assert!(!storage_paths(empty.path()).unwrap().root_dir.exists());
     }
 
     #[test]
@@ -7547,6 +8161,7 @@ mod tests {
         let scope = collaboration_object_scope("network-one", "conversation-one").unwrap();
         with_locked_state(tmp.path(), |_, state| {
             state.objects.push(ConversationObjectRecord {
+                delivery_state: None,
                 seq: 2,
                 event_id: "evt-mismatch".to_string(),
                 collaboration_scope: Some(scope.clone()),
@@ -7590,6 +8205,7 @@ mod tests {
             scope: Option<CollaborationObjectScope>,
         ) -> ConversationObjectRecord {
             ConversationObjectRecord {
+                delivery_state: None,
                 seq: 0,
                 event_id,
                 collaboration_scope: scope,

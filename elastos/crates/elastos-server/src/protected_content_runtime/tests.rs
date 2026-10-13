@@ -7357,9 +7357,11 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     .unwrap();
     let decrypt = RuntimeDecryptRegistryAdapter::new(decrypt_registry.clone());
 
-    let audit_a = RuntimeReleaseAuditIdV1::new(digest(0xa1)).unwrap();
-    let audit_b = RuntimeReleaseAuditIdV1::new(digest(0xa2)).unwrap();
     let flow_now = crate::auth::now_ts();
+    let audit_a =
+        super::runtime_open_audit_id("profile:alpha", preliminary_buy.mint_id(), flow_now);
+    let audit_b =
+        super::runtime_open_audit_id("profile:alpha", preliminary_buy.mint_id(), flow_now);
     let prepare_issued_at = flow_now.saturating_sub(5);
     let prepare_expires_at = flow_now + 240;
     let prepared_a = prepare_recipient(
@@ -7373,6 +7375,18 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     )
     .await
     .unwrap();
+    let replayed_a = prepare_recipient(
+        &decrypt,
+        &preliminary_buy,
+        session_a,
+        audit_a,
+        runtime_operation_issuer_for_seed(0x21),
+        prepare_issued_at,
+        prepare_expires_at,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replayed_a, prepared_a);
     let prepared_b = prepare_recipient(
         &decrypt,
         &preliminary_buy,
@@ -7644,6 +7658,26 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     close_viewer_session(&decrypt, &session).await.unwrap();
     close_viewer_session(&decrypt, &session).await.unwrap();
     cancel_prepared_recipient(&decrypt, &prepared_a)
+        .await
+        .unwrap();
+    let audit_c =
+        super::runtime_open_audit_id("profile:alpha", preliminary_buy.mint_id(), flow_now);
+    let prepared_c = prepare_recipient(
+        &decrypt,
+        &preliminary_buy,
+        session_a,
+        audit_c,
+        runtime_operation_issuer_for_seed(0x21),
+        prepare_issued_at,
+        prepare_expires_at,
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        prepared_c.prepared_recipient_handle(),
+        session.viewer_session_handle()
+    );
+    cancel_prepared_recipient(&decrypt, &prepared_c)
         .await
         .unwrap();
 

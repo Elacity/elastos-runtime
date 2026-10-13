@@ -1330,9 +1330,9 @@ enum CarrierNodeNetwork {
     /// Operator configuration cannot select this value.
     Public,
     /// Direct connections only. The Minimal preset has no public Iroh relay
-    /// and no public address discovery. Peers use explicit tickets and
-    /// MemoryLookup. An approved ElastOS relay stays CR3. This constructor
-    /// rejects `ELASTOS_RELAY_URL`.
+    /// and no public address discovery. Peers resolve LAN addresses through
+    /// mDNS and explicit tickets through MemoryLookup. An approved ElastOS relay
+    /// stays CR3. This constructor rejects `ELASTOS_RELAY_URL`.
     Isolated,
 }
 
@@ -1707,20 +1707,17 @@ async fn start_carrier_node_with_network(
     )
     .await?;
 
-    // Add mDNS for LAN discovery alongside the N0 preset lookup services.
-    match network {
-        CarrierNodeNetwork::Public if carrier_mdns_enabled() => {
-            if let Ok(mdns) = MdnsAddressLookup::builder().build(endpoint.id()) {
-                endpoint
-                    .address_lookup()
-                    .context("Carrier endpoint closed before mDNS setup")?
-                    .add(mdns);
-            }
+    // LAN discovery exchanges IP addresses for direct connections.
+    // The endpoint's IP-only policy also filters the published addresses.
+    if carrier_mdns_enabled() {
+        if let Ok(mdns) = MdnsAddressLookup::builder().build(endpoint.id()) {
+            endpoint
+                .address_lookup()
+                .context("Carrier endpoint closed before mDNS setup")?
+                .add(mdns);
         }
-        CarrierNodeNetwork::Public => {
-            info!("carrier: mDNS discovery disabled by ELASTOS_CARRIER_MDNS");
-        }
-        CarrierNodeNetwork::Isolated => {}
+    } else {
+        info!("carrier: mDNS discovery disabled by ELASTOS_CARRIER_MDNS");
     }
 
     // Add MemoryLookup for explicit peer addresses (--connect tickets)
@@ -2662,7 +2659,10 @@ async fn carrier_provider_invoke_registry(
         }),
     );
 
-    let result = if target == "custody" {
+    let result = if target == "custody"
+        || target == crate::collaboration_history::HISTORY_PROVIDER
+        || target == crate::collaboration_transport::SHARED_PROVIDER
+    {
         registry
             .send_runtime_provider_target_raw(target, &request)
             .await
@@ -2696,6 +2696,8 @@ fn carrier_provider_target_allowed(target: &str) -> bool {
             | "collaboration"
             | "collaboration-direct"
             | "collaboration-profile"
+            | "collaboration.history"
+            | "collaboration.shared"
     )
 }
 
@@ -8773,15 +8775,23 @@ impl CarrierClient {
         send.finish().context(CarrierTransportFailure)?;
 
         let mut reader = BufReader::new(recv);
-        // A bounded read holds at most 64 KiB of base64 plus its envelope;
-        // a holder that sends more is refused before it is buffered.
-        let (line, _budget) = if bounded {
-            let line = read_peer_line(
-                &mut reader,
-                CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES,
-                CARRIER_PROVIDER_REPLY_WAIT,
-            )
-            .await;
+        let reply_bound = if invocation.target == crate::collaboration_history::HISTORY_PROVIDER
+            && invocation.op == "read"
+            && invocation.transfer == ProviderTransfer::Json
+        {
+            Some(crate::collaboration_history::MAX_HISTORY_CARRIER_REPLY_BYTES as u64)
+        } else if invocation.target == crate::collaboration_transport::SHARED_PROVIDER
+            && invocation.op == "deliver"
+            && invocation.transfer == ProviderTransfer::Json
+        {
+            Some(crate::collaboration_transport::MAX_SHARED_CARRIER_REPLY_BYTES as u64)
+        } else if bounded {
+            Some(CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES)
+        } else {
+            None
+        };
+        let (line, _budget) = if let Some(limit) = reply_bound {
+            let line = read_peer_line(&mut reader, limit, CARRIER_PROVIDER_REPLY_WAIT).await;
             (line, None)
         } else if whole_content {
             (
@@ -8802,6 +8812,12 @@ impl CarrierClient {
             }
         };
         let line = line.map_err(carrier_answer_read_error)?;
+        if let Some(limit) = reply_bound {
+            anyhow::ensure!(
+                line.ends_with('\n'),
+                "bounded Carrier provider response exceeds {limit} bytes"
+            );
+        }
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         carrier_provider_invoke_result(response)
     }
@@ -10900,9 +10916,50 @@ pub(crate) mod tests {
         assert!(!response.to_string().contains("\"connect_ticket\":"));
     }
 
+    #[tokio::test]
+    async fn test_carrier_shared_dispatch_uses_private_runtime_target_and_authenticated_source() {
+        let registry = ProviderRegistry::new();
+        let target = crate::collaboration_transport::SHARED_PROVIDER;
+        registry
+            .register_runtime_provider_target(target, Arc::new(MockCarrierContentProvider))
+            .await
+            .unwrap();
+        let request = serde_json::json!({
+            "source": target, "target": target, "operation": "deliver", "transfer": "json",
+            "request": {"op":"deliver", "_runtime_invocation": {
+                "schema":"elastos.provider.invocation/v1", "source":target, "target":target,
+                "op":"deliver", "capability":format!("provider:{target}->{target}:deliver"),
+                "transport":"carrier-provider-plane", "carrier":null, "transfer":"json",
+                "range":null, "progress":null
+            }}
+        });
+        assert!(registry
+            .send_raw(target, &request["request"])
+            .await
+            .is_err());
+        let source = authenticated_test_source_endpoint();
+        let response = carrier_provider_invoke_registry(&registry, &request, &source)
+            .await
+            .unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["result"]["data"]["runtime_invocation"]["carrier"]["source_endpoint_did"],
+            public_key_to_did(&source).unwrap()
+        );
+        let mut forged = request;
+        forged["request"]["_runtime_invocation"]["carrier"] =
+            serde_json::json!({"source_endpoint_did":"forged"});
+        let refused = carrier_provider_invoke_registry(&registry, &forged, &source)
+            .await
+            .unwrap();
+        assert_eq!(refused["ok"], false);
+        assert_eq!(refused["code"], "invalid_provider_invocation");
+    }
+
     #[test]
     fn test_carrier_provider_target_admission_keeps_protected_runtime_targets_narrow() {
         assert!(carrier_provider_target_allowed("custody"));
+        assert!(carrier_provider_target_allowed("collaboration.shared"));
         assert!(!carrier_provider_target_allowed("protect"));
         assert!(!carrier_provider_target_allowed("media"));
         assert!(!carrier_provider_target_allowed(
@@ -12912,6 +12969,127 @@ pub(crate) mod tests {
             _local_dir: local_dir,
             _remote_dir: remote_dir,
         }
+    }
+
+    struct HistoryWireProbe {
+        bytes: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for HistoryWireProbe {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("history is Runtime-owned".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+        fn name(&self) -> &'static str {
+            "history-wire-probe"
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(
+                serde_json::json!({"body":"x".repeat(self.bytes.load(std::sync::atomic::Ordering::SeqCst))}),
+            )
+        }
+    }
+
+    async fn assert_private_carrier_reply_bound(target: &str, operation: &str, limit: usize) {
+        let fixture = peer_did_route_fixture(181, 182).await;
+        let payload_size = 32 * 1024;
+        assert!(payload_size < limit);
+        let size = Arc::new(std::sync::atomic::AtomicUsize::new(payload_size));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        fixture
+            ._remote_registry
+            .register_runtime_provider_target(
+                target,
+                Arc::new(HistoryWireProbe {
+                    bytes: size.clone(),
+                    requests: requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(fixture
+            ._remote_registry
+            .send_raw(target, &serde_json::json!({"op":operation}))
+            .await
+            .is_err());
+        let invocation = ProviderInvocation {
+            source: target.into(),
+            target: target.into(),
+            op: operation.into(),
+            request: serde_json::json!({"op":operation}),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: fixture.remote_did.clone(),
+                timeout_ms: Some(5_000),
+            }),
+        };
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture.local_registry.invoke_provider(invocation.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response["body"], "x".repeat(payload_size));
+        let mut request = requests.lock().unwrap()[0].clone();
+        assert_eq!(
+            request["_runtime_invocation"]["carrier"]["source_endpoint_did"],
+            public_key_to_did(&fixture.local_node.endpoint.id()).unwrap()
+        );
+        // The receiving Runtime owns this metadata; wire callers supply null.
+        request["_runtime_invocation"]["carrier"] = serde_json::Value::Null;
+        size.store(limit + 1, std::sync::atomic::Ordering::SeqCst);
+        let client = CarrierClient::connect_known_endpoint(
+            &fixture.local_node.endpoint,
+            fixture.remote_addr.clone(),
+            5,
+        )
+        .await
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.invoke_provider(&invocation, request),
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(&format!("exceeds {limit} bytes")), "{error}");
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn private_history_carrier_read_authenticates_source_and_bounds_the_wire_reply() {
+        assert_private_carrier_reply_bound(
+            crate::collaboration_history::HISTORY_PROVIDER,
+            "read",
+            crate::collaboration_history::MAX_HISTORY_CARRIER_REPLY_BYTES,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn private_shared_carrier_delivery_authenticates_source_and_bounds_the_wire_reply() {
+        assert_private_carrier_reply_bound(
+            crate::collaboration_transport::SHARED_PROVIDER,
+            "deliver",
+            crate::collaboration_transport::MAX_SHARED_CARRIER_REPLY_BYTES,
+        )
+        .await;
     }
 
     fn peer_did_invocation(peer_did: &str) -> ProviderInvocation {
@@ -18942,9 +19120,13 @@ pub(crate) mod tests {
     async fn test_default_carrier_node_is_isolated() {
         let dir = tempfile::tempdir().unwrap();
         let (sk, did) = elastos_identity::derive_did(&[45u8; 32]);
-        let node = start_carrier_node(&sk, &did, dir.path().to_path_buf())
-            .await
-            .unwrap();
+        let node = tokio::time::timeout(
+            Duration::from_secs(10),
+            start_carrier_node(&sk, &did, dir.path().to_path_buf()),
+        )
+        .await
+        .expect("direct Carrier startup deadline")
+        .unwrap();
         {
             let state = node.gossip_state.lock().await;
             assert!(
@@ -18952,6 +19134,14 @@ pub(crate) mod tests {
                 "unset ELASTOS_CARRIER_NETWORK starts Isolated"
             );
         }
-        shutdown_test_carrier_node(node).await;
+        assert_eq!(
+            node.endpoint.address_lookup().unwrap().len(),
+            if carrier_mdns_enabled() { 3 } else { 2 },
+            "direct startup registers LAN mDNS alongside memory and gossip lookups unless opted out"
+        );
+        assert!(node.endpoint.addr().relay_urls().next().is_none());
+        tokio::time::timeout(Duration::from_secs(5), shutdown_test_carrier_node(node))
+            .await
+            .expect("direct Carrier shutdown deadline");
     }
 }

@@ -1056,6 +1056,53 @@ class SignerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "catalog head differs"):
             self.prepare()
 
+    def test_pinned_community_network_is_bound_like_the_catalog(self):
+        name = "collaboration-network-release-v1.json"
+        network = S.json_bytes({"expected_network_id": "fixture-network"})
+        def clear_snapshot():
+            for path in self.snapshot.iterdir():
+                path.unlink()
+        def pin(components, data):
+            components = copy.deepcopy(components)
+            components["collaboration_network"] = {"head_cid": S.raw_cid(data), "expected_network_id": "fixture-network",
+                                                   "trusted_profile_signer_dids": [DID]}
+            return components
+        def approve_source_components(components):
+            template = S.parse_json(self.source_components)
+            template.pop("collaboration_network", None)
+            if "collaboration_network" in components:
+                template["collaboration_network"] = copy.deepcopy(components["collaboration_network"])
+            self.source_components = S.json_bytes(template)
+            self.source_components_oid = hashlib.sha1(b"blob " + str(len(self.source_components)).encode() + b"\0" + self.source_components).hexdigest()
+            prefix = f"/repos/{S.REPOSITORY}/git"
+            next(entry for entry in self.api[f"{prefix}/trees/{TREE}"]["tree"]
+                 if entry["path"] == "components.json")["sha"] = self.source_components_oid
+            self.api[f"{prefix}/blobs/{self.source_components_oid}"] = {
+                "sha": self.source_components_oid, "encoding": "base64", "size": len(self.source_components),
+                "content": base64.b64encode(self.source_components).decode()}
+            self.reapprove_components(components)
+        original = self.current_shape()
+        (self.root / name).write_bytes(network)
+        self.manifest["files"][name] = {"sha256": S.sha256(network), "size": len(network), "cid": S.raw_cid(network)}
+        approved = pin(original, network)
+        approve_source_components(approved)
+        prepared = self.prepare()
+        self.assertEqual(len(prepared.files), 7)
+        self.assertEqual(S.parse_json(dict(prepared.files)["components-x86_64-linux.json"].read_bytes())["collaboration_network"],
+                         approved["collaboration_network"])
+        self.assertFalse(self.marker.exists())
+        for components, message in ((pin(original, b"other network"), "Community network head differs"),
+                                    (original, "unbound artifact")):
+            clear_snapshot()
+            approve_source_components(components)
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self.prepare()
+        clear_snapshot()
+        del self.manifest["files"][name]
+        approve_source_components(pin(original, network))
+        with self.assertRaisesRegex(ValueError, "Community network snapshot required"):
+            self.prepare()
+
     def reapprove_components(self, components):
         self.platform_components["x86_64-linux"] = components
         self.manifest["release"]["platforms"]["x86_64-linux"]["binary"] = copy.deepcopy(self.manifest["files"]["elastos-x86_64-linux"])

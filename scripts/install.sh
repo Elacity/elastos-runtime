@@ -117,6 +117,7 @@ show_help() {
     echo "  --publisher-gateway URL  Bootstrap publisher URL (stamped for normal installs)"
     echo "  --install-dir PATH    Binary install directory (default: ~/.local/bin)"
     echo "  --install-only        Install Runtime without setup or opening Home"
+    echo "  --isolated            Keep this Home out of the shared Community room"
     echo "  --uninstall           Remove the Runtime and its components; keep your data"
     echo "  --remove-data         With --uninstall, also delete the data directory"
     echo "  --help                Show this help"
@@ -943,13 +944,16 @@ finish_install() {
     fi
     step 5 "Set up Home"
     info "Setting up Home..."
-    "$runtime_bin" setup </dev/null || return $?
+    local setup_args=(setup)
+    if [[ "${ISOLATED:-false}" == true ]]; then
+        setup_args+=(--isolated)
+    fi
+    "$runtime_bin" "${setup_args[@]}" </dev/null || return $?
     if ! prepare_browser_linux_host; then
         warn "Browser host preparation is incomplete. Home is ready. Run the installer from a terminal to complete Browser host access, then run elastos setup."
     elif [[ "${BROWSER_LINUX_HOST_READY:-false}" == true ]]; then
-        # The first setup prepared the admitted helpers before host access.
-        # Resume ordinary-user image preparation after the installer grants it.
-        "$runtime_bin" setup </dev/null || warn "Home is ready. Browser preparation needs repair with elastos setup."
+        # Resume image preparation with the same Community choice.
+        "$runtime_bin" "${setup_args[@]}" </dev/null || warn "Home is ready. Browser preparation needs repair with elastos setup."
     fi
     show_ready "$runtime_bin"
     if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
@@ -1108,6 +1112,7 @@ uninstall_installation() {
 # acts only after bash has read the whole script. Repo smoke/publisher
 # helpers source this file for its definitions only.
 main() {
+ISOLATED=false
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_ONLY="${ELASTOS_INSTALL_ONLY:-false}"
 UNINSTALL=false
@@ -1125,6 +1130,7 @@ while [[ $# -gt 0 ]]; do
             [[ -z "${2:-}" ]] && die "Usage: --publisher-gateway https://<url>"
             PUBLISHER_GATEWAY="${2%/}"; shift 2 ;;
         --install-only) INSTALL_ONLY=true; shift ;;
+        --isolated) ISOLATED=true; shift ;;
         --uninstall) UNINSTALL=true; shift ;;
         --remove-data) REMOVE_DATA=true; shift ;;
         --install-dir)

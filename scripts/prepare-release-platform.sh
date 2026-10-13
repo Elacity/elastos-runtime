@@ -357,6 +357,9 @@ cp scripts/release-upstream-recipes.json "$STAGING/upstream-recipes.json"
 if [[ -f "$SOURCE_ROOT/model-catalog.json" ]]; then
     cp "$SOURCE_ROOT/model-catalog.json" "$STAGING/artifacts/model-catalog.json"
 fi
+if [[ -f "$SOURCE_ROOT/collaboration-network-release-v1.json" ]]; then
+    cp "$SOURCE_ROOT/collaboration-network-release-v1.json" "$STAGING/artifacts/collaboration-network-release-v1.json"
+fi
 fi
 
 if [[ "$SETUP_PLATFORM" == linux-* ]]; then

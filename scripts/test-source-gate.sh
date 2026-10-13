@@ -17,7 +17,9 @@ prepush() {
 
 product_ui() {
   node --version
+  node scripts/check-chat-ui-artifacts.mjs check
   node scripts/home-shell-regression-smoke.mjs
+  node scripts/home-shell-bridge-smoke.mjs
   node scripts/home-agent-shell-smoke.mjs
   node scripts/people-discovery-smoke.mjs
 }

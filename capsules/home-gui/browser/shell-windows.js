@@ -125,8 +125,13 @@ export function acceptHomeNavigation(entry, data) {
   record.sequence = data.sequence;
   // Null means this document is still loading, not a request to clear selection.
   if (data.query !== null) {
-    entry.launchQuery = { ...data.query };
-    persistBrowserSession();
+    const currentQuery = normalizedLaunchQuery(entry.launchQuery);
+    const keys = Object.keys(data.query);
+    if (keys.length !== Object.keys(currentQuery).length ||
+        keys.some((key) => currentQuery[key] !== data.query[key])) {
+      entry.launchQuery = { ...data.query };
+      persistBrowserSession();
+    }
   }
   return true;
 }

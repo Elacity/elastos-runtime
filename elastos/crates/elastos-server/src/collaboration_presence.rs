@@ -21,7 +21,7 @@ use crate::collaboration_core::{
 use crate::collaboration_product::{CHAT_INTERFACE, CHAT_ROOM_CAPSULE, CHAT_SERVICE};
 use crate::esp_binding::{esp_request_binding, EspRequestBinding};
 
-const PRESENCE_PAYLOAD_TYPE: &str = "elastos.chat.presence/v1";
+pub(crate) const PRESENCE_PAYLOAD_TYPE: &str = "elastos.chat.presence/v1";
 const PRESENCE_RESOURCE: &str = "elastos://chat/presence";
 const PRESENCE_TTL_SECS: u64 = 45;
 const PRESENCE_STATE_SCHEMA: &str = "elastos.chat.presence-state/v1";
@@ -84,6 +84,14 @@ pub struct CollaborationPresenceSnapshotRecord {
     handle: Option<String>,
     last_seen_at: u64,
     expires_at: u64,
+}
+
+/// Internal route evidence. The signed original still owns all Profile and
+/// conversation authority; capsule projections expose neither it nor routes.
+#[derive(Clone)]
+pub(crate) struct HistoryParticipant {
+    pub(crate) endpoint_did: String,
+    pub(crate) presence_envelope: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +224,68 @@ impl CollaborationPresenceProductPort {
 
     pub fn snapshot(&self, now: u64) -> anyhow::Result<CollaborationPresenceSnapshot> {
         self.read_model.snapshot(now)
+    }
+
+    pub(crate) fn history_participants(&self, now: u64) -> anyhow::Result<Vec<HistoryParticipant>> {
+        let state = self
+            .read_model
+            .load_state()?
+            .unwrap_or_else(|| self.read_model.empty_state());
+        let mut peers = Vec::new();
+        for record in state.records {
+            let presence = self.read_model.verify_record(&record)?;
+            if presence.expires_at <= now
+                || presence.issued_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+            {
+                continue;
+            }
+            let authorized = self
+                .core
+                .authorize_stored_product_message(record.envelope.as_bytes())?;
+            if let Ok(endpoint) = authorized.sender_profile().sole_endpoint_did() {
+                if self.core.is_bootstrap_endpoint(endpoint) {
+                    continue;
+                }
+                peers.push(HistoryParticipant {
+                    endpoint_did: endpoint.to_string(),
+                    presence_envelope: record.envelope,
+                });
+            }
+        }
+        peers.sort_by(|left, right| left.endpoint_did.cmp(&right.endpoint_did));
+        peers.dedup_by(|left, right| left.endpoint_did == right.endpoint_did);
+        Ok(peers)
+    }
+
+    /// The request carries its own live signed presence, avoiding a race with
+    /// the receiver's next gossip projection. Carrier owns the source fact.
+    pub(crate) fn authorize_history_requester(
+        &self,
+        envelope_bytes: &[u8],
+        source_endpoint_did: &str,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        if self.core.is_bootstrap_endpoint(source_endpoint_did)
+            || self
+                .core
+                .is_bootstrap_endpoint(&self.core.local_device_did())
+        {
+            anyhow::bail!("Community bootstrap endpoints carry discovery metadata only");
+        }
+        let presence = self.read_model.verify_envelope(envelope_bytes)?;
+        if presence.expires_at <= now
+            || presence.issued_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+        {
+            anyhow::bail!("history requester presence is unavailable");
+        }
+        let authorized = self.core.authorize_stored_product_message(envelope_bytes)?;
+        if !authorized
+            .sender_profile()
+            .authorizes_endpoint(source_endpoint_did)
+        {
+            anyhow::bail!("history requester source is outside its signed Profile");
+        }
+        Ok(())
     }
 
     fn require_prepared(&self, prepared: &PreparedCollaborationPresence) -> anyhow::Result<()> {
@@ -678,7 +748,7 @@ fn presence_from_authorized(
     if message.payload_type != PRESENCE_PAYLOAD_TYPE {
         anyhow::bail!("collaboration payload is not Chat presence");
     }
-    exact_presence_payload(authorized.product_payload())?;
+    validate_presence_payload(authorized.product_payload())?;
     let profile = authorized.sender_profile();
     Ok(VerifiedPresence {
         envelope_bytes: envelope_bytes.to_vec(),
@@ -689,6 +759,11 @@ fn presence_from_authorized(
         issued_at: message.created_at,
         expires_at: message.expires_at,
     })
+}
+
+/// Runtime admission and Presence projection use the same exact DTO.
+pub(crate) fn validate_presence_payload(value: &serde_json::Value) -> anyhow::Result<()> {
+    exact_presence_payload(value).map(|_| ())
 }
 
 fn exact_presence_payload(value: &serde_json::Value) -> anyhow::Result<PresencePayload> {
@@ -1030,15 +1105,22 @@ mod tests {
                 PRESENCE_TTL_SECS,
             )
             .unwrap();
-        for message in [&presence, &chat, &malformed_presence] {
+        for message in [&presence, &chat] {
             fixture
                 .core
                 .accept_incoming_from_signed_source_for_test(message.envelope_bytes(), NOW + 4)
                 .unwrap();
         }
+        assert!(fixture
+            .core
+            .accept_incoming_from_signed_source_for_test(
+                malformed_presence.envelope_bytes(),
+                NOW + 4,
+            )
+            .is_err());
         assert_eq!(fixture.chat.pending_messages().unwrap().len(), 1);
         assert_eq!(fixture.presence.pending_presences().unwrap().len(), 1);
-        assert_eq!(fixture.core.summary().unwrap().pending_product_handoffs, 3);
+        assert_eq!(fixture.core.summary().unwrap().pending_product_handoffs, 2);
 
         let other_temp = tempfile::tempdir().unwrap();
         let other = fixture_at(other_temp.path());
@@ -1051,7 +1133,7 @@ mod tests {
             .presence
             .project_handoff(&handoffs[0], NOW + 4)
             .unwrap();
-        assert_eq!(fixture.core.summary().unwrap().pending_product_handoffs, 2);
+        assert_eq!(fixture.core.summary().unwrap().pending_product_handoffs, 1);
         assert_eq!(fixture.chat.pending_messages().unwrap().len(), 1);
 
         let chat_handoffs = fixture.chat.pending_messages().unwrap();
@@ -1059,7 +1141,7 @@ mod tests {
             .chat
             .project_handoff(&fixture.data_root, &chat_handoffs[0])
             .unwrap();
-        assert_eq!(fixture.core.summary().unwrap().pending_product_handoffs, 1);
+        assert_eq!(fixture.core.summary().unwrap().pending_product_handoffs, 0);
         assert!(fixture.chat.pending_messages().unwrap().is_empty());
         assert!(fixture.presence.pending_presences().unwrap().is_empty());
         let snapshot = fixture.presence.snapshot(NOW + 4).unwrap();
@@ -1083,7 +1165,7 @@ mod tests {
         assert_eq!(restarted_presence.snapshot(NOW + 4).unwrap(), snapshot);
         assert_eq!(
             restarted_core.summary().unwrap().pending_product_handoffs,
-            1
+            0
         );
     }
 

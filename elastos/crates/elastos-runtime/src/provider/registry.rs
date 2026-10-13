@@ -679,8 +679,14 @@ const RESERVED_SUB_NAMES: &[&str] = &[
 ];
 
 /// Reserved names for provider targets that only Runtime invocation can reach.
-const RESERVED_RUNTIME_PROVIDER_TARGETS: &[&str] =
-    &["protect", "media", "custody", "protected-content-decrypt"];
+const RESERVED_RUNTIME_PROVIDER_TARGETS: &[&str] = &[
+    "protect",
+    "media",
+    "custody",
+    "protected-content-decrypt",
+    "collaboration.history",
+    "collaboration.shared",
+];
 
 /// Registry of providers
 pub struct ProviderRegistry {
@@ -4624,7 +4630,14 @@ mod tests {
             .register_sub_provider("decrypt", Arc::new(RawMockProvider))
             .await
             .unwrap();
-        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+        for target in [
+            "protect",
+            "media",
+            "custody",
+            "protected-content-decrypt",
+            "collaboration.history",
+            "collaboration.shared",
+        ] {
             registry
                 .register_runtime_provider_target(target, Arc::new(RawMockProvider))
                 .await
@@ -4651,7 +4664,14 @@ mod tests {
         assert_eq!(registry.sub_provider_schemes().await, vec!["decrypt"]);
         assert!(!registry.has_ready_runtime_provider_target("decrypt").await);
         let registrations = registry.registrations().await;
-        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+        for target in [
+            "protect",
+            "media",
+            "custody",
+            "protected-content-decrypt",
+            "collaboration.history",
+            "collaboration.shared",
+        ] {
             let protected = registry
                 .invoke_provider(ProviderInvocation {
                     source: "runtime".to_string(),
@@ -4705,7 +4725,14 @@ mod tests {
             .register_sub_provider("decrypt", Arc::new(MockProvider::new()))
             .await
             .unwrap();
-        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+        for target in [
+            "protect",
+            "media",
+            "custody",
+            "protected-content-decrypt",
+            "collaboration.history",
+            "collaboration.shared",
+        ] {
             registry
                 .register_runtime_provider_target(target, Arc::new(RawMockProvider))
                 .await

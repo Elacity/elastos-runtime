@@ -475,6 +475,11 @@ enum Commands {
         /// Developer-supplied directory containing ffmpeg and ffprobe
         #[arg(long, hide = true, requires = "prerequisites_only")]
         media_tools_dir: Option<PathBuf>,
+
+        /// Keep this Home out of the shared Community room. Choose this
+        /// before the Home first starts; a Home keeps a network it joined.
+        #[arg(long)]
+        isolated: bool,
     },
 
     /// Manage trusted release sources
@@ -1518,7 +1523,11 @@ async fn run() -> anyhow::Result<()> {
             list,
             prerequisites_only,
             media_tools_dir,
+            isolated,
         } => {
+            if isolated {
+                setup::choose_isolated_collaboration()?;
+            }
             setup::run(
                 profile,
                 with,

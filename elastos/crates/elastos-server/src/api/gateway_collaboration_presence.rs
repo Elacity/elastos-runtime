@@ -271,6 +271,9 @@ pub fn publish_runtime_owned_presence(
     >,
     now: u64,
 ) -> anyhow::Result<usize> {
+    if discovery_service.is_some_and(|service| !service.community_joined()) {
+        return Ok(0);
+    }
     let local_device_did =
         crate::collaboration_profile_authority::load_existing_device_did(data_dir)?;
     let mut published = 0usize;
@@ -341,6 +344,9 @@ fn presence_opted_in(
     let (Some(service), Some(device_did)) = (discovery_service, local_device_did) else {
         return false;
     };
+    if !service.community_joined() {
+        return false;
+    }
     let localhost_root = crate::auth::principal_localhost_root(principal_id);
     let Ok(store) = crate::collaboration_contact_store::CollaborationContactStore::new(
         data_dir,

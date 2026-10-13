@@ -39,7 +39,6 @@ pub const RUNTIME_KIND_MANAGED_HOME: &str = "managed-home";
 pub const OPERATOR_RUNTIME_REQUIRED_MESSAGE: &str =
     "This command requires a running runtime.\n\n  elastos serve\n\nThen run this command again.";
 pub const GATEWAY_OWNED_HOME_TERMINAL_ENV: &str = "ELASTOS_GATEWAY_OWNED_HOME_TERMINAL";
-const CARRIER_MDNS_ENV: &str = "ELASTOS_CARRIER_MDNS";
 const MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS: &[&str] = &["localhost-provider", "did-provider"];
 const MANAGED_RUNTIME_REQUIRED_COMPONENTS: &[&str] = &["shell"];
 
@@ -55,15 +54,6 @@ struct ManagedRuntimeStartGuard {
 
 fn default_runtime_kind() -> String {
     RUNTIME_KIND_OPERATOR.to_string()
-}
-
-fn managed_runtime_default_carrier_mdns(runtime_kind: &str) -> Option<&'static str> {
-    match runtime_kind {
-        RUNTIME_KIND_MANAGED_CHAT | RUNTIME_KIND_MANAGED_HOME | RUNTIME_KIND_MANAGED_IDENTITY => {
-            Some("0")
-        }
-        _ => None,
-    }
 }
 
 fn managed_runtime_start_lock_path(data_dir: &Path) -> PathBuf {
@@ -1286,11 +1276,6 @@ async fn ensure_managed_runtime(
         .stdout(std::process::Stdio::from(log_file.try_clone()?))
         .stderr(std::process::Stdio::from(log_file))
         .stdin(std::process::Stdio::null());
-    if std::env::var_os(CARRIER_MDNS_ENV).is_none() {
-        if let Some(value) = managed_runtime_default_carrier_mdns(runtime_kind) {
-            child.env(CARRIER_MDNS_ENV, value);
-        }
-    }
     if subordinate_gateway_host {
         child.env("ELASTOS_ALLOW_SUBORDINATE_RUNTIME_HOST", "1");
         child.env("ELASTOS_RUNTIME_COORDS_FILE", &coords_path);
@@ -1636,26 +1621,6 @@ mod tests {
             .iter()
             .any(|resource| resource.contains("localhost://Users/self")));
         assert!(allow.contains(&"localhost://Local/SharedByLocalUsersAndBots/Home/*"));
-    }
-
-    #[test]
-    fn managed_runtimes_default_carrier_mdns_off() {
-        assert_eq!(
-            managed_runtime_default_carrier_mdns(RUNTIME_KIND_MANAGED_HOME),
-            Some("0")
-        );
-        assert_eq!(
-            managed_runtime_default_carrier_mdns(RUNTIME_KIND_MANAGED_CHAT),
-            Some("0")
-        );
-        assert_eq!(
-            managed_runtime_default_carrier_mdns(RUNTIME_KIND_MANAGED_IDENTITY),
-            Some("0")
-        );
-        assert_eq!(
-            managed_runtime_default_carrier_mdns(RUNTIME_KIND_OPERATOR),
-            None
-        );
     }
 
     /// `ELASTOS_RUNTIME_COORDS_FILE` is process-global, so the tests that set

@@ -7754,6 +7754,10 @@ fn runtime_open_audit_id(
     hasher.update(principal_id.as_bytes());
     hasher.update(mint_id.as_bytes());
     hasher.update(now.to_be_bytes());
+    // Each new open needs a distinct audit ID; pending retries reuse the persisted ID.
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    hasher.update(nonce);
     RuntimeReleaseAuditIdV1::new(Digest32::new(hasher.finalize().into())).unwrap_or_else(|_| {
         RuntimeReleaseAuditIdV1::new(Digest32::new([1; 32])).expect("nonzero audit id")
     })

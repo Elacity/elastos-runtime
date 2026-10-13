@@ -1457,18 +1457,21 @@ prepare_browser_linux_host
                                'exit "${BROWSER_SETUP_RESULT:-0}"\n')
             runtime.chmod(0o755)
             script = HELPERS + """
-INSTALL_DIR="$1" INSTALL_ONLY=false DATA_DIR="$1/data"
+INSTALL_DIR="$1" INSTALL_ONLY=false DATA_DIR="$1/data" ISOLATED="$3"
 export CALLS="$1/calls" HOST_READY="$1/host-ready" BROWSER_SETUP_RESULT="$2"
 prepare_browser_linux_host() { touch "$HOST_READY"; BROWSER_LINUX_HOST_READY=true; printf 'HOST_READY\\n' >> "$CALLS"; }
 show_ready() { printf 'HOME_READY\\n' >> "$CALLS"; }
 finish_install
 """
-            for browser_result in [0, 7]:
-                calls, ready = root / 'calls', root / 'host-ready'
-                calls.unlink(missing_ok=True); ready.unlink(missing_ok=True)
-                result = shell(script, root, browser_result)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(calls.read_text().splitlines(), ['SETUP:setup', 'HOST_READY', 'SETUP:setup', 'HOME_READY'])
+            for isolated in ['false', 'true']:
+                for browser_result in [0, 7]:
+                    calls, ready = root / 'calls', root / 'host-ready'
+                    calls.unlink(missing_ok=True); ready.unlink(missing_ok=True)
+                    result = shell(script, root, browser_result, isolated)
+                    setup = 'SETUP:setup --isolated' if isolated == 'true' else 'SETUP:setup'
+                    with self.subTest(isolated=isolated, browser_result=browser_result):
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(calls.read_text().splitlines(), [setup, 'HOST_READY', setup, 'HOME_READY'])
 
     def test_rerun_with_retained_linux_helper_never_asks_for_sudo_after_setup_retires_it(self):
         # An earlier release left the helper and its check now fails. Setup runs
