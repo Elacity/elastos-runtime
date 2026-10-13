@@ -1058,14 +1058,15 @@ class SignerTests(unittest.TestCase):
 
     def test_pinned_community_network_is_bound_like_the_catalog(self):
         name = "collaboration-network-release-v1.json"
-        network = S.json_bytes({"expected_network_id": "fixture-network"})
+        network = S.json_bytes({"schema": S.COMMUNITY_STARTUP_SCHEMA, "expected_network_id": "fixture-network",
+                                "trusted_profile_signer_dids": [DID]})
         def clear_snapshot():
             for path in self.snapshot.iterdir():
                 path.unlink()
-        def pin(components, data):
+        def pin(components, data, **changes):
             components = copy.deepcopy(components)
             components["collaboration_network"] = {"head_cid": S.raw_cid(data), "expected_network_id": "fixture-network",
-                                                   "trusted_profile_signer_dids": [DID]}
+                                                   "trusted_profile_signer_dids": [DID], **changes}
             return components
         def approve_source_components(components):
             template = S.parse_json(self.source_components)
@@ -1088,10 +1089,19 @@ class SignerTests(unittest.TestCase):
         approve_source_components(approved)
         prepared = self.prepare()
         self.assertEqual(len(prepared.files), 7)
+        self.assertEqual(dict(prepared.files)[name].read_bytes(), network)
         self.assertEqual(S.parse_json(dict(prepared.files)["components-x86_64-linux.json"].read_bytes())["collaboration_network"],
                          approved["collaboration_network"])
         self.assertFalse(self.marker.exists())
+        other_did = S.public_did(bytes.fromhex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"))
         for components, message in ((pin(original, b"other network"), "Community network head differs"),
+                                    (pin(original, network, expected_network_id="other-network"),
+                                     "Community network ID differs from the release pin"),
+                                    (pin(original, network, trusted_profile_signer_dids=[other_did]),
+                                     "Community signer set differs from the release pin"),
+                                    (pin(original, network, trusted_profile_signer_dids=[DID, other_did]),
+                                     "Community signer set differs from the release pin"),
+                                    (pin(original, network, revision=1), "Community network pin fields refused"),
                                     (original, "unbound artifact")):
             clear_snapshot()
             approve_source_components(components)
@@ -1102,6 +1112,304 @@ class SignerTests(unittest.TestCase):
         approve_source_components(pin(original, network))
         with self.assertRaisesRegex(ValueError, "Community network snapshot required"):
             self.prepare()
+
+    def community_input(self):
+        grant = {"schema": S.COMMUNITY_GRANT_SCHEMA, "network_id": "fixture-community", "conversation_id": "community-room",
+                 "sender_service": "chat", "admission_policy": "profile_scoped_signer"}
+        node = PUBLIC.hex()
+        ticket = S.json_bytes({"endpoints": [{"id": node, "addrs": []}], "topic": None})
+        profile = {"schema": S.COMMUNITY_PROFILE_SCHEMA, "network_id": grant["network_id"], "revision": 1,
+                   "signer_did": DID, "bootstrap_peers": [{"node_id": node, "connect_ticket": base64.b32encode(ticket).decode().lower().rstrip("=")}],
+                   "default_conversation": {"grant_cid": S.raw_cid(S.json_bytes(grant))}}
+        self.community_manifest = {"schema": S.COMMUNITY_INPUT_SCHEMA, "source": {"commit": COMMIT, "tree": TREE},
+                                   "domain": S.COMMUNITY_PROFILE_DOMAIN, "profile": profile,
+                                   "default_conversation_grant": grant, "trusted_profile_signer_dids": [DID]}
+        self.policy["operation"] = "community-profile"
+        self.policy["community_profile"] = {"expected_network_id": grant["network_id"], "conversation_id": grant["conversation_id"],
+                                            "revision": 1, "previous_profile_sha256": None, "trusted_profile_signer_dids": [DID],
+                                            "profile_payload_sha256": S.sha256(S.json_bytes(profile)),
+                                            "default_conversation_grant_sha256": S.sha256(S.json_bytes(grant))}
+        self.approve_community_input()
+
+    def approve_community_input(self):
+        data = S.json_bytes(self.community_manifest)
+        (self.root / "community-profile-input.json").write_bytes(data)
+        self.policy["manifest_sha256"] = S.sha256(data)
+
+    def prepare_community(self):
+        return S.prepare_community_profile(self.policy, self.root, "community-profile-input.json", self.fetch)
+
+    def test_community_profile_signs_frozen_initial_bytes_in_its_own_domain(self):
+        self.community_input()
+        prepared = self.prepare_community()
+        (self.root / "community-profile-input.json").write_bytes(b"changed after approval")
+        backend = FakeBackend()
+        publication = dict(S.sign_community_profile(prepared, backend))
+        config = S.parse_json(publication["collaboration-network-release-v1.json"])
+        self.assertEqual(set(config), {"schema", "expected_network_id", "trusted_profile_signer_dids", "profile_chain_base64", "default_conversation_grant_base64"})
+        envelope_bytes = base64.b64decode(config["profile_chain_base64"][0], validate=True)
+        envelope = S.parse_json(envelope_bytes)
+        self.assertEqual(S.json_bytes(envelope["payload"]), prepared.profile)
+        self.assertEqual(envelope["signer_did"], DID)
+        self.assertEqual(base64.b64decode(config["default_conversation_grant_base64"], validate=True), prepared.grant)
+        pin = S.parse_json(publication["collaboration-network-release-pin-v1.json"])["collaboration_network"]
+        self.assertEqual(pin, {"head_cid": S.raw_cid(publication["collaboration-network-release-v1.json"]),
+                               "expected_network_id": "fixture-community", "trusted_profile_signer_dids": [DID]})
+        # The release signer admits exactly this output pair.
+        S.check_collaboration_network_pin(pin, publication["collaboration-network-release-v1.json"])
+        digest = hashlib.sha256(b"elastos.collaboration-network.profile.v1\0" + prepared.profile).digest()
+        self.assertEqual([call for call in backend.calls if isinstance(call, tuple) and call[0] == "sign"], [("sign", digest)])
+        self.assertIn(("verify", digest, bytes(64)), backend.calls)
+        self.assertFalse(self.marker.exists())
+        # The release/head helper remains closed to the new operation.
+        with self.assertRaisesRegex(ValueError, "domain refused"):
+            S.signature_digest(S.COMMUNITY_PROFILE_DOMAIN, prepared.profile)
+
+    def test_community_public_verification_refuses_tamper_and_release_domain_signature(self):
+        self.community_input()
+        prepared = self.prepare_community()
+        class BoundBackend(FakeBackend):
+            def sign(self, digest):
+                self.calls.append(("sign", digest))
+                return digest + digest
+            def verify(self, digest, signature):
+                self.calls.append(("verify", digest, signature))
+                return signature == digest + digest
+        backend = BoundBackend()
+        publication = dict(S.sign_community_profile(prepared, backend))
+        config = S.parse_json(publication["collaboration-network-release-v1.json"])
+        envelope = S.parse_json(base64.b64decode(config["profile_chain_base64"][0]))
+        wrong = copy.deepcopy(envelope)
+        wrong["payload"]["network_id"] = "foreign-community"
+        with self.assertRaisesRegex(ValueError, "approved signer/payload"):
+            S.verify_community_profile_envelope(prepared, S.json_bytes(wrong), backend)
+        wrong = copy.deepcopy(envelope)
+        release_digest = S.signature_digest("elastos.release.v1", prepared.profile)
+        wrong["signature"] = (release_digest + release_digest).hex()
+        with self.assertRaisesRegex(ValueError, "public verification failed"):
+            S.verify_community_profile_envelope(prepared, S.json_bytes(wrong), backend)
+        S.verify_community_profile_envelope(prepared, S.json_bytes(envelope), backend)
+
+    def test_community_schema_domain_chain_and_grant_refusals_precede_backend(self):
+        self.community_input()
+        original = copy.deepcopy(self.community_manifest)
+        for change in [
+            lambda value: value.update(domain="elastos.release.v1"),
+            lambda value: value.update(schema="elastos.release/v1"),
+            lambda value: value["source"].update(tree="9" * 40),
+            lambda value: value.update(trusted_profile_signer_dids=[]),
+            lambda value: value["profile"].update(schema="unknown"),
+            lambda value: value["profile"].update(network_id="foreign-community"),
+            lambda value: value["profile"].update(revision=2),
+            lambda value: value["profile"].update(previous_profile_sha256="sha256:" + "a" * 64),
+            lambda value: value["profile"].update(signer_did=S.public_did(bytes(32))),
+            lambda value: value["profile"]["default_conversation"].update(grant_cid=S.raw_cid(b"other grant")),
+            lambda value: value["default_conversation_grant"].update(sender_service="home"),
+            lambda value: value["default_conversation_grant"].update(admission_policy="open"),
+            lambda value: value["default_conversation_grant"].update(conversation_id="another-room"),
+        ]:
+            self.community_manifest = copy.deepcopy(original)
+            change(self.community_manifest)
+            self.approve_community_input()
+            backend = mock.Mock()
+            with self.subTest(input=self.community_manifest), self.assertRaises(ValueError):
+                self.prepare_community()
+            backend.assert_not_called()
+            self.assertFalse(self.marker.exists())
+
+    def test_community_hashes_topology_and_bounds_are_operator_owned(self):
+        self.community_input()
+        original = copy.deepcopy(self.community_manifest)
+        policy = copy.deepcopy(self.policy)
+        # A builder can change its manifest, but cannot approve payload/grant hashes.
+        for change in [
+            lambda value: value["profile"]["bootstrap_peers"][0].update(node_id="0" * 64),
+            lambda value: value["profile"].update(bootstrap_peers=[]),
+            lambda value: value["profile"]["bootstrap_peers"].extend(value["profile"]["bootstrap_peers"] * 16),
+            lambda value: value["profile"]["bootstrap_peers"].extend(copy.deepcopy(value["profile"]["bootstrap_peers"])),
+            lambda value: value["profile"]["bootstrap_peers"][0].update(connect_ticket="a" * (8 * 1024 + 1)),
+        ]:
+            self.community_manifest = copy.deepcopy(original)
+            change(self.community_manifest)
+            self.approve_community_input()
+            with self.subTest(input=self.community_manifest), self.assertRaises(ValueError):
+                self.prepare_community()
+        self.community_manifest = original
+        self.policy = copy.deepcopy(policy)
+        self.approve_community_input()
+        for field in ("profile_payload_sha256", "default_conversation_grant_sha256"):
+            self.policy["community_profile"][field] = "0" * 64
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "hash differs"):
+                self.prepare_community()
+            self.policy = copy.deepcopy(policy)
+        self.policy["max_snapshot_bytes"] = 1
+        with self.assertRaisesRegex(ValueError, "quota"):
+            self.prepare_community()
+
+    def test_community_refuses_a_second_bootstrap_peer_even_when_approved(self):
+        self.community_input()
+        node = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+        ticket = S.json_bytes({"endpoints": [{"id": node, "addrs": []}], "topic": None})
+        self.community_manifest["profile"]["bootstrap_peers"].append({
+            "node_id": node, "connect_ticket": base64.b32encode(ticket).decode().lower().rstrip("="),
+        })
+        self.policy["community_profile"]["profile_payload_sha256"] = S.sha256(S.json_bytes(self.community_manifest["profile"]))
+        self.approve_community_input()
+        # Release preparation's Runtime verifier names exactly one peer, so the signer refuses what prepare would block.
+        with self.assertRaisesRegex(ValueError, "exactly one bootstrap peer"):
+            self.prepare_community()
+
+    def test_community_prompt_names_what_is_signed_and_cancel_precedes_key_use(self):
+        prompts = []
+        for conversation in ("community-room", "other-room"):
+            self.community_input()
+            grant = self.community_manifest["default_conversation_grant"]
+            grant["conversation_id"] = conversation
+            self.community_manifest["profile"]["default_conversation"] = {"grant_cid": S.raw_cid(S.json_bytes(grant))}
+            self.policy["community_profile"].update(
+                conversation_id=conversation, default_conversation_grant_sha256=S.sha256(S.json_bytes(grant)),
+                profile_payload_sha256=S.sha256(S.json_bytes(self.community_manifest["profile"])))
+            self.approve_community_input()
+            policy_path = self.base / f"policy-{conversation}.json"
+            policy_path.write_bytes(S.json_bytes(self.policy))
+            output = self.base / f"output-{conversation}"
+            argv = [str(SOURCE), "--operation", "community-profile", "--manifest", "community-profile-input.json",
+                    "--policy", str(policy_path), "--input-root", str(self.root), "--output-root", str(output)]
+            prompt = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(S, "pinned_tools"), \
+                 mock.patch.object(S, "github_json", side_effect=self.fetch), \
+                 mock.patch.object(sys, "stdin", io.StringIO("\n")), mock.patch.object(sys, "stderr", prompt), \
+                 mock.patch.object(S, "OpenSSLBackend") as backend:
+                with self.assertRaisesRegex(ValueError, "signing cancelled"):
+                    S.main()
+            backend.assert_not_called()
+            self.assertFalse(output.exists())
+            text = prompt.getvalue()
+            profile = self.community_manifest["profile"]
+            for fact in ("network fixture-community", f"conversation {conversation}", "revision 1", DID,
+                         f"bootstrap node {PUBLIC.hex()}", S.sha256(S.json_bytes(profile)), S.sha256(S.json_bytes(grant))):
+                self.assertIn(fact, text)
+            prompts.append(text)
+        self.assertNotEqual(prompts[0], prompts[1])
+
+    def test_community_foreign_custody_and_input_refusals_use_no_backend(self):
+        self.community_input()
+        policy_path = self.base / "operator-policy.json"
+        policy_path.write_bytes(S.json_bytes(self.policy))
+        output = self.base / "community-publication"
+        argv = [str(SOURCE), "--operation", "community-profile", "--manifest", "community-profile-input.json",
+                "--policy", str(policy_path), "--input-root", str(self.root), "--output-root", str(output)]
+        for case in ("cancel", "policy-operation", "policy-in-input", "manifest-tamper", "manifest-symlink"):
+            arguments = list(argv)
+            policy = copy.deepcopy(self.policy)
+            if case == "policy-operation":
+                policy["operation"] = "release"
+            policy_path.write_bytes(S.json_bytes(policy))
+            if case == "policy-in-input":
+                inside = self.root / "operator-policy.json"
+                inside.write_bytes(S.json_bytes(policy))
+                arguments[arguments.index("--policy") + 1] = str(inside)
+            self.approve_community_input()
+            manifest_path = self.root / "community-profile-input.json"
+            if case == "manifest-tamper":
+                manifest_path.write_bytes(b"unapproved bytes")
+            if case == "manifest-symlink":
+                manifest_path.unlink()
+                manifest_path.symlink_to(policy_path)
+            with self.subTest(case=case), mock.patch.object(sys, "argv", arguments), \
+                 mock.patch.object(S, "pinned_tools"), mock.patch.object(S, "github_json", side_effect=self.fetch), \
+                 mock.patch.object(sys, "stdin", io.StringIO("\n")), mock.patch.object(sys, "stderr", io.StringIO()), \
+                 mock.patch.object(S, "OpenSSLBackend") as backend:
+                with self.assertRaises((ValueError, OSError)):
+                    S.main()
+                backend.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertFalse(self.marker.exists())
+            if manifest_path.is_symlink():
+                manifest_path.unlink()
+
+    def test_cli_refuses_cross_operation_arguments_and_policy_before_key_use(self):
+        self.community_input()
+        policy_path = self.base / "operator-policy.json"
+        output = self.base / "refused-publication"
+        base = [str(SOURCE), "--policy", str(policy_path), "--input-root", str(self.root),
+                "--output-root", str(output)]
+        cases = (
+            ("combined operations", ["--operation", "community-profile", "--model-catalog", "payload.json"],
+             self.policy, "cannot be combined"),
+            ("Community policy for catalogue", ["--model-catalog", "payload.json"],
+             self.policy, "policy operation differs"),
+            ("Community policy for release", [], self.policy, "policy operation differs"),
+            ("release policy for Community", ["--operation", "community-profile"],
+             dict(self.policy, operation="release"), "policy operation differs"),
+        )
+        for name, options, policy, detail in cases:
+            policy_path.write_bytes(S.json_bytes(policy))
+            with self.subTest(case=name), mock.patch.object(sys, "argv", base + options), \
+                 mock.patch.object(S, "pinned_tools") as tools, \
+                 mock.patch.object(S, "github_json") as remote, \
+                 mock.patch.object(S, "OpenSSLBackend") as backend, \
+                 mock.patch.object(S, "regular_bytes", wraps=S.regular_bytes) as reads, \
+                 self.assertRaisesRegex(ValueError, detail):
+                S.main()
+            tools.assert_not_called()
+            remote.assert_not_called()
+            backend.assert_not_called()
+            self.assertEqual(reads.call_count, 0 if name == "combined operations" else 1)
+            self.assertFalse(output.exists())
+            self.assertFalse(any(path.name.startswith(".elastos-signing-") for path in self.base.iterdir()))
+
+    def test_community_cli_confirms_its_subject_and_writes_only_approved_outputs(self):
+        self.community_input()
+        policy_path = self.base / "operator-policy.json"
+        policy_path.write_bytes(S.json_bytes(self.policy))
+        output = self.base / "community-publication"
+        argv = [str(SOURCE), "--operation", "community-profile", "--manifest", "community-profile-input.json",
+                "--policy", str(policy_path), "--input-root", str(self.root), "--output-root", str(output)]
+        backend = FakeBackend()
+        prompt = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(S, "pinned_tools"), \
+             mock.patch.object(S, "github_json", side_effect=self.fetch), \
+             mock.patch.object(sys, "stdin", io.StringIO(DID + "\n")), \
+             mock.patch.object(sys, "stderr", prompt), mock.patch("builtins.print"), \
+             mock.patch.object(S, "OpenSSLBackend", return_value=backend):
+            S.main()
+        self.assertIn("approved initial Community profile", prompt.getvalue())
+        self.assertEqual({path.name for path in output.iterdir()}, {
+            "collaboration-network-release-v1.json", "collaboration-network-release-pin-v1.json"})
+        config_bytes = (output / "collaboration-network-release-v1.json").read_bytes()
+        config = S.parse_json(config_bytes)
+        envelope = S.parse_json(base64.b64decode(config["profile_chain_base64"][0], validate=True))
+        self.assertEqual(envelope["payload"], self.community_manifest["profile"])
+        pin = S.parse_json((output / "collaboration-network-release-pin-v1.json").read_bytes())
+        self.assertEqual(pin["collaboration_network"]["head_cid"], S.raw_cid(config_bytes))
+        digest = hashlib.sha256(S.COMMUNITY_PROFILE_DOMAIN.encode() + b"\0"
+                                + S.json_bytes(self.community_manifest["profile"])).digest()
+        self.assertEqual([call for call in backend.calls if isinstance(call, tuple) and call[0] == "sign"], [("sign", digest)])
+        self.assertEqual(backend.calls[-1], "close")
+        for path in output.iterdir():
+            self.assertEqual(path.stat().st_mode & 0o777, 0o444)
+
+    def test_community_key_mismatch_or_failed_public_verification_produces_no_output(self):
+        self.community_input()
+        prepared = self.prepare_community()
+        for field, value in (("public", bytes(32)), ("verified", False), ("signature", b"short")):
+            backend = FakeBackend()
+            setattr(backend, field, value)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                S.sign_community_profile(prepared, backend)
+            if field == "public":
+                self.assertFalse(any(isinstance(call, tuple) and call[0] == "sign" for call in backend.calls))
+
+    def test_community_key_path_stays_outside_candidate_custody(self):
+        self.community_input()
+        self.policy["key_path"] = str(self.root / "elastos")
+        self.policy["openssl"] = {"path": "/custodian/pinned/openssl"}
+        with mock.patch.object(S.OpenSSLBackend, "run") as process:
+            with self.assertRaisesRegex(ValueError, "custodian key must be outside input root"):
+                S.OpenSSLBackend(self.policy, self.root, self.snapshot)
+            process.assert_not_called()
+        self.assertFalse(self.marker.exists())
 
     def reapprove_components(self, components):
         self.platform_components["x86_64-linux"] = components

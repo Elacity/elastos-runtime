@@ -62,6 +62,21 @@ function fixture(t, changes = {}) {
     config.trees[github] = { sha: github, truncated: false, tree: [entry('workflows', 'tree', workflows)] };
     config.trees[workflows] = { sha: workflows, truncated: false, tree: [entry('release-package.yml', 'blob', blob)] };
   }
+  // The darwin package Runtime answers the key-free Community verifier like the real one.
+  const runtime = `#!${process.execPath}
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const c = JSON.parse(fs.readFileSync(${JSON.stringify(join(root, 'config.json'))}));
+const args = process.argv.slice(2);
+fs.appendFileSync(c.root + '/runtime.jsonl', JSON.stringify({ args, home: process.env.HOME }) + '\\n');
+if (args.join(' ') !== 'collaboration-config verify --input ' + args[3]) process.exit(2);
+if (c.runtimeRefuses) { console.error('profile signer is not trusted'); process.exit(1); }
+const bytes = fs.readFileSync(args[3]);
+const config = JSON.parse(bytes);
+console.log(JSON.stringify({ schema: 'elastos.collaboration.operator-receipt/v1', network_id: config.expected_network_id,
+  signer_did: c.runtimeSigner || config.trusted_profile_signer_dids[0],
+  config_sha256: 'sha256:' + crypto.createHash('sha256').update(bytes).digest('hex') }));
+`;
   for (const [index, platform] of (changes.ciOnly ? [] : platforms.entries())) {
     const input = join(root, platform, 'inputs');
     mkdirSync(input, { recursive: true });
@@ -70,7 +85,9 @@ function fixture(t, changes = {}) {
       mkdirSync(join(dir, 'artifacts'), { recursive: true });
       const receipt = { schema: 'elastos.release-platform-input/v1', platform, version, source: { commit, tree, clean: true }, ...changes[platform] };
       writeFileSync(join(dir, 'platform-input.json'), JSON.stringify(receipt));
-      writeFileSync(join(dir, 'artifacts', `elastos-${platform}`), `${platform}-${version}`);
+      const verifier = platform === 'aarch64-darwin' && changes.network;
+      writeFileSync(join(dir, 'artifacts', `elastos-${platform}`), verifier ? runtime : `${platform}-${version}`,
+        verifier ? { mode: 0o755 } : {});
       writeFileSync(join(dir, 'components.json'), JSON.stringify({ schema: 'elastos.components/v1', external: {} }));
       writeFileSync(join(dir, 'artifacts', 'shared.tar.gz'), 'shared bytes');
       if (platform === 'aarch64-darwin') {
@@ -224,7 +241,19 @@ fs.writeFileSync(process.env.ARGUMENT_LOG, JSON.stringify(args));
 fs.writeFileSync(process.env.ARGUMENT_LOG + '.delivery', JSON.stringify({ gateway: process.env.ELASTOS_PUBLISHER_GATEWAY, ipns: process.env.ELASTOS_IPNS_NAME }));
 const output = args[args.indexOf('--prepare-only') + 1];
 fs.mkdirSync(output, { recursive: true });
-fs.writeFileSync(output + '/signing-input.json', JSON.stringify({ source: { commit: '${commit}', tree: '${tree}' }, files: [{ size: 1 }], installer: { stamps: ${JSON.stringify(delivery)} } }));
+const c = JSON.parse(fs.readFileSync(${JSON.stringify(join(root, 'config.json'))}));
+const platforms = args.flatMap((arg, i) => arg === '--platform-input' ? [args[i + 1].split('=')[0]] : []);
+const files = {};
+const put = (name, bytes) => {
+  fs.writeFileSync(output + '/' + name, bytes);
+  files[name] = { size: bytes.length, sha256: require('node:crypto').createHash('sha256').update(bytes).digest('hex') };
+};
+// The approved source's components.json pin and release copy, as the package build carries them.
+for (const p of platforms) put('components-' + p + '.json', Buffer.from(JSON.stringify(Object.assign(
+  { schema: 'elastos.components/v1', external: {} }, c.network ? { collaboration_network: c.network.pin } : {}))));
+if (c.network) put('collaboration-network-release-v1.json', Buffer.from(c.network.file));
+fs.writeFileSync(output + '/signing-input.json', JSON.stringify({ source: { commit: '${commit}', tree: '${tree}' }, files,
+  release: { platforms: Object.fromEntries(platforms.map(p => [p, {}])) }, installer: { stamps: ${JSON.stringify(delivery)} } }));
 `, { mode: 0o755 });
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FIXTURE_CONFIG: join(root, 'config.json'),
     RELEASE_WORK: join(root, 'work'), RELEASE_ORIGIN: 'https://fixture.invalid',
@@ -755,3 +784,104 @@ for (const data of ['relative/elastos', '/srv/elastos-data', '/srv/elastos/']) {
     }
   });
 }
+
+// The custodian community-profile output: the startup file and its release pin fragment.
+const rawCid = bytes => {
+  const bits = [...Buffer.concat([Buffer.from([1, 0x55, 0x12, 0x20]), createHash('sha256').update(bytes).digest()])]
+    .map(byte => byte.toString(2).padStart(8, '0')).join('');
+  return 'b' + bits.match(/.{1,5}/g).map(group => 'abcdefghijklmnopqrstuvwxyz234567'[parseInt(group.padEnd(5, '0'), 2)]).join('');
+};
+const otherDid = 'did:key:z6MkiTBz1ymuepAQ4HEHYSF1H8quG5GLVVQR3djdX3mDooWp';
+function communityOutput(networkId = 'fixture-community', signers = [did]) {
+  const file = JSON.stringify({ schema: 'elastos.collaboration-network.startup-config/v1', expected_network_id: networkId,
+    trusted_profile_signer_dids: signers, profile_chain_base64: ['Zml4dHVyZQ=='], default_conversation_grant_base64: 'Z3JhbnQ=' });
+  return { file, pin: { head_cid: rawCid(Buffer.from(file)), expected_network_id: networkId, trusted_profile_signer_dids: signers } };
+}
+function custodianDir(f, { file, pin }, extra = false) {
+  const dir = join(f.root, 'community-output');
+  mkdirSync(dir, { mode: 0o700 });
+  writeFileSync(join(dir, 'collaboration-network-release-v1.json'), file, { mode: 0o444 });
+  writeFileSync(join(dir, 'collaboration-network-release-pin-v1.json'), JSON.stringify({ collaboration_network: pin }), { mode: 0o444 });
+  if (extra) writeFileSync(join(dir, 'notes.txt'), 'operator notes', { mode: 0o444 });
+  return dir;
+}
+const runtimeCalls = f => existsSync(join(f.root, 'runtime.jsonl'))
+  ? readFileSync(join(f.root, 'runtime.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) : [];
+
+test('prepare names no Community network when neither the source nor the operator names one', t => {
+  const f = fixture(t);
+  const result = f.prepare('1.2.3', ['aarch64-darwin']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Community: this release names no network\./);
+  assert.equal(existsSync(join(f.root, 'work/1.2.3/unsigned/collaboration-network-release-v1.json')), false);
+  assert.deepEqual(runtimeCalls(f), []);
+});
+
+test('prepare admits the custodian Community output the approved source pins and verifies it with the release Runtime', t => {
+  const output = communityOutput();
+  const f = fixture(t, { network: output });
+  const result = f.prepare('1.2.3', [], { RELEASE_COMMUNITY_DIR: custodianDir(f, output) });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, new RegExp(`names network fixture-community \\(head ${output.pin.head_cid}\\), profile signer ${did}, verified by the release Runtime`));
+  const unsigned = join(f.root, 'work/1.2.3/unsigned');
+  assert.equal(readFileSync(join(unsigned, 'collaboration-network-release-v1.json'), 'utf8'), output.file);
+  for (const platform of platforms) {
+    assert.deepEqual(JSON.parse(readFileSync(join(unsigned, `components-${platform}.json`))).collaboration_network, output.pin);
+  }
+  const calls = runtimeCalls(f);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args.slice(0, 3), ['collaboration-config', 'verify', '--input']);
+  assert.equal(calls[0].home, join(f.root, 'work/1.2.3/community/home'));
+  assert.equal(readFileSync(calls[0].args[3], 'utf8'), output.file);
+});
+
+// A refused admission leaves the input without package provenance, which the signer refuses, and policy stops.
+function assertUnsignable(f) {
+  const manifest = JSON.parse(readFileSync(join(f.root, 'work/1.2.3/unsigned/signing-input.json')));
+  assert.equal('provenance' in manifest, false);
+  const policy = spawnSync('bash', [f.script, 'policy', '1.2.3', '/fixture/signer.py', '/fixture/key', '/fixture/openssl'],
+    { encoding: 'utf8', env: f.env });
+  assert.notEqual(policy.status, 0);
+  assert.match(policy.stderr, /prepare 1\.2\.3 did not finish/);
+}
+
+for (const [label, source, custodian, changes, error, verified] of [
+  ['the source pins a network but no custodian output is named', communityOutput(), null, {}, /set RELEASE_COMMUNITY_DIR/, false],
+  ['custodian output is named but the source pins no network', null, communityOutput(), {}, /pins no Community network/, false],
+  ['the custodian file changed after signing', communityOutput(),
+    { ...communityOutput(), file: communityOutput().file.replace('fixture-community', 'fixture-communitx') }, {},
+    /Community network head differs from its file/, false],
+  ['the source pins another signed network', communityOutput('other-community'), communityOutput(), {},
+    /pins another Community network than the custodian output/, false],
+  ['the custodian pin names another network ID', communityOutput(),
+    { ...communityOutput(), pin: { ...communityOutput().pin, expected_network_id: 'other-community' } }, {},
+    /Community network ID differs from the release pin/, false],
+  ['the custodian pin names another network signer', communityOutput(),
+    { ...communityOutput(), pin: { ...communityOutput().pin, trusted_profile_signer_dids: [otherDid] } }, {},
+    /Community signer set differs from the release pin/, false],
+  ['the release Runtime refuses the profile signature', communityOutput(), communityOutput(), { runtimeRefuses: true },
+    /release Runtime refused the Community network: profile signer is not trusted/, true],
+  ['the release Runtime verifies a profile signer outside the pin', communityOutput(), communityOutput(), { runtimeSigner: otherDid },
+    /release Runtime verified another Community network than the release pin/, true],
+]) {
+  test(`prepare refuses Community admission when ${label}`, t => {
+    const f = fixture(t, { ...(source ? { network: source } : {}), ...changes });
+    const result = f.prepare('1.2.3', ['aarch64-darwin'], custodian ? { RELEASE_COMMUNITY_DIR: custodianDir(f, custodian) } : {});
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, error);
+    assert.match(result.stderr, /Community network admission refused/);
+    assert.equal(runtimeCalls(f).length, verified ? 1 : 0);
+    assert.doesNotMatch(result.stdout, /Unsigned input:/);
+    assertUnsignable(f);
+  });
+}
+
+test('prepare refuses a custodian directory that holds other files', t => {
+  const output = communityOutput();
+  const f = fixture(t, { network: output });
+  const result = f.prepare('1.2.3', ['aarch64-darwin'], { RELEASE_COMMUNITY_DIR: custodianDir(f, output, true) });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /holding exactly collaboration-network-release-v1.json and collaboration-network-release-pin-v1.json/);
+  assert.deepEqual(runtimeCalls(f), []);
+  assertUnsignable(f);
+});

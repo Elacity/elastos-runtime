@@ -127,7 +127,8 @@ configuration with the same validator Runtime startup uses. Runtime startup
 itself still reads only `collaboration-network-v1.json`.
 
 The release delivers that file the same way it delivers `model-catalog.json`.
-Release staging and the custodian signer bind it to the pin, and release
+Release staging binds it to the pin, the custodian signer also requires the
+pin's network ID and signer set to equal the file's, and release
 publication admits it only when its bytes match the pin and pass the startup
 validator. Installed setup fetches the exact pinned CID from the trusted source
 over Carrier, with the startup configuration's 3 MiB byte bound checked before
@@ -185,9 +186,10 @@ and its configuration bytes that a release then pins.
 
 ## Operator provisioning
 
-`elastos collaboration-config` is the only repository tool that creates this
-startup file and is never called by the installer or Runtime. Key creation,
-profile generation, and verification are offline. The separate explicit local
+`elastos collaboration-config` creates fixture startup files and verifies exact
+candidate files. The offline custodian creates production startup files through
+the initial-profile operation below. Key creation, profile generation, and
+verification are offline. The separate explicit local
 bootstrap export attaches only to the selected running Runtime. The
 configuration authority is the signer explicitly named in
 `trusted_profile_signer_dids`. Runtime device, Carrier, Wallet, passkey, and
@@ -196,15 +198,89 @@ user-message authority keep their own identities and checks.
 The production Community network's profile signer is the release maintainer
 DID. Runtime checks each signing role separately: the signed release pins the
 file's CID and its signer set, and profile signatures use their own domain,
-`elastos.collaboration-network.profile.v1`. Production profiles are signed by
-the approved offline release custodian outside CI; that custodian operation is
-prepared when this network ships.
+`elastos.collaboration-network.profile.v1`. The approved offline release
+custodian signs production profiles outside CI.
 
 The existing release-signing interface, `scripts/release-signer.py`, uses the
 custodian's Ed25519 PEM key through OpenSSL. The `collaboration-config` file
 interface accepts an owner-only raw 32-byte Ed25519 key for the disposable test
 and fixture networks below. Production keys stay in their existing custody
 workflow.
+
+### Initial production profile
+
+The custodian runs the installed, reviewed `release-signer.py` with
+`--operation community-profile`. This operation supports revision 1 with no
+previous profile hash. Later chain revisions need their own reviewed operation.
+It signs the exact approved profile through the existing maintainer PEM and
+publicly verifies the signature before writing a new read-only output set.
+The release/head signing operation keeps its existing domain checks.
+
+Prepare inert `community-profile-input.json` with these exact fields:
+`schema` (`elastos.collaboration-network.signing-input/v1`), `source`
+(`commit`, `tree`), `domain` (`elastos.collaboration-network.profile.v1`),
+`profile` (the unsigned profile schema above), `default_conversation_grant`
+(the canonical grant), and `trusted_profile_signer_dids` (the approved set).
+The profile names the existing maintainer DID, exactly one approved bootstrap
+receipt (release preparation verifies the file with the Runtime's operator
+receipt, which names one peer), and the raw CID of that grant. The grant names
+the same network, the approved conversation, sender service `chat`, and policy
+`profile_scoped_signer`. Before the DID prompt the signer shows the network,
+conversation, revision, signer set, bootstrap node and its ticket addresses,
+and the payload and grant hashes.
+The bootstrap Runtime and its placement are explicit operator inputs; an
+artifact host has its own installation role.
+
+The protected custodian policy retains the source, interpreter, tool, OpenSSL,
+PEM path, and file/total quotas described in the
+[release signer instructions](../scripts/README.md#signing-and-publication-ownership).
+Set `operation` to `community-profile` and `manifest_sha256` to the exact input
+file hash. Its `community_profile` object has these exact fields:
+
+- `expected_network_id` and `conversation_id`: the approved identifiers.
+- `revision`: `1`; `previous_profile_sha256`: `null`.
+- `trusted_profile_signer_dids`: the same explicit signer set as the input.
+- `profile_payload_sha256`: SHA-256 of the canonical unsigned profile bytes.
+- `default_conversation_grant_sha256`: SHA-256 of the canonical grant bytes.
+
+Canonical bytes use sorted object keys, compact UTF-8 JSON, and no trailing
+newline. Keep this policy outside the candidate input directory. It approves
+the unsigned inputs before the final Community file CID or release manifest
+exists. Run the installed tool with a clean environment and confirm the
+complete maintainer DID at its prompt:
+
+```sh
+env -i /path/to/pinned-python -I -S /path/to/installed-release-signer.py \
+  --operation community-profile --manifest community-profile-input.json \
+  --policy /path/to/approved-community-policy.json \
+  --input-root /path/to/unsigned-community-input \
+  --output-root /path/to/new-community-output
+```
+
+The output contains `collaboration-network-release-v1.json` and
+`collaboration-network-release-pin-v1.json`. The latter supplies the
+`collaboration_network` fragment for the components manifest, with the exact
+startup-file CID, network ID and signer set. The tool checks ticket bounds,
+canonical encoding and node binding. The reviewed, key-free Runtime verifier
+checks complete transport semantics before the output goes into the source.
+It reads only owner-only files, and the signer writes read-only (`0444`)
+outputs, so check an owner-only copy:
+
+```text
+install -d -m 700 /path/to/check
+install -m 600 /path/to/new-community-output/collaboration-network-release-v1.json /path/to/check/
+elastos collaboration-config verify \
+  --input /path/to/check/collaboration-network-release-v1.json
+```
+
+The release then carries the output like `model-catalog.json`: a reviewed
+pull request puts the startup file at the repository root and the pin
+fragment's `collaboration_network` object in `components.json`, and release
+preparation binds that source pin to this exact output through
+`RELEASE_COMMUNITY_DIR` and runs the package's own Runtime verifier
+([Publishing a release](VERSIONING.md#publishing-a-release)). Profile signing
+creates inert files; publication and activation use their own explicit
+operator approval.
 
 For an isolated test fixture, create a disposable authority key as a separate
 explicit action. Give the fixture an owner and cleanup condition, keep its trust

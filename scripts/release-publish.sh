@@ -23,6 +23,8 @@
 # RELEASE_APPROVAL names a pre-existing operator-owned approval outside RELEASE_WORK.
 # It pins source H, trusted builder W/tree/ref, the public delivery tuple and gh.
 # Historical packages need a new attested build; this tool creates no approval.
+# RELEASE_COMMUNITY_DIR (prepare) names the custodian's community-profile output
+# for the Community network the approved source pins; unset, the release names none.
 set -euo pipefail
 umask 077
 
@@ -140,6 +142,11 @@ prepare() {
     done
     [[ "$seen" == *" aarch64-darwin "* ]] || die "operator Mac inputs must include aarch64-darwin"
     need_env RELEASE_SEED RELEASE_SEED_DATA
+    local community=()
+    if [[ -n "${RELEASE_COMMUNITY_DIR:-}" ]]; then
+        [[ -d "$RELEASE_COMMUNITY_DIR" ]] || die "RELEASE_COMMUNITY_DIR is not a directory: $RELEASE_COMMUNITY_DIR"
+        community=(--community "$(realpath "$RELEASE_COMMUNITY_DIR")")
+    fi
     approval_json=$(provenance approval) || die "independent approval refused"
     checked_update_pin "$run" "$version" "$(jq -r .source.commit <<< "$approval_json")"
     run_attempt=$(provenance run --run "$run") || die "package producer refused"
@@ -223,6 +230,11 @@ prepare() {
         scripts/publish-release.sh --version "$version" --channel canary \
         --prepare-only "$work/unsigned" --publisher-did "$did" \
         "${args[@]}")
+    # The release names the Community network the source pins only with its signed custodian output.
+    # This runs before bind: the signer refuses an input without bound package provenance.
+    provenance community --work "$work" ${community[@]+"${community[@]}"} \
+        --runtime "$work/inputs/aarch64-darwin/$name/artifacts/elastos-aarch64-darwin" \
+        || die "Community network admission refused"
     provenance bind --work "$work" || die "unsigned input differs from approved source/delivery"
     echo "Unsigned input: $work/unsigned (signing-input.json sha256 $(sha "$work/unsigned/signing-input.json"))"
 }
@@ -232,6 +244,8 @@ policy() {
     local work input python signer key openssl develop approval_json approval_sha256
     work=$(work_dir "$1") input="$(work_dir "$1")/unsigned"
     [[ -f "$input/signing-input.json" ]] || die "prepare $1 first"
+    # Bind is prepare's last step; an unbound input means prepare refused or stopped.
+    jq -e '.provenance' "$input/signing-input.json" > /dev/null || die "prepare $1 did not finish; remove $work and prepare again"
     approval_json=$(provenance approval) || die "independent approval refused"
     approval_sha256=$(jq -r .sha256 <<< "$approval_json")
     [[ "$(jq -r '[.approval.path, .approval.sha256] | join(" ")' "$work/run.json")" == "$RELEASE_APPROVAL $approval_sha256" ]] \
@@ -394,5 +408,5 @@ command="${1:-}"
 case "$command" in
     prepare|policy|seed) shift; "$command" "$@" ;;
     seed-upgrade) shift; seed_upgrade "$@" ;;
-    *) sed -n '2,25p' "${BASH_SOURCE[0]}"; exit 2 ;;
+    *) sed -n '2,27p' "${BASH_SOURCE[0]}"; exit 2 ;;
 esac

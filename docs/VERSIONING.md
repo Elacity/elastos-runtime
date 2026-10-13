@@ -175,6 +175,13 @@ writes `model-catalog.json` and prints its CID.
 `publisher_dids` (the signing DID) and `local_use` (`max_cache_bytes` 8 GiB, `max_model_memory_bytes` 4 GiB).
 Keep that head stable across releases: a new head means every admitted model needs Use again.
 
+The Community network travels the same way. The custodian signs its initial profile with
+`release-signer.py --operation community-profile` ([COLLABORATION_NETWORK_PROFILE.md](COLLABORATION_NETWORK_PROFILE.md#initial-production-profile)),
+which writes `collaboration-network-release-v1.json` and `collaboration-network-release-pin-v1.json`. Put the first at the
+repository root and merge the second's `collaboration_network` object into `components.json` through a reviewed pull request,
+then build the package. At prepare, set `RELEASE_COMMUNITY_DIR` to that signed output directory (canonical, owner-only, those
+two files only). Without it the release names no network, and prepare refuses a source that pins one.
+
 Before preparing a release, the operator creates an approval file in a protected
 directory outside the candidate inputs and `RELEASE_WORK`. Set `RELEASE_APPROVAL`
 to its canonical absolute path. The directory and file belong to the operator
@@ -269,7 +276,12 @@ a SHA-256 pin. It supports the attestation verification flags used by the signer
    a worktree, takes Kubo from the Mac build, checks the public bootstrap against
    the independent delivery approval, copies the seed's
    current `publish-state.json` and runs `scripts/publish-release.sh
-   --prepare-only` in an isolated data directory.
+   --prepare-only` in an isolated data directory. It then binds the Community
+   network: with `RELEASE_COMMUNITY_DIR`, the custodian's pin must equal the
+   source pin and name the exact startup-file bytes, network ID and signer set
+   the release carries, and the package's own `aarch64-darwin` Runtime must
+   accept the file with `elastos collaboration-config verify`; the signer
+   refuses a pin whose file, network ID or signer set differ.
 3. **Sign.** `scripts/release-publish.sh policy VERSION SIGNER KEY OPENSSL`
    writes the exact signer policy (with the current `develop` head and the
    independent approval file's path and SHA-256) and prints the `release-signer.py`
@@ -291,7 +303,11 @@ a SHA-256 pin. It supports the attestation verification flags used by the signer
    hash, stop the service, run the preflight, import, and start the service.
    The import sends no gossip. Older seed Runtimes still print `No running
    runtime found` after the commit; that is expected, and the sequence accepts
-   only that error. Releases from 0.8.0 list per-capsule records
+   only that error. The seed's Runtime admits only release files it knows: the
+   first release that carries `collaboration-network-release-v1.json` needs a
+   seed Runtime with Community network admission, so run `seed-upgrade` from a
+   package that has it before this import; an older seed Runtime's preflight
+   refuses the file before it imports anything. Releases from 0.8.0 list per-capsule records
    (`capsule_records`, each `elastos.capsule.record/v1` signed under its own
    domain `elastos.capsule.record.v1`). `release-signer.py` derives one record
    per released archive from the verified components and signs it; a record

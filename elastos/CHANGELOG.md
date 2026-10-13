@@ -24,6 +24,12 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Developer detail
 
+- A release names the Community network only when the approved source pins it
+  and `scripts/release-publish.sh prepare` gets `RELEASE_COMMUNITY_DIR`, the
+  custodian's `community-profile` output for exactly that pin; the package's
+  own Runtime verifies the file before signing, and prepare refuses a source
+  pin without that output. The release signer refuses a Community pin whose
+  network ID or signer set differ from its file.
 - `scripts/release-publish.sh seed` and `seed-upgrade` require `RELEASE_SEED_DATA`
   to end in `/elastos` and export `XDG_DATA_HOME` as its parent, because the
   Runtime reads `$XDG_DATA_HOME/elastos`; the seed script checks the saved

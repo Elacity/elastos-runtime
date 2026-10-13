@@ -42,6 +42,11 @@ use, writes canonical model-catalog.json and prints its raw CID (model_catalog.h
 
 This code neither builds candidates nor runs candidate tools. Production custody,
 real signing and installer integration require separate operator acceptance.
+
+The explicit community-profile operation signs one approved initial Community
+profile before its startup-file CID enters a release manifest. Its separate
+policy pins the canonical payload and grant hashes, network, conversation,
+revision and signer set. The existing maintainer PEM stays with OpenSSL.
 """
 
 import argparse
@@ -79,6 +84,13 @@ PACKAGE_WORKFLOW = ".github/workflows/release-package.yml"
 PACKAGE_REF = "refs/heads/develop"
 APPROVAL_SCHEMA = "elastos.release.approval/v1"
 PROVENANCE_SCHEMA = "elastos.release.provenance/v1"
+COMMUNITY_PROFILE_DOMAIN = "elastos.collaboration-network.profile.v1"
+COMMUNITY_PROFILE_SCHEMA = "elastos.collaboration-network.profile/v1"
+COMMUNITY_INPUT_SCHEMA = "elastos.collaboration-network.signing-input/v1"
+COMMUNITY_STARTUP_SCHEMA = "elastos.collaboration-network.startup-config/v1"
+COMMUNITY_GRANT_SCHEMA = "elastos.collaboration.default-conversation-grant/v1"
+MAX_COMMUNITY_PROFILE_BYTES = 64 * 1024
+MAX_COMMUNITY_GRANT_BYTES = 8 * 1024
 MODEL_CATALOG_DOMAIN = "elastos.model.catalog.v1"
 MODEL_CATALOG_SCHEMA = "elastos.model.catalog/v1"
 MAX_MODEL_CATALOG = 128 * 1024
@@ -833,6 +845,178 @@ class Prepared:
     capsule_records: tuple
 
 
+@dataclass(frozen=True)
+class PreparedCommunityProfile:
+    publisher_did: str
+    profile: bytes
+    grant: bytes
+    network_id: str
+    signer_dids: tuple
+
+
+def check_community_bootstrap_peer(peer):
+    require(type(peer) is dict and set(peer) == {"node_id", "connect_ticket"}, "Community bootstrap fields refused")
+    node, encoded = peer["node_id"], peer["connect_ticket"]
+    require(type(node) is str and HASH.fullmatch(node), "canonical Community node ID required")
+    require(type(encoded) is str and 0 < len(encoded) <= 8 * 1024
+            and re.fullmatch(r"[a-z2-7]+", encoded), "bounded canonical Community ticket required")
+    ticket_bytes = base64.b32decode(encoded.upper() + "=" * ((-len(encoded)) % 8))
+    require(base64.b32encode(ticket_bytes).decode().lower().rstrip("=") == encoded,
+            "Community ticket base32 differs")
+    ticket = parse_json(ticket_bytes)
+    require(set(ticket) == {"endpoints", "topic"} and ticket["topic"] is None
+            and type(ticket["endpoints"]) is list and 0 < len(ticket["endpoints"]) <= 8,
+            "Community ticket endpoints refused")
+    for endpoint in ticket["endpoints"]:
+        require(type(endpoint) is dict and set(endpoint) == {"id", "addrs"}
+                and endpoint["id"] == node and type(endpoint["addrs"]) is list,
+                "Community ticket node binding differs")
+    require(json_bytes(ticket) == ticket_bytes, "Community ticket JSON is not canonical")
+    # Transport-address semantics are checked by the key-free Runtime verifier
+    # before this exact approved output is admitted into release preparation.
+
+
+def prepare_community_profile(policy, root, manifest_name, fetch):
+    verify_source(policy, fetch)
+    require(policy.get("operation") == "community-profile", "Community policy operation required")
+    check_did(policy.get("publisher_did"))
+    approval = policy.get("community_profile")
+    require(type(approval) is dict and set(approval) == {
+        "expected_network_id", "conversation_id", "revision", "previous_profile_sha256",
+        "trusted_profile_signer_dids", "profile_payload_sha256", "default_conversation_grant_sha256",
+    }, "Community approval fields refused")
+    network = approval["expected_network_id"]
+    conversation = approval["conversation_id"]
+    require(type(network) is str and re.fullmatch(r"[a-z0-9][a-z0-9._:-]{0,127}", network), "Community network ID refused")
+    require(type(conversation) is str and re.fullmatch(r"[a-z0-9._:-]{1,128}", conversation), "Community conversation ID refused")
+    require(type(approval["revision"]) is int and approval["revision"] == 1
+            and approval["previous_profile_sha256"] is None, "only initial Community revision is supported")
+    signers = approval["trusted_profile_signer_dids"]
+    require(type(signers) is list and 0 < len(signers) <= 32
+            and all(type(signer) is str for signer in signers)
+            and len(set(signers)) == len(signers) and policy["publisher_did"] in signers,
+            "Community signer set refused")
+    for signer in signers:
+        check_did(signer)
+    for quota in ("max_file_bytes", "max_snapshot_bytes"):
+        require(type(policy.get(quota)) is int and 0 < policy[quota] < 2**63, "trusted snapshot quota required")
+    held_root = directory_fd(root)
+    try:
+        data = regular_bytes(relative_path(manifest_name), MAX_JSON, root_fd=held_root)
+    finally:
+        os.close(held_root)
+    require(len(data) <= policy["max_file_bytes"] and sha256(data) == checked_hash(policy.get("manifest_sha256")),
+            "Community input differs from operator approval")
+    manifest = parse_json(data)
+    require(set(manifest) == {"schema", "source", "domain", "profile", "default_conversation_grant", "trusted_profile_signer_dids"}
+            and manifest["schema"] == COMMUNITY_INPUT_SCHEMA and manifest["domain"] == COMMUNITY_PROFILE_DOMAIN,
+            "Community input schema/domain refused")
+    require(manifest["source"] == {field: policy[field] for field in ("commit", "tree")}
+            and manifest["trusted_profile_signer_dids"] == signers, "Community source/signer set differs")
+    profile = manifest["profile"]
+    require(type(profile) is dict and set(profile) == {
+        "schema", "network_id", "revision", "signer_did", "bootstrap_peers", "default_conversation",
+    }, "Community initial profile fields refused")
+    require(profile["schema"] == COMMUNITY_PROFILE_SCHEMA and profile["network_id"] == network
+            and type(profile["revision"]) is int and profile["revision"] == 1
+            and profile["signer_did"] == policy["publisher_did"], "Community profile identity differs")
+    peers = profile["bootstrap_peers"]
+    # Release preparation verifies the file with the Runtime's operator receipt, which names exactly
+    # one bootstrap peer; a profile it cannot verify must not be signed. More peers come later (0.8.1).
+    require(type(peers) is list and len(peers) == 1,
+            "a Community profile needs exactly one bootstrap peer (release preparation verifies one)")
+    for peer in peers:
+        check_community_bootstrap_peer(peer)
+    require(len({peer["node_id"] for peer in peers}) == len(peers)
+            and len({peer["connect_ticket"] for peer in peers}) == len(peers), "duplicate Community bootstrap route")
+    grant = manifest["default_conversation_grant"]
+    require(type(grant) is dict and set(grant) == {"schema", "network_id", "conversation_id", "sender_service", "admission_policy"}
+            and grant == {"schema": COMMUNITY_GRANT_SCHEMA, "network_id": network, "conversation_id": conversation,
+                          "sender_service": "chat", "admission_policy": "profile_scoped_signer"},
+            "Community default conversation grant differs")
+    profile_bytes, grant_bytes = json_bytes(profile), json_bytes(grant)
+    require(len(grant_bytes) <= MAX_COMMUNITY_GRANT_BYTES
+            and sha256(grant_bytes) == checked_hash(approval["default_conversation_grant_sha256"]), "Community grant hash differs")
+    require(profile["default_conversation"] == {"grant_cid": raw_cid(grant_bytes)}, "Community grant CID differs")
+    require(sha256(profile_bytes) == checked_hash(approval["profile_payload_sha256"]), "Community payload hash differs")
+    envelope = json_bytes({"payload": profile, "signature": "0" * 128, "signer_did": policy["publisher_did"]})
+    require(len(envelope) <= MAX_COMMUNITY_PROFILE_BYTES, "Community profile bytes exceed their bound")
+    prepared = PreparedCommunityProfile(policy["publisher_did"], profile_bytes, grant_bytes, network, tuple(signers))
+    publication = community_profile_publication(prepared, envelope)
+    require(all(len(data) <= policy["max_file_bytes"] for _, data in publication)
+            and sum(len(data) for _, data in publication) <= policy["max_snapshot_bytes"], "Community snapshot exceeds quota")
+    return prepared
+
+
+def community_profile_summary(prepared):
+    """What the custodian signs, shown before the DID is typed."""
+    profile, grant = parse_json(prepared.profile), parse_json(prepared.grant)
+    lines = ["approved initial Community profile",
+             f"  network {profile['network_id']}, conversation {grant['conversation_id']}, revision {profile['revision']}",
+             f"  trusted profile signers {', '.join(prepared.signer_dids)}"]
+    for peer in profile["bootstrap_peers"]:
+        encoded = peer["connect_ticket"]
+        ticket = parse_json(base64.b32decode(encoded.upper() + "=" * ((-len(encoded)) % 8)))
+        addrs = [json.dumps(addr, sort_keys=True, separators=(",", ":")) for endpoint in ticket["endpoints"] for addr in endpoint["addrs"]]
+        lines.append(f"  bootstrap node {peer['node_id']} at {', '.join(addrs) or 'no direct address'}")
+    lines += [f"  profile payload sha256 {sha256(prepared.profile)}", f"  grant sha256 {sha256(prepared.grant)}\n"]
+    return "\n".join(lines)
+
+
+def community_profile_digest(payload):
+    return hashlib.sha256(COMMUNITY_PROFILE_DOMAIN.encode() + b"\0" + payload).digest()
+
+
+def verify_community_profile_envelope(prepared, data, backend):
+    require(type(data) is bytes and 0 < len(data) <= MAX_COMMUNITY_PROFILE_BYTES, "Community envelope byte bound refused")
+    envelope = parse_json(data)
+    require(set(envelope) == {"payload", "signature", "signer_did"} and json_bytes(envelope) == data,
+            "Community envelope is not canonical")
+    require(json_bytes(envelope["payload"]) == prepared.profile
+            and envelope["signer_did"] == prepared.publisher_did
+            and public_did(backend.public_key()) == prepared.publisher_did, "Community envelope differs from approved signer/payload")
+    signature = envelope["signature"]
+    require(type(signature) is str and re.fullmatch(r"[0-9a-f]{128}", signature), "Community Ed25519 signature refused")
+    require(backend.verify(community_profile_digest(prepared.profile), bytes.fromhex(signature)) is True,
+            "Community signature public verification failed")
+
+
+def sign_community_profile(prepared, backend):
+    require(public_did(backend.public_key()) == prepared.publisher_did, "custodian public DID differs")
+    signature = backend.sign(community_profile_digest(prepared.profile))
+    require(type(signature) is bytes and len(signature) == 64, "Ed25519 signature length differs")
+    envelope = json_bytes({"payload": parse_json(prepared.profile), "signature": signature.hex(), "signer_did": prepared.publisher_did})
+    verify_community_profile_envelope(prepared, envelope, backend)
+    return community_profile_publication(prepared, envelope)
+
+
+def community_profile_publication(prepared, envelope):
+    config = json_bytes({"schema": COMMUNITY_STARTUP_SCHEMA, "expected_network_id": prepared.network_id,
+                         "trusted_profile_signer_dids": list(prepared.signer_dids),
+                         "profile_chain_base64": [base64.b64encode(envelope).decode()],
+                         "default_conversation_grant_base64": base64.b64encode(prepared.grant).decode()})
+    pin = json_bytes({"collaboration_network": {"head_cid": raw_cid(config), "expected_network_id": prepared.network_id,
+                                             "trusted_profile_signer_dids": list(prepared.signer_dids)}})
+    return (("collaboration-network-release-v1.json", config), ("collaboration-network-release-pin-v1.json", pin))
+
+
+def check_collaboration_network_pin(pin, data):
+    """The Runtime's release-pin checks (verify_release_network_bytes) before any key use:
+    the pin names these exact bytes, their network and their complete signer set."""
+    require(type(pin) is dict and set(pin) == {"head_cid", "expected_network_id", "trusted_profile_signer_dids"},
+            "Community network pin fields refused")
+    require(pin["head_cid"] == raw_cid(data), "Community network head differs from its file")
+    config = parse_json(data)
+    require(type(config) is dict and config.get("schema") == COMMUNITY_STARTUP_SCHEMA,
+            "Community network file is not a startup configuration")
+    require(type(pin["expected_network_id"]) is str and config.get("expected_network_id") == pin["expected_network_id"],
+            "Community network ID differs from the release pin")
+    signers = (pin["trusted_profile_signer_dids"], config.get("trusted_profile_signer_dids"))
+    require(all(type(dids) is list and dids and all(type(did) is str for did in dids) and len(set(dids)) == len(dids)
+                for dids in signers) and sorted(signers[0]) == sorted(signers[1]),
+            "Community signer set differs from the release pin")
+
+
 def prepare(policy, root, manifest_name, fetch, snapshot_root):
     held_root = directory_fd(root)
     try:
@@ -966,8 +1150,10 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
                 require(type(pin) is dict and type(pin.get("head_cid")) is str, f"{subject} pin refused")
                 record = records.get(name)
                 require(type(record) is dict, f"{subject} snapshot required")
-                require(pin["head_cid"] == raw_cid(regular_bytes(snapshot_root / name, MAX_JSON)),
-                        f"{subject} head differs from snapshot")
+                data = regular_bytes(snapshot_root / name, MAX_JSON)
+                require(pin["head_cid"] == raw_cid(data), f"{subject} head differs from snapshot")
+                if field == "collaboration_network":
+                    check_collaboration_network_pin(pin, data)
                 admit_ref(record["cid"], record["sha256"], record["size"], name)
     require(advertised == approved_refs, "unbound artifact in approved snapshot")
     head = manifest["head"]
@@ -1243,13 +1429,17 @@ def main():
     mode.add_argument("--manifest", default="signing-input.json")
     mode.add_argument("--model-catalog", metavar="PAYLOAD", help="sign this model catalogue payload instead of a release")
     parser.add_argument("--output-root", required=True, type=Path)
+    parser.add_argument("--operation", choices=("release", "community-profile"), default="release")
     args = parser.parse_args()
+    require(args.model_catalog is None or args.operation == "release",
+            "model catalogue and Community profile operations cannot be combined")
     require(sys.flags.isolated == 1 and sys.flags.no_site == 1, "run the pinned interpreter with -I -S")
     require(args.input_root.is_absolute() and args.policy.is_absolute() and args.output_root.is_absolute(), "absolute input/policy/output paths required")
     require(args.input_root == args.input_root.resolve() and args.policy == args.policy.resolve()
             and args.output_root == args.output_root.resolve(), "canonical custodian/input paths required")
     require(not args.policy.is_relative_to(args.input_root) and not args.output_root.is_relative_to(args.input_root), "custodian paths must be outside input root")
     policy = parse_json(regular_bytes(args.policy, MAX_JSON, trusted=True))
+    require(policy.get("operation", "release") == args.operation, "policy operation differs from command")
     pinned_tools(policy, args.input_root)
     require(not args.output_root.exists(), "output root already exists")
     for path in (args.output_root.parent, *args.output_root.parent.parents):
@@ -1274,24 +1464,32 @@ def main():
             write_outputs(args.output_root, (("model-catalog.json", catalog),))
             print(f"Signed model catalogue. Pin model_catalog.head_cid: {raw_cid(catalog)}")
             return
-        prepared = prepare(policy, args.input_root, args.manifest, github_json, Path(scratch))
-        approval, digest = approved_release(policy["approval"]["path"], args.input_root, policy["approval"]["sha256"])
-        delivery = approval["delivery"]
-        print(f"Approved source: {approval['source']['commit']} tree {approval['source']['tree']}\n"
-              f"Approved builder: {approval['workflow']['commit']} {approval['workflow']['ref']} tree {approval['workflow']['tree']}\n"
-              f"Approved delivery: {delivery['PUBLISHER_GATEWAY']} node {delivery['PUBLISHER_NODE_ID']} IPNS {delivery['IPNS_NAME']}\n"
-              f"Independent approval SHA-256: {digest}", file=sys.stderr)
-        require(confirmed(prepared.publisher_did, "approved release", sys.stdin, sys.stderr), "signing cancelled")
+        if args.operation == "community-profile":
+            prepared = prepare_community_profile(policy, args.input_root, args.manifest, github_json)
+            require(confirmed(prepared.publisher_did, community_profile_summary(prepared), sys.stdin, sys.stderr),
+                    "signing cancelled")
+        else:
+            prepared = prepare(policy, args.input_root, args.manifest, github_json, Path(scratch))
+            approval, digest = approved_release(policy["approval"]["path"], args.input_root, policy["approval"]["sha256"])
+            delivery = approval["delivery"]
+            print(f"Approved source: {approval['source']['commit']} tree {approval['source']['tree']}\n"
+                  f"Approved builder: {approval['workflow']['commit']} {approval['workflow']['ref']} tree {approval['workflow']['tree']}\n"
+                  f"Approved delivery: {delivery['PUBLISHER_GATEWAY']} node {delivery['PUBLISHER_NODE_ID']} IPNS {delivery['IPNS_NAME']}\n"
+                  f"Independent approval SHA-256: {digest}", file=sys.stderr)
+            require(confirmed(prepared.publisher_did, "approved release", sys.stdin, sys.stderr), "signing cancelled")
         # Recheck canonical source authority after confirmation, before backend use.
         verify_source(policy, github_json)
-        approved_release(policy["approval"]["path"], args.input_root, policy["approval"]["sha256"])
+        if args.operation == "release":
+            approved_release(policy["approval"]["path"], args.input_root, policy["approval"]["sha256"])
         backend = OpenSSLBackend(policy, args.input_root, Path(scratch))
         try:
-            publication = sign_publication(prepared, backend)
+            publication = (sign_community_profile(prepared, backend) if args.operation == "community-profile"
+                           else sign_publication(prepared, backend))
         finally:
             backend.close()
         write_outputs(args.output_root, publication)
-    print("Signed approved publication snapshot.")
+    print("Signed approved Community profile snapshot." if args.operation == "community-profile"
+          else "Signed approved publication snapshot.")
 
 
 if __name__ == "__main__":

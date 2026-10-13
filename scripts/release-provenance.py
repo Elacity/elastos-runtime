@@ -5,7 +5,11 @@ RELEASE_APPROVAL is an operator-owned file prepared before downloading inputs.
 It approves source H, the complete builder commit/tree W and its canonical ref,
 the public delivery tuple, and an installed gh executable by path and SHA-256.
 This program never creates that approval. Historical packages without attestations
-need a new approved build. No candidate executable runs during these checks.
+need a new approved build. The only candidate executable these checks run is the
+attested release Runtime's key-free Community startup validator.
+
+The release names a Community network only when the approved source pins one and
+RELEASE_COMMUNITY_DIR holds the custodian's signed output for exactly that network.
 """
 
 import argparse
@@ -104,6 +108,61 @@ def bind(approval_path, approval, digest, work):
         path.chmod(0o400)
 
 
+NETWORK_FILE = "collaboration-network-release-v1.json"
+NETWORK_PIN_FILE = "collaboration-network-release-pin-v1.json"
+
+
+def community(work, community_dir, runtime):
+    """Bind the prepared release's Community network to the custodian output, or to none."""
+    unsigned = work / "unsigned"
+    manifest = S.parse_json(S.regular_bytes(unsigned / "signing-input.json", S.MAX_JSON))
+    pins = [S.parse_json(S.regular_bytes(unsigned / f"components-{platform}.json", S.MAX_JSON)).get("collaboration_network")
+            for platform in sorted(manifest["release"]["platforms"])]
+    S.require(pins and all(pin == pins[0] for pin in pins), "prepared components disagree on collaboration_network")
+    pin, carried = pins[0], NETWORK_FILE in manifest["files"]
+    if community_dir is None:
+        S.require(pin is None and not carried, "the approved source pins a Community network; set RELEASE_COMMUNITY_DIR "
+                  "to the custodian's signed output for it")
+        return "Community: this release names no network."
+    S.require(pin is not None and carried, "RELEASE_COMMUNITY_DIR is set but the approved source pins no Community network; "
+              f"commit {NETWORK_FILE} and its components.json pin, then build a new package")
+    S.require(community_dir.is_absolute() and community_dir == community_dir.resolve()
+              and sorted(path.name for path in community_dir.iterdir()) == sorted((NETWORK_FILE, NETWORK_PIN_FILE)),
+              f"RELEASE_COMMUNITY_DIR must be a canonical directory holding exactly {NETWORK_FILE} and {NETWORK_PIN_FILE}")
+    data = S.regular_bytes(community_dir / NETWORK_FILE, S.MAX_JSON, trusted=True)
+    fragment = S.parse_json(S.regular_bytes(community_dir / NETWORK_PIN_FILE, S.MAX_JSON, trusted=True))
+    S.require(set(fragment) == {"collaboration_network"}, "Community pin file fields refused")
+    S.check_collaboration_network_pin(fragment["collaboration_network"], data)
+    S.require(fragment["collaboration_network"] == pin, "the approved source pins another Community network than the custodian output")
+    S.require(S.regular_bytes(unsigned / NETWORK_FILE, S.MAX_JSON) == data
+              and manifest["files"][NETWORK_FILE]["sha256"] == S.sha256(data),
+              "the release carries other Community network bytes than the custodian output")
+    # The release's own Runtime runs the startup validator every Home runs before it joins.
+    scratch = work / "community"
+    scratch.mkdir(mode=0o700)
+    (scratch / "home").mkdir(mode=0o700)
+    copy = scratch / NETWORK_FILE
+    with copy.open("xb") as output:
+        output.write(data)
+    copy.chmod(0o600)
+    try:
+        result = subprocess.run([str(runtime), "collaboration-config", "verify", "--input", str(copy)],
+                                capture_output=True, timeout=60, stdin=subprocess.DEVNULL,
+                                env={"HOME": str(scratch / "home"), "XDG_DATA_HOME": str(scratch / "home"),
+                                     "PATH": "/usr/bin:/bin", "LANG": "C"})
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("the release Runtime did not verify the Community network within 60 s") from error
+    S.require(result.returncode == 0, "the release Runtime refused the Community network: "
+              + result.stderr.decode(errors="replace").strip()[-400:])
+    receipt = S.parse_json(result.stdout)
+    S.require(receipt.get("network_id") == pin["expected_network_id"]
+              and receipt.get("signer_did") in pin["trusted_profile_signer_dids"]
+              and receipt.get("config_sha256") == "sha256:" + S.sha256(data),
+              "the release Runtime verified another Community network than the release pin")
+    return (f"Community: this release names network {pin['expected_network_id']} (head {pin['head_cid']}), "
+            f"profile signer {receipt['signer_did']}, verified by the release Runtime.")
+
+
 def update_pin(approval, work_root, run, version, pin_path, head_path):
     """Admit only a source whose CI update journey started from the release users run now.
 
@@ -132,7 +191,7 @@ def update_pin(approval, work_root, run, version, pin_path, head_path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("approval", "update-pin", "run", "artifact", "receipt", "seed", "bind"))
+    parser.add_argument("command", choices=("approval", "update-pin", "run", "artifact", "receipt", "seed", "bind", "community"))
     parser.add_argument("--approval", required=True, type=Path)
     parser.add_argument("--work-root", required=True, type=Path)
     parser.add_argument("--run", type=int)
@@ -143,6 +202,8 @@ def main():
     parser.add_argument("--payload-root", type=Path)
     parser.add_argument("--version")
     parser.add_argument("--work", type=Path)
+    parser.add_argument("--community", type=Path, help="the custodian's community-profile output directory")
+    parser.add_argument("--runtime", type=Path, help="the attested release Runtime for this Mac")
     parser.add_argument("--pin", type=Path)
     parser.add_argument("--head", type=Path)
     args = parser.parse_args()
@@ -156,6 +217,9 @@ def main():
         return
     if args.command == "bind":
         bind(args.approval, approval, digest, args.work.resolve())
+        return
+    if args.command == "community":
+        print(community(args.work.resolve(), args.community, args.runtime))
         return
     fetch = lambda path: cli_fetch(approval, path)
     run = S.checked_package_run(approval, args.run, fetch)
