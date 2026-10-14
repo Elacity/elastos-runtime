@@ -980,16 +980,28 @@ async function runPasskeySignIn() {
 
 // One plain reason and one next step per failed sign-in; never a status code
 // or server text. Stages: start (begin or status), passkey (the browser),
-// verify (Home checks the passkey), open (Home opens after sign-in).
+// verify (Home checks the passkey), open (Home opens after sign-in). Home
+// names its reason (see SignInFailure in auth_gateway.rs); without one, the
+// stage and status decide.
 function signInFailure(stage, error) {
   const status = Number(error && error.status) || 0;
   const name = String(error && error.name || "");
+  const reason = signInFailureReason(error);
   let message;
   let tone = "error";
   if (stage === "open") {
     message = "Home could not open after sign-in. Reload this page.";
-  } else if (status === 429) {
+  } else if (status === 429 || reason === "busy") {
     message = "Sign-in is busy right now. Wait a minute, then try again.";
+  } else if (reason === "home_error") {
+    message = "Home could not finish sign-in. Try again in a moment.";
+  } else if (stage === "verify" && reason === "unknown_passkey") {
+    message = "Home does not know this passkey. Use the passkey you created for this Home.";
+  } else if (stage === "verify" && reason === "removed_passkey") {
+    message = "This passkey was removed from this Home. Use another passkey for this Home.";
+  } else if (stage === "verify" && reason === "expired") {
+    message = "Sign-in took too long. Select your account to try again.";
+    tone = "muted";
   } else if (stage === "passkey") {
     if (name === "NotAllowedError" || name === "AbortError") {
       message = "No passkey was used. Select your account to try again.";
@@ -1007,6 +1019,15 @@ function signInFailure(stage, error) {
     message = "Home could not start sign-in. Try again in a moment.";
   }
   return Object.assign(new Error(message), { signInFailure: true, tone });
+}
+
+function signInFailureReason(error) {
+  try {
+    const body = JSON.parse(String(error && error.detail || ""));
+    return body?.schema === "elastos.auth.passkey.sign-in.failure/v1" ? readText(body.reason) : "";
+  } catch (_error) {
+    return "";
+  }
 }
 
 async function unlockComplete(response, flow = null) {

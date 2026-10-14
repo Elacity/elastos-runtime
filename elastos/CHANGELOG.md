@@ -6,6 +6,14 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Fixed
+
+- The lock screen names the real reason a sign-in failed: a passkey this Home
+  removed, a passkey from another Home, a sign-in that took too long, or a Home
+  error. Add passkey asks the browser for a different device or security key
+  than the account's current passkeys, and a busy Home keeps the fresh approval
+  (#338).
+
 ### Developer detail
 
 - `scripts/release-publish.sh` publishes a final version `X.Y.Z` on `stable`
