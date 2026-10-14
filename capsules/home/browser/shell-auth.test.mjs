@@ -257,3 +257,45 @@ test("a lock screen that cannot reach Home says so before any passkey prompt", a
     "Home is not responding. Check that ElastOS is running, then try again.",
   );
 });
+
+test("guest passkey setup shows plain sentences, never browser or server text", async () => {
+  routes["/api/auth/passkey/status"] = () => ({ body: { registered: true, guest_registration_enabled: true } });
+  await showHomeUnlock(() => {});
+  const status = element("#home-unlock-status");
+  const createGuest = async () => {
+    element("#home-unlock-create").click();
+    element("#home-unlock-primary").click();
+    await settle();
+    assert.doesNotMatch(status.textContent, /\d{3}|request failed|registration is disabled|timed out or was not allowed/i);
+    return status.textContent;
+  };
+
+  // The flow's own sentence passes through.
+  element("#home-unlock-name").value = "";
+  assert.equal(await createGuest(), "Enter the display name people will see.");
+
+  element("#home-unlock-name").value = "Guest";
+  routes["/api/auth/passkey/register/begin"] = () => ({ status: 403, body: "guest passkey registration is disabled" });
+  assert.equal(await createGuest(), "Home did not allow this. Ask the owner of this Home, then try again.");
+  assert.equal(status.dataset.tone, "error");
+
+  routes["/api/auth/passkey/register/begin"] = () => ({ status: 500, body: "auth state write failed" });
+  assert.equal(await createGuest(), "Home could not finish this step. Try again in a moment.");
+
+  routes["/api/auth/passkey/register/begin"] = () => ({
+    body: {
+      schema: "elastos.auth.passkey.register.begin/v1",
+      ceremony_id: "guest-1",
+      options: { publicKey: { challenge: "AA", user: { id: "AQ", name: "x", displayName: "x" } } },
+    },
+  });
+  credentials = {
+    create: async () => {
+      throw Object.assign(new Error("The operation either timed out or was not allowed."), { name: "NotAllowedError" });
+    },
+  };
+  assert.equal(await createGuest(), "The passkey prompt was closed. Select the button to try again.");
+
+  delete routes["/api/auth/passkey/register/begin"];
+  assert.equal(await createGuest(), "Home is not responding. Check that ElastOS is running, then try again.");
+});

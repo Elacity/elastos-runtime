@@ -1054,7 +1054,42 @@ function reportUnlockError(error) {
     setUnlockStatus(error.message, error.tone);
     return;
   }
-  setUnlockStatus(String(error.message || error), "error");
+  setUnlockStatus(unlockFailureMessage(error), "error");
+}
+
+// Setup, guest passkey and recovery failures are one plain sentence too. The
+// flows' own sentences pass through; a browser or server error never does
+// (the same rule as System's publicSystemError).
+function unlockFailureMessage(error) {
+  const status = Number(error && error.status) || 0;
+  const name = String(error && error.name || "");
+  const message = readText(error && error.message ? error.message : String(error || ""));
+  if (name === "NotAllowedError" || name === "AbortError") {
+    return "The passkey prompt was closed. Select the button to try again.";
+  }
+  if (name === "InvalidStateError") {
+    return "This device already has a passkey for this Home. Sign in with it, or use another device.";
+  }
+  if (name === "SecurityError") {
+    return "Passkeys do not work at this address. Open Home at the address where you created your passkey.";
+  }
+  if (status === 429) {
+    return "Home is busy right now. Wait a minute, then try again.";
+  }
+  if (status === 401 || status === 403) {
+    return "Home did not allow this. Ask the owner of this Home, then try again.";
+  }
+  if (status) {
+    return "Home could not finish this step. Try again in a moment.";
+  }
+  if (error instanceof TypeError) {
+    return "Home is not responding. Check that ElastOS is running, then try again.";
+  }
+  if (name !== "Error" || !message
+    || /\b(request failed|failed to fetch|schema|[45]\d\d)\b/i.test(message)) {
+    return "Home could not finish this step. Try again in a moment.";
+  }
+  return message;
 }
 
 function setButtonsDisabled(disabled) {

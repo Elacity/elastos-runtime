@@ -13,6 +13,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   error. Add passkey asks the browser for a different device or security key
   than the account's current passkeys, and a busy Home keeps the fresh approval
   (#338).
+- Setup, guest passkey and recovery failures on the lock screen show one plain
+  sentence instead of browser or server error text (#338).
 
 ### Developer detail
 
