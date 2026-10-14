@@ -1669,14 +1669,30 @@ fn passkey_add_binding(client: &PasskeyAddClient<'_>) -> anyhow::Result<[u8; 32]
     .into())
 }
 
-/// Starts a registration only this session can complete.
+/// Starts a registration only this session can complete. The account's own
+/// active passkeys are excluded, so the new passkey lives on another
+/// authenticator; other accounts' passkeys stay private.
 pub(crate) fn begin_passkey_add(
+    data_dir: &Path,
     identity: &mut elastos_identity::IdentityManager,
     client: &PasskeyAddClient<'_>,
     ceremony_id: &str,
 ) -> anyhow::Result<elastos_identity::CreationOptions> {
     let binding = passkey_add_binding(client)?;
-    identity.begin_bound_principal_registration(ceremony_id, client.rp_id, client.origin, binding)
+    let own_credential_ids = active_passkey_principals(data_dir)?
+        .into_iter()
+        .filter(|principal| principal.principal_id == client.principal_id)
+        .filter_map(|principal| principal.proof_binding.passkey)
+        .filter(|passkey| passkey.rp_id == client.rp_id)
+        .map(|passkey| passkey.credential_id)
+        .collect::<Vec<_>>();
+    identity.begin_bound_principal_registration_excluding(
+        ceremony_id,
+        client.rp_id,
+        client.origin,
+        binding,
+        &own_credential_ids,
+    )
 }
 
 /// Adds the new passkey to the signing owner's own account: same principal,
@@ -5757,6 +5773,25 @@ pub fn active_admin_passkey_principal_count(data_dir: &Path) -> anyhow::Result<u
         .into_iter()
         .filter(is_admin)
         .count())
+}
+
+/// True when this Home removed the passkey with this credential id and has
+/// no active passkey with it.
+pub fn passkey_credential_removed(data_dir: &Path, credential_id: &str) -> anyhow::Result<bool> {
+    let state = load_auth_state(data_dir)?;
+    let mut removed = false;
+    for passkey in state
+        .principals
+        .iter()
+        .filter_map(|principal| principal.proof_binding.passkey.as_ref())
+        .filter(|passkey| passkey.credential_id == credential_id)
+    {
+        if passkey.revoked_at.is_none() {
+            return Ok(false);
+        }
+        removed = true;
+    }
+    Ok(removed)
 }
 
 pub fn active_passkey_principals(data_dir: &Path) -> anyhow::Result<Vec<PrincipalRecord>> {

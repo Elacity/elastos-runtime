@@ -31,6 +31,38 @@ impl std::fmt::Display for CeremonyCapacityExceeded {
 }
 
 impl std::error::Error for CeremonyCapacityExceeded {}
+
+/// The sign-in passkey is not in this Home's credential store.
+#[derive(Debug)]
+pub struct UnknownCredential;
+
+impl std::fmt::Display for UnknownCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Unknown credential")
+    }
+}
+
+impl std::error::Error for UnknownCredential {}
+
+/// The sign-in challenge is gone (used, or lost on restart) or too old; a new
+/// sign-in starts a new one.
+#[derive(Debug)]
+pub enum AuthenticationChallengeUnavailable {
+    Missing,
+    Expired,
+}
+
+impl std::fmt::Display for AuthenticationChallengeUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "No pending authentication challenge",
+            Self::Expired => "Authentication challenge expired",
+        })
+    }
+}
+
+impl std::error::Error for AuthenticationChallengeUnavailable {}
+
 const FLAG_USER_PRESENT: u8 = 0x01;
 const FLAG_USER_VERIFIED: u8 = 0x04;
 const FLAG_ATTESTED_CREDENTIAL_DATA: u8 = 0x40;
@@ -294,12 +326,33 @@ impl IdentityManager {
         origin: &str,
         binding: [u8; 32],
     ) -> anyhow::Result<CreationOptions> {
+        self.begin_bound_principal_registration_excluding(ceremony, rp_id, origin, binding, &[])
+    }
+
+    /// Bound registration that asks the browser to refuse the listed
+    /// credentials, so an authenticator that already holds one of them
+    /// cannot create a second passkey for the same account.
+    pub fn begin_bound_principal_registration_excluding(
+        &mut self,
+        ceremony: &str,
+        rp_id: &str,
+        origin: &str,
+        binding: [u8; 32],
+        exclude_credential_ids: &[String],
+    ) -> anyhow::Result<CreationOptions> {
+        let exclude = exclude_credential_ids
+            .iter()
+            .map(|id| CredentialDescriptor {
+                type_: "public-key".to_string(),
+                id: id.clone(),
+            })
+            .collect();
         self.begin_registration_inner(
             ceremony,
             rp_id,
             origin,
             "ElastOS Passkey",
-            false,
+            exclude,
             Some(binding),
         )
     }
@@ -358,7 +411,23 @@ impl IdentityManager {
         rp_id: &str,
         rp_origin: &str,
     ) -> anyhow::Result<CreationOptions> {
-        self.begin_registration_inner(session_token, rp_id, rp_origin, "ElastOS User", true, None)
+        let exclude = self
+            .store
+            .get_credentials()
+            .iter()
+            .map(|c| CredentialDescriptor {
+                type_: "public-key".to_string(),
+                id: c.credential_id.clone(),
+            })
+            .collect();
+        self.begin_registration_inner(
+            session_token,
+            rp_id,
+            rp_origin,
+            "ElastOS User",
+            exclude,
+            None,
+        )
     }
 
     /// Begin registration for a separate runtime principal.
@@ -377,7 +446,7 @@ impl IdentityManager {
             rp_id,
             rp_origin,
             "ElastOS Passkey",
-            false,
+            Vec::new(),
             None,
         )
     }
@@ -388,7 +457,7 @@ impl IdentityManager {
         rp_id: &str,
         rp_origin: &str,
         display_name: &str,
-        exclude_existing: bool,
+        exclude: Vec<CredentialDescriptor>,
         registration_binding: Option<[u8; 32]>,
     ) -> anyhow::Result<CreationOptions> {
         self.admit_challenge(session_token, rp_id, Some(rp_origin))?;
@@ -415,19 +484,6 @@ impl IdentityManager {
 
         // User ID is random for registration, real ID derived from credential after
         let user_id = URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes());
-
-        let exclude = if exclude_existing {
-            self.store
-                .get_credentials()
-                .iter()
-                .map(|c| CredentialDescriptor {
-                    type_: "public-key".to_string(),
-                    id: c.credential_id.clone(),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
 
         let options = CreationOptions {
             public_key: PublicKeyCredentialCreationOptions {
@@ -703,13 +759,13 @@ impl IdentityManager {
         let pending = self
             .challenges
             .remove(session_token)
-            .ok_or_else(|| anyhow::anyhow!("No pending authentication challenge"))?;
+            .ok_or(AuthenticationChallengeUnavailable::Missing)?;
 
         if !matches!(pending.challenge_type, ChallengeType::Authentication) {
             anyhow::bail!("Pending challenge is not an authentication");
         }
         if pending.created.elapsed() > CHALLENGE_EXPIRY {
-            anyhow::bail!("Authentication challenge expired");
+            return Err(AuthenticationChallengeUnavailable::Expired.into());
         }
 
         // Find the matching credential
@@ -719,7 +775,7 @@ impl IdentityManager {
             .get_credentials()
             .into_iter()
             .find(|c| c.credential_id == *credential_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown credential"))?;
+            .ok_or(UnknownCredential)?;
 
         // Decode and verify client data
         let client_data_bytes = URL_SAFE_NO_PAD.decode(&response.response.client_data_json)?;

@@ -193,3 +193,109 @@ test("a refused or cancelled passkey add is one plain sentence", async () => {
     message: "Home did not add the passkey. Select Add passkey to try again.",
   });
 });
+
+const signInRefusal = (status, reason) => () => ({
+  status,
+  body: { schema: "elastos.auth.passkey.sign-in.failure/v1", reason },
+});
+
+test("Home's own reason picks the sentence when it refuses a passkey", async () => {
+  routes["/api/auth/passkey/authenticate/begin"] = begin;
+  credentials = { get: async () => fakeCredential() };
+  const cases = [
+    [403, "removed_passkey", "This passkey was removed from this Home. Use another passkey for this Home.", "error"],
+    [403, "unknown_passkey", "Home does not know this passkey. Use the passkey you created for this Home.", "error"],
+    [403, "expired", "Sign-in took too long. Select your account to try again.", "muted"],
+    [403, "refused", "Home did not accept this passkey. Use the passkey you created for this Home.", "error"],
+    [500, "home_error", "Home could not finish sign-in. Try again in a moment.", "error"],
+    [429, "busy", "Sign-in is busy right now. Wait a minute, then try again.", "error"],
+  ];
+  for (const [status, reason, message, tone] of cases) {
+    routes["/api/auth/passkey/authenticate/complete"] = signInRefusal(status, reason);
+    assert.equal(await signInOnLockFace(), message, reason);
+    assert.equal(faceStatus.dataset.tone, tone, reason);
+  }
+  // An answer that is not Home's sign-in reason falls back to the stage.
+  routes["/api/auth/passkey/authenticate/complete"] = () => ({
+    status: 403,
+    body: { schema: "elastos.other/v1", reason: "removed_passkey" },
+  });
+  assert.equal(
+    await signInOnLockFace(),
+    "Home did not accept this passkey. Use the passkey you created for this Home.",
+  );
+});
+
+test("a passkey the browser refuses at this address names the address", async () => {
+  routes["/api/auth/passkey/authenticate/begin"] = begin;
+  credentials = {
+    get: async () => { throw Object.assign(new Error("The relying party ID is not a registrable domain"), { name: "SecurityError" }); },
+  };
+  assert.equal(
+    await signInOnLockFace(),
+    "Passkeys do not work at this address. Open Home at the address where you created your passkey.",
+  );
+});
+
+test("a sign-in that Home cannot open asks for a reload", async () => {
+  routes["/api/auth/passkey/authenticate/begin"] = begin;
+  routes["/api/auth/passkey/authenticate/complete"] = () => ({ body: { schema: "elastos.auth.passkey.verify/v1" } });
+  credentials = { get: async () => fakeCredential() };
+  await showHomeUnlock(() => { throw new Error("shell attach failed"); });
+  assert.equal(await signInOnLockFace(), "Home could not open after sign-in. Reload this page.");
+});
+
+test("a lock screen that cannot reach Home says so before any passkey prompt", async () => {
+  routes["/api/auth/passkey/status"] = () => ({ status: 500, body: "auth state unavailable" });
+  await showHomeUnlock(() => {});
+  assert.equal(faceStatus.hidden, false);
+  assert.equal(faceStatus.textContent, "Home could not start sign-in. Try again in a moment.");
+  delete routes["/api/auth/passkey/status"];
+  await showHomeUnlock(() => {});
+  assert.equal(
+    faceStatus.textContent,
+    "Home is not responding. Check that ElastOS is running, then try again.",
+  );
+});
+
+test("guest passkey setup shows plain sentences, never browser or server text", async () => {
+  routes["/api/auth/passkey/status"] = () => ({ body: { registered: true, guest_registration_enabled: true } });
+  await showHomeUnlock(() => {});
+  const status = element("#home-unlock-status");
+  const createGuest = async () => {
+    element("#home-unlock-create").click();
+    element("#home-unlock-primary").click();
+    await settle();
+    assert.doesNotMatch(status.textContent, /\d{3}|request failed|registration is disabled|timed out or was not allowed/i);
+    return status.textContent;
+  };
+
+  // The flow's own sentence passes through.
+  element("#home-unlock-name").value = "";
+  assert.equal(await createGuest(), "Enter the display name people will see.");
+
+  element("#home-unlock-name").value = "Guest";
+  routes["/api/auth/passkey/register/begin"] = () => ({ status: 403, body: "guest passkey registration is disabled" });
+  assert.equal(await createGuest(), "Home did not allow this. Ask the owner of this Home, then try again.");
+  assert.equal(status.dataset.tone, "error");
+
+  routes["/api/auth/passkey/register/begin"] = () => ({ status: 500, body: "auth state write failed" });
+  assert.equal(await createGuest(), "Home could not finish this step. Try again in a moment.");
+
+  routes["/api/auth/passkey/register/begin"] = () => ({
+    body: {
+      schema: "elastos.auth.passkey.register.begin/v1",
+      ceremony_id: "guest-1",
+      options: { publicKey: { challenge: "AA", user: { id: "AQ", name: "x", displayName: "x" } } },
+    },
+  });
+  credentials = {
+    create: async () => {
+      throw Object.assign(new Error("The operation either timed out or was not allowed."), { name: "NotAllowedError" });
+    },
+  };
+  assert.equal(await createGuest(), "The passkey prompt was closed. Select the button to try again.");
+
+  delete routes["/api/auth/passkey/register/begin"];
+  assert.equal(await createGuest(), "Home is not responding. Check that ElastOS is running, then try again.");
+});

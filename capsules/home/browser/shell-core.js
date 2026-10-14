@@ -75,6 +75,7 @@ export async function fetchJson(url, init) {
       `request failed: ${response.status} ${response.statusText}${detail ? ` ${detail}` : ""}`,
     );
     error.status = response.status;
+    error.detail = detail;
     throw error;
   }
   return response.json();

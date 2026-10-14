@@ -980,16 +980,28 @@ async function runPasskeySignIn() {
 
 // One plain reason and one next step per failed sign-in; never a status code
 // or server text. Stages: start (begin or status), passkey (the browser),
-// verify (Home checks the passkey), open (Home opens after sign-in).
+// verify (Home checks the passkey), open (Home opens after sign-in). Home
+// names its reason (see SignInFailure in auth_gateway.rs); without one, the
+// stage and status decide.
 function signInFailure(stage, error) {
   const status = Number(error && error.status) || 0;
   const name = String(error && error.name || "");
+  const reason = signInFailureReason(error);
   let message;
   let tone = "error";
   if (stage === "open") {
     message = "Home could not open after sign-in. Reload this page.";
-  } else if (status === 429) {
+  } else if (status === 429 || reason === "busy") {
     message = "Sign-in is busy right now. Wait a minute, then try again.";
+  } else if (reason === "home_error") {
+    message = "Home could not finish sign-in. Try again in a moment.";
+  } else if (stage === "verify" && reason === "unknown_passkey") {
+    message = "Home does not know this passkey. Use the passkey you created for this Home.";
+  } else if (stage === "verify" && reason === "removed_passkey") {
+    message = "This passkey was removed from this Home. Use another passkey for this Home.";
+  } else if (stage === "verify" && reason === "expired") {
+    message = "Sign-in took too long. Select your account to try again.";
+    tone = "muted";
   } else if (stage === "passkey") {
     if (name === "NotAllowedError" || name === "AbortError") {
       message = "No passkey was used. Select your account to try again.";
@@ -1007,6 +1019,15 @@ function signInFailure(stage, error) {
     message = "Home could not start sign-in. Try again in a moment.";
   }
   return Object.assign(new Error(message), { signInFailure: true, tone });
+}
+
+function signInFailureReason(error) {
+  try {
+    const body = JSON.parse(String(error && error.detail || ""));
+    return body?.schema === "elastos.auth.passkey.sign-in.failure/v1" ? readText(body.reason) : "";
+  } catch (_error) {
+    return "";
+  }
 }
 
 async function unlockComplete(response, flow = null) {
@@ -1033,7 +1054,42 @@ function reportUnlockError(error) {
     setUnlockStatus(error.message, error.tone);
     return;
   }
-  setUnlockStatus(String(error.message || error), "error");
+  setUnlockStatus(unlockFailureMessage(error), "error");
+}
+
+// Setup, guest passkey and recovery failures are one plain sentence too. The
+// flows' own sentences pass through; a browser or server error never does
+// (the same rule as System's publicSystemError).
+function unlockFailureMessage(error) {
+  const status = Number(error && error.status) || 0;
+  const name = String(error && error.name || "");
+  const message = readText(error && error.message ? error.message : String(error || ""));
+  if (name === "NotAllowedError" || name === "AbortError") {
+    return "The passkey prompt was closed. Select the button to try again.";
+  }
+  if (name === "InvalidStateError") {
+    return "This device already has a passkey for this Home. Sign in with it, or use another device.";
+  }
+  if (name === "SecurityError") {
+    return "Passkeys do not work at this address. Open Home at the address where you created your passkey.";
+  }
+  if (status === 429) {
+    return "Home is busy right now. Wait a minute, then try again.";
+  }
+  if (status === 401 || status === 403) {
+    return "Home did not allow this. Ask the owner of this Home, then try again.";
+  }
+  if (status) {
+    return "Home could not finish this step. Try again in a moment.";
+  }
+  if (error instanceof TypeError) {
+    return "Home is not responding. Check that ElastOS is running, then try again.";
+  }
+  if (name !== "Error" || !message
+    || /\b(request failed|failed to fetch|schema|[45]\d\d)\b/i.test(message)) {
+    return "Home could not finish this step. Try again in a moment.";
+  }
+  return message;
 }
 
 function setButtonsDisabled(disabled) {

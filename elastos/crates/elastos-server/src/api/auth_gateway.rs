@@ -641,7 +641,7 @@ pub async fn passkey_authenticate_begin(
 ) -> Response {
     match passkey_authenticate_begin_inner(&state, &headers).await {
         Ok(response) => Json(response).into_response(),
-        Err(err) => auth_error_response(err),
+        Err(err) => sign_in_failure_response(err),
     }
 }
 
@@ -652,7 +652,102 @@ pub async fn passkey_authenticate_complete(
 ) -> Response {
     match passkey_authenticate_complete_inner(&state, &headers, input).await {
         Ok(response) => passkey_verified_response(&headers, response),
-        Err(err) => auth_error_response(err),
+        Err(err) => sign_in_failure_response(err),
+    }
+}
+
+const SIGN_IN_FAILURE_SCHEMA: &str = "elastos.auth.passkey.sign-in.failure/v1";
+
+/// Why a passkey sign-in failed. The lock face gives each reason its own next
+/// step; Home sends only this code, never the server error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignInFailure {
+    /// This Home does not know the passkey.
+    UnknownPasskey,
+    /// This Home removed the passkey.
+    RemovedPasskey,
+    /// The sign-in took too long, or Home restarted during it.
+    Expired,
+    /// Home checked the passkey and refused it.
+    Refused,
+    Busy,
+    HomeError,
+}
+
+impl SignInFailure {
+    fn classify(err: &anyhow::Error) -> Self {
+        use elastos_identity::webauthn::{
+            AuthenticationChallengeUnavailable, CeremonyCapacityExceeded, UnknownCredential,
+        };
+        if let Some(SignInRefused(failure)) = err.downcast_ref::<SignInRefused>() {
+            *failure
+        } else if err.is::<CeremonyCapacityExceeded>() {
+            Self::Busy
+        } else if err.is::<AuthenticationChallengeUnavailable>() {
+            Self::Expired
+        } else if err.is::<UnknownCredential>() {
+            Self::UnknownPasskey
+        } else if is_auth_refusal(err) {
+            Self::Refused
+        } else {
+            Self::HomeError
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::UnknownPasskey => "unknown_passkey",
+            Self::RemovedPasskey => "removed_passkey",
+            Self::Expired => "expired",
+            Self::Refused => "refused",
+            Self::Busy => "busy",
+            Self::HomeError => "home_error",
+        }
+    }
+
+    fn status(self) -> StatusCode {
+        match self {
+            Self::Busy => StatusCode::TOO_MANY_REQUESTS,
+            Self::HomeError => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::FORBIDDEN,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SignInRefused(SignInFailure);
+
+impl std::fmt::Display for SignInRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "passkey sign-in refused: {}", self.0.code())
+    }
+}
+
+impl std::error::Error for SignInRefused {}
+
+fn sign_in_failure_response(err: anyhow::Error) -> Response {
+    let failure = SignInFailure::classify(&err);
+    tracing::debug!(reason = failure.code(), error = %err, "passkey sign-in failed");
+    let body = Json(json!({
+        "schema": SIGN_IN_FAILURE_SCHEMA,
+        "reason": failure.code(),
+    }));
+    if failure == SignInFailure::Busy {
+        return (failure.status(), [("retry-after", "60")], body).into_response();
+    }
+    (failure.status(), body).into_response()
+}
+
+/// A failed sign-in with a passkey this Home removed says so, instead of
+/// treating the passkey as unknown or refused.
+fn removed_passkey_or(
+    state: &GatewayState,
+    credential_id: &str,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    match crate::auth::passkey_credential_removed(&state.data_dir, credential_id) {
+        Ok(true) => SignInRefused(SignInFailure::RemovedPasskey).into(),
+        _ => err,
     }
 }
 
@@ -760,18 +855,13 @@ async fn passkey_add_begin_inner(
         anyhow::bail!("passkey add relying party mismatch");
     }
     let proof_binding_id = principal.proof_binding_id.as_str();
-    consume_passkey_step_up_token(
-        &state.data_dir,
-        &input.step_up_token,
-        &launch,
-        180,
-        PASSKEY_ADD_OPERATION,
-        &passkey_add_intent(),
-    )?;
     let ceremony_id = format!("passkey:add:{}", random_hex(16));
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
+    // The challenge comes first, so a busy Home does not use up the approval;
+    // a challenge whose approval is refused is cancelled.
     let options = crate::auth::begin_passkey_add(
+        &state.data_dir,
         &mut manager,
         &crate::auth::PasskeyAddClient {
             origin: &rp.origin,
@@ -782,6 +872,17 @@ async fn passkey_add_begin_inner(
         },
         &ceremony_id,
     )?;
+    if let Err(err) = consume_passkey_step_up_token(
+        &state.data_dir,
+        &input.step_up_token,
+        &launch,
+        180,
+        PASSKEY_ADD_OPERATION,
+        &passkey_add_intent(),
+    ) {
+        manager.cancel_challenge(&ceremony_id);
+        return Err(err);
+    }
     Ok(PasskeyBeginResponse {
         schema: "elastos.auth.passkey.add.begin/v1".into(),
         ceremony_id,
@@ -3608,8 +3709,19 @@ async fn passkey_authenticate_complete_inner(
     let rp = super::handlers::identity::derive_rp(headers)?;
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
-    let outcome =
-        manager.complete_authentication(&input.ceremony_id, &input.response, &rp.id, &rp.origin)?;
+    let outcome = match manager.complete_authentication(
+        &input.ceremony_id,
+        &input.response,
+        &rp.id,
+        &rp.origin,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) if err.is::<elastos_identity::webauthn::UnknownCredential>() => {
+            drop(manager);
+            return Err(removed_passkey_or(state, &input.response.raw_id, err));
+        }
+        Err(err) => return Err(err),
+    };
     let credential = outcome.credential.clone();
     let origin = outcome.origin.clone();
     let user_verified = outcome.user_verified;
@@ -3623,6 +3735,7 @@ async fn passkey_authenticate_complete_inner(
         "passkey authentication verified and session granted",
         None,
     )
+    .map_err(|err| removed_passkey_or(state, &credential.credential_id, err))
 }
 
 #[derive(Debug)]
@@ -4509,8 +4622,18 @@ pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
         )
             .into_response();
     }
+    let status = if is_auth_refusal(&err) {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, err.to_string()).into_response()
+}
+
+/// Home checked the request and refused it, as opposed to failing itself.
+fn is_auth_refusal(err: &anyhow::Error) -> bool {
     let text = err.to_string();
-    let status = if err.is::<PasskeyRegistrationDenied>()
+    err.is::<PasskeyRegistrationDenied>()
         || err.is::<crate::auth::OwnerEnrollmentDenied>()
         || text.contains("missing")
         || text.contains("invalid")
@@ -4529,12 +4652,6 @@ pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
         || text.contains("not bound")
         || text.contains("required")
         || text.contains("conflicting")
-    {
-        StatusCode::FORBIDDEN
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
-    (status, text).into_response()
 }
 
 #[derive(Debug, Default)]
@@ -10574,5 +10691,218 @@ mod tests {
             crate::auth::active_admin_passkey_principal_count(temp.path()).unwrap(),
             1
         );
+    }
+
+    async fn sign_in_reason(
+        state: &GatewayState,
+        headers: &HeaderMap,
+        credential_id: &str,
+    ) -> (StatusCode, Value) {
+        let begin = passkey_authenticate_begin_inner(state, headers)
+            .await
+            .unwrap();
+        let response = passkey_authenticate_complete(
+            State(state.clone()),
+            headers.clone(),
+            Json(PasskeyAuthenticateCompleteRequest {
+                ceremony_id: begin.ceremony_id,
+                response: AuthenticationResponse {
+                    _id: credential_id.to_string(),
+                    raw_id: credential_id.to_string(),
+                    _type: "public-key".to_string(),
+                    response: elastos_identity::AuthenticatorAssertionResponse {
+                        client_data_json: String::new(),
+                        authenticator_data: String::new(),
+                        signature: String::new(),
+                        _user_handle: None,
+                    },
+                },
+            }),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn failed_sign_in_names_a_removed_or_unknown_passkey_without_server_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let owner = passkey_add_account(
+            temp.path(),
+            "owner-passkey",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        let guest = passkey_add_account(
+            temp.path(),
+            "guest-passkey",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
+        let guest_binding = records_for(temp.path(), &guest.principal_id)[0]
+            .proof_binding_id
+            .clone();
+        passkey_revoke_inner(&state, &owner.host_headers, guest_binding)
+            .await
+            .unwrap();
+
+        let (status, body) = sign_in_reason(&state, &owner.host_headers, "guest-passkey").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body,
+            json!({ "schema": SIGN_IN_FAILURE_SCHEMA, "reason": "removed_passkey" })
+        );
+        let (status, body) =
+            sign_in_reason(&state, &owner.host_headers, "another-homes-passkey").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["reason"], "unknown_passkey");
+    }
+
+    #[test]
+    fn sign_in_failures_are_classified_by_their_cause() {
+        use elastos_identity::webauthn::{
+            AuthenticationChallengeUnavailable, CeremonyCapacityExceeded, UnknownCredential,
+        };
+        let cases: [(anyhow::Error, SignInFailure); 7] = [
+            (UnknownCredential.into(), SignInFailure::UnknownPasskey),
+            (
+                AuthenticationChallengeUnavailable::Missing.into(),
+                SignInFailure::Expired,
+            ),
+            (
+                AuthenticationChallengeUnavailable::Expired.into(),
+                SignInFailure::Expired,
+            ),
+            (CeremonyCapacityExceeded.into(), SignInFailure::Busy),
+            (
+                crate::auth::OwnerEnrollmentDenied.into(),
+                SignInFailure::Refused,
+            ),
+            (anyhow::anyhow!("Origin mismatch"), SignInFailure::Refused),
+            (
+                anyhow::anyhow!("could not write auth state"),
+                SignInFailure::HomeError,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(SignInFailure::classify(&err), expected, "{err}");
+        }
+        let response = sign_in_failure_response(CeremonyCapacityExceeded.into());
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "60");
+        assert_eq!(
+            sign_in_failure_response(anyhow::anyhow!("could not write auth state")).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    fn excluded_ids(begin: &PasskeyBeginResponse<Option<CreationOptions>>) -> Vec<String> {
+        let mut ids = begin
+            .options
+            .as_ref()
+            .unwrap()
+            .public_key
+            .exclude_credentials
+            .iter()
+            .map(|credential| credential.id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn adding_a_passkey_excludes_only_the_owners_own_passkeys() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let owner = passkey_add_account(
+            temp.path(),
+            "owner-passkey",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        let _guest = passkey_add_account(
+            temp.path(),
+            "guest-passkey",
+            crate::auth::RuntimePrincipalRole::Guest,
+        );
+        let begin =
+            begin_passkey_add_for(&state, &owner, passkey_add_approval(temp.path(), &owner))
+                .await
+                .unwrap();
+        assert_eq!(excluded_ids(&begin), ["owner-passkey"]);
+        let added = complete_passkey_add_for(&state, &owner, &begin, b"owner-second-passkey")
+            .await
+            .unwrap();
+        let new_credential_id = stored_credentials(&state)
+            .await
+            .into_iter()
+            .find(|credential| passkey_proof_binding_id(credential) == added.proof_binding_id)
+            .unwrap()
+            .credential_id;
+
+        let begin =
+            begin_passkey_add_for(&state, &owner, passkey_add_approval(temp.path(), &owner))
+                .await
+                .unwrap();
+        let mut expected = vec!["owner-passkey".to_string(), new_credential_id];
+        expected.sort();
+        assert_eq!(excluded_ids(&begin), expected);
+    }
+
+    #[tokio::test]
+    async fn a_busy_home_keeps_the_add_approval_and_refused_approvals_leave_no_challenge() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let owner = passkey_add_account(
+            temp.path(),
+            "owner-passkey",
+            crate::auth::RuntimePrincipalRole::Admin,
+        );
+        // Refused approvals cancel their challenge, so they never fill Home.
+        for _ in 0..12 {
+            assert!(
+                begin_passkey_add_for(&state, &owner, "not-an-approval".into())
+                    .await
+                    .is_err()
+            );
+        }
+        let fill = (0..8)
+            .map(|index| format!("fill-{index}"))
+            .collect::<Vec<_>>();
+        {
+            let manager = state.identity_manager().unwrap();
+            let mut manager = manager.lock().await;
+            for ceremony in &fill {
+                manager
+                    .begin_bound_principal_registration(
+                        ceremony,
+                        "localhost",
+                        "http://localhost:61180",
+                        [7; 32],
+                    )
+                    .unwrap();
+            }
+        }
+        let approval = passkey_add_approval(temp.path(), &owner);
+        let err = begin_passkey_add_for(&state, &owner, approval.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            err.is::<elastos_identity::webauthn::CeremonyCapacityExceeded>(),
+            "{err}"
+        );
+        {
+            let manager = state.identity_manager().unwrap();
+            let mut manager = manager.lock().await;
+            for ceremony in &fill {
+                manager.cancel_challenge(ceremony);
+            }
+        }
+        // The same approval still starts the add once Home has room.
+        begin_passkey_add_for(&state, &owner, approval)
+            .await
+            .unwrap();
     }
 }
