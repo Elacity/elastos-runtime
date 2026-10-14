@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { getEventListeners } from "node:events";
 
-const moduleVersion = "home-update-20261003a";
+const moduleVersion = "home-update-20261014a";
 const requests = [];
 const originalConsoleError = console.error;
 console.error = (...args) => {

@@ -75,6 +75,11 @@ export async function fetchJson(url, init) {
       `request failed: ${response.status} ${response.statusText}${detail ? ` ${detail}` : ""}`,
     );
     error.status = response.status;
+    // Typed refusal details let callers name the cause and the wait without
+    // reading server text.
+    const retryAfter = Number.parseInt(response.headers?.get?.("retry-after") || "", 10);
+    error.retryAfterSeconds = Number.isSafeInteger(retryAfter) && retryAfter > 0 ? retryAfter : null;
+    error.refusal = response.headers?.get?.("x-elastos-refusal") || "";
     throw error;
   }
   return response.json();

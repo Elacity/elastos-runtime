@@ -2,8 +2,8 @@ import {
   clearHomeAuthorityToken,
   fetchJson,
   setHomeAuthorityToken,
-} from "./shell-core.js?v=home-update-20261003a";
-import { ownerRecoveryCommand } from "./owner-recovery-command.js?v=home-update-20261003a";
+} from "./shell-core.js?v=home-update-20261014a";
+import { ownerRecoveryCommand } from "./owner-recovery-command.js?v=home-update-20261014a";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockFace = document.querySelector(".home-unlock-face");
@@ -854,7 +854,7 @@ async function runPasskeyCreate() {
     }
   } catch (error) {
     if (enrollmentPurpose === "recover") clearRecoverySelection();
-    throw error;
+    throw signUpFailure(error);
   } finally {
     busy = false;
     setButtonsDisabled(false);
@@ -989,7 +989,7 @@ function signInFailure(stage, error) {
   if (stage === "open") {
     message = "Home could not open after sign-in. Reload this page.";
   } else if (status === 429) {
-    message = "Sign-in is busy right now. Wait a minute, then try again.";
+    message = `Sign-in is busy right now. Try again ${retryPhrase(error.retryAfterSeconds)}.`;
   } else if (stage === "passkey") {
     if (name === "NotAllowedError" || name === "AbortError") {
       message = "No passkey was used. Select your account to try again.";
@@ -1006,7 +1006,27 @@ function signInFailure(stage, error) {
   } else {
     message = "Home could not start sign-in. Try again in a moment.";
   }
-  return Object.assign(new Error(message), { signInFailure: true, tone });
+  return Object.assign(new Error(message), { unlockFailure: true, tone });
+}
+
+// A refused sign-up names the cause and the wait, never a status code or
+// server text. Other failures keep their own messages.
+function signUpFailure(error) {
+  if (Number(error && error.status) !== 429) return error;
+  const retry = retryPhrase(error.retryAfterSeconds);
+  const message = error.refusal === "guest-capacity"
+    ? `This Home has no space for new accounts right now. Sign in with an existing account, or try again ${retry}.`
+    : `Sign-up is busy right now. Try again ${retry}.`;
+  return Object.assign(new Error(message), { unlockFailure: true, tone: "error" });
+}
+
+// Home's Retry-After as words: whole minutes or hours, rounded up.
+function retryPhrase(seconds) {
+  if (!Number.isSafeInteger(seconds) || seconds <= 0) return "later";
+  if (seconds <= 90) return "in about a minute";
+  if (seconds < 3600) return `in about ${Math.ceil(seconds / 60)} minutes`;
+  const hours = Math.ceil(seconds / 3600);
+  return hours === 1 ? "in about an hour" : `in about ${hours} hours`;
 }
 
 async function unlockComplete(response, flow = null) {
@@ -1029,7 +1049,7 @@ export function profileReadinessActionTarget(response) {
 }
 
 function reportUnlockError(error) {
-  if (error?.signInFailure) {
+  if (error?.unlockFailure) {
     setUnlockStatus(error.message, error.tone);
     return;
   }
