@@ -93,9 +93,14 @@ impl BeginLimiter {
     }
 }
 
+/// Whole Retry-After seconds: a fractional second still needs one complete
+/// second before retrying, and a refusal always asks for at least one.
+pub(super) fn retry_after_seconds(retry: Duration) -> u64 {
+    (retry.as_secs() + u64::from(retry.subsec_nanos() != 0)).max(1)
+}
+
 fn begin_limit_response(kind: CeremonyKind, retry: Duration) -> Response {
-    // A fractional second still needs one complete second before retrying.
-    let seconds = retry.as_secs() + u64::from(retry.subsec_nanos() != 0);
+    let seconds = retry_after_seconds(retry);
     let action = match kind {
         CeremonyKind::Registration => "sign-up",
         CeremonyKind::Authentication => "sign-in",

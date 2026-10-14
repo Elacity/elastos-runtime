@@ -68,11 +68,12 @@ globalThis.fetch = async (url, init = {}) => {
   requests.push({ url, body: init.body ? JSON.parse(init.body) : null });
   const route = routes[url];
   if (!route) throw new TypeError("Failed to fetch");
-  const { status = 200, body = {} } = await route();
+  const { status = 200, body = {}, headers = {} } = await route();
   return {
     ok: status >= 200 && status < 300,
     status,
     statusText: status === 403 ? "Forbidden" : "",
+    headers: { get: (name) => headers[name.toLowerCase()] ?? null },
     text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
     json: async () => body,
   };
@@ -134,7 +135,14 @@ test("a cancelled passkey prompt says so and how to retry", async () => {
 
 test("a busy or unreachable Home is named, not shown as a status code", async () => {
   routes["/api/auth/passkey/authenticate/begin"] = () => ({ status: 429, body: "Passkey sign-in is busy." });
-  assert.equal(await signInOnLockFace(), "Sign-in is busy right now. Wait a minute, then try again.");
+  assert.equal(await signInOnLockFace(), "Sign-in is busy right now. Try again later.");
+  // The five-minute start budget can ask for more than one minute.
+  routes["/api/auth/passkey/authenticate/begin"] = () => ({
+    status: 429,
+    body: "Too many passkey sign-in attempts. Try again in 239 seconds.",
+    headers: { "retry-after": "239" },
+  });
+  assert.equal(await signInOnLockFace(), "Sign-in is busy right now. Try again in about 4 minutes.");
   delete routes["/api/auth/passkey/authenticate/begin"];
   assert.equal(
     await signInOnLockFace(),
@@ -192,4 +200,75 @@ test("a refused or cancelled passkey add is one plain sentence", async () => {
   await assert.rejects(addAccountPasskey("system-launch"), {
     message: "Home did not add the passkey. Select Add passkey to try again.",
   });
+});
+
+async function signUpAsGuest() {
+  routes["/api/auth/passkey/status"] = () => ({ body: { registered: true, guest_registration_enabled: true } });
+  await showHomeUnlock(() => {});
+  element("#home-unlock-create").click();
+  element("#home-unlock-name").value = "Guest";
+  element("#home-unlock-primary").click();
+  await settle();
+  const status = element("#home-unlock-status");
+  assert.equal(status.hidden, false, "the refusal is visible on the sign-up card");
+  assert.doesNotMatch(status.textContent, /\d{3}|request failed|Too Many|Guest sign-up is full/i);
+  assert.equal(status.dataset.tone, "error");
+  return status.textContent;
+}
+
+const guestCapacity = () => ({
+  status: 429,
+  body: "Guest sign-up is full. Use an existing account or try again later.",
+  headers: { "retry-after": "42597", "x-elastos-refusal": "guest-capacity" },
+});
+
+test("a full guest store names the existing-account path and the wait", async () => {
+  routes["/api/auth/passkey/register/begin"] = guestCapacity;
+  assert.equal(
+    await signUpAsGuest(),
+    "This Home has no space for new accounts right now. Sign in with an existing account, or try again in about 12 hours.",
+  );
+  routes["/api/auth/passkey/register/begin"] = () => ({
+    ...guestCapacity(),
+    headers: { "x-elastos-refusal": "guest-capacity" },
+  });
+  assert.equal(
+    await signUpAsGuest(),
+    "This Home has no space for new accounts right now. Sign in with an existing account, or try again later.",
+  );
+});
+
+test("a busy sign-up names the wait from either start budget", async () => {
+  for (const [retryAfter, wait] of [["60", "in about a minute"], ["239", "in about 4 minutes"]]) {
+    routes["/api/auth/passkey/register/begin"] = () => ({
+      status: 429,
+      body: "Too many passkey sign-up attempts.",
+      headers: { "retry-after": retryAfter },
+    });
+    assert.equal(await signUpAsGuest(), `Sign-up is busy right now. Try again ${wait}.`);
+  }
+});
+
+test("a full store at completion keeps the created passkey for a later retry", async () => {
+  routes["/api/auth/passkey/register/begin"] = () => ({
+    body: {
+      schema: "elastos.auth.passkey.register.begin/v1",
+      ceremony_id: "guest-1",
+      options: { publicKey: { challenge: "AA", user: { id: "AQ", name: "x", displayName: "x" } } },
+    },
+  });
+  routes["/api/auth/passkey/register/complete"] = guestCapacity;
+  let created = 0;
+  credentials = { create: async () => { created += 1; return fakeCredential(); } };
+  requests.length = 0;
+  assert.match(await signUpAsGuest(), /^This Home has no space for new accounts right now\./);
+  // Retry replays the same completion: no new begin and no second passkey.
+  element("#home-unlock-primary").click();
+  await settle();
+  const urls = requests.map((request) => request.url);
+  assert.deepEqual(urls.filter((url) => url.endsWith("/register/begin")), ["/api/auth/passkey/register/begin"]);
+  const completions = requests.filter((request) => request.url.endsWith("/register/complete"));
+  assert.equal(completions.length, 2);
+  assert.deepEqual(completions[1].body, completions[0].body);
+  assert.equal(created, 1);
 });

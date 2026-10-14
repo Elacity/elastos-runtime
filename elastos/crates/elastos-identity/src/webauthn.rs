@@ -21,12 +21,25 @@ const MAX_REGISTRATION_CHALLENGES: usize = 8;
 const MAX_GUIDED_REGISTRATION_CHALLENGES: usize = 8;
 const MAX_AUTHENTICATION_CHALLENGES: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeremonyKind {
+    Registration,
+    Authentication,
+}
+
 #[derive(Debug)]
-pub struct CeremonyCapacityExceeded;
+pub struct CeremonyCapacityExceeded {
+    pub kind: CeremonyKind,
+    /// Time until the oldest challenge in the full pool expires and frees a slot.
+    pub retry_after: Duration,
+}
 
 impl std::fmt::Display for CeremonyCapacityExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Passkey sign-in is busy. Try again shortly.")
+        f.write_str(match self.kind {
+            CeremonyKind::Registration => "Passkey sign-up is busy. Try again shortly.",
+            CeremonyKind::Authentication => "Passkey sign-in is busy. Try again shortly.",
+        })
     }
 }
 
@@ -393,21 +406,17 @@ impl IdentityManager {
     ) -> anyhow::Result<CreationOptions> {
         self.admit_challenge(session_token, rp_id, Some(rp_origin))?;
         let guided = registration_binding.is_some();
-        let pending = self
-            .challenges
-            .values()
-            .filter(|pending| {
-                matches!(pending.challenge_type, ChallengeType::Registration { .. })
-                    && pending.registration_binding.is_some() == guided
-            })
-            .count();
+        let in_pool = |pending: &PendingChallenge| {
+            matches!(pending.challenge_type, ChallengeType::Registration { .. })
+                && pending.registration_binding.is_some() == guided
+        };
         let capacity = if guided {
             MAX_GUIDED_REGISTRATION_CHALLENGES
         } else {
             MAX_REGISTRATION_CHALLENGES
         };
-        if pending >= capacity {
-            return Err(CeremonyCapacityExceeded.into());
+        if self.challenges.values().filter(|c| in_pool(c)).count() >= capacity {
+            return Err(self.capacity_exceeded(CeremonyKind::Registration, in_pool));
         }
 
         let challenge = generate_challenge();
@@ -646,14 +655,12 @@ impl IdentityManager {
         rp_id: &str,
     ) -> anyhow::Result<RequestOptions> {
         self.admit_challenge(session_token, rp_id, None)?;
-        if self
-            .challenges
-            .values()
-            .filter(|pending| matches!(pending.challenge_type, ChallengeType::Authentication))
-            .count()
-            >= MAX_AUTHENTICATION_CHALLENGES
+        let in_pool = |pending: &PendingChallenge| {
+            matches!(pending.challenge_type, ChallengeType::Authentication)
+        };
+        if self.challenges.values().filter(|c| in_pool(c)).count() >= MAX_AUTHENTICATION_CHALLENGES
         {
-            return Err(CeremonyCapacityExceeded.into());
+            return Err(self.capacity_exceeded(CeremonyKind::Authentication, in_pool));
         }
 
         let credentials = self.store.get_credentials();
@@ -837,6 +844,22 @@ impl IdentityManager {
     fn cleanup_expired(&mut self) {
         self.challenges
             .retain(|_, c| c.created.elapsed() < CHALLENGE_EXPIRY);
+    }
+
+    /// A full pool frees its first slot when its oldest challenge expires.
+    fn capacity_exceeded(
+        &self,
+        kind: CeremonyKind,
+        in_pool: impl Fn(&PendingChallenge) -> bool,
+    ) -> anyhow::Error {
+        let retry_after = self
+            .challenges
+            .values()
+            .filter(|pending| in_pool(pending))
+            .map(|pending| CHALLENGE_EXPIRY.saturating_sub(pending.created.elapsed()))
+            .min()
+            .unwrap_or(CHALLENGE_EXPIRY);
+        CeremonyCapacityExceeded { kind, retry_after }.into()
     }
 
     #[cfg(test)]
@@ -1544,6 +1567,32 @@ mod tests {
     }
 
     #[test]
+    fn full_challenge_pool_names_its_kind_and_oldest_expiry() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(root.path().into()).unwrap();
+        let (rp, origin) = ("localhost", "http://localhost");
+        for index in 0..MAX_GUIDED_REGISTRATION_CHALLENGES {
+            manager
+                .begin_bound_principal_registration(&format!("guided-{index}"), rp, origin, [1; 32])
+                .unwrap();
+        }
+        // The oldest guided challenge has 100 seconds left; the others are new.
+        manager.challenges.get_mut("guided-0").unwrap().created =
+            Instant::now() - CHALLENGE_EXPIRY + Duration::from_secs(100);
+        let error = manager
+            .begin_bound_principal_registration("guided-overflow", rp, origin, [1; 32])
+            .unwrap_err();
+        let capacity = error.downcast_ref::<CeremonyCapacityExceeded>().unwrap();
+        assert_eq!(capacity.kind, CeremonyKind::Registration);
+        assert!(capacity.retry_after <= Duration::from_secs(100));
+        assert!(capacity.retry_after > Duration::from_secs(95));
+        assert_eq!(
+            error.to_string(),
+            "Passkey sign-up is busy. Try again shortly."
+        );
+    }
+
+    #[test]
     fn challenge_flood_keeps_reserved_pools_and_valid_completions() {
         use p256::ecdsa::signature::Signer;
         let root = tempfile::tempdir().unwrap();
@@ -1569,10 +1618,12 @@ mod tests {
                 .begin_authentication(&format!("login-{index}"), rp)
                 .unwrap();
         }
-        assert!(manager
+        let error = manager
             .begin_authentication("login-overflow", rp)
-            .unwrap_err()
-            .is::<CeremonyCapacityExceeded>());
+            .unwrap_err();
+        let capacity = error.downcast_ref::<CeremonyCapacityExceeded>().unwrap();
+        assert_eq!(capacity.kind, CeremonyKind::Authentication);
+        assert!(capacity.retry_after <= CHALLENGE_EXPIRY);
         // Ordinary registration has its own pool, and guided guest registration
         // remains available after both other pools reach capacity.
         for index in 1..MAX_REGISTRATION_CHALLENGES {

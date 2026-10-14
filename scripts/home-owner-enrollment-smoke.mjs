@@ -618,7 +618,7 @@ if (process.argv.includes("--browser")) {
       assert(url.pathname.startsWith("/apps/home/"));
       if (name === "home-shell-host.js") {
         return route.fulfill({ contentType: "text/javascript", body: `
-          import { bindHomeUnlock, showHomeUnlock } from "./shell-auth.js?v=home-update-20261003a";
+          import { bindHomeUnlock, showHomeUnlock } from "./shell-auth.js?v=home-update-20261014a";
           document.querySelector("#home-shell-boot-mask").hidden = true;
           bindHomeUnlock();
           await showHomeUnlock(() => { throw new Error("Unexpected enrollment dispatch"); });

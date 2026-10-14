@@ -3665,6 +3665,7 @@ pub(in crate::api) fn local_first_owner_registration(
 }
 
 const OWNER_CLAIM_HEADER: &str = "x-elastos-owner-enrollment";
+const REFUSAL_HEADER: &str = "x-elastos-refusal";
 
 fn guest_registration_cookie_name(origin: &str) -> &'static str {
     if origin.starts_with("https://") {
@@ -4492,7 +4493,14 @@ fn passkey_verified_response(headers: &HeaderMap, response: PasskeyVerifyRespons
 
 pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
     if let Some(capacity) = err.downcast_ref::<crate::auth::GuestRegistrationCapacityExceeded>() {
-        let mut response = (StatusCode::TOO_MANY_REQUESTS, capacity.to_string()).into_response();
+        // The typed refusal lets Home tell a full guest store from a busy one
+        // without reading the message text.
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(REFUSAL_HEADER, "guest-capacity")],
+            capacity.to_string(),
+        )
+            .into_response();
         if let Some(seconds) = capacity.retry_after_secs {
             response.headers_mut().insert(
                 "retry-after",
@@ -4501,11 +4509,16 @@ pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
         }
         return response;
     }
-    if err.is::<elastos_identity::webauthn::CeremonyCapacityExceeded>() {
+    if let Some(capacity) =
+        err.downcast_ref::<elastos_identity::webauthn::CeremonyCapacityExceeded>()
+    {
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            [("retry-after", "60")],
-            "Passkey sign-in is busy. Try again shortly.",
+            [(
+                "retry-after",
+                passkey_limits::retry_after_seconds(capacity.retry_after).to_string(),
+            )],
+            capacity.to_string(),
         )
             .into_response();
     }
@@ -4884,13 +4897,34 @@ mod tests {
             ));
     }
 
-    #[test]
-    fn challenge_capacity_returns_retryable_http_response() {
-        let error = anyhow::Error::new(elastos_identity::webauthn::CeremonyCapacityExceeded)
-            .context("begin refused");
-        let response = auth_error_response(error);
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(response.headers()["retry-after"], "60");
+    #[tokio::test]
+    async fn challenge_capacity_returns_its_kind_and_pool_retry_time() {
+        use axum::body::to_bytes;
+        use elastos_identity::webauthn::{CeremonyCapacityExceeded, CeremonyKind};
+
+        for (kind, retry_after, header, body) in [
+            (
+                CeremonyKind::Registration,
+                std::time::Duration::from_millis(238_400),
+                "239",
+                "Passkey sign-up is busy. Try again shortly.",
+            ),
+            (
+                CeremonyKind::Authentication,
+                std::time::Duration::ZERO,
+                "1",
+                "Passkey sign-in is busy. Try again shortly.",
+            ),
+        ] {
+            let error = anyhow::Error::new(CeremonyCapacityExceeded { kind, retry_after })
+                .context("begin refused");
+            let response = auth_error_response(error);
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()["retry-after"], header);
+            assert!(response.headers().get(REFUSAL_HEADER).is_none());
+            let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(std::str::from_utf8(&bytes).unwrap(), body);
+        }
     }
 
     #[tokio::test]
@@ -4904,6 +4938,7 @@ mod tests {
             .context("registration refused");
             let response = auth_error_response(error);
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()[REFUSAL_HEADER], "guest-capacity");
             assert_eq!(
                 response
                     .headers()

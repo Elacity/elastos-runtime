@@ -18,7 +18,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-update-20261003a";
+} from "./shell-core.js?v=home-update-20261014a";
 import {
   addAccountPasskey,
   bindHomeUnlock,
@@ -29,11 +29,11 @@ import {
   profileReadinessActionTarget,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-update-20261003a";
+} from "./shell-auth.js?v=home-update-20261014a";
 import {
   handleHomeWalletConnectorEffect,
   WALLET_CONNECTOR_EFFECT_TYPE,
-} from "./home-wallet-connector-host.js?v=home-update-20261003a";
+} from "./home-wallet-connector-host.js?v=home-update-20261014a";
 import {
   createHomeClipboardFrameState,
   createHomeClipboardHost,
