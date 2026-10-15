@@ -333,8 +333,17 @@ class FiniteRuntime:
         if (self.metric("memory.max") != str(self.budget) or self.metric("memory.swap.max") != "0"
                 or self.metric("pids.max") != "512"):
             raise RuntimeError("finite journey kernel limits changed")
-        pids = [int(value) for value in bounded_text(self.group / "cgroup.procs", 8192).split()]
-        if not pids or len(pids) > 512 or len(set(pids)) != len(pids):
+        # Reading cgroup.procs can race with kernel updates; retry to get a consistent snapshot.
+        pids = None
+        for attempt in range(3):
+            raw_pids = [int(value) for value in bounded_text(self.group / "cgroup.procs", 8192).split()]
+            # Validate the snapshot: no duplicates and reasonable count
+            if raw_pids and len(raw_pids) == len(set(raw_pids)) and len(raw_pids) <= 512:
+                pids = raw_pids
+                break
+            if attempt < 2:
+                time.sleep(0.05)
+        if pids is None or not pids or len(pids) > 512 or len(set(pids)) != len(pids):
             raise RuntimeError("finite journey process census differs")
         for pid in list(self.outside):
             try:
@@ -500,8 +509,8 @@ class FiniteRuntime:
                 self.stop.wait(.1)
             if not self.stop.is_set():
                 raise RuntimeError("finite journey observer deadline")
-        except BaseException:
-            self.error = "finite_resource_observation_failed"
+        except BaseException as exc:
+            self.error = f"finite_resource_observation_failed: {type(exc).__name__}: {exc}"
             private_json(self.control / "response.json", {"id": self.last_action + 1, "status": "failed"})
             private_json(self.control / "stop.json", {"stop": True})
 
@@ -865,7 +874,9 @@ def free_port(kind=socket.SOCK_STREAM):
 def wait_healthy(child, address, label, stop=None):
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not (stop and stop.is_set()):
-        assert child.poll() is None, f"installed {label} exited before health"
+        if child.poll() is not None:
+            error_detail = f" ({child.error})" if hasattr(child, "error") and child.error else ""
+            raise AssertionError(f"installed {label} exited before health{error_detail}")
         try:
             with urllib.request.urlopen(f"http://{address}/healthz", timeout=1) as response:
                 if response.status == 200:
