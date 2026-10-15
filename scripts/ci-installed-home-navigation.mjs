@@ -48,6 +48,32 @@ export async function openInstalledAssistant(page, homeUrl, timeout = 60000) {
   return assistant;
 }
 
+// Crossing the phone boundary is one clean stage reset (shell-phone-stage.js):
+// it closes every open layer, the Assistant room included, before new input.
+// Resizes and waits until the reset has committed the new form factor.
+export async function resizeInstalledHome(page, viewport, timeout = 30000) {
+  await page.setViewportSize(viewport);
+  const factor = viewport.width <= 640 ? "phone" : viewport.width <= 1100 ? "tablet" : "desktop";
+  await page.frameLocator("#active-shell-frame")
+    .locator(`body[data-form-factor="${factor}"]:not([data-stage-reset])`)
+    .waitFor({ state: "attached", timeout });
+}
+
+// Reopens the Assistant room a stage reset closed; its frame and conversation
+// stay mounted. On a phone the Dock tucks under an open window, so the room's
+// own control is pressed directly.
+export async function reopenInstalledAssistant(page, timeout = 30000) {
+  const shell = page.frameLocator("#active-shell-frame");
+  const iframe = shell.locator("#assistant-space-frame");
+  if (!await iframe.isVisible()) {
+    await shell.locator("#assistant-toggle").dispatchEvent("click");
+  }
+  await iframe.waitFor({ state: "visible", timeout });
+  const assistant = await (await iframe.elementHandle()).contentFrame();
+  await assistant.locator('#agent-harness.is-visible[aria-hidden="false"]').waitFor({ state: "visible", timeout });
+  return assistant;
+}
+
 export async function returnInstalledHome(page, assistant, evidence, timeout = 10000) {
   // Assistant owns the visible Home control while Home's dock is hidden.
   await assistant.locator("#agent-shelf-flip-back").click({ timeout });

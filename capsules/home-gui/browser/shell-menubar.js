@@ -22,6 +22,7 @@ import {
   dismissWithMotion,
   prepareSurfaceOpen,
 } from "./shell-motion.js?v=home-20260813a";
+import { registerStageLayer } from "./shell-popovers.js?v=home-20260813a";
 
 /* Resolved lazily — the menubar lives in the lazy GUI template, which is not
    in the DOM at module-evaluation time. */
@@ -50,6 +51,10 @@ let outsideDismissBound = false;
 
 export function bindMenubar(nextDeps) {
   deps = nextDeps;
+  registerStageLayer("app-menu", {
+    selector: ".toolbar-menu-popover:not([hidden])",
+    close: () => closeMenus({ restoreFocus: false }),
+  });
 }
 
 export function setMenuManifest(windowId, rawMenus) {

@@ -8,6 +8,7 @@ import {
   launchHomeTarget,
 } from "./shell-windows.js?v=home-20260813a";
 import { showWalletRail, walletRailOpen } from "./shell-wallet-rail.js?v=home-20260813a";
+import { registerStageLayer } from "./shell-popovers.js?v=home-20260813a";
 
 /* Connector sheet: thin ceremony surface for wallet-metamask / unisat /
    walletconnect. Same launch path as a window, mounted in a rail-aligned
@@ -46,6 +47,7 @@ export function bindConnectorSheet() {
     return;
   }
   bound = true;
+  registerStageLayer("connector-sheet", { selector: "#connector-sheet", close: () => hideConnectorSheet() });
   closeButton?.addEventListener("click", () => hideConnectorSheet());
   sheet.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {

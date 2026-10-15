@@ -1293,8 +1293,9 @@ assert(
     shellSpotlight.spotlightOpen() === true &&
       spotlight.hidden === false &&
       spotlightInput === document.activeElement &&
-      spotlight.getAttribute("aria-hidden") === "false",
-    "Home Spotlight did not open and focus the search field",
+      spotlight.getAttribute("aria-hidden") === "false" &&
+      ["aria-haspopup", "aria-controls", "aria-expanded"].every((name) => spotlightInvoker.getAttribute(name) === null),
+    "Home Spotlight did not open and focus the search field, or its desktop bar button gained popup semantics",
     {
       hidden: spotlight.hidden,
       activeElement: document.activeElement?.selector || null,
@@ -1325,6 +1326,47 @@ assert(
     "Home Spotlight did not open the selected app and close",
     restoredBrowserLaunches.slice(launchesBefore),
   );
+  // System is open now, so activating its row focuses that window rather
+  // than launching again; Spotlight closing is the activation signal.
+  const launchesBeforePress = restoredBrowserLaunches.length;
+  shellSpotlight.showSpotlight();
+  spotlightInput.value = "system";
+  spotlightInput.dispatch("input");
+  // Tablet and desktop: a touch opens on press, exactly as before the phone
+  // work (phones-r1 #4).
+  spotlightResults.children[1].dispatch("pointerdown", { pointerType: "touch" });
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  assert(shellSpotlight.spotlightOpen() === false, "Home Spotlight off the phone must open a touched result on press");
+  // Phone: a finger landing may be a scroll, so touch opens on the tap.
+  window.innerWidth = 390;
+  shellSpotlight.showSpotlight();
+  spotlightInput.value = "system";
+  spotlightInput.dispatch("input");
+  const touchedRow = spotlightResults.children[1];
+  touchedRow.dispatch("pointerdown", { pointerType: "touch" });
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  assert(
+    shellSpotlight.spotlightOpen() === true &&
+      spotlightInvoker.getAttribute("aria-haspopup") === "dialog" &&
+      spotlightInvoker.getAttribute("aria-controls") === "spotlight" &&
+      spotlightInvoker.getAttribute("aria-expanded") === "true",
+    "Home Spotlight on the phone must not open a result when a finger lands on it (the touch may be a scroll), and its bar button must be marked expanded",
+  );
+  touchedRow.dispatch("click");
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  window.innerWidth = 1280;
+  assert(shellSpotlight.spotlightOpen() === false, "Home Spotlight on the phone must open a touched result on tap");
+  shellSpotlight.showSpotlight();
+  spotlightInput.value = "system";
+  spotlightInput.dispatch("input");
+  spotlightResults.children[1].dispatch("pointerdown", { pointerType: "mouse" });
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  assert(shellSpotlight.spotlightOpen() === false, "Home Spotlight must open a result on mouse press");
+  assert(
+    restoredBrowserLaunches.length === launchesBeforePress,
+    "Home Spotlight press tests must focus the open System window, not launch again",
+    restoredBrowserLaunches.slice(launchesBeforePress),
+  );
   spotlightInvoker.focus();
   shellSpotlight.showSpotlight();
   spotlightInput.value = "no-match-query";
@@ -1344,8 +1386,9 @@ assert(
   spotlightPanel.dispatch("animationend", { target: spotlightPanel });
   assert(
     shellSpotlight.spotlightOpen() === false &&
-      document.activeElement === spotlightInvoker,
-    "Home Spotlight did not close on Escape and restore focus",
+      document.activeElement === spotlightInvoker &&
+      ["aria-haspopup", "aria-controls", "aria-expanded"].every((name) => spotlightInvoker.getAttribute(name) === null),
+    "Home Spotlight did not close on Escape and restore focus, or its desktop bar button gained popup semantics",
     {
       hidden: spotlight.hidden,
       activeElement: document.activeElement?.selector || null,

@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import http from "node:http";
 import { extname } from "node:path";
 import test from "node:test";
-import { openInstalledApp, openInstalledAssistant, returnInstalledHome } from "./ci-installed-home-navigation.mjs";
+import { openInstalledApp, openInstalledAssistant, reopenInstalledAssistant, resizeInstalledHome, returnInstalledHome } from "./ci-installed-home-navigation.mjs";
 import { publicJourneyFailure } from "./ci-installed-home-failure.mjs";
 
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
@@ -474,6 +474,72 @@ test("installed navigation waits for real Home GUI restoration and preserves app
       });
     }
     assert.deepEqual(errors, []);
+  } finally {
+    await browser?.close();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test("a resize across the phone boundary waits out Home's stage reset and reopens the Assistant room it closed", async () => {
+  // The fixture plays the shell's contract (shell-phone-stage.js): a crossing
+  // marks body[data-stage-reset], closes the room, then commits the form factor.
+  const server = http.createServer((request, response) => {
+    const url = new URL(request.url, "http://localhost");
+    response.setHeader("content-type", "text/html");
+    if (url.pathname === "/shell") {
+      response.end(`<!doctype html><body data-form-factor="desktop">
+        <div id="assistant-space"><iframe id="assistant-space-frame" src="/assistant"></iframe></div>
+        <button id="assistant-toggle" hidden>Assistant</button>
+        <script>
+          const room = document.querySelector("#assistant-space");
+          const frame = document.querySelector("#assistant-space-frame");
+          const show = open => {
+            room.hidden = !open;
+            frame.contentWindow.postMessage({ open }, location.origin);
+          };
+          document.querySelector("#assistant-toggle").addEventListener("click", () => show(true));
+          addEventListener("resize", () => {
+            const factor = innerWidth <= 640 ? "phone" : innerWidth <= 1100 ? "tablet" : "desktop";
+            if ((factor === "phone") === (document.body.dataset.formFactor === "phone")) return;
+            document.body.dataset.stageReset = "running";
+            show(false);
+            setTimeout(() => {
+              document.body.dataset.formFactor = factor;
+              delete document.body.dataset.stageReset;
+            }, 150);
+          });
+        </script>`);
+    } else if (url.pathname === "/assistant") {
+      response.end(`<!doctype html><div id="agent-harness" class="is-visible" aria-hidden="false">Reply</div>
+        <script>
+          addEventListener("message", event => {
+            const harness = document.querySelector("#agent-harness");
+            harness.classList.toggle("is-visible", event.data.open);
+            harness.setAttribute("aria-hidden", String(!event.data.open));
+          });
+        </script>`);
+    } else if (url.pathname === "/") {
+      response.end(`<!doctype html><body style="margin:0"><iframe id="active-shell-frame" src="/shell" style="border:0;width:100vw;height:100vh;display:block"></iframe>`);
+    } else response.writeHead(404).end();
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    await page.goto(`http://127.0.0.1:${server.address().port}/`);
+    const shell = page.frameLocator("#active-shell-frame");
+    const before = await (await shell.locator("#assistant-space-frame").elementHandle()).contentFrame();
+    await resizeInstalledHome(page, { width: 390, height: 844 }, 3000);
+    assert.equal(await shell.locator("body").getAttribute("data-form-factor"), "phone");
+    assert.equal(await shell.locator("#assistant-space").isVisible(), false, "the reset closed the room");
+    const after = await reopenInstalledAssistant(page, 3000);
+    assert.equal(after, before, "the same Assistant frame and conversation");
+    await resizeInstalledHome(page, { width: 1440, height: 900 }, 3000);
+    assert.equal(await shell.locator("body").getAttribute("data-form-factor"), "desktop");
+    assert.equal(await reopenInstalledAssistant(page, 3000), before);
+    assert.equal(await shell.locator("#assistant-space").isVisible(), true);
   } finally {
     await browser?.close();
     server.closeAllConnections();

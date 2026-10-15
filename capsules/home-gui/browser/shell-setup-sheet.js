@@ -4,6 +4,7 @@ import {
   rememberChromeNotification,
   setHomeSetupNotificationHandler,
 } from "./shell-notifications.js?v=home-20260813a";
+import { registerStageLayer } from "./shell-popovers.js?v=home-20260813a";
 import { openTarget, openSystemRecoverySave } from "./shell-windows.js?v=home-20260813a";
 
 const PROFILE_READINESS_SCHEMA = "elastos.profile.readiness/v1";
@@ -42,6 +43,7 @@ export function bindSetupSheet() {
     return;
   }
   bound = true;
+  registerStageLayer("setup-sheet", { selector: "#setup-sheet", close: () => hideSetupSheet() });
   closeButton?.addEventListener("click", () => hideSetupSheet());
   document.querySelector("#setup-sheet-later")?.addEventListener("click", () => hideSetupSheet());
   recoveryButton?.addEventListener("click", () => openRecoveryAct());
