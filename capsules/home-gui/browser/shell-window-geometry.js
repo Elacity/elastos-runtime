@@ -437,7 +437,14 @@ export function attachForwardedWindowDrag(windowNode, focusWindow, onWindowGeome
     ) {
       return;
     }
-    if (data.phase === "end") {
+    // A hidden, maximized or snapped window keeps its place, including when it
+    // changes state in the middle of a drag.
+    const movable =
+      !windowNode.classList.contains("hidden") &&
+      windowNode.dataset.maximized !== "true" &&
+      windowNode.dataset.browserMaximized !== "true" &&
+      !windowNode.dataset.snap;
+    if (data.phase === "end" || !movable) {
       finish();
       return;
     }
@@ -449,13 +456,6 @@ export function attachForwardedWindowDrag(windowNode, focusWindow, onWindowGeome
     const pointerX = frameRect.left + data.clientX - workspaceRect.left;
     const pointerY = frameRect.top + data.clientY - workspaceRect.top;
     if (data.phase === "start") {
-      if (
-        windowNode.dataset.maximized === "true" ||
-        windowNode.dataset.browserMaximized === "true" ||
-        windowNode.dataset.snap
-      ) {
-        return;
-      }
       hideWindowSnapPreview();
       focusWindow(windowNode.dataset.windowId);
       const bounds = normalWindowBounds(windowNode);

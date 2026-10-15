@@ -86,13 +86,15 @@ test("toolbar controls, other buttons and a second pointer keep their own behavi
   assert.deepEqual(toolbar.posted.map(({ message }) => message.phase), ["start"]);
 });
 
-function homeWindow({ mode = "unified-toolbar", maximized = false } = {}) {
+function homeWindow({ mode = "unified-toolbar", maximized = false, hidden = false } = {}) {
   const listeners = new Set();
   const interactions = { begun: 0, ended: 0, saved: 0, focused: [] };
   const frameWindow = {};
+  const classes = new Set(hidden ? ["window", "hidden"] : ["window"]);
   const node = {
     isConnected: true,
     offsetWidth: 800,
+    classList: { contains: (name) => classes.has(name), add: (name) => classes.add(name) },
     dataset: { windowId: "browser-1", windowChromeMode: mode, ...(maximized ? { maximized: "true" } : {}) },
     style: { left: "100px", top: "50px" },
   };
@@ -142,7 +144,7 @@ test("Home moves the Browser window with the pointer and saves the place on rele
   assert.deepEqual(home.interactions, { begun: 1, ended: 1, saved: 1, focused: ["browser-1"] });
 });
 
-test("Home ignores drag messages from other frames, other chrome modes and maximized windows", () => {
+test("Home ignores drag messages from other frames, other chrome modes, maximized and hidden windows", () => {
   const stranger = homeWindow();
   stranger.send("start", 400, 80, {});
   stranger.send("move", 280, 160, {});
@@ -158,6 +160,30 @@ test("Home ignores drag messages from other frames, other chrome modes and maxim
   maximized.send("move", 280, 160);
   assert.deepEqual(maximized.position(), [100, 50]);
   assert.equal(maximized.interactions.begun, 0);
+
+  const hidden = homeWindow({ hidden: true });
+  hidden.send("start", 400, 80);
+  hidden.send("move", 280, 160);
+  assert.deepEqual(hidden.position(), [100, 50]);
+  assert.deepEqual(hidden.interactions, { begun: 0, ended: 0, saved: 0, focused: [] });
+});
+
+test("a window that is snapped, maximized or hidden during a drag stops following the pointer", () => {
+  for (const change of [
+    (node) => { node.dataset.snap = "left"; },
+    (node) => { node.dataset.maximized = "true"; },
+    (node) => { node.classList.add("hidden"); },
+  ]) {
+    const home = homeWindow();
+    home.send("start", 400, 80);
+    home.send("move", 340, 120);
+    const placed = home.position();
+    change(home.node);
+    home.send("move", 280, 160);
+    home.send("end", 280, 160);
+    assert.deepEqual(home.position(), placed);
+    assert.deepEqual([home.interactions.begun, home.interactions.ended, home.interactions.saved], [1, 1, 1]);
+  }
 });
 
 test("closing the window removes its drag listener and ends an active drag", () => {
