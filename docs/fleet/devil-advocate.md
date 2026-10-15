@@ -5,7 +5,7 @@
 ### 1. **Mac is an Unacceptable Bottleneck**
 **Challenge**: 140-160 minutes per commit on the critical path (Mac alone) defeats the goal of "faster feedback." Current CI is 35-45 min for installed journeys. This fleet makes it WORSE, not better.
 
-**Response**: 
+**Response**:
 - Current CI runs Mac journeys once per PR (before merge). Fleet runs once per develop commit (~1-2/hour during active dev, 5-10/day typical).
 - Absolute time doesn't matter as much as not blocking PRs. Developers get instant feedback that "your PR will be tested after merge."
 - Parallel execution on other devices (Jetson, Linux) provides incremental confidence while Mac finishes.
@@ -155,7 +155,7 @@ The fleet design handwaves "run `scripts/update-hop-compare.py`" without showing
 ---
 
 ## Alternative: "Start Smaller"
-**Devil's Advocate Recommendation**: 
+**Devil's Advocate Recommendation**:
 Don't build the fleet. Instead:
 1. Fix CI flakiness (better timeouts, isolated Homes)
 2. Optimize slow journeys (Mac ~45 min → ~25 min)
