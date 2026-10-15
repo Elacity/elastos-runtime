@@ -10,6 +10,7 @@ import {
   beginShellInteraction,
   clamp,
   endShellInteraction,
+  WINDOW_CHROME_UNIFIED_TOOLBAR,
 } from "./shell-core.js?v=home-20260813a";
 
 const WINDOW_MIN_VISIBLE_DRAG_WIDTH = 96;
@@ -402,6 +403,80 @@ export function attachWindowDrag(windowNode, handle, focusWindow, onWindowGeomet
 
   handle.addEventListener("pointerup", stopDrag);
   handle.addEventListener("pointercancel", stopDrag);
+}
+
+export const WINDOW_DRAG_MESSAGE_TYPE = "elastos.home.window-drag/v1";
+
+/** A unified-toolbar capsule draws its own top bar, so a press on an empty
+ * part of that bar arrives as messages. Only this window's frame can move it.
+ * Positions are frame-relative and are added to the frame's current place,
+ * because some engines report screen positions offset or flipped. */
+export function attachForwardedWindowDrag(windowNode, focusWindow, onWindowGeometryChange = null) {
+  let dragging = null;
+  const finish = () => {
+    if (!dragging) {
+      return;
+    }
+    dragging = null;
+    endShellInteraction();
+    if (typeof onWindowGeometryChange === "function") {
+      onWindowGeometryChange();
+    }
+  };
+  const listener = (event) => {
+    const data = event.data;
+    if (!data || data.type !== WINDOW_DRAG_MESSAGE_TYPE) {
+      return;
+    }
+    const frame = windowNode.querySelector(".window-frame");
+    if (
+      windowNode.dataset.windowChromeMode !== WINDOW_CHROME_UNIFIED_TOOLBAR ||
+      !windowNode.isConnected ||
+      !frame?.contentWindow ||
+      event.source !== frame.contentWindow
+    ) {
+      return;
+    }
+    if (data.phase === "end") {
+      finish();
+      return;
+    }
+    if (!Number.isFinite(data.clientX) || !Number.isFinite(data.clientY)) {
+      return;
+    }
+    const frameRect = frame.getBoundingClientRect();
+    const workspaceRect = desktop.getBoundingClientRect();
+    const pointerX = frameRect.left + data.clientX - workspaceRect.left;
+    const pointerY = frameRect.top + data.clientY - workspaceRect.top;
+    if (data.phase === "start") {
+      if (
+        windowNode.dataset.maximized === "true" ||
+        windowNode.dataset.browserMaximized === "true" ||
+        windowNode.dataset.snap
+      ) {
+        return;
+      }
+      hideWindowSnapPreview();
+      focusWindow(windowNode.dataset.windowId);
+      const bounds = normalWindowBounds(windowNode);
+      if (!dragging) {
+        beginShellInteraction();
+      }
+      dragging = { offsetX: pointerX - bounds.x, offsetY: pointerY - bounds.y };
+      return;
+    }
+    if (data.phase !== "move" || !dragging) {
+      return;
+    }
+    const limits = partialDragBoundsForWindow(windowNode.offsetWidth);
+    windowNode.style.left = `${safeClamp(pointerX - dragging.offsetX, limits.minX, limits.maxX)}px`;
+    windowNode.style.top = `${safeClamp(pointerY - dragging.offsetY, limits.minY, limits.maxY)}px`;
+  };
+  window.addEventListener("message", listener);
+  return () => {
+    window.removeEventListener("message", listener);
+    finish();
+  };
 }
 
 export function attachWindowResize(windowNode, focusWindow, onWindowGeometryChange = null) {
