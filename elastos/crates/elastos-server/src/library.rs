@@ -2000,6 +2000,10 @@ async fn library_publish(
     let target = library_target(data_dir, principal_id, uri)?;
     check_revision(data_dir, principal_id, &target.uri, if_revision)?;
     if let Some(protection) = protection {
+        anyhow::ensure!(
+            crate::protected_content_runtime::protected_content_enabled(data_dir),
+            "protected content is not available in this release"
+        );
         let loaded =
             validate_runtime_custody_publish_input(data_dir, principal_id, &target, protection)?;
         let source_storage = published_source_storage(data_dir, principal_id, &target)?.to_string();
@@ -3476,6 +3480,11 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
         }
         if is_extractable_archive_name(&name) {
             capabilities.push("extract_archive");
+        }
+        if active_record.is_none()
+            && crate::protected_content_runtime::protected_content_enabled(data_dir)
+        {
+            capabilities.push("protect");
         }
         capabilities
     };

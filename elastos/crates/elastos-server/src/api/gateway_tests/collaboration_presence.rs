@@ -174,6 +174,7 @@ fn room_attribution_name_map_never_upgrades_false_or_none_rows_after_reopen() {
                   member_did: Option<String>,
                   sender_profile_verified: Option<bool>| {
         crate::room_service::ConversationObjectView {
+            delivery_state: None,
             sender_profile_verified,
             seq,
             sender: sender.to_string(),
@@ -188,6 +189,7 @@ fn room_attribution_name_map_never_upgrades_false_or_none_rows_after_reopen() {
         }
     };
     let poll = || crate::room_service::RoomPollView {
+        own_delivery: Vec::new(),
         room_slug: "chat-room".to_string(),
         display_name: "Local".to_string(),
         expires_at: now + 300,

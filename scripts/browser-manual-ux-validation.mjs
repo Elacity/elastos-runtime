@@ -86,7 +86,7 @@ function regexMatches(pattern, value) {
   }
 }
 
-function macVmArtifactAccepted(artifact) {
+export function macVmArtifactAccepted(artifact) {
   const afterControl = artifact?.vm_control?.after || {};
   const videoInput = artifact?.embedded_video_input || {};
   const displaySession = videoInput.display_session || {};

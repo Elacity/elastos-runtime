@@ -3,30 +3,56 @@
   const CID = /^bafybei[a-z2-7]{52}$/;
   const STATES = new Set(["capacity_pending", "reserved", "preparing", "verifying", "admission_pending", "admitted", "reclaimed", "failed", "uncertain", "cancelled", "expired"]);
   const active = p => p && ["capacity_pending", "reserved", "preparing", "verifying", "admission_pending", "uncertain"].includes(p.state);
+  const MEMORY_FIT_TEXT = Object.freeze({
+    fits: "This device has enough memory for this model. Replies also need some of it free when the model runs.",
+    insufficient: "This device has less memory than this model requires. Choose a smaller model.",
+    unavailable: "This Home could not check the device memory. Ask the Home owner to check the memory limits, then try again.",
+  });
   const FAILURE_TEXT = Object.freeze({
     authorization_unavailable: "Preparation stopped. Open Models again to check access.",
     policy_unavailable: "Preparation stopped. Model policy is unavailable.",
-    capacity_unavailable: "Preparation stopped. Storage capacity is unavailable.",
+    capacity_unavailable: "Not enough free disk space for this model. Free some space, then Retry.",
+    download_interrupted: "The download stopped before it finished. Retry.",
+    storage_service_unavailable: "The storage service is unavailable. Retry when it is running.",
+    cache_budget_unavailable: "This model does not fit the local cache budget. Remove an unneeded model, choose a smaller model, or increase the budget, then Retry.",
+    memory_budget_unavailable: "This model exceeds the local model memory budget. Choose a smaller model or increase the budget, then Retry.",
+    model_memory_insufficient: MEMORY_FIT_TEXT.insufficient,
+    model_memory_observation_unavailable: MEMORY_FIT_TEXT.unavailable,
+    request_expired: "This request is no longer valid. Check your device's clock, then try again.",
     content_unavailable: "Preparation failed. Model content could not be read.",
     local_storage_unavailable: "Preparation failed. Local storage could not be written.",
     verification_failed: "Preparation failed. Model verification did not pass.",
     preparation_unavailable: "Preparation failed.",
+    activation_unavailable: "Local AI could not start. The model stays on this device. Retry.",
   });
   const failureText = p => FAILURE_TEXT[p.failure_class] || "Preparation failed.";
+  const DISPATCH_UNAVAILABLE_TEXT = Object.freeze({
+    unsupported_host: "Local AI is not supported on this device.",
+    source_engine_required: "This source Home needs its local model engine. Install the engine through source setup, then Retry.",
+    catalog_updated: "Model list updated. Press Use to keep using this model.",
+    cache_budget_unavailable: FAILURE_TEXT.cache_budget_unavailable,
+    memory_budget_unavailable: FAILURE_TEXT.memory_budget_unavailable,
+  });
   // One phase per Runtime projection. The full view (System) and the compact
   // Marketplace detail read their copy from the same phase.
-  function phaseOf(r, p, message) {
+  function phaseOf(r, p, message, finishingExpired = false) {
     if (message) return "unavailable";
     if (r.dispatch_ready) return "ready";
-    if (r.admitted) return "service_unavailable";
+    // Admitted content whose engine is still being activated is finishing,
+    // not broken: Runtime clears activation_pending once dispatch can start.
+    // An unresolved finish has a bounded wait before offering Retry.
+    if (r.admitted) return activating(r, p) && !finishingExpired ? "finishing" : "service_unavailable";
     if (active(p)) return p.cancel_requested ? "cancelling" : p.state === "capacity_pending" ? "capacity" : p.state === "uncertain" ? "settling" : p.state === "verifying" ? "verifying" : "preparing";
     if (!p) return "absent";
     return p.state;
   }
+  const FINISHING_DEADLINE_MS = 120000;
+  const activating = (r, p) => Boolean(r.admitted && p?.activation_pending && !p.failure_class && !r.dispatch_unavailable_reason);
   const PHASE_TEXT = Object.freeze({
     unavailable: "Current status unavailable", ready: "Available on this device",
     service_unavailable: "Available on this device. Model service unavailable.",
-    cancelling: "Cancelling preparation…", capacity: "Waiting for local capacity…", settling: "Waiting for preparation to settle…",
+    finishing: "Finishing setup…",
+    cancelling: "Cancelling preparation…", settling: "Waiting for preparation to settle…",
     verifying: "Checking model files…", preparing: "Preparing local files…", absent: "Ready to prepare",
     reclaimed: "Model removed from local cache.", cancelled: "Preparation cancelled.", expired: "Preparation expired.",
   });
@@ -43,6 +69,8 @@
   function parseRuntime(r, cid) {
     check(r && [r.admitted, r.kept, r.dispatch_ready].every(v => typeof v === "boolean"));
     check(r.dispatch_ready ? r.admitted && /^model:[0-9a-f]{64}$/.test(r.offer_id) : r.offer_id === null);
+    check(r.dispatch_unavailable_reason == null || (r.admitted && !r.dispatch_ready &&
+      typeof r.dispatch_unavailable_reason === "string" && Object.hasOwn(DISPATCH_UNAVAILABLE_TEXT, r.dispatch_unavailable_reason)));
     const p = r.preparation;
     if (p !== null) {
       check(p && p.cid === cid && text(p.operation_id, 160) && STATES.has(p.state));
@@ -68,7 +96,8 @@
       check(item.role === "content" && item.installed === false && item.launchable === false
         && CID.test(item.cid) && text(item.title) && text(item.publisher_did, 256)
         && item.publisher_did.startsWith("did:") && item.signature_state === "catalog-signature-verified"
-        && Number.isSafeInteger(item.content_size_bytes) && item.content_size_bytes > 0);
+        && Number.isSafeInteger(item.content_size_bytes) && item.content_size_bytes > 0
+        && typeof item.model_memory_fit === "string" && Object.hasOwn(MEMORY_FIT_TEXT, item.model_memory_fit));
       parseRuntime(item.model_runtime, item.cid);
     }
     return entries;
@@ -85,6 +114,10 @@
     const rank = bytes ? Math.min(4, Math.floor(Math.log(bytes) / Math.log(1000))) : 0;
     return `${(bytes / 1000 ** rank).toLocaleString(undefined, { maximumFractionDigits: rank ? 2 : 0 })} ${units[rank]}`;
   }
+  // Waiting for space names how much this model still needs, so the user knows what to free.
+  const capacityText = p => p.failure_class === "cache_budget_unavailable"
+    ? "Waiting for room in the local cache budget. Remove an unneeded model or increase the budget and it continues."
+    : `Waiting for free space. This model needs ${formatBytes(p.total_bytes - p.completed_bytes)} on this Home, plus 2 GB kept free. Free some space and it continues.`;
   function element(tag, value, className) {
     const node = document.createElement(tag);
     if (value) node.textContent = value;
@@ -97,15 +130,21 @@
       "operation_id", "cid", "state", "total_bytes", "completed_bytes", "cancel_requested", "admitted", "activation_pending", "failure_class",
     ].map(key => [key, output[key]]));
     return parseRuntime({ admitted: output.admitted, kept: output.kept,
-      dispatch_ready: output.dispatch_ready, offer_id: output.offer_id, preparation }, cid);
+      dispatch_ready: output.dispatch_ready, dispatch_unavailable_reason: output.dispatch_unavailable_reason,
+      offer_id: output.offer_id, preparation }, cid);
   }
   window.ElastosModelManagement = {
     create({ root, capsule, token, buttonClass = "pc2-btn pc2-btn-secondary", cid: requiredCid = null, compact = false, onReadyOpen = null }) {
       let visible = false, closed = false, generation = 0, busy = false, timer, reader;
       let selectedCid = requiredCid, choices = [], model = null, methods = new Map(), message = "", loading = false;
-      let unresolvedUse = null, reconcileRequired = false;
+      let unresolvedUse = null, reconcileRequired = false, refusal = "";
       let pendingFocus = null;
       let reclaimStep = "idle";
+      // Consecutive failed status reads while a preparation is pending. A short
+      // run keeps polling with backoff; only a long run gives up to Refresh.
+      let statusFailures = 0, statusFailingSince = 0;
+      // When this view first saw the current operation finishing setup.
+      let finishingOperation = "", finishingSince = 0;
       root.classList.add("model-management");
       root.tabIndex = -1;
       const show = () => visible && !closed && !document.hidden;
@@ -114,10 +153,21 @@
         const response = await fetch(path, { method: body ? "POST" : "GET", headers: {
           "x-elastos-home-token": token, ...(body ? { "content-type": "application/json" } : {}),
         }, ...(body ? { body: JSON.stringify(body) } : {}), signal });
-        if (!response.ok) throw new Error("Model request failed");
         const raw = await response.text();
         check(raw.length <= 2 * 1024 * 1024);
-        return JSON.parse(raw);
+        const result = JSON.parse(raw);
+        if (!response.ok) {
+          // Only the exact invoked operation can return a final typed denial.
+          const bound = body && result?.schema === "elastos.capsules.invoke-result/v1" && result.status === "error"
+            && ["capsule", "interface", "method", "request_id"].every(key => result[key] === body[key]);
+          let denial = bound && ["cache_budget_unavailable", "memory_budget_unavailable", "model_memory_insufficient", "model_memory_observation_unavailable", "request_expired"].includes(result.code)
+            ? FAILURE_TEXT[result.code] : "";
+          if (bound && result.code === "not_enough_free_space" && text(result.message, 300)
+            && /^Not enough free disk space on this Home: this needs \d+(?:\.\d)? GB plus 2 GB kept free\. Free some space, then select Get again\.$/.test(result.message)) denial = result.message;
+          if (denial) throw Object.assign(new Error(denial), { refusal: denial, code: result.code });
+          throw new Error("Model request failed");
+        }
+        return result;
       }
       async function invoke(operation, input, signal, requestId) {
         const method = methods.get(operation);
@@ -161,7 +211,7 @@
       async function load() {
         if (!show() || busy) return;
         stopRead(); const epoch = ++generation; const io = controller(); reader = io;
-        loading = true; message = ""; render();
+        loading = true; message = ""; refusal = ""; statusFailures = 0; render();
         try {
           const [catalog, interfaces] = await Promise.all([
             request("/api/capsules/catalog", null, io.signal), request("/api/capsules/interfaces", null, io.signal),
@@ -170,7 +220,7 @@
           bindMethods(interfaces); model = parseCatalog(catalog);
           reconcileRequired = false;
           reclaimStep = "idle";
-          if (model?.cid !== unresolvedUse?.cid || model?.model_runtime.preparation) unresolvedUse = null;
+          if (model?.cid !== unresolvedUse?.cid || model?.model_runtime.preparation || unresolvedUse?.expiredConfirmed) unresolvedUse = null;
         } catch {
           if (epoch !== generation || !show()) return;
           model = null; choices = []; message = "Models are unavailable. Check your connection and trusted catalog, then retry.";
@@ -184,7 +234,7 @@
         const runtime = model?.model_runtime, preparation = runtime?.preparation;
         const pending = active(preparation) || (preparation && runtime.admitted && !runtime.dispatch_ready);
         if (!show() || busy || message || !pending) return;
-        timer = setTimeout(poll, 1500);
+        timer = setTimeout(poll, statusFailures ? Math.min(1500 * 2 ** statusFailures, 10000) : 1500);
       }
       async function poll() {
         if (!show() || busy || !model) return;
@@ -197,21 +247,27 @@
           const r = operationRuntime(result, cid);
           check(r.preparation?.operation_id === id);
           model.model_runtime = r;
+          statusFailures = 0;
         } catch {
           if (epoch !== generation || !show()) return;
-          message = "Status is unavailable. Refresh to check before trying again.";
+          if (!statusFailures++) statusFailingSince = Date.now();
+          if (statusFailures >= 5 && Date.now() - statusFailingSince >= 60000) {
+            message = "Status is unavailable. Refresh to check before trying again.";
+          }
         } finally { io.done(); if (epoch === generation) { render(); schedule(); } }
       }
       async function act(operation, keep) {
         if (busy || loading || !show() || !model || reconcileRequired) return;
+        if (operation === "use" && !unresolvedUse && model.model_memory_fit !== "fits") return;
         stopRead(); const epoch = ++generation, cid = model.cid;
+        const freshUse = operation === "use" && !unresolvedUse;
         const id = model.model_runtime.preparation?.operation_id;
-        busy = true; message = ""; render();
+        busy = true; message = ""; refusal = ""; statusFailures = 0; render();
         const io = controller();
         try {
           const opening = operation === "open";
           const input = opening ? { cid, keep: true } : operation === "retention" ? { cid, keep } : operation === "cancel" ? { operation_id: id } : { cid };
-          if (operation === "use" && !unresolvedUse) unresolvedUse = { cid, id: `model-${crypto.randomUUID()}` };
+          if (freshUse) unresolvedUse = { cid, id: `model-v1:${Date.now()}:${crypto.randomUUID()}` };
           const result = await invoke(opening ? "retention" : operation, input, io.signal, operation === "use" ? unresolvedUse.id : undefined);
           if (epoch !== generation || !show() || model?.cid !== cid) return;
           check(result.cid === cid);
@@ -240,8 +296,15 @@
             model.model_runtime = r;
             if (operation === "use") unresolvedUse = null;
           }
-        } catch {
-          if (epoch === generation && show()) {
+        } catch (error) {
+          if (epoch === generation && show() && operation === "use" && error?.refusal) {
+            if (error.code === "request_expired" && !freshUse) {
+              unresolvedUse.expiredConfirmed = true;
+              reconcileRequired = true;
+            }
+            else unresolvedUse = null;
+            refusal = error.refusal;
+          } else if (epoch === generation && show()) {
             if (operation === "reclaim") {
               try {
                 const catalog = await request("/api/capsules/catalog", null, io.signal);
@@ -283,7 +346,7 @@
         const refresh = button("Refresh models", () => void load(), loading);
         refresh.dataset.modelControl = "refresh";
         if (!compact) root.append(refresh);
-        const status = element("p", loading ? "Loading models…" : message);
+        const status = element("p", loading ? "Loading models…" : message || refusal || (statusFailures ? "Checking status…" : ""));
         status.setAttribute("role", "status"); status.hidden = compact && !status.textContent; root.append(status);
         if (!model) {
           if (!loading && !message && !requiredCid && choices.length > 1) {
@@ -315,17 +378,27 @@
             element("p", `Content ID: ${model.cid}`, "model-identity"));
           row.append(identity);
         }
-        const phase = phaseOf(r, p, message);
-        const label = phase === "failed" ? failureText(p) : (compact ? COMPACT_PHASE_TEXT : PHASE_TEXT)[phase];
+        if (!activating(r, p)) finishingOperation = "";
+        else if (finishingOperation !== p.operation_id) { finishingOperation = p.operation_id; finishingSince = Date.now(); }
+        const phase = phaseOf(r, p, message, Boolean(finishingOperation) && Date.now() - finishingSince >= FINISHING_DEADLINE_MS);
+        const label = (phase === "failed" || (["cancelled", "expired"].includes(phase) && p?.failure_class)) ? failureText(p)
+          : phase === "settling" && p?.failure_class === "storage_service_unavailable" ? "The storage service is unavailable. Waiting for preparation to settle."
+          : phase === "capacity" ? capacityText(p) : phase === "service_unavailable" && r.dispatch_unavailable_reason
+          ? DISPATCH_UNAVAILABLE_TEXT[r.dispatch_unavailable_reason] : phase === "service_unavailable" && p?.failure_class
+            ? failureText(p) : (compact ? COMPACT_PHASE_TEXT : PHASE_TEXT)[phase];
         row.append(element("p", label));
+        row.append(element("p", MEMORY_FIT_TEXT[model.model_memory_fit], "model-memory-fit"));
         if (active(p)) {
           const progress = element("progress"); progress.max = p.total_bytes || 1; progress.value = p.completed_bytes;
           progress.setAttribute("aria-label", "Preparation progress"); row.append(progress, element("p", `${formatBytes(p.completed_bytes)} of ${formatBytes(p.total_bytes)} prepared`));
         }
         const controls = element("div", "", "model-controls");
-        const use = button((p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : compact ? "Get" : "Use", () => void act("use"), active(p) || reconcileRequired);
+        const useLabel = r.dispatch_unavailable_reason === "catalog_updated" ? "Use"
+          : (p && p.state !== "reclaimed") || unresolvedUse ? "Retry" : compact ? "Get" : "Download";
+        const use = button(useLabel, () => void act("use"), active(p) || reconcileRequired
+          || (!unresolvedUse && model.model_memory_fit !== "fits"));
         use.dataset.modelControl = "use";
-        if (!active(p) && !r.dispatch_ready) controls.append(use);
+        if (!active(p) && !r.dispatch_ready && phase !== "finishing") controls.append(use);
         if (r.dispatch_ready && typeof onReadyOpen === "function") {
           const open = button("Open in Assistant", () => void act("open"), reconcileRequired);
           open.dataset.modelControl = "open-assistant";

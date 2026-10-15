@@ -26,7 +26,8 @@ The MCP stdio host, SDK process and installed browser need target proof.
 
 ## Invitation and explicit approval
 
-Browser Settings provides **Agent access**. The owner creates a page invitation;
+The owner-side approval module (`browser-operator-approval.js`) is not mounted in
+Browser Settings until a shipped agent can complete this flow (#290). The owner creates a page invitation;
 this visible step performs a bounded owner inspection to obtain the exact document
 generation. The returned metadata contains Runtime origin, page ID, generation
 and a 30-second expiry. Credentials and page content remain with the owner.

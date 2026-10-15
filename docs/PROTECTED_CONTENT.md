@@ -81,8 +81,9 @@ topology stays private.
 
 Capsule URI lookup, public provider proxying, interface projection, and route
 lists exclude all four targets. Runtime registers a target only after the
-provider returns the exact successful identity, version, configured state,
-schema, and ordered operation set. Rejected startup settles and reaps the child
+provider returns the exact successful identity, a valid release version (it may
+differ from the Runtime's after a Runtime-only update), configured state,
+schema or protocol version, and ordered operation set. Rejected startup settles and reaps the child
 before it returns an error.
 
 Protect, media, and decrypt run as local native provider processes. Custody can
@@ -106,7 +107,7 @@ Verified deployed read behavior is:
   access returns `false`.
 
 The configured Base 8453 contract uses these operations. Deployed verification
-evidence belongs in [state.md](../state.md):
+evidence belongs in its GitHub issue:
 
 - `CentralStorage.bindIP(bytes16,address,uint256)` accepts acknowledged
   contracts only and is called by `AssetFactory.registerNewAsset`.
@@ -201,6 +202,45 @@ the stable installed Runtime, own one exact PID file, stop only the proven
 prior Runtime, preserve one bounded principal-root rollback, and write one
 owner-only restart receipt.
 
+Principal-root migration writes encrypted rollback objects bound to the
+principal, root, object URI and recovery data key. Runtime can restore the
+original plaintext during migration recovery. It keeps the rollback payload
+through release recovery and Home acceptance. Every Home start, local or public
+and whether the installed Home controller, the installer or the owner started
+it, then removes verified payload files and keeps the migration receipts.
+
+Cleanup holds the installation writer lock and verifies the signed installed
+release, exact Home process and generation, host ownership, health response,
+private attach, served Home hash and configured protected roots. An active
+release transaction or migration journal keeps its recovery copies until it
+finishes. A source-home deployment keeps its encrypted copies until the
+installed release acceptance gate passes. Its owner also reconciles the restart
+receipt and payload-free proof directory before the next source-home restart.
+
+Cleanup also checks older Runtime migration and upgrade directories under
+`backups/`. It imports a legacy plaintext backup only when its committed
+receipt, object inventory, file names, hashes and ownership agree; a backup
+that fails any of these checks stays in place and is reported on each Home
+start. The owner of such a backup, or of an older manual backup outside
+`backups/`, supplies the original owner-only plan and exact backup directory:
+
+```sh
+"$ELASTOS_INSTALLED_RUNTIME" principal-root-cleanup \
+  --data-dir "$ELASTOS_DATA_DIR" \
+  --binary "$ELASTOS_INSTALLED_RUNTIME" \
+  --plan "$ELASTOS_MIGRATION_PLAN" \
+  --backup-dir "$ELASTOS_MIGRATION_BACKUP"
+```
+
+Keep the original plan bytes, including formatting, because the receipt binds
+their hash. A missing plan or receipt, changed payload, link, or uncertain
+directory stays with its owner for reconciliation. These cleanup gaps are
+reported while Home remains available. Cleanup durably removes the verified
+files from the active filesystem; earlier snapshots and external copies have
+their own retention policy. The recovery key remains available for active
+protected objects, so this cleanup does not claim physical or cryptographic
+erasure.
+
 `elastos run <provider> [--with <provider>]... --carrier-addr <addr>` hosts
 one or more native providers standalone, outside the full Home/gateway
 supervisor tree, and writes an owner-only readiness receipt at
@@ -238,7 +278,7 @@ the resulting composition end to end.
 
 ## Remaining work
 
-The ordered release proof is in [TASKS.md](../TASKS.md). The protected-content
+The ordered release proof is in [GitHub issues](https://github.com/Elacity/elastos-runtime/issues). The protected-content
 part requires:
 
 1. final combined-source review and CI;
@@ -261,7 +301,7 @@ part requires:
 7. the installed two-Runtime mint-list-deny-buy-open-play-close journey,
    including restart, replay, tamper rejection, settlement and cleanup;
    proven headless by the same driver (`finalize` reads `overall_ok: true`,
-   see `state.md`), not yet through Brave on the seed;
+   see its GitHub issue), not yet through Brave on the seed;
 8. the manual J5 UI acceptance in the [0.7.1 release plan](https://app.notion.com/p/3d6b682adcca81948f78d12abcd677b9); and
 9. one atomic cutover that removes the provisional authority surfaces.
 

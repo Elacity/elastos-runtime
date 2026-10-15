@@ -20,7 +20,7 @@ MAX_ARCHIVE_SIZE = 64 * 1024 * 1024 * 1024
 
 
 class PackageWriter:
-    """Bound compressed output and retain the installation volume's free space."""
+    """Bound compressed output and require each chunk to fit the volume's free space."""
     def __init__(self, raw, directory):
         self.raw, self.directory = raw, directory
         self.size, self.checkpoint = 0, -16 * 1024 * 1024
@@ -31,12 +31,26 @@ class PackageWriter:
         if self.size - self.checkpoint >= 16 * 1024 * 1024:
             usage = shutil.disk_usage(self.directory)
             # Reserve the next check interval as well as this output chunk.
-            if usage.free - len(data) - 16 * 1024 * 1024 < usage.total // 10:
-                raise ValueError("image packaging must keep 10% free disk space")
+            if usage.free < len(data) + 16 * 1024 * 1024:
+                raise ValueError("image packaging needs more free disk space than the volume has")
             self.checkpoint = self.size
         written = self.raw.write(data)
         self.size += written
         return written
+
+
+class PayloadReader:
+    """Bind the image receipt to the bytes that enter the archive."""
+    def __init__(self, source):
+        self.source = source
+        self.size = 0
+        self.sha256 = hashlib.sha256()
+
+    def read(self, size=-1):
+        data = self.source.read(size)
+        self.size += len(data)
+        self.sha256.update(data)
+        return data
 
 
 def digest(path):
@@ -48,7 +62,7 @@ def digest(path):
 
 
 def package(image, platform, archive, manifest_output, release_path):
-    if platform not in {"darwin-arm64", "linux-arm64", "linux-amd64"}:
+    if platform not in {"darwin-arm64", "linux-arm64"}:
         raise ValueError(f"unsupported Browser image platform: {platform}")
     if (not release_path.endswith(".tar.gz") or release_path.startswith("/")
             or any(part in {"", ".", ".."} for part in release_path.split("/"))):
@@ -72,7 +86,8 @@ def package(image, platform, archive, manifest_output, release_path):
         raise ValueError("Browser image set failed verification; source and existing package preserved")
     receipt = json.loads(files["browser-vm-rootfs-manifest.json"].read_bytes())
     # Publish the byte/contract receipt. Operator paths remain in the build receipt.
-    portable = {k: receipt[k] for k in ("schema", "ok", "target_platform", "size", "sha256")}
+    portable = {k: receipt[k] for k in ("schema", "ok", "target_platform", "size", "sha256",
+                                      "inputs_sha256", "recipe_options")}
     for name in ("kernel", "initrd"):
         portable[name] = {k: receipt[name][k] for k in ("size", "sha256")}
     preflight = receipt["preflight"]
@@ -80,6 +95,9 @@ def package(image, platform, archive, manifest_output, release_path):
     for group in ("required", "optional_audio"):
         portable["preflight"][group] = {name: {"ok": entry["ok"]} for name, entry in preflight[group].items()}
     receipt_bytes = (json.dumps(portable, sort_keys=True, indent=2) + "\n").encode()
+    payload_records = {"rootfs.ext4": receipt, "vmlinux": receipt["kernel"], "initrd": receipt["initrd"],
+                       "browser-vm-rootfs-manifest.json": {"size": len(receipt_bytes),
+                                                          "sha256": hashlib.sha256(receipt_bytes).hexdigest()}}
     archive.parent.mkdir(parents=True, exist_ok=True)
     manifest_output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".browser-image-package-", dir=archive.parent) as temp:
@@ -89,10 +107,13 @@ def package(image, platform, archive, manifest_output, release_path):
                 for name, source in sorted(files.items()):
                     content = io.BytesIO(receipt_bytes) if name == "browser-vm-rootfs-manifest.json" else source.open("rb")
                     with content:
-                        size = len(receipt_bytes) if name == "browser-vm-rootfs-manifest.json" else source.stat().st_size
+                        record = payload_records[name]
                         info = tarfile.TarInfo("browser-vm-image/" + name)
-                        info.mode, info.size, info.mtime = 0o644, size, 0
-                        tar.addfile(info, content)
+                        info.mode, info.size, info.mtime = 0o644, record["size"], 0
+                        payload = PayloadReader(content)
+                        tar.addfile(info, payload)
+                        if payload.size != record["size"] or payload.sha256.hexdigest() != record["sha256"]:
+                            raise ValueError("source image changed during packaging: " + name)
         # Recheck source hashes after reading: a concurrent build cannot silently
         # turn the archive into a mixed image set.
         for name, entry in (("rootfs.ext4", receipt), ("vmlinux", receipt["kernel"]), ("initrd", receipt["initrd"])):

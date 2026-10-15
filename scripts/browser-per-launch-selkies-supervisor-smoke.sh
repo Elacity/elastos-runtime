@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -z "${ELASTOS_UPDATE_PARENT_PIPE:-}" ]]; then
+  exec python3 - "$0" "$@" <<'PYOWNER'
+import os, subprocess, sys
+reader, writer = os.pipe()
+stat = os.fstat(reader)
+env = dict(os.environ, ELASTOS_UPDATE_PARENT_PIPE=f"{reader}:{stat.st_dev}:{stat.st_ino}")
+raise SystemExit(subprocess.call(["bash", *sys.argv[1:]], env=env, pass_fds=(reader,)))
+PYOWNER
+fi
+
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp_dir="$(mktemp -d)"
 pid_a=""

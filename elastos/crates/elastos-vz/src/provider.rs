@@ -373,6 +373,16 @@ impl VzProvider {
             .ok_or_else(|| ElastosError::CapsuleNotFound(handle.id.0.clone()))
     }
 
+    /// Exact native object/console retirement. Call only after all Browser
+    /// control and stream producers have joined. Retain this future on timeout.
+    pub async fn release_terminal_native_vm(&self, handle: &CapsuleHandle) -> bool {
+        let mut vms = self.vms.write().await;
+        match vms.get_mut(&handle.id) {
+            Some(vm) => vm.release_terminal_native_vm().await,
+            None => false,
+        }
+    }
+
     /// Dial the guest's vsock listener on `port` from the host.
     ///
     /// Only valid while the VM is still owned by the provider

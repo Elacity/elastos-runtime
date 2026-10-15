@@ -1601,6 +1601,24 @@ img {
   transform: scale(0.96);
 }
 
+/* After setup: one row per 0.8.0 goal, in the website's order. */
+.setup-sheet-goal {
+  grid-template-columns: 28px 1fr auto;
+  grid-template-rows: auto;
+  align-items: center;
+  padding: 10px 14px;
+}
+
+.setup-sheet-goal .el-button {
+  grid-column: auto;
+  min-height: 34px;
+}
+
+.setup-sheet-goal[hidden],
+.setup-sheet.is-yielded .setup-sheet-goal {
+  display: none;
+}
+
 @keyframes setup-sheet-enter {
   from {
     opacity: 0;
@@ -1724,6 +1742,82 @@ img {
   color: var(--text);
   font-size: 13px;
   font-weight: 600;
+}
+
+/* Home link status (shell-link-status.js): while the host reports that this
+   Home's gateway is not answering, the bar shows a pulsing dot and
+   "Reconnecting…", and Notification Centre opens with the explanation. The
+   bar status stays rendered (empty) so its live region is announced. */
+.toolbar-link-status {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.toolbar-link-status-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toolbar-link-status-dot,
+.notification-center-link {
+  display: none;
+}
+
+.toolbar-link-status-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f5a524;
+  animation: toolbar-link-status-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes toolbar-link-status-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toolbar-link-status-dot {
+    animation: none;
+  }
+}
+
+body[data-home-link="reconnecting"] .toolbar-link-status {
+  margin-right: 8px;
+}
+
+body[data-home-link="reconnecting"] .toolbar-link-status-dot,
+body[data-home-link="reconnecting"] .notification-center-link {
+  display: block;
+}
+
+.notification-center-link {
+  flex: 0 0 auto;
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--lift);
+}
+
+.notification-center-link-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.notification-center-link-detail {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .notification-center-clear {
@@ -5341,52 +5435,6 @@ body.assistant-space-active #inbox-rail {
 
 .window.window-chrome-unified-sidebar .window-body {
   height: 100% !important;
-}
-
-/* Unified-toolbar chrome (Browser): no window title — menubar owns the name.
-   Traffic lights sit in the tool-row band; capsule pads
-   --window-chrome-safe-leading. */
-.window.window-chrome-unified-toolbar {
-  --window-chrome-safe-leading: 96px;
-}
-
-.window.window-chrome-unified-toolbar .window-head {
-  position: absolute;
-  top: 0;
-  left: 0;
-  z-index: 6;
-  width: 78px;
-  height: 52px;
-  min-height: 52px;
-  margin-bottom: 0;
-  padding: 0 8px 0 12px;
-  align-items: center;
-  border-radius: 12px 0 0 0;
-  background: transparent;
-  box-shadow: none;
-  filter: none;
-}
-
-.window.window-chrome-unified-toolbar.window-active .window-head {
-  filter: none;
-}
-
-.window.window-chrome-unified-toolbar .window-head-icon,
-.window.window-chrome-unified-toolbar .window-head-title,
-.window.window-chrome-unified-toolbar .window-head-balance {
-  display: none;
-}
-
-.window.window-chrome-unified-toolbar .window-head-draggable {
-  flex: 1 1 auto;
-  min-width: 28px;
-  min-height: 28px;
-  justify-content: flex-start;
-  align-self: stretch;
-}
-
-.window.window-chrome-unified-toolbar .window-body {
-  height: 100%;
 }
 
 /* Continuous standard: titlebar fill matches frame (Wallet / Archive / GBA /

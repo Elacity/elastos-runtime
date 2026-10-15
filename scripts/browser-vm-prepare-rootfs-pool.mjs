@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 function fail(message) {
@@ -60,12 +60,38 @@ function parseArgs(argv) {
   return args;
 }
 
-function readyRootfsFiles(poolDir) {
+// Copies carry the admitted rootfs hash; the launcher boots only copies of the
+// current image. Copies of another image are removed to free their space.
+function admittedRootfsSha256(rootfs, dataDir) {
+  const manifestPath = process.env.ELASTOS_BROWSER_VM_ROOTFS_MANIFEST ||
+    path.join(dataDir, "browser-vm/browser-vm-rootfs-manifest.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  if (!/^[0-9a-f]{64}$/.test(manifest?.sha256 || "") || manifest.size !== fs.statSync(rootfs).size) {
+    throw new Error(`Browser VM rootfs manifest does not describe ${rootfs}`);
+  }
+  return manifest.sha256;
+}
+
+function imageIdentity(rootfs, dataDir) {
+  const stat = fs.statSync(rootfs);
+  return { sha256: admittedRootfsSha256(rootfs, dataDir), file: `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}` };
+}
+
+function readyRootfsFiles(poolDir, imageSha256) {
   try {
-    return fs.readdirSync(poolDir).filter((name) => /^rootfs-[A-Za-z0-9._-]+\.ext4$/.test(name));
+    return fs.readdirSync(poolDir).filter((name) =>
+      name.startsWith(`rootfs-${imageSha256}-`) && /^rootfs-[A-Za-z0-9._-]+\.ext4$/.test(name));
   } catch (error) {
     if (error?.code === "ENOENT") return [];
     throw error;
+  }
+}
+
+function discardOtherImages(poolDir, imageSha256) {
+  for (const name of fs.readdirSync(poolDir)) {
+    if (/^rootfs-[A-Za-z0-9._-]+\.ext4$/.test(name) && !name.startsWith(`rootfs-${imageSha256}-`)) {
+      fs.rmSync(path.join(poolDir, name), { force: true });
+    }
   }
 }
 
@@ -73,7 +99,46 @@ function emit(value) {
   console.log(JSON.stringify(value));
 }
 
-function main() {
+let stopping = false;
+let activeCopy = null;
+let forceTimer = null;
+function stopCopy() {
+  stopping = true;
+  if (activeCopy && !forceTimer) {
+    activeCopy.kill("SIGTERM");
+    forceTimer = setTimeout(() => activeCopy?.kill("SIGKILL"), 1000);
+  }
+}
+process.on("SIGTERM", stopCopy);
+process.on("SIGINT", stopCopy);
+if (process.env.ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF === "1") {
+  process.stdin.once("end", stopCopy);
+  process.stdin.once("error", stopCopy);
+  process.stdin.resume();
+}
+
+async function copyRootfs(rootfs, partial) {
+  if (stopping) throw new Error("rootfs pool refill stopped");
+  await new Promise((resolve, reject) => {
+    const child = spawn("cp", ["--reflink=auto", "--sparse=always", rootfs, partial], {
+      stdio: ["ignore", "ignore", "inherit"],
+    });
+    activeCopy = child;
+    const timeout = setTimeout(stopCopy,
+      Number(process.env.ELASTOS_BROWSER_VM_ROOTFS_COPY_TIMEOUT_MS || "900000"));
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      clearTimeout(timeout);
+      clearTimeout(forceTimer);
+      forceTimer = null;
+      activeCopy = null;
+      if (stopping || code !== 0) reject(new Error(`rootfs pool cp stopped: ${signal || code}`));
+      else resolve();
+    });
+  });
+}
+
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   const dataDir = args.dataDir || defaultDataDir();
   validateAbsolute("--data-dir", dataDir);
@@ -88,12 +153,14 @@ function main() {
     fail(`Browser VM rootfs does not exist: ${rootfs}`);
   }
   fs.mkdirSync(poolDir, { recursive: true, mode: 0o700 });
-  const existing = readyRootfsFiles(poolDir).length;
+  const image = imageIdentity(rootfs, dataDir);
+  discardOtherImages(poolDir, image.sha256);
+  const existing = readyRootfsFiles(poolDir, image.sha256).length;
   const created = [];
   for (let index = existing; index < args.count; index += 1) {
     const id = `${Date.now().toString(36)}-${crypto.randomBytes(4).toString("hex")}`;
-    const partial = path.join(poolDir, `rootfs-${id}.ext4.partial`);
-    const ready = path.join(poolDir, `rootfs-${id}.ext4`);
+    const partial = path.join(poolDir, `rootfs-${image.sha256}-${id}.ext4.partial`);
+    const ready = path.join(poolDir, `rootfs-${image.sha256}-${id}.ext4`);
     const startedAt = Date.now();
     emit({
       schema: "elastos.browser.vm-rootfs-pool.event/v1",
@@ -101,20 +168,18 @@ function main() {
       rootfs,
       partial,
     });
-    const result = spawnSync("cp", ["--reflink=auto", "--sparse=always", rootfs, partial], {
-      stdio: "pipe",
-      encoding: "utf8",
-      timeout: Number(process.env.ELASTOS_BROWSER_VM_ROOTFS_COPY_TIMEOUT_MS || "900000"),
-    });
-    if (result.error || result.status !== 0) {
-      try {
-        fs.rmSync(partial, { force: true });
-      } catch {}
-      fail(result.error?.message || result.stderr || result.stdout || `cp exited ${result.status}`);
+    try {
+      await copyRootfs(rootfs, partial);
+      // An update or Undo during the copy discards it.
+      const after = imageIdentity(rootfs, dataDir);
+      if (after.sha256 !== image.sha256 || after.file !== image.file) {
+        throw new Error("Browser VM image changed during the rootfs pool copy");
+      }
+      fs.chmodSync(partial, 0o600);
+      fs.renameSync(partial, ready);
+    } finally {
+      fs.rmSync(partial, { force: true });
     }
-    fs.chmodSync(partial, 0o600);
-    fs.renameSync(partial, ready);
-    created.push(ready);
     emit({
       schema: "elastos.browser.vm-rootfs-pool.event/v1",
       event: "copy_ready",
@@ -129,10 +194,16 @@ function main() {
     data_dir: dataDir,
     pool_dir: poolDir,
     requested_count: args.count,
-    ready_count: readyRootfsFiles(poolDir).length,
+    ready_count: readyRootfsFiles(poolDir, image.sha256).length,
     created,
     script: fileURLToPath(import.meta.url),
   });
 }
 
-main();
+main().catch((error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+}).finally(() => {
+  // Release the lifetime reader once all copies have been reaped.
+  if (process.env.ELASTOS_BROWSER_LOCAL_EXIT_PARENT_EOF === "1") process.stdin.destroy();
+});

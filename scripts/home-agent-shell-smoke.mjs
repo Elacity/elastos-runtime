@@ -43,6 +43,13 @@ const localCarrierSetup = read("scripts/local-carrier-setup-smoke.sh");
 
 /* ---- typed model contract, in source ------------------------------------- */
 
+assert.ok(
+  readFileSync(new URL("capsules/marketplace/browser/model-contract.js", root)).equals(
+    readFileSync(new URL("capsules/assistant/browser/model-contract.js", root)),
+  ),
+  "Marketplace uses the canonical Assistant model contract; run just vendor-ui",
+);
+
 for (const [name, source] of capsuleScripts) {
   assert.ok(
     !/offer:[a-z0-9-]+:[a-z0-9-]+/i.test(source),
@@ -91,8 +98,10 @@ assert.ok(harnessHost.includes("error?.status === 409"), "a revision conflict re
 assert.ok(harnessHost.includes("if (workspaceRevision === null) {"), "no write before the read");
 assert.ok(entry.includes("loadAgentWorkspace()"), "the entry reads the workspace on boot");
 assert.ok(
-  entry.indexOf("loadAgentWorkspace()") < entry.indexOf('postToHome({ type: "home-agent:ready" })'),
-  "ready is posted after the workspace is read",
+  entry.indexOf('postToHome({ type: "home-agent:hello", docId: DOC_ID });') <
+    entry.indexOf("loadAgentWorkspace()") &&
+    entry.indexOf("loadAgentWorkspace()") < entry.indexOf('postToHome({ type: "home-agent:ready", docId: DOC_ID });'),
+  "each document says hello when its script starts and ready after its workspace is read",
 );
 assert.equal(
   (gateway.match(/\/api\/apps\/assistant\/workspace-v2/g) || []).length,
@@ -125,12 +134,6 @@ assert.ok(
 /* ---- ownership split with Home GUI ---------------------------------------- */
 
 assert.ok(homeFace.includes('const TARGET_ID = "assistant"'));
-assert.ok(
-  homeFace.includes("function onAssistantFrameDocumentLoad(") &&
-    homeFace.includes('frame?.addEventListener("load", onAssistantFrameDocumentLoad)') &&
-    homeFace.includes("frameReady = false"),
-  "a replaced Assistant document must handshake ready again so Home can raise the room",
-);
 assert.ok(
   homeWindows.includes('const HOME_AGENT_TARGET_ID = "assistant"') &&
     (homeWindows.match(/targetId === HOME_AGENT_TARGET_ID/g) || []).length === 3 &&
@@ -317,6 +320,54 @@ for (const invalid of [
   { type: "home-agent:open-browser", url: `https://example.com/${"x".repeat(2_048)}` },
 ]) {
   assert.equal(homeMessageContract.normalizeHomeAgentBrowserUrl(invalid), "");
+}
+
+/* Readiness: each document announces hello {docId} then ready {docId}. The
+   contract takes no load event, so the frame's load timing cannot matter. */
+{
+  const create = () => homeMessageContract.createAssistantFrameReadiness();
+  const id = (n) => n.toString(16).padStart(32, "0");
+  const hello = (docId) => ({ type: "home-agent:hello", docId });
+  const ready = (docId) => ({ type: "home-agent:ready", docId });
+  const legacy = { type: "home-agent:ready" };
+  // A document's hello hides, its ready shows once (whenever the load event fired).
+  let readiness = create();
+  assert.equal(readiness.receive(ready(id(1))), "", "a ready before its document's hello is ignored");
+  assert.equal(readiness.receive(hello(id(1))), "hide");
+  assert.equal(readiness.receive(ready(id(1))), "show", "the document's own ready shows the room");
+  assert.equal(readiness.receive(ready(id(1))), "", "a duplicate ready is ignored");
+  // In-frame reload: the new hello hides; the old document's late ready is ignored; the new ready shows.
+  assert.equal(readiness.receive(hello(id(2))), "hide", "a new document's hello hides the room");
+  assert.equal(readiness.receive(ready(id(1))), "", "a stale ready from the replaced document is ignored");
+  assert.equal(readiness.receive(ready(id(2))), "show", "the reloaded document's ready shows the room");
+  // A document that never gets ready, replaced by one that does.
+  assert.equal(readiness.receive(hello(id(3))), "hide");
+  assert.equal(readiness.receive(hello(id(4))), "hide");
+  assert.equal(readiness.receive(ready(id(3))), "", "the abandoned document's ready is ignored");
+  assert.equal(readiness.receive(ready(id(4))), "show");
+  // Home sets or changes src: nothing is current until the new document says hello.
+  readiness.reset();
+  assert.equal(readiness.receive(ready(id(4))), "", "a ready from before Home changed src is ignored");
+  assert.equal(readiness.receive(hello(id(5))), "hide");
+  assert.equal(readiness.receive(ready(id(5))), "show");
+  // Wrong shapes never count.
+  for (const bad of [{ ...ready(id(5)), extra: true }, ready("not-an-id"), ready(5), hello(""),
+    { type: "home-agent:ready", nonce: "x" }, { type: "home-agent:other", docId: id(6) }, null, "home-agent:ready"]) {
+    assert.equal(readiness.receive(bad), "", JSON.stringify(bad));
+  }
+  // Legacy Assistant after Undo (only {type} ready, no hello): shows as before, before or after load.
+  readiness = create();
+  assert.equal(readiness.receive(legacy), "show", "a legacy ready shows the room");
+  assert.equal(readiness.receive(legacy), "show", "a legacy reload's ready shows the room again");
+  readiness.reset();
+  assert.equal(readiness.receive(legacy), "show", "after Home changes src, a legacy ready still shows");
+  // Undo, then an in-frame reload into the old Assistant: its ready takes over from current A.
+  assert.equal(readiness.receive(hello(id(7))), "hide");
+  assert.equal(readiness.receive(legacy), "show", "a legacy ready after a current hello shows the room");
+  assert.equal(readiness.receive(ready(id(7))), "", "the replaced current document's ready no longer counts");
+  assert.equal(readiness.receive(hello(id(8))), "hide", "a following current document takes over again");
+  assert.equal(readiness.receive(ready(id(8))), "show");
+  assert.equal(readiness.receive(ready(id(8))), "", "shown once");
 }
 
 const offersPayload = {

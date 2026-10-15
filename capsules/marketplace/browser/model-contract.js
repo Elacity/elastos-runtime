@@ -10,6 +10,30 @@ export const MODEL_TEXT_INPUT_SCHEMA = "elastos.model.input.text/v1";
 export const MODEL_TEXT_INPUT_V2_SCHEMA = "elastos.model.input.text/v2";
 export const MODEL_TEXT_OUTPUT_SCHEMA = "elastos.model.output.text/v1";
 
+/** Capture once before persistence or network work; retained retries reuse it. */
+export function newModelRequestId(nowMs = Date.now(), cryptoRef = globalThis.crypto) {
+  if (!Number.isSafeInteger(nowMs) || nowMs <= 0 || typeof cryptoRef?.randomUUID !== "function") {
+    throw contractError("request_id_unavailable", "A fresh request ID is unavailable.");
+  }
+  const nonce = cryptoRef.randomUUID();
+  if (typeof nonce !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(nonce)) {
+    throw contractError("request_id_unavailable", "A fresh request ID is unavailable.");
+  }
+  return `model-v1:${nowMs}:${nonce}`;
+}
+
+/** This invocation's provider refusal does not settle an earlier lost create. */
+export function isExpiredInvocationRefusal(payload, body) {
+  const refusal = payload?.refusal;
+  return payload?.status === "error"
+    && ["model_invocation_refused", "remote_model_invocation_refused"].includes(payload.code)
+    && payload.reason === "request_expired"
+    && refusal?.schema === "elastos.model.invocation-refusal/v1"
+    && refusal.scope === "invocation" && refusal.dispatch === "provider_refused"
+    && /^sha256:[0-9a-f]{64}$/.test(refusal.input_hash)
+    && ["request_id", "offer_id", "operation"].every(key => refusal[key] === body[key]);
+}
+
 const TEXT_MODALITY = "text/plain";
 
 /** Offers that take text and answer with text, exactly as the provider lists them. */
@@ -285,7 +309,9 @@ export function textOfferRows(offers, backendReports = {}) {
       label: offer.title,
       detail: offerRowDetail(offer, facts),
       streamOutput: offer.stream_output === true,
+      routeKind: offerRouteKind(offer),
       inputSchemas: Array.isArray(offer.input_schemas) ? [...offer.input_schemas] : [],
+      context: offer.context && typeof offer.context === "object" ? { ...offer.context } : null,
       selectionFacts: facts,
     };
   });
@@ -315,29 +341,33 @@ export function transcriptPrompt(messages) {
   return lines.join("\n\n");
 }
 
-export function textRunCreateBody({ offer, messages, requestId }) {
+export function textRunCreateBody({ offer, messages, requestId, maxOutputTokens = null }) {
   if (!offer || typeof offer.offerId !== "string" || typeof offer.operation !== "string") {
     throw contractError("no_offer", "no text model offer selected");
   }
   if (typeof requestId !== "string" || requestId.trim() === "") {
     throw contractError("no_request_id", "run request needs a request id");
   }
+  const input = offer.inputSchemas?.includes(MODEL_TEXT_INPUT_V2_SCHEMA)
+    ? {
+        schema: MODEL_TEXT_INPUT_V2_SCHEMA,
+        messages: messages.map(({ role, content }) => ({
+          role: role === "agent" ? "assistant" : role,
+          content,
+        })),
+      }
+    : {
+        schema: MODEL_TEXT_INPUT_SCHEMA,
+        prompt: transcriptPrompt(messages),
+      };
+  if (offer.context && Number.isInteger(maxOutputTokens) && maxOutputTokens > 0) {
+    input.max_output_tokens = maxOutputTokens;
+  }
   return {
     offer_id: offer.offerId,
     operation: offer.operation,
     request_id: requestId,
-    input: offer.inputSchemas?.includes(MODEL_TEXT_INPUT_V2_SCHEMA)
-      ? {
-          schema: MODEL_TEXT_INPUT_V2_SCHEMA,
-          messages: messages.map(({ role, content }) => ({
-            role: role === "agent" ? "assistant" : role,
-            content,
-          })),
-        }
-      : {
-          schema: MODEL_TEXT_INPUT_SCHEMA,
-          prompt: transcriptPrompt(messages),
-        },
+    input,
   };
 }
 

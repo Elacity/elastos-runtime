@@ -429,7 +429,7 @@ function startServer() {
           json(response, { message: "provider launch failed" }, 500);
           return;
         }
-        json(response, { capsules: catalogCapsules });
+        json(response, { capsules: catalogCapsules, policy: { protected_content: true } });
         return;
       }
       if (url.pathname === "/api/capsules/interfaces") {
@@ -615,9 +615,9 @@ async function run() {
     await frame.locator(".store-row-skeleton").first().waitFor();
     await waitForRequestCount(requestLog, normalToken, "/api/capsules/catalog", 1);
     await waitForRequestCount(requestLog, normalToken, "/api/capsules/interfaces", 1);
-    await waitForRequestCount(requestLog, normalToken, "/api/provider/object/list_runtime_custody", 1);
     state[normalToken].initialCatalogBarrier.release();
     state[normalToken].initialInterfacesBarrier.release();
+    await waitForRequestCount(requestLog, normalToken, "/api/provider/object/list_runtime_custody", 1);
     await frame.locator(".store-row").filter({ hasText: "People" }).first().waitFor();
     const discoverTextWhileMediaPending = await frame.locator("#store-main").textContent();
     assert(

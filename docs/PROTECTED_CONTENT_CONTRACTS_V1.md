@@ -344,7 +344,7 @@ Ed25519/classical and full PQ authorization is a pre-activation decision. The
 Runtime mint journal can commit 2-of-3 PQ-hybrid envelopes without claiming
 content availability or a catalog path. Buy/open remains blocked until Runtime
 verifies the existing content provider's exact signed availability receipt.
-Remaining inactive e2e and cutover work is tracked in `TASKS.md`.
+Remaining inactive e2e and cutover work is tracked in GitHub issues.
 
 The parent branch's provisional `elastos_common::protected_content` DTOs are
 not this canonical contract. Integration must replace that surface atomically

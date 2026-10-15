@@ -85,3 +85,82 @@ test("one refresh discovers a grant installed by Services summary, including sum
     assert.equal(state.sharedLoading, false);
   }
 });
+
+function publisherFixture() {
+  const source = readFileSync(new URL("../capsules/marketplace/browser/marketplace.js", import.meta.url), "utf8");
+  const context = vm.createContext({
+    state: {}, homeToken: "fixture", publicError: value => value,
+    publicTitle: capsule => capsule.name, publicDescription: () => "", appCategory: () => "apps",
+    catalogIconRoute: () => "", appIcon: () => "", appGradient: () => "", appBadges: () => [],
+    acceptedContentLabels: () => [], executableActions: () => [], appSortKey: app => app.id,
+  });
+  for (const [start, end] of [
+    ["  async function loadCatalogData()", "  async function loadMediaData()"],
+    ["  function capsuleToApp(", "  function appCategory("],
+    ["  function shortDid(", "  function modelSizeLabel("],
+    ["  function packageLabel(", "  function openApp("],
+  ]) vm.runInContext(source.slice(source.indexOf(start), source.indexOf(end)), context);
+  return context;
+}
+
+test("declared authors and signatures cannot receive Runtime publisher verification", () => {
+  const context = publisherFixture();
+  for (const [author, expected] of [
+    ["", "Publisher unknown"], ["  ", "Publisher unknown"],
+    ["Unknown publisher", "Publisher unknown"], ["ElastOS", "Declared author · ElastOS"],
+  ]) {
+    for (const signature_state of ["invalid", { malformed: true }, "catalog-signature-verified"]) {
+      const app = context.capsuleToApp({ name: "fixture", role: "app", source: "local", author, signature_state }, new Map(), []);
+      assert.equal(context.detailPublisher(app), expected);
+      assert.equal(context.packageLabel(app), "Publisher verification unavailable");
+      assert.doesNotMatch(context.signatureLabel(app), /Runtime verified|Verified publisher/);
+    }
+  }
+});
+
+test("invalid or unavailable model catalog verification clears publisher cards", async () => {
+  const context = publisherFixture();
+  const model = { name: "fixture", source: "signed-model-catalog", role: "content", installed: false, launchable: false,
+    cid: `bafybei${"a".repeat(52)}`, publisher_did: "did:key:zFixture", content_size_bytes: 1024,
+    signature_state: "catalog-signature-verified" };
+  for (const [status, changes, accepted] of [
+    ["verified", {}, true], ["verified", { signature_state: "invalid" }, false],
+    ["verified", { signature_state: { malformed: true } }, false], ["unavailable", {}, false],
+  ]) {
+    context.fetch = async url => ({ ok: true, json: async () => url.endsWith("catalog")
+      ? { model_catalog_state: status, capsules: [{ ...model, ...changes }] } : { interfaces: [] } });
+    await context.loadCatalogData();
+    assert.equal(context.state.apps.length, accepted ? 1 : 0);
+    if (accepted) assert.match(context.detailPublisher(context.state.apps[0]), /^Runtime-verified publisher/);
+    else assert.match(context.state.appLoadError, /verification is unavailable/);
+  }
+});
+
+test("a signed model shows its own description and never Runtime's generic capsule text", () => {
+  const context = publisherFixture();
+  const model = { name: "fixture", source: "signed-model-catalog", role: "content", cid: `bafybei${"a".repeat(52)}`, content_size_bytes: 1024 };
+  for (const [description, expected] of [
+    ["Larger model for better answers.", "Larger model for better answers."],
+    ["Capsule metadata available through Runtime.", "Language model for Assistant."],
+    [undefined, "Language model for Assistant."],
+  ]) assert.equal(context.capsuleToApp({ ...model, description }, new Map(), []).description, expected);
+});
+
+test("the catalog's protected-content policy decides whether Marketplace shows Media", async () => {
+  const source = readFileSync(new URL("../capsules/marketplace/browser/marketplace.js", import.meta.url), "utf8");
+  for (const enabled of [false, true]) {
+    const mediaNav = { hidden: false };
+    const context = publisherFixture();
+    context.state.destination = "media";
+    context.document = { querySelectorAll: selector => selector === '[data-destination="media"]' ? [mediaNav] : [] };
+    context.categories = [];
+    context.selectDestination = id => { context.state.destination = context.normalizeDestination(id); };
+    vm.runInContext(source.slice(source.indexOf("  function syncProtectedContent()"), source.indexOf("  function destinationTitle(")), context);
+    context.fetch = async url => ({ ok: true, json: async () => url.endsWith("catalog")
+      ? { model_catalog_state: "unconfigured", capsules: [], policy: { protected_content: enabled } } : { interfaces: [] } });
+    await context.loadCatalogData();
+    context.syncProtectedContent();
+    assert.equal(mediaNav.hidden, !enabled);
+    assert.equal(context.state.destination, enabled ? "media" : "discover");
+  }
+});

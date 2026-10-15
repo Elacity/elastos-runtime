@@ -22,6 +22,8 @@ Configure tool paths with:
   ELASTOS_COLLABORATION_STARTUP_MODE (configured|isolated)
   ELASTOS_COLLABORATION_STARTUP_CONFIG_INPUT
   ELASTOS_BROWSER_VM_ARTIFACT_DATA_DIR
+  SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER (0|1)
+  ELASTOS_LLAMA_AMD64_BUNDLE / ELASTOS_LLAMA_ARM64_BUNDLE (qualified Linux engine archive)
 
 To target a non-default runtime root, set HOME or XDG_DATA_HOME before running.
 ELASTOS_DATA_DIR is intentionally not accepted as a gateway data-root override.
@@ -49,6 +51,30 @@ detect_platform() {
             exit 1
             ;;
     esac
+}
+
+require_source_engine_bundle() {
+    [[ "${SETUP_SOURCE_HOME_CONFIG_ONLY:-0}" != "1" ]] || return
+    case "${SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER:-0}" in
+        0) return ;;
+        1) ;;
+        *) echo "SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER accepts 0 or 1." >&2; exit 1 ;;
+    esac
+    local variable bundle
+    case "$PLATFORM" in
+        linux-amd64) variable=ELASTOS_LLAMA_AMD64_BUNDLE ;;
+        linux-arm64) variable=ELASTOS_LLAMA_ARM64_BUNDLE ;;
+        *) return ;;
+    esac
+    bundle="${!variable:-}"
+    if [[ -z "$bundle" || ! -f "$bundle" || -L "$bundle" ]]; then
+        echo "${variable} must name the qualified Linux engine archive." >&2
+        echo "On a matching Ubuntu 22.04 host, build the pinned source with GGML_OPENMP=OFF:" >&2
+        echo "  bash scripts/build/build-llama-server-bundle.sh --platform ${PLATFORM} NEW_OUTPUT_DIRECTORY" >&2
+        echo "Set ${variable} to the generated .tar.gz archive, then rerun:" >&2
+        echo "  SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER=1 scripts/setup-source-home.sh" >&2
+        exit 1
+    fi
 }
 
 default_data_dir() {
@@ -191,89 +217,30 @@ require_supported_rust() {
 }
 
 find_node() {
-    if [[ -n "${ELASTOS_NODE_BIN:-}" && -x "${ELASTOS_NODE_BIN}" ]]; then
-        printf '%s\n' "${ELASTOS_NODE_BIN}"
-        return
-    fi
-    if command -v node >/dev/null 2>&1; then
-        command -v node
-        return
-    fi
-    for candidate in \
-        /opt/homebrew/bin/node \
-        /usr/local/bin/node
-    do
-        if [[ -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return
-        fi
-    done
-    local candidate
-    candidate="$(find "${HOME}/.elastos/node" -path '*/bin/node' -type f 2>/dev/null | sort | tail -n 1 || true)"
-    if [[ -n "$candidate" && -x "$candidate" ]]; then
-        printf '%s\n' "$candidate"
-        return
-    fi
-    candidate="$(find "${HOME}/.nvm/versions/node" -path '*/bin/node' -type f 2>/dev/null | sort | tail -n 1 || true)"
-    if [[ -n "$candidate" && -x "$candidate" ]]; then
-        printf '%s\n' "$candidate"
-        return
-    fi
-    echo "node not found. Install Node or set ELASTOS_NODE_BIN to an executable node binary." >&2
-    exit 1
+    local candidate="${ELASTOS_NODE_BIN:-${DATA_DIR}/bin/node}"
+    [[ "$candidate" == /* && -x "$candidate" ]] || {
+        echo "Browser needs its managed Node component, or an explicit executable ELASTOS_NODE_BIN." >&2
+        return 1
+    }
+    printf '%s\n' "$candidate"
 }
 
 find_turnserver() {
-    if [[ -n "${ELASTOS_BROWSER_VM_TURNSERVER_BIN:-}" && -x "${ELASTOS_BROWSER_VM_TURNSERVER_BIN}" ]]; then
-        printf '%s\n' "${ELASTOS_BROWSER_VM_TURNSERVER_BIN}"
-        return
-    fi
-    if [[ -n "${ELASTOS_TURNSERVER_BIN:-}" && -x "${ELASTOS_TURNSERVER_BIN}" ]]; then
-        printf '%s\n' "${ELASTOS_TURNSERVER_BIN}"
-        return
-    fi
-    if command -v turnserver >/dev/null 2>&1; then
-        command -v turnserver
-        return
-    fi
-    for candidate in \
-        /usr/bin/turnserver \
-        /usr/local/bin/turnserver \
-        /opt/homebrew/bin/turnserver
-    do
-        if [[ -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return
-        fi
-    done
-    return 1
+    local candidate="${ELASTOS_BROWSER_VM_TURNSERVER_BIN:-${ELASTOS_TURNSERVER_BIN:-${DATA_DIR}/bin/turnserver}}"
+    [[ "$candidate" == /* && -x "$candidate" ]] || return 1
+    printf '%s\n' "$candidate"
 }
 
 find_vz_turn_program() {
     if [[ -n "${ELASTOS_BROWSER_VM_TURN_PROGRAM:-}" ]]; then
-        if [[ ! -x "${ELASTOS_BROWSER_VM_TURN_PROGRAM}" ]]; then
-            echo "ELASTOS_BROWSER_VM_TURN_PROGRAM is not executable: ${ELASTOS_BROWSER_VM_TURN_PROGRAM}" >&2
+        [[ "${ELASTOS_BROWSER_VM_TURN_PROGRAM}" == /* && -x "${ELASTOS_BROWSER_VM_TURN_PROGRAM}" ]] || {
+            echo "ELASTOS_BROWSER_VM_TURN_PROGRAM must be an explicit executable path." >&2
             return 2
-        fi
+        }
         printf '%s\n' "${ELASTOS_BROWSER_VM_TURN_PROGRAM}"
-        return
+    else
+        find_turnserver
     fi
-    if command -v turnserver >/dev/null 2>&1; then
-        command -v turnserver
-        return
-    fi
-    local candidate
-    for candidate in \
-        /usr/bin/turnserver \
-        /usr/local/bin/turnserver \
-        /opt/homebrew/bin/turnserver
-    do
-        if [[ -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return
-        fi
-    done
-    return 1
 }
 
 browser_vm_target_platform() {
@@ -518,9 +485,11 @@ if [[ -n "${ELASTOS_DATA_DIR:-}" && "${ELASTOS_DATA_DIR}" != "${DEFAULT_DATA_DIR
 fi
 DATA_DIR="${DEFAULT_DATA_DIR}"
 PLATFORM="$(detect_platform)"
+require_source_engine_bundle
 CARGO_BIN="$(find_cargo)"
 NODE_BIN="$(find_node)"
 SOURCE_HOME_KUBO_INSTALLED="0"
+SOURCE_HOME_LLAMA_INSTALLED="0"
 configure_rust_toolchain_env "$CARGO_BIN"
 export PATH="$(dirname "$CARGO_BIN"):$(dirname "$NODE_BIN"):${PATH}"
 require_supported_rust "$(command -v rustc)"
@@ -544,6 +513,15 @@ for name, component in manifest.get("external", {}).items():
         raise SystemExit(f"{name} provider_runtime.runtime_abi must be elastos.provider-stdio/v1")
     if runtime.get("execution") != "native-provider":
         raise SystemExit(f"{name} provider_runtime.execution must be native-provider")
+    capsule_path = pathlib.Path(os.environ["COMPONENTS_SRC"]).parent / "capsules" / name / "capsule.json"
+    if not capsule_path.is_file():
+        capsule_path = pathlib.Path(os.environ["COMPONENTS_SRC"]).parent / "elastos" / "capsules" / name / "capsule.json"
+    if capsule_path.is_file():
+        capsule = json.loads(capsule_path.read_text())
+        honest = (capsule.get("type"), capsule.get("execution"), capsule.get("runtime_abi"), capsule.get("entrypoint")) == ("native-provider", "native-provider", "elastos.provider-stdio/v1", name)
+        legacy = capsule.get("type") in ("wasm", "microvm") and capsule.get("execution") is None and capsule.get("runtime_abi") is None and capsule.get("entrypoint") == "rootfs.ext4"
+        if capsule.get("role") != "provider" or not (honest or legacy):
+            raise SystemExit(f"{name} capsule metadata must describe its native provider execution")
     provides = runtime.get("provides")
     if not isinstance(provides, str) or not provides:
         raise SystemExit(f"{name} provider_runtime.provides must be a non-empty string")
@@ -562,12 +540,7 @@ PY
 
 source_home_helper_binary_names() {
     printf '%s\n' "browser-local-exit"
-    if [[ "$(uname -s)" == "Linux" ]]; then
-        printf '%s\n' \
-            browser-engine-supervisor \
-            browser-native-proxy-engine \
-            browser-stream-bridge
-    fi
+
 }
 
 source_home_binary_names() {
@@ -762,7 +735,12 @@ import pathlib
 import sys
 
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
-print(manifest.get("runtime_abi", ""))
+abi = manifest.get("runtime_abi", "")
+if abi == "elastos.runtime-projection/v1" and (manifest.get("type") not in ("wasm", "web-projection") or manifest.get("execution") != "web-projection"):
+    raise SystemExit(f"{sys.argv[1]} projection execution requires type=wasm (legacy) or web-projection")
+if abi == "elastos.component/v1" and (manifest.get("type"), manifest.get("execution")) != ("wasm", "component"):
+    raise SystemExit(f"{sys.argv[1]} component execution requires type=wasm")
+print(abi)
 PY
 }
 
@@ -878,6 +856,8 @@ install_browser_runtime_helpers() {
         "${DATA_DIR}/scripts/browser-vm-vz-transport-bootstrap.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-local-crosvm-launcher.mjs" \
         "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher.mjs"
+    install -m 755 "${ROOT}/scripts/browser-vm-linux-network.py" \
+        "${DATA_DIR}/scripts/browser-vm-linux-network.py"
     install -m 755 "${ROOT}/scripts/browser-vm-prepare-rootfs-pool.mjs" \
         "${DATA_DIR}/scripts/browser-vm-prepare-rootfs-pool.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-engine-preflight.sh" \
@@ -937,6 +917,32 @@ EOF
     "${ROOT}/scripts/setup-source-home-browser-artifacts.sh" \
         --data-dir "${DATA_DIR}" \
         --platform "${PLATFORM}"
+    python3 - "${DATA_DIR}" "${PLATFORM}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import stat
+import sys
+
+data_dir, platform = Path(sys.argv[1]), sys.argv[2]
+manifest_path = data_dir / "components.json"
+manifest = json.loads(manifest_path.read_text())
+selected = manifest["profiles"]["source-home"]["components"]
+for name in manifest["profiles"]["browser-host"]["components"]:
+    component = manifest["external"][name]
+    info = component["platforms"].get(platform)
+    if info is None or ("source" not in info and name != "browser-vz-engine-supervisor"):
+        continue
+    relative = info.get("install_path", component.get("install_path"))
+    path = data_dir / relative
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise SystemExit(f"Browser helper {name} must be an installed regular file")
+    content = path.read_bytes()
+    info.update(checksum="sha256:" + hashlib.sha256(content).hexdigest(), size=len(content))
+    if name not in selected:
+        selected.append(name)
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+PY
     # Guest images are build outputs. Setup consumes the verified set and keeps
     # its bytes and receipt intact; guest changes go through the image builder.
 }
@@ -1128,6 +1134,7 @@ stamp_source_home_components_manifest() {
     SOURCE_HOME_BINARY_NAMES_JSON="${SOURCE_HOME_BINARY_NAMES_JSON}" \
     APP_CAPSULES_JSON="${APP_CAPSULES_JSON}" \
     SOURCE_HOME_KUBO_INSTALLED="${SOURCE_HOME_KUBO_INSTALLED}" \
+    SOURCE_HOME_LLAMA_INSTALLED="${SOURCE_HOME_LLAMA_INSTALLED}" \
     python3 - <<'PY'
 import hashlib
 import json
@@ -1155,6 +1162,14 @@ if os.environ["SOURCE_HOME_KUBO_INSTALLED"] == "1":
     if not kubo.is_file():
         raise SystemExit("successful Kubo setup did not install bin/kubo")
     source_home_components.append("kubo")
+    host_components.append("kubo")
+    receipt = json.loads((data_dir / "receipts/kubo-build.json").read_bytes())
+    manifest["external"]["kubo"]["capsule_metadata"] = {
+        "role": "content", "type": "data", "install_path": "capsules/kubo",
+        "platforms": {platform: receipt["capsule_metadata"]}}
+if os.environ["SOURCE_HOME_LLAMA_INSTALLED"] == "1":
+    manifest["external"]["llama-server"] = previous["external"]["llama-server"]
+    source_home_components.append("llama-server")
 
 for name in host_components:
     platforms = manifest["external"][name].setdefault("platforms", {})
@@ -1223,49 +1238,122 @@ components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
 PY
 }
 
-install_signed_model_catalog() {
-    echo "[setup-source-home] install signed model catalog"
-    COMPONENTS_SRC="${ROOT}/model-catalog.json" \
-    COMPONENTS_DEST="${DATA_DIR}/model-catalog.json" \
-    COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
-    python3 - <<'PY'
-import base64
-import hashlib
-import json
-import os
-import pathlib
-import stat
-
-src = pathlib.Path(os.environ["COMPONENTS_SRC"])
-dest = pathlib.Path(os.environ["COMPONENTS_DEST"])
-manifest = json.loads(pathlib.Path(os.environ["COMPONENTS_MANIFEST"]).read_bytes())
-pin = manifest.get("model_catalog")
-if not isinstance(pin, dict) or not isinstance(pin.get("head_cid"), str) or not pin["head_cid"]:
-    raise SystemExit("source-home components.json is missing model_catalog.head_cid")
-data = src.read_bytes()
-head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
-if head != pin["head_cid"]:
-    raise SystemExit(f"model-catalog.json head {head} does not match pin {pin['head_cid']}")
-dest.write_bytes(data)
-dest.chmod(stat.S_IRUSR | stat.S_IWUSR)
-PY
-}
-
 install_local_model_engine() {
-    local mode="${SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER:-auto}"
+    local mode="${SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER:-0}"
 
     if [[ "$mode" == "0" ]]; then
         echo "[setup-source-home] skip llama-server install: SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER=0"
         return
     fi
-    if [[ "$mode" != "1" && "$PLATFORM" != "darwin-arm64" ]]; then
-        return
+    if [[ "$mode" != "1" ]]; then
+        echo "SETUP_SOURCE_HOME_INSTALL_LLAMA_SERVER accepts 0 or 1." >&2
+        exit 1
     fi
 
-    echo "[setup-source-home] install llama-server for local model Use"
-    HOME="${HOME}" \
-    ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
-        "$(source_home_runtime_bin)" setup --with llama-server
+    echo "[setup-source-home] build licensed llama-server prerequisite"
+    python3 - "$ROOT" "$DATA_DIR" "$PLATFORM" "${SETUP_SOURCE_HOME_UPSTREAM_CACHE:-${ROOT}/target-build/upstream-cache}" <<'PY'
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import tarfile
+import tempfile
+
+root, data, platform, cache = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
+spec = importlib.util.spec_from_file_location('release_upstream', root / 'scripts/release-upstream-input.py')
+upstream = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(upstream)
+recipes = json.loads((root / 'scripts/release-upstream-recipes.json').read_bytes())['recipes']
+selected = [r for r in recipes if r['component'] == 'llama-server' and r['platform'] == platform]
+if len(selected) != 1:
+    raise SystemExit('llama-server requires one build recipe for the selected platform')
+recipe = selected[0]
+if recipe['source'].get('path') in ('@llama-arm64-bundle', '@llama-amd64-bundle'):
+    architecture = platform.removeprefix('linux-').upper()
+    variable = 'ELASTOS_LLAMA_' + architecture + '_BUNDLE'
+    bundle = os.environ.get(variable)
+    if not bundle:
+        raise SystemExit(f'{variable} is required. Build the qualified Ubuntu 22.04 bundle with '
+                         f'scripts/build/build-llama-server-bundle.sh --platform {platform} NEW_OUTPUT_DIRECTORY, '
+                         'then rerun source setup with that archive.')
+    recipe['source']['path'] = str(Path(bundle).absolute())
+cache = upstream.directory(cache)
+with tempfile.TemporaryDirectory(prefix='.llama-package-', dir=cache) as temporary:
+    receipt = upstream.package(recipe, cache, Path(temporary))
+    bundle = upstream.directory(data / recipe['install_path'])
+    capsule = upstream.directory(data / 'capsules/llama-server')
+    entries = []
+    with tarfile.open(Path(temporary) / receipt['release_path'], 'r:gz') as archive:
+        for member in archive.getmembers():
+            name = member.name.removeprefix(recipe['root'] + '/')
+            if name == member.name or not member.isfile():
+                raise SystemExit('llama-server capsule contains an unsupported member')
+            if name != '_elastos_object.json':
+                upstream.relative(name)
+            content = archive.extractfile(member).read()
+            for base in (bundle, capsule):
+                destination = base / name
+                upstream.directory(destination.parent)
+                if destination.exists() or destination.is_symlink():
+                    if upstream.regular(destination).read_bytes() != content:
+                        raise SystemExit('Existing llama-server files differ from the selected recipe')
+                else:
+                    destination.write_bytes(content)
+                destination.chmod(0o500 if member.mode & 0o111 else 0o400)
+            entries.append({'path': name, 'sha256': 'sha256:' + upstream.digest(bundle / name), 'type': 'file'})
+    expected_files = {row['path'] for row in entries}
+    for base in (bundle, capsule):
+        for path in base.rglob('*'):
+            name = path.relative_to(base).as_posix()
+            if name == '.elastos-engine.json' and base == bundle:
+                continue
+            if name == '.elastos-artifact-sha256' and base == capsule:
+                # Homes set up by earlier releases keep `sha256:`-prefixed receipts.
+                if (upstream.regular(path).read_text().removeprefix('sha256:')
+                        != receipt['checksum'].removeprefix('sha256:') + '\n'):
+                    raise SystemExit('Existing llama-server capsule receipt differs from its recipe')
+                continue
+            if path.is_symlink() or (not path.is_dir() and name not in expected_files):
+                raise SystemExit('Existing llama-server bundle contains an unexpected file')
+    manifest_path = data / 'components.json'
+    manifest = json.loads(upstream.regular(manifest_path).read_bytes())
+    version = manifest['external']['llama-server']['version']
+    if recipe['root'] != 'llama-' + version or len(entries) > 1024:
+        raise SystemExit('llama-server recipe differs from its installed engine contract')
+    engine_receipt = {'schema': 'elastos.local-model-engine/v2', 'version': version,
+                      'platform': platform, 'archive_sha256': receipt['checksum'],
+                      'entries': sorted(entries, key=lambda row: row['path'])}
+    engine_receipt_path = bundle / '.elastos-engine.json'
+    if engine_receipt_path.exists() or engine_receipt_path.is_symlink():
+        if json.loads(upstream.regular(engine_receipt_path).read_bytes()) != engine_receipt:
+            raise SystemExit('Existing llama-server receipt differs from the selected recipe')
+    else:
+        engine_receipt_path.write_text(json.dumps(engine_receipt, sort_keys=True) + '\n')
+    engine_receipt_path.chmod(0o400)
+    capsule_marker = capsule / '.elastos-artifact-sha256'
+    if not capsule_marker.exists():
+        capsule_marker.write_text(receipt['checksum'].removeprefix('sha256:') + '\n')
+    capsule_marker.chmod(0o400)
+    for base in (bundle, capsule):
+        for directory in sorted((p for p in base.rglob('*') if p.is_dir()), reverse=True):
+            directory.chmod(0o500)
+        base.chmod(0o500)
+    link = upstream.directory(data / 'bin') / 'llama-server'
+    if link.is_symlink():
+        if link.resolve() != bundle / recipe['binary_path']:
+            raise SystemExit('Existing llama-server link differs from the selected bundle')
+    elif link.exists():
+        raise SystemExit('llama-server executable link collides with an existing file')
+    else:
+        link.symlink_to(bundle / recipe['binary_path'])
+    info = manifest['external']['llama-server']['platforms'][platform]
+    info.update({key: receipt[key] for key in ('checksum', 'size', 'release_path', 'extract_path', 'install_path', 'binary_path')})
+    manifest['external']['llama-server']['capsule_metadata'] = {'role': 'content', 'type': 'data', 'install_path': 'capsules/llama-server',
+        'platforms': {platform: receipt['capsule_metadata']}}
+    manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+PY
+    SOURCE_HOME_LLAMA_INSTALLED="1"
 }
 
 stamp_source_home_capsule_artifacts_manifest() {
@@ -1307,14 +1395,23 @@ install_content_publish_backend() {
         echo "[setup-source-home] skip Kubo install: SETUP_SOURCE_HOME_INSTALL_KUBO=0"
         return
     fi
-    if [[ "$mode" != "1" && "$PLATFORM" != "darwin-arm64" ]]; then
+    if [[ ! -e "${DATA_DIR}/bin/kubo" && ! -L "${DATA_DIR}/bin/kubo" && "$mode" != "1" && "$PLATFORM" != "darwin-arm64" ]]; then
         return
     fi
 
     echo "[setup-source-home] install Kubo for Library/Documents publish"
-    HOME="${HOME}" \
-    ELASTOS_COMPONENTS_MANIFEST="${DATA_DIR}/components.json" \
-        "$(source_home_runtime_bin)" setup --with kubo
+    # CI seeds this cache before source-home verifies the installed prerequisite.
+    local default_cache="${ROOT}/target-build/upstream-cache"
+    if [[ -n "${RUNNER_TEMP:-}" ]]; then
+        default_cache="${RUNNER_TEMP}/kubo-cache"
+    fi
+    local command=("${ROOT}/scripts/seed-kubo-cache.sh"
+        "${SETUP_SOURCE_HOME_UPSTREAM_CACHE:-${KUBO_CACHE_DIR:-${default_cache}}}"
+        "$DATA_DIR" "$PLATFORM")
+    if [[ -e "${DATA_DIR}/bin/kubo" || -L "${DATA_DIR}/bin/kubo" ]]; then
+        command+=(--verify-installed)
+    fi
+    "${command[@]}"
     if [[ ! -f "${DATA_DIR}/bin/kubo" || ! -x "${DATA_DIR}/bin/kubo" ]]; then
         echo "Kubo setup succeeded without an installed executable: ${DATA_DIR}/bin/kubo" >&2
         exit 1
@@ -1430,7 +1527,6 @@ source_home_binary_names | while IFS= read -r provider; do
     install -m 755 "$(source_home_provider_bin "${provider}")" "${DATA_DIR}/bin/${provider}"
 done
 stamp_source_home_components_manifest
-install_signed_model_catalog
 
 echo "[setup-source-home] install content publish backend before final manifest stamp"
 install_content_publish_backend
@@ -1444,6 +1540,7 @@ install_app_capsules
 for retired_provider in "${RETIRED_SOURCE_HOME_PROVIDER_BINARIES[@]}"; do
     rm -f "${DATA_DIR}/bin/${retired_provider}"
 done
+install_browser_runtime_helpers
 stamp_source_home_capsule_artifacts_manifest
 python3 "${ROOT}/scripts/components-release-integrity-check.py" \
     --manifest "${DATA_DIR}/components.json" \
@@ -1451,7 +1548,6 @@ python3 "${ROOT}/scripts/components-release-integrity-check.py" \
     --profile source-home \
     --source-root "${ROOT}" \
     --source-home-data-dir "${DATA_DIR}"
-install_browser_runtime_helpers
 start_browser_runtime_turn
 install_browser_source_home_config
 install_collaboration_startup_config

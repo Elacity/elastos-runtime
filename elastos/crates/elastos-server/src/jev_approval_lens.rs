@@ -21,6 +21,7 @@ use elastos_model_contract::{
     RUNTIME_ACCESS_BINDING_SCHEMA, RUNTIME_CREATE_BINDING_SCHEMA,
 };
 use elastos_runtime::provider::ProviderRegistry;
+use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 
 use crate::api::HostedModelOfferHint;
@@ -361,7 +362,7 @@ async fn evaluate_named_jev(
     if context.offer_id == jev_offer_id {
         return unavailable_recommendation("Jev does not evaluate its own request");
     }
-    let eval_request_id = format!("jev-eval:{}:{}", context.request_id, unique_eval_token());
+    let eval_request_id = new_eval_request_id(now_ts().saturating_mul(1000));
     evaluate_advice(
         data_dir,
         registry,
@@ -697,17 +698,10 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
-fn unique_eval_token() -> String {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    format!(
-        "{}-{}",
-        millis,
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    )
+fn new_eval_request_id(issued_ms: u64) -> String {
+    let mut nonce = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    format!("model-v1:{issued_ms}:{}", hex::encode(nonce))
 }
 
 fn bounded_request_id(request_id: &str) -> anyhow::Result<&str> {
@@ -792,6 +786,24 @@ mod tests {
             privacy_policy_ref: "fixture:privacy:v1".to_string(),
             fallback: "operator_asserted_disabled".to_string(),
         }
+    }
+
+    #[test]
+    fn model_jev_evaluation_uses_a_fresh_request_identity() {
+        let now = 1_000_000;
+        let first = new_eval_request_id(now);
+        let second = new_eval_request_id(now);
+        assert_ne!(first, second);
+        assert_eq!(
+            elastos_model_contract::validate_new_model_request_id(&first, now, 0).unwrap(),
+            now
+        );
+        assert!(elastos_model_contract::validate_new_model_request_id(
+            &first,
+            now + elastos_model_contract::MODEL_REQUEST_MAX_AGE_MS + 1,
+            0
+        )
+        .is_err());
     }
 
     #[test]

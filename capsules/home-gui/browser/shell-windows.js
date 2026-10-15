@@ -19,6 +19,8 @@ import {
   saveShellSessionState,
   ignoreRepeatedAction,
   targetById,
+  WINDOW_TOP_INSET,
+  WINDOW_BOTTOM_INSET,
 } from "./shell-core.js?v=home-20260813a";
 import {
   fitWindowBounds,
@@ -32,6 +34,7 @@ import {
   attachWindowResize,
 } from "./shell-window-geometry.js?v=home-20260813a";
 import {
+  agentSpaceEngaged,
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
   desktopStageId,
@@ -46,6 +49,7 @@ import {
   restoreExtraDesktops,
   restoreSpaceOrder,
   setActiveStage,
+  syncStagePresentation,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
 } from "./shell-stages.js?v=home-20260813a";
@@ -123,8 +127,13 @@ export function acceptHomeNavigation(entry, data) {
   record.sequence = data.sequence;
   // Null means this document is still loading, not a request to clear selection.
   if (data.query !== null) {
-    entry.launchQuery = { ...data.query };
-    persistBrowserSession();
+    const currentQuery = normalizedLaunchQuery(entry.launchQuery);
+    const keys = Object.keys(data.query);
+    if (keys.length !== Object.keys(currentQuery).length ||
+        keys.some((key) => currentQuery[key] !== data.query[key])) {
+      entry.launchQuery = { ...data.query };
+      persistBrowserSession();
+    }
   }
   return true;
 }
@@ -1319,6 +1328,24 @@ function postMarketplaceNavigate(entry, query) {
   }, "*");
 }
 
+function isChatConversationQuery(query) {
+  return !!query && typeof query === "object" && !Array.isArray(query)
+    && Object.keys(query).join(",") === "conversation_id"
+    && typeof query.conversation_id === "string" && query.conversation_id.length > 0;
+}
+
+function postChatNavigate(entry, query) {
+  const frame = entry.node.querySelector(".window-frame");
+  const homeToken = browserLaunchAuthority(frame?.dataset.route)?.homeToken;
+  if (!homeToken || !frame?.contentWindow) return false;
+  frame.contentWindow.postMessage({
+    type: "elastos.chat.navigate/v1",
+    homeToken,
+    query: { conversation_id: query.conversation_id },
+  }, "*");
+  return true;
+}
+
 function postServicesNavigate(entry, query) {
   const frame = entry.node.querySelector(".window-frame");
   const homeToken = browserLaunchAuthority(frame?.dataset.route)?.homeToken;
@@ -1725,6 +1752,15 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   const defaultHybrid = !single && targetById(shellState.currentSummary, targetId)?.window_policy === "hybrid"
     && options.newWindow !== true && !options.authorizedLaunch && !options.restoredPlacement
     && Object.keys(options.query || {}).length === 0;
+  // A conversation request (People's Message) goes to the open Chat window.
+  if (targetId === "chat-room" && options.newWindow !== true && !options.authorizedLaunch
+    && !options.restoredPlacement && isChatConversationQuery(options.query)) {
+    const open = topDefaultHybridWindow(targetId);
+    if (open && postChatNavigate(open, options.query)) {
+      focusWindow(open.id);
+      return open;
+    }
+  }
   if (!single && !defaultHybrid) return createBrowserTargetWindow(targetId, options);
   let entry = single ? topBrowserWindowEntryForTarget(targetId) : topDefaultHybridWindow(targetId);
   const key = `${single ? "single" : "default"}:${targetId}`;
@@ -2101,34 +2137,27 @@ function browserWindowSpec(launched, offset) {
     return walletConnectorWindowSpec();
   }
   if (launched.target === SYSTEM_APP_ID) {
-    return {
-      x: 36,
-      y: 44,
-      width: 980,
-      height: 620,
-    };
+    return centredWindowSpec({ width: 980, height: 620 }, 0, 0);
   }
   if (launched.target === "gba-emulator") {
-    return {
-      x: 88 + offset * 24,
-      y: 62 + offset * 20,
-      width: 900,
-      height: 620,
-    };
+    return centredWindowSpec({ width: 900, height: 620 }, offset * 24, offset * 20);
   }
   if (launched.target === "browser") {
-    return {
-      x: 48 + offset * 18,
-      y: 54 + offset * 18,
-      width: 1280,
-      height: 804,
-    };
+    return centredWindowSpec({ width: 1280, height: 804 }, offset * 18, offset * 18);
   }
+  return centredWindowSpec({ width: 1040, height: 720 }, offset * 26, offset * 22);
+}
+
+function centredWindowSpec({ width, height }, cascadeX, cascadeY) {
+  const fitted = fitWindowBounds({ x: 0, y: 0, width, height });
+  const workspaceRect = desktop.getBoundingClientRect();
+  const roomWidth = window.innerWidth - workspaceRect.left;
+  const roomHeight = window.innerHeight - workspaceRect.top - WINDOW_TOP_INSET - WINDOW_BOTTOM_INSET;
   return {
-    x: 104 + offset * 26,
-    y: 78 + offset * 22,
-    width: 1040,
-    height: 720,
+    x: Math.round((roomWidth - fitted.width) / 2) + cascadeX,
+    y: WINDOW_TOP_INSET + Math.round((roomHeight - fitted.height) / 2) + cascadeY,
+    width,
+    height,
   };
 }
 
@@ -2424,6 +2453,13 @@ function restoreSessionSpaces(storedSession, restoredEntries) {
     Array.isArray(storedSession?.space_order) ? storedSession.space_order : []
   ).map((key) => resolveStableSpaceKey(key, restoredEntries));
   restoreSpaceOrder(remappedOrder);
+  /* Restoration awaits each window's launch, so the person may have opened
+     the Assistant meanwhile; switching Space now would close that room. Keep
+     the current Space but place the restored windows on it. */
+  if (agentSpaceEngaged()) {
+    syncStagePresentation();
+    return;
+  }
   const savedStageKey =
     typeof storedSession?.active_stage === "string" && storedSession.active_stage.trim()
       ? storedSession.active_stage.trim()

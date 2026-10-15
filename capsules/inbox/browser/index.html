@@ -96,7 +96,7 @@
       flex-direction: column;
       gap: 4px;
       /* Unified-sidebar chrome paints the traffic lights over the first 52px;
-         capsule-local value on purpose (see home-entropy-check: Chat/Inbox). */
+         capsule-local value on purpose. */
       padding: 52px 12px 16px;
       border: 0;
       border-right: 1px solid var(--line);
@@ -398,6 +398,34 @@
       letter-spacing: 0;
       line-height: 1.45;
       white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .entry-facts {
+      display: grid;
+      gap: 6px;
+      white-space: normal;
+    }
+
+    .entry-fact {
+      display: grid;
+      grid-template-columns: minmax(96px, 30%) minmax(0, 1fr);
+      gap: 12px;
+    }
+
+    .entry-fact-value {
+      color: var(--text);
+    }
+
+    .entry-fact-note {
+      margin: 0;
+    }
+
+    @media (max-width: 520px) {
+      .entry-fact {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 0;
+      }
     }
 
     .entry-actions {

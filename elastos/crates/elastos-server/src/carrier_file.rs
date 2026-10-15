@@ -71,7 +71,9 @@ impl CarrierClient {
         expected_size: u64,
         progress: &mut (impl FnMut(u64, u64) -> Result<()> + Send),
     ) -> Result<()> {
-        let (mut send, recv) = self.conn.open_bi().await?;
+        let (mut send, recv) = tokio::time::timeout(IDLE_TIMEOUT, self.conn.open_bi())
+            .await
+            .context("Carrier file stream deadline")??;
         let mut recv = IncomingFile(recv);
         let mut request = serde_json::to_vec(&serde_json::json!({"op":"file","path":path}))?;
         request.push(b'\n');

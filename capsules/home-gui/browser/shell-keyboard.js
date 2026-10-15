@@ -297,7 +297,8 @@ export function bindShellKeyboard() {
       if (!homeGuiOwnsKeys()) {
         return;
       }
-      if (event.key === "Escape") {
+      // Escape from the Home welcome sheet or its card is the sheet's own Close.
+      if (event.key === "Escape" && !event.target?.closest?.("#setup-sheet")) {
         if (handleShellEscape()) {
           event.preventDefault();
           event.stopPropagation();

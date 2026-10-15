@@ -312,19 +312,77 @@ img {
   visibility: hidden;
 }
 
-.home-unlock-older-key {
-  position: absolute;
-  z-index: 2;
-  bottom: max(28px, env(safe-area-inset-bottom));
-  left: 50%;
-  transform: translateX(-50%);
-  width: max-content;
-  max-width: calc(100% - 32px);
+.home-unlock .home-unlock-face-status {
+  display: block;
+  max-width: 320px;
+  margin: 14px auto 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.45);
+  color: #f5f5f7;
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: center;
 }
 
-#home-passkey-hint-help {
+.home-unlock .home-unlock-face-status[data-tone="error"] {
+  color: #ffb4b4;
+}
+
+.home-unlock .home-unlock-face-status[hidden] {
+  display: none;
+}
+
+.home-unlock .home-unlock-recover {
+  display: block;
+  margin: 18px auto 0;
+  padding: 6px 10px;
+  border: 0;
+  background: none;
+  color: rgba(245, 245, 247, 0.82);
+  font: inherit;
   font-size: 13px;
-  line-height: 1.5;
+  text-decoration: underline;
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+}
+
+.home-unlock-create {
+  appearance: none;
+  margin-top: 18px;
+  padding: 9px 20px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 999px;
+  background: rgba(16, 24, 32, 0.55);
+  color: #f5f5f7;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0;
+  white-space: nowrap;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.28);
+}
+
+.home-unlock-create:hover {
+  background: rgba(16, 24, 32, 0.75);
+  border-color: rgba(96, 165, 250, 0.7);
+}
+
+.home-unlock-create:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 3px;
+}
+
+.home-unlock-create:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.home-unlock-create[hidden] {
+  display: none;
 }
 
 .home-unlock-card {

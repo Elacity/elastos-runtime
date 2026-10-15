@@ -303,7 +303,7 @@ pub(crate) struct ProviderHost {
     _registry: Arc<ProviderRegistry>,
     carrier: elastos_server::carrier::CarrierRuntimeService,
     receipt_path: PathBuf,
-    _host_lock: elastos_server::host_lock::HostProcessGuard,
+    _host_lock: elastos_server::host_lock::FileLock,
 }
 
 impl ProviderHost {

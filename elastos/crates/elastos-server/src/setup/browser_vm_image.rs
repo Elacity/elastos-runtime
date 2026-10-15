@@ -1,7 +1,7 @@
 //! Receipt-bound image acquisition through the existing first-party installer.
 //! This prepares image bytes; Engine host admission still owns launch readiness.
 
-use super::{ComponentsManifest, PlatformInfo};
+use super::{replace_directory, ComponentsManifest, PlatformInfo};
 use anyhow::{bail, ensure, Context};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -202,7 +202,14 @@ fn aliases(platform: &str) -> Vec<(&'static str, &'static str)> {
     vec![
         ("browser-vm/rootfs.ext4", "rootfs.ext4"),
         ("browser-vm/browser-vm-rootfs-manifest.json", RECEIPT),
-        ("bin/vmlinux", "vmlinux"),
+        (
+            if platform == "darwin-arm64" {
+                "bin/vmlinux"
+            } else {
+                "browser-vm/vmlinux"
+            },
+            "vmlinux",
+        ),
         (
             if platform == "darwin-arm64" {
                 "bin/initrd"
@@ -282,18 +289,23 @@ fn verify_payload_with_cancel(
 
 pub(super) fn verify_legacy_or_missing_release(data: &Path, platform: &str) -> anyhow::Result<()> {
     guest_platform(platform)?;
-    let initrd = if platform == "darwin-arm64" {
-        "bin/initrd"
-    } else {
-        "browser-vm/initrd"
-    };
     // Existing source-home installations own these paths. Verify their bytes and
     // receipt in place; setup acquisition neither copies nor rewrites them.
+    let image_aliases = aliases(platform);
+    let mut kernel = data.join(image_aliases[2].0);
+    if platform.starts_with("linux-")
+        && matches!(fs::symlink_metadata(&kernel), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+    {
+        // Source Home staged the guest kernel here before release image aliases.
+        // The receipt must still bind its bytes; an existing Browser alias wins,
+        // including a broken or corrupt alias that requires repair.
+        kernel = data.join("bin/vmlinux");
+    }
     let paths = [
-        data.join("browser-vm").join(RECEIPT),
-        data.join("browser-vm/rootfs.ext4"),
-        data.join("bin/vmlinux"),
-        data.join(initrd),
+        data.join(image_aliases[1].0),
+        data.join(image_aliases[0].0),
+        kernel,
+        data.join(image_aliases[3].0),
     ];
     verify_cached_payload(&paths, platform, "legacy", || verify_payload_paths(&paths, platform))
         .map_err(|err| anyhow::anyhow!("Browser image release package metadata is unavailable and the installed image set requires preparation ({err}); install a release with browser-vm-image metadata or select an approved remote Engine"))
@@ -459,11 +471,12 @@ impl<R: Read> Read for CancellableReader<'_, R> {
 
 pub(super) async fn install_via_carrier(
     data: &Path,
-    info: &PlatformInfo,
+    row: &crate::capsule_record::AdmittedRow,
     dest: &Path,
     platform: &str,
     context: super::FirstPartyCarrierContext,
 ) -> anyhow::Result<()> {
+    let info = row.info();
     validate_request(data, info, dest, platform)?;
     let bind_addr = super::first_party_carrier_bind_addr(data, context)?;
     let source = crate::sources::load_trusted_sources(data)?
@@ -480,8 +493,24 @@ pub(super) async fn install_via_carrier(
     let temporary = tempfile::tempfile_in(parent)?;
     let mut download = tokio::fs::File::from_std(temporary);
     let mut checkpoint = 0;
+    let mut displayed = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut progress = |received: u64, total: u64| -> anyhow::Result<()> {
         check_cancelled(Some(&cancellation.0))?;
+        if received == 0
+            || received == total
+            || displayed.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            eprint!(
+                "\rBrowser image: {} / {} MiB ({}%)",
+                received / (1024 * 1024),
+                total / (1024 * 1024),
+                received.saturating_mul(100) / total.max(1)
+            );
+            if received == total {
+                eprintln!();
+            }
+            displayed = std::time::Instant::now();
+        }
         if received == 0
             || received == total
             || received.saturating_sub(checkpoint) >= 16 * 1024 * 1024
@@ -498,21 +527,18 @@ pub(super) async fn install_via_carrier(
         }
         Ok(())
     };
-    // Progress can continue beyond the old 30-second total limit. Each Carrier
-    // read/write still has a 30-second idle limit, with one hour for all routes.
-    tokio::time::timeout(
-        std::time::Duration::from_secs(60 * 60),
-        crate::carrier::fetch_file_from_trusted_source_to_bound(
-            &source,
-            info.release_path.as_deref().unwrap(),
-            &mut download,
-            size,
-            &mut progress,
-            bind_addr,
-        ),
+    // The download fails only when no bytes arrive for 30 s (each Carrier
+    // read/write has that idle limit); progress keeps it alive.
+    crate::carrier::fetch_file_from_trusted_source_to_bound(
+        &source,
+        info.release_path.as_deref().unwrap(),
+        &mut download,
+        size,
+        &mut progress,
+        bind_addr,
     )
     .await
-    .context("Browser image download exceeded its one-hour deadline (previous set preserved)")??;
+    .context("Browser image download failed (previous set preserved)")?;
     tokio::time::timeout(std::time::Duration::from_secs(30), download.sync_all())
         .await
         .context("Browser image download sync deadline")??;
@@ -676,10 +702,9 @@ fn install_archive_reader(
     outcome
 }
 
-fn lock_installation(parent: &Path) -> anyhow::Result<fs::File> {
+fn lock_installation(parent: &Path) -> anyhow::Result<crate::host_lock::FileLock> {
     #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd;
         use std::os::unix::fs::OpenOptionsExt;
         let file = fs::OpenOptions::new()
             .create(true)
@@ -692,11 +717,7 @@ fn lock_installation(parent: &Path) -> anyhow::Result<fs::File> {
             file.metadata()?.is_file(),
             "Browser image install lock must be a regular file"
         );
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("Browser image install lock failed");
-        }
-        Ok(file)
+        crate::host_lock::FileLock::exclusive(file).context("Browser image install lock failed")
     }
     #[cfg(not(unix))]
     bail!("Browser image installation requires a supported Unix host")
@@ -720,62 +741,14 @@ fn check_disk_space(path: &Path, needed: u64) -> anyhow::Result<()> {
         let block_size = stats.f_frsize;
         #[cfg(target_pointer_width = "32")]
         let block_size = u64::from(stats.f_frsize);
-        disk_budget(
-            needed,
-            disk_block_count(stats.f_bavail).saturating_mul(block_size),
-            disk_block_count(stats.f_blocks).saturating_mul(block_size),
-        )
+        let available = disk_block_count(stats.f_bavail).saturating_mul(block_size);
+        Ok(elastos_common::require_free_space(
+            u128::from(available),
+            u128::from(needed),
+        )?)
     }
     #[cfg(not(unix))]
     bail!("Browser image free-space check requires a supported Unix host")
-}
-
-fn disk_budget(needed: u64, available: u64, total: u64) -> anyhow::Result<()> {
-    ensure!(needed <= available.saturating_sub(total / 10), "Browser image preparation needs {needed} bytes while keeping 10% free space; free disk space and retry (previous set preserved)");
-    Ok(())
-}
-
-fn replace_directory(staged: &Path, dest: &Path) -> anyhow::Result<()> {
-    if !dest.exists() {
-        fs::rename(staged, dest)?;
-        return Ok(());
-    }
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let staged = std::ffi::CString::new(staged.as_os_str().as_bytes())?;
-        let dest = std::ffi::CString::new(dest.as_os_str().as_bytes())?;
-        // Both paths name owned directories on the same filesystem. An unsupported
-        // exchange fails with the previous installation still in place.
-        #[cfg(target_os = "macos")]
-        let result = unsafe {
-            libc::renameatx_np(
-                libc::AT_FDCWD,
-                staged.as_ptr(),
-                libc::AT_FDCWD,
-                dest.as_ptr(),
-                libc::RENAME_SWAP,
-            )
-        };
-        #[cfg(target_os = "linux")]
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                libc::AT_FDCWD,
-                staged.as_ptr(),
-                libc::AT_FDCWD,
-                dest.as_ptr(),
-                libc::RENAME_EXCHANGE,
-            )
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("Browser image atomic replacement failed; previous set preserved");
-        }
-        Ok(())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    bail!("Browser image atomic replacement is unsupported on this host")
 }
 
 #[cfg(test)]
@@ -790,6 +763,10 @@ mod tests {
     fn fixture(rootfs: &[u8]) -> Vec<(String, Vec<u8>)> {
         let mut receipt = json!({
             "schema":"elastos.browser.vm-rootfs-build/v1", "ok":true, "target_platform":"linux-arm64",
+            "inputs_sha256":"c".repeat(64),
+            "recipe_options":{"target_platform":"linux-arm64", "rootfs_size":"8192M",
+                "debian_suite":"bookworm", "debian_mirror":"https://deb.debian.org/debian",
+                "cdp_timeout_ms":"20000"},
             "size":rootfs.len(), "sha256":sha(rootfs),
             "kernel":{"size":6,"sha256":sha(b"kernel")},
             "initrd":{"size":6,"sha256":sha(b"initrd")},
@@ -986,8 +963,7 @@ mod tests {
             std::time::Duration::from_secs(5),
             super::super::install_first_party_component_via_carrier(
                 target.path(),
-                NAME,
-                &info,
+                &crate::capsule_record::AdmittedRow::for_test(NAME, &info),
                 &dest,
                 super::super::FirstPartyCarrierContext::Setup,
             ),
@@ -1041,8 +1017,7 @@ mod tests {
         });
         super::super::install_first_party_component_via_carrier(
             target.path(),
-            NAME,
-            &info,
+            &crate::capsule_record::AdmittedRow::for_test(NAME, &info),
             &dest,
             super::super::FirstPartyCarrierContext::Runtime,
         )
@@ -1055,8 +1030,7 @@ mod tests {
         corrupt.checksum = Some(format!("sha256:{}", "0".repeat(64)));
         let error = super::super::install_first_party_component_via_carrier(
             target.path(),
-            NAME,
-            &corrupt,
+            &crate::capsule_record::AdmittedRow::for_test(NAME, &corrupt),
             &dest,
             super::super::FirstPartyCarrierContext::Runtime,
         )
@@ -1067,11 +1041,21 @@ mod tests {
         assert!(!runtime.is_closed());
         assert_eq!(runtime.bound_sockets(), vec![bind_addr]);
         assert!(std::net::UdpSocket::bind(bind_addr).is_err());
-        let expected_entries = if platform == "darwin-arm64" { 4 } else { 5 };
+        let mut expected_entries = BTreeSet::from([
+            "image-set".to_string(),
+            ".browser-image-install.lock".to_string(),
+        ]);
+        expected_entries.extend(aliases(&platform).into_iter().filter_map(|(alias, _)| {
+            Path::new(alias)
+                .strip_prefix("browser-vm")
+                .ok()
+                .map(|name| name.to_string_lossy().into_owned())
+        }));
         assert_eq!(
             fs::read_dir(target.path().join("browser-vm"))
                 .unwrap()
-                .count(),
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<BTreeSet<_>>(),
             expected_entries,
             "download and failed stages leave only the installed set, aliases and lock"
         );
@@ -1161,7 +1145,25 @@ mod tests {
     }
 
     #[test]
-    fn browser_image_foreign_paths_and_low_disk_space_are_actionable() {
+    fn browser_image_linux_keeps_capsule_kernel_owned_separately() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("bin")).unwrap();
+        fs::write(temp.path().join("bin/vmlinux"), b"capsule kernel").unwrap();
+        let (bytes, info) = archive(&fixture(b"image"));
+        install_archive(temp.path(), &bytes, &info, "linux-arm64").unwrap();
+        verify_installed(temp.path(), &info, "linux-arm64").unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("bin/vmlinux")).unwrap(),
+            b"capsule kernel"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("browser-vm/image-set/vmlinux")).unwrap(),
+            b"kernel"
+        );
+    }
+
+    #[test]
+    fn browser_image_foreign_paths_are_actionable() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("bin")).unwrap();
         fs::write(temp.path().join("bin/vmlinux"), b"operator-owned").unwrap();
@@ -1175,8 +1177,6 @@ mod tests {
             b"operator-owned"
         );
         assert!(!temp.path().join("browser-vm").exists());
-        assert!(disk_budget(100, 199, 1000).is_err());
-        assert!(disk_budget(100, 200, 1000).is_ok());
     }
 
     #[test]
@@ -1187,6 +1187,21 @@ mod tests {
         fs::write(dest.join("good"), b"preserved").unwrap();
         assert!(replace_directory(&temp.path().join("absent"), &dest).is_err());
         assert_eq!(fs::read(dest.join("good")).unwrap(), b"preserved");
+    }
+
+    #[test]
+    fn browser_image_ended_install_lock_is_free_while_a_command_spawned_under_it_runs() {
+        use crate::host_lock::test_support::{lock_is_free, SpawnedWhileOpen};
+
+        let temp = tempfile::tempdir().unwrap();
+        let lock = lock_installation(temp.path()).unwrap();
+        let path = temp.path().join(".browser-image-install.lock");
+        let _command = SpawnedWhileOpen::new(&path);
+        drop(lock);
+        assert!(
+            lock_is_free(&path),
+            "the next install must not wait for a command spawned under the last"
+        );
     }
 
     #[test]
@@ -1329,6 +1344,52 @@ mod tests {
         assert!(!fresh.exists());
     }
 
+    #[test]
+    fn browser_image_manual_aliases_verify_the_guest_kernel_on_each_host() {
+        for platform in ["darwin-arm64", "linux-arm64", "linux-amd64"] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path();
+            let source = data.join("source");
+            fs::create_dir_all(data.join("browser-vm")).unwrap();
+            fs::create_dir_all(data.join("bin")).unwrap();
+            fs::create_dir(&source).unwrap();
+            let mut files = fixture(b"manual-image");
+            let mut receipt: Value = serde_json::from_slice(&files[0].1).unwrap();
+            receipt["target_platform"] = json!(guest_platform(platform).unwrap());
+            files[0].1 = serde_json::to_vec(&receipt).unwrap();
+            for (name, bytes) in &files {
+                fs::write(source.join(name), bytes).unwrap();
+            }
+            for (alias, file) in aliases(platform) {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(source.join(file), data.join(alias)).unwrap();
+            }
+            if platform.starts_with("linux-") {
+                // The capsule VM kernel is a separate artifact from the Browser guest.
+                fs::write(data.join("bin/vmlinux"), b"capsule-kernel").unwrap();
+            }
+            verify_legacy_or_missing_release(data, platform).unwrap();
+            if platform.starts_with("linux-") {
+                fs::remove_file(data.join("browser-vm/vmlinux")).unwrap();
+                fs::write(data.join("bin/vmlinux"), b"kernel").unwrap();
+                verify_legacy_or_missing_release(data, platform).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(
+                    source.join("missing-kernel"),
+                    data.join("browser-vm/vmlinux"),
+                )
+                .unwrap();
+                assert!(verify_legacy_or_missing_release(data, platform).is_err());
+                fs::remove_file(data.join("browser-vm/vmlinux")).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(source.join("vmlinux"), data.join("browser-vm/vmlinux"))
+                    .unwrap();
+            }
+            fs::write(source.join("vmlinux"), b"mutated").unwrap();
+            assert!(verify_legacy_or_missing_release(data, platform).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn browser_image_missing_trusted_source_keeps_working_set() {
         let temp = tempfile::tempdir().unwrap();
@@ -1341,8 +1402,7 @@ mod tests {
         let (_, new_info) = archive(&fixture(b"new-image"));
         assert!(super::super::install_first_party_component_via_carrier(
             temp.path(),
-            NAME,
-            &new_info,
+            &crate::capsule_record::AdmittedRow::for_test(NAME, &new_info),
             &temp.path().join(INSTALL_PATH),
             super::super::FirstPartyCarrierContext::Setup,
         )

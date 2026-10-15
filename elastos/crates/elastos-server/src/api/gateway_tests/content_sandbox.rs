@@ -496,6 +496,25 @@ appProbe.ready = true;
 "#,
     )
     .unwrap();
+    write_test_browser_capsule(
+        data_dir,
+        "marketplace",
+        "app",
+        "Test Marketplace capsule",
+        Some("<!doctype html><title>Marketplace fixture</title><script src=\"./probe.js\" defer></script>"),
+    );
+    write_test_wasm_entrypoint(data_dir, "marketplace");
+    std::fs::copy(
+        root.join("probe.js"),
+        data_dir.join("capsules/marketplace/browser/probe.js"),
+    )
+    .unwrap();
+    // Home GUI mounts app windows from its own sandboxed shell document.
+    std::fs::write(
+        data_dir.join("capsules/home-gui/browser/index.html"),
+        "<!doctype html><title>Shell fixture</title><iframe id=\"assistant\" src=\"/apps/assistant/\"></iframe><iframe id=\"marketplace\" src=\"/apps/marketplace/\"></iframe>",
+    )
+    .unwrap();
 }
 
 #[tokio::test]

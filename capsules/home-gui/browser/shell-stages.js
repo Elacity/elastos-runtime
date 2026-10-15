@@ -105,6 +105,7 @@ export function isAgentSpace(spaceId) {
  * @param {{
  *   available: () => boolean,
  *   busy: () => boolean,
+ *   engaged: () => boolean,
  *   open: () => void,
  *   close: () => void,
  * }} hooks
@@ -115,6 +116,12 @@ export function bindAgentSpace(hooks) {
 
 function agentSpaceAvailable() {
   return agentSpaceHooks?.available?.() === true;
+}
+
+/* The person has the Agent room open or opening (face up or mid-morph, or the
+   ring already on the Agent Space). */
+export function agentSpaceEngaged() {
+  return isAgentSpace(getActiveStageId()) || agentSpaceHooks?.engaged?.() === true;
 }
 
 /* Agent ↔ other Space switches ride the Shelf morph, never a slide or cut. */

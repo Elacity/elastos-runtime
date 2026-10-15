@@ -30,9 +30,8 @@ use axum::Extension;
 use axum::Json;
 use axum::Router;
 use elastos_common::localhost::{
-    edge_binding_path, edge_site_head_path, my_website_root_path, publisher_artifacts_path,
-    publisher_install_script_path, publisher_release_head_path, publisher_release_manifest_path,
-    publisher_site_releases_dir, rooted_localhost_fs_path, MY_WEBSITE_URI,
+    edge_binding_path, edge_site_head_path, my_website_root_path, publisher_site_releases_dir,
+    rooted_localhost_fs_path, MY_WEBSITE_URI,
 };
 use elastos_common::{CapsuleRole, CapsuleType};
 use elastos_identity::IdentityManager;
@@ -52,6 +51,7 @@ pub(crate) use gateway_browser::gateway_browser_operator::{
     register_browser_operator_sessions, BrowserOperatorService,
 };
 pub(crate) use gateway_browser::gateway_browser_remote::invoke as invoke_remote_browser_engine;
+pub(crate) use gateway_browser::gateway_browser_remote::provider_transport_ready as browser_remote_provider_transport_ready;
 #[path = "gateway_capsule_catalog.rs"]
 mod gateway_capsule_catalog;
 #[path = "gateway_collaboration_presence.rs"]
@@ -72,6 +72,8 @@ mod gateway_home_system_ai_provider;
 mod gateway_home_terminal;
 #[path = "gateway_home_token.rs"]
 mod gateway_home_token;
+#[path = "gateway_home_update.rs"]
+mod gateway_home_update;
 #[path = "gateway_home_wallet_connector.rs"]
 mod gateway_home_wallet_connector;
 #[path = "gateway_inbox.rs"]
@@ -156,6 +158,7 @@ pub(super) use gateway_home_token::{
     require_internal_shell_runtime_wallet_authority, require_runtime_wallet_authority,
     runtime_wallet_authority, HomeLaunchContext, RequiredHomeLaunchToken,
 };
+use gateway_home_update::*;
 
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -178,6 +181,7 @@ use gateway_origin::*;
 use gateway_passkey_step_up::*;
 pub(super) use gateway_passkey_step_up::{
     consume_or_recover_passkey_step_up_effect, consume_passkey_step_up_token,
+    require_hosted_step_up_launch,
 };
 #[cfg(test)]
 pub(crate) use gateway_passkey_step_up::{
@@ -636,6 +640,22 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                 .layer(DefaultBodyLimit::max(96 * 1024)),
         )
         .route(
+            "/api/auth/passkey/add/begin",
+            post(super::auth_gateway::passkey_add_begin).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/auth/passkey/add/complete",
+            post(super::auth_gateway::passkey_add_complete).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/auth/owner-recovery/begin",
+            post(super::auth_gateway::owner_recovery_begin),
+        )
+        .route(
+            "/api/auth/owner-recovery/complete",
+            post(super::auth_gateway::owner_recovery_complete),
+        )
+        .route(
             "/api/auth/passkey/authenticate/begin",
             post(super::auth_gateway::passkey_authenticate_begin),
         )
@@ -706,6 +726,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             get(gateway_carrier_bootstrap),
         )
         .route("/api/carrier/bootstrap", get(gateway_carrier_bootstrap))
+        .route(
+            "/api/apps/chat-room/contacts/request",
+            post(chat_room_contact_request),
+        )
         .route("/artifacts/*path", get(serve_artifact_file))
         .route(
             "/api/apps/assistant/workspace",
@@ -731,7 +755,12 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                     gateway_home_agent::HOME_AGENT_WORKSPACE_MAX_BYTES,
                 )),
         )
-        .route("/api/apps/system/summary", get(system_summary))
+        .route(
+            "/api/apps/system/summary",
+            get(system_summary)
+                .post(system_update_apply)
+                .layer(DefaultBodyLimit::max(8 * 1024)),
+        )
         .route(
             "/api/apps/system/appearance/preferences",
             post(system_appearance_preferences_update),
@@ -751,6 +780,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/system/access/guest-registration",
             post(system_guest_registration_update),
+        )
+        .route(
+            "/api/apps/system/community",
+            get(system_community_membership_get).post(system_community_membership_update),
         )
         .route(
             "/api/apps/system/ai-provider",
@@ -1214,6 +1247,7 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         )
         .with_state(state.clone())
         .layer(Extension(TrustedGatewayApiUrl(Arc::from(gateway_api_url))))
+        .layer(Extension(ReleaseReadGate::new()))
         .layer(axum::middleware::from_fn(refuse_content_api_resources))
         .layer(axum::middleware::from_fn_with_state(
             admission_state,
@@ -1452,6 +1486,7 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
         .map(str::to_string)
         .unwrap_or_else(|| err.to_string());
     let status = if text.contains("home launch token")
+        || text.contains("admin passkey required")
         || text.contains("fresh passkey")
         || text.contains("passkey step-up")
         || text.contains("auth session is not active")
@@ -1459,7 +1494,9 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
         || text.contains("belongs to a different principal")
     {
         StatusCode::FORBIDDEN
-    } else if profile_required.is_some() {
+    } else if profile_required.is_some()
+        || text == crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+    {
         StatusCode::CONFLICT
     } else if text.contains("service access request delivery failed") {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1530,7 +1567,9 @@ fn home_error_response(err: anyhow::Error) -> Response {
     if text.contains("share terms") || text.contains("hosted connection is required") {
         return (StatusCode::BAD_REQUEST, text).into_response();
     }
-    if profile_required.is_some() {
+    if profile_required.is_some()
+        || text == crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
+    {
         return (StatusCode::CONFLICT, text).into_response();
     }
     if appearance_request.is_some() {
@@ -1563,9 +1602,6 @@ fn home_error_response(err: anyhow::Error) -> Response {
 #[cfg(test)]
 #[path = "gateway_browser_tests.rs"]
 mod gateway_browser_tests;
-#[cfg(test)]
-#[path = "gateway_legacy_passkey_tests.rs"]
-mod gateway_legacy_passkey_tests;
 #[cfg(test)]
 #[path = "gateway_tests/mod.rs"]
 mod gateway_tests;

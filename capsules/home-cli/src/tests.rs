@@ -124,7 +124,6 @@ fn command_contract_is_home_cli_and_terminal_scoped() {
             "people".to_string(),
             "apps".to_string(),
             "system".to_string(),
-            "mywebsite".to_string(),
             "wallet".to_string(),
             "exits".to_string(),
             "invoke".to_string(),
@@ -139,7 +138,6 @@ fn command_contract_is_home_cli_and_terminal_scoped() {
     assert_eq!(normalize_contract_command("approvals"), "inbox");
     assert_eq!(normalize_contract_command("approve"), "inbox");
     assert_eq!(normalize_contract_command("contacts"), "people");
-    assert_eq!(normalize_contract_command("spaces"), "mywebsite");
     assert_eq!(normalize_contract_command("exit-nodes"), "exits");
     assert_eq!(normalize_contract_command("settings"), "system");
     assert_eq!(normalize_contract_command("dev"), "debug");
@@ -246,7 +244,6 @@ fn first_run_help_matches_five_tabs_without_power_user_noise() {
     assert!(help.contains("help advanced"));
     assert!(help.contains("help debug"));
     for hidden in [
-        "mywebsite",
         "wallet",
         "exits",
         "invoke <capsule>",
@@ -274,7 +271,6 @@ fn advanced_and_debug_help_keep_contract_commands_available() {
     let invoke = help_lines("invoke").join("\n");
 
     assert!(advanced.contains("Advanced Commands"));
-    assert!(advanced.contains("mywebsite [status|stage <dir>|preview|publish|open]"));
     assert!(advanced.contains("wallet"));
     assert!(advanced.contains("exits"));
     assert!(advanced.contains("invoke [list [capsule] | <capsule> <method> [json|target]]"));
@@ -304,7 +300,6 @@ fn dashboard_commands_match_five_tabs_without_power_user_noise() {
     assert!(commands.contains("help debug"));
     for hidden in [
         "Other Commands",
-        "mywebsite",
         "wallet",
         "exits",
         "invoke <capsule>",
@@ -327,11 +322,6 @@ fn home_cli_line_mode_accepts_shared_snapshot_backed_commands() {
         "apps",
         "inbox",
         "people",
-        "mywebsite",
-        "mywebsite status",
-        "site",
-        "website",
-        "spaces",
         "wallet",
         "exits",
         "debug",
@@ -507,7 +497,7 @@ fn people_line_mode_emits_snapshot_backed_people_actions() {
             contact_id: "contact-alice".to_string(),
             display_name: "Alice".to_string(),
             relationship: "connected".to_string(),
-            route: "/apps/chat-room/".to_string(),
+            conversation_id: Some("direct:sha256:alice".to_string()),
             can_message: true,
             ..PeopleContactStatus::default()
         }],
@@ -539,7 +529,7 @@ fn people_line_mode_resolves_visible_contacts_and_requires_message_route() {
             display_name: "Alice".to_string(),
             handle: Some("@alice".to_string()),
             relationship: "conversation".to_string(),
-            route: "/apps/chat-room/".to_string(),
+            conversation_id: Some("direct:sha256:alice".to_string()),
             can_message: true,
             profile_card: Some(PeopleProfileCardStatus {
                 display_name: "Alice A.".to_string(),
@@ -563,7 +553,7 @@ fn people_line_mode_resolves_visible_contacts_and_requires_message_route() {
         Some("people-remove-contact:contact-alice".to_string())
     );
 
-    snapshot.people.contacts[0].route = "elastos://peer/peer-alice".to_string();
+    snapshot.people.contacts[0].conversation_id = None;
     assert!(
         people_line_action("people message contact-alice", &snapshot)
             .unwrap_err()
@@ -586,7 +576,7 @@ fn tui_snapshot_refresh_picks_up_people_changes() {
             contact_id: "contact-alice".to_string(),
             display_name: "Alice".to_string(),
             relationship: "connected".to_string(),
-            route: "/apps/chat-room/".to_string(),
+            conversation_id: Some("direct:sha256:alice".to_string()),
             can_message: true,
             ..PeopleContactStatus::default()
         }],
@@ -605,32 +595,6 @@ fn tui_snapshot_refresh_picks_up_people_changes() {
     let after = build_tui_screen(&snapshot, &state, 120, 30);
     assert!(after.contains("Alice"));
     assert!(after.contains("connected"));
-}
-
-#[test]
-fn mywebsite_line_mode_emits_explicit_site_actions() {
-    assert_eq!(mywebsite_line_action("mywebsite").unwrap(), None);
-    assert_eq!(mywebsite_line_action("spaces status").unwrap(), None);
-    assert_eq!(
-        mywebsite_line_action("mywebsite stage /tmp/my site").unwrap(),
-        Some("site-stage:/tmp/my site".to_string())
-    );
-    assert_eq!(
-        mywebsite_line_action("site preview").unwrap(),
-        Some("site-local".to_string())
-    );
-    assert_eq!(
-        mywebsite_line_action("website publish").unwrap(),
-        Some("site-ephemeral".to_string())
-    );
-    assert_eq!(
-        mywebsite_line_action("spaces open").unwrap(),
-        Some("site-open".to_string())
-    );
-    assert!(mywebsite_line_action("mywebsite stage")
-        .unwrap_err()
-        .to_string()
-        .contains("stage <dir>"));
 }
 
 #[test]
@@ -661,7 +625,6 @@ fn system_pages_hide_peer_context_in_header() {
 #[test]
 fn debug_spaces_aliases_resolve_to_selected_roots() {
     assert_eq!(space_query_for_command("webspaces", ""), "WebSpaces");
-    assert_eq!(space_query_for_command("mywebsite", ""), "MyWebSite");
     assert_eq!(space_query_for_command("spaces", "public"), "public");
 
     let snapshot = sample_snapshot();
@@ -670,28 +633,13 @@ fn debug_spaces_aliases_resolve_to_selected_roots() {
         .iter()
         .find(|root| root.name == "WebSpaces")
         .expect("sample WebSpaces root missing");
-    let lines = space_detail_lines(webspaces, &snapshot, 80);
+    let lines = space_detail_lines(webspaces, 80);
 
     assert!(lines.iter().any(|line| line == "Group      Spaces"));
     assert!(lines
         .iter()
         .any(|line| line.contains("localhost://WebSpaces/Elastos")));
     assert!(lines.iter().any(|line| line.contains("elastos webspace")));
-}
-
-#[test]
-fn mywebsite_page_is_task_oriented_and_hides_space_roots() {
-    let snapshot = sample_snapshot();
-    let lines = mywebsite_task_lines(&snapshot);
-    let text = lines.join("\n");
-
-    assert!(text.contains("Stage    mywebsite stage <dir>"));
-    assert!(text.contains("Preview  mywebsite preview"));
-    assert!(text.contains("Publish  mywebsite publish"));
-    assert!(text.contains("Open     mywebsite open"));
-    assert!(!text.contains("WebSpaces"));
-    assert!(!text.contains("scratch space"));
-    assert!(!text.contains("localhost://Local"));
 }
 
 #[test]
@@ -841,15 +789,6 @@ fn sample_snapshot() -> HomeSnapshot {
                 "status": "available"
             }]
         })),
-        site: SiteStatus {
-            staged: true,
-            local_url: None,
-            active_release: None,
-            active_channel: None,
-            active_bundle_cid: None,
-            release_count: 0,
-        },
-        shares: ShareStatus::default(),
         room: RoomStatus {
             room_slug: "chat-room".to_string(),
             title: "Room".to_string(),
@@ -896,15 +835,6 @@ fn sample_snapshot() -> HomeSnapshot {
                 example: "localhost://UsersAI/self".to_string(),
             },
             RootStatus {
-                name: "MyWebSite".to_string(),
-                kind: "file-backed".to_string(),
-                uri: "localhost://MyWebSite".to_string(),
-                path: Some("/tmp/MyWebSite".to_string()),
-                exists: true,
-                description: "Site root".to_string(),
-                example: "localhost://MyWebSite/index.html".to_string(),
-            },
-            RootStatus {
                 name: "Public".to_string(),
                 kind: "file-backed".to_string(),
                 uri: "localhost://Public".to_string(),
@@ -942,46 +872,6 @@ fn sample_snapshot() -> HomeSnapshot {
             },
         ],
         actions: vec![
-            ActionInfo {
-                id: "chat".to_string(),
-                label: "Chat".to_string(),
-                description: String::new(),
-                command: "home: open Chat".to_string(),
-                ready: true,
-                reason: None,
-            },
-            ActionInfo {
-                id: "site-local".to_string(),
-                label: "Preview".to_string(),
-                description: String::new(),
-                command: "home: start MyWebSite local preview".to_string(),
-                ready: true,
-                reason: None,
-            },
-            ActionInfo {
-                id: "site-ephemeral".to_string(),
-                label: "Publish".to_string(),
-                description: String::new(),
-                command: "home: publish a temporary HTTPS URL for MyWebSite".to_string(),
-                ready: true,
-                reason: None,
-            },
-            ActionInfo {
-                id: "site-open".to_string(),
-                label: "Open".to_string(),
-                description: String::new(),
-                command: "home: open MyWebSite preview in browser".to_string(),
-                ready: true,
-                reason: None,
-            },
-            ActionInfo {
-                id: "shares-list".to_string(),
-                label: "Shared".to_string(),
-                description: String::new(),
-                command: "elastos shares list".to_string(),
-                ready: true,
-                reason: None,
-            },
             ActionInfo {
                 id: "capsule-gba-ucity".to_string(),
                 label: "gba-ucity".to_string(),
@@ -1526,7 +1416,7 @@ fn home_actions_stay_task_focused() {
         .into_iter()
         .map(|idx| snapshot.actions[idx].id.as_str())
         .collect();
-    assert_eq!(ids, vec!["chat"]);
+    assert!(ids.is_empty(), "{ids:?}");
 }
 
 #[test]
@@ -1536,12 +1426,6 @@ fn quit_action_switches_browser_pty_back_to_home_gui_only() {
 
     snapshot.session.mode = "native_terminal".to_string();
     assert_eq!(quit_action(&snapshot), "quit");
-}
-
-#[test]
-fn default_home_selection_activates_chat_on_first_enter() {
-    let state = TuiState::default();
-    assert_eq!(state.activate(&sample_snapshot()), Some("chat".to_string()));
 }
 
 #[test]
@@ -1577,28 +1461,25 @@ fn apps_use_runtime_targets_but_only_cli_native_or_explicit_open_entries_are_act
     assert!(!labels.contains(&"Home CLI"));
     assert!(!labels.contains(&"Full-screen Chat"));
     assert!(!labels.contains(&"Shared Conversation"));
-    assert!(!labels.contains(&"Shared"));
 
-    let chat_index = labels.iter().position(|label| *label == "Chat").unwrap();
-    assert_eq!(
-        selected_app_action(&snapshot, chat_index).map(|action| action.id.as_str()),
-        Some("chat")
-    );
-    for read_only in ["Browser", "uCity", "GBA Emulator"] {
+    for read_only in ["Browser", "Chat", "uCity", "GBA Emulator"] {
         let index = labels.iter().position(|label| *label == read_only).unwrap();
         let entry = &entries[index];
         assert_eq!(entry.action_id, None);
         assert!(selected_app_action(&snapshot, index).is_none());
         assert!(entry.command.contains("Desktop"));
-        assert_eq!(
-            TuiState {
-                tab: Tab::Apps,
-                app_index: index,
-                ..TuiState::default()
-            }
-            .activate(&snapshot),
-            None
-        );
+        let state = TuiState {
+            tab: Tab::Apps,
+            app_index: index,
+            ..TuiState::default()
+        };
+        assert_eq!(state.activate(&snapshot), None);
+        if entry.category == "Apps" {
+            assert_eq!(
+                state.desktop_only_notice(&snapshot),
+                Some(format!("Open {read_only} on the Desktop"))
+            );
+        }
     }
     let gba_index = labels
         .iter()
@@ -1661,13 +1542,12 @@ fn quick_launch_only_includes_working_home_actions() {
         .into_iter()
         .map(|idx| snapshot.actions[idx].id.as_str())
         .collect();
-    assert_eq!(ids, vec!["chat"]);
+    assert!(ids.is_empty(), "{ids:?}");
 }
 
 #[test]
 fn every_visible_default_menu_item_is_actionable_or_has_next_step() {
     let mut snapshot = sample_snapshot();
-    snapshot.site.staged = false;
     snapshot.actions.insert(
         1,
         ActionInfo {
@@ -1706,7 +1586,10 @@ fn every_visible_default_menu_item_is_actionable_or_has_next_step() {
             );
         } else {
             assert!(
-                matches!(entry.state.as_str(), "gui-only" | "read-only" | "setup"),
+                matches!(
+                    entry.state.as_str(),
+                    "gui-only" | "read-only" | "setup" | "active"
+                ),
                 "read-only app must say why Enter will not launch it: {} [{}]",
                 entry.label,
                 entry.state
@@ -1722,10 +1605,9 @@ fn every_visible_default_menu_item_is_actionable_or_has_next_step() {
     }
 
     let screen = build_tui_screen(&snapshot, &TuiState::default(), 120, 40);
-    assert!(screen.contains("1 Chat [ready]"));
+    assert!(!screen.contains("Chat [ready]"));
     assert!(!screen.contains("Approve access [setup]"));
     assert!(screen.contains("Approve access: open Inbox and review the request first"));
-    assert!(!screen.contains("elastos site stage"));
     for hidden in [
         "Spaces",
         "Full-screen Chat",
@@ -1738,44 +1620,6 @@ fn every_visible_default_menu_item_is_actionable_or_has_next_step() {
             "default Home CLI leaked hidden/developer item: {hidden}",
         );
     }
-}
-
-#[test]
-fn blocked_mywebsite_is_not_a_default_home_action() {
-    let mut snapshot = sample_snapshot();
-    snapshot.site.staged = false;
-    if let Some(action) = snapshot
-        .actions
-        .iter_mut()
-        .find(|action| action.id == "site-local")
-    {
-        action.ready = false;
-        action.reason = Some("stage a site first".to_string());
-    }
-    let ids: Vec<&str> = home_action_indices(&snapshot)
-        .into_iter()
-        .map(|idx| snapshot.actions[idx].id.as_str())
-        .collect();
-    assert_eq!(ids, vec!["chat"]);
-    assert!(!alerts_lines(&snapshot, 120, None)
-        .iter()
-        .any(|line| line.contains("elastos site stage")));
-    assert!(mywebsite_task_lines(&snapshot)
-        .join("\n")
-        .contains("Stage    mywebsite stage <dir>"));
-}
-
-#[test]
-fn shared_catalog_entries_stay_out_of_default_home_actions() {
-    let mut snapshot = sample_snapshot();
-    snapshot.shares.channel_count = 1;
-    snapshot.shares.active_count = 1;
-
-    let ids: Vec<&str> = home_action_indices(&snapshot)
-        .into_iter()
-        .map(|idx| snapshot.actions[idx].id.as_str())
-        .collect();
-    assert_eq!(ids, vec!["chat"]);
 }
 
 #[test]
@@ -1824,7 +1668,7 @@ fn pending_browser_access_surfaces_approval_actions_on_home() {
         .into_iter()
         .map(|idx| snapshot.actions[idx].id.as_str())
         .collect();
-    assert_eq!(ids, vec!["chat", "room-approve", "room-deny"]);
+    assert_eq!(ids, vec!["room-approve", "room-deny"]);
     let alerts = alerts_lines(&snapshot, 120, None);
     assert!(alerts
         .iter()
@@ -1861,7 +1705,7 @@ fn active_browser_sessions_surface_disconnect_action_on_home() {
         .into_iter()
         .map(|idx| snapshot.actions[idx].id.as_str())
         .collect();
-    assert_eq!(ids, vec!["chat", "room-revoke-all"]);
+    assert_eq!(ids, vec!["room-revoke-all"]);
 
     let alerts = alerts_lines(&snapshot, 120, None);
     assert!(alerts
@@ -1914,7 +1758,7 @@ fn people_tab_uses_people_model_and_keeps_transport_in_debug() {
             display_name: "Alice".to_string(),
             handle: Some("@alice".to_string()),
             relationship: "connected".to_string(),
-            route: "/apps/chat-room/".to_string(),
+            conversation_id: Some("direct:sha256:alice".to_string()),
             can_message: true,
             device_label: Some("peer-alice".to_string()),
             profile_card: None,
@@ -2359,6 +2203,43 @@ fn stale_direct_request_stays_unavailable_in_inbox() {
 }
 
 #[test]
+fn live_direct_message_and_service_requests_hand_off_to_desktop_in_native_terminal() {
+    for action_id in [
+        "chat-open-direct:direct:sha256:abc",
+        "service-approve-request:req-1",
+        "service-deny-request:req-1",
+    ] {
+        let mut snapshot = sample_snapshot();
+        snapshot.session.mode = "native".to_string();
+        snapshot.notifications.entries = vec![NotificationEntryStatus {
+            id: "notice-1".to_string(),
+            source_app: "inbox".to_string(),
+            kind: "request".to_string(),
+            title: "Pending".to_string(),
+            body: "Someone is waiting.".to_string(),
+            action_ref: Some(NotificationActionRefStatus {
+                app: "inbox".to_string(),
+                action_id: action_id.to_string(),
+            }),
+            read: false,
+            severity: "attention".to_string(),
+        }];
+        let state = TuiState {
+            tab: Tab::Inbox,
+            ..TuiState::default()
+        };
+
+        let mut buf = String::new();
+        render_inbox_tab(&mut buf, &snapshot, &state, 120);
+        assert!(
+            buf.contains("Open Inbox on the Desktop to answer this."),
+            "{action_id}"
+        );
+        assert!(!buf.contains("no longer available"), "{action_id}");
+    }
+}
+
+#[test]
 fn tabs_keep_people_between_inbox_and_apps() {
     let mut state = TuiState::default();
     state.next_tab();
@@ -2371,21 +2252,6 @@ fn tabs_keep_people_between_inbox_and_apps() {
     assert_eq!(state.tab, Tab::People);
     state.prev_tab();
     assert_eq!(state.tab, Tab::Inbox);
-}
-
-#[test]
-fn shared_catalog_entries_stay_out_of_default_apps() {
-    let mut snapshot = sample_snapshot();
-    assert!(!app_entries(&snapshot)
-        .iter()
-        .any(|entry| entry.label == "Shared"));
-
-    snapshot.shares.channel_count = 1;
-    snapshot.shares.active_count = 1;
-
-    assert!(!app_entries(&snapshot)
-        .iter()
-        .any(|entry| entry.label == "Shared"));
 }
 
 #[test]
@@ -2407,8 +2273,8 @@ fn blocked_home_action_becomes_next_step_not_primary_action() {
         ..TuiState::default()
     };
 
-    assert_eq!(home_action_indices(&snapshot).len(), 1);
-    assert_eq!(state.activate(&snapshot), Some("chat".to_string()));
+    assert!(home_action_indices(&snapshot).is_empty());
+    assert_eq!(state.activate(&snapshot), None);
     assert!(
         !render_home_actions(&snapshot, &home_action_indices(&snapshot), 1, 120)
             .join("\n")
@@ -2565,12 +2431,9 @@ fn home_screen_stays_compact() {
     assert!(!screen.contains("-- Status --"));
     assert!(screen.starts_with("\x1b[H\x1b[J"));
     assert!(!screen.ends_with("\r\n"));
-    assert!(screen.contains("1 Chat [ready]"));
+    assert!(!screen.contains("Chat [ready]"));
     assert!(screen.contains("Next"));
-    assert!(!screen.contains("MyWebSite [ready]"));
-    assert!(!screen.contains("MyWebSite is empty."));
     assert!(!screen.contains("Updates [ready]"));
-    assert!(!screen.contains("Shared [ready]"));
     assert!(screen.contains("Up/Down select"));
     assert!(screen.contains("q/Esc Desktop"));
     assert!(screen.contains("? help"));
@@ -2730,7 +2593,6 @@ fn tui_starts_at_tab_row_without_summary_header() {
     assert!(!first_line.contains("Home CLI"));
     assert!(!first_line.contains("identity ready"));
     assert!(!first_line.contains("bootstrap ready"));
-    assert!(!first_line.contains("site empty"));
 }
 
 #[test]
@@ -2763,75 +2625,6 @@ fn tui_lines_do_not_trigger_terminal_autowrap() {
             );
         }
     }
-}
-
-#[test]
-fn mywebsite_notice_surfaces_only_after_explicit_home_action() {
-    let snapshot = sample_snapshot();
-    let notice =
-        "MyWebSite is empty. Stage a local directory with `elastos site stage <dir>`. Then reopen MyWebSite from Home to preview or go public.";
-    let screen = build_tui_screen(
-        &snapshot,
-        &TuiState {
-            notice: Some(notice.to_string()),
-            ..TuiState::default()
-        },
-        100,
-        32,
-    );
-
-    assert_eq!(
-        alerts_lines(&snapshot, 100, Some(notice))
-            .join("\n")
-            .matches("MyWebSite is empty.")
-            .count(),
-        1
-    );
-    assert!(screen.contains("MyWebSite is empty."));
-    assert!(screen.contains("Needs attention"));
-}
-
-#[test]
-fn staged_site_summary_and_banner_stay_honest() {
-    let mut snapshot = sample_snapshot();
-    snapshot.site.local_url = None;
-    snapshot.site.active_release = None;
-    if let Some(action) = snapshot
-        .actions
-        .iter_mut()
-        .find(|action| action.id == "site-local")
-    {
-        action.ready = false;
-        action.reason =
-            Some("missing site-provider -- run: elastos setup --profile demo".to_string());
-    }
-
-    assert_eq!(
-        website_summary(&snapshot),
-        "staged at localhost://MyWebSite"
-    );
-}
-
-#[test]
-fn mywebsite_tasks_show_staged_site_and_next_steps() {
-    let mut snapshot = sample_snapshot();
-    snapshot.site.local_url = None;
-    if let Some(action) = snapshot
-        .actions
-        .iter_mut()
-        .find(|action| action.id == "site-local")
-    {
-        action.ready = false;
-        action.reason =
-            Some("missing site-provider -- run: elastos setup --profile demo".to_string());
-    }
-
-    let screen = mywebsite_task_lines(&snapshot).join("\n");
-    assert!(screen.contains("Status   staged at localhost://MyWebSite"));
-    assert!(screen.contains("Stage    mywebsite stage <dir>"));
-    assert!(screen.contains("Preview  mywebsite preview (blocked"));
-    assert!(screen.contains("Open     mywebsite open"));
-    assert!(!screen.contains("press Enter"));
 }
 
 #[test]

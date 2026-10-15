@@ -25,6 +25,8 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     appLoadError: null,
     mediaLoadError: null,
     mediaTruncated: false,
+    // Runtime policy: protected content (Media) ships after 0.8.0 (#91).
+    protectedContent: false,
     modelCatalogState: "unconfigured",
     sharedModels: [],
     modelAccess: [],
@@ -308,8 +310,14 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     state.mediaLoadError = null;
     renderSurfaceState();
     await Promise.all([
-      loadCatalogData().then(render),
-      loadMediaData().then(render),
+      loadCatalogData().then(() => {
+        render();
+        if (!state.protectedContent) {
+          state.mediaLoading = false;
+          return undefined;
+        }
+        return loadMediaData().then(render);
+      }),
       ...(state.sharedLoaded ? [loadSharedModels()] : []),
     ]);
   }
@@ -361,6 +369,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       }
       const capsules = Array.isArray(catalog.capsules) ? catalog.capsules : [];
       state.modelCatalogState = catalog.model_catalog_state || "unconfigured";
+      state.protectedContent = catalog.policy?.protected_content === true;
       const modelCids = new Set();
       for (const capsule of capsules.filter(item => item.source === "signed-model-catalog")) {
         if (catalog.model_catalog_state !== "verified" || capsule.role !== "content" || capsule.installed !== false || capsule.launchable !== false ||
@@ -439,9 +448,9 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       modelCid: model ? capsule.cid : null,
       contentBytes: model ? capsule.content_size_bytes : null,
       name: publicTitle(capsule),
-      developer: String(model ? capsule.publisher_did : capsule.author || "Unknown publisher"),
+      developer: String(model ? capsule.publisher_did : capsule.author || "").trim(),
       category: appCategory(capsule, role),
-      description: model ? "Language model for Assistant." : publicDescription(capsule),
+      description: model ? modelDescription(capsule) : publicDescription(capsule),
       version: String(capsule.version || ""),
       installed,
       launchable,
@@ -460,9 +469,16 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       dependencies,
       availableActions: model ? [] : executableActions(interfaceEntries),
       viewerTitle: model ? "Assistant" : String(capsule.viewer_title || ""),
-      size: model ? `${capsule.content_size_bytes.toLocaleString()} bytes` : capsule.cid ? "Verified app" : "Local app",
+      size: model ? `${capsule.content_size_bytes.toLocaleString()} bytes` : capsule.cid ? "Published app" : "Local app",
       sourceSummary: capsule.cid ? "SmartWeb" : "Local",
     };
+  }
+
+  // A signed catalogue entry may carry its own one-line description; without
+  // one, Runtime's generic capsule text is replaced by the model's purpose.
+  function modelDescription(capsule) {
+    const description = String(capsule.description || "").trim();
+    return description && !/\bruntime\b/i.test(description) ? description : "Language model for Assistant.";
   }
 
   function appCategory(capsule, role) {
@@ -579,6 +595,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   function render() {
+    syncProtectedContent();
     selectDestination(state.destination, { silent: true });
     updateInstalledBadge();
     const surfaceBlocked = renderSurfaceState();
@@ -589,8 +606,15 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     openPendingModelDetail();
   }
 
+  function syncProtectedContent() {
+    document.querySelectorAll('[data-destination="media"]').forEach((node) => {
+      node.hidden = !state.protectedContent;
+    });
+    if (!state.protectedContent && state.destination === "media") selectDestination("discover", { silent: true });
+  }
+
   function normalizeDestination(id) {
-    if (id === "media") return "media";
+    if (id === "media") return state.protectedContent ? "media" : "discover";
     if (id === "installed") return "installed";
     if (categories.some((category) => category.id === id)) return id;
     return "discover";
@@ -763,7 +787,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     const shared = state.sharedModels.filter(matches);
     const access = state.modelAccess.filter(matches);
     const localStatus = state.appLoading ? "Loading verified models…" : state.appLoadError
-      || (state.modelCatalogState === "unavailable" ? "The model catalog could not be verified." : "");
+      || (state.modelCatalogState === "unavailable" ? "The signed model list could not be fetched or verified. Connect to the internet and try again." : "");
     const unavailable = state.remoteAvailability.filter(service => service.status !== "reachable").length;
     els.storeSections.innerHTML = `${modelsSettingsChrome()}
       <section class="store-section"><h2 class="store-section-title">On this Home</h2>
@@ -884,36 +908,20 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     els.installedBadge.classList.toggle("hidden", count === 0);
   }
 
-  function isFirstPartyPublisher(author) {
-    const value = String(author || "").trim();
-    return !value || /^elastos$/i.test(value) || value === "Unknown publisher";
-  }
-
-  function rowSubtitle(app) {
-    if (app.modelCid) return app.description;
-    if (!isFirstPartyPublisher(app.developer)) {
-      return app.developer;
-    }
-    const description = String(app.description || "").trim();
-    if (description) {
-      const line = description.split(/[.!?]/)[0].trim();
-      if (line) {
-        return line;
-      }
-    }
-    return roleLabel(app.role);
-  }
-
   function shortDid(did) {
     return did.length <= 32 ? did : `${did.slice(0, 16)}…${did.slice(-4)}`;
   }
 
   function detailPublisher(app) {
-    if (app.modelCid) return `Verified publisher · ${shortDid(app.developer)}`;
-    if (isFirstPartyPublisher(app.developer)) {
-      return "ElastOS";
-    }
-    return app.developer;
+    if (app.modelCid) return `Runtime-verified publisher · ${shortDid(app.developer)}`;
+    const author = app.developer;
+    return !author || /^unknown publisher$/i.test(author)
+      ? "Publisher unknown"
+      : `Declared author · ${author}`;
+  }
+
+  function rowSubtitle(app) {
+    return app.modelCid ? app.description : detailPublisher(app);
   }
 
   function modelSizeLabel(bytes) {
@@ -1134,10 +1142,10 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       `Status: ${app.installed ? "Installed on this Home" : "Not installed on this Home"}`,
       `Launch: ${app.launchable ? "Open from Home available" : "Open from Home unavailable"}`,
     ];
-    if (app.paymentState && app.paymentState !== "none") {
+    if (app.paymentState === "provider") {
       items.push("Supports payments");
     }
-    if (app.drmState && app.drmState !== "none") {
+    if (app.drmState === "provider") {
       items.push("Uses protected content");
     }
     return items;
@@ -1178,7 +1186,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
           <div class="requirement-item"><div class="requirement-value">${escapeHtml(app.capsuleType || "Unknown")}</div><div class="requirement-label">Type</div></div>
         </div>
         <ul class="permissions-list">
-          <li><span class="permission-icon">${icons.check}</span>${escapeHtml(signatureLabel(app.signatureState))}</li>
+          <li><span class="permission-icon">${icons.check}</span>${escapeHtml(signatureLabel(app))}</li>
           ${app.modelCid ? `<li class="model-publisher-identity">Publisher: ${escapeHtml(app.developer)}</li><li class="model-content-identity">Content ID: ${escapeHtml(app.modelCid)}</li><li>${app.contentBytes.toLocaleString()} bytes</li>` : ""}
           <li><span class="permission-icon">${icons.check}</span>${escapeHtml(packageLabel(app))}</li>
         </ul>
@@ -1187,30 +1195,27 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   function packageLabel(app) {
-    if (app.modelCid) return "Verified publisher";
-    if (app.trustState === "cid-with-manifest-signature") return "Verified";
-    if (app.trustState === "local-manifest-signature") return "Signed local";
-    if (app.installed) return "On this device";
-    return "Catalog entry";
+    if (app.modelCid) return "Runtime-verified publisher";
+    return "Publisher verification unavailable";
   }
 
   function trustLabel(stateValue) {
     const labels = {
-      "cid-with-manifest-signature": "Verified SmartWeb app",
-      "local-manifest-signature": "Signed local app",
-      "cid-without-manifest-signature": "Verification incomplete",
+      "cid-with-manifest-signature": "Published content and manifest signature declared",
+      "local-manifest-signature": "Local manifest signature declared",
+      "cid-without-manifest-signature": "Published content declared",
       "local-dev": "Local app",
     };
     return labels[stateValue] || "Not declared";
   }
 
-  function signatureLabel(stateValue) {
+  function signatureLabel(app) {
+    if (app.modelCid) return "Runtime verified the catalog publisher signature";
     const labels = {
       "manifest-signature-declared": "Manifest signature declared",
       "no-manifest-signature": "Manifest signature not declared",
-      "catalog-signature-verified": "Catalog publisher signature verified",
     };
-    return labels[stateValue] || "Manifest signature status unavailable";
+    return labels[app.signatureState] || "Manifest signature status unavailable";
   }
 
   function openApp(appId) {
@@ -1336,7 +1341,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
         }
       });
       node.addEventListener("keydown", (event) => {
-        if ((event.key === "Enter" || event.key === " ") && node.dataset.action === "detail") {
+        if (event.target === node && (event.key === "Enter" || event.key === " ") && node.dataset.action === "detail") {
           event.preventDefault();
           showAppDetail(node.dataset.app);
         }

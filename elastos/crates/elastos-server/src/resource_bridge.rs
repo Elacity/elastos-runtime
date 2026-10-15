@@ -963,7 +963,7 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
 
         "get_runtime_info" => serde_json::json!({
             "type": "runtime_info",
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": env!("ELASTOS_VERSION"),
             "capsule_count": 0,
         }),
 
@@ -1285,7 +1285,7 @@ pub async fn handle_remote_request_with_audit_dir(
         "ping" => serde_json::json!({"type": "pong"}),
         "get_runtime_info" => serde_json::json!({
             "type": "runtime_info",
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": env!("ELASTOS_VERSION"),
             "capsule_count": 0,
         }),
         request_type if is_runtime_control_request(request_type) => serde_json::json!({
@@ -1771,6 +1771,22 @@ mod tests {
         assert!(err
             .to_string()
             .contains("attached component bridge requires a local runtime API URL"));
+    }
+
+    #[tokio::test]
+    async fn runtime_info_reports_the_release_version_the_cli_shows() {
+        let response = handle_remote_request(
+            r#"{"id":3,"request":{"type":"get_runtime_info"}}"#,
+            "http://127.0.0.1:12345",
+            "client-token",
+            "test-capsule",
+            &[],
+            None,
+        )
+        .await
+        .expect("runtime info is answered locally");
+
+        assert_eq!(response["response"]["version"], env!("ELASTOS_VERSION"));
     }
 
     #[tokio::test]

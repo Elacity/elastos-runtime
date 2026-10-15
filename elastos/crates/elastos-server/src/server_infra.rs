@@ -65,11 +65,6 @@ const MEDIA_PROVIDER_ID: &str = "media-provider";
 const MEDIA_PROVIDER_ROUTE: &str = "media";
 #[cfg(test)]
 const MEDIA_PROVIDER_PROTOCOL_VERSION: &str = "elastos.media-provider/v1";
-#[cfg(test)]
-const MEDIA_PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => "0.1.0-dev",
-};
 const MEDIA_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -433,11 +428,15 @@ async fn register_media_provider(
 }
 
 pub(crate) async fn setup_server_infrastructure() -> anyhow::Result<ServerInfrastructure> {
-    setup_server_infrastructure_impl(true).await
+    setup_server_infrastructure_impl(true, elastos_server::ipfs::IpfsHostRole::User).await
 }
 
 pub(crate) async fn setup_control_plane_infrastructure() -> anyhow::Result<ServerInfrastructure> {
-    setup_server_infrastructure_impl(false).await
+    setup_server_infrastructure_impl(false, elastos_server::ipfs::IpfsHostRole::User).await
+}
+
+pub(crate) async fn setup_gateway_infrastructure() -> anyhow::Result<ServerInfrastructure> {
+    setup_server_infrastructure_impl(false, elastos_server::ipfs::IpfsHostRole::Gateway).await
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +473,21 @@ pub(crate) async fn register_ipfs_provider_plane(
     provider_registry: &Arc<provider::ProviderRegistry>,
     binary_path: &Path,
 ) -> anyhow::Result<()> {
-    let bridge = provider::ProviderBridge::spawn(binary_path, Default::default())
+    register_ipfs_provider_plane_with_role(
+        provider_registry,
+        binary_path,
+        elastos_server::ipfs::IpfsHostRole::User,
+    )
+    .await
+}
+
+async fn register_ipfs_provider_plane_with_role(
+    provider_registry: &Arc<provider::ProviderRegistry>,
+    binary_path: &Path,
+    role: elastos_server::ipfs::IpfsHostRole,
+) -> anyhow::Result<()> {
+    let config = elastos_server::ipfs::ipfs_provider_config(role);
+    let bridge = provider::ProviderBridge::spawn(binary_path, config)
         .await
         .map_err(|err| anyhow::anyhow!("failed to spawn ipfs-provider: {err}"))?;
     let ipfs_provider: Arc<dyn provider::Provider> = Arc::new(
@@ -624,6 +637,7 @@ async fn serve_capability_store(
 
 async fn setup_server_infrastructure_impl(
     spawn_host_providers: bool,
+    ipfs_role: elastos_server::ipfs::IpfsHostRole,
 ) -> anyhow::Result<ServerInfrastructure> {
     let data_dir = default_data_dir();
     let carrier_bind_addr = configured_carrier_bind_addr(&data_dir)?;
@@ -992,10 +1006,13 @@ async fn setup_server_infrastructure_impl(
     }
 
     match binaries::resolve_verified_native_provider_binary("ipfs-provider") {
-        Ok(Some(path)) => match register_ipfs_provider_plane(&provider_registry, &path).await {
-            Ok(()) => tracing::info!("ipfs-provider capsule from {}", path.display()),
-            Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
-        },
+        Ok(Some(path)) => {
+            match register_ipfs_provider_plane_with_role(&provider_registry, &path, ipfs_role).await
+            {
+                Ok(()) => tracing::info!("ipfs-provider capsule from {}", path.display()),
+                Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
+            }
+        }
         Ok(None) => {
             tracing::warn!(
                 "ipfs-provider binary is not installed; elastos://content publish/fetch will fail closed"
@@ -1203,7 +1220,14 @@ async fn setup_server_infrastructure_impl(
         Err(e) => tracing::warn!("Skipping net-provider due to verification failure: {}", e),
     }
 
-    if let Some(local_exit_config) = browser_local_exit_config_from_env(&data_dir) {
+    // Retained Browser helpers from an earlier release stay stopped where
+    // Browser is unavailable.
+    let browser_available =
+        elastos_server::setup::browser_available(&elastos_server::setup::detect_platform());
+    if let Some(local_exit_config) = browser_available
+        .then(|| browser_local_exit_config_from_env(&data_dir))
+        .flatten()
+    {
         if let Some(path) = crate::find_installed_provider_binary("browser-local-exit") {
             if let Err(e) = verify_provider_binary("browser-local-exit", &path) {
                 tracing::warn!(
@@ -1255,14 +1279,21 @@ async fn setup_server_infrastructure_impl(
         Err(e) => tracing::warn!("Skipping exit-provider due to verification failure: {}", e),
     }
 
-    match binaries::resolve_verified_native_provider_binary("browser-engine-adapter") {
+    let browser_engine_adapter = if browser_available {
+        binaries::resolve_verified_native_provider_binary("browser-engine-adapter")
+    } else {
+        Ok(None)
+    };
+    match browser_engine_adapter {
         Ok(Some(path)) => {
             let browser_engine_config = provider::BridgeProviderConfig {
                 extra: browser_engine_adapter_config_from_env(&data_dir)
                     .unwrap_or(serde_json::Value::Null),
                 ..Default::default()
             };
-            match provider::ProviderBridge::spawn(&path, browser_engine_config).await {
+            match provider::ProviderBridge::spawn_with_owned_helpers(&path, browser_engine_config)
+                .await
+            {
                 Ok(bridge) => {
                     let bridge = Arc::new(bridge);
                     match start_browser_engine_provider(
@@ -2199,7 +2230,7 @@ mod tests {
             "data": {
                 "provider": MEDIA_PROVIDER_ID,
                 "protocol_version": MEDIA_PROVIDER_PROTOCOL_VERSION,
-                "version": MEDIA_PROVIDER_VERSION,
+                "version": "0.7.2-alpha.5",
                 "configured": true,
                 "supported_operations": ["status", "prepare"],
             }
@@ -2376,8 +2407,7 @@ mod tests {
             request_log.display(),
             status_response,
         );
-        fs::write(&binary, script).unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_from_child(&binary, script, 0o700);
         (binary, pid_file, request_log)
     }
 
@@ -2400,9 +2430,46 @@ mod tests {
             status_release.display(),
             media_provider_status(),
         );
-        fs::write(&binary, script).unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_from_child(&binary, script, 0o700);
         (binary, pid_file, request_log, status_signal, status_release)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn browser_helper_pipe_closes_with_runtime_provider_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/browser-helper-parent-lifetime.test.py");
+        let binary = temp.path().join("browser-provider.sh");
+        crate::test_support::write_from_child(
+            &binary,
+            format!(
+                "#!/bin/sh\nexec python3 '{}' --provider '{}'\n",
+                script.display(),
+                temp.path().display()
+            ),
+            0o700,
+        );
+        let bridge =
+            provider::ProviderBridge::spawn_with_owned_helpers(&binary, Default::default())
+                .await
+                .unwrap();
+        let ready: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("ready.json")).unwrap()).unwrap();
+        let pid = ready["helper"].as_u64().unwrap() as libc::pid_t;
+        bridge.shutdown().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let gone = unsafe { libc::kill(pid, 0) } != 0;
+        if !gone {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        assert!(gone, "Browser helper outlived Runtime provider shutdown");
+        assert!(temp.path().join("clean-stop").exists());
     }
 
     #[tokio::test]
@@ -2788,7 +2855,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_provider_startup_registers_only_the_runtime_media_route() {
+    async fn media_provider_startup_accepts_another_release_and_registers_only_the_runtime_media_route(
+    ) {
         let registry = provider::ProviderRegistry::new();
         let (bridge, provider) = test_provider_bridge(media_provider_status(), Duration::ZERO);
 
@@ -3499,15 +3567,14 @@ mod tests {
         );
         let script_path = tempdir.path().join("fake-model-provider.sh");
         let pid_path = tempdir.path().join("fake-model-provider.pid");
-        fs::write(
+        crate::test_support::write_from_child(
             &script_path,
             format!(
                 "#!/bin/sh\nprintf '%s' $$ > '{}'\nIFS= read -r _line || exit 0\nprintf '{{\"status\":\"error\",\"code\":\"invalid_config\",\"message\":\"invalid configuration\"}}\\n'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
                 pid_path.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
 
         let error = match provider::ProviderBridge::spawn(
             &script_path,
@@ -3935,14 +4002,13 @@ mod tests {
         let bin_dir = temp.path().join("mock-bin");
         fs::create_dir_all(&bin_dir).unwrap();
         let path = bin_dir.join("ipfs-provider");
-        fs::write(
+        crate::test_support::write_from_child(
             &path,
             format!(
                 "#!/bin/sh\nwhile IFS= read -r line; do\n  printf '{{\"status\":\"ok\",\"data\":{{\"cid\":\"%s\"}}}}\\n' '{PROVIDER_HOST_TEST_CID}'\ndone\n"
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            0o700,
+        );
         path
     }
 

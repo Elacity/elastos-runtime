@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Disposable test Homes never join the Community network a release pins (setup and update skip it).
+export ELASTOS_COLLABORATION_STARTUP_MODE=isolated
 
 # This fixture owns setup, launch, and cleanup after bootstrap.
 export ELASTOS_INSTALL_ONLY=1
@@ -9,7 +11,7 @@ source "${REPO_ROOT}/scripts/lib/public-install-guards.sh"
 source "${REPO_ROOT}/scripts/lib/runtime-cleanup.sh"
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 FORCE_RELAY_ONLY="${ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY:-0}"
-HOME_DIR="$(mktemp -d /tmp/elastos-public-identity-XXXXXX)"
+HOME_DIR="$(smoke_home_dir public-identity)"
 DATA_DIR=""
 cleanup() {
     if [[ -n "$DATA_DIR" ]] && ! cleanup_elastos_runtime_home "$HOME_DIR" "$DATA_DIR" "${RUN_BIN:-${HOME_DIR}/.local/bin/elastos}"; then

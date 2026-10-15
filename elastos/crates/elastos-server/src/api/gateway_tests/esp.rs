@@ -48,7 +48,7 @@ fn write_esp_invoke_capsule(data_dir: &std::path::Path) {
         "description": "ESP invocation contract test",
         "author": "elastos",
         "role": "app",
-        "type": "wasm",
+        "type": "web-projection",
         "runtime_abi": "elastos.runtime-projection/v1",
         "bus_contract": "elastos.runtime-projection/v1",
         "execution": "web-projection",

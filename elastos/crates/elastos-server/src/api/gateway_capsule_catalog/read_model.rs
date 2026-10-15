@@ -15,12 +15,20 @@ pub(in crate::api::gateway) const CAPSULE_INTERFACE_REGISTRY_SCHEMA: &str =
 pub(in crate::api::gateway) fn capsule_catalog_summary(
     data_dir: &std::path::Path,
 ) -> CapsuleCatalogResponse {
+    capsule_catalog_summary_for(data_dir, &crate::setup::detect_platform())
+}
+
+pub(in crate::api::gateway) fn capsule_catalog_summary_for(
+    data_dir: &std::path::Path,
+    platform: &str,
+) -> CapsuleCatalogResponse {
     let launch_targets = home_launch_targets(data_dir)
         .into_iter()
         .map(|target| (target.target.clone(), target))
         .collect::<BTreeMap<_, _>>();
     let components = load_capsule_components(data_dir);
     let accepted_content_by_viewer = accepted_content_by_viewer(data_dir);
+    let protected_content = crate::protected_content_runtime::protected_content_enabled(data_dir);
 
     let mut capsules = crate::api::capsule_inventory::list_active_capsule_manifests(data_dir)
         .into_iter()
@@ -28,6 +36,12 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
         .filter(|manifest| manifest.name != "home-agent")
         // A directory or component entry cannot authenticate model content.
         .filter(|manifest| manifest.model_content.is_none())
+        .filter(|manifest| {
+            protected_content
+                || manifest.name != crate::protected_content_runtime::ELACITY_PLAYER_CAPSULE_ID
+        })
+        // Browser is absent, not merely unlaunchable, where it is unavailable.
+        .filter(|manifest| manifest.name != "browser" || crate::setup::browser_available(platform))
         .map(|manifest| {
             catalog_capsule_summary(
                 manifest,
@@ -37,6 +51,16 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
             )
         })
         .collect::<Vec<_>>();
+    // The browser terminal only starts in developer mode, so the Terminal
+    // Home view is offered only when it can start.
+    if !home_terminal_policy_allows(data_dir) {
+        for capsule in capsules
+            .iter_mut()
+            .filter(|capsule| capsule.name == HOME_CLI_SHELL_ID)
+        {
+            capsule.launchable = false;
+        }
+    }
     let model_catalog_state = match crate::api::capsule_inventory::model_catalog_entries(data_dir) {
         Ok(None) => "unconfigured",
         Ok(Some(entries))
@@ -135,6 +159,7 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
             payment_note: "Paid apps and services must use wallet/payment provider receipts, not embedded payment SDKs.".to_string(),
             drm_state: "provider-rail-required".to_string(),
             drm_note: "Protected apps and content must use rights, key, and decrypt providers for dDRM enforcement.".to_string(),
+            protected_content,
         },
     }
 }
@@ -142,10 +167,24 @@ pub(in crate::api::gateway) fn capsule_catalog_summary(
 pub(in crate::api::gateway) fn capsule_interface_registry_summary(
     data_dir: &std::path::Path,
 ) -> CapsuleInterfaceRegistryResponse {
-    let catalog = capsule_catalog_summary(data_dir);
+    capsule_interface_registry_summary_for(data_dir, &crate::setup::detect_platform())
+}
+
+pub(in crate::api::gateway) fn capsule_interface_registry_summary_for(
+    data_dir: &std::path::Path,
+    platform: &str,
+) -> CapsuleInterfaceRegistryResponse {
+    capsule_interface_registry_summary_from_catalog(&capsule_catalog_summary_for(
+        data_dir, platform,
+    ))
+}
+
+pub(in crate::api::gateway) fn capsule_interface_registry_summary_from_catalog(
+    catalog: &CapsuleCatalogResponse,
+) -> CapsuleInterfaceRegistryResponse {
     let mut interfaces = Vec::new();
-    for capsule in catalog.capsules {
-        for interface in capsule.interfaces {
+    for capsule in &catalog.capsules {
+        for interface in &capsule.interfaces {
             let bindings = interface
                 .methods
                 .iter()
@@ -164,7 +203,7 @@ pub(in crate::api::gateway) fn capsule_interface_registry_summary(
                 projections: capsule.projections.clone(),
                 cid: capsule.cid.clone(),
                 trust_state: capsule.trust_state.clone(),
-                interface,
+                interface: interface.clone(),
                 bindings,
             });
         }
@@ -216,11 +255,11 @@ fn catalog_capsule_summary(
     } else {
         manifest.window_policy
     };
-    let capsule_type = manifest.capsule_type.clone();
+    let capsule_type = manifest.execution_type();
     let runtime_abi = manifest.runtime_abi.clone();
     let bus_contract = manifest.bus_contract.clone();
     let wit_world_sha256 = manifest.wit_world_sha256.clone();
-    let execution = manifest.execution.clone();
+    let execution = manifest.effective_execution();
     let declared_projections = manifest.projections.clone();
     let category = capsule_category(&role);
     // A content capsule with a bound viewer is launchable through that viewer.
@@ -280,6 +319,7 @@ fn catalog_capsule_summary(
         name: name.clone(),
         model_content: manifest.model_content,
         model_runtime: None,
+        model_memory_fit: None,
         publisher_did: None,
         content_size_bytes: None,
         version: manifest.version,
@@ -674,6 +714,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_reports_actual_execution_for_legacy_wire_manifests() {
+        for (source, expected_type, expected_execution) in [
+            (
+                include_str!("../../../../../../capsules/model-provider/capsule.json"),
+                CapsuleType::NativeProvider,
+                CapsuleExecution::NativeProvider,
+            ),
+            (
+                include_str!("../../../../../../capsules/home/capsule.json"),
+                CapsuleType::WebProjection,
+                CapsuleExecution::WebProjection,
+            ),
+            (
+                include_str!("../../../../../capsules/shell/capsule.json"),
+                CapsuleType::NativeHost,
+                CapsuleExecution::NativeHost,
+            ),
+        ] {
+            let manifest: CapsuleManifest = serde_json::from_str(source).unwrap();
+            manifest.validate().unwrap();
+            let summary = catalog_capsule_summary(
+                manifest,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            );
+            assert_eq!(summary.capsule_type, expected_type);
+            assert_eq!(summary.execution, Some(expected_execution));
+            assert!(
+                summary.model_memory_fit.is_none(),
+                "ordinary app rows have no model memory fact"
+            );
+        }
+    }
+
+    #[test]
     fn model_catalog_projection_keeps_same_name_local_content_unprepared() {
         use crate::api::capsule_inventory::tests::{
             model_catalog_fixture, write_model_catalog_fixture,
@@ -848,6 +924,8 @@ pub(in crate::api::gateway) struct CapsuleCatalogPolicy {
     pub(in crate::api::gateway) payment_note: String,
     pub(in crate::api::gateway) drm_state: String,
     pub(in crate::api::gateway) drm_note: String,
+    /// Whether Home shows protected-content surfaces (Media, Protect and List).
+    pub(in crate::api::gateway) protected_content: bool,
 }
 
 #[derive(Serialize)]
@@ -857,6 +935,9 @@ pub(in crate::api::gateway) struct CapsuleSummary {
     pub(in crate::api::gateway) model_content: Option<elastos_common::ModelContentMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api::gateway) model_runtime: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) model_memory_fit:
+        Option<elastos_common::host_memory::ModelMemoryFit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api::gateway) publisher_did: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

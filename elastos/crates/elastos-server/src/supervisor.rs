@@ -16,7 +16,10 @@ use tokio::sync::RwLock;
 
 use crate::carrier_service::CarrierServiceProvider;
 use crate::ownership;
-use crate::setup::{CapsuleEntry, ComponentsManifest};
+use crate::setup::{
+    read_artifact_sha256_receipt, write_artifact_sha256_receipt, CapsuleEntry, ComponentsManifest,
+    CACHED_ARTIFACT_SHA_FILE,
+};
 use crate::vm_provider::VmCapsuleProvider;
 
 use elastos_crosvm::{CrosvmConfig, NetworkConfig, RunningVm, VmConfig};
@@ -27,7 +30,6 @@ use elastos_runtime::session::{SessionRegistry, SessionType};
 /// Carrier-managed control network.
 const VM_PROVIDER_PORT: u16 = 7000;
 const CACHED_CID_FILE: &str = ".elastos-cid";
-const CACHED_ARTIFACT_SHA_FILE: &str = ".elastos-artifact-sha256";
 const CHAT_RETURN_HOME_EXIT_CODE: i32 = 73;
 
 fn vm_provider_bridge_enabled() -> bool {
@@ -248,6 +250,25 @@ impl Supervisor {
             .unwrap_or_else(|| data_dir.join(default_relative))
     }
 
+    /// Why this release cannot run microVM capsules on `platform`, if it cannot.
+    fn microvm_unavailable(registry: &ComponentsManifest, platform: &str) -> Option<String> {
+        ["crosvm", "vmlinux"]
+            .into_iter()
+            .find(|name| {
+                registry
+                    .external
+                    .get(*name)
+                    .and_then(|component| crate::setup::resolve_platform_info(component, platform))
+                    .is_none()
+            })
+            .map(|name| {
+                format!(
+                    "microVM capsules are not available on {platform} in this release \
+                     ({name} is not published for it)"
+                )
+            })
+    }
+
     fn verify_host_artifact(&self, component: &str, path: &Path) -> Result<()> {
         let checksum =
             crate::setup::verify_installed_component_binary(&self.data_dir, component, path)
@@ -319,20 +340,18 @@ impl Supervisor {
             }
 
             if !entry.sha256.is_empty() {
-                let cached_sha =
-                    std::fs::read_to_string(capsule_dir.join(CACHED_ARTIFACT_SHA_FILE))
-                        .with_context(|| {
-                            format!(
-                                "carrier service '{}' missing cached capsule sha metadata at {}",
-                                name,
-                                capsule_dir.join(CACHED_ARTIFACT_SHA_FILE).display()
-                            )
-                        })?;
-                if cached_sha.trim() != entry.sha256 {
+                let cached_sha = read_artifact_sha256_receipt(capsule_dir).with_context(|| {
+                    format!(
+                        "carrier service '{}' missing cached capsule sha metadata at {}",
+                        name,
+                        capsule_dir.join(CACHED_ARTIFACT_SHA_FILE).display()
+                    )
+                })?;
+                if cached_sha != entry.sha256 {
                     bail!(
                         "carrier service '{}' cached sha mismatch: have {}, expected {}",
                         name,
-                        cached_sha.trim(),
+                        cached_sha,
                         entry.sha256
                     );
                 }
@@ -819,54 +838,54 @@ impl Supervisor {
     /// Ensure a capsule artifact is locally available. Downloads if missing.
     async fn ensure_capsule(&self, name: &str) -> Result<PathBuf> {
         let capsule_dir = self.capsules_dir.join(name);
-
-        // Look up in registry
-        let entry = self
-            .registry
-            .capsules
-            .get(name)
-            .with_context(|| format!("capsule '{name}' not in registry"))?;
-
-        if entry.cid.is_empty() {
-            bail!("capsule '{name}' has no CID in registry (not yet published)");
+        if cached_capsule_matches(&capsule_dir, registry_entry(&self.registry, name)?) {
+            return Ok(capsule_dir);
         }
 
-        // Already present and matches current registry entry?
-        if capsule_dir.join("capsule.json").is_file() {
-            let cached_cid = tokio::fs::read_to_string(capsule_dir.join(CACHED_CID_FILE))
-                .await
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            let cached_sha = tokio::fs::read_to_string(capsule_dir.join(CACHED_ARTIFACT_SHA_FILE))
-                .await
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-
-            if cached_cid == entry.cid && (entry.sha256.is_empty() || cached_sha == entry.sha256) {
-                return Ok(capsule_dir);
+        // On a Home with a signed release the entry comes from that release after
+        // its capsule records are admitted, and the writer is held until the new
+        // capsule replaces the cache.
+        let admitted = crate::setup::admit_installed_components(
+            &self.data_dir,
+            crate::setup::FirstPartyCarrierContext::Runtime,
+        )?;
+        let entry = registry_entry(
+            admitted
+                .as_ref()
+                .map_or(&self.registry, |admitted| &admitted.manifest),
+            name,
+        )?;
+        if cached_capsule_matches(&capsule_dir, entry) {
+            return Ok(capsule_dir);
+        }
+        let row = match &admitted {
+            Some(admitted) => admitted.admission.registry_entry(name, entry)?,
+            None => {
+                crate::capsule_record::Admission::unsigned_home(&self.data_dir, &self.registry)?
+                    .registry_entry(name, entry)?
             }
-
+        };
+        if capsule_dir.exists() {
             eprintln!(
                 "  Refreshing cached capsule '{}' (registry CID changed or cache metadata missing)...",
                 name
             );
-            let _ = tokio::fs::remove_dir_all(&capsule_dir).await;
         }
-
-        // Download capsule artifact through the registered content availability contract.
-        self.download_capsule(name, entry, &capsule_dir).await?;
-
+        self.download_capsule(&row, &capsule_dir).await?;
         Ok(capsule_dir)
     }
 
     /// Download a capsule artifact, verify, and extract.
     ///
     /// Canonical path today: content provider backed by local IPFS/Kubo.
-    /// No HTTP fallback is allowed here.
-    async fn download_capsule(&self, name: &str, entry: &CapsuleEntry, dest: &Path) -> Result<()> {
-        self.try_download_capsule_via_content_provider(name, &entry.cid, &entry.sha256, dest)
+    /// No HTTP fallback is allowed here. The old cache is replaced only after
+    /// the new bytes are verified and extracted.
+    async fn download_capsule(
+        &self,
+        row: &crate::capsule_record::AdmittedRow,
+        dest: &Path,
+    ) -> Result<()> {
+        self.try_download_capsule_via_content_provider(row, dest)
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -882,53 +901,42 @@ impl Supervisor {
     /// code does not bind itself to the low-level backend namespace.
     async fn try_download_capsule_via_content_provider(
         &self,
-        name: &str,
-        cid: &str,
-        expected_sha256: &str,
+        row: &crate::capsule_record::AdmittedRow,
         dest: &Path,
     ) -> Result<()> {
-        use sha2::Digest;
-
+        let (name, info) = (row.name(), row.info());
+        let cid = info.cid.as_deref().unwrap_or_default();
+        let sha256 = info
+            .checksum
+            .as_deref()
+            .and_then(|checksum| checksum.strip_prefix("sha256:"))
+            .unwrap_or_default();
         println!(
             "  Fetching capsule '{}' via content provider (CID: {})...",
             name, cid
         );
 
         let bytes = self.content_fetch_via_provider(cid).await?;
+        crate::setup::verify_release_bytes(name, &bytes, info)?;
 
-        // Verify sha256 — fail closed if missing
-        if expected_sha256.is_empty() {
-            bail!(
-                "No sha256 checksum for capsule '{}' (CID: {}). \
-                 Integrity verification is mandatory. \
-                 Ensure components.json includes sha256 for all artifacts.",
-                name,
-                cid
-            );
-        }
-        let actual = hex::encode(sha2::Sha256::digest(&bytes));
-        if actual != *expected_sha256 {
-            bail!(
-                "sha256 mismatch for '{}': expected {expected_sha256}, got {actual}",
-                name
-            );
-        }
-        println!("  Checksum verified (sha256)");
-
-        // Extract tarball
-        std::fs::create_dir_all(dest)?;
+        // Extract beside the cache, then replace it in one rename.
+        let parent = dest.parent().context("capsule cache parent missing")?;
+        std::fs::create_dir_all(parent)?;
+        let staged = tempfile::Builder::new()
+            .prefix(".capsule-stage-")
+            .tempdir_in(parent)?;
         let tar_gz = flate2::read::GzDecoder::new(&bytes[..]);
         let mut archive = tar::Archive::new(tar_gz);
-        archive.unpack(dest)?;
-
-        tokio::fs::write(dest.join(CACHED_CID_FILE), format!("{}\n", cid)).await?;
-        if !expected_sha256.is_empty() {
-            tokio::fs::write(
-                dest.join(CACHED_ARTIFACT_SHA_FILE),
-                format!("{}\n", expected_sha256),
-            )
-            .await?;
+        archive.unpack(staged.path())?;
+        std::fs::write(staged.path().join(CACHED_CID_FILE), format!("{}\n", cid))?;
+        write_artifact_sha256_receipt(staged.path(), sha256)?;
+        let retired = parent.join(format!(".capsule-retired-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&retired);
+        if dest.exists() {
+            std::fs::rename(dest, &retired)?;
         }
+        std::fs::rename(staged.keep(), dest)?;
+        let _ = std::fs::remove_dir_all(&retired);
         let _ = ownership::repair_path_recursive(dest);
 
         println!("  Extracted to {} (via content provider)", dest.display());
@@ -975,6 +983,11 @@ impl Supervisor {
                 .await;
         }
 
+        // VM path — the release must publish crosvm and a guest kernel for this platform
+        let platform = crate::setup::detect_platform();
+        if let Some(reason) = Self::microvm_unavailable(&self.registry, &platform) {
+            bail!("{reason}. Cannot launch capsule '{name}'.");
+        }
         // VM path — hard require KVM
         if !elastos_crosvm::is_supported() {
             bail!("/dev/kvm not available — crosvm requires KVM. Cannot launch capsule '{name}'.");
@@ -1458,51 +1471,53 @@ impl Supervisor {
 
     /// Download an external tool (kubo, cloudflared, etc.) by name.
     async fn download_external(&self, name: &str, platform: &str) -> Result<PathBuf> {
-        let component = self
-            .registry
-            .external
-            .get(name)
-            .with_context(|| format!("external component '{name}' not in registry"))?;
-
-        let platform_info = component
-            .platforms
-            .get(platform)
-            .or_else(|| component.platforms.get("*"))
-            .with_context(|| format!("no platform '{platform}' for '{name}'"))?;
-
-        let install_path = platform_info
-            .install_path
-            .as_deref()
-            .or(component.install_path.as_deref())
-            .with_context(|| format!("no install_path for '{name}'"))?;
-
-        let dest = self.data_dir.join(install_path);
+        let row =
+            |registry: &'_ ComponentsManifest| -> Result<(crate::setup::PlatformInfo, PathBuf)> {
+                let component = registry
+                    .external
+                    .get(name)
+                    .with_context(|| format!("external component '{name}' not in registry"))?;
+                let platform_info = component
+                    .platforms
+                    .get(platform)
+                    .or_else(|| component.platforms.get("*"))
+                    .with_context(|| format!("no platform '{platform}' for '{name}'"))?;
+                let install_path = platform_info
+                    .install_path
+                    .as_deref()
+                    .or(component.install_path.as_deref())
+                    .with_context(|| format!("no install_path for '{name}'"))?;
+                Ok((platform_info.clone(), self.data_dir.join(install_path)))
+            };
 
         // Already installed?
+        let (_, dest) = row(&self.registry)?;
         if dest.is_file() {
             return Ok(dest);
         }
 
-        if platform_info.release_path.is_some() {
-            crate::setup::install_first_party_component_via_carrier(
+        // On a Home with a signed release, the row comes from that release after
+        // its capsule records are admitted, and the writer is held until it is written.
+        let admitted = crate::setup::admit_installed_components(
+            &self.data_dir,
+            crate::setup::FirstPartyCarrierContext::Runtime,
+        )?;
+        let (platform_info, dest) = row(admitted
+            .as_ref()
+            .map_or(&self.registry, |admitted| &admitted.manifest))?;
+        crate::setup::install_first_party_component_via_carrier(
+            &self.data_dir,
+            &crate::setup::admitted_row(
                 &self.data_dir,
+                admitted.as_ref(),
+                &self.registry,
                 name,
-                platform_info,
-                &dest,
-                crate::setup::FirstPartyCarrierContext::Runtime,
-            )
-            .await?;
-            return Ok(dest);
-        }
-
-        let url = platform_info
-            .url
-            .as_deref()
-            .with_context(|| format!("no URL for '{name}' on '{platform}'"))?;
-
-        // Download using existing setup infrastructure
-        crate::setup::run_download(name, url, platform_info, &dest).await?;
-
+                &platform_info,
+            )?,
+            &dest,
+            crate::setup::FirstPartyCarrierContext::Runtime,
+        )
+        .await?;
         Ok(dest)
     }
 
@@ -1568,6 +1583,30 @@ impl Supervisor {
 
         Ok(listen_addr)
     }
+}
+
+/// The published registry entry `name`.
+fn registry_entry<'a>(registry: &'a ComponentsManifest, name: &str) -> Result<&'a CapsuleEntry> {
+    let entry = registry
+        .capsules
+        .get(name)
+        .with_context(|| format!("capsule '{name}' not in registry"))?;
+    if entry.cid.is_empty() {
+        bail!("capsule '{name}' has no CID in registry (not yet published)");
+    }
+    Ok(entry)
+}
+
+/// The cached capsule at `dir` holds exactly `entry`'s bytes.
+fn cached_capsule_matches(dir: &Path, entry: &CapsuleEntry) -> bool {
+    if !dir.join("capsule.json").is_file() {
+        return false;
+    }
+    let cached_cid = std::fs::read_to_string(dir.join(CACHED_CID_FILE))
+        .map(|cid| cid.trim().to_string())
+        .unwrap_or_default();
+    let cached_sha = read_artifact_sha256_receipt(dir).unwrap_or_default();
+    cached_cid == entry.cid && (entry.sha256.is_empty() || cached_sha == entry.sha256)
 }
 
 #[cfg(test)]
@@ -1665,6 +1704,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external: std::collections::HashMap::new(),
                 capsules,
                 profiles: std::collections::HashMap::new(),
@@ -1695,6 +1735,99 @@ mod tests {
                 assert_eq!(platform, "linux-amd64");
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn on_demand_chat_home_launch_uses_carrier_and_refuses_checksum_mismatch() {
+        let capsule = include_bytes!("../../../../capsules/chat-room/capsule.json");
+        let page = b"<!doctype html><title>Chat fixture</title>";
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut archive = tar::Builder::new(encoder);
+        for (path, bytes) in [
+            ("chat-room/capsule.json", capsule.as_slice()),
+            ("chat-room/browser/index.html", page.as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, bytes).unwrap();
+        }
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+
+        for mismatch in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path();
+            let (server, serving, mut info) =
+                crate::setup::tests::carrier_component_download_fixture(
+                    data,
+                    "chat-room.tar.gz",
+                    bytes.clone(),
+                )
+                .await;
+            info.extract_path = Some("chat-room".into());
+            info.install_path = Some("capsules/chat-room".into());
+            if mismatch {
+                info.checksum = Some(format!("sha256:{}", "0".repeat(64)));
+            }
+            let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
+                "external": {"chat-room": {
+                    "install_path": "capsules/chat-room", "platforms": {"*": info}
+                }},
+                "capsules": {"chat-room": {
+                    "cid": info.cid, "size": bytes.len(),
+                    "sha256": info.checksum.as_deref().unwrap().strip_prefix("sha256:").unwrap()
+                }},
+                "profiles": {"home": {"components": []}}
+            }))
+            .unwrap();
+            let registry_path = data.join("components.json");
+            let registry_bytes = serde_json::to_vec(&manifest).unwrap();
+            std::fs::write(&registry_path, &registry_bytes).unwrap();
+            let supervisor = Supervisor::new(data.to_path_buf(), manifest);
+            let dest = data.join("capsules/chat-room");
+
+            let result =
+                crate::setup::ensure_capsule_component_for_home_launch(data, "chat-room").await;
+            server.close().await;
+            serving.await.unwrap();
+
+            assert_eq!(std::fs::read(&registry_path).unwrap(), registry_bytes);
+            if mismatch {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("Checksum mismatch for chat-room"), "{error}");
+                assert!(
+                    !dest.parent().unwrap().exists(),
+                    "refusal left a partial install"
+                );
+            } else {
+                assert_eq!(result.unwrap().status, "materialized");
+                assert_eq!(std::fs::read(dest.join("capsule.json")).unwrap(), capsule);
+                assert_eq!(
+                    std::fs::read(dest.join("browser/index.html")).unwrap(),
+                    page
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dest.join(CACHED_CID_FILE))
+                        .unwrap()
+                        .trim(),
+                    info.cid.as_deref().unwrap()
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dest.join(CACHED_ARTIFACT_SHA_FILE))
+                        .unwrap()
+                        .trim(),
+                    hex::encode(sha2::Sha256::digest(&bytes))
+                );
+                // A second open uses the verified package even with Carrier stopped.
+                let ensure =
+                    crate::setup::ensure_capsule_component_for_home_launch(data, "chat-room")
+                        .await
+                        .unwrap();
+                assert_eq!(ensure.status, "installed");
+                assert_eq!(supervisor.ensure_capsule("chat-room").await.unwrap(), dest);
+            }
         }
     }
 
@@ -1866,6 +1999,7 @@ mod tests {
             tempfile::tempdir().unwrap().keep(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external: std::collections::HashMap::new(),
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -2014,6 +2148,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external,
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -2070,6 +2205,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external,
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -2114,6 +2250,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external,
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
@@ -2126,6 +2263,40 @@ mod tests {
         assert!(err
             .to_string()
             .contains("refusing to launch capsule with unverified host artifact 'crosvm'"));
+    }
+
+    #[test]
+    fn test_microvm_unavailable_when_release_publishes_no_vm_platform() {
+        let manifest = |crosvm: serde_json::Value| -> ComponentsManifest {
+            serde_json::from_value(serde_json::json!({
+                "external": {
+                    "crosvm": {"install_path": "bin/crosvm", "platforms": crosvm},
+                    "vmlinux": {"install_path": "bin/vmlinux", "platforms": {
+                        "linux-amd64": {"release_path": "vmlinux-linux-amd64"}
+                    }}
+                },
+                "profiles": {}
+            }))
+            .unwrap()
+        };
+        let reason =
+            Supervisor::microvm_unavailable(&manifest(serde_json::json!({})), "linux-amd64")
+                .unwrap();
+        assert_eq!(
+            reason,
+            "microVM capsules are not available on linux-amd64 in this release \
+             (crosvm is not published for it)"
+        );
+        let published = manifest(serde_json::json!({
+            "linux-amd64": {"release_path": "crosvm-linux-amd64"}
+        }));
+        assert_eq!(
+            Supervisor::microvm_unavailable(&published, "linux-amd64"),
+            None
+        );
+        assert!(Supervisor::microvm_unavailable(&published, "linux-arm64")
+            .unwrap()
+            .contains("not available on linux-arm64"));
     }
 
     #[test]
@@ -2147,7 +2318,7 @@ mod tests {
             "carrier-service".to_string(),
             CapsuleEntry {
                 cid: "bafy-test-cid".to_string(),
-                sha256: "sha256:test-artifact".to_string(),
+                sha256: "test-artifact".to_string(),
                 size: 0,
                 repository: None,
                 platforms: vec![],
@@ -2158,6 +2329,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external: std::collections::HashMap::new(),
                 capsules,
                 profiles: std::collections::HashMap::new(),
@@ -2192,7 +2364,7 @@ mod tests {
             "carrier-service".to_string(),
             CapsuleEntry {
                 cid: "bafy-test-cid".to_string(),
-                sha256: "sha256:test-artifact".to_string(),
+                sha256: "test-artifact".to_string(),
                 size: 0,
                 repository: None,
                 platforms: vec![],
@@ -2203,6 +2375,7 @@ mod tests {
             data_dir.to_path_buf(),
             ComponentsManifest {
                 model_catalog: None,
+                collaboration_network: None,
                 external: std::collections::HashMap::new(),
                 capsules,
                 profiles: std::collections::HashMap::new(),
@@ -2256,6 +2429,97 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("kubo not found"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signed_home_supervisor_admits_records_before_any_acquisition() {
+        let root = tempfile::tempdir().unwrap();
+        // The installed signed release lists records and also a registry capsule.
+        std::fs::write(
+            root.path().join("components.json"),
+            serde_json::to_vec(&serde_json::json!({"external": {}, "profiles": {},
+                "capsules": {"fixture-app": {"cid": TEST_SUPERVISOR_CID,
+                    "sha256": "1".repeat(64), "size": 1}}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (server, serving, bundle) =
+            crate::setup::tests::signed_engine_fixture(root.path(), "record-size").await;
+        let data = root.path().canonicalize().unwrap();
+        let registry: ComponentsManifest =
+            serde_json::from_slice(&std::fs::read(data.join("components.json")).unwrap()).unwrap();
+        let supervisor = Supervisor::new(data.clone(), registry);
+        // Neither a registry capsule nor an external tool is fetched or written.
+        let error = supervisor.ensure_capsule("fixture-app").await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("capsule registry must be empty"),
+            "{error:#}"
+        );
+        assert!(!data.join("capsules/fixture-app").exists());
+        let error = supervisor
+            .download_external("llama-server", &crate::setup::detect_platform())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("capsule registry must be empty"),
+            "{error:#}"
+        );
+        assert!(!bundle.exists());
+        server.close().await;
+        assert_eq!(serving.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn capsule_refresh_keeps_the_old_cache_until_new_bytes_verify() {
+        use sha2::Digest;
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(2);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "capsule.json", &b"{}"[..])
+            .unwrap();
+        let archive = builder.into_inner().unwrap().finish().unwrap();
+        let entry: CapsuleEntry = serde_json::from_value(serde_json::json!({
+            "cid": TEST_SUPERVISOR_CID, "size": archive.len(),
+            "sha256": hex::encode(sha2::Sha256::digest(&archive)),
+        }))
+        .unwrap();
+        let data = tempfile::tempdir().unwrap().keep();
+        let registry = ComponentsManifest {
+            model_catalog: None,
+            collaboration_network: None,
+            external: std::collections::HashMap::new(),
+            capsules: std::collections::HashMap::from([("fixture-app".to_string(), entry)]),
+            profiles: std::collections::HashMap::new(),
+        };
+        let cache = data.join("capsules/fixture-app");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("capsule.json"), b"previous").unwrap();
+        std::fs::write(cache.join(CACHED_CID_FILE), b"previous-cid\n").unwrap();
+        for (served, accepted) in [(b"tampered archive".to_vec(), false), (archive, true)] {
+            let provider = registry_with_content_provider(serde_json::json!({
+                "status": "ok",
+                "data": {"data": base64::engine::general_purpose::STANDARD.encode(&served)}
+            }))
+            .await;
+            let mut supervisor = Supervisor::new(data.clone(), registry.clone());
+            supervisor.set_provider_registry(provider);
+            let result = supervisor.ensure_capsule("fixture-app").await;
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+            let installed = std::fs::read(cache.join("capsule.json")).unwrap();
+            assert_eq!(
+                installed,
+                if accepted {
+                    &b"{}"[..]
+                } else {
+                    &b"previous"[..]
+                }
+            );
+        }
     }
 
     #[tokio::test]
