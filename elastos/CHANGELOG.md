@@ -62,6 +62,13 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   `ci-release-policy-test.py` checks they use the same runner, Rust toolchain
   and targets, and that the job's path filter covers every file the build
   calls, loads or packages.
+- The source gate refuses a file deletion added to product code unless it
+  goes through the owned-removal helper of its language (exact path below an
+  owned folder however the folder is spelled, no link followed, every removal
+  relative to a held folder descriptor, optional device+inode check) or
+  carries a `removal-ok: <reason>` comment. Strings and comments that mention
+  a deletion pass; import aliases, quoted `rm` and wrappers such as `sudo` or
+  `xargs` count. Browser host retirement now uses the Rust helper.
 
 ## [0.8.0] - 2026-10-15
 

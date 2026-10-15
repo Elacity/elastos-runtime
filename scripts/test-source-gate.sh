@@ -3,7 +3,7 @@
 # this file, so a failure shows locally before it shows in CI.
 #   test-source-gate.sh           runs every section
 #   test-source-gate.sh SECTION   runs one section (CI names one per step):
-#                                 product-data, prepush, product-ui, release
+#                                 product-data, prepush, removal, product-ui, release
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,6 +13,13 @@ product_data() {
 
 prepush() {
   python3 scripts/ci-local-prepush-test.py
+}
+
+# Deletion added since the base uses the owned-removal helper of its language
+# or a removal-ok marker; CI passes the pull request's base.
+removal() {
+  python3 scripts/removal-guard-test.py
+  python3 scripts/removal-guard.py --base "${REMOVAL_GUARD_BASE:-origin/develop}"
 }
 
 product_ui() {
@@ -42,8 +49,9 @@ release() {
 case "${1:-all}" in
   product-data) product_data ;;
   prepush) prepush ;;
+  removal) removal ;;
   product-ui) product_ui ;;
   release) release ;;
-  all) product_data; prepush; product_ui; release ;;
-  *) echo "usage: $0 [product-data|prepush|product-ui|release]" >&2; exit 2 ;;
+  all) product_data; prepush; removal; product_ui; release ;;
+  *) echo "usage: $0 [product-data|prepush|removal|product-ui|release]" >&2; exit 2 ;;
 esac
