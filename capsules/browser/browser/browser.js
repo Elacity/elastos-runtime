@@ -28,7 +28,7 @@ import {
   requestedDisplayMode,
 } from "./browser-status.js?v=browser-20260907c";
 import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260915d";
-import { engineChoiceHidden, renderServiceSelection } from "./browser-service-selection.js?v=browser-20261014a";
+import { engineChoiceHidden, renderServiceSelection } from "./browser-service-selection.js?v=browser-20261015a";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;

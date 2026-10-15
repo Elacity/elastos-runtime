@@ -271,12 +271,34 @@ pub fn publish_runtime_owned_presence(
     >,
     now: u64,
 ) -> anyhow::Result<usize> {
+    let pass = publish_runtime_owned_presence_pass(data_dir, port, discovery_service, now);
+    // History says "Discovery is off" only after a pass that read every
+    // person's switch and found it off; any error leaves it unknown.
+    port.record_local_publication(match &pass {
+        Ok((published, _)) if *published > 0 => Some(true),
+        Ok((_, true)) => Some(false),
+        _ => None,
+    });
+    pass.map(|(published, _)| published)
+}
+
+/// Returns how many people were announced and whether Discovery was read as
+/// off for everyone else.
+fn publish_runtime_owned_presence_pass(
+    data_dir: &std::path::Path,
+    port: &crate::collaboration_presence::CollaborationPresenceProductPort,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+    now: u64,
+) -> anyhow::Result<(usize, bool)> {
     if discovery_service.is_some_and(|service| !service.community_joined()) {
-        return Ok(0);
+        return Ok((0, false));
     }
     let local_device_did =
         crate::collaboration_profile_authority::load_existing_device_did(data_dir)?;
     let mut published = 0usize;
+    let mut confirmed_off = true;
     for principal in crate::auth::active_passkey_principals(data_dir)? {
         let localhost_root = crate::auth::principal_localhost_root(&principal.principal_id);
         let Some(profile) = crate::collaboration_profile_authority::load_profile_authority(
@@ -295,14 +317,19 @@ pub fn publish_runtime_owned_presence(
         // up, not only while someone is looking at it — so it must obey the
         // switch the person actually set. A Home whose owner has Discovery
         // off says nothing, exactly as they asked.
-        if !presence_opted_in(
+        match presence_opt_in(
             data_dir,
             discovery_service,
             &principal.principal_id,
             &profile,
             local_device_did.as_deref(),
         ) {
-            continue;
+            Some(true) => {}
+            Some(false) => continue,
+            None => {
+                confirmed_off = false;
+                continue;
+            }
         }
         let presentation = AuthenticatedPresencePresentation {
             principal_id: principal.principal_id.clone(),
@@ -321,7 +348,7 @@ pub fn publish_runtime_owned_presence(
         port.prepare_presence(operation, &presentation.profile, now)?;
         published = published.saturating_add(1);
     }
-    Ok(published)
+    Ok((published, confirmed_off))
 }
 
 /// Has this person opted in to being announced? Presence rides the same
@@ -341,24 +368,40 @@ fn presence_opted_in(
     profile: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
     local_device_did: Option<&str>,
 ) -> bool {
-    let (Some(service), Some(device_did)) = (discovery_service, local_device_did) else {
-        return false;
-    };
+    presence_opt_in(
+        data_dir,
+        discovery_service,
+        principal_id,
+        profile,
+        local_device_did,
+    ) == Some(true)
+}
+
+/// The person's Discovery switch: `None` when it cannot be read.
+fn presence_opt_in(
+    data_dir: &std::path::Path,
+    discovery_service: Option<
+        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    >,
+    principal_id: &str,
+    profile: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+    local_device_did: Option<&str>,
+) -> Option<bool> {
+    let (service, device_did) = (discovery_service?, local_device_did?);
     if !service.community_joined() {
-        return false;
+        return Some(false);
     }
     let localhost_root = crate::auth::principal_localhost_root(principal_id);
-    let Ok(store) = crate::collaboration_contact_store::CollaborationContactStore::new(
+    let store = crate::collaboration_contact_store::CollaborationContactStore::new(
         data_dir,
         principal_id,
         &localhost_root,
         service.network_profile(),
         profile,
         device_did,
-    ) else {
-        return false;
-    };
-    store.discovery_enabled().unwrap_or(false)
+    )
+    .ok()?;
+    store.discovery_enabled().ok()
 }
 
 fn presence_heartbeat_request_id(
@@ -660,6 +703,32 @@ mod tests {
             ),
             "no device identity means no announcement, not an assumed yes"
         );
+
+        // History learns "Discovery is off" from the Runtime publisher only
+        // when the switch was read as off; unreadable stays unknown.
+        let chat_root = tempfile::tempdir().unwrap();
+        let chat = crate::collaboration_product::test_chat_product_port(
+            chat_root.path(),
+            NETWORK,
+            "community",
+        );
+        let port = crate::collaboration_presence::CollaborationPresenceProductPort::new(
+            chat.test_core().clone(),
+        )
+        .unwrap();
+        let now = crate::auth::now_ts();
+        assert_eq!(port.local_publication(), None);
+        assert_eq!(
+            publish_runtime_owned_presence(temp.path(), &port, Some(&discovery_service), now)
+                .unwrap(),
+            0
+        );
+        assert_eq!(port.local_publication(), Some(false));
+        assert_eq!(
+            publish_runtime_owned_presence(temp.path(), &port, None, now).unwrap(),
+            0
+        );
+        assert_eq!(port.local_publication(), None);
 
         // The person opens People and switches Discovery on. Only now does
         // the Runtime speak for them.

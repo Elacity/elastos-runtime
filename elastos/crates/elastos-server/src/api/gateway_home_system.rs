@@ -5297,33 +5297,20 @@ pub(super) async fn home_events_stream(
         cursor: String::new(),
     };
     let stream = futures_lite::stream::unfold(stream_state, |mut stream_state| async move {
-        loop {
-            let snapshot = home_realtime_snapshot(
-                &stream_state.state,
-                &stream_state.context,
-                &stream_state.authority,
-            )
-            .await;
-            let cursor = home_realtime_cursor(&snapshot);
-            if stream_state.cursor.is_empty() {
-                stream_state.cursor = cursor;
-            } else if cursor != stream_state.cursor {
-                let events = home_realtime_events(&stream_state.cursor, &snapshot);
-                stream_state.cursor = cursor.clone();
-                let response = HomeEventsResponse {
-                    schema: HOME_EVENTS_SCHEMA.to_string(),
-                    cursor,
-                    keepalive: false,
-                    retry_after_ms: HOME_EVENTS_RETRY_MS,
-                    events,
-                };
-                return Some((
-                    Ok::<SseEvent, Infallible>(home_events_sse_event(response)),
-                    stream_state,
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(HOME_EVENTS_POLL_MS)).await;
-        }
+        let HomeEventsStreamState {
+            state,
+            context,
+            authority,
+            cursor,
+        } = &mut stream_state;
+        let response = next_home_events_stream_response(cursor, || {
+            home_realtime_snapshot(state, context, authority)
+        })
+        .await;
+        Some((
+            Ok::<SseEvent, Infallible>(home_events_sse_event(response)),
+            stream_state,
+        ))
     });
 
     let mut response = Sse::new(stream)
@@ -5343,6 +5330,38 @@ pub(super) async fn home_events_stream(
         axum::http::HeaderValue::from_static("no"),
     );
     response
+}
+
+/// Waits one poll interval before every snapshot after the first, so a
+/// snapshot that changes on every call cannot turn the stream into a busy loop.
+async fn next_home_events_stream_response<F, Fut>(
+    cursor: &mut String,
+    mut take_snapshot: F,
+) -> HomeEventsResponse
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = HomeRealtimeSnapshot>,
+{
+    loop {
+        if !cursor.is_empty() {
+            tokio::time::sleep(Duration::from_millis(HOME_EVENTS_POLL_MS)).await;
+        }
+        let snapshot = take_snapshot().await;
+        let next = home_realtime_cursor(&snapshot);
+        if cursor.is_empty() {
+            *cursor = next;
+        } else if next != *cursor {
+            let events = home_realtime_events(cursor, &snapshot);
+            *cursor = next.clone();
+            return HomeEventsResponse {
+                schema: HOME_EVENTS_SCHEMA.to_string(),
+                cursor: next,
+                keepalive: false,
+                retry_after_ms: HOME_EVENTS_RETRY_MS,
+                events,
+            };
+        }
+    }
 }
 
 struct HomeEventsStreamState {
@@ -5566,12 +5585,35 @@ fn home_realtime_cursor_parts(snapshot: &HomeRealtimeSnapshot) -> HomeRealtimeCu
             snapshot.capability_request_count,
         )),
         wallet: stable_cursor_hash(&snapshot.wallet_request_signature),
-        browser: stable_cursor_hash(&snapshot.browser_sessions),
+        browser: stable_cursor_hash(&browser_sessions_cursor_value(&snapshot.browser_sessions)),
         desktop: stable_cursor_hash(&snapshot.desktop_signature),
         chat_room: stable_cursor_hash(&snapshot.room_signature),
         people: stable_cursor_hash(&snapshot.people_signature),
         services: stable_cursor_hash(&snapshot.services_signature),
     }
+}
+
+/// Session fields that change with the clock, not with the session. Hashing
+/// them made `browser.sessions.changed` fire on every poll.
+const BROWSER_SESSION_CLOCK_FIELDS: [&str; 3] =
+    ["age_ms", "pending_launch_age_ms", "last_frame_at"];
+
+fn browser_sessions_cursor_value(status: &serde_json::Value) -> serde_json::Value {
+    let mut status = status.clone();
+    if let Some(sessions) = status
+        .pointer_mut("/lifecycle/sessions")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for session in sessions
+            .iter_mut()
+            .filter_map(serde_json::Value::as_object_mut)
+        {
+            for field in BROWSER_SESSION_CLOCK_FIELDS {
+                session.remove(field);
+            }
+        }
+    }
+    status
 }
 
 fn stable_cursor_hash<T: Serialize>(value: &T) -> String {
@@ -8606,5 +8648,90 @@ mod home_catalogue_snapshot_tests {
             .unwrap()
             .active
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod home_events_pacing_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn snapshot_with_browser_session(session: serde_json::Value) -> HomeRealtimeSnapshot {
+        HomeRealtimeSnapshot {
+            principal_id: "person:local:test".to_string(),
+            runtime_signature: String::new(),
+            recovery_readiness: RecoveryReadinessSummary::unavailable(),
+            profile_readiness: ProfileReadinessSummary::setup_required(),
+            notification_signature: Vec::new(),
+            wallet_request_signature: Vec::new(),
+            capability_request_count: 0,
+            desktop_signature: Vec::new(),
+            room_signature: String::new(),
+            people_signature: Vec::new(),
+            services_signature: Vec::new(),
+            browser_sessions: serde_json::json!({
+                "schema": "elastos.browser.session-capacity/v1",
+                "total_sessions": 1,
+                // Shape of browser_gateway_session_status.
+                "lifecycle": {
+                    "schema": "elastos.browser.lifecycle-status/v1",
+                    "sessions": [session],
+                },
+            }),
+        }
+    }
+
+    fn browser_session(phase: &str, age_ms: u64) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "session-hash",
+            "phase": phase,
+            "started_at": 1_000,
+            "age_ms": age_ms,
+            "last_frame_at": 1_000 + age_ms,
+            "pending_launch_age_ms": age_ms,
+        })
+    }
+
+    #[test]
+    fn browser_session_clock_fields_do_not_change_the_cursor() {
+        let earlier = snapshot_with_browser_session(browser_session("active", 10));
+        let later = snapshot_with_browser_session(browser_session("active", 9_000));
+        assert_eq!(home_realtime_cursor(&earlier), home_realtime_cursor(&later));
+
+        let closing = snapshot_with_browser_session(browser_session("closing", 9_000));
+        let events = home_realtime_events(&home_realtime_cursor(&earlier), &closing);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "browser.sessions.changed"),
+            "a real session change must still emit a browser event"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_takes_at_most_one_snapshot_per_second_while_sessions_change() {
+        let snapshots = AtomicU32::new(0);
+        let take_snapshot = || {
+            // Every snapshot differs, as a live Browser session's did before.
+            let n = snapshots.fetch_add(1, Ordering::SeqCst);
+            let phase = if n.is_multiple_of(2) {
+                "active"
+            } else {
+                "launching"
+            };
+            std::future::ready(snapshot_with_browser_session(browser_session(phase, 0)))
+        };
+        let start = tokio::time::Instant::now();
+        let mut cursor = String::new();
+        for _ in 0..5 {
+            let response = next_home_events_stream_response(&mut cursor, take_snapshot).await;
+            assert!(!response.events.is_empty());
+            let elapsed_secs = u32::try_from(start.elapsed().as_secs()).unwrap();
+            assert!(
+                snapshots.load(Ordering::SeqCst) <= elapsed_secs + 1,
+                "{} snapshots in {elapsed_secs} s",
+                snapshots.load(Ordering::SeqCst)
+            );
+        }
     }
 }

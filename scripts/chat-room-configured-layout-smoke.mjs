@@ -789,14 +789,14 @@ async function runScenario(scenario) {
       // Accepted uses the ordinary time label. The peer row has the same
       // timestamp, so compare rendered UI without duplicating its formatter.
       const acceptedLabel = await frame.locator('#message-list [data-seq="2"] .message-meta span:last-child').innerText();
-      assert(acceptedLabel && !/Sending|Expired|Delivery unknown/.test(acceptedLabel),
+      assert(acceptedLabel && !/Sending|Delivery unconfirmed|Delivery unknown/.test(acceptedLabel),
         "peer row does not provide an ordinary accepted time label", acceptedLabel);
       assert(sending.snapshot.own_delivery[0].state === "sending" && !sending.released,
         "Sending response was not captured before the newer delivery evidence");
       trace.communityDeliveryState = "expired";
       await notifyChatRuntime(page);
       await frame.waitForFunction(() =>
-        document.querySelector('#message-list [data-seq="1"] .message-meta span:last-child')?.textContent === "Expired");
+        document.querySelector('#message-list [data-seq="1"] .message-meta span:last-child')?.textContent === "Delivery unconfirmed");
       trace.communityHoldExpired = true;
       await notifyChatRuntime(page);
       await waitFor(() => expired.reached);
@@ -961,13 +961,13 @@ async function runScenario(scenario) {
         && await own.locator(".message-meta span:first-child").innerText() === "You",
         "initial own Community message or author differs");
       const otherMeta = await other.locator(".message-meta").innerText();
-      assert(otherMeta.includes("Fixture Friend") && !/Sending|Expired/.test(otherMeta),
+      assert(otherMeta.includes("Fixture Friend") && !/Sending|Delivery unconfirmed/.test(otherMeta),
         "another person's Community row acquired an own delivery label");
       const draft = "Keep this draft while the own message expires";
       await frame.locator("#message-input").fill(draft);
       trace.communityDeliveryState = "expired";
       await frame.waitForFunction(() =>
-        document.querySelector('#message-list [data-seq="1"] .message-meta span:last-child')?.textContent === "Expired");
+        document.querySelector('#message-list [data-seq="1"] .message-meta span:last-child')?.textContent === "Delivery unconfirmed");
       assert(trace.communityDeliveryPolls.some(poll => poll.state === "expired"
         && poll.since === 2 && poll.latest_seq === 2 && poll.object_count === 0),
         "Expired was not observed through a status-only poll at the existing sequence", trace.communityDeliveryPolls);

@@ -1233,6 +1233,59 @@ function paintUserMessageBody(body, text, { parts = null, modelText = "" } = {})
   }
 }
 
+const MSG_ACTION_ICONS = {
+  copy: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.8A1.7 1.7 0 0 0 8.8 1H3.7A1.7 1.7 0 0 0 2 2.7v5.1a1.7 1.7 0 0 0 1.7 1.7h.8"/></svg>`,
+  edit: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.7 1.7 0 0 1 2 2L5 13l-2.6.6L3 11l8.5-8.5Z"/></svg>`,
+  regen: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 6.5A5.5 5.5 0 1 0 14 9.5"/><path d="M13.5 2.5v4h-4"/></svg>`,
+  trash: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M6.5 2h3M4 4l.6 8.6A1.6 1.6 0 0 0 6.2 14h3.6a1.6 1.6 0 0 0 1.6-1.4L12 4"/></svg>`,
+};
+
+function makeMsgAction(svg, label, extra = "") {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = `agent-msg-action${extra ? ` ${extra}` : ""}`;
+  btn.innerHTML = svg;
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  return btn;
+}
+
+function makeDeleteAction() {
+  const del = makeMsgAction(MSG_ACTION_ICONS.trash, "Delete", "is-danger");
+  del.dataset.deleteMessage = "1";
+  del.disabled = Boolean(ctx.turnBusy);
+  return del;
+}
+
+/* A reply that has just finished streaming gets what a redrawn one has: the
+   index of the message it was saved as, Regenerate enabled and Delete. Call
+   after commitAgentReply stored it as the session's last message. */
+function settleStreamedReply(row, session) {
+  if (!row?.isConnected) {
+    return;
+  }
+  const regen = row.querySelector("[data-regenerate]");
+  if (regen) {
+    regen.disabled = false;
+  }
+  const index = (session?.messages?.length ?? 0) - 1;
+  if (session?.messages?.[index]?.role !== "agent") {
+    return;
+  }
+  /* A resumed partial was drawn before this row; the message now holds this
+     row's text, so the stale row would answer to the same index. */
+  for (const stale of host.streamEl()?.querySelectorAll(`.agent-msg[data-msg-index="${index}"]`) || []) {
+    if (stale !== row) stale.remove();
+  }
+  row.dataset.msgIndex = String(index);
+  const actions = row.querySelector(".agent-msg-actions");
+  if (actions && !actions.querySelector("[data-delete-message]")) {
+    const del = makeDeleteAction();
+    del.disabled = false;
+    actions.append(del);
+  }
+}
+
 export function appendMessage(
   role,
   text,
@@ -1265,41 +1318,23 @@ export function appendMessage(
 
   const actions = document.createElement("div");
   actions.className = "agent-msg-actions";
-  const makeIcon = (svg, label, extra = "") => {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = `agent-msg-action${extra ? ` ${extra}` : ""}`;
-    btn.innerHTML = svg;
-    btn.title = label;
-    btn.setAttribute("aria-label", label);
-    return btn;
-  };
-  const ICONS = {
-    copy: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.8A1.7 1.7 0 0 0 8.8 1H3.7A1.7 1.7 0 0 0 2 2.7v5.1a1.7 1.7 0 0 0 1.7 1.7h.8"/></svg>`,
-    edit: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.7 1.7 0 0 1 2 2L5 13l-2.6.6L3 11l8.5-8.5Z"/></svg>`,
-    regen: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 6.5A5.5 5.5 0 1 0 14 9.5"/><path d="M13.5 2.5v4h-4"/></svg>`,
-    trash: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M6.5 2h3M4 4l.6 8.6A1.6 1.6 0 0 0 6.2 14h3.6a1.6 1.6 0 0 0 1.6-1.4L12 4"/></svg>`,
-  };
-  const copyBtn = makeIcon(ICONS.copy, "Copy");
+  const copyBtn = makeMsgAction(MSG_ACTION_ICONS.copy, "Copy");
   copyBtn.dataset.copyMessage = "1";
   actions.append(copyBtn);
   if (role === "user" && !streaming) {
-    const edit = makeIcon(ICONS.edit, "Edit and resubmit");
+    const edit = makeMsgAction(MSG_ACTION_ICONS.edit, "Edit and resubmit");
     edit.dataset.editMessage = "1";
     edit.disabled = Boolean(ctx.turnBusy);
     actions.append(edit);
   }
   if (role === "agent") {
-    const regen = makeIcon(ICONS.regen, "Regenerate reply");
+    const regen = makeMsgAction(MSG_ACTION_ICONS.regen, "Regenerate reply");
     regen.dataset.regenerate = "1";
     regen.disabled = streaming || Boolean(ctx.turnBusy);
     actions.append(regen);
   }
   if (!streaming) {
-    const del = makeIcon(ICONS.trash, "Delete", "is-danger");
-    del.dataset.deleteMessage = "1";
-    del.disabled = Boolean(ctx.turnBusy);
-    actions.append(del);
+    actions.append(makeDeleteAction());
   }
 
   if (!streaming) {
@@ -2609,6 +2644,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       const partial = materializeCanonical();
       commitAgentReply(session, partial.answer, partial.reasoning, { partial: true, turn: result.turnManifest });
       answerRow?.classList.remove("is-streaming");
+      settleStreamedReply(answerRow, session);
       if (result.stopRequested && result.settlementUnknown) {
         /* Local engines cannot confirm a stop; the turn keeps its unknown state. */
         progress.dispatch({ type: "GENERATION_STOPPED" });
@@ -2640,6 +2676,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
         progressEl?.remove();
         answerRow?.remove();
       }
+      settleStreamedReply(answerRow, session);
       if (session && result.turnManifest) {
         liveTurn = result.turnManifest;
         session.lastTurn = cheapTurnSnapshot(liveTurn);
@@ -2825,10 +2862,6 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       }
     };
     scheduleIdleWork(finalize);
-    const regen = answerRow?.querySelector("[data-regenerate]");
-    if (regen) {
-      regen.disabled = false;
-    }
 
     const turnUsage = noteLiveTurnUsage({
       usage: result.usage || null,
@@ -2859,6 +2892,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
         session.lastTurn = cheapTurnSnapshot(liveTurn);
       }
     }
+    settleStreamedReply(answerRow, session);
     if (stoppedEarly && answerRow && !answerRow.querySelector(".agent-msg-stopped")) {
       const note = document.createElement("div");
       note.className = "agent-msg-stopped";
@@ -2907,6 +2941,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     }
     if (partialAnswer) {
       persistPartialAgentReply(partialAnswer, partialThinking);
+      settleStreamedReply(answerRow, session);
       answerRow?.classList.remove("is-streaming");
       if (answerBody) {
         answerBody.dataset.mdSource = partialAnswer;

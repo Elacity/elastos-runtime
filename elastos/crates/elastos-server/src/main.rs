@@ -1219,6 +1219,43 @@ impl std::io::Write for ConditionalStderrWriter {
 // Host terminal raw mode — needed for interactive VM serial console
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
+static NOFILE_RAISE: std::sync::OnceLock<Result<(u64, u64), String>> = std::sync::OnceLock::new();
+
+/// macOS refuses a soft RLIMIT_NOFILE above OPEN_MAX (10240) even when the
+/// hard limit reads as unlimited; Linux gets the same sane ceiling.
+#[cfg(unix)]
+const NOFILE_SOFT_CAP: u64 = 10240;
+
+/// New soft limit, or None when the current one is already high enough.
+#[cfg(unix)]
+fn nofile_soft_target(soft: u64, hard: u64, cap: u64) -> Option<u64> {
+    let target = hard.min(cap);
+    (target > soft).then_some(target)
+}
+
+/// Returns (before, after) soft limits.
+#[cfg(unix)]
+fn raise_nofile_soft_limit() -> Result<(u64, u64), String> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit only read and write the struct we own.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let before = limit.rlim_cur;
+    let Some(target) = nofile_soft_target(before, limit.rlim_max, NOFILE_SOFT_CAP) else {
+        return Ok((before, before));
+    };
+    limit.rlim_cur = target;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok((before, target))
+}
+
 fn main() -> anyhow::Result<()> {
     // Ubuntu's default umask 0002 made files a later update refuses as
     // group-writable (#279). Drop group/world write before any thread starts and
@@ -1228,6 +1265,12 @@ fn main() -> anyhow::Result<()> {
         let inherited = libc::umask(0o022);
         libc::umask(inherited | 0o022);
     }
+    // Browser helpers (VZ supervisor, local exit) inherit this; macOS starts
+    // Terminal launches at 256 fds, too few for the 128-session web egress.
+    #[cfg(unix)]
+    let nofile = raise_nofile_soft_limit();
+    #[cfg(unix)]
+    NOFILE_RAISE.set(nofile).ok();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -1293,6 +1336,21 @@ async fn run() -> anyhow::Result<()> {
                 .add_directive("elastos=info".parse().expect("valid tracing directive")),
         )
         .init();
+
+    // Logged once, by the Runtime-starting commands only, to keep CLI output clean.
+    #[cfg(unix)]
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        None | Some("gateway") | Some("home") | Some("serve")
+    ) {
+        match NOFILE_RAISE.get() {
+            Some(Ok((before, after))) => {
+                tracing::info!("open-file soft limit {after} (was {before})")
+            }
+            Some(Err(err)) => tracing::warn!("could not raise open-file limit: {err}"),
+            None => {}
+        }
+    }
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Commands::Home {
@@ -2283,6 +2341,17 @@ pub(crate) async fn create_runtime(
 #[cfg(test)]
 mod tests {
     use super::verify_component_binary_with_data_dir;
+
+    #[cfg(unix)]
+    #[test]
+    fn nofile_soft_target_raises_to_capped_hard_limit() {
+        use super::nofile_soft_target;
+        assert_eq!(nofile_soft_target(256, u64::MAX, 10240), Some(10240));
+        assert_eq!(nofile_soft_target(256, 4096, 10240), Some(4096));
+        assert_eq!(nofile_soft_target(1024, 524288, 10240), Some(10240));
+        assert_eq!(nofile_soft_target(10240, u64::MAX, 10240), None);
+        assert_eq!(nofile_soft_target(65536, 65536, 10240), None);
+    }
     use clap::Parser;
     use sha2::Digest;
     use std::fs;

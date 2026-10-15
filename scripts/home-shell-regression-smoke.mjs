@@ -237,6 +237,14 @@ class FakeElement {
 
   scrollIntoView() {}
 
+  setPointerCapture() {}
+
+  releasePointerCapture() {}
+
+  hasPointerCapture() {
+    return false;
+  }
+
   getBoundingClientRect() {
     if (this.selector === "#desktop") {
       return { left: 0, top: 0, width: 1024, height: 768, right: 1024, bottom: 768 };
@@ -962,8 +970,10 @@ assert(
   "People, Chat, or Inbox reintroduced capsule-owned outer window chrome",
 );
 assert(
-  browserStyle.includes("padding: 8px 10px 8px var(--window-chrome-safe-leading, 96px);"),
-  "Browser no longer applies the Home-owned toolbar content inset",
+  browserStyle.includes("padding: 8px 10px;") &&
+    !browserStyle.includes("--window-chrome-safe-leading") &&
+    !homeGuiStyle.includes("window-chrome-unified-toolbar"),
+  "Browser must sit under the standard draggable Home title bar, without a traffic-light inset",
 );
 assert(
   !homeGuiScript.includes("(label || toolbarFullscreenButton).textContent"),
@@ -1380,8 +1390,7 @@ const expectedWindowChrome = {
     className: "window-chrome-continuous",
   },
   browser: {
-    mode: "unified-toolbar",
-    className: "window-chrome-unified-toolbar",
+    mode: "standard",
   },
 };
 
@@ -1402,6 +1411,26 @@ for (const entry of shellCore.shellState.windows.values()) {
 }
 
 const browserEntry = [...shellCore.shellState.windows.values()].find((entry) => entry.targetId === "browser");
+{
+  const browserHead = browserEntry.node.querySelector(".window-head");
+  browserEntry.node.offsetWidth = 800;
+  browserEntry.node.offsetHeight = 600;
+  browserEntry.node.style.left = "200px";
+  browserEntry.node.style.top = "100px";
+  const leftBefore = browserEntry.node.style.left;
+  const topBefore = browserEntry.node.style.top;
+  browserHead.dispatch("pointerdown", { pointerId: 41, clientX: 400, clientY: 120, target: browserHead });
+  browserHead.dispatch("pointermove", { pointerId: 41, clientX: 460, clientY: 180, target: browserHead });
+  browserHead.dispatch("pointerup", { pointerId: 41, clientX: 460, clientY: 180, target: browserHead });
+  assert(
+    browserEntry.node.dataset.windowChromeMode === "standard" &&
+      !browserEntry.node.classList.contains("window-chrome-unified-toolbar") &&
+      browserEntry.node.style.left === "260px" &&
+      browserEntry.node.style.top === "160px",
+    "Browser window title bar must be a standard Home title bar that drags the window",
+    { left: [leftBefore, browserEntry.node.style.left], top: [topBefore, browserEntry.node.style.top] },
+  );
+}
 const browserClose = browserEntry.node.querySelector("[data-action='close']");
 browserClose.focus();
 shellWindows.minimizeWindow(browserEntry.id);

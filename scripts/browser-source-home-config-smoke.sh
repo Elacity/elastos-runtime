@@ -289,8 +289,8 @@ if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST_TIMEOUT_M
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_READY_TIMEOUT_MS !== "120000") {
   throw new Error("VM adapter must keep the guest control readiness budget bounded");
 }
-if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS !== "16") {
-  throw new Error("VM adapter must bound pre-opened Runtime egress streams while keeping enough slots for Browser pages");
+if ("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS" in (adapter?.supervisor?.env ?? {})) {
+  throw new Error("VM adapter must not configure the egress cap; the supervisor owns fixed web and media caps");
 }
 if (adapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_MAX_ACTIVE_PAGES !== "1") {
   throw new Error("VM adapter must pass the single active Browser VM page contract to the control service");

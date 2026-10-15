@@ -5112,7 +5112,7 @@ fn apply_active_poll_state(
 fn community_delivery_label(state: Option<CommunityDeliveryState>) -> Option<&'static str> {
     match state {
         Some(CommunityDeliveryState::Sending) => Some("Sending"),
-        Some(CommunityDeliveryState::Expired) => Some("Expired"),
+        Some(CommunityDeliveryState::Expired) => Some("Delivery unconfirmed"),
         Some(CommunityDeliveryState::Unknown) => Some("Delivery status unavailable"),
         Some(CommunityDeliveryState::Accepted) | None => None,
     }
@@ -5624,9 +5624,9 @@ mod tests {
         for (delivery, expected, label, changed) in [
             (Unknown, Unknown, Some("Delivery status unavailable"), true),
             (Sending, Sending, Some("Sending"), true),
-            (Expired, Expired, Some("Expired"), true),
-            (Unknown, Expired, Some("Expired"), false),
-            (Sending, Expired, Some("Expired"), false),
+            (Expired, Expired, Some("Delivery unconfirmed"), true),
+            (Unknown, Expired, Some("Delivery unconfirmed"), false),
+            (Sending, Expired, Some("Delivery unconfirmed"), false),
             (Accepted, Accepted, None, true),
             (Expired, Accepted, None, false),
             (Unknown, Accepted, None, false),

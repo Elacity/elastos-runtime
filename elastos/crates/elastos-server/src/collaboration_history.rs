@@ -29,6 +29,10 @@ pub(crate) const MAX_HISTORY_RESPONSE_BYTES: usize = MAX_CONVERSATION_HISTORY_BY
 pub(crate) const MAX_HISTORY_CARRIER_REPLY_BYTES: usize = MAX_HISTORY_RESPONSE_BYTES + 64;
 const MAX_PEERS_PER_PASS: usize = 4;
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
+// History requests carry this Home's own signed presence, which the Runtime
+// publishes only while Discovery is on.
+const DISCOVERY_OFF_DETAIL: &str = "Turn on Discovery in People to load earlier Community posts.";
+const ALONE_DETAIL: &str = "No other members are online right now.";
 
 #[derive(Clone)]
 pub(crate) struct CollaborationHistoryService {
@@ -209,7 +213,15 @@ impl CollaborationHistoryService {
             .iter()
             .find(|peer| peer.endpoint_did == local_endpoint);
         let Some(local) = local else {
-            self.inner.product.set_history_status(false);
+            // Discovery off is a fact only the publisher knows; before its first
+            // pass, or while its presence is still projecting, keep searching.
+            if self.inner.presence.local_publication() == Some(false) {
+                self.inner
+                    .product
+                    .set_history_unavailable(DISCOVERY_OFF_DETAIL);
+            } else {
+                self.inner.product.set_history_searching();
+            }
             return Ok(());
         };
         let request = serde_json::to_value(self.request(local.presence_envelope.clone()))?;
@@ -218,7 +230,7 @@ impl CollaborationHistoryService {
             .filter(|peer| peer.endpoint_did != local_endpoint)
             .collect::<Vec<_>>();
         if remote.is_empty() {
-            self.inner.product.set_history_status(false);
+            self.inner.product.set_history_unavailable(ALONE_DETAIL);
             return Ok(());
         }
         let round_complete = {
@@ -782,20 +794,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_without_own_presence_asks_for_discovery_only_when_it_is_off() {
+        // Discovery off: this Home publishes no presence of its own, so it has
+        // nothing to sign a history request with, whoever else is online.
+        let now = now_secs();
+        let root = tempfile::tempdir().unwrap();
+        let product = test_chat_product_port(root.path(), "history-off", "community");
+        let presence = CollaborationPresenceProductPort::new(product.test_core().clone()).unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        let service = CollaborationHistoryService::new(
+            product.clone(),
+            presence.clone(),
+            registry,
+            root.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let peer = fixture("history-off", "community", now).await;
+        product
+            .test_core()
+            .accept_incoming_from_signed_source_for_test(peer.own_presence.as_bytes(), now)
+            .unwrap();
+        for handoff in presence.pending_presences().unwrap() {
+            presence.project_handoff(&handoff, now).unwrap();
+        }
+        assert_eq!(presence.history_participants(now).unwrap().len(), 1);
+        product.set_community_connected(true);
+        let detail = || {
+            let view = product.conversation_transport_view().history.unwrap();
+            (view.status, view.detail)
+        };
+        // Before the Runtime publisher's first pass nothing is known yet.
+        service.fetch_once(now).await.unwrap();
+        assert!(product.conversation_transport_view().available);
+        assert_eq!(detail().0, "searching");
+        presence.record_local_publication(Some(false));
+        service.fetch_once(now).await.unwrap();
+        assert_eq!(
+            detail(),
+            (
+                "unavailable".to_string(),
+                "Turn on Discovery in People to load earlier Community posts.".to_string()
+            )
+        );
+        // Discovery switched on: presence is published but not yet projected.
+        presence.record_local_publication(Some(true));
+        service.fetch_once(now).await.unwrap();
+        assert_eq!(detail().0, "searching");
+        // A publisher pass that failed leaves the switch unknown.
+        presence.record_local_publication(None);
+        service.fetch_once(now).await.unwrap();
+        assert_eq!(detail().0, "searching");
+    }
+
+    #[tokio::test]
     async fn unavailable_history_keeps_live_transport_available_and_rotates_past_four_peers() {
         let now = now_secs();
         let a = fixture("history-fair", "community", now).await;
         a.product.set_community_connected(true);
         a.service.fetch_once(now).await.unwrap();
         assert!(a.product.conversation_transport_view().available);
-        assert_eq!(
-            a.product
-                .conversation_transport_view()
-                .history
-                .unwrap()
-                .status,
-            "unavailable"
-        );
+        let alone = a.product.conversation_transport_view().history.unwrap();
+        assert_eq!(alone.status, "unavailable");
+        assert_eq!(alone.detail, "No other members are online right now.");
         let mut fixtures = Vec::new();
         for _ in 0..5 {
             let peer = fixture("history-fair", "community", now).await;
@@ -863,13 +924,11 @@ mod tests {
         assert_eq!(tokio::time::Instant::now() - start, PEER_TIMEOUT);
         assert_eq!(plane.calls.lock().unwrap().len(), 1);
         assert!(a.product.conversation_transport_view().available);
+        let failed = a.product.conversation_transport_view().history.unwrap();
+        assert_eq!(failed.status, "unavailable");
         assert_eq!(
-            a.product
-                .conversation_transport_view()
-                .history
-                .unwrap()
-                .status,
-            "unavailable"
+            failed.detail,
+            "Earlier Community posts cannot be loaded right now."
         );
     }
 }

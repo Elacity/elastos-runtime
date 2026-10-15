@@ -29,6 +29,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tracing_subscriber::{fmt, EnvFilter};
 
+// Chromium allows up to 128 sockets per proxy, and pre-opened idle streams
+// count against the slot pool, so the web bridge must not starve page loads.
+const WEB_EGRESS_MAX_SESSIONS: usize = 128;
+const MEDIA_EGRESS_MAX_SESSIONS: usize = 16;
 const OPEN_REQUEST_ENV: &str = "ELASTOS_BROWSER_VM_OPEN_REQUEST";
 const VZ_TRANSPORT_AUTHORITY_SCHEMA: &str = "elastos.browser.vz-transport-authority/v1";
 const VZ_TRANSPORT_SECRET_SCHEMA: &str = "elastos.browser.vz-transport-secret/v1";
@@ -916,16 +920,6 @@ async fn run() -> Result<(), String> {
     let shutdown = Arc::new(AtomicBool::new(false));
     owner.shutdown = Some(Arc::clone(&shutdown));
     trace_stage("spawn_egress_bridge", "");
-    let egress_max_sessions =
-        post_effect_try!(env_u32("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS", 16,));
-    if egress_max_sessions == 0 || egress_max_sessions > 256 {
-        return Err(owner
-            .finish_cleanup(
-                "ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS must be from 1 to 256",
-                None,
-            )
-            .await);
-    }
     let egress_port = owner
         .transport
         .authority
@@ -940,7 +934,7 @@ async fn run() -> Result<(), String> {
         egress_port,
         owner.paths.runtime_stream_path.clone(),
         Arc::clone(&shutdown),
-        egress_max_sessions as usize,
+        WEB_EGRESS_MAX_SESSIONS,
         None,
     ));
     owner.ordinary_stream_bridge = true;
@@ -965,7 +959,7 @@ async fn run() -> Result<(), String> {
                 .expect("validated Browser VZ media Runtime socket"),
         ),
         Arc::clone(&shutdown),
-        egress_max_sessions as usize,
+        MEDIA_EGRESS_MAX_SESSIONS,
         Some(media_peers),
     ));
     owner.media_stream_bridge = true;
@@ -4939,6 +4933,18 @@ mod tests {
     use std::sync::{mpsc, Mutex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn egress_bridges_use_fixed_independent_caps() {
+        assert_eq!(WEB_EGRESS_MAX_SESSIONS, 128);
+        assert_eq!(MEDIA_EGRESS_MAX_SESSIONS, 16);
+        let source = include_str!("browser-vz-engine-supervisor.rs");
+        let removed = ["ELASTOS_BROWSER_VM_", "EGRESS_MAX_SESSIONS"].concat();
+        assert!(
+            !source.contains(&removed),
+            "egress caps must not be configurable"
+        );
+    }
 
     fn transport_fixture(suffix: char) -> VzTransportLaunch {
         let expires_at = (current_unix_millis().unwrap() / 1_000 + 300) * 1_000;

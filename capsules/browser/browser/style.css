@@ -1,5 +1,4 @@
-/* Browser chrome — Safari-inspired unified toolbar.
-   Shell owns traffic lights (unified-toolbar); menubar owns the app name.
+/* Browser chrome — Safari-inspired toolbar under the standard Home title bar.
    Page stage stays white — content ground, not chrome. */
 :root {
   --bg: var(--el-bg);
@@ -62,14 +61,14 @@ select {
   overflow: hidden;
 }
 
-/* One tool band under shell lights — pad leading for traffic lights. */
+/* One tool band under the Home title bar. */
 .browser-chrome {
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   min-height: 52px;
-  padding: 8px 10px 8px var(--window-chrome-safe-leading, 96px);
+  padding: 8px 10px;
   border-bottom: 0;
   background: var(--bg);
 }
@@ -453,7 +452,7 @@ body[data-loading="true"] .browser-address {
   .browser-chrome {
     min-height: 48px;
     gap: 6px;
-    padding: 6px 8px 6px var(--window-chrome-safe-leading, 96px);
+    padding: 6px 8px;
   }
 
   .browser-address {

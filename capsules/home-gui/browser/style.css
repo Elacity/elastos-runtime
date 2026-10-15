@@ -5410,52 +5410,6 @@ body.assistant-space-active #inbox-rail {
   height: 100% !important;
 }
 
-/* Unified-toolbar chrome (Browser): no window title — menubar owns the name.
-   Traffic lights sit in the tool-row band; capsule pads
-   --window-chrome-safe-leading. */
-.window.window-chrome-unified-toolbar {
-  --window-chrome-safe-leading: 96px;
-}
-
-.window.window-chrome-unified-toolbar .window-head {
-  position: absolute;
-  top: 0;
-  left: 0;
-  z-index: 6;
-  width: 78px;
-  height: 52px;
-  min-height: 52px;
-  margin-bottom: 0;
-  padding: 0 8px 0 12px;
-  align-items: center;
-  border-radius: 12px 0 0 0;
-  background: transparent;
-  box-shadow: none;
-  filter: none;
-}
-
-.window.window-chrome-unified-toolbar.window-active .window-head {
-  filter: none;
-}
-
-.window.window-chrome-unified-toolbar .window-head-icon,
-.window.window-chrome-unified-toolbar .window-head-title,
-.window.window-chrome-unified-toolbar .window-head-balance {
-  display: none;
-}
-
-.window.window-chrome-unified-toolbar .window-head-draggable {
-  flex: 1 1 auto;
-  min-width: 28px;
-  min-height: 28px;
-  justify-content: flex-start;
-  align-self: stretch;
-}
-
-.window.window-chrome-unified-toolbar .window-body {
-  height: 100%;
-}
-
 /* Continuous standard: titlebar fill matches frame (Wallet / Archive / GBA /
    connectors). Soft hairline only — no frosted second band. */
 .window.window-chrome-continuous .window-head {

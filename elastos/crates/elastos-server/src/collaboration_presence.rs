@@ -39,6 +39,9 @@ const MAX_PRESENCE_STATE_BYTES: usize = MAX_PRESENCE_RECORDS * 3 * 1024;
 pub struct CollaborationPresenceProductPort {
     core: Arc<CollaborationCore>,
     read_model: Arc<PresenceReadModel>,
+    /// The Runtime publisher's last pass: `Some(true)` it announced someone,
+    /// `Some(false)` it read Discovery off for everyone, `None` unknown.
+    local_publication: Arc<std::sync::Mutex<Option<bool>>>,
 }
 
 #[derive(Clone)]
@@ -141,7 +144,22 @@ impl CollaborationPresenceProductPort {
             anyhow::bail!("default collaboration conversation is not owned by Chat");
         }
         let read_model = Arc::new(PresenceReadModel::new(core.clone()));
-        Ok(Self { core, read_model })
+        Ok(Self {
+            core,
+            read_model,
+            local_publication: Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    pub(crate) fn record_local_publication(&self, state: Option<bool>) {
+        if let Ok(mut current) = self.local_publication.lock() {
+            *current = state;
+        }
+    }
+
+    /// `Some(false)`: the Runtime announces nobody here, so Discovery is off.
+    pub(crate) fn local_publication(&self) -> Option<bool> {
+        self.local_publication.lock().ok().and_then(|state| *state)
     }
 
     #[cfg(test)]

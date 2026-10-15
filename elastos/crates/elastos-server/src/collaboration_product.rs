@@ -355,6 +355,14 @@ impl CollaborationChatProductPort {
         }
     }
 
+    /// History is unavailable for a known reason the person can act on.
+    pub(crate) fn set_history_unavailable(&self, detail: &str) {
+        if let Ok(mut status) = self.history_status.lock() {
+            status.status = "unavailable".to_string();
+            status.detail = detail.to_string();
+        }
+    }
+
     pub(crate) fn set_history_status(&self, available: bool) {
         if let Ok(mut status) = self.history_status.lock() {
             status.status = if available {

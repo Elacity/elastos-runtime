@@ -39,10 +39,9 @@ const MAX_REFUSED: usize = 8;
 const LEASE_ENV: &str = "ELASTOS_UPDATE_CONTROLLER_LEASE";
 const HOST_ENV: &str = "ELASTOS_UPDATE_CONTROLLER_HOST";
 const MAX_PRIVATE_JSON: u64 = 256 * 1024;
-// Every Home start, first or after an update, gets this one budget. Home on a slow
-// device (Jetson: 22-30 s idle, kubo alone 12 s) must not be rolled back for being slow.
-// One update is bounded by a candidate start plus one rollback start.
-const READY_TIMEOUT: Duration = Duration::from_secs(120);
+// Every Home start shares runtime_control::RUNTIME_READY_TIMEOUT. One update is
+// bounded by a candidate start plus one rollback start.
+use crate::runtime_control::RUNTIME_READY_TIMEOUT as READY_TIMEOUT;
 // A recovery run starts the restored previous release at most this often, so it
 // stays within the same bound as one update's candidate and rollback starts.
 const PREVIOUS_START_ATTEMPTS: usize = 2;
@@ -1092,8 +1091,21 @@ impl Controller {
             if child.observed_exit()?.is_some() {
                 bail!("Home exited before it became ready.");
             }
-            if process_start(pid).as_deref() != Some(start.as_str()) {
-                bail!("Home process generation changed.");
+            match process_start(pid) {
+                Some(current) if current != start => bail!("Home process generation changed."),
+                Some(_) => {}
+                // macOS hides an exiting Home's start time before its exit is observable, so
+                // check again until the exit shows or the deadline passes.
+                None => {
+                    if tokio::time::Instant::now() >= deadline {
+                        bail!(
+                            "Home did not become ready within {} seconds.",
+                            budget.as_secs()
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
             }
             let home_port = BROWSER_HOME_PORT;
             // A fixture Home reports its ephemeral port once it has bound the listener.
