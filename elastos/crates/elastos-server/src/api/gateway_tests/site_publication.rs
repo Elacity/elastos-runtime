@@ -221,6 +221,8 @@ async fn test_root_serves_mywebsite_when_staged() {
     assert_eq!(&body[..], b"<html>home site</html>");
 }
 
+/// Launcher readiness. `docs/LAUNCHER_CONTRACT.md` defines this response:
+/// HTTP 200 and the body bytes `OK`.
 #[tokio::test]
 async fn test_healthz_200() {
     let dir = tempfile::tempdir().unwrap();
@@ -238,6 +240,10 @@ async fn test_healthz_200() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"OK");
 }
 
 #[tokio::test]
