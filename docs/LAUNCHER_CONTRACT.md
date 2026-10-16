@@ -41,8 +41,14 @@ updates follow the saved source. The launcher does not pass a channel flag.
 
 The installer accepts Linux x86_64, Linux aarch64, and macOS Apple silicon
 (`aarch64-darwin`). On any other operating system or architecture it exits 1.
-Intel Mac (`x86_64` / darwin-x64) is outside this install set. See
-[Mac notes](MAC.md) for the source-home path on Apple silicon.
+Intel Mac is outside this install set. That host has one name pair. The
+release platform id is `x86_64-darwin`. The package key is `darwin-amd64`.
+`scripts/release-platforms.json` maps `darwin-amd64` to `x86_64-darwin`. The
+launcher calls the same host `darwin-x64`. The signer admits `x86_64-linux`,
+`aarch64-linux`, and `aarch64-darwin`. It refuses `x86_64-darwin` in
+`scripts/release-signer.py` until one signed Intel artifact exists. This tree
+has no Intel download. See [Mac notes](MAC.md) for the source-home path on
+Apple silicon.
 
 ## Start
 
