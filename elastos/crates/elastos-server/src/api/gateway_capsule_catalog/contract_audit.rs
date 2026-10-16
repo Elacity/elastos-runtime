@@ -406,9 +406,9 @@ async fn audit_manifest(
     CapsuleContractSummary {
         name: manifest.name.clone(),
         role: manifest.role.clone(),
-        capsule_type: manifest.capsule_type.clone(),
+        capsule_type: manifest.execution_type(),
         runtime_abi: manifest.runtime_abi.clone(),
-        execution: manifest.execution.clone(),
+        execution: manifest.effective_execution(),
         installed,
         launch_state: if !installed {
             "not-installed"
@@ -442,12 +442,7 @@ async fn audit_manifest(
                 "runtime-mediated-only"
             }
             .to_string(),
-            host_process: if manifest.permissions.host_process {
-                "runtime-owned-host-process"
-            } else {
-                "none"
-            }
-            .to_string(),
+            host_process: host_process_boundary(manifest).to_string(),
             direct_network: manifest.permissions.guest_network,
         },
     }
@@ -648,10 +643,21 @@ fn changed_top_level_fields(
         .collect()
 }
 
+fn host_process_boundary(manifest: &CapsuleManifest) -> &'static str {
+    match manifest.execution_type() {
+        CapsuleType::NativeProvider => "native-provider-process",
+        CapsuleType::NativeHost => "native-host-process",
+        _ if manifest.permissions.host_process => "runtime-owned-host-process",
+        _ => "none",
+    }
+}
+
 fn execution_boundary(manifest: &CapsuleManifest) -> &'static str {
-    match manifest.execution {
+    match manifest.effective_execution() {
         Some(CapsuleExecution::Component) => "component",
-        Some(CapsuleExecution::WebProjection) => "runtime-projection",
+        Some(CapsuleExecution::WebProjection) => "web-projection",
+        Some(CapsuleExecution::NativeProvider) => "native-provider-process",
+        Some(CapsuleExecution::NativeHost) => "native-host-process",
         Some(CapsuleExecution::Microvm) => "runtime-supervised-microvm",
         Some(CapsuleExecution::Data) | None if manifest.role == CapsuleRole::Content => {
             "inert-content"
@@ -927,6 +933,59 @@ mod tests {
             .iter()
             .map(|issue| issue.code.as_str())
             .collect()
+    }
+
+    #[test]
+    fn audit_reports_actual_execution_boundaries() {
+        for (source, boundary, host_process) in [
+            (
+                include_str!("../../../../../../capsules/home/capsule.json"),
+                "web-projection",
+                "none",
+            ),
+            (
+                include_str!("../../../../../../capsules/model-provider/capsule.json"),
+                "native-provider-process",
+                "native-provider-process",
+            ),
+            (
+                include_str!("../../../../../capsules/shell/capsule.json"),
+                "native-host-process",
+                "native-host-process",
+            ),
+        ] {
+            let manifest: CapsuleManifest = serde_json::from_str(source).unwrap();
+            manifest.validate().unwrap();
+            assert_eq!(execution_boundary(&manifest), boundary);
+            assert_eq!(host_process_boundary(&manifest), host_process);
+        }
+    }
+
+    #[test]
+    fn audit_reports_legacy_provider_labels_as_native_processes() {
+        let base: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../../capsules/model-provider/capsule.json"
+        ))
+        .unwrap();
+        for (capsule_type, execution) in [
+            ("wasm", serde_json::Value::Null),
+            ("microvm", serde_json::Value::Null),
+            ("microvm", serde_json::json!("microvm")),
+        ] {
+            // Legacy labels are accepted for update compatibility, not isolation proof.
+            let mut value = base.clone();
+            value["type"] = serde_json::json!(capsule_type);
+            value["execution"] = execution;
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("capsule.json");
+            std::fs::write(&path, value.to_string()).unwrap();
+            let mut issues = Vec::new();
+            let (manifest, _) = load_manifest(&path, "model-provider", &mut issues).unwrap();
+            assert!(issues.is_empty());
+            assert_eq!(execution_boundary(&manifest), "native-provider-process");
+            assert_eq!(host_process_boundary(&manifest), "native-provider-process");
+            assert_eq!(manifest.execution_type(), CapsuleType::NativeProvider);
+        }
     }
 
     #[test]
@@ -1244,7 +1303,7 @@ mod tests {
 
         assert_eq!(
             tunnel_json.pointer("/boundary/host_process"),
-            Some(&serde_json::json!("runtime-owned-host-process"))
+            Some(&serde_json::json!("native-provider-process"))
         );
         assert!(
             tunnel_json.pointer("/boundary/carrier").is_none(),

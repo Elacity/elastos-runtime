@@ -6,8 +6,8 @@
     <title>ElastOS Browser</title>
     <script src="./elastos-theme.js"></script>
     <link rel="stylesheet" href="./elastos-ui.css">
-    <link rel="stylesheet" href="./style.css?v=browser-20260819a" />
-    <link rel="modulepreload" href="./browser.js?v=browser-20260915b" />
+    <link rel="stylesheet" href="./style.css?v=browser-20261015a" />
+    <link rel="modulepreload" href="./browser.js?v=browser-20261015a" />
     <link rel="modulepreload" href="./browser-location.js?v=browser-20260523b" />
     <link rel="modulepreload" href="./browser-runtime-api.js?v=browser-20260907c" />
     <link rel="modulepreload" href="./browser-clipboard.js?v=browser-20260725b" />
@@ -16,8 +16,7 @@
     <link rel="modulepreload" href="./browser-input-surface.js?v=browser-20260725b" />
     <link rel="modulepreload" href="./browser-status.js?v=browser-20260907c" />
     <link rel="modulepreload" href="./browser-remote-display.js?v=browser-20260915d" />
-    <link rel="modulepreload" href="./browser-service-selection.js?v=browser-20260907c" />
-    <link rel="modulepreload" href="./browser-operator-approval.js" />
+    <link rel="modulepreload" href="./browser-service-selection.js?v=browser-20261015a" />
     <link rel="modulepreload" href="./browser-history.js?v=browser-20260520e" />
     <link rel="modulepreload" href="./browser-webrtc.js?v=browser-20260913h" />
     <link rel="modulepreload" href="/apps/home/home-clipboard-client.js?v=home-20260726a" />
@@ -68,7 +67,7 @@
         <select id="browser-engine" class="browser-select" aria-label="Browser engine" title="Browser engine">
           <option value="">Automatic</option>
         </select>
-        <p id="browser-engine-summary" class="browser-settings-hint">Use the best Browser Engine available.</p>
+        <p id="browser-engine-summary" class="browser-settings-hint">Select this device’s VM Engine or an approved remote Engine.</p>
         <label class="browser-settings-label browser-settings-label-spaced" for="browser-exit">Exit node</label>
         <select id="browser-exit" class="browser-exit-select" aria-label="Browser exit node" title="Browser exit node">
           <option value="">This device</option>
@@ -77,6 +76,13 @@
         <button id="browser-profile-reset" class="browser-settings-action browser-settings-danger" type="button" aria-label="Reset Browser profile" title="Reset Browser profile">
           Reset profile
         </button>
+        <section id="browser-profile-reset-confirmation" class="browser-settings-confirm" role="alertdialog" aria-labelledby="browser-profile-reset-question" hidden>
+          <p id="browser-profile-reset-question">Reset Browser cookies, local storage, history, and cache for this account?</p>
+          <div class="browser-settings-confirm-row">
+            <button id="browser-profile-reset-cancel" class="browser-settings-action" type="button">Cancel</button>
+            <button id="browser-profile-reset-commit" class="browser-settings-action browser-settings-confirm-commit" type="button">Reset profile</button>
+          </div>
+        </section>
       </section>
 
       <section class="browser-stage" aria-label="Web page">
@@ -100,10 +106,10 @@
           ></video>
         </div>
         <div id="browser-metrics" class="browser-metrics" hidden></div>
-        <div id="browser-status" class="browser-status" role="status"></div>
+        <div id="browser-status" class="browser-status" role="status" data-visible="true">Browser is checking its Engine. Wait, or reopen Browser from Home to retry.</div>
       </section>
     </main>
 
-    <script type="module" src="./browser.js?v=browser-20260915b"></script>
+    <script type="module" src="./browser.js?v=browser-20261015a"></script>
   </body>
 </html>

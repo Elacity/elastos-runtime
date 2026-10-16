@@ -1266,7 +1266,7 @@ mod consumer_path {
             .await
             .unwrap_err();
         assert!(
-            !matches!(error, RemoteRouteError::PreDispatchRefused { .. }),
+            !matches!(error, RemoteRouteError::InvocationRefused { .. }),
             "{error}"
         );
         assert_eq!(
@@ -1274,13 +1274,40 @@ mod consumer_path {
             1,
             "a second ticket entry would create again"
         );
+        *fx.provider.next_create_status_error.lock().unwrap() = Some(json!({
+            "status":"error", "code":elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE,
+            "message":elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE,
+        }));
+        let expired_request = request("expired-on-provider");
+        match fx
+            .route(&[grant.clone()], "runs_create", expired_request.clone())
+            .await
+            .unwrap_err()
+        {
+            RemoteRouteError::InvocationRefused { binding, reason } => {
+                assert_eq!(reason, "request_expired");
+                assert_eq!(binding["dispatch"], "provider_refused");
+                assert_eq!(binding["offer_id"], offer_id);
+                assert_eq!(binding["request_id"], "expired-on-provider");
+                assert_eq!(
+                    binding["input_hash"],
+                    model_input_hash(&expired_request["input"]).unwrap()
+                );
+            }
+            other => panic!("expected provider expiry refusal, got {other}"),
+        }
+        assert_eq!(
+            fx.create_count().await,
+            2,
+            "expiry does not try a second ticket entry"
+        );
         fx.write_request_record("denied");
         let refused = fx
             .route(&[grant], "runs_create", request("fresh-revoked"))
             .await
             .unwrap_err();
         match refused {
-            RemoteRouteError::PreDispatchRefused { binding, reason } => {
+            RemoteRouteError::InvocationRefused { binding, reason } => {
                 assert_eq!(reason, "denied");
                 assert_eq!(binding["offer_id"], offer_id);
                 assert_eq!(binding["request_id"], "fresh-revoked");
@@ -1288,7 +1315,7 @@ mod consumer_path {
             }
             other => panic!("expected bound refusal, got {other}"),
         }
-        assert_eq!(fx.create_count().await, 1);
+        assert_eq!(fx.create_count().await, 2);
         fx.shutdown().await;
     }
 
@@ -2274,6 +2301,56 @@ async fn shared_hosted_offer_denies_fresh_creates_and_recovers_without_losing_ol
     assert_eq!(fx.create_count().await, baseline + 1);
     let old = fx.run_operation("runs_get", &old_run, SEED_PRINCIPAL).await;
     assert_eq!(old["ok"], true, "{old}");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_model_expired_request_records_the_provider_refusal_phase() {
+    let fx = TwoRuntimes::start().await;
+    let mut remote = fx.remote(SEED_PRINCIPAL, "assistant");
+    remote["refusal_scope"] = json!("invocation");
+    let request = json!({
+        "op":"runs_create", "request_id":"request-pruned", "offer_id":"qwen-local",
+        "operation":"text.generate", "input":{"prompt":"kept draft"}, "remote_model":remote,
+    });
+    *fx.provider.next_create_status_error.lock().unwrap() = Some(json!({
+        "status":"error", "code":elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE,
+        "message":elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE,
+    }));
+    let baseline = fx.create_count().await;
+    let refused = fx.call("runs_create", request.clone()).await;
+    assert_eq!(refused["ok"], true, "{refused}");
+    assert_eq!(refused["result"]["code"], "remote_model_invocation_refused");
+    assert_eq!(refused["result"]["reason"], "request_expired");
+    let mut expected =
+        crate::api::gateway::gateway_model_service::invocation_refusal_binding(&request).unwrap();
+    expected["dispatch"] = json!("provider_refused");
+    assert_eq!(refused["result"]["refusal"], expected);
+    assert_eq!(
+        fx.create_count().await,
+        baseline + 1,
+        "provider was called once"
+    );
+    // Only this invocation is refused. Its reservation was released, so a
+    // later explicit submission follows the normal provider path.
+    let mut fresh_request = request.clone();
+    fresh_request["request_id"] = json!(format!(
+        "model-v1:{}:fresh-submission",
+        crate::auth::now_ts().saturating_mul(1000)
+    ));
+    let accepted = fx.call("runs_create", fresh_request).await;
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    assert_eq!(accepted["result"]["status"], "ok");
+    let runs = fx.provider.run_owners.lock().unwrap().len();
+    *fx.provider.next_create_status_error.lock().unwrap() = Some(json!({
+        "status":"error", "code":"request_expired", "message":"different",
+    }));
+    let mut new_request = request.clone();
+    new_request["request_id"] = json!("another-request");
+    let ambiguous = fx.call("runs_create", new_request).await;
+    assert_eq!(ambiguous["ok"], false, "{ambiguous}");
+    assert!(ambiguous.get("result").is_none());
+    assert_eq!(fx.provider.run_owners.lock().unwrap().len(), runs);
     fx.shutdown().await;
 }
 

@@ -15,7 +15,8 @@ import { bindAssistantModes } from "./assistant-modes.js";
                                                    Sent on every leave, also one this capsule
                                                    asked for — the room never lowers on its
                                                    own request, so both paths are one morph
-     capsule → Home   home-agent:ready             module booted, frame can be shown
+     capsule → Home   home-agent:hello {docId}     this document started (sent first)
+                      home-agent:ready {docId}     workspace loaded, frame can be shown
                       home-agent:shelf-metrics     composer pill size, so Home's pill matches
                       home-agent:close             user asks to leave from inside (Home, Esc)
                       home-agent:open-viewer       artifact to show in Documents
@@ -31,8 +32,13 @@ import {
 } from "./agent-harness.js";
 import { handleShellEscape } from "./shell-popovers.js";
 import { postToHome, loadAgentWorkspace, bindWorkspaceApply, scheduleAgentWorkspacePersist } from "./harness-host.js";
+import { createHomeMessageGate } from "./home-agent-gate.js";
 
 const HOME_MESSAGE_TYPES = new Set(["home-agent:open", "home-agent:shelf-handover", "home-agent:close"]);
+/* One id per document, so Home can tell this document's ready from one sent
+   by the document it replaced. */
+const DOC_ID = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+postToHome({ type: "home-agent:hello", docId: DOC_ID });
 
 function fromHome(event) {
   return event.source === window.parent && event.source !== window;
@@ -121,14 +127,7 @@ function reportShelfMetrics() {
   });
 }
 
-window.addEventListener("message", (event) => {
-  if (!fromHome(event)) {
-    return;
-  }
-  const message = event.data;
-  if (!message || typeof message !== "object" || !HOME_MESSAGE_TYPES.has(message.type)) {
-    return;
-  }
+function applyHomeMessage(message) {
   if (message.type === "home-agent:open") {
     applyLaunchQuery(message.query);
     if (!agentShelfFaceActive() || !agentHarnessActive()) {
@@ -145,6 +144,19 @@ window.addEventListener("message", (event) => {
     setHandover(false);
     lowerRoom();
   }
+}
+
+const homeMessages = createHomeMessageGate({ apply: applyHomeMessage, composer: composerInput() });
+
+window.addEventListener("message", (event) => {
+  if (!fromHome(event)) {
+    return;
+  }
+  const message = event.data;
+  if (!message || typeof message !== "object" || !HOME_MESSAGE_TYPES.has(message.type)) {
+    return;
+  }
+  homeMessages.receive(message);
 });
 
 /* Escape rides the same popover stack Home used; when nothing inside claims
@@ -195,5 +207,6 @@ loadAgentWorkspace()
     notice.textContent = "Your workspace could not be loaded. Reload to retry; existing work is unchanged.";
   })
   .finally(() => {
-    postToHome({ type: "home-agent:ready" });
+    homeMessages.initialized();
+    postToHome({ type: "home-agent:ready", docId: DOC_ID });
   });

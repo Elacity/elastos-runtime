@@ -14,9 +14,8 @@ later run `elastos` from a new shell. The
 [installation guide](INSTALL.md#installed-files) explains how to inspect the
 selected signed manifest and installed component registry. A public install
 receives only the components in that manifest. Source and installed artifacts
-have separate identities. [state.md](../state.md) records whether exact
-publication-parity evidence has been accepted. The normal Home path does not
-need a separate `elastos serve` process.
+have separate identities. [Install/update acceptance](https://github.com/Elacity/elastos-runtime/issues/89)
+owns publication-parity evidence. The normal Home path does not need a separate `elastos serve` process.
 
 The current default Home exposes System, People, Services, Browser, Wallet,
 Documents, Library, Marketplace, Archive, and Inbox.
@@ -29,7 +28,7 @@ reuses one, or needs none.
 Useful next commands:
 
 ```bash
-elastos chat --nick alice
+elastos home --status
 elastos update --check
 ```
 
@@ -37,12 +36,11 @@ Open Documents or Library from Home to work with your files. The source Home
 profile includes these apps and their content backend. For an installed release,
 its signed manifest determines the available components.
 
-The demo profile adds more Apps and tools. The operator profile supports
-`serve`, remote node control, agents, WASM or microVM `run`, and non-interactive
-capsule work. Data `run` and interactive packaged capsules use the lanes in the
-command matrix.
-[Installing ElastOS](INSTALL.md) documents profiles, trust, and updates.
-[Sites](SITES.md) documents local site staging and publication.
+The same install also provides the operator runtime for `serve`, remote node
+control, WASM or microVM `run`, and non-interactive capsule work. Data
+`run` and interactive packaged capsules use the lanes in the command matrix.
+[Installing ElastOS](INSTALL.md) documents setup, trust, and updates.
+[Sites](SITES.md) documents the `elastos site` operator commands.
 
 ## Build from source
 
@@ -157,4 +155,3 @@ managed Home lane. See the command matrix for these paths:
 - [Repository README](../README.md)
 - [Architecture](ARCHITECTURE.md)
 - [Glossary](GLOSSARY.md)
-- [State](../state.md)

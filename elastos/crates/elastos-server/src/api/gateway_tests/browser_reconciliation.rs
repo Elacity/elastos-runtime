@@ -101,12 +101,6 @@ async fn yield_until_cleanup_obligation_count(state: &GatewayState, expected: us
     );
 }
 
-async fn finish_current_reconciliation_sweep() {
-    for _ in 0..1_000 {
-        tokio::task::yield_now().await;
-    }
-}
-
 // Keep this paused clock under the test's explicit control while other test
 // runtimes hold the shared Browser registry lock. An idle runtime would otherwise
 // advance lifecycle deadlines during those unrelated lock waits.
@@ -141,22 +135,28 @@ async fn settle_sweep_without_virtual_time_autoadvance(
     }
 }
 
-async fn advance_until_reconciliation_call_count(
+// Drives one backoff retry of a controlled reconciler parked after sweep
+// `completed_sweeps`. Run it under `with_manual_test_clock`, which keeps
+// registry-lock waits on other test runtimes from auto-advancing call timeouts.
+// The reconciler reports its backoff deadline before the clock moves, so every
+// wait here is a notification; only the manual clock's hang guard is timed.
+async fn retry_reconciliation_after_minimum_backoff(
+    reconciler: &BrowserLifecycleReconciler,
     calls: &BrowserReconciliationCallRecorder,
-    expected: usize,
-    step: Duration,
+    completed_sweeps: usize,
 ) {
-    for _ in 0..10 {
-        if calls.count() >= expected {
-            return;
-        }
-        tokio::time::advance(step).await;
-        finish_current_reconciliation_sweep().await;
-    }
-    assert!(
-        calls.count() >= expected,
-        "reconciliation call count did not reach {expected}"
+    let calls_before_backoff = calls.count();
+    reconciler.resume_sweeps();
+    reconciler.wait_for_armed_backoffs(completed_sweeps).await;
+    assert_eq!(
+        calls.count(),
+        calls_before_backoff,
+        "the retry must wait for the backoff timer"
     );
+    tokio::time::advance(BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF).await;
+    reconciler
+        .wait_for_completed_sweeps(completed_sweeps + 1)
+        .await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -612,106 +612,121 @@ async fn hanging_stream_timeout_releases_exact_claim_for_retry_without_restart()
 
 #[tokio::test(start_paused = true)]
 async fn transient_reconciliation_failure_retries_with_backoff_and_retains_ownership() {
-    let dir = tempfile::tempdir().unwrap();
-    let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
-        dir.path(),
-        MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess,
-    )
-    .await;
-    record_pending_launch(
-        &state,
-        "person:local:transient-reconciliation",
-        "launch:transient-reconciliation",
-        "stream:transient-reconciliation",
-    )
-    .await;
-    let reconciler = start_browser_lifecycle_reconciler(state.clone()).expect("Runtime reconciler");
-
-    reconciliation_calls.wait_for_count(1).await;
-    assert_eq!(
-        browser_launch_reconciliation_obligation_count(&state.data_dir).await,
-        1
-    );
-    assert!(close_calls.snapshot().await.is_empty());
-    finish_current_reconciliation_sweep().await;
-    advance_until_reconciliation_call_count(&reconciliation_calls, 2, Duration::from_millis(100))
+    with_manual_test_clock(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
+            dir.path(),
+            MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess,
+        )
         .await;
-    close_calls.wait_for_count(1).await;
-    assert_eq!(
-        browser_launch_reconciliation_obligation_count(&state.data_dir).await,
-        0
-    );
-    reconciler.cancel();
-    reconciler.join().await.expect("Runtime shutdown");
+        record_pending_launch(
+            &state,
+            "person:local:transient-reconciliation",
+            "launch:transient-reconciliation",
+            "stream:transient-reconciliation",
+        )
+        .await;
+        let reconciler = start_controlled_browser_lifecycle_reconciler(state.clone())
+            .expect("controlled Runtime reconciler");
+
+        reconciler.wait_for_completed_sweeps(1).await;
+        assert_eq!(reconciliation_calls.count(), 1);
+        assert_eq!(
+            browser_launch_reconciliation_obligation_count(&state.data_dir).await,
+            1
+        );
+        assert!(close_calls.snapshot().await.is_empty());
+        retry_reconciliation_after_minimum_backoff(&reconciler, &reconciliation_calls, 1).await;
+        assert!(
+            reconciliation_calls.count() >= 2,
+            "reconciliation call count did not reach 2"
+        );
+        close_calls.wait_for_count(1).await;
+        assert_eq!(
+            browser_launch_reconciliation_obligation_count(&state.data_dir).await,
+            0
+        );
+        reconciler.cancel();
+        reconciler.join().await.expect("Runtime shutdown");
+    })
+    .await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn reconciliation_timeout_retains_exact_ownership_until_late_terminal_cleanup() {
-    let dir = tempfile::tempdir().unwrap();
-    let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
-        dir.path(),
-        MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess,
-    )
-    .await;
-    let principal_id = "person:local:timeout-reconciliation";
-    let reservation = record_pending_launch(
-        &state,
-        principal_id,
-        "launch:timeout-reconciliation",
-        "stream:timeout-reconciliation",
-    )
-    .await;
-    let reconciler = start_browser_lifecycle_reconciler(state.clone()).expect("Runtime reconciler");
-
-    reconciliation_calls.wait_for_count(1).await;
-    assert_eq!(
-        browser_launch_reconciliation_obligation_count(&state.data_dir).await,
-        1
-    );
-    assert!(close_calls.snapshot().await.is_empty());
-
-    tokio::time::advance(Duration::from_secs(31)).await;
-    finish_current_reconciliation_sweep().await;
-    assert_eq!(
-        browser_launch_reconciliation_obligation_count(&state.data_dir).await,
-        1
-    );
-    assert!(close_calls.snapshot().await.is_empty());
-
-    advance_until_reconciliation_call_count(&reconciliation_calls, 2, Duration::from_millis(100))
+    with_manual_test_clock(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
+            dir.path(),
+            MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess,
+        )
         .await;
-    close_calls.wait_for_count(1).await;
-    assert_eq!(
-        browser_launch_reconciliation_obligation_count(&state.data_dir).await,
-        0
-    );
-    assert_eq!(
-        browser_engine_cleanup_obligation_count(&state.data_dir).await,
-        0
-    );
-    let calls = close_calls.snapshot().await;
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0]["page_id"], calls[0]["runtime_cleanup"]["page_id"]);
-    assert_eq!(
-        calls[0]["runtime_cleanup"]["generation"],
-        reservation.generation()
-    );
-    assert_eq!(
-        calls[0]["runtime_cleanup"]["stream_id"],
-        "stream:timeout-reconciliation"
-    );
-    drop(calls);
+        let principal_id = "person:local:timeout-reconciliation";
+        let reservation = record_pending_launch(
+            &state,
+            principal_id,
+            "launch:timeout-reconciliation",
+            "stream:timeout-reconciliation",
+        )
+        .await;
+        let reconciler = start_controlled_browser_lifecycle_reconciler(state.clone())
+            .expect("controlled Runtime reconciler");
 
-    let replacement = reserve_browser_launch(
-        &state.data_dir,
-        principal_id,
-        browser_lifecycle("launch:replacement-after-timeout-terminal-cleanup"),
-    )
-    .await
-    .expect("replacement only after timeout path terminal cleanup");
-    release_browser_launch(&replacement).await;
-    reconciler.cancel();
-    reconciler.join().await.expect("Runtime shutdown");
+        reconciliation_calls.wait_for_count(1).await;
+        assert_eq!(
+            browser_launch_reconciliation_obligation_count(&state.data_dir).await,
+            1
+        );
+        assert!(close_calls.snapshot().await.is_empty());
+
+        tokio::time::advance(BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT + Duration::from_millis(1))
+            .await;
+        reconciler.wait_for_completed_sweeps(1).await;
+        assert_eq!(
+            browser_launch_reconciliation_obligation_count(&state.data_dir).await,
+            1
+        );
+        assert!(close_calls.snapshot().await.is_empty());
+
+        retry_reconciliation_after_minimum_backoff(&reconciler, &reconciliation_calls, 1).await;
+        assert!(
+            reconciliation_calls.count() >= 2,
+            "reconciliation call count did not reach 2"
+        );
+        close_calls.wait_for_count(1).await;
+        assert_eq!(
+            browser_launch_reconciliation_obligation_count(&state.data_dir).await,
+            0
+        );
+        assert_eq!(
+            browser_engine_cleanup_obligation_count(&state.data_dir).await,
+            0
+        );
+        let calls = close_calls.snapshot().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["page_id"], calls[0]["runtime_cleanup"]["page_id"]);
+        assert_eq!(
+            calls[0]["runtime_cleanup"]["generation"],
+            reservation.generation()
+        );
+        assert_eq!(
+            calls[0]["runtime_cleanup"]["stream_id"],
+            "stream:timeout-reconciliation"
+        );
+        drop(calls);
+
+        let replacement = reserve_browser_launch(
+            &state.data_dir,
+            principal_id,
+            browser_lifecycle("launch:replacement-after-timeout-terminal-cleanup"),
+        )
+        .await
+        .expect("replacement only after timeout path terminal cleanup");
+        release_browser_launch(&replacement).await;
+        reconciler.cancel();
+        reconciler.join().await.expect("Runtime shutdown");
+    })
+    .await;
 }
 
 #[tokio::test(start_paused = true)]

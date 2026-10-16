@@ -6,12 +6,15 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertPhoneDrawer, DRAWER_SETTLE_MS, PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const browserRoot = join(repoRoot, "capsules/people/browser");
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
+const PHONE_SCREENSHOT = "/tmp/people-phone-390x844.png";
+const PHONE_DRAWER_SCREENSHOT = "/tmp/people-phone-drawer-390x844.png";
 
 function assert(condition, message, details = undefined) {
   if (!condition) {
@@ -133,6 +136,8 @@ function freshScenarioState(scenario) {
     discoveryTogglePosts: 0,
     profileAttemptCount: 0,
     createdProfileName: "",
+    removalAttempts: 0,
+    contactRemoved: false,
   };
 }
 
@@ -169,6 +174,17 @@ function scenarioSummary(state) {
           status: "off",
           statusMessage: "Discovery is off.",
         }),
+    });
+  }
+  if (state.scenario === "remove-confirmation") {
+    return summary({
+      readinessStatus: "ready",
+      profileName: "Ready Profile",
+      contacts: [
+        { ...acceptedContact(), relationship: state.contactRemoved ? "removed" : "connected", can_message: !state.contactRemoved },
+        { ...acceptedContact(), contact_id: "contact:other", display_name: "Other Contact", conversation_id: "direct:opaque:other" },
+      ],
+      discovery: discoverySummary({ configured: true }),
     });
   }
   if (state.scenario === "visible") {
@@ -237,6 +253,7 @@ function startServer() {
     discoveryRequests: 0,
     discoveryToggles: 0,
     profileAttempts: 0,
+    removalTargets: [],
   };
   const server = createServer(async (request, response) => {
     try {
@@ -261,7 +278,7 @@ function startServer() {
         const body = Buffer.from(
           "<!doctype html><html><body style=\"margin:0\">"
           + "<script>window.peopleSmokeMessages=[];window.addEventListener('message',(event)=>window.peopleSmokeMessages.push(event.data));</script>"
-          + `<iframe title="People" sandbox="allow-forms allow-modals allow-pointer-lock allow-scripts" style="border:0;height:100vh;width:100vw" src="${iframeSrc}"></iframe>`
+          + `<iframe title="People" sandbox="allow-forms allow-pointer-lock allow-scripts" style="border:0;height:100vh;width:100vw" src="${iframeSrc}"></iframe>`
           + "</body></html>",
         );
         response.writeHead(200, {
@@ -308,6 +325,18 @@ function startServer() {
         const body = await readJson(request);
         assert(body.advertisement_id === "ad-visible-1", "People request used the wrong advertisement selector", body);
         return json(response, scenarioSummary(state).discovery);
+      }
+      if (url.pathname === "/api/apps/people/contacts/remove" && request.method === "POST") {
+        const body = await readJson(request);
+        assert(scenario === "remove-confirmation" && body.contact_id === "contact:accepted",
+          "People removal changed its confirmed target", body);
+        trace.removalTargets.push(body.contact_id);
+        state.removalAttempts += 1;
+        if (state.removalAttempts === 1) {
+          return json(response, { error: "unauthorized" }, 401);
+        }
+        state.contactRemoved = true;
+        return json(response, { status: "ok" });
       }
       if (url.pathname === "/api/apps/people/profile" && request.method === "POST") {
         trace.profileAttempts += 1;
@@ -544,7 +573,7 @@ async function assertFirstRunScenario(frame, width) {
   assert(state.count === "0 contacts", "first run contact count is wrong", state);
   assert(state.title === "Create your Profile", "first run title is wrong", state);
   assert(
-    state.description === "Your Profile is your signed identity for People and Chat.",
+    state.description === "Confirm the name people will see in People and Chat. Discovery stays off until you enable it.",
     "first run explanation is wrong",
     state,
   );
@@ -693,7 +722,81 @@ async function assertProfileFailureScenario(frame, width) {
   await assertNoOverflow(frame, `profile failure recovered at ${width}px`);
 }
 
-async function runScenario(page, port, scenario, width) {
+// Signed in, the page is short: the sections must not take the spare height.
+async function assertPhoneScenario(page, port) {
+  const frame = await openPeople(page, port, "ready-off", PHONE_VIEWPORT.width);
+  await page.setViewportSize(PHONE_VIEWPORT);
+  await setPhoneFormFactor(frame);
+  await page.waitForTimeout(DRAWER_SETTLE_MS);
+  await waitFor(() => frame.evaluate(() => document.querySelector("#profile-title")?.textContent === "My Profile"));
+  const head = await frame.evaluate(() => {
+    const rect = (selector) => document.querySelector(selector).getBoundingClientRect();
+    const title = rect(".people-page-title");
+    const toggle = rect(".el-drawer-toggle");
+    return {
+      titleTop: Math.round(title.top),
+      titleMiddle: Math.round(title.top + title.height / 2),
+      toggleMiddle: Math.round(toggle.top + toggle.height / 2),
+      toggleLeft: Math.round(toggle.left),
+    };
+  });
+  assert(
+    head.titleTop <= 40 && Math.abs(head.titleMiddle - head.toggleMiddle) <= 4 && head.toggleLeft <= 16,
+    "People phone: content must start at the top with the drawer toggle leading the page title",
+    head,
+  );
+  await page.screenshot({ path: PHONE_SCREENSHOT });
+  await assertPhoneDrawer(page, frame, {
+    label: "People",
+    drawer: "#people-sidebar",
+    room: ".people-main",
+    closeTarget: '[data-section-target="people"]',
+    screenshot: PHONE_DRAWER_SCREENSHOT,
+  });
+}
+
+async function assertRemoveConfirmationScenario(frame, page, width, trace) {
+  const beforePosts = trace.removalTargets.length;
+  const remove = frame.locator('[data-action="remove"][data-contact-id="contact:accepted"]');
+  await remove.waitFor({ state: "visible" });
+  await remove.click();
+  const confirm = frame.locator('[data-action="confirm-remove"][data-contact-id="contact:accepted"]');
+  const cancel = frame.locator('[data-action="cancel-remove"][data-contact-id="contact:accepted"]');
+  await confirm.waitFor({ state: "visible" });
+  assert(await cancel.evaluate(node => node === document.activeElement), "Remove must focus the safe Cancel action");
+  assert((await frame.locator('.person-confirm').innerText()).includes("Remove Ari Contact from People?"),
+    "Remove confirmation named the wrong contact");
+  await assertVisible(frame, ['.person-confirm', '[data-action="cancel-remove"]', '[data-action="confirm-remove"]'],
+    `Remove confirmation at ${width}px`);
+  await assertNoOverflow(frame, `Remove confirmation at ${width}px`);
+  assert(trace.removalTargets.length === beforePosts, "Opening confirmation sent a removal POST");
+  await cancel.click();
+  await confirm.waitFor({ state: "hidden" });
+  assert(trace.removalTargets.length === beforePosts, "Cancel sent a removal POST");
+  await remove.click();
+  const failed = page.waitForResponse(response => response.request().method() === "POST"
+    && new URL(response.url()).pathname === "/api/apps/people/contacts/remove", { timeout: 10000 });
+  await confirm.click();
+  assert((await failed).status() === 401, "Removal refusal was not exercised");
+  await waitForStatus(frame, "Could not complete that action.");
+  await waitFor(() => confirm.isEnabled());
+  assert(trace.removalTargets.length === beforePosts + 1, "Refused removal dispatched more than once");
+  assert((await frame.locator('.person-confirm').innerText()).includes("Remove Ari Contact from People?"),
+    "Removal retry changed its contact");
+  await confirm.click();
+  await waitForStatus(frame, "Removed from People.");
+  await confirm.waitFor({ state: "hidden" });
+  assert(trace.removalTargets.length === beforePosts + 2
+    && trace.removalTargets.slice(beforePosts).every(id => id === "contact:accepted"),
+    "Removal retry changed its exact target", trace);
+  assert(await frame.locator('[data-action="remove"][data-contact-id="contact:other"]').isVisible(),
+    "Removing one contact changed the other contact");
+  assert(await frame.locator('[data-action="remove"][data-contact-id="contact:accepted"]').count() === 0,
+    "Removed contact still has Remove");
+  await assertNoOverflow(frame, `Removed contacts at ${width}px`);
+}
+
+async function runScenario(page, port, scenario, width, trace) {
   const frame = await openPeople(page, port, scenario, width);
   if (scenario === "first-run") {
     await assertFirstRunScenario(frame, width);
@@ -711,6 +814,10 @@ async function runScenario(page, port, scenario, width) {
     await assertProfileFailureScenario(frame, width);
     return;
   }
+  if (scenario === "remove-confirmation") {
+    await assertRemoveConfirmationScenario(frame, page, width, trace);
+    return;
+  }
   throw new Error(`unknown People smoke scenario: ${scenario}`);
 }
 
@@ -725,17 +832,20 @@ async function main() {
   });
   const page = context.pages()[0] || await context.newPage();
   try {
+    await assertPhoneScenario(page, port);
     for (const width of [375, 1280]) {
       await runScenario(page, port, "first-run", width);
       await runScenario(page, port, "ready-off", width);
       await runScenario(page, port, "visible", width);
       await runScenario(page, port, "profile-failure", width);
+      await runScenario(page, port, "remove-confirmation", width, trace);
     }
     assert(trace.discoveryRefreshes === 2, "People smoke changed Discovery refresh count", trace);
     assert(trace.discoveryToggles === 2, "People smoke changed Discovery toggle count", trace);
     assert(trace.discoveryRequests === 2, "People smoke changed discovery request count", trace);
     assert(trace.profileAttempts === 4, "People smoke changed Profile attempt count", trace);
-    console.log("PASS People first-run, discovery, retry, and layout");
+    assert(trace.removalTargets.length === 4, "People smoke changed removal attempt count", trace);
+    console.log("PASS People first-run, discovery, retry, exact contact confirmation, and layout");
   } finally {
     await context.close();
     server.close();

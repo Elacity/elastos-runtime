@@ -27,8 +27,8 @@ The latest installed evidence in this snapshot is E-105/E-106, from source
 `b233d8322a44c11e9432f95404d31e35a0517753`, tree
 `3f073277ba791a659adb2cde9885d9b310d08ba7`. Earlier source and installation refs
 remain attached to their original observations. Subsequent PR39 source changes
-need their own installed checks. See [current state](../../state.md) and
-[open work](../../TASKS.md) for the current integration status.
+need their own installed checks. See [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) for the
+current integration status.
 
 This public copy retains all seven sheets, findings and formulas. Local evidence
 paths have been replaced with private-evidence labels; the evidence files,

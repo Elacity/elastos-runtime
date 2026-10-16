@@ -13,7 +13,7 @@ pub(in crate::api) mod preparation;
 const DEV_CAPSULES_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../capsules");
 const MODEL_CATALOG_FILE: &str = "model-catalog.json";
 const MODEL_CATALOG_DOMAIN: &str = "elastos.model.catalog.v1";
-const MAX_MODEL_CATALOG_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_MODEL_CATALOG_BYTES: usize = 128 * 1024;
 const MAX_MODEL_CATALOG_ENTRIES: usize = 8;
 
 pub(crate) struct VerifiedModelCatalogEntry {
@@ -50,7 +50,11 @@ struct ModelCatalogEntry {
     object_manifest: Value,
 }
 
-fn read_model_catalog_file(data_dir: &Path, name: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn read_model_catalog_file(
+    data_dir: &Path,
+    name: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<u8>> {
     let root = std::fs::symlink_metadata(data_dir)?;
     if !root.is_dir() || root.file_type().is_symlink() {
         anyhow::bail!("model catalog requires a real data directory");
@@ -111,7 +115,7 @@ pub(crate) fn model_catalog_entries(
     verify_model_catalog(&trust, &bytes, now).map(Some)
 }
 
-fn verify_model_catalog(
+pub(crate) fn verify_model_catalog(
     trust: &crate::setup::ModelCatalogConfig,
     bytes: &[u8],
     now: u64,
@@ -257,26 +261,32 @@ fn installed_external_component_names_from_manifest(
     manifest
         .external
         .iter()
-        .filter_map(|(name, component)| {
-            let platform_info = crate::setup::resolve_platform_info(component, &platform);
-            let install_path = crate::setup::resolve_install_path(component, platform_info)?;
-            let install_path = Path::new(install_path);
-            if install_path.is_absolute()
-                || install_path
-                    .components()
-                    .any(|part| matches!(part, std::path::Component::ParentDir))
-                || !data_dir.join(install_path).exists()
-            {
-                return None;
-            }
-            Some(name.clone())
-        })
+        .filter(|(_, component)| component_is_installed(data_dir, component, &platform))
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
+fn component_is_installed(
+    data_dir: &Path,
+    component: &crate::setup::Component,
+    platform: &str,
+) -> bool {
+    let platform_info = crate::setup::resolve_platform_info(component, platform);
+    let Some(install_path) = crate::setup::resolve_install_path(component, platform_info) else {
+        return false;
+    };
+    let install_path = Path::new(install_path);
+    !install_path.is_absolute()
+        && !install_path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        && data_dir.join(install_path).exists()
+}
+
 pub(crate) fn installed_active_capsule_dir(data_dir: &Path, name: &str) -> Option<PathBuf> {
-    let active_capsules = active_capsule_names(data_dir)?;
-    if !active_capsules.contains(name) {
+    let manifest = components_manifest(data_dir)?;
+    let component = manifest.external.get(name)?;
+    if !component_is_installed(data_dir, component, &crate::setup::detect_platform()) {
         return None;
     }
     let dir = installed_capsules_root(data_dir).join(name);
@@ -420,7 +430,9 @@ pub(crate) mod tests {
             serde_json::json!(format!("sha256:{:x}", digest.finalize()));
     }
 
-    fn sign_model_catalog(payload: &Value) -> (crate::setup::ModelCatalogConfig, Vec<u8>) {
+    pub(crate) fn sign_model_catalog(
+        payload: &Value,
+    ) -> (crate::setup::ModelCatalogConfig, Vec<u8>) {
         let key = elastos_runtime::signature::SigningKey::from_bytes(&[7; 32]);
         let (signature, signer_did) = crate::crypto::domain_separated_sign(
             &key,
@@ -528,6 +540,58 @@ pub(crate) mod tests {
             "even a repinned payload needs the configured signature"
         );
         assert!(verify_model_catalog(&trust, &vec![0; MAX_MODEL_CATALOG_BYTES + 1], 2).is_err());
+    }
+
+    #[test]
+    fn model_catalog_refuses_unknown_publisher_and_invalid_signatures() {
+        let (trust, bytes) = sign_model_catalog(&model_catalog_fixture());
+        assert_eq!(verify_model_catalog(&trust, &bytes, 2).unwrap().len(), 1);
+
+        let fixture_key = elastos_runtime::signature::SigningKey::from_bytes(&[8; 32]);
+        let (_, other_publisher) =
+            crate::crypto::domain_separated_sign(&fixture_key, MODEL_CATALOG_DOMAIN, b"fixture");
+        crate::crypto::decode_did_key(&other_publisher).unwrap();
+        let mut unknown_trust = trust.clone();
+        unknown_trust.publisher_dids = vec![other_publisher];
+        assert!(verify_model_catalog(&unknown_trust, &bytes, 2).is_err());
+
+        for signature in [String::new(), "g".repeat(128), "00".repeat(64)] {
+            let mut envelope: Value = serde_json::from_slice(&bytes).unwrap();
+            envelope["signature"] = signature.into();
+            let altered = serde_json::to_vec(&envelope).unwrap();
+            let mut repinned = trust.clone();
+            repinned.head_cid = head_cid(&altered);
+            assert!(
+                verify_model_catalog(&repinned, &altered, 2).is_err(),
+                "a matching content pin cannot turn an invalid signature into publisher proof"
+            );
+        }
+    }
+
+    #[test]
+    fn model_catalog_accepts_release_signer_output_byte_for_byte() {
+        // Written by `scripts/release-signer.py --model-catalog` with a disposable key.
+        const CATALOG: &[u8] = include_bytes!("../../tests/fixtures/model-catalog.json");
+        let trust = crate::setup::ModelCatalogConfig {
+            head_cid: "bafkreifmbqk5trnjxqfjiop5bzmml6vl5ybrpoujssrmfqce4wrodn4x4y".into(),
+            publisher_dids: vec!["did:key:z6MkoeptPmH1nZnoao7WrcaNW9ZxZ7FteBCXPP8ofMzHE7bk".into()],
+            local_use: None,
+        };
+        let entries = verify_model_catalog(&trust, CATALOG, 1_760_000_000).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].manifest.name, "model-fixture");
+        assert_eq!(entries[0].publisher_did, trust.publisher_dids[0]);
+        for index in 0..CATALOG.len() {
+            let mut changed = CATALOG.to_vec();
+            changed[index] ^= 1;
+            let mut repinned = trust.clone();
+            repinned.head_cid = head_cid(&changed);
+            assert!(verify_model_catalog(&trust, &changed, 1_760_000_000).is_err());
+            assert!(
+                verify_model_catalog(&repinned, &changed, 1_760_000_000).is_err(),
+                "byte {index} changed without breaking the signature"
+            );
+        }
     }
 
     #[test]
@@ -829,37 +893,5 @@ pub(crate) mod tests {
             active_capsule_names(data_dir.path()).unwrap(),
             BTreeSet::from(["object-provider".to_string()])
         );
-    }
-
-    #[test]
-    fn checkout_permanent_catalog_matches_components_pin() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
-        let components: crate::setup::ComponentsManifest =
-            serde_json::from_slice(&std::fs::read(root.join("components.json")).unwrap()).unwrap();
-        let trust = components
-            .model_catalog
-            .expect("matching install pins a signed model catalog");
-        let bytes = std::fs::read(root.join(MODEL_CATALOG_FILE)).unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let entries = verify_model_catalog(&trust, &bytes, now).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(
-            entries[0].cid,
-            "bafybeid5l7gfgsqy2wozia2q7mtyux2wrbnlfehzz4at3ic3cngvyku6hi"
-        );
-        assert_eq!(entries[0].manifest.name, "qwen3-5-9b-q4-k-m-local");
-        assert_eq!(
-            entries[1].cid,
-            "bafybeidy5kfvqwg6g6pfgdfwslmhijosbeskt5b2duqdqxnc7e6fwmr72y"
-        );
-        assert_eq!(entries[1].manifest.name, "smollm2-135m-instruct-q8-0-local");
-        assert_eq!(
-            entries[0].publisher_did,
-            "did:key:z6Mkjg9duxEF2nskEPR9F38eSfrY6F1GyWUq5aDbgsMqgcjA"
-        );
-        assert_eq!(entries[1].publisher_did, entries[0].publisher_did);
     }
 }

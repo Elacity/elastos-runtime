@@ -43,6 +43,13 @@ const localCarrierSetup = read("scripts/local-carrier-setup-smoke.sh");
 
 /* ---- typed model contract, in source ------------------------------------- */
 
+assert.ok(
+  readFileSync(new URL("capsules/marketplace/browser/model-contract.js", root)).equals(
+    readFileSync(new URL("capsules/assistant/browser/model-contract.js", root)),
+  ),
+  "Marketplace uses the canonical Assistant model contract; run just vendor-ui",
+);
+
 for (const [name, source] of capsuleScripts) {
   assert.ok(
     !/offer:[a-z0-9-]+:[a-z0-9-]+/i.test(source),
@@ -68,7 +75,7 @@ assert.ok(
   "Assistant Chat and Studio decode events through the typed contract module",
 );
 assert.ok(agentLive.includes("after_sequence: afterSequence"), "runs_events is polled by after_sequence");
-assert.ok(agentLive.includes("textRunCreateBody({ offer, messages, requestId: createRequestId })"));
+assert.ok(agentLive.includes("maxOutputTokens: manifest.outputReserve"));
 assert.ok(agentLive.includes('modelRunCall("runs_cancel", { run_id: runId, request_id: newRequestId() })'));
 assert.ok(!agentLive.includes("agent-run-cursor"), "the URUX cursor helper is gone");
 
@@ -91,8 +98,10 @@ assert.ok(harnessHost.includes("error?.status === 409"), "a revision conflict re
 assert.ok(harnessHost.includes("if (workspaceRevision === null) {"), "no write before the read");
 assert.ok(entry.includes("loadAgentWorkspace()"), "the entry reads the workspace on boot");
 assert.ok(
-  entry.indexOf("loadAgentWorkspace()") < entry.indexOf('postToHome({ type: "home-agent:ready" })'),
-  "ready is posted after the workspace is read",
+  entry.indexOf('postToHome({ type: "home-agent:hello", docId: DOC_ID });') <
+    entry.indexOf("loadAgentWorkspace()") &&
+    entry.indexOf("loadAgentWorkspace()") < entry.indexOf('postToHome({ type: "home-agent:ready", docId: DOC_ID });'),
+  "each document says hello when its script starts and ready after its workspace is read",
 );
 assert.equal(
   (gateway.match(/\/api\/apps\/assistant\/workspace-v2/g) || []).length,
@@ -125,12 +134,6 @@ assert.ok(
 /* ---- ownership split with Home GUI ---------------------------------------- */
 
 assert.ok(homeFace.includes('const TARGET_ID = "assistant"'));
-assert.ok(
-  homeFace.includes("function onAssistantFrameDocumentLoad(") &&
-    homeFace.includes('frame?.addEventListener("load", onAssistantFrameDocumentLoad)') &&
-    homeFace.includes("frameReady = false"),
-  "a replaced Assistant document must handshake ready again so Home can raise the room",
-);
 assert.ok(
   homeWindows.includes('const HOME_AGENT_TARGET_ID = "assistant"') &&
     (homeWindows.match(/targetId === HOME_AGENT_TARGET_ID/g) || []).length === 3 &&
@@ -236,6 +239,7 @@ assert.ok(!/Planning weekend|calm weekend/.test(read("capsules/assistant/browser
 /* ---- the pure contract module -------------------------------------------- */
 
 const contract = await import(new URL("model-contract.js", capsuleDir));
+const context = await import(new URL("agent-context.js", capsuleDir));
 const homeMessageContract = await import(
   new URL("capsules/home-gui/browser/home-agent-message-contract.js", root)
 );
@@ -318,6 +322,54 @@ for (const invalid of [
   assert.equal(homeMessageContract.normalizeHomeAgentBrowserUrl(invalid), "");
 }
 
+/* Readiness: each document announces hello {docId} then ready {docId}. The
+   contract takes no load event, so the frame's load timing cannot matter. */
+{
+  const create = () => homeMessageContract.createAssistantFrameReadiness();
+  const id = (n) => n.toString(16).padStart(32, "0");
+  const hello = (docId) => ({ type: "home-agent:hello", docId });
+  const ready = (docId) => ({ type: "home-agent:ready", docId });
+  const legacy = { type: "home-agent:ready" };
+  // A document's hello hides, its ready shows once (whenever the load event fired).
+  let readiness = create();
+  assert.equal(readiness.receive(ready(id(1))), "", "a ready before its document's hello is ignored");
+  assert.equal(readiness.receive(hello(id(1))), "hide");
+  assert.equal(readiness.receive(ready(id(1))), "show", "the document's own ready shows the room");
+  assert.equal(readiness.receive(ready(id(1))), "", "a duplicate ready is ignored");
+  // In-frame reload: the new hello hides; the old document's late ready is ignored; the new ready shows.
+  assert.equal(readiness.receive(hello(id(2))), "hide", "a new document's hello hides the room");
+  assert.equal(readiness.receive(ready(id(1))), "", "a stale ready from the replaced document is ignored");
+  assert.equal(readiness.receive(ready(id(2))), "show", "the reloaded document's ready shows the room");
+  // A document that never gets ready, replaced by one that does.
+  assert.equal(readiness.receive(hello(id(3))), "hide");
+  assert.equal(readiness.receive(hello(id(4))), "hide");
+  assert.equal(readiness.receive(ready(id(3))), "", "the abandoned document's ready is ignored");
+  assert.equal(readiness.receive(ready(id(4))), "show");
+  // Home sets or changes src: nothing is current until the new document says hello.
+  readiness.reset();
+  assert.equal(readiness.receive(ready(id(4))), "", "a ready from before Home changed src is ignored");
+  assert.equal(readiness.receive(hello(id(5))), "hide");
+  assert.equal(readiness.receive(ready(id(5))), "show");
+  // Wrong shapes never count.
+  for (const bad of [{ ...ready(id(5)), extra: true }, ready("not-an-id"), ready(5), hello(""),
+    { type: "home-agent:ready", nonce: "x" }, { type: "home-agent:other", docId: id(6) }, null, "home-agent:ready"]) {
+    assert.equal(readiness.receive(bad), "", JSON.stringify(bad));
+  }
+  // Legacy Assistant after Undo (only {type} ready, no hello): shows as before, before or after load.
+  readiness = create();
+  assert.equal(readiness.receive(legacy), "show", "a legacy ready shows the room");
+  assert.equal(readiness.receive(legacy), "show", "a legacy reload's ready shows the room again");
+  readiness.reset();
+  assert.equal(readiness.receive(legacy), "show", "after Home changes src, a legacy ready still shows");
+  // Undo, then an in-frame reload into the old Assistant: its ready takes over from current A.
+  assert.equal(readiness.receive(hello(id(7))), "hide");
+  assert.equal(readiness.receive(legacy), "show", "a legacy ready after a current hello shows the room");
+  assert.equal(readiness.receive(ready(id(7))), "", "the replaced current document's ready no longer counts");
+  assert.equal(readiness.receive(hello(id(8))), "hide", "a following current document takes over again");
+  assert.equal(readiness.receive(ready(id(8))), "show");
+  assert.equal(readiness.receive(ready(id(8))), "", "shown once");
+}
+
 const offersPayload = {
   status: "ok",
   data: {
@@ -356,7 +408,9 @@ assert.deepEqual(rows, [
     label: "Local chat",
     detail: "This Home · local",
     streamOutput: true,
+    routeKind: "local",
     inputSchemas: [],
+    context: null,
     selectionFacts: localFacts,
   },
 ]);
@@ -501,6 +555,42 @@ assert.deepEqual(body, {
   operation: "text.generate",
   request_id: "req-1",
   input: { schema: "elastos.model.input.text/v1", prompt: contract.transcriptPrompt(messages) },
+});
+const boundedLocal = contract.textOfferRows([{ ...textOffers[0], context: {
+  context_window_tokens: 256, max_output_tokens: 64,
+} }])[0];
+const effective = context.capabilitiesForOffer(boundedLocal);
+assert.deepEqual(effective.context, {
+  ...context.TEXT_CONTRACT_CAPABILITIES.context,
+  maxInputTokens: 256,
+  maxOutputTokens: 64,
+});
+assert.equal(context.makeBudget(effective.context, 32).outputReserve, 32);
+assert.ok(context.makeBudget(effective.context, 32).hardEstimatedInputLimit < 256 - 32);
+const longHistory = Array.from({ length: 25 }, (_, i) => ({
+  id: `turn-${i}`, role: i % 2 ? "assistant" : "user", content: `turn ${i} ${"x".repeat(400)}`,
+}));
+const packed = context.compileContext({
+  history: longHistory,
+  currentInput: { id: "current", role: "user", content: "Continue" },
+  constraints: [{ id: "system", kind: "system_policy", role: "system", content: "Be brief.", mustInclude: true }],
+  budget: context.makeBudget(effective.context, 32),
+  capabilities: effective,
+});
+assert.ok(packed.omitted.length > 0);
+assert.ok(packed.manifest.estimatedInputTokens <= packed.budget.hardEstimatedInputLimit);
+assert.equal(packed.manifest.outputReserve, 32);
+for (const missing of [null, {}, { context_window_tokens: 256 },
+  { context_window_tokens: 256, max_output_tokens: 256 }]) {
+  assert.throws(() => context.capabilitiesForOffer({ ...boundedLocal, context: missing }),
+    { code: "context_overflow" });
+}
+assert.deepEqual(contract.textRunCreateBody({
+  offer: boundedLocal, messages, requestId: "bounded", maxOutputTokens: 32,
+}).input, {
+  schema: contract.MODEL_TEXT_INPUT_SCHEMA,
+  prompt: contract.transcriptPrompt(messages),
+  max_output_tokens: 32,
 });
 // Follow the serialized offer response through selection into the run request.
 const conversation = [

@@ -58,12 +58,7 @@ globalThis.addEventListener?.("pagehide", () => {
 setRuntimeTerminalMode(false);
 boot().catch((error) => {
   console.error("Home CLI terminal could not start", error);
-  showFallback("Home CLI could not start. Return to the Desktop and try again.", {
-    allowDesktopRecovery: true,
-    allowRefresh: true,
-    focusDesktopRecovery: true,
-    includeRetainedTerminalOutput: true,
-  });
+  showTerminalStartFailure(error, "Home CLI could not start. Return to the Desktop and try again.");
 });
 
 async function boot() {
@@ -441,12 +436,7 @@ function reattachHomeCliTerminal(message = "") {
   globalThis.setTimeout?.(() => {
     startRuntimeTerminal().catch((error) => {
       console.error("Home CLI could not restart", error);
-      showFallback("Home CLI could not reconnect. Return to the Desktop and try again.", {
-        allowDesktopRecovery: true,
-        allowRefresh: true,
-        focusDesktopRecovery: true,
-        includeRetainedTerminalOutput: true,
-      });
+      showTerminalStartFailure(error, "Home CLI could not reconnect. Return to the Desktop and try again.");
     });
   }, 0);
 }
@@ -458,12 +448,19 @@ function retryHomeCliTerminalFromFallback() {
   showFallback("Starting Home CLI terminal...", { includeRetainedTerminalOutput: false });
   startRuntimeTerminal().catch((error) => {
     console.error("Home CLI retry failed", error);
-    showFallback("Home CLI could not start. Return to the Desktop and try again.", {
-      allowDesktopRecovery: true,
-      allowRefresh: true,
-      focusDesktopRecovery: true,
-      includeRetainedTerminalOutput: true,
-    });
+    showTerminalStartFailure(error, "Home CLI could not start. Return to the Desktop and try again.");
+  });
+}
+
+function showTerminalStartFailure(error, message) {
+  const refused = error?.status === 403;
+  showFallback(refused
+    ? "Runtime refused web terminal access. The host operator can check developer mode and guest registration. Return to the Desktop."
+    : message, {
+    allowDesktopRecovery: true,
+    allowRefresh: !refused,
+    focusDesktopRecovery: true,
+    includeRetainedTerminalOutput: true,
   });
 }
 
@@ -687,7 +684,9 @@ async function fetchJson(url, init = {}) {
   const response = await fetch(url, init);
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
-    throw new Error(detail || `request failed: ${response.status}`);
+    const error = new Error(detail || `request failed: ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }

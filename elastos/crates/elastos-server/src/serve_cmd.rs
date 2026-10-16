@@ -69,6 +69,15 @@ pub async fn run_serve(
                 .validate()
                 .map_err(|e| anyhow::anyhow!("Invalid manifest: {}", e))?;
 
+            if matches!(
+                manifest.execution_type(),
+                elastos_common::CapsuleType::WebProjection
+                    | elastos_common::CapsuleType::NativeProvider
+                    | elastos_common::CapsuleType::NativeHost
+            ) {
+                anyhow::bail!("Web projections and native helpers use their existing Runtime-owned host paths");
+            }
+
             if manifest.capsule_type == elastos_common::CapsuleType::MicroVM {
                 tracing::info!("Launching MicroVM capsule: {}", manifest.name);
 
@@ -426,6 +435,8 @@ pub async fn run_serve(
         binary_sha256,
         policy_sha256,
         dependency_sha256,
+        generation: std::env::var("ELASTOS_UPDATE_GENERATION").unwrap_or_default(),
+        home_url: String::new(),
     };
     let coords_path = crate::runtime_control::runtime_coord_path(&data_dir);
     if let Err(e) = crate::runtime_control::write_runtime_coords(&coords_path, &coords) {
@@ -433,7 +444,7 @@ pub async fn run_serve(
     } else if runtime_kind == crate::runtime_control::RUNTIME_KIND_MANAGED_CHAT {
         eprintln!("[serve] Managed chat runtime ready");
     } else {
-        eprintln!("[serve] Attach commands (elastos chat, elastos run) ready");
+        eprintln!("[serve] Attach commands (elastos run, elastos capsule) ready");
     }
 
     {

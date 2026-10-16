@@ -159,9 +159,8 @@ async function settle() {
 }
 
 function extractInboxScript(html) {
-  const match = html.match(/<script>([\s\S]*)<\/script>\s*<\/body>/);
-  assert(match, "Inbox inline script not found");
-  return match[1];
+  assert(html.includes('<script src="./inbox.js"></script>'), "Inbox script reference not found");
+  return fs.readFileSync(new URL("../capsules/inbox/browser/inbox.js", import.meta.url), "utf8");
 }
 
 async function runInboxHomeChromeSmoke() {
@@ -264,7 +263,7 @@ async function runInboxHomeChromeSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 
@@ -644,7 +643,7 @@ async function runInboxLaunchSelectionSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 
@@ -728,7 +727,7 @@ async function runInboxMissingLaunchSelectionSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 
@@ -827,7 +826,7 @@ async function runInboxRemovedLaunchSelectionSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
   await nodes.get("refresh").listeners.get("click")[0]();
@@ -927,7 +926,7 @@ async function runInboxRequestedSelectionAppearsLaterSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 

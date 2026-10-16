@@ -88,6 +88,9 @@ let currentDefaults = [];
 let currentBalanceRows = [];
 let currentPrices = {};
 let currentApprovalMethods = {};
+// Home preloads the Wallet rail out of sight. Until the user opens it, Wallet
+// reads prices without asking for market-price access.
+let walletShownToUser = readQueryParam("preload") !== "1";
 let pricesStale = false;
 let pricesUnavailable = false;
 let currentRequests = [];
@@ -434,6 +437,8 @@ function onWalletRefreshMessage(event) {
   if (message.type !== "elastos:wallet-refresh") {
     return;
   }
+  // Home sends this refresh when the user opens the Wallet rail.
+  walletShownToUser = true;
   refreshWalletState().catch((error) =>
     showStatus(String(error.message || error), "error"),
   );
@@ -500,7 +505,7 @@ async function loadWalletState() {
   }
   const [summary, prices] = await Promise.all([
     fetchJson("/api/apps/wallet/wallet/summary", { headers: shellHeaders() }),
-    loadPrices(),
+    loadPrices({ requestAccess: walletShownToUser }),
   ]);
   const walletAccounts = summary && summary.wallet_accounts;
   const walletApprovals = summary && summary.wallet_approvals;

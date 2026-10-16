@@ -84,7 +84,7 @@ export function resolveReasoningPolicy(requested, caps = TEXT_CONTRACT_CAPABILIT
 /** Char/4 estimator — not the provider tokenizer. Pack against a margin, not the raw cap. */
 export const TOKEN_ESTIMATOR = "chars/4";
 const ESTIMATOR_HEADROOM = 0.92;
-const MIN_VIABLE_ESTIMATED_INPUT = 512;
+const MIN_VIABLE_ESTIMATED_INPUT = 32;
 
 export class ContextOverflowError extends Error {
   constructor(message) {
@@ -92,6 +92,21 @@ export class ContextOverflowError extends Error {
     this.name = "ContextOverflowError";
     this.code = "context_overflow";
   }
+}
+
+export function capabilitiesForOffer(offer, capabilities = TEXT_CONTRACT_CAPABILITIES) {
+  if (!offer?.context && offer?.routeKind !== "local") return capabilities;
+  const contextWindow = offer.context?.context_window_tokens;
+  const outputLimit = offer.context?.max_output_tokens;
+  if (!Number.isInteger(contextWindow) || contextWindow <= 0 ||
+      !Number.isInteger(outputLimit) || outputLimit <= 0 || outputLimit >= contextWindow) {
+    throw new ContextOverflowError("Selected local model has incomplete context limits");
+  }
+  return { ...capabilities, context: {
+    ...capabilities.context,
+    maxInputTokens: contextWindow,
+    maxOutputTokens: outputLimit,
+  } };
 }
 
 export function approxTokens(text) {
@@ -793,6 +808,7 @@ export function compileContext({
     tokenEstimator: TOKEN_ESTIMATOR,
     estimatorHeadroom: tokenBudget.estimatorHeadroom,
     estimatedInputTokens: used,
+    outputReserve: tokenBudget.outputReserve,
     estimatedSystemTokens: systemTokens,
     estimatedRuntimeTokens: runtimeTokens,
     estimatedCurrentInputTokens: currentInputTokens,

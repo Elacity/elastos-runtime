@@ -8,6 +8,7 @@ import {
 import {
   closeOtherShellPopovers,
   registerShellPopover,
+  registerStageLayer,
 } from "./shell-popovers.js?v=home-20260813a";
 import {
   iframeAllowForLaunch,
@@ -94,6 +95,7 @@ export function bindWalletRail() {
   }
   if (!registered) {
     registerShellPopover("wallet-rail", () => hideWalletRail({ restoreFocus: false }));
+    registerStageLayer("wallet-rail", { selector: "#wallet-rail", close: () => hideWalletRail({ restoreFocus: false }) });
     registered = true;
   }
   barButton?.addEventListener("click", () => {
@@ -337,6 +339,10 @@ function markFrameReady() {
   frame?.classList.add("is-ready");
   pushUiPreferencesToFrameWindow(frame?.contentWindow);
   flushQueuedChromeCommand();
+  // The rail opened while the preloaded Wallet was still loading.
+  if (walletRailOpen() && new URL(frame.dataset.route).searchParams.get("preload") === "1") {
+    postWalletSoftRefresh();
+  }
 }
 
 function onWalletChromeMessage(event) {
@@ -415,7 +421,7 @@ export function preloadWalletRail() {
   if (!walletRailAvailable() || !frame || frame.dataset.route || launching) {
     return;
   }
-  void mountWalletFrame();
+  void mountWalletFrame({ preload: true });
 }
 
 function clearPreloadTimer() {
@@ -656,7 +662,7 @@ export function retireWalletRail() {
   }
 }
 
-async function mountWalletFrame() {
+async function mountWalletFrame({ preload = false } = {}) {
   if (launching) {
     return;
   }
@@ -698,6 +704,9 @@ async function mountWalletFrame() {
     // chrome (those live in this head). Window launches omit the flag.
     const route = new URL(String(launched.route || ""), window.location.origin);
     route.searchParams.set("presentation", "rail");
+    // A preloaded Wallet stays out of sight, so it must not ask for market
+    // prices until the rail opens (see postWalletSoftRefresh).
+    if (preload) route.searchParams.set("preload", "1");
     frame.src = route.href;
     frame.dataset.route = route.href;
   } catch (error) {

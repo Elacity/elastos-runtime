@@ -245,7 +245,16 @@ pub struct OfferSummary {
     pub stream_output: bool,
     pub policy: OfferPolicySummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<LocalContextLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted: Option<HostedOfferDisclosure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalContextLimits {
+    pub context_window_tokens: u32,
+    pub max_output_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -312,6 +321,14 @@ pub struct ProviderFault {
 }
 
 impl ProviderFault {
+    pub fn request_expired() -> Self {
+        Self {
+            code: elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE,
+            message: elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE,
+            detail: None,
+        }
+    }
+
     pub fn invalid_request(message: &'static str) -> Self {
         Self {
             code: "invalid_request",

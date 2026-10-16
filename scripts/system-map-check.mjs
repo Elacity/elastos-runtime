@@ -9,13 +9,11 @@ import { Script } from "node:vm";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const c4Path = resolve(repoRoot, "docs/system-map/c4.md");
 const viewerPath = resolve(repoRoot, "docs/system-map/viewer.html");
-const statePath = resolve(repoRoot, "state.md");
 const glossaryPath = resolve(repoRoot, "docs/GLOSSARY.md");
 const mapReadmePath = resolve(repoRoot, "docs/system-map/README.md");
-const [c4, viewer, state, glossary, mapReadme] = await Promise.all([
+const [c4, viewer, glossary, mapReadme] = await Promise.all([
   readFile(c4Path, "utf8"),
   readFile(viewerPath, "utf8"),
-  readFile(statePath, "utf8"),
   readFile(glossaryPath, "utf8"),
   readFile(mapReadmePath, "utf8"),
 ]);
@@ -30,7 +28,6 @@ const localTargetPath = (sourcePath, target) => {
 
 const linkedDocuments = [
   resolve(repoRoot, "PRINCIPLES.md"),
-  statePath,
   c4Path,
   resolve(repoRoot, "docs/README.md"),
   resolve(repoRoot, "docs/ARCHITECTURE.md"),
@@ -126,7 +123,7 @@ for (const required of [
   "not a C4 Level 4 diagram",
   "not the capsule contract",
   "Runtime owns Browser display and engine selection",
-  "Assign target roles from verified host capabilities recorded in state.md",
+  "Assign target roles from verified host capabilities recorded in the owning GitHub issue",
   "Markdown is correct and this viewer is wrong",
 ]) {
   if (!viewer.includes(required)) failures.push(`viewer is missing: ${required}`);
@@ -141,10 +138,6 @@ for (const required of [
   "Consequence-aware effects",
 ]) {
   if (!c4.includes(required)) failures.push(`c4.md is missing: ${required}`);
-}
-
-if (!/^Last updated: \d{4}-\d{2}-\d{2} UTC$/m.test(state)) {
-  failures.push("state.md is missing a valid UTC update date");
 }
 
 for (const required of [

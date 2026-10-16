@@ -223,7 +223,7 @@ test("Library protect and list sends the exact runtime custody publish shape", a
     revision: "rev:movie",
     name: "movie.mp4",
     mime: "video/mp4",
-    capabilities: ["publish"],
+    capabilities: ["publish", "protect"],
   });
 
   assert.deepEqual(requests, [
@@ -346,6 +346,13 @@ test("Library protect and list ignores ineligible objects", async () => {
       name: "missing-capability.mp4",
       mime: "video/mp4",
     },
+    {
+      uri: "localhost://Users/test/Documents/protection-not-released.mp4",
+      kind: "file",
+      name: "protection-not-released.mp4",
+      mime: "video/mp4",
+      capabilities: ["publish"],
+    },
   ];
 
   for (const object of cases) {
@@ -387,7 +394,7 @@ test("Library renders pending, denied, unavailable, and failed protection states
       revision: "rev:movie",
       name: "movie.mp4",
       mime: "video/mp4",
-      capabilities: ["publish"],
+      capabilities: ["publish", "protect"],
     });
 
     assert.equal(statuses.at(-1), expected);
@@ -425,7 +432,7 @@ test("Library coalesces repeated protect and list clicks for one object", async 
     revision: "rev:movie",
     name: "movie.mp4",
     mime: "video/mp4",
-    capabilities: ["publish"],
+    capabilities: ["publish", "protect"],
   };
 
   const first = actions.protectAndListObject(object);

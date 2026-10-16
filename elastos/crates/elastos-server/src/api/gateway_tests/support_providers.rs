@@ -3230,6 +3230,8 @@ enum MockBrowserEngineCloseFailure {
     AlreadyClosed,
     RestartFailClosed,
     RetainedOwnerUnavailable,
+    MismatchedTerminalBinding,
+    IncompleteTerminalReceipt,
 }
 
 struct MockRetryingBrowserEngineProvider {
@@ -3941,6 +3943,20 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                         "launch_settlement_result": settlement,
                     }));
                 }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
+                        | MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement
+                ) && request["url"]
+                    .as_str()
+                    .is_some_and(|url| url.contains("profile-recovery.invalid"))
+                {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "profile_recovery_required",
+                        "message": "Browser profile setup was interrupted. Reset this profile to start again.",
+                    }));
+                }
                 if (matches!(
                     self.failure,
                     MockDispatchedBrowserLaunchFailure::PendingThenTerminal
@@ -4330,6 +4346,16 @@ impl Provider for MockRetryingBrowserEngineProvider {
                         "code": "engine_close_indeterminate",
                         "message": "Engine retained owner unavailable"
                     })),
+                    MockBrowserEngineCloseFailure::MismatchedTerminalBinding => {
+                        let mut response = mock_browser_terminal_cleanup_response(request);
+                        response["data"]["binding"]["generation"] = json!("generation:mismatched");
+                        Ok(response)
+                    }
+                    MockBrowserEngineCloseFailure::IncompleteTerminalReceipt => {
+                        let mut response = mock_browser_terminal_cleanup_response(request);
+                        response["data"]["effects"]["vm_absent"] = json!(false);
+                        Ok(response)
+                    }
                 };
             }
             let response = <MockBrowserEngineProvider as Provider>::send_raw(

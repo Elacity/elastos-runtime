@@ -347,9 +347,10 @@ dependencies = [
 
 [[package]]
 name = "elastos-common"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -367,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-identity"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

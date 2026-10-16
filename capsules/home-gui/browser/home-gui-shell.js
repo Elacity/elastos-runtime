@@ -5,6 +5,7 @@ import {
   openHomeGuiTarget,
   relaunchHomeGuiWindowForToken,
   renewHomeGuiBrowserWindowAuthority,
+  renewHomeGuiChatWindowAuthority,
   restoreHomeGuiSession,
   setHomeGuiMenuManifest,
   handleHomeGuiHomeNavigation,
@@ -21,6 +22,8 @@ import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
 } from "./home-gui-authority.js?v=home-20260813a";
+import { FORM_FACTOR_EVENT, isPhone, relayKeyboardInset } from "./shell-form-factor.js?v=home-20260813a";
+import { applyHomeLinkStatus } from "./shell-link-status.js?v=home-20260813a";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -157,6 +160,23 @@ function handleGuiCommand(message) {
   }
   if (command === "renew-browser-authority") {
     return handleBrowserAuthorityRenewalCommand(message);
+  }
+  if (command === "renew-chat-authority") {
+    if (!hasExactKeys(message, ["type", "command", "requestId", "homeToken", "launched", "expiresAt", "phase"])
+      || !/^[A-Za-z0-9-]{1,64}$/.test(message.requestId)
+      || !Number.isSafeInteger(message.expiresAt) || !["prepare", "commit"].includes(message.phase)) return false;
+    const freshHomeToken = new URLSearchParams(new URL(message.launched?.route, homeOrigin).hash.slice(1)).get("home_token") || "";
+    if (message.phase === "commit") {
+      const ok = renewHomeGuiChatWindowAuthority(message.homeToken, message.launched, homeOrigin);
+      postToHome({ type: "home:chat-authority-committed", requestId: message.requestId,
+        oldHomeToken: message.homeToken, freshHomeToken, ok });
+      return ok;
+    }
+    const ok = message.expiresAt > Date.now()
+      && renewHomeGuiChatWindowAuthority(message.homeToken, message.launched, homeOrigin, false);
+    postToHome({ type: "home:chat-authority-renewed", requestId: message.requestId,
+      oldHomeToken: message.homeToken, freshHomeToken, ok });
+    return ok;
   }
   if (command === "open-target") {
     return openHomeGuiTarget(message.target, { query: message.query || {} });
@@ -368,6 +388,14 @@ window.addEventListener("message", (event) => {
     settleRequest(message);
     return;
   }
+  if (message.type === "home:keyboard-inset") {
+    relayKeyboardInset(message.inset);
+    return;
+  }
+  if (message.type === "home:link-status") {
+    applyHomeLinkStatus(message);
+    return;
+  }
   if (message.type === "home:shell-summary") {
     applySummary(message.summary).catch((error) => {
       document.body.dataset.homeStatus = "error";
@@ -386,6 +414,13 @@ window.addEventListener("message", (event) => {
         console.error("home-gui command failed", error);
       });
   }
+});
+
+// The host page owns the top-level viewport tag; it takes the phone variant
+// only while this shell's committed form factor is a phone (also at load:
+// the first commit happens when the interactions bind).
+window.addEventListener(FORM_FACTOR_EVENT, () => {
+  postToHome({ type: "home:form-factor", phone: isPhone() });
 });
 
 bindHomeGuiInteractions({

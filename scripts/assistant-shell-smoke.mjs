@@ -183,6 +183,7 @@ function createFetchFixture({
       };
     }
     if (url === "/api/provider/model/runs_create") {
+      if (typeof createResponse === "function") return createResponse(JSON.parse(init.body));
       return {
         ok: true,
         status: 200,
@@ -249,7 +250,7 @@ async function buildApp(options = {}) {
   const timerOrder = [];
   let timerId = 0;
   let uuidCounter = 0;
-  let nowMs = 0;
+  let nowMs = 1000;
   const clipboard = {
     config: null,
     startCount: 0,
@@ -364,6 +365,7 @@ async function buildApp(options = {}) {
 {
   const cid = `bafybei${"a".repeat(52)}`;
   const mapped = offer("content-offer", "Prepared model");
+  const successor = offer("content-offer-current-engine", "Prepared model");
   const hosted = offer(`model:${"b".repeat(64)}`, "Hosted service");
   const rows = [{ source: "signed-model-catalog", role: "content", installed: false, launchable: false,
     cid, title: "Prepared model", signature_state: "catalog-signature-verified",
@@ -373,7 +375,9 @@ async function buildApp(options = {}) {
   let readOffers = () => currentOffers;
   const fixture = await buildApp({ offersRead: () => readOffers(), unavailable: () => failed,
     catalogRead: () => ({ schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified", capsules: currentRows }),
-    workspace: { schema: "elastos.assistant.workspace/v1", revision: 0, sessions: [], draft: "Keep exact text",
+    workspace: { schema: "elastos.assistant.workspace/v1", revision: 0,
+      sessions: [{ id: "saved-chat", title: "Saved chat", mode: "chat", created_at: 1, updated_at: 2,
+        messages: [{ role: "user", content: "Saved question" }, { role: "assistant", content: "Saved answer", run_id: "original-run" }] }], draft: "Keep exact text",
       selected_offer_id: mapped.id, selected_model_cid: cid },
   });
   const { app, fetch, posts, flushTimers } = fixture;
@@ -398,13 +402,29 @@ async function buildApp(options = {}) {
   assert.deepEqual(select.children.map(option => option.textContent).sort(), ["Hosted service", "Prepared model"]);
   assert.equal(select.children.find(option => option.selected).value, `content:${cid}`);
   assert.equal(nodes.get("#assistant-send").disabled, false);
+  const history = app.snapshot().sessions;
+  currentOffers = [successor, hosted];
+  currentRows = [{ ...rows[0], model_runtime: { admitted: true, dispatch_ready: true, offer_id: successor.id } }];
+  await app.refreshModels(); mounted.render();
+  assert.equal(app.snapshot().selectedOfferId, successor.id, "the saved CID updates only the execution hint");
+  assert.equal(app.snapshot().selectedModelCid, cid);
+  assert.equal(select.children.find(option => option.selected).value, `content:${cid}`);
+  assert.equal(app.snapshot().sendDisabled, false);
+  assert.equal(app.snapshot().draft, "Keep exact text");
+  assert.deepEqual(app.snapshot().sessions, history, "engine replacement preserves saved chat history");
+  await flushTimers();
+  assert.equal(fetch.savedBodies.at(-1).selected_offer_id, successor.id);
+  assert.equal(fetch.savedBodies.at(-1).selected_model_cid, cid);
+  assert.equal(fetch.savedBodies.at(-1).draft, "Keep exact text");
+  assert.deepEqual(fetch.savedBodies.at(-1).sessions, history);
+  assert.equal(fetch.fetchCalls.filter(([url]) => url.endsWith("runs_create")).length, 0, "hint repair starts no run");
   for (const unavailableRows of [[], [rows[0], rows[0]], [{ ...rows[0], model_runtime: { admitted: true, dispatch_ready: false, offer_id: null } }]]) {
     currentRows = unavailableRows;
     await app.refreshModels(); mounted.render();
     assert.equal(nodes.get("#assistant-send").disabled, true);
     assert.equal(await app.sendDraft(), false);
     assert.equal(app.snapshot().selectedModelCid, cid);
-    assert.equal(app.snapshot().selectedOfferId, mapped.id);
+    assert.equal(app.snapshot().selectedOfferId, successor.id);
     assert.equal(app.snapshot().draft, "Keep exact text");
   }
   currentRows = rows; failed = true;
@@ -466,6 +486,40 @@ for (const first of ["offers", "workspace"]) {
   assert.equal(app.snapshot().selectedOfferId, "saved", `${first} first preserves saved choice`);
   assert.equal(app.snapshot().draft, "Saved text");
   assert.equal(app.snapshot().sendDisabled, true);
+}
+
+for (const first of ["offers", "workspace"]) {
+  const cid = `bafybei${"a".repeat(52)}`;
+  const successor = offer("current-engine", "Saved model");
+  const pending = {}, started = {};
+  const arrived = ["offers", "workspace"].map(key => new Promise(resolve => { started[key] = resolve; }));
+  const held = key => new Promise(resolve => { pending[key] = resolve; started[key](); });
+  const opening = buildApp({ offersRead: async () => { await held("offers"); return [successor]; },
+    catalogRead: () => ({ schema: "elastos.capsules.catalog/v1", model_catalog_state: "verified", capsules: [{
+      source: "signed-model-catalog", role: "content", installed: false, launchable: false, cid,
+      title: "Saved model", signature_state: "catalog-signature-verified",
+      model_runtime: { admitted: true, dispatch_ready: true, offer_id: successor.id } }] }),
+    workspaceRead: () => held("workspace"),
+    workspace: { schema: "elastos.assistant.workspace/v1", revision: 1, sessions: [], draft: "Saved text",
+      selected_offer_id: "previous-engine", selected_model_cid: cid },
+  });
+  await Promise.all(arrived);
+  pending[first]();
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  pending[first === "offers" ? "workspace" : "offers"]();
+  const { app, fetch, flushTimers } = await opening;
+  assert.equal(app.snapshot().selectedOfferId, successor.id, `${first} first resolves saved CID through current catalog`);
+  assert.equal(app.snapshot().selectedModelCid, cid);
+  assert.equal(app.snapshot().draft, "Saved text");
+  assert.equal(app.snapshot().sendDisabled, false);
+  await flushTimers();
+  assert.equal(fetch.savedBodies.at(-1).selected_offer_id, successor.id);
+  assert.equal(fetch.savedBodies.at(-1).selected_model_cid, cid);
+  assert.equal(await app.sendDraft(), true);
+  const create = fetch.fetchCalls.find(([url]) => url.endsWith("runs_create"));
+  assert.equal(JSON.parse(create[1].body).offer_id, successor.id, "a fresh request uses the current engine offer");
+  assert.equal(JSON.parse(create[1].body).input.prompt, "Saved text");
+  await app.stopRun();
 }
 
 {
@@ -810,7 +864,7 @@ for (const first of ["offers", "workspace"]) {
   });
   assert.equal(createBody.offer_id, "offer:text-1");
   assert.equal(createBody.operation, "text.generate");
-  assert.match(createBody.request_id, /^uuid-/);
+  assert.match(createBody.request_id, /^model-v1:\d+:uuid-/);
   const messages = app.snapshot().currentSession.messages;
   assert.equal(messages.at(-1).content, "Hello world");
 }
@@ -874,6 +928,58 @@ for (const first of ["offers", "workspace"]) {
     /> Note: Transcript truncated to fit the trusted Home Clipboard limit\.$/,
   );
   assert.equal(clipboardWrites[0].text.includes("\ufffd"), false);
+}
+
+// An exact refusal keeps the unsent draft and removes only this attempt's
+// message. A mismatched refusal keeps the original uncertain request blocked.
+for (const [exact, editDuringCreate] of [[true, null], [true, "Newer edit"], [true, ""], [false, null]]) {
+  const prompt = "Keep this draft";
+  const originalMessages = [{ role: "user", content: prompt }, { role: "assistant", content: "Earlier reply" }];
+  let appRef, requests = 0;
+  const { app, fetch } = await buildApp({
+    workspace: { schema: "elastos.assistant.workspace/v1", revision: 3,
+      sessions: [{ id: "saved-chat", mode: "chat", title: "Saved chat", messages: originalMessages }],
+      draft: prompt, selected_offer_id: "offer:text-1" },
+    createResponse: body => {
+      if (++requests > 1) return { ok: true, status: 200, json: async () => ({ status: "ok", data: {
+        schema: "elastos.model.run/v1", run_id: `run:sha256:${"a".repeat(64)}`,
+        status: "completed", sequence_cursor: 1,
+        terminal: { output: { schema: "elastos.model.output.text/v1", text: "Fresh reply" } },
+      } }) };
+      if (editDuringCreate !== null) appRef.setDraft(editDuringCreate);
+      return { ok: false, status: 409, json: async () => ({ status: "error", code: "model_invocation_refused",
+        reason: "request_expired", message: "This request is no longer valid. Check your device's clock, then try again.",
+        refusal: { schema: "elastos.model.invocation-refusal/v1", scope: "invocation", dispatch: "provider_refused",
+          request_id: exact ? body.request_id : "different-request", offer_id: body.offer_id,
+          operation: body.operation, input_hash: `sha256:${"b".repeat(64)}` },
+      }) };
+    },
+  });
+  appRef = app;
+  assert.equal(await app.sendDraft(), false);
+  const firstId = JSON.parse(fetch.fetchCalls.find(([url]) => url.endsWith("runs_create"))[1].body).request_id;
+  assert.equal(app.snapshot().activeRun.status, exact ? "not_sent" : "settlement_unknown");
+  assert.equal(app.snapshot().activeRun.terminal, exact);
+  if (exact) {
+    assert.deepEqual(app.snapshot().currentSession.messages, originalMessages, "only the unsent attempt is removed");
+    assert.equal(app.snapshot().draft, editDuringCreate ?? prompt, "a newer edit keeps even an empty draft");
+    if (editDuringCreate === "") {
+      assert.equal(await app.sendDraft(), false);
+      assert.equal(requests, 1, "a deliberately cleared draft stays unsent");
+      app.setDraft("Fresh deliberate edit");
+    }
+    assert.equal(await app.sendDraft(), true);
+    const creates = fetch.fetchCalls.filter(([url]) => url.endsWith("runs_create")).map(([,init]) => JSON.parse(init.body));
+    assert.notEqual(creates[1].request_id, firstId);
+    assert.equal(creates[1].input.prompt, editDuringCreate === "" ? "Fresh deliberate edit" : editDuringCreate ?? prompt);
+    assert.equal(app.snapshot().currentSession.messages.filter(message => message.role === "user").length, 2,
+      "a deliberate retry adds one user message");
+  } else {
+    app.setDraft(prompt);
+    assert.equal(await app.sendDraft(), false);
+    assert.equal(requests, 1);
+    assert.equal(app.snapshot().activeRun.createRequestId, firstId);
+  }
 }
 
 {
@@ -1111,7 +1217,7 @@ for (const first of ["offers", "workspace"]) {
   const timers = new Map();
   const timerOrder = [];
   let timerId = 0;
-  let nowMs = 0;
+  let nowMs = 1000;
   const savedBodies = [];
   let workspaceRevision = 4;
   let resolveFirstSave = null;

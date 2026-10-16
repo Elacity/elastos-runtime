@@ -1,0 +1,22 @@
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -3,8 +3,8 @@
+ # file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ [metadata]
+-name = selkies-gstreamer
+-version = 0.0.0
++name = selkies
++version = 1.6.1
+ author = "Dan Isla, Seungmin Kim"
+ author_email = "danisla@users.noreply.github.com, 8457324+ehfd@users.noreply.github.com"
+ description = Open-Source Low-Latency Linux WebRTC HTML5 Remote Desktop and 3D Graphics / Game Streaming Platform with GStreamer
+@@ -33,7 +33,7 @@
+     psutil
+     watchdog
+     Pillow
+-    python-xlib @ https://github.com/selkies-project/python-xlib/archive/master.zip
++    python-xlib
+ 
+ [options.packages.find]
+ where = src

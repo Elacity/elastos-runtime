@@ -2,8 +2,8 @@
 
 Status: target architecture and product contract. This document records the
 storage direction. Product support requires implementation and acceptance.
-Current verified behavior belongs in [state.md](../state.md), and open work
-belongs in [TASKS.md](../TASKS.md). The
+Current verified behavior and open work belong in
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues). The
 [implementation guide](OBJECT_PROTECTION_IMPLEMENTATION.md) defines the staged
 provider boundary and acceptance tests.
 
@@ -118,7 +118,7 @@ The release plan's Required SA1-SA6 criteria qualify this contract for each
 shipped payload. Reuse common mechanism tests, then prove actual payload saves,
 restore and failure handling. Existing game-save checks cover the shipped GBA
 surface; this contract adds no separate emulator product. Current implementation
-and acceptance limits remain in state.md.
+and acceptance limits remain in the owning GitHub issue.
 
 ## The everyday object journey
 

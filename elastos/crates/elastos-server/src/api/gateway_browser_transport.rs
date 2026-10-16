@@ -66,6 +66,15 @@ pub(in crate::api::gateway) struct BrowserVzTransportLaunchBinding<'a> {
     pub(in crate::api::gateway) egress_runtime_socket_path: &'a str,
 }
 
+pub(in crate::api::gateway) fn browser_vz_transport_ready(data_dir: &Path) -> bool {
+    read_browser_vz_transport_config(data_dir)
+        .ok()
+        .flatten()
+        .is_some_and(|config| {
+            config.enabled && validate_browser_vz_transport_config(&config).is_ok()
+        })
+}
+
 pub(in crate::api::gateway) fn prepare_browser_vz_transport_launch(
     data_dir: &Path,
     binding: BrowserVzTransportLaunchBinding<'_>,
@@ -115,11 +124,13 @@ pub(in crate::api::gateway) fn prepare_browser_vz_transport_launch(
         &media_runtime_socket_path,
     )?;
 
-    let turn_port = select_port(
+    let (turn_port, _) = select_port_block(
         binding.generation,
         "turn-listener",
         config.turn_port_start,
         config.turn_port_end,
+        1,
+        |min, max| ports_bindable_here(&config.turn_listen_host, min, max, false),
     )?;
     let (relay_port_min, relay_port_max) = select_port_block(
         binding.generation,
@@ -127,6 +138,7 @@ pub(in crate::api::gateway) fn prepare_browser_vz_transport_launch(
         config.turn_relay_port_start,
         config.turn_relay_port_end,
         config.turn_relay_block_size,
+        |min, max| ports_bindable_here(&config.turn_relay_host, min, max, true),
     )?;
     let expires_at_unix_secs = current_unix_secs()?
         .checked_add(config.ttl_secs)
@@ -819,8 +831,13 @@ fn validate_browser_vz_transport_config(config: &BrowserVzTransportConfig) -> Re
     {
         return Err("Browser VZ vsock ports must be non-zero and distinct".to_string());
     }
-    if !(120..=3_600).contains(&config.ttl_secs) {
-        return Err("Browser VZ transport ttl_secs must be 120..3600".to_string());
+    // A Browser session lives until the user closes it, five minutes without a
+    // Home heartbeat, or the Home launch token lifetime; the transport must not
+    // end it earlier.
+    if !(120..=HOME_LAUNCH_TOKEN_TTL_SECS).contains(&config.ttl_secs) {
+        return Err(format!(
+            "Browser VZ transport ttl_secs must be 120..{HOME_LAUNCH_TOKEN_TTL_SECS}"
+        ));
     }
     Ok(())
 }
@@ -985,20 +1002,17 @@ fn validate_transport_target(value: &str, require_loopback: bool) -> Result<Stri
     Ok(parsed.to_string())
 }
 
-fn select_port(generation: &str, label: &str, start: u16, end: u16) -> Result<u16, String> {
-    validate_port_range(label, start, end)?;
-    let digest = Sha256::digest(format!("{generation}\n{label}").as_bytes());
-    let value = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"));
-    let size = u64::from(end) - u64::from(start) + 1;
-    Ok(u16::try_from(u64::from(start) + value % size).expect("selected port fits"))
-}
-
+/// The generation's hashed block of ports, or the next block that is
+/// `bindable` now. The configured ranges overlap the OS ephemeral ports (macOS
+/// 49152-65535, Linux 32768-60999), so any program's listener can hold a hashed
+/// port. The supervisor's preflight checks the chosen block again before TURN starts.
 fn select_port_block(
     generation: &str,
     label: &str,
     start: u16,
     end: u16,
     block_size: u16,
+    bindable: impl Fn(u16, u16) -> bool,
 ) -> Result<(u16, u16), String> {
     validate_port_range(label, start, end)?;
     let available = u32::from(end) - u32::from(start) + 1;
@@ -1008,14 +1022,34 @@ fn select_port_block(
     let blocks = available / u32::from(block_size);
     let digest = Sha256::digest(format!("{generation}\n{label}").as_bytes());
     let value = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix"));
-    let offset = u32::try_from(value % u64::from(blocks)).expect("block offset fits")
-        * u32::from(block_size);
-    let min = u32::from(start) + offset;
-    let max = min + u32::from(block_size) - 1;
-    Ok((
-        u16::try_from(min).expect("relay min fits"),
-        u16::try_from(max).expect("relay max fits"),
-    ))
+    let hashed = u32::try_from(value % u64::from(blocks)).expect("block index fits");
+    let block = |step: u32| {
+        let min = u32::from(start) + (hashed + step) % blocks * u32::from(block_size);
+        let max = min + u32::from(block_size) - 1;
+        (
+            u16::try_from(min).expect("block min fits"),
+            u16::try_from(max).expect("block max fits"),
+        )
+    };
+    Ok((0..blocks)
+        .map(block)
+        .find(|&(min, max)| bindable(min, max))
+        .unwrap_or_else(|| block(0)))
+}
+
+/// False only when another socket holds one of the ports on this host. A host
+/// this machine cannot bind, such as a remote relay, is its supervisor's to check.
+fn ports_bindable_here(host: &str, min: u16, max: u16, udp: bool) -> bool {
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return true;
+    };
+    let free = |result: std::io::Result<()>| {
+        !result.is_err_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+    };
+    (min..=max).all(|port| {
+        free(std::net::TcpListener::bind((ip, port)).map(drop))
+            && (!udp || free(std::net::UdpSocket::bind((ip, port)).map(drop)))
+    })
 }
 
 fn validate_port_range(label: &str, start: u16, end: u16) -> Result<(), String> {
@@ -1182,6 +1216,58 @@ mod tests {
         .unwrap();
         #[cfg(unix)]
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn turn_ports_skip_a_block_another_program_holds() {
+        // Four blocks of eight relay ports.
+        let select = |generation: &str, bindable: &dyn Fn(u16, u16) -> bool| {
+            select_port_block(generation, "turn-relay", 43100, 43131, 8, bindable).unwrap()
+        };
+        for n in 0..8 {
+            let generation = format!("generation-{n}");
+            let hashed = select(&generation, &|_, _| true);
+            assert_eq!((hashed.0 - 43100) % 8, 0);
+            assert_eq!(hashed.1, hashed.0 + 7);
+            // Another program holds a port of the hashed block: the next block.
+            let next = if hashed.0 == 43124 {
+                (43100, 43107)
+            } else {
+                (hashed.0 + 8, hashed.1 + 8)
+            };
+            assert_eq!(select(&generation, &|min, _| min != hashed.0), next);
+            // Nothing free: the hashed block, whose busy port the supervisor names.
+            assert_eq!(select(&generation, &|_, _| false), hashed);
+        }
+        // The probe sees another program's TCP listener, and its UDP socket for
+        // relays. A host this machine cannot bind is its remote supervisor's to check.
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (tcp, udp) = (
+            tcp.local_addr().unwrap().port(),
+            udp.local_addr().unwrap().port(),
+        );
+        assert!(!ports_bindable_here("127.0.0.1", tcp, tcp, false));
+        assert!(!ports_bindable_here("127.0.0.1", udp, udp, true));
+        assert!(ports_bindable_here("192.0.2.10", tcp, tcp, true));
+    }
+
+    #[test]
+    fn remote_engine_offer_requires_enabled_valid_transport() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!browser_vz_transport_ready(root.path()));
+        write_config(root.path());
+        assert!(browser_vz_transport_ready(root.path()));
+        let path = root.path().join("config/browser-vz-vsock-transport.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["enabled"] = serde_json::json!(false);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(!browser_vz_transport_ready(root.path()));
+        config["enabled"] = serde_json::json!(true);
+        config["schema"] = serde_json::json!("invalid");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(!browser_vz_transport_ready(root.path()));
     }
 
     fn effect_receipt(authority: &serde_json::Value) -> serde_json::Value {
@@ -1429,6 +1515,44 @@ mod tests {
         let public = browser_vz_public_transport_proof(&launch.authority, &receipt).unwrap();
         assert!(public.get("credential").is_none());
         assert!(public.get("auth_secret").is_none());
+    }
+
+    #[test]
+    fn transport_outlives_ten_minutes_up_to_home_token_lifetime() {
+        let root = tempfile::tempdir().unwrap();
+        write_config(root.path());
+        let path = root.path().join("config/browser-vz-vsock-transport.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let write = |config: &serde_json::Value| {
+            std::fs::write(&path, serde_json::to_vec(config).unwrap()).unwrap()
+        };
+        config["ttl_secs"] = serde_json::json!(HOME_LAUNCH_TOKEN_TTL_SECS + 1);
+        write(&config);
+        assert!(!browser_vz_transport_ready(root.path()));
+        config["ttl_secs"] = serde_json::json!(HOME_LAUNCH_TOKEN_TTL_SECS);
+        write(&config);
+        assert!(browser_vz_transport_ready(root.path()));
+        let issued_at_ms = current_unix_secs().unwrap() * 1_000;
+        let launch = prepare_browser_vz_transport_launch(
+            root.path(),
+            BrowserVzTransportLaunchBinding {
+                generation:
+                    "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+                page_id: "page:vz-long-session",
+                vm_id: "browser-vm-long-session",
+                principal_id: "person:local:proof",
+                egress_stream_id: "stream:long-session",
+                egress_target: "tls://example.com:443",
+                egress_runtime_socket_path: "/tmp/elastos-egress-long-session.sock",
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let expires_at_ms = launch.authority["expires_at_unix_ms"].as_u64().unwrap();
+        assert!(expires_at_ms >= issued_at_ms + HOME_LAUNCH_TOKEN_TTL_SECS * 1_000);
+        assert!(expires_at_ms > issued_at_ms + 10 * 60 * 1_000);
+        validate_browser_vz_transport_authority(&launch.authority).unwrap();
     }
 
     #[test]

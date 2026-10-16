@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { readFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertPhoneDrawer, DRAWER_SETTLE_MS, PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const browserRoot = join(repoRoot, "capsules/marketplace/browser");
@@ -429,7 +430,7 @@ function startServer() {
           json(response, { message: "provider launch failed" }, 500);
           return;
         }
-        json(response, { capsules: catalogCapsules });
+        json(response, { capsules: catalogCapsules, policy: { protected_content: true } });
         return;
       }
       if (url.pathname === "/api/capsules/interfaces") {
@@ -530,6 +531,9 @@ async function readHomeMessages(page) {
   );
 }
 
+const PHONE_SCREENSHOT = "/tmp/marketplace-phone-390x844.png";
+const PHONE_DRAWER_SCREENSHOT = "/tmp/marketplace-phone-drawer-390x844.png";
+const PHONE_TOUCH_TARGET_PX = 44;
 async function waitForFrameWidth(frame, expectedWidth) {
   await frame.waitForFunction((width) => window.innerWidth === width, expectedWidth);
 }
@@ -615,9 +619,9 @@ async function run() {
     await frame.locator(".store-row-skeleton").first().waitFor();
     await waitForRequestCount(requestLog, normalToken, "/api/capsules/catalog", 1);
     await waitForRequestCount(requestLog, normalToken, "/api/capsules/interfaces", 1);
-    await waitForRequestCount(requestLog, normalToken, "/api/provider/object/list_runtime_custody", 1);
     state[normalToken].initialCatalogBarrier.release();
     state[normalToken].initialInterfacesBarrier.release();
+    await waitForRequestCount(requestLog, normalToken, "/api/provider/object/list_runtime_custody", 1);
     await frame.locator(".store-row").filter({ hasText: "People" }).first().waitFor();
     const discoverTextWhileMediaPending = await frame.locator("#store-main").textContent();
     assert(
@@ -880,6 +884,34 @@ async function run() {
     await page.setViewportSize({ width: 640, height: 900 });
     await waitForFrameWidth(frame, 640);
     await assertNoHorizontalOverflow(frame, "narrow Marketplace layout");
+
+    await frame.locator('[data-destination="discover"]').click();
+    await frame.locator('.store-row[data-app="people"]').first().waitFor();
+    await page.setViewportSize(PHONE_VIEWPORT);
+    await waitForFrameWidth(frame, PHONE_VIEWPORT.width);
+    await setPhoneFormFactor(frame);
+    await page.waitForTimeout(DRAWER_SETTLE_MS);
+    await assertNoHorizontalOverflow(frame, "phone Marketplace layout");
+    await page.screenshot({ path: PHONE_SCREENSHOT });
+    const phonePills = await frame.locator(".store-pill").evaluateAll((pills) =>
+      pills.map((pill) => {
+        const rect = pill.getBoundingClientRect();
+        return { label: pill.textContent.trim(), height: Math.round(rect.height) };
+      }),
+    );
+    assert(
+      phonePills.length > 0 && phonePills.every((pill) => pill.height >= PHONE_TOUCH_TARGET_PX),
+      "phone row actions must be 44 px targets",
+      phonePills,
+    );
+    await assertPhoneDrawer(page, frame, {
+      label: "Marketplace",
+      drawer: "#store-sidebar",
+      room: "#store-main",
+      closeTarget: '[data-destination="installed"]',
+      screenshot: PHONE_DRAWER_SCREENSHOT,
+    });
+    await setPhoneFormFactor(frame, false);
 
     await page.goto(`http://127.0.0.1:${port}/fixture-media-error`);
     const mediaErrorFrame = await waitForMarketplaceFrame(page);

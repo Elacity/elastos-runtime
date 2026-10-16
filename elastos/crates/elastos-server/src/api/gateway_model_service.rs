@@ -454,6 +454,17 @@ fn denied(code: &str, message: &str) -> Value {
 
 pub(crate) const INVOCATION_REFUSAL_SCHEMA: &str = "elastos.model.invocation-refusal/v1";
 
+/// This closed provider fault means request validation declined new inference.
+/// It is distinct from Runtime's refusal before calling the provider.
+pub(crate) fn provider_refused_expired_request(result: &Value) -> bool {
+    result.as_object().is_some_and(|object| {
+        object.len() == 3
+            && result["status"] == "error"
+            && result["code"] == elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE
+            && result["message"] == elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE
+    })
+}
+
 /// Binds a refusal to this invocation, without settling any previous attempt.
 pub(crate) fn invocation_refusal_binding(request: &Value) -> Option<Value> {
     if request["op"] != "runs_create" || request["remote_model"]["refusal_scope"] != "invocation" {
@@ -478,9 +489,30 @@ fn refused_before_dispatch(
     message: &str,
     owns_reservation: bool,
 ) -> Value {
-    let Some(binding) = invocation_refusal_binding(request) else {
+    refused_invocation(
+        data_dir,
+        source_did,
+        request,
+        code,
+        message,
+        owns_reservation,
+        "not_started",
+    )
+}
+
+fn refused_invocation(
+    data_dir: &Path,
+    source_did: &str,
+    request: &Value,
+    code: &str,
+    message: &str,
+    owns_reservation: bool,
+    dispatch: &str,
+) -> Value {
+    let Some(mut binding) = invocation_refusal_binding(request) else {
         return denied(code, message);
     };
+    binding["dispatch"] = json!(dispatch);
     let grant_id = request["remote_model"]["grant_id"]
         .as_str()
         .unwrap_or_default();
@@ -511,7 +543,9 @@ fn refused_before_dispatch(
     }
     json!({ "ok": true, "result": {
         "status": "error", "code": "remote_model_invocation_refused",
-        "reason": code, "message": "This invocation was refused before provider dispatch.",
+        "reason": code, "message": if dispatch == "provider_refused" {
+            elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE
+        } else { "This invocation was refused before provider dispatch." },
         "refusal": binding,
     } })
 }
@@ -1485,6 +1519,19 @@ pub(crate) async fn invoke(
         }
     };
     if let Some(message) = provider_status_error(&result) {
+        if held_slot && provider_refused_expired_request(&result) {
+            let refusal = refused_invocation(
+                data_dir,
+                &source_did,
+                request,
+                elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE,
+                elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE,
+                true,
+                "provider_refused",
+            );
+            release_run_slot(data_dir, now, &reservation_key);
+            return refusal;
+        }
         if held_slot {
             release_run_slot(data_dir, now, &reservation_key);
         }

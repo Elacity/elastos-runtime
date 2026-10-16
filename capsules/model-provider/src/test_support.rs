@@ -7,9 +7,40 @@ use std::os::unix::fs::PermissionsExt as _;
 
 static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(1);
 const TEST_ROOT_PREFIX: &str = "model-provider-";
+/// Bounds a hang only: every test wait ends on its condition, so load must not trip it.
+pub(crate) const FIXTURE_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 thread_local! {
     static TEST_ROOT_REGISTRY: TestRootRegistry = TestRootRegistry::default();
+    static TEST_REQUEST_IDS: RefCell<std::collections::BTreeMap<String, String>> = RefCell::default();
+}
+
+/// Each named creation keeps one time and nonce across retries and changed input.
+pub(crate) fn fixture_model_request_id(label: &str) -> String {
+    if elastos_model_contract::model_request_issued_ms(label).is_some() {
+        return label.to_string();
+    }
+    TEST_REQUEST_IDS.with(|ids| {
+        ids.borrow_mut()
+            .entry(label.to_string())
+            .or_insert_with(|| {
+                let issued = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                fixture_model_request_id_at(label, issued)
+            })
+            .clone()
+    })
+}
+
+pub(crate) fn fixture_model_request_id_at(label: &str, issued_ms: u64) -> String {
+    use sha2::Digest as _;
+    let nonce = sha2::Sha256::digest(label.as_bytes());
+    format!(
+        "model-v1:{issued_ms}:fixture-{}-{nonce:x}",
+        std::process::id()
+    )
 }
 
 #[derive(Default)]
@@ -77,6 +108,48 @@ pub(crate) fn sha256_file(path: &Path) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// GGUF metadata with llama geometry and no tensors.
+pub(crate) fn fake_gguf(
+    layers: u32,
+    embedding: u32,
+    heads: u32,
+    kv_heads: u32,
+    feed_forward: u32,
+    vocabulary: u64,
+) -> Vec<u8> {
+    fn string(out: &mut Vec<u8>, value: &str) {
+        out.extend((value.len() as u64).to_le_bytes());
+        out.extend(value.as_bytes());
+    }
+    let numbers = [
+        ("llama.block_count", layers),
+        ("llama.embedding_length", embedding),
+        ("llama.attention.head_count", heads),
+        ("llama.attention.head_count_kv", kv_heads),
+        ("llama.feed_forward_length", feed_forward),
+    ];
+    let mut out = b"GGUF".to_vec();
+    out.extend(3_u32.to_le_bytes());
+    out.extend(0_u64.to_le_bytes());
+    out.extend((numbers.len() as u64 + 2).to_le_bytes());
+    string(&mut out, "general.architecture");
+    out.extend(8_u32.to_le_bytes());
+    string(&mut out, "llama");
+    for (key, value) in numbers {
+        string(&mut out, key);
+        out.extend(4_u32.to_le_bytes());
+        out.extend(value.to_le_bytes());
+    }
+    string(&mut out, "tokenizer.ggml.tokens");
+    out.extend(9_u32.to_le_bytes());
+    out.extend(8_u32.to_le_bytes());
+    out.extend(vocabulary.to_le_bytes());
+    for _ in 0..vocabulary {
+        string(&mut out, "t");
+    }
+    out
+}
+
 #[cfg(unix)]
 pub(crate) fn write_fake_llama_server(root: &Path, mode: &str) -> (PathBuf, PathBuf, PathBuf) {
     let engine = root.join("bin/fake-llama-server");
@@ -84,9 +157,19 @@ pub(crate) fn write_fake_llama_server(root: &Path, mode: &str) -> (PathBuf, Path
     let events = root.join("models/fake.events");
     std::fs::create_dir_all(engine.parent().unwrap()).unwrap();
     std::fs::create_dir_all(model.parent().unwrap()).unwrap();
-    std::fs::write(
-        &engine,
+    // Write the script from a child process. A writer fd opened here could be
+    // copied into another test thread's concurrent fork and make exec of this
+    // script fail with ETXTBSY until that child execs.
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\"", "sh"])
+        .arg(&engine)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        &mut writer.stdin.take().unwrap(),
         br#"#!/usr/bin/python3
+import errno
 import http.server
 import json
 import os
@@ -103,7 +186,7 @@ def arg(name):
 model_path = pathlib.Path(arg('-m'))
 port = int(arg('--port'))
 alias = arg('--alias')
-mode = model_path.read_text(encoding='utf-8').strip()
+mode = model_path.with_suffix('.mode').read_text(encoding='utf-8').strip()
 events = model_path.with_suffix('.events')
 unresponsive = model_path.with_suffix('.unresponsive')
 wrong_alias = model_path.with_suffix('.wrong-alias')
@@ -123,13 +206,17 @@ def terminate(_signum, _frame):
 def ignore_termination(_signum, _frame):
     record('term_ignored')
 
-if mode in ('ignore_term', 'timeout_ignore_term'):
+if mode in ('ignore_term', 'timeout_ignore_term', 'stream_then_stall_ignore_term'):
     signal.signal(signal.SIGTERM, ignore_termination)
 else:
     signal.signal(signal.SIGTERM, terminate)
 record('start:' + str(os.getpid()))
 record('parent:' + str(os.getppid()))
-if mode == 'healthy_with_subtree':
+if mode == 'loader_failure':
+    record('loader_failure')
+    print('libgomp.so.1: missing loader dependency', file=sys.stderr)
+    raise SystemExit(127)
+if mode in ('healthy_with_subtree', 'stream_then_stall_with_subtree'):
     subtree = subprocess.Popen([
         sys.executable,
         '-c',
@@ -151,6 +238,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if mode == 'slow_health':
                 time.sleep(0.225)
             if unresponsive.exists():
+                record('unresponsive')
                 threading.Event().wait()
             model_id = 'wrong-model' if wrong_alias.exists() else alias
             body = {'object': 'list', 'data': [{'id': model_id, 'object': 'model'}]}
@@ -163,7 +251,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(body).encode('utf-8'))
 
     def do_POST(self):
-        if self.path != '/v1/chat/completions':
+        if self.path not in ('/v1/chat/completions', '/v1/chat/completions/input_tokens'):
             self.send_error(404)
             return
         length = int(self.headers.get('Content-Length', '0'))
@@ -172,10 +260,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if body.get('model') != alias or body.get('chat_template_kwargs') != {'enable_thinking': False}:
             self.send_error(400)
             return
+        if self.path == '/v1/chat/completions/input_tokens':
+            # A fixture tokenizer charges UTF-8 content and per-message template
+            # markers. The pinned engine's endpoint owns exact production counts.
+            count = sum(len(message['content'].encode('utf-8')) + 8 for message in body['messages'])
+            record('count:' + str(count))
+            response = {'object': 'response.input_tokens', 'input_tokens': count}
+            if mode == 'incomplete_count':
+                del response['input_tokens']
+            if mode == 'stalled_count':
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', '100')
+                self.end_headers()
+                self.wfile.write(b'{')
+                self.wfile.flush()
+                record('count_body_started')
+                while True:
+                    try:
+                        self.wfile.write(b' ')
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        record('count_disconnected')
+                        return
+                    time.sleep(0.025)
+            data = json.dumps(response).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         active = model_path.with_suffix('.active')
         if mode == 'active_after_disconnect' and prompt == 'stall':
             active.touch()
         record('request:' + prompt)
+        record('max_tokens:' + str(body.get('max_tokens')))
         if mode == 'crash_once' and prompt == 'crash':
             marker = model_path.with_suffix('.crashed')
             if not marker.exists():
@@ -185,6 +305,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'text/event-stream')
         self.end_headers()
         if prompt == 'stall':
+            if mode in ('stream_then_stall_with_subtree', 'stream_then_stall_ignore_term'):
+                payload = json.dumps({'choices': [{'delta': {'content': 'first reply'}}]})
+                self.wfile.write(('data: ' + payload + '\n\n').encode('utf-8'))
+                self.wfile.flush()
+                record('stream_delta')
             while True:
                 try:
                     self.wfile.write(b': keepalive\n\n')
@@ -204,13 +329,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(('data: ' + payload + '\n\ndata: [DONE]\n\n').encode('utf-8'))
         self.wfile.flush()
 
-server = http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler)
+# Another test's listener can briefly hold this just-reserved port; the
+# provider's alias check rejects that listener until this engine binds.
+while True:
+    try:
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler)
+        break
+    except OSError as error:
+        if error.errno != errno.EADDRINUSE:
+            raise
+        time.sleep(0.01)
 server.daemon_threads = True
 server.serve_forever()
 "#,
     )
     .unwrap();
-    std::fs::write(&model, mode.as_bytes()).unwrap();
+    assert!(writer.wait().unwrap().success());
+    // SmolLM2-135M geometry, so memory admission sees a real profile.
+    std::fs::write(&model, fake_gguf(30, 576, 9, 3, 1536, 1)).unwrap();
+    std::fs::write(model.with_extension("mode"), mode.as_bytes()).unwrap();
     std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::set_permissions(&model, std::fs::Permissions::from_mode(0o600)).unwrap();
     (engine, model, events)

@@ -1,0 +1,12 @@
+{
+  "component_kinds": [
+    "browser-vm-image"
+  ],
+  "components_schema": "elastos.components/v1",
+  "head_cid": "Qmeo1oq5QdGpHmB6qkeDURuXMYKpN2jDbSL832N6tV5z25",
+  "release_cid": "QmUC1XLvsGrrwNKK6QCbNzZmTAdQ3AzqmfS8Q2vjCABDL5",
+  "release_sha256": "e754d18206c4f61ba3adad4de4db7ebbed30b485b7e13ac465d07fedeaa76d28",
+  "schema": "elastos.update-hop.oldest-release/v1",
+  "signer_did": "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe",
+  "version": "0.8.0-alpha.15"
+}

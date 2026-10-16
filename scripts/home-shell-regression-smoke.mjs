@@ -237,6 +237,14 @@ class FakeElement {
 
   scrollIntoView() {}
 
+  setPointerCapture() {}
+
+  releasePointerCapture() {}
+
+  hasPointerCapture() {
+    return false;
+  }
+
   getBoundingClientRect() {
     if (this.selector === "#desktop") {
       return { left: 0, top: 0, width: 1024, height: 768, right: 1024, bottom: 768 };
@@ -501,11 +509,11 @@ shellCore.shellState.currentSummary = firstRunSummary;
 shellSurface.renderDesktop(firstRunSummary);
 assert(
   JSON.stringify(shellCore.shellState.shellLayoutState.taskbar) === JSON.stringify([
+    "chat-room",
     "browser",
+    "system",
     "wallet",
     "documents",
-    "chat-room",
-    "system",
   ]),
   "fresh layout did not seed only the available core dock targets in canonical order",
   shellCore.shellState.shellLayoutState.taskbar,
@@ -962,8 +970,10 @@ assert(
   "People, Chat, or Inbox reintroduced capsule-owned outer window chrome",
 );
 assert(
-  browserStyle.includes("padding: 8px 10px 8px var(--window-chrome-safe-leading, 96px);"),
-  "Browser no longer applies the Home-owned toolbar content inset",
+  browserStyle.includes("padding: 8px 10px;") &&
+    !browserStyle.includes("--window-chrome-safe-leading") &&
+    !homeGuiStyle.includes("window-chrome-unified-toolbar"),
+  "Browser must sit under the standard draggable Home title bar, without a traffic-light inset",
 );
 assert(
   !homeGuiScript.includes("(label || toolbarFullscreenButton).textContent"),
@@ -1283,8 +1293,9 @@ assert(
     shellSpotlight.spotlightOpen() === true &&
       spotlight.hidden === false &&
       spotlightInput === document.activeElement &&
-      spotlight.getAttribute("aria-hidden") === "false",
-    "Home Spotlight did not open and focus the search field",
+      spotlight.getAttribute("aria-hidden") === "false" &&
+      ["aria-haspopup", "aria-controls", "aria-expanded"].every((name) => spotlightInvoker.getAttribute(name) === null),
+    "Home Spotlight did not open and focus the search field, or its desktop bar button gained popup semantics",
     {
       hidden: spotlight.hidden,
       activeElement: document.activeElement?.selector || null,
@@ -1315,6 +1326,47 @@ assert(
     "Home Spotlight did not open the selected app and close",
     restoredBrowserLaunches.slice(launchesBefore),
   );
+  // System is open now, so activating its row focuses that window rather
+  // than launching again; Spotlight closing is the activation signal.
+  const launchesBeforePress = restoredBrowserLaunches.length;
+  shellSpotlight.showSpotlight();
+  spotlightInput.value = "system";
+  spotlightInput.dispatch("input");
+  // Tablet and desktop: a touch opens on press, exactly as before the phone
+  // work (phones-r1 #4).
+  spotlightResults.children[1].dispatch("pointerdown", { pointerType: "touch" });
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  assert(shellSpotlight.spotlightOpen() === false, "Home Spotlight off the phone must open a touched result on press");
+  // Phone: a finger landing may be a scroll, so touch opens on the tap.
+  window.innerWidth = 390;
+  shellSpotlight.showSpotlight();
+  spotlightInput.value = "system";
+  spotlightInput.dispatch("input");
+  const touchedRow = spotlightResults.children[1];
+  touchedRow.dispatch("pointerdown", { pointerType: "touch" });
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  assert(
+    shellSpotlight.spotlightOpen() === true &&
+      spotlightInvoker.getAttribute("aria-haspopup") === "dialog" &&
+      spotlightInvoker.getAttribute("aria-controls") === "spotlight" &&
+      spotlightInvoker.getAttribute("aria-expanded") === "true",
+    "Home Spotlight on the phone must not open a result when a finger lands on it (the touch may be a scroll), and its bar button must be marked expanded",
+  );
+  touchedRow.dispatch("click");
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  window.innerWidth = 1280;
+  assert(shellSpotlight.spotlightOpen() === false, "Home Spotlight on the phone must open a touched result on tap");
+  shellSpotlight.showSpotlight();
+  spotlightInput.value = "system";
+  spotlightInput.dispatch("input");
+  spotlightResults.children[1].dispatch("pointerdown", { pointerType: "mouse" });
+  spotlightPanel.dispatch("animationend", { target: spotlightPanel });
+  assert(shellSpotlight.spotlightOpen() === false, "Home Spotlight must open a result on mouse press");
+  assert(
+    restoredBrowserLaunches.length === launchesBeforePress,
+    "Home Spotlight press tests must focus the open System window, not launch again",
+    restoredBrowserLaunches.slice(launchesBeforePress),
+  );
   spotlightInvoker.focus();
   shellSpotlight.showSpotlight();
   spotlightInput.value = "no-match-query";
@@ -1334,8 +1386,9 @@ assert(
   spotlightPanel.dispatch("animationend", { target: spotlightPanel });
   assert(
     shellSpotlight.spotlightOpen() === false &&
-      document.activeElement === spotlightInvoker,
-    "Home Spotlight did not close on Escape and restore focus",
+      document.activeElement === spotlightInvoker &&
+      ["aria-haspopup", "aria-controls", "aria-expanded"].every((name) => spotlightInvoker.getAttribute(name) === null),
+    "Home Spotlight did not close on Escape and restore focus, or its desktop bar button gained popup semantics",
     {
       hidden: spotlight.hidden,
       activeElement: document.activeElement?.selector || null,
@@ -1380,8 +1433,7 @@ const expectedWindowChrome = {
     className: "window-chrome-continuous",
   },
   browser: {
-    mode: "unified-toolbar",
-    className: "window-chrome-unified-toolbar",
+    mode: "standard",
   },
 };
 
@@ -1402,6 +1454,26 @@ for (const entry of shellCore.shellState.windows.values()) {
 }
 
 const browserEntry = [...shellCore.shellState.windows.values()].find((entry) => entry.targetId === "browser");
+{
+  const browserHead = browserEntry.node.querySelector(".window-head");
+  browserEntry.node.offsetWidth = 800;
+  browserEntry.node.offsetHeight = 600;
+  browserEntry.node.style.left = "200px";
+  browserEntry.node.style.top = "100px";
+  const leftBefore = browserEntry.node.style.left;
+  const topBefore = browserEntry.node.style.top;
+  browserHead.dispatch("pointerdown", { pointerId: 41, clientX: 400, clientY: 120, target: browserHead });
+  browserHead.dispatch("pointermove", { pointerId: 41, clientX: 460, clientY: 180, target: browserHead });
+  browserHead.dispatch("pointerup", { pointerId: 41, clientX: 460, clientY: 180, target: browserHead });
+  assert(
+    browserEntry.node.dataset.windowChromeMode === "standard" &&
+      !browserEntry.node.classList.contains("window-chrome-unified-toolbar") &&
+      browserEntry.node.style.left === "260px" &&
+      browserEntry.node.style.top === "160px",
+    "Browser window title bar must be a standard Home title bar that drags the window",
+    { left: [leftBefore, browserEntry.node.style.left], top: [topBefore, browserEntry.node.style.top] },
+  );
+}
 const browserClose = browserEntry.node.querySelector("[data-action='close']");
 browserClose.focus();
 shellWindows.minimizeWindow(browserEntry.id);
@@ -2352,6 +2424,27 @@ for (const target of hybridTargets) {
     `${target.target}: restore changed a saved selector`);
   }
 }
+// People's Message names a conversation; an open Chat window shows it.
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+await openHybrid("chat-room");
+const chatWindow = [...shellCore.shellState.windows.values()][0];
+const chatFrame = chatWindow.node.querySelector(".window-frame");
+const chatPosted = [];
+chatFrame.contentWindow = { postMessage(message, origin) { chatPosted.push({ message, origin }); } };
+const chatLaunches = restoredBrowserLaunches.length;
+await openHybrid("chat-room", { query: { conversation_id: "direct:sha256:fixture" } });
+assert(shellCore.shellState.windows.size === 1 && restoredBrowserLaunches.length === chatLaunches
+  && shellCore.shellState.activeWindowId === chatWindow.id,
+  "Chat conversation Open created a window instead of using the open one");
+const chatToken = new URLSearchParams(new URL(chatFrame.dataset.route, window.location.href).hash.slice(1)).get("home_token");
+assert(chatToken && JSON.stringify(chatPosted.map((post) => post.message)) === JSON.stringify([{
+  type: "elastos.chat.navigate/v1",
+  homeToken: chatToken,
+  query: { conversation_id: "direct:sha256:fixture" },
+}]), "Chat conversation Open did not ask the open window to show it");
+await openHybrid("chat-room", { query: { conversation_id: "direct:sha256:fixture" }, newWindow: true });
+assert(shellCore.shellState.windows.size === 2, "Chat New Window was reused for a conversation");
 // A Library picker alone is never the destination for ordinary browse Open.
 shellCore.shellState.windows.clear();
 shellCore.shellState.activeWindowId = null;
@@ -2410,6 +2503,50 @@ assert(restoredBrowserLaunches.at(-1).query.url === "https://example.invalid/vis
   "session restore launched a hidden leftover Browser");
 shellCore.shellState.windows.clear();
 shellCore.shellState.activeWindowId = null;
+{
+  // A restore that finishes after the person opened the Assistant keeps the room.
+  const shellStages = await import(`../capsules/home-gui/browser/shell-stages.js?v=${moduleVersion}`);
+  let engaged = true;
+  let roomCloses = 0;
+  shellStages.bindAgentSpace({
+    available: () => true, busy: () => false, engaged: () => engaged,
+    open() {}, close() { roomCloses += 1; },
+  });
+  const restoreWithVisibleWindow = async () => {
+    shellCore.shellState.homeBrowserState.session = {
+      root_shell: "home-gui", browser_context_id: shellCore.shellState.browserContextId, active_stage: "desktop",
+      windows: [{ target: "browser", active: true, query: { url: "https://example.invalid/restored" } }],
+    };
+    await shellWindows.restoreShellSession();
+    shellCore.shellState.windows.clear();
+    shellCore.shellState.activeWindowId = null;
+  };
+  await restoreWithVisibleWindow();
+  assert(roomCloses === 0, "session restore closed an Assistant room opened while it ran");
+  // Opening -> restore -> close before the ring entered Agent: restored windows sit on their own Desktops.
+  shellCore.shellState.homeBrowserState.session = {
+    root_shell: "home-gui", browser_context_id: shellCore.shellState.browserContextId, active_stage: "desktop",
+    desktops: ["desk-restore-2"],
+    windows: [
+      { target: "browser", active: true, query: { url: "https://example.invalid/here" } },
+      { target: "browser", desktopSpaceId: "desk-restore-2", query: { url: "https://example.invalid/elsewhere" } },
+    ],
+  };
+  await shellWindows.restoreShellSession();
+  engaged = false;
+  const restoredBySpace = Object.fromEntries([...shellCore.shellState.windows.values()]
+    .map((entry) => [entry.desktopSpaceId === "desk-restore-2" ? "other" : "current", entry.node.dataset.spaceVisible]));
+  assert(shellStages.getActiveStageId() === shellStages.desktopStageId() && roomCloses === 0,
+    "restore during an opening room changed the Space or closed the room", shellStages.getActiveStageId());
+  assert(restoredBySpace.current === "true" && restoredBySpace.other === "false",
+    "restored windows were not placed on their Desktops while the room was opening", restoredBySpace);
+  shellCore.shellState.windows.clear();
+  shellCore.shellState.activeWindowId = null;
+  shellStages.restoreExtraDesktops([]);
+  await restoreWithVisibleWindow();
+  assert(roomCloses === 1, "session restore must still apply the saved Space when no room is open");
+  shellStages.bindAgentSpace(undefined);
+}
 const shellMenubar = await import(`../capsules/home-gui/browser/shell-menubar.js?v=${moduleVersion}`);
 const menuLaunches = [];
 shellMenubar.bindMenubar({
@@ -2572,7 +2709,7 @@ await openHybrid("documents", { query: { doc: "did:document-c" } });
 const documentWindows = [...shellCore.shellState.windows.values()];
 const originalDocumentTokens = documentWindows.map((entry) =>
   new URL(entry.node.querySelector(".window-frame").dataset.route, window.location.href).hash);
-const documentsSource = readFileSync(new URL("../capsules/documents/browser/index.html", import.meta.url), "utf8");
+const documentsSource = readFileSync(new URL("../capsules/documents/browser/documents.js", import.meta.url), "utf8");
 const navigationFunction = (source, name) => {
   const start = source.search(new RegExp(`(?:async )?function ${name}\\(`));
   assert(start >= 0, `Documents function missing: ${name}`);
@@ -2836,6 +2973,32 @@ for (const [target, entry] of consumerEntries) {
   assert(!shellWindows.acceptHomeNavigation(entry, { ...report, query: {} }), "Changed actor accepted an existing binding");
   entry.targetId = oldTarget;
   assert(JSON.stringify(entry.launchQuery) === before, "Wrong actor/effect altered selector");
+
+  const sessionSaves = () => savedStatePatches.filter((patch) => Object.hasOwn(patch, "session")).length;
+  const settledQuery = { ...entry.launchQuery };
+  const savesBeforeRefresh = sessionSaves();
+  for (let refresh = 0; refresh < 8; refresh += 1) {
+    const hint = { ...report, sequence: record.sequence + 1, query: settledQuery };
+    assert(shellWindows.acceptHomeNavigation(entry, hint), `${target} rejected a fresh unchanged selection`);
+    assert(record.sequence === hint.sequence, `${target} did not advance its navigation guard`);
+    assert(!shellWindows.acceptHomeNavigation(entry, hint), `${target} accepted a replay after an unchanged selection`);
+  }
+  assert(sessionSaves() === savesBeforeRefresh, `${target} saved Home state for an unchanged selection`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: null }),
+    `${target} rejected a loading document hint`);
+  assert(JSON.stringify(entry.launchQuery) === before && sessionSaves() === savesBeforeRefresh,
+    `${target} changed settled selection while loading`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: {} }),
+    `${target} rejected an explicit selection clear`);
+  assert(sessionSaves() === savesBeforeRefresh + 1 && Object.keys(entry.launchQuery).length === 0,
+    `${target} did not persist its selection clear exactly once`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: {} }),
+    `${target} rejected a fresh empty selection`);
+  assert(sessionSaves() === savesBeforeRefresh + 1, `${target} saved the same empty selection twice`);
+  assert(shellWindows.acceptHomeNavigation(entry, { ...report, sequence: record.sequence + 1, query: settledQuery }),
+    `${target} rejected its next settled selection`);
+  assert(sessionSaves() === savesBeforeRefresh + 2 && JSON.stringify(entry.launchQuery) === before,
+    `${target} did not persist its changed selection exactly once`);
 }
 await openHybrid("library", { query: { mode: "attach", returnTarget: "chat-room" } });
 const pickerEntry = [...shellCore.shellState.windows.values()].at(-1);

@@ -1,8 +1,55 @@
 # Agent And Operator Process
 
 This file is the durable working contract for people and agents changing this
-repo. Product principles live in [PRINCIPLES.md](PRINCIPLES.md), current truth
-lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
+repo. Product principles live in [PRINCIPLES.md](PRINCIPLES.md). GitHub issues
+are the only place for work status, acceptance criteria and proof.
+
+## Work Tracking And Acceptance
+
+- GitHub issues own the work queue. In each lane, take the lowest-numbered open
+  task in the current weekly milestone whose dependencies are satisfied and
+  which has no active blocker. Keep at most one task issue In progress per
+  lane. Parent issues group the lane;
+  they do not authorize a second active task. User messages approve, redirect
+  or reorder work; they do not create a parallel task list.
+- Close a task only when its Done means is proven and its PR has the required
+  reviews and is merged. Until then, keep verified work open in QA / Review.
+  Take the next unblocked task in that lane; starting it does not complete its
+  predecessor. Keep blocked work open with its blocker in the issue.
+- At the first CI failure caused by your candidate, cancel its remaining jobs
+  and repair the cause before another push. Continue eligible work while CI
+  runs. If CI is the only remaining work, end the turn and check again in
+  15 minutes. Record an external blocker in the owning issue.
+- Run at most one heavy local build on this Mac at a time. Workers agree which
+  issue owns that build before starting it. CI builds do not count toward this
+  local limit. Continue reviews, source work or other light checks in parallel.
+- Comment on GitHub only for a decision, a result with its link, a blocker or a review verdict.
+  Keep comments to at most 3 lines: no narration, hashes, receipts or agent-to-agent coordination.
+  The checklist states what must be true; the Acceptance record below is the only place for current status and evidence.
+- Do not create briefings, plans, gists or notes files.
+  Move useful open work from dated audits to its issue.
+- Keep seed security details, credentials and private operator data out of
+  public issues, PRs and logs. Give the public issue only a safe summary and
+  the approval or verification still needed. Retain sensitive raw evidence
+  privately under its existing access controls.
+- Every Done means includes the complete user journey. A visible feature must
+  work well from start to end, with clear controls and recovery. Keep an
+  unfinished or confusing feature hidden until that journey passes. Hiding a
+  feature does not complete its task. Source checks alone do not prove the
+  installed product works.
+- Durable product instructions, licences, test fixtures and artifact provenance
+  stay with their code or package. They do not carry a second work queue.
+
+### Acceptance record
+
+The owning issue keeps one record, edited in place, with these six items:
+
+- Candidate: PR head and tested merge SHA, or one release source.
+- Exercised checks and the reason for each skipped check.
+- Review links with the reviewed SHA.
+- Installed release evidence.
+- Remaining gate.
+- Next owner.
 
 ## User-Facing Communication
 
@@ -22,40 +69,51 @@ lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
 
 ## Branch Roles
 
-- `main` is the stable source line.
-- `upstream/<version>-dev` branches are development integration lines. Resolve
-  the active line from `state.md` and fetched refs before choosing a base.
+- `main` is the release line. It changes only through the weekly release PR.
+- `develop` is the integration line. Task PRs merge into it when their checks
+  and reviews pass (see Review And Commit Discipline).
 - Feature and fix branches remain unpublished working lines until they are
   explicitly pushed for review.
 - Do not assume a `review/*` or `live` ref exists. Identify the exact public
   review or deployed commit from fetched refs and target-host evidence before
   making either claim.
-- Treat any other local branch or target-host checkout as evidence only after
-  reporting its exact branch, commit, tree id, dirty status, and verification
-  command.
+- Verify the exact branch, commit, tree id, dirty status and command before
+  treating a local branch or target-host checkout as evidence. Keep these
+  identities in the lifecycle inventory or the installed-artifact receipt;
+  routine check-ins link the related PR, CI run and review.
 - Always report remote divergence. A local branch being green is not the same as
-  `elacity/<branch>` being up to date.
+  the remote branch being up to date.
 
 ## Creating Work Branches
 
-New feature or bugfix branches start from a user-selected `upstream/XX-dev`
-integration branch. The current checkout and `main` are not implicit bases:
-
-- Run `git fetch origin --prune`, then list `upstream/*-dev` lines and active
-  `feat/*`/`fix/*` branches before proposing bases.
-- Ask the user which base to start from, offering each `upstream/XX-dev`
-  (newest recommended) plus "an existing working branch" for work that depends
-  on another in-flight branch. Ask even when only one dev line exists.
-- If the chosen base is a working branch rather than `upstream/XX-dev`, warn
-  immediately: the new branch must merge back only after (or together with)
-  its parent, merging it into `upstream/XX-dev` may conflict with the parent's
-  changes, and it needs a rebase if the parent moves.
-- Name branches `feat/<slug>` or `fix/<slug>`; do not push or set upstream
-  tracking until asked.
+Every task branch uses [develop](https://github.com/Elacity/elastos-runtime/tree/develop)
+as its base and PR target unless the owning issue names another base. This is
+standing approval; do not ask for each task. Fetch the current base before
+branching. If the base moves, check compatibility before merging; history
+rewrite still needs approval. A branch that depends on another in-flight branch
+says so in its PR and merges after its parent. Name branches `feat/<slug>` or
+`fix/<slug>`. Pushes and upstream tracking follow the Push Approval Levels below.
 
 Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/branching-strategy/SKILL.md).
 
+## Releases
+
+- Weekly test releases (`0.8.0-alpha.N`, canary channel) are built from a
+  `develop` merge commit through `.github/workflows/release-package.yml`
+  (dispatched from `develop`) and published with `scripts/release-publish.sh`
+  (see [Publishing a release](docs/VERSIONING.md#publishing-a-release)). Each one
+  gets one comment on #93 naming its commit and accepted scope.
+- Milestones: `0.8.0` (the five first-release goals, phones, isolation S0-S2 and
+  the release gates in #93) and `After 0.8.0`. There are no weekly milestones.
+- `main` changes only when a stable release is tagged: a release PR from the
+  accepted `develop` commit, then `vX.Y.Z` on the merge commit, then `main`
+  merges back into `develop`.
+- 0.8.0 ships when every result in the 0.8.0 milestone meets its Done means.
+
 ## Branch Lifecycle
+
+Retire a branch or close a PR only with its owner's agreement. A green check,
+merge or duplicate finding does not replace that agreement.
 
 Before creating, deleting, merging, or publishing branches, produce a short
 branch inventory:
@@ -93,12 +151,13 @@ Local refs, worktrees, build outputs, proof directories, installed artifacts,
 and rollback copies are operational state with an explicit lifecycle. Creating
 them creates a cleanup obligation; "temporary" is not a lifecycle.
 
-- Keep a local, untracked operator ledger for every non-canonical branch,
+- Keep a local, untracked machine-readable inventory for every non-canonical branch,
   worktree, detached HEAD, large proof directory, installed runtime, and
   rollback set. Record its exact path or ref, commit and tree where applicable,
   owner or purpose, dirty state, creation or observation date, protection
   source, and one terminal decision: keep, review/merge, archive, or remove.
-  Never commit private paths or operator details from this ledger.
+  This lifecycle inventory is not a status or proof log. Keep private paths and
+  operator details private. References to the local ledger below mean this inventory.
 - Keep local branches only for active development or valuable work that is not
   protected by a fetched remote ref or intentional tag. Do not create
   `backup/*`, `archive/*`, timestamped safety, or sync refs for clean or already
@@ -116,6 +175,9 @@ them creates a cleanup obligation; "temporary" is not a lifecycle.
   different-history refs are not automatic deletion candidates: preserve or
   explicitly waive the unique history first. Before deleting a worktree,
   verify its status, untracked files, open files/processes, and protecting ref.
+- Stop each test Home and its owned child processes when its test ends. Keep
+  its data until its retention decision is made. Remove completed-test login
+  agents; an agent kept for an active test must name the owning GitHub issue.
 - Build outputs, Cargo targets, dependency caches, VM hibernation state, and
   proof scratch directories are rebuildable artifacts, not rollback copies.
   Do not retain them merely because they were expensive to create.
@@ -129,9 +191,9 @@ them creates a cleanup obligation; "temporary" is not a lifecycle.
   condition, and must be removed when that gate closes. Do not recursively copy
   a live data root without an explicit size estimate and exclusion list for
   existing backups, VM images, caches, identity state, and user data.
-- Maintain at least 10% free space on development and staging volumes. If free
-  space falls below that threshold, stop creating worktrees, builds, VM images,
-  and backups until the ledger is reconciled and safe reclaim has completed.
+- Before creating a worktree, build, VM image or backup, check that its bytes
+  plus 2 GiB fit in the volume's free space (the product's own rule). If they do
+  not, stop until the ledger is reconciled and safe reclaim has completed.
 - Before handoff, rerun the branch/worktree inventory, check every touched
   worktree for dirt, report local/remote divergence, and update the local
   ledger. Do not describe a cleanup as complete while an unexplained ref,
@@ -151,10 +213,34 @@ target before acting.
 - release: merge to `main`, update release notes/version/tag, and push only
   after the release gate passes.
 
-Default safety rule: code is not pushed, deployed, tagged, or merged to `main`
-unless the user explicitly asks for that action after seeing the relevant local
-state and verification result. "Looks good" after reviewing one commit is not
-permission to publish unrelated remaining commits.
+### Push Approval Levels
+
+- **No approval needed:** fast-forward pushes to the branch of the active task
+  or its existing draft PR; opening draft PRs; rerunning checks; reading logs.
+  Report what was pushed, including the remote, branch, commits and check results.
+- **Standing task-merge permission:** merge your task PR into `develop`, or
+  into the user-approved base named in its issue, when all current checks pass,
+  the independent reviews below pass, findings are resolved, dependencies are
+  integrated, and any explicit human acceptance gate passes. Check current-base
+  compatibility and report links to the merged PR, CI run and reviews. Use a
+  normal merge; history rewrite needs approval.
+- **Standing test-key permission:** create and use disposable keys and signatures
+  for a named, isolated test fixture. Keep its trust store separate from real
+  Homes and production keys. Record its owner and cleanup condition; keep private
+  keys out of source, logs and reports. This permission covers fixture keys only.
+- **Ask first:** force-push or history rewrite; merges into other bases; changes
+  to `main`; tags and releases; production signing, including release and catalogue
+  keys; changes on the seed or existing installed Homes; deleting branches;
+  other secrets and credentials.
+
+The operator runs production signing with Anders's approval. Named isolated
+fixtures may generate disposable keys and signatures in CI; their trust stays
+separate from real Homes and production keys. Fork PRs and publication jobs use
+GitHub-hosted runners.
+
+These levels replace blanket push-approval requirements. Verification and the
+agreed publication scope still apply. Keep unrelated work and private operational
+records outside the published candidate.
 
 Before any remote push, show:
 
@@ -164,6 +250,18 @@ git diff --stat <upstream>...HEAD
 git rev-list --left-right --count <upstream>...HEAD
 ```
 
+Before each push, commit the candidate and check it with
+`just ci-local-prepush`. The committed pre-push hook checks the exact pushed
+HEAD and refuses a base that conflicts or shares changed files with develop.
+It runs formatting, workspace/all-targets checks, Clippy for touched crates, and
+their unit targets.
+Use the [local pre-push procedure](scripts/README.md#local-pre-push-gate) to
+activate the hook and share the local heavy-build lease across worktrees.
+Reproduce an unclear failed Mac install, update, or Home startup step locally
+under that lease before pushing. Review a large diff with Opus before long Mac
+CI. Record the command and result in the owning issue; source checks and an
+operator reminder alone do not prove that installed step.
+
 Before deploying public Home, show the exact commit being deployed, confirm that
 `live` either already points to that commit or will be moved only after
 successful verification, and preserve a rollback path for the installed binary,
@@ -171,28 +269,48 @@ capsules, provider config, and `components.json`.
 
 ## Review And Commit Discipline
 
+- Keep review requests off draft PRs. When a PR leaves draft, request the
+  required reviewers on GitHub yourself and name them in the report. Keep an
+  existing request instead of sending a duplicate.
+- Each task change needs one independent development review marked PASS.
+  Security code, including gateway, auth, provider launchers, confinement,
+  signing, publish/update, install.sh and workflows, also needs a posted
+  `Independent adversarial review ... VERDICT: PASS` from a different model
+  family than its author. Codex authors run `elastos-pr-review <PR>` themselves
+  and verify that the posted verdict covers the current candidate.
+- Agents merge their own task PRs after the current checks and reviews pass.
+  Keep explicit human acceptance gates recorded in the owning issue. Request
+  `irzhywau` for security follow-up: he reviews merged security task PRs, and a
+  finding goes into an existing issue or a revert when it reopens a hole.
+  When he authors a security task PR, Anders conducts the follow-up review.
+  Weekly release PRs still need his approval before merge and tag; when he is
+  the author, Anders reviews. Also request the feature owner when required.
+- Use one development review round per coherent change. Resolve findings in
+  that round and fix their cause before requesting the current verdict. Scope
+  decisions belong to Anders. Ask before adding new diagnostic tooling.
 - Keep commits authority-bound and reviewable: one coherent concern per commit,
   with its own verification commands.
-- Do not hide corrective commits. If a reviewed commit must be repaired before
-  publish, fold the repair into the coherent slice before asking for review.
-- Preserve reviewed history by default. When a branch has a reviewed prefix and
-  an unpublished tail, reorganize only the unpublished tail unless the user
-  explicitly asks to redo the whole branch.
-- If a commit is too small, badly titled, or only fixes the immediately previous
-  unpublished commit, merge it into that unpublished slice before review instead
-  of publishing a corrective follow-up.
+- Preserve commit history by default. Ask before amending, squashing, rebasing
+  or otherwise rewriting commits, including an unpublished tail.
+- If a correction belongs with the previous unpublished commit, propose folding
+  it into that concern for review. Obtain approval before rewriting the history.
 - Do not delete or rewrite dirty worktrees unless the user explicitly approves
   it. If duplicate trees exist, prove byte identity and clean status before
   recommending deletion.
-- Avoid volatile proof logs in durable docs. Store open work in `TASKS.md`,
-  verified current truth in `state.md`, and release history in
-  `elastos/CHANGELOG.md`.
+- Before a PASS is carried to a new head (merge, rebase, push), confirm that the
+  reviewed commit is an ancestor of that head and diff the reviewed paths
+  between the two. Any lost change voids the PASS. Give each review finding a
+  disposition tied to the published head: fixed in `<sha>` with test `<name>`,
+  moved to #N, or rejected because `<reason>`. Report author checks,
+  independent review and installed acceptance separately.
+- Keep release history in `elastos/CHANGELOG.md` and product instructions in
+  the relevant documentation.
 - Keep product documentation release-neutral. Use version numbers only for
   exact release state, compatibility or migration, release notes or changelogs,
   manifests, and exact Git refs or evidence. Keep standing instructions,
   READMEs, contracts, and roadmaps independent of the current release.
   Branch heads, PR numbers, commit IDs, CI results, and installation snapshots
-  belong in `state.md` or a dated evidence record. Contract versions,
+  belong in the owning GitHub issue. Contract versions,
   dependency pins, and artifact provenance stay with the contract or artifact
   they identify.
 
@@ -203,7 +321,8 @@ basic gate before handing work back:
 
 ```bash
 git diff --check
-node scripts/home-entropy-check.mjs
+node scripts/check-product-data.mjs
+node --test scripts/check-product-data.test.mjs
 (cd elastos && cargo fmt --all -- --check)
 cargo fmt --manifest-path capsules/chain-provider/Cargo.toml -- --check
 ```
@@ -216,7 +335,7 @@ for touched crates or scripts, for example:
 cargo test --manifest-path capsules/chain-provider/Cargo.toml -- --nocapture
 ```
 
-For Browser-facing changes, include the relevant Browser entropy/smoke gates and
+For Browser-facing changes, include the relevant Browser behaviour/smoke gates and
 do not claim product readiness unless `scripts/browser-objective-audit.mjs`
 passes with accepted product media plus matching manual UX evidence.
 
@@ -233,17 +352,20 @@ path, installed artifact path, SHA-256 of the built and installed artifact,
 restart or stale-process cleanup performed, and the live localhost proof command
 and result.
 
+Prove installed behavior on the CI install jobs (GitHub-hosted Linux x86-64,
+Linux ARM64 and macOS machines) when they cover the journey, and link that CI
+run as the proof. Otherwise use the installed-proof steps above. The Jetson is
+checked on the weekly candidate. A PR that changes what users see links the CI
+screenshots at desktop and phone width.
+
 ## Journey Register Gate
 
-Product-behavior changes and releases are measured against the journey audit
-register [docs/audits/ElastOS-Home-Journey-Audit.xlsx](docs/audits/ElastOS-Home-Journey-Audit.xlsx),
-the standing reference for stability and correctness for any PR or release.
-Before declaring product work done or a release ready, load the
-[e2e-audit skill](.claude/skills/e2e-audit/SKILL.md) and apply its
-invariant: read the touched areas' journeys and findings, keep Pass journeys
-stable, update rows a change intentionally alters in the same PR, add rows for
-new surface, and close findings only with their recorded proof. Live verdicts
-come from installed evidence on the exact revision, never from source reading.
+Use [docs/audits/ElastOS-Home-Journey-Audit.xlsx](docs/audits/ElastOS-Home-Journey-Audit.xlsx)
+and the [e2e-audit skill](.claude/skills/e2e-audit/SKILL.md) as historical test
+input. Transfer relevant journeys and open findings to the owning GitHub issue.
+Keep accepted journeys working, add acceptance checks for changed behavior,
+and record results in that issue. Installed acceptance requires evidence from
+the exact candidate and human checks where specified.
 
 ## Public Live Deployment
 
@@ -306,16 +428,17 @@ Use target roles consistently:
 - Mac: staging, macOS VZ Browser proof, and cross-platform proof;
 - Jetson: Linux/crosvm native Browser target and intended main device proof.
 
-Mac staging requires durable SSH before serious testing. `tmate` is acceptable
+Browser staging on this local Mac uses direct execution. Remote Mac staging
+requires durable SSH before serious testing. `tmate` is acceptable
 only as a break-glass bootstrap channel. During that bootstrap, create or reuse a
 dedicated staging account, install an agent-owned public key in
 the target account's authorized-keys file, disable password assumptions, record a local SSH host
 alias, and verify non-interactive commands work. If no durable SSH is available,
-say the Mac is blocked instead of implying it was verified.
+say remote Mac staging is blocked instead of implying it was verified.
 
 Do not commit staging aliases, private key names, reverse-tunnel ports, local
-worktree paths, or operator usernames. Keep those details in local operator
-notes and pass them through explicit environment variables or CLI flags.
+worktree paths, or operator usernames. Keep those details in private operational
+configuration and pass them through explicit environment variables or CLI flags.
 
 Target proof must cite the exact source tree, target-local commit or artifact
 receipt, and verification command used for the run. Do not treat a missing
@@ -361,10 +484,8 @@ Rust target; do not re-document dependency installation here.
   use. `wasm32-unknown-unknown` is the capsule Component target; the release
   scripts also add it on demand via `ensure_rust_target_installed`.
 - Core gate has no JS/Python package deps: the `.mjs` checks in `just verify`
-  (`home-entropy-check.mjs`, `browser-entropy-check.mjs`,
-  `browser-window-close-handshake.test.mjs`, etc.) and the Python smokes use
-  only stdlib/`node --test`. `playwright` appears only as a scanned string in
-  entropy checks and as an import in Browser/GUI headless smokes that are NOT
+  (`check-product-data.mjs`, `browser-window-close-handshake.test.mjs`, etc.) and the Python smokes use
+  only stdlib/`node --test`. `playwright` appears as an import in Browser/GUI headless smokes that are NOT
   part of the core gate, so no `npm install` is needed for build/lint/test.
 - Build/lint/test run from the repo root (the recipes `cd elastos`
   themselves): `just build`, `just lint`, `just test`. A cold `just build` is
@@ -387,8 +508,8 @@ Rust target; do not re-document dependency installation here.
   the PUBLISHED release binary from `https://elastos.elacitylabs.com`. Whenever
   the published binary trails this dev tree's `install.sh` contract (newer
   subcommands, setup profiles), the installed-path proofs fail;
-  [state.md](state.md) ("Public Install Truth") records the currently published
-  version and its compatibility. Use the source `elastos serve` path above to
+  the owning GitHub issue records the accepted installed version and its
+  compatibility. Use the source `elastos serve` path above to
   run the runtime locally instead.
 - No KVM: crosvm/microVM paths (Browser VM, full-screen chat microVM) warn and
   fail closed here, so product Browser proof and microVM chat are not runnable

@@ -1,7 +1,7 @@
 /* Agent session nav, search, CRUD, project create.
    Bound from agent-harness.js. Tip: home-20260804bb
    Host session.agent persist only — UI ≠ authority (Principle 16).
-   Wave 1: archive soft-hide, JSON import/export, body search (already). */
+   Wave 1: archive soft-hide, JSON export, body search (already). */
 
 import {
   listProjects,
@@ -16,7 +16,6 @@ import {
   renderActiveSession,
   renderFollowUpQueue,
   stopAgentStream,
-  setTitle,
   titleFromPrompt,
 } from "./agent-stream.js";
 import {
@@ -113,86 +112,6 @@ export function exportActiveSessionJson(sessionId = ctx.activeSessionId) {
   a.download = `${(session.title || "chat").replace(/[^\w\-]+/g, "_").slice(0, 48)}.json`;
   a.click();
   URL.revokeObjectURL(url);
-}
-
-export function importSessionsFromJsonText(raw) {
-  let parsed;
-  try {
-    parsed = JSON.parse(String(raw || ""));
-  } catch {
-    window.alert("Import failed — not valid JSON");
-    return 0;
-  }
-  const incoming = [];
-  if (parsed?.schema === "elastos.home.agent.session/v1" && parsed.session) {
-    incoming.push(parsed.session);
-  } else if (parsed?.schema === "elastos.home.agent.workspace/v1" && Array.isArray(parsed.sessions)) {
-    incoming.push(...parsed.sessions);
-  } else if (Array.isArray(parsed)) {
-    incoming.push(...parsed);
-  } else if (parsed?.id && parsed?.messages) {
-    incoming.push(parsed);
-  }
-  if (!incoming.length) {
-    window.alert("Import failed — no sessions found");
-    return 0;
-  }
-  if (incoming.some((session) => !session || typeof session !== "object" || Array.isArray(session) ||
-      (session.title !== undefined && typeof session.title !== "string") ||
-      (session.messages !== undefined && (!Array.isArray(session.messages) ||
-        session.messages.some((message) => !message || typeof message !== "object" || Array.isArray(message)))))) {
-    window.alert("Import failed — invalid conversation records");
-    return 0;
-  }
-  let added = 0;
-  captureActiveSessionState();
-  for (const src of incoming) {
-    if (!src || typeof src !== "object") {
-      continue;
-    }
-    const id = `s-import-${globalThis.crypto.randomUUID()}`;
-    ctx.sessions = [
-      {
-        ...JSON.parse(JSON.stringify(src)),
-        id,
-        importedFromId: src.id ?? null,
-        title: String(src.title || "Imported chat"),
-        group: src.group || "Today",
-        mode: src.mode || "chat",
-        pinned: Boolean(src.pinned),
-        projectId: src.projectId || null,
-        archived: Boolean(src.archived),
-        tags: Array.isArray(src.tags) ? src.tags : [],
-        forkedFrom: src.forkedFrom ?? null,
-        updatedAt: src.updatedAt ?? Date.now(),
-        messages: Array.isArray(src.messages) ? src.messages : [],
-      },
-      ...ctx.sessions,
-    ];
-    added += 1;
-  }
-  if (added) {
-    selectSession(ctx.sessions[0]?.id);
-  }
-  return added;
-}
-
-export function promptImportSessionsJson() {
-  const input = document.createElement("input");
-  input.type = "file";
-  input.accept = "application/json,.json";
-  input.addEventListener("change", async () => {
-    const file = input.files?.[0];
-    if (!file) {
-      return;
-    }
-    const text = await file.text();
-    const n = importSessionsFromJsonText(text);
-    if (n > 0) {
-      window.alert(`Imported ${n} chat${n === 1 ? "" : "s"}`);
-    }
-  });
-  input.click();
 }
 
 export function sessionSearchOpen() {
@@ -356,7 +275,7 @@ export function appendSessionRow(host, session, { nested = false } = {}) {
   kebab.setAttribute("aria-label", `Chat actions for ${session.title}`);
   kebab.setAttribute("aria-haspopup", "menu");
   kebab.setAttribute("aria-expanded", "false");
-  kebab.title = "Pin, add to project, rename…";
+  kebab.title = "Pin, add to project, fork…";
   kebab.textContent = "···";
 
   row.append(btn, kebab);
@@ -595,23 +514,6 @@ export function newChat() {
   persistAgentWorkspaceSoon();
 }
 
-export function renameSession(sessionId) {
-  const session = ctx.sessions.find((s) => s.id === sessionId);
-  if (!session) {
-    return;
-  }
-  const next = window.prompt("Rename chat", session.title);
-  if (!next?.trim()) {
-    return;
-  }
-  session.title = next.trim().slice(0, 64);
-  if (session.id === ctx.activeSessionId) {
-    setTitle(session.title);
-  }
-  renderSessions();
-  persistAgentWorkspaceSoon();
-}
-
 /** Wave 7.02 — copy chat into a new session (host-persisted; no Capsule authority). */
 export function forkSession(sessionId) {
   captureActiveSessionState();
@@ -643,27 +545,6 @@ export function forkSession(sessionId) {
   host.syncTruthStrip?.();
   renderSessions();
   renderActiveSession();
-  persistAgentWorkspaceSoon();
-}
-
-/** Tags are presentation labels on this Home — comma-separated, max 6. */
-export function editSessionTags(sessionId) {
-  const session = ctx.sessions.find((s) => s.id === sessionId);
-  if (!session) {
-    return;
-  }
-  const current = Array.isArray(session.tags) ? session.tags.join(", ") : "";
-  const next = window.prompt("Tags (comma-separated, max 6)", current);
-  if (next == null) {
-    return;
-  }
-  session.tags = String(next)
-    .split(/[,#]+/)
-    .map((t) => t.trim().toLowerCase().replace(/\s+/g, "-").slice(0, 24))
-    .filter(Boolean)
-    .slice(0, 6);
-  session.updatedAt = Date.now();
-  renderSessions();
   persistAgentWorkspaceSoon();
 }
 
@@ -767,13 +648,10 @@ export function openSessionActions(sessionId, anchor) {
     list.append(create);
   }
 
-  addAction("Rename", "rename");
   addAction("Fork chat", "fork");
-  addAction("Edit tags…", "tags");
   addAction(session.archived ? "Unarchive" : "Archive", "archive");
   addAction("Export Markdown", "export");
   addAction("Export JSON", "export-json");
-  addAction("Import JSON…", "import-json");
   addAction("Delete", "delete", { danger: true });
 
   for (const btn of document.querySelectorAll("[data-session-menu]")) {
@@ -808,16 +686,8 @@ export function runSessionAction(action) {
     pendingProjectAssignSessionId = id;
     return;
   }
-  if (action === "rename") {
-    renameSession(id);
-    return;
-  }
   if (action === "fork") {
     forkSession(id);
-    return;
-  }
-  if (action === "tags") {
-    editSessionTags(id);
     return;
   }
   if (action === "archive") {
@@ -841,10 +711,6 @@ export function runSessionAction(action) {
   }
   if (action === "export-json") {
     exportActiveSessionJson(id);
-    return;
-  }
-  if (action === "import-json") {
-    promptImportSessionsJson();
     return;
   }
   if (action === "delete") {

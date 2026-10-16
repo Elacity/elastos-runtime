@@ -15,6 +15,8 @@ pub(super) struct DirectUiState {
 #[serde(deny_unknown_fields)]
 pub(super) struct DirectConversationList {
     pub(super) conversations: Vec<DirectConversationView>,
+    #[serde(default)]
+    pub(super) community_unread: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -25,6 +27,9 @@ pub(super) struct DirectConversationView {
     /// The relationship ended. History stays readable; composing stops.
     #[serde(default)]
     pub(super) removed: bool,
+    /// A message arrived that this person has not opened yet.
+    #[serde(default)]
+    pub(super) unread: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -38,6 +43,8 @@ pub(super) struct DirectMessageList {
 #[serde(deny_unknown_fields)]
 pub(super) struct DirectMessageView {
     pub(super) message_id: String,
+    #[serde(default)]
+    pub(super) request_id: Option<String>,
     pub(super) direction: DirectMessageDirection,
     pub(super) text: String,
     pub(super) created_at: u64,
@@ -68,7 +75,7 @@ impl DirectDeliveryState {
             Self::Received => "Received",
             Self::Pending => "Sending",
             Self::ReceiptSettled => "Sent",
-            Self::Expired => "Not delivered",
+            Self::Expired => "Expired",
         }
     }
 }
@@ -78,6 +85,23 @@ pub(super) struct DirectSendInput<'a> {
     pub(super) request_id: &'a str,
     pub(super) conversation_id: &'a str,
     pub(super) text: &'a str,
+    pub(super) retry_existing: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct DirectSendFailure {
+    #[serde(skip)]
+    pub(super) status: u16,
+    #[serde(default)]
+    pub(super) code: Option<String>,
+}
+
+pub(super) fn terminal_retry_detail(code: Option<&str>) -> Option<&'static str> {
+    match code {
+        Some("retry_expired") => Some("The 24-hour delivery window ended. Delivery is unconfirmed. Send again creates a new message."),
+        Some("retry_unavailable") => Some("The original message is unavailable to retry. Delivery is unconfirmed. Send again creates a new message."),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -232,6 +256,7 @@ mod tests {
             conversation_id: id.to_string(),
             display_name: name.to_string(),
             removed: false,
+            unread: false,
         }
     }
 
@@ -335,8 +360,7 @@ mod tests {
         );
         assert_eq!(state.messages[0].delivery_state.label(), "Sent");
 
-        // The terminal state parses and renders honestly: an abandoned
-        // message says "Not delivered", never "Sending".
+        // Without a receipt, expiry leaves delivery unconfirmed.
         let expired: DirectMessageList = serde_json::from_value(serde_json::json!({
             "conversation_id": "direct:one",
             "messages": [{
@@ -353,7 +377,45 @@ mod tests {
             state.messages[0].delivery_state,
             DirectDeliveryState::Expired
         );
-        assert_eq!(state.messages[0].delivery_state.label(), "Not delivered");
+        assert_eq!(state.messages[0].delivery_state.label(), "Expired");
+    }
+
+    #[test]
+    fn retry_fields_are_opted_product_fields_and_terminal_codes_are_distinct() {
+        let messages: DirectMessageList = serde_json::from_value(serde_json::json!({
+            "conversation_id":"direct:one", "messages":[{
+                "message_id":"message:one", "request_id":"chat-message:one",
+                "direction":"outgoing", "text":"hello", "created_at":42, "delivery_state":"pending"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            messages.messages[0].request_id.as_deref(),
+            Some("chat-message:one")
+        );
+        assert_eq!(messages.messages[0].delivery_state.label(), "Sending");
+        let legacy: DirectConversationList =
+            serde_json::from_value(serde_json::json!({"conversations":[]})).unwrap();
+        assert_eq!(legacy.community_unread, None);
+        let current: DirectConversationList =
+            serde_json::from_value(serde_json::json!({"conversations":[],"community_unread":true}))
+                .unwrap();
+        assert_eq!(current.community_unread, Some(true));
+        assert!(terminal_retry_detail(Some("retry_expired"))
+            .unwrap()
+            .contains("24-hour"));
+        assert!(terminal_retry_detail(Some("retry_unavailable"))
+            .unwrap()
+            .contains("unavailable"));
+        assert!(terminal_retry_detail(Some("conflict")).is_none());
+        assert!(terminal_retry_detail(None).is_none());
+        let retry = DirectSendInput {
+            request_id: "old",
+            conversation_id: "direct:one",
+            text: "hello",
+            retry_existing: true,
+        };
+        assert_eq!(serde_json::to_value(retry).unwrap()["retry_existing"], true);
     }
 
     #[test]

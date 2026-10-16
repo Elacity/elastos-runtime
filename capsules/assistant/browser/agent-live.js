@@ -6,7 +6,7 @@
    Tip: home-20260814a */
 
 import { getHomeGuiLaunchToken } from "./harness-host.js";
-import { catalogModels, selectedModelOffer, readyModelChoices } from "./model-selection.js";
+import { catalogModels, selectedModelOffer, readyModelChoices, downloadingModel } from "./model-selection.js";
 import { yieldToBrowser, YIELD_EVENT_SLICE, YIELD_MS } from "./agent-stream-qos.js";
 import {
   eligibleTextOffers,
@@ -15,9 +15,12 @@ import {
   applyRunEventsPage,
   terminalOutputText,
   contractError,
+  newModelRequestId,
+  isExpiredInvocationRefusal,
 } from "./model-contract.js";
 import {
   compileContext,
+  capabilitiesForOffer,
   attachProviderPayload,
   splitSessionMessages,
   makeBudget,
@@ -36,6 +39,17 @@ import {
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
+
+/** Runtime derives an admitted local model's offer ID from its verified content
+   binding; such an offer is a choice only through its catalog row. */
+const ADMITTED_OFFER_ID = /^model:[0-9a-f]{64}$/;
+
+/** While Assistant is open, the catalog is read again this often when a model
+   downloads and nothing is selectable yet (progress), or when an admitted
+   model is advertised before its catalog row is bound to its offer (just after
+   Get, or after a failed catalog read). The second case is bounded. */
+const LIVE_REFRESH_MS = 3000;
+const CATALOG_JOIN_RETRIES = 10;
 
 /** PRINCIPLES-safe default — no tools, no capsule authority (UI ≠ authority). */
 export const DEFAULT_LIVE_SYSTEM_PROMPT =
@@ -89,6 +103,41 @@ let liveState = {
 
 let probePromise = null;
 let probeEpoch = 0;
+let watchingLiveModels = false;
+let liveRefreshTimer = null;
+let catalogJoinRetries = 0;
+
+/** Assistant open: re-read as described at LIVE_REFRESH_MS. Closed: no timer
+   runs and a probe still in flight schedules none when it lands. */
+export function watchLiveModels(on) {
+  watchingLiveModels = Boolean(on);
+  catalogJoinRetries = 0;
+  scheduleLiveRefresh();
+}
+
+/** One timer for both re-reads, and none while a probe is already in flight. */
+function scheduleLiveRefresh() {
+  clearTimeout(liveRefreshTimer);
+  liveRefreshTimer = null;
+  const pending = liveCatalogPending();
+  if (!pending) catalogJoinRetries = 0;
+  if (!watchingLiveModels) return;
+  const downloading = !selectedLiveOffer() && liveDownloadingModel();
+  const joining = pending && catalogJoinRetries < CATALOG_JOIN_RETRIES;
+  if (!downloading && !joining) return;
+  if (pending) catalogJoinRetries += 1;
+  liveRefreshTimer = setTimeout(() => {
+    liveRefreshTimer = null;
+    if (watchingLiveModels && !liveState.checking) void probeLiveInference({ force: true });
+  }, LIVE_REFRESH_MS);
+}
+
+/** Every probe result is published: the chip and an open menu follow it. */
+function publishLiveState(next) {
+  liveState = next;
+  scheduleLiveRefresh();
+  window.dispatchEvent(new CustomEvent("assistant:live-models"));
+}
 
 export function getLiveInferenceState() {
   return { ...liveState, models: liveState.models.slice() };
@@ -149,8 +198,8 @@ export function clearBackendReports() {
   }
 }
 
-/* An existing choice stays exact. Only a workspace with no choice uses the
-   initial first advertised offer; later absence never substitutes another. */
+/* CID intent uses its current verified offer. Service intent stays exact.
+   Only a workspace with no choice uses the initial first advertised offer. */
 let selectedLiveOfferId = "";
 let selectedContentCid = null;
 let selectionEpoch = 0;
@@ -168,9 +217,8 @@ export function selectLiveOffer(offerId, modelCid = null) {
 // launch hydration continue to use selectLiveOffer without changing retention.
 export async function selectLiveOfferForUse(offerId, modelCid = null) {
   const local = liveContentModels().find(model => model.offerId === offerId && (modelCid == null || model.cid === modelCid));
-  // Runtime derives admitted local offer IDs from the verified content binding.
-  // A missing catalog mapping cannot turn that offer into an operator choice.
-  if (modelCid == null && !local && !/^model:[0-9a-f]{64}$/.test(offerId)) {
+  // A missing catalog mapping cannot turn an admitted offer into an operator choice.
+  if (modelCid == null && !local && !ADMITTED_OFFER_ID.test(offerId)) {
     selectLiveOffer(offerId);
     return true;
   }
@@ -205,14 +253,31 @@ export function liveContentChoice() { return selectedContentCid; }
 export function liveContentModels() {
   return readyModelChoices(liveState.catalogModels || [], liveState.models.map(m => ({ ...m, id: m.offerId })));
 }
+/** Offers the menu lists by their offer title. An admitted model is listed only
+   through its catalog row (title and CID), never by its raw offer name. */
+export function liveMenuOffers() {
+  const content = liveContentModels();
+  return liveState.models.filter(m => !ADMITTED_OFFER_ID.test(m.offerId) && !content.some(c => c.offerId === m.offerId));
+}
+/** An admitted model is advertised but its catalog row is not bound to it yet. */
+export function liveCatalogPending() {
+  const content = liveContentModels();
+  return liveState.models.some(m => ADMITTED_OFFER_ID.test(m.offerId) && !content.some(c => c.offerId === m.offerId));
+}
+/** The catalog model a running preparation is downloading, or null. */
+export function liveDownloadingModel() {
+  return downloadingModel(liveState.catalogModels || []);
+}
 function currentChoice(models, content) {
-  // Initial empty workspace may use the first offer. An existing choice stays exact.
+  // An empty workspace may use the first offer; saved CID and service intent stay exact.
   const id = selectedLiveOfferId || (selectedContentCid == null ? models[0]?.offerId : "");
   return selectedModelOffer(models.map(m => ({ ...m, id: m.offerId })), id, selectedContentCid, content || []);
 }
 
 export function liveOfferChoice() {
-  return selectedLiveOfferId;
+  return selectedContentCid != null
+    ? currentChoice(liveState.models, liveState.catalogModels)?.offerId || selectedLiveOfferId
+    : selectedLiveOfferId;
 }
 
 export function selectedLiveOffer() {
@@ -270,7 +335,7 @@ export async function probeLiveInference({ force = false } = {}) {
       if (epoch !== probeEpoch) return;
       const models = chatOfferRows(offers);
       if (!models.length) {
-        liveState = {
+        publishLiveState({
           live: false,
           checking: false,
           model: "",
@@ -279,10 +344,10 @@ export async function probeLiveInference({ force = false } = {}) {
           checkedAt: Date.now(),
           models: [],
           catalogModels: content,
-        };
+        });
         return;
       }
-      liveState = {
+      publishLiveState({
         live: Boolean(currentChoice(models, content)),
         checking: false,
         model: currentChoice(models, content)?.label || "Chosen model unavailable",
@@ -291,10 +356,10 @@ export async function probeLiveInference({ force = false } = {}) {
         checkedAt: Date.now(),
         models,
         catalogModels: content,
-      };
+      });
     } catch (error) {
       if (epoch !== probeEpoch) return;
-      liveState = {
+      publishLiveState({
         live: false,
         checking: false,
         model: "",
@@ -303,7 +368,7 @@ export async function probeLiveInference({ force = false } = {}) {
         checkedAt: Date.now(),
         models: [],
         catalogModels: [],
-      };
+      });
     } finally {
       if (epoch === probeEpoch) probePromise = null;
     }
@@ -324,6 +389,8 @@ export function compileLiveContext({
   degradedFallback = false,
   debug = false,
 } = {}) {
+  const offer = selectedLiveOffer();
+  const effectiveCapabilities = capabilitiesForOffer(offer, capabilities);
   const raw = sessionMessages || session?.messages || [];
   let { history, currentInput: splitCurrent } = splitSessionMessages(raw);
   const current = currentInput || splitCurrent;
@@ -365,12 +432,13 @@ export function compileLiveContext({
     currentInput: current,
     constraints,
     intent: "",
-    budget: makeBudget(capabilities.context, clampLiveMaxTokens(maxTokens)),
-    capabilities,
+    budget: makeBudget(effectiveCapabilities.context, clampLiveMaxTokens(maxTokens)),
+    capabilities: effectiveCapabilities,
     transcriptChars: transcriptCharCount(raw),
     thinkingChars,
   });
   attachProviderPayload(compiled);
+  compiled.manifest.offerId = offer?.offerId || "";
   logContextManifest(compiled.manifest, compiled.invariants, { debug });
   return compiled;
 }
@@ -435,8 +503,14 @@ export async function modelRunCall(op, body = {}) {
     error.code = data?.code || "model_error";
     error.status = res.status;
     if (data?.code === "approval_required") error.approvalOfferId = body.offer_id;
+    const expiredRefusal = op === "runs_create" && res.status === 409 && isExpiredInvocationRefusal(data, body);
+    if (expiredRefusal) {
+      error.reason = "request_expired";
+      error.message = "This request is no longer valid. Check your device's clock, then try again.";
+    }
     error.preDispatchRefusal =
       data?.code === "approval_required" || data?.code === "approval_denied"
+      || expiredRefusal
       || (op === "runs_create" && res.status === 409
         && /^remote:[A-Za-z0-9_-]{1,128}:[A-Za-z0-9_.:-]{1,160}$/.test(body.offer_id)
         && data?.code === "remote_model_invocation_refused"
@@ -523,10 +597,14 @@ export async function streamChatViaContract(
     activeRun = null;
     throw contractError("no_model_offers", "no text model offer on this Home");
   }
+  if (!turn.providerRunId && manifest.offerId && offer?.offerId !== manifest.offerId) {
+    activeRun = null;
+    throw contractError("model_selection_changed", "Selected model changed while context was prepared");
+  }
   const resuming = Boolean(turn.providerRunId);
   let created;
   let runId;
-  const createRequestId = resuming ? null : newRequestId();
+  const createRequestId = resuming ? null : newModelRequestId();
   if (!resuming) {
     backendReportRunId = "";
     forgetBackendReport(offer?.offerId);
@@ -535,7 +613,10 @@ export async function streamChatViaContract(
   try {
     created = resuming
       ? await modelRunCall("runs_get", { run_id: turn.providerRunId, request_id: newRequestId() })
-      : await modelRunCall("runs_create", textRunCreateBody({ offer, messages, requestId: createRequestId }));
+      : await modelRunCall("runs_create", textRunCreateBody({
+          offer, messages, requestId: createRequestId,
+          maxOutputTokens: manifest.outputReserve,
+        }));
     runId = typeof created?.run_id === "string" ? created.run_id : "";
     if (!runId || runId.trim() !== runId || runId.length > 80 || (resuming && runId !== turn.providerRunId)) {
       throw contractError("no_run_id", "contract returned no run id");
@@ -578,6 +659,7 @@ export async function streamChatViaContract(
       usage: null,
       latencyMs: Date.now() - startedAt,
       aborted: false,
+      stopRequested: run.cancelRequested,
       seq,
       reasoning,
       contextHash: manifest.semanticContextHash || manifest.contextHash,

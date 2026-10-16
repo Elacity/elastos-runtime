@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build the native FFmpeg pair used by managed Home, with corresponding source."""
 import argparse
+import bz2
 import hashlib
 import json
 import os
@@ -13,13 +14,16 @@ import tarfile
 import tempfile
 import urllib.request
 
+X264_COMMIT = "b35605ace3ddf7c1a5d67a2eb553f034aef41d55"
+X264_TREE = "0700538866963f968154ea768289bf100350e84e"
+
 SOURCES = {
     "ffmpeg-9.0.1.tar.xz": (
         "https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz",
         "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635",
     ),
     "x264-b35605ace3ddf7c1a5d67a2eb553f034aef41d55.tar.bz2": (
-        "https://code.videolan.org/videolan/x264/-/archive/b35605ace3ddf7c1a5d67a2eb553f034aef41d55/x264-b35605ace3ddf7c1a5d67a2eb553f034aef41d55.tar.bz2",
+        "https://code.videolan.org/videolan/x264.git",
         "6eeb82934e69fd51e043bd8c5b0d152839638d1ce7aa4eea65a3fedcf83ff224",
     ),
 }
@@ -35,6 +39,27 @@ def run(command, cwd, env, capture=False):
                           stdout=subprocess.PIPE if capture else None,
                           stderr=subprocess.STDOUT if capture else None,
                           text=True).stdout
+
+
+def fetch_source(archive, url, digest):
+    if archive.name == f"x264-{X264_COMMIT}.tar.bz2":
+        with tempfile.TemporaryDirectory(prefix=".x264-source-", dir=archive.parent) as temporary:
+            git = ["git", "-C", temporary]
+            subprocess.run([*git, "init", "--bare", "--quiet"], check=True)
+            subprocess.run([*git, "fetch", "--quiet", "--depth=1", url, X264_COMMIT], check=True, timeout=60)
+            commit = subprocess.check_output([*git, "rev-parse", "FETCH_HEAD"], text=True).strip()
+            tree = subprocess.check_output([*git, "rev-parse", "FETCH_HEAD^{tree}"], text=True).strip()
+            if commit != X264_COMMIT or tree != X264_TREE:
+                raise ValueError("x264 source commit or tree differs from the pin")
+            # Match the pinned archive bytes, independent of the server's archive generator.
+            source = subprocess.check_output([*git, "-c", "tar.umask=0002", "archive", "--format=tar",
+                                              f"--prefix=x264-{X264_COMMIT}/", X264_COMMIT])
+            archive.write_bytes(bz2.compress(source))
+    else:
+        with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as dest:
+            shutil.copyfileobj(response, dest)
+    if sha(archive) != digest:
+        raise ValueError(f"Source checksum mismatch: {archive.name}")
 
 
 def verify(output, expected):
@@ -120,7 +145,7 @@ def main():
     if jobs not in range(1, 5):
         raise ValueError("CARGO_BUILD_JOBS must be between 1 and 4")
     compiler = "clang" if system == "Darwin" else "musl-gcc"
-    for tool in (compiler, "make", "pkg-config", "otool" if system == "Darwin" else "readelf"):
+    for tool in (compiler, "git", "make", "pkg-config", "otool" if system == "Darwin" else "readelf"):
         if shutil.which(tool) is None:
             raise ValueError(f"Native media builder needs {tool}")
     # Preserve SIMD on ARM; x86 builds require NASM rather than silently slowing encoding.
@@ -151,8 +176,8 @@ def main():
         return
     output.parent.mkdir(parents=True, exist_ok=True)
     disk = shutil.disk_usage(output.parent)
-    if disk.free * 10 < disk.total or disk.free < 4 * 1024**3:
-        raise ValueError("Media build needs 4 GiB free and at least 10% free volume space")
+    if disk.free < 4 * 1024**3:
+        raise ValueError("Media build needs 4 GiB free volume space")
     with tempfile.TemporaryDirectory(prefix=".media-tools-build-", dir=output.parent) as temporary:
         work = Path(temporary)
         package = work / "media-tools"
@@ -161,24 +186,23 @@ def main():
         roots = {}
         for name, (url, digest) in SOURCES.items():
             archive = package / "sources" / name
-            print(f"Downloading pinned source: {url}", flush=True)
-            with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as dest:
-                shutil.copyfileobj(response, dest)
-            if sha(archive) != digest:
-                raise ValueError(f"Source checksum mismatch: {name}")
+            print(f"Fetching pinned source: {url}", flush=True)
+            fetch_source(archive, url, digest)
             dest = work / name.split("-")[0]
             dest.mkdir()
             roots[name.split("-")[0]] = unpack(archive, dest)
-        prefix = work / "prefix"
+        # Fixed prefixes keep the random build directory out of the binaries; DESTDIR stages installs.
+        stage = work / "stage"
         x264 = roots["x264"]
-        run(["./configure", f"--prefix={prefix}", "--enable-static", "--disable-cli", "--disable-opencl",
+        run(["./configure", "--prefix=/elastos/x264", "--enable-static", "--disable-cli", "--disable-opencl",
              "--disable-avs", "--disable-lavf", "--disable-ffms", "--disable-gpac", "--disable-lsmash",
              "--disable-swscale"], x264, env)
         run(["make", f"-j{jobs}"], x264, env)
-        run(["make", "install"], x264, env)
-        env["PKG_CONFIG_LIBDIR"] = str(prefix / "lib/pkgconfig")
+        run(["make", "install", f"DESTDIR={stage}"], x264, env)
+        env["PKG_CONFIG_LIBDIR"] = str(stage / "elastos/x264/lib/pkgconfig")
+        env["PKG_CONFIG_SYSROOT_DIR"] = str(stage)
         ffmpeg = roots["ffmpeg"]
-        flags = ["./configure", f"--prefix={work / 'install'}", f"--cc={compiler}",
+        flags = ["./configure", "--prefix=/elastos/media-tools", f"--cc={compiler}",
                  "--disable-autodetect", "--disable-network", "--disable-shared", "--enable-static",
                  "--enable-gpl", "--enable-libx264", "--disable-ffplay", "--disable-doc",
                  "--disable-debug", "--pkg-config-flags=--static"]
@@ -202,7 +226,7 @@ def main():
             "# ElastOS media tools\n\nFFmpeg 9.0.1 and x264 r3222 are built with GPLv2-enabled FFmpeg. "
             "Exact corresponding source and the unmodified build recipe are in sources/. "
             "Licenses are in licenses/. No nonfree or external network libraries are enabled.\n\n"
-            "Build on native Apple silicon or Linux x86_64/ARM64 with Python 3, make and pkg-config. "
+            "Build on native Apple silicon or Linux x86_64/ARM64 with Python 3, Git, make and pkg-config. "
             "Mac requires Xcode command-line tools; Linux requires musl-gcc and binutils, plus NASM on x86_64. "
             "Linux also includes musl's copyright notices; build-info.json records its version. "
             "On non-Debian builders, set ELASTOS_MUSL_VERSION and ELASTOS_MUSL_LICENSE for that toolchain. "

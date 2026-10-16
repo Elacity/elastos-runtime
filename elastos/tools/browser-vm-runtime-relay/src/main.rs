@@ -629,18 +629,21 @@ fn accept_vsock(_listener_fd: RawFd) -> Result<File, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn temp_socket_dir() -> PathBuf {
+        static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
         let path = Path::new("/tmp").join(format!(
-            "bvr-{}-{}",
+            "bvr-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time")
-                .as_nanos()
+                .as_nanos(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path).expect("temp socket dir");
+        fs::create_dir(&path).expect("exclusive temp socket dir");
         path
     }
 
@@ -667,6 +670,37 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("timed out waiting for socket {}", path.display());
+    }
+
+    #[test]
+    fn parallel_socket_fixtures_have_distinct_directories() {
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut paths = thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        let mut paths = Vec::new();
+                        barrier.wait();
+                        for _ in 0..128 {
+                            paths.push(temp_socket_dir());
+                        }
+                        paths
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("fixture worker"))
+                .collect::<Vec<_>>()
+        });
+        let created = paths.len();
+        paths.sort();
+        paths.dedup();
+        for path in &paths {
+            fs::remove_dir(path).expect("fixture cleanup");
+        }
+        assert_eq!(paths.len(), created, "parallel fixtures shared a directory");
     }
 
     #[test]

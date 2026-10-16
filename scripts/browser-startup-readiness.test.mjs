@@ -35,14 +35,17 @@ test("address entry waits for its controller before the Browser module starts", 
   assert.match(input, /\sdisabled(?:\s|=|\/?>)/);
 });
 
-test("a Home window without a URL keeps the address field for the first ordinary submit", async () => {
+test("a fresh Dock window opens the default page after checking Runtime ownership", async () => {
   const state = start();
   assert.equal(state.address.disabled, true);
   assert.equal(state.readiness.loading, true);
   assert.deepEqual(state.calls, []);
+  assert.match(state.messages.at(-1), /checking its Engine.*retry/);
   state.summary.resolve({});
+  await new Promise(setImmediate);
+  assert.deepEqual(state.calls, ["https://ela.city/"]);
+  state.open.resolve();
   await state.settled;
-  assert.deepEqual(state.calls, []);
   assert.equal(state.address.disabled, false);
 });
 
@@ -63,7 +66,8 @@ test("initial summary failure enables retry after showing the failure", async ()
   state.summary.reject(new Error("Runtime summary unavailable"));
   await state.settled;
   assert.deepEqual(state.calls, []);
-  assert.deepEqual(state.messages, ["Runtime summary unavailable"]);
+  assert.match(state.messages[0], /checking its Engine/);
+  assert.equal(state.messages.at(-1), "Runtime summary unavailable");
   assert.equal(state.address.disabled, false);
 });
 

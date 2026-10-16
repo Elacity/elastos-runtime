@@ -97,7 +97,7 @@ fn private_file(meta: &Metadata, size: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn open_at(dir: &File, name: &str, directory: bool) -> io::Result<File> {
+pub(super) fn open_at(dir: &File, name: &str, directory: bool) -> io::Result<File> {
     let name = CString::new(name).map_err(|_| invalid("invalid staged name"))?;
     let flags = libc::O_RDONLY
         | libc::O_NOFOLLOW
@@ -643,14 +643,12 @@ fn capacity_observation(
     available_bytes: u64,
     required_bytes: u64,
 ) -> io::Result<CapacityObservation> {
-    let remaining_bytes = available_bytes
-        .checked_sub(required_bytes)
-        .ok_or_else(|| invalid("insufficient backend capacity"))?;
+    // This is an observation. Runtime owns the requested-work admission and
+    // shared reserve, including a volume with fewer bytes than the request.
     if volume_id == 0
         || capacity_bytes == 0
         || available_bytes > capacity_bytes
         || !(1..=super::MAX_CAPACITY_REQUIRED_BYTES).contains(&required_bytes)
-        || remaining_bytes < capacity_bytes.div_ceil(10)
     {
         return Err(invalid("invalid or insufficient backend capacity"));
     }
@@ -1330,7 +1328,7 @@ mod tests {
         assert_eq!(capacity["data"]["required_bytes"], 1);
         let total = capacity["data"]["capacity_bytes"].as_u64().unwrap();
         let available = capacity["data"]["available_bytes"].as_u64().unwrap();
-        assert!(total > 0 && available <= total && available > total.div_ceil(10));
+        assert!(total > 0 && available <= total && available >= 1);
         assert!(
             !child_data.join("ipfs-repo").exists(),
             "capacity must observe the daemon's repo, not the child's default"
@@ -1454,6 +1452,8 @@ mod tests {
         );
 
         let mut provider = IpfsProvider {
+            host_role: crate::HostRole::User,
+            initialized: true,
             state: KuboState::Cold,
             api_port: 0,
             gateway_port: 0,
@@ -1580,6 +1580,8 @@ mod tests {
 
     fn ready_provider(root: &Path, port: u16) -> IpfsProvider {
         IpfsProvider {
+            host_role: crate::HostRole::User,
+            initialized: true,
             state: KuboState::Ready,
             api_port: port,
             gateway_port: 0,
@@ -1591,17 +1593,25 @@ mod tests {
     }
 
     #[test]
-    fn private_capacity_arithmetic_preserves_ten_percent_floor() {
-        let exact = capacity_observation(7, 1000, 110, 10).unwrap();
-        assert_eq!(exact.available_bytes - exact.required_bytes, 100);
-        assert!(capacity_observation(7, 1000, 110, 11).is_err());
-        assert!(capacity_observation(7, 1001, 110, 10).is_err());
-        assert!(capacity_observation(7, 1001, 111, 10).is_ok());
+    fn private_capacity_arithmetic_requires_the_work_to_fit_available_bytes() {
+        let exact = capacity_observation(7, 1000, 110, 110).unwrap();
+        assert_eq!(exact.available_bytes, exact.required_bytes);
+        let short = capacity_observation(7, 1000, 110, 111).unwrap();
+        assert_eq!((short.available_bytes, short.required_bytes), (110, 111));
+        assert!(short.required_bytes > short.available_bytes);
+        assert_eq!(
+            capacity_observation(7, 1000, 0, 10)
+                .unwrap()
+                .available_bytes,
+            0
+        );
+        // Capacity size alone never refuses work that fits the available bytes.
+        assert!(capacity_observation(7, 1_000_000, 10, 10).is_ok());
+        assert!(capacity_observation(7, 1000, 1000, 1000).is_ok());
         for (volume, total, available, required) in [
             (0, 1000, 110, 10),
             (7, 0, 0, 1),
             (7, 1000, 1001, 1),
-            (7, 1000, 5, 10),
             (7, 1000, 110, 0),
             (7, u64::MAX, u64::MAX, u64::MAX),
         ] {
@@ -1784,6 +1794,88 @@ mod tests {
         provider.state = KuboState::Cold;
         assert!(check_capacity(&provider, 1).is_err());
         assert!(!provider.repo_dir.exists());
+    }
+
+    #[test]
+    fn preparation_capacity_checks_keep_kubo_from_the_idle_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("actual-repo");
+        fs::create_dir(&repo).unwrap();
+        fs::set_permissions(&repo, fs::Permissions::from_mode(0o700)).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        for name in ["blocks", "datastore"] {
+            fs::create_dir(repo.join(name)).unwrap();
+        }
+        let stat = serde_json::json!({"RepoPath":repo,"RepoSize":0}).to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut provider = ready_provider(root.path(), port);
+        let mut kubo = Command::new("sleep").arg("60").spawn().unwrap();
+        crate::write_coord_file(
+            root.path(),
+            &crate::CoordFile {
+                kubo_pid: kubo.id(),
+                api_port: port,
+                gateway_port: 0,
+                started_at: 1,
+                last_used: crate::now_unix_secs(),
+            },
+        );
+        // One check every 500 ms, as a download does per window, for three idle limits.
+        let checks = 6 * crate::IDLE_TIMEOUT_SECS;
+        let server = std::thread::spawn(move || {
+            for _ in 0..checks {
+                for body in [
+                    br#"{"Version":"0.40.1"}"#.to_vec(),
+                    serde_json::json!({"Key":"Datastore.Spec","Value":capacity_datastore_spec()})
+                        .to_string()
+                        .into_bytes(),
+                    stat.clone().into_bytes(),
+                ] {
+                    let mut socket = accept_fixture(&listener);
+                    headers(&mut socket);
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    socket.write_all(&body).unwrap();
+                }
+            }
+        });
+        crate::spawn_idle_watcher(
+            root.path().to_path_buf(),
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+            crate::HostRole::User,
+        );
+        let capacity = r#"{"op":"runtime_check_capacity","required_bytes":1}"#;
+        for _ in 0..checks {
+            let response = provider.handle(crate::parse_request(capacity).unwrap());
+            assert_eq!(serde_json::to_value(response).unwrap()["status"], "ok");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        server.join().unwrap();
+        let kept = kubo.try_wait().unwrap().is_none();
+        // Without use, the existing idle stop still ends the daemon.
+        let deadline = Instant::now() + Duration::from_secs(crate::IDLE_TIMEOUT_SECS + 3);
+        let stopped = loop {
+            if kubo.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if !stopped {
+            let _ = kubo.kill();
+            kubo.wait().unwrap();
+        }
+        assert!(kept, "idle stop ended kubo during capacity checks");
+        assert!(stopped, "idle stop no longer ends unused kubo");
+        assert!(crate::read_coord_file(root.path()).is_none());
     }
 
     #[test]
