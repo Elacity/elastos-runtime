@@ -13,6 +13,9 @@ platform() {
         Linux-x86_64) printf '%s\n' "linux-amd64" ;;
         Linux-aarch64|Linux-arm64) printf '%s\n' "linux-arm64" ;;
         Darwin-arm64) printf '%s\n' "darwin-arm64" ;;
+        # darwin-amd64 is the package key for release id x86_64-darwin.
+        # scripts/release-platforms.json maps that key to the id. The signer
+        # refuses x86_64-darwin. This name is not a signed download.
         Darwin-x86_64) printf '%s\n' "darwin-amd64" ;;
         *)
             echo "Unsupported release platform: $(uname -s)-$(uname -m)" >&2

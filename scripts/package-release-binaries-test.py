@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Package names for hosts that already have a native release build."""
 
+import json
 import os
 import stat
 import subprocess
@@ -43,6 +44,18 @@ class PackageReleaseNameTest(unittest.TestCase):
                 result = package_name(*host)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), name)
+
+    def test_intel_package_key_is_the_release_id_the_signer_refuses(self):
+        platforms = json.loads((ROOT / "scripts/release-platforms.json").read_text())
+        self.assertEqual(platforms["darwin-amd64"], "x86_64-darwin")
+        signer = (ROOT / "scripts/release-signer.py").read_text()
+        self.assertIn(
+            'set(platforms) <= {"x86_64-linux", "aarch64-linux", "aarch64-darwin"}, "release platforms refused"',
+            signer,
+        )
+        result = package_name("Darwin", "x86_64")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "darwin-amd64")
 
     def test_other_darwin_hosts_stop(self):
         result = package_name("Darwin", "i386")
