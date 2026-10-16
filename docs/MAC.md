@@ -8,8 +8,9 @@ artifacts, and `.dmg` packaging work.
 
 The public release id for an Intel Mac is `x86_64-darwin`. The signed installer
 stops on that host before a download lookup. The message is
-`macOS release lookup requires Apple silicon`. This runbook's source-home path
-is the local build. A signed download for that id is a separate release decision.
+`Intel Mac has no signed release yet. See docs/MAC.md for the source-home path.`
+This runbook is that source-home path. A signed download for that id is a
+separate release decision.
 
 CI job `gateway-smoke-macos-intel` builds the native `elastos` binary on
 `macos-15-intel` and requires `GET /healthz` to return the two bytes `OK` from

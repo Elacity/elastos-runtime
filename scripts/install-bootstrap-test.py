@@ -1582,6 +1582,19 @@ printf '%s\\n' "$PLATFORM"
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
+    def test_intel_mac_stops_before_release_lookup(self):
+        result = shell('''
+SYSTEM=Darwin MACHINE=x86_64
+uname() { case "$1" in -s) echo "$SYSTEM";; -m) echo "$MACHINE";; esac; }
+detect_platform
+printf '%s\\n' "$PLATFORM"
+''')
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("Intel Mac has no signed release yet", result.stderr)
+        self.assertIn("docs/MAC.md", result.stderr)
+        main = SOURCE.split("# ── Main", 1)[1]
+        self.assertLess(main.index("detect_platform"), main.index("release-head.json"))
+
     def test_platform_paths_match_rust_dirs5_contract(self):
         # setup.rs and sources.rs use dirs5.0.1::data_dir. Mac ignores XDG;
         # Linux uses an absolute XDG path, otherwise HOME/.local/share.

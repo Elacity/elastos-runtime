@@ -108,6 +108,7 @@ show_help() {
     echo ""
     echo -e "${BOLD}ElastOS Installer${NC}"
     echo "  Release lookup: Linux x86_64/aarch64 and macOS Apple silicon."
+    echo "  Intel Mac has no signed download. Use the source-home path in docs/MAC.md."
     echo "  The signed release determines which platforms have downloads."
     echo ""
     echo -e "${BOLD}Usage:${NC}"
@@ -330,7 +331,7 @@ detect_platform() {
     case "${OS}" in
         linux)  PLATFORM="${ARCH}-linux" ;;
         darwin)
-            [[ "$ARCH" == aarch64 ]] || die "macOS release lookup requires Apple silicon"
+            [[ "$ARCH" == aarch64 ]] || die "Intel Mac has no signed release yet. See docs/MAC.md for the source-home path."
             PLATFORM="aarch64-darwin"
             ;;
         *) die "Unsupported OS: ${OS}" ;;
