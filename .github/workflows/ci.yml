@@ -1585,8 +1585,12 @@ jobs:
         timeout-minutes: 70
         run: |
           set -euo pipefail
-          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/gateway-intel-target" >> "$GITHUB_ENV"
+          # GITHUB_ENV applies on the next step. Export it here so this build
+          # writes the binary the /healthz probe executes.
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/gateway-intel-target"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
           cargo build --locked --release --manifest-path elastos/Cargo.toml -p elastos-server --bin elastos
+          test -x "$CARGO_TARGET_DIR/release/elastos"
       - name: gateway /healthz returns OK
         timeout-minutes: 10
         run: |

@@ -1643,6 +1643,16 @@ class ReleasePolicyTests(unittest.TestCase):
             with self.subTest(mutation=name), self.assertRaises(AssertionError):
                 validate_restores_are_verified(changed)
 
+    def test_intel_gateway_smoke_probes_the_binary_it_built(self):
+        build, = [step for step in steps("gateway-smoke-macos-intel")
+                  if step.startswith("name: build the gateway binary\n")]
+        probe, = [step for step in steps("gateway-smoke-macos-intel")
+                  if "scripts/gateway-healthz-smoke.sh" in step]
+        self.assertLess(build.index('export CARGO_TARGET_DIR="$RUNNER_TEMP/gateway-intel-target"'),
+                        build.index("cargo build --locked --release"))
+        self.assertIn('test -x "$CARGO_TARGET_DIR/release/elastos"', build)
+        self.assertIn('scripts/gateway-healthz-smoke.sh "$CARGO_TARGET_DIR/release/elastos"', probe)
+
     def test_github_runners_and_check_names_stay_fixed(self):
         expected = {
             "source-gate": ("source-gate", "ubuntu-24.04"),
