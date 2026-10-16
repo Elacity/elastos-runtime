@@ -45,6 +45,7 @@ async fn frontdoor_refuses_foreign_origins_rebinding_and_missing_or_duplicate_ho
         app.clone().oneshot(duplicate).await.unwrap().status(),
         StatusCode::FORBIDDEN
     );
+    super::write_gateway_health_lock(dir.path(), std::process::id());
     let valid = Request::builder()
         .uri("/healthz")
         .header(HOST, "127.0.0.1:61180")

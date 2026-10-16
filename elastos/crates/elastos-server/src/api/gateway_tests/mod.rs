@@ -86,6 +86,14 @@ fn test_launch_token_from_route(route: &str) -> String {
     .expect("launch route home token")
 }
 
+pub(super) fn write_gateway_health_lock(data_dir: &std::path::Path, pid: u32) {
+    std::fs::write(
+        data_dir.join("host-process.lock"),
+        format!("{{\"pid\":{pid},\"role\":\"gateway\",\"addr\":\"localhost:8090\"}}\n"),
+    )
+    .unwrap();
+}
+
 fn test_state(cache_dir: &std::path::Path) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
     GatewayState {

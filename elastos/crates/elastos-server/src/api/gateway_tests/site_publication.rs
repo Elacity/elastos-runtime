@@ -221,11 +221,11 @@ async fn test_root_serves_mywebsite_when_staged() {
     assert_eq!(&body[..], b"<html>home site</html>");
 }
 
-/// Launcher readiness. `docs/LAUNCHER_CONTRACT.md` defines this response:
-/// HTTP 200 and the body bytes `OK`.
+/// Launcher readiness. The body is the two bytes `OK` when this process holds the lock.
 #[tokio::test]
 async fn test_healthz_200() {
     let dir = tempfile::tempdir().unwrap();
+    super::write_gateway_health_lock(dir.path(), std::process::id());
     let state = test_state(dir.path());
     let app = gateway_router(state);
 
@@ -244,6 +244,47 @@ async fn test_healthz_200() {
         .await
         .unwrap();
     assert_eq!(&body[..], b"OK");
+    assert_eq!(body.len(), 2);
+}
+
+#[tokio::test]
+async fn test_healthz_refuses_another_pid_and_a_tampered_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    super::write_gateway_health_lock(dir.path(), std::process::id().wrapping_add(1));
+    let app = gateway_router(test_state(dir.path()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    std::fs::write(dir.path().join("host-process.lock"), b"not-json").unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let contract = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../docs/LAUNCHER_CONTRACT.md"
+    ))
+    .unwrap();
+    assert!(contract.contains("http://localhost:8090/home/"));
+    assert!(contract.contains("two bytes `OK`"));
+    assert!(!contract.contains("three bytes"));
+    assert!(!contract.contains("darwin-x64"));
+    assert!(!contract.contains("127.0.0.1:8090/home/"));
 }
 
 #[tokio::test]
@@ -685,6 +726,7 @@ async fn test_concurrent_release_reads_wait_health_works_and_scan_once() {
             .is_err()
     );
     assert!(requests.iter().all(|request| !request.is_finished()));
+    super::write_gateway_health_lock(&fixture.base, std::process::id());
     let response = app
         .clone()
         .oneshot(

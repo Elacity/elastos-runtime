@@ -93,6 +93,7 @@ async fn start_gateway_server_with_shutdown(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     crate::auth::verify_auth_audit_chain_ready(&data_dir)?;
+    let _health_lock = crate::host_lock::publish_gateway_lock_if_unowned(&data_dir, addr)?;
     let listener = TcpListener::bind(addr).await?;
     let local_control_registry = provider_registry.clone();
     let gateway_api_url = if addr.parse::<axum::http::uri::Authority>()?.port_u16() == Some(0) {

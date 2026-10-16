@@ -1368,7 +1368,7 @@ pub fn arm_owner_recovery(
     ttl_secs: u64,
 ) -> anyhow::Result<zeroize::Zeroizing<String>> {
     let origin_url = url::Url::parse(origin).map_err(|_| OwnerEnrollmentDenied)?;
-    let loopback = matches!(origin_url.host_str(), Some("localhost" | "127.0.0.1"));
+    let loopback = origin_url.host_str() == Some("localhost");
     if origin.len() > 512
         || rp_id.len() > 253
         || !(origin_url.scheme() == "https" || origin_url.scheme() == "http" && loopback)
@@ -1831,6 +1831,25 @@ fn check_owner_claim(
     Ok(())
 }
 
+fn require_localhost_origin(origin: &str, rp_id: &str) -> anyhow::Result<()> {
+    let url = url::Url::parse(origin).map_err(|_| OwnerEnrollmentDenied)?;
+    if url.scheme() != "http" || url.host_str() != Some("localhost") || rp_id != "localhost" {
+        return enrollment_denied();
+    }
+    Ok(())
+}
+
+fn require_passkey_origin(origin: &str, rp_id: &str) -> anyhow::Result<()> {
+    let url = url::Url::parse(origin).map_err(|_| OwnerEnrollmentDenied)?;
+    let Some(host) = url.host_str() else {
+        return enrollment_denied();
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() || host != rp_id {
+        return enrollment_denied();
+    }
+    Ok(())
+}
+
 pub(crate) fn begin_owner_enrollment(
     data_dir: &Path,
     identity: &mut elastos_identity::IdentityManager,
@@ -1851,6 +1870,9 @@ pub(crate) fn begin_owner_enrollment_with_intent(
     now: u64,
 ) -> anyhow::Result<Option<(String, Option<elastos_identity::CreationOptions>)>> {
     validate_owner_enrollment_intent(intent)?;
+    if request.loopback {
+        require_localhost_origin(request.origin, request.rp_id)?;
+    }
     mutate_auth_state(data_dir, |state| {
         identity.reload_credentials()?;
         if let Some(record) = &state.owner_enrollment {
@@ -2782,6 +2804,90 @@ mod owner_recovery_tests {
         arm_owner_recovery(home.root.path(), ORIGIN, "localhost", 300)
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn local_home_passkey_registers_and_signs_in_at_localhost() {
+        let origin = "http://localhost:8090";
+        let root = tempfile::tempdir().unwrap();
+        let mut identity = elastos_identity::IdentityManager::new(root.path().into()).unwrap();
+        let secret = random_secret_hex();
+        let owner = OwnerAdmission {
+            origin,
+            rp_id: "localhost",
+            claimant: &secret,
+            loopback: true,
+        };
+        let (_, options) =
+            begin_owner_enrollment(root.path(), &mut identity, &owner, "owner", now_ts())
+                .unwrap()
+                .unwrap();
+        let response =
+            owner_attestation_for_test(&options.unwrap().public_key.challenge, "localhost", origin);
+        let grant = complete_owner_enrollment(
+            root.path(),
+            &mut identity,
+            &owner,
+            "owner",
+            Some(&response),
+            None,
+            now_ts(),
+        )
+        .unwrap()
+        .unwrap();
+        let credential = identity
+            .credentials()
+            .into_iter()
+            .find(|credential| credential.rp_id == "localhost")
+            .unwrap();
+        let signed_in = grant_passkey_session(
+            root.path(),
+            PasskeySessionRequest {
+                credential: &credential,
+                origin,
+                user_verified: true,
+                display_name: None,
+                profile_display_name: None,
+                reason: "local home sign-in",
+                purpose: PasskeySessionPurpose::SignIn,
+            },
+        )
+        .unwrap();
+        assert_eq!(signed_in.principal_id, grant.principal_id);
+        assert!(grant_passkey_session(
+            root.path(),
+            PasskeySessionRequest {
+                credential: &credential,
+                origin: "http://127.0.0.1:8090",
+                user_verified: true,
+                display_name: None,
+                profile_display_name: None,
+                reason: "ip literal sign-in",
+                purpose: PasskeySessionPurpose::SignIn,
+            },
+        )
+        .is_err());
+
+        let fresh = tempfile::tempdir().unwrap();
+        let mut fresh_identity =
+            elastos_identity::IdentityManager::new(fresh.path().into()).unwrap();
+        let ip_owner = OwnerAdmission {
+            origin: "http://127.0.0.1:8090",
+            rp_id: "127.0.0.1",
+            claimant: &secret,
+            loopback: true,
+        };
+        assert!(begin_owner_enrollment(
+            fresh.path(),
+            &mut fresh_identity,
+            &ip_owner,
+            "ip",
+            now_ts()
+        )
+        .is_err());
+        assert!(
+            arm_owner_recovery(fresh.path(), "http://127.0.0.1:8090", "127.0.0.1", 300).is_err()
+        );
     }
 
     fn begin(
@@ -3874,6 +3980,7 @@ fn grant_passkey_session_in_state(
     now: u64,
 ) -> anyhow::Result<AuthSessionGrantV1> {
     let credential = request.credential;
+    require_passkey_origin(request.origin, &credential.rp_id)?;
     let mut binding =
         ProofBinding::passkey_webauthn(elastos_runtime::auth::PasskeyWebAuthnBinding {
             credential_id: credential.credential_id.clone(),

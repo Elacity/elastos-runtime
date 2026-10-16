@@ -429,8 +429,28 @@ pub(super) fn request_host(headers: &HeaderMap) -> anyhow::Result<Option<String>
     Ok(Some(validated_gateway_host(headers)?))
 }
 
-pub(super) async fn healthz() -> &'static str {
-    "OK"
+/// Readiness for the process that holds `host-process.lock`.
+/// The body is the two bytes `OK` only when this process is the recorded gateway.
+pub(super) async fn healthz(State(state): State<GatewayState>) -> Response {
+    if gateway_health_lock_matches(&state.data_dir) {
+        (StatusCode::OK, "OK").into_response()
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }
+}
+
+fn gateway_health_lock_matches(data_dir: &std::path::Path) -> bool {
+    let Ok(bytes) = std::fs::read(data_dir.join("host-process.lock")) else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    meta.get("pid").and_then(|value| value.as_u64()) == Some(u64::from(std::process::id()))
+        && matches!(
+            meta.get("role").and_then(|value| value.as_str()),
+            Some("gateway" | "gateway-public")
+        )
 }
 
 pub(super) async fn serve_release_manifest(
