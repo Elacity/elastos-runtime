@@ -1658,6 +1658,9 @@ class ReleasePolicyTests(unittest.TestCase):
             "source-home-linux": ("source-home-linux (${{ matrix.os }})", "${{ matrix.os }}"),
             "source-home-linux-arm64": ("source-home-linux (${{ matrix.check_name || matrix.os }})", "${{ matrix.os }}"),
             "source-home-macos": ("source-home-macos", "macos-14"),
+            # Intel gateway /healthz smoke. Signed x86_64-darwin admission is
+            # still the signer and installer gate in docs/MAC.md.
+            "gateway-smoke-macos-intel": ("gateway-smoke-macos-intel", "macos-15-intel"),
             "cancel-on-failure": ("cancel-on-failure", "ubuntu-24.04"),
             # Anders decides whether this becomes a required check (#320).
             "update-hop-linux": ("update-hop-linux", "ubuntu-24.04"),

@@ -1560,6 +1560,48 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # Native Intel Mac proof of the launcher readiness probe. This job builds
+  # the gateway binary and requires GET /healthz to return OK. It is not a
+  # signed release. docs/MAC.md records the signer and installer gates.
+  gateway-smoke-macos-intel:
+    name: gateway-smoke-macos-intel
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    needs: source-gate
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
+      - name: require an Intel Mac with room to compile
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_OS/$RUNNER_ARCH" == macOS/X64 ]]
+          df -Pk .
+          df -Pk . | awk 'NR == 2 { if ($4 < 8 * 1024 * 1024) { print "Intel runner has under 8 GiB free"; exit 1 } }'
+      - name: build the gateway binary
+        timeout-minutes: 70
+        run: |
+          set -euo pipefail
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/gateway-intel-target" >> "$GITHUB_ENV"
+          cargo build --locked --release --manifest-path elastos/Cargo.toml -p elastos-server --bin elastos
+      - name: gateway /healthz returns OK
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          export ELASTOS_GATEWAY_LOG="$RUNNER_TEMP/gateway.log"
+          scripts/gateway-healthz-smoke.sh "$CARGO_TARGET_DIR/release/elastos"
+      - name: upload gateway log
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: gateway-smoke-macos-intel-log
+          path: ${{ runner.temp }}/gateway.log
+          retention-days: 7
+          if-no-files-found: ignore
+
   # A pull request run stops at its first failed job, so the macOS and Linux
   # journeys do not run on for 30+ minutes after a decisive failure. Pushes,
   # merge queues and dispatches keep running every job to the end. This job
