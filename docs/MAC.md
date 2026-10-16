@@ -29,8 +29,9 @@ A signed Intel release opens only when these gates move together:
 - The Mac Browser engine host is Apple silicon Virtualization.framework. See
   [Browser support](BROWSER_SUPPORT.md). This runbook claims no local Intel
   Browser engine.
-- `scripts/package-release-binaries.sh` accepts `Darwin-arm64` and rejects
-  `Darwin-x86_64`.
+- `scripts/package-release-binaries.sh` prints `darwin-amd64` for Darwin
+  x86_64. The package name is `elastos-runtime-darwin-amd64`. The Intel smoke
+  job checks that printed name. That job uploads no release tarball.
 - `scripts/ci-release-policy-test.py` keeps the release-package matrix on the
   three signed platforms above.
 

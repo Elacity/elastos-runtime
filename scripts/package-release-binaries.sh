@@ -13,12 +13,19 @@ platform() {
         Linux-x86_64) printf '%s\n' "linux-amd64" ;;
         Linux-aarch64|Linux-arm64) printf '%s\n' "linux-arm64" ;;
         Darwin-arm64) printf '%s\n' "darwin-arm64" ;;
+        Darwin-x86_64) printf '%s\n' "darwin-amd64" ;;
         *)
             echo "Unsupported release platform: $(uname -s)-$(uname -m)" >&2
             exit 1
             ;;
     esac
 }
+
+# CI on an Intel Mac prints this name. Packaging still requires built binaries.
+if [[ "${1:-}" == --print-platform ]]; then
+    platform
+    exit 0
+fi
 
 PLATFORM="$(platform)"
 PACKAGE="elastos-runtime-${PLATFORM}"

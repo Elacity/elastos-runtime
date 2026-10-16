@@ -1579,6 +1579,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$RUNNER_OS/$RUNNER_ARCH" == macOS/X64 ]]
+          [[ "$(scripts/package-release-binaries.sh --print-platform)" == darwin-amd64 ]]
           df -Pk .
           df -Pk . | awk 'NR == 2 { if ($4 < 8 * 1024 * 1024) { print "Intel runner has under 8 GiB free"; exit 1 } }'
       - name: build the gateway binary
