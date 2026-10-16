@@ -8784,7 +8784,8 @@ mod tests {
         let (_, owner) = local_profile_owner_grant(root.path());
         crate::auth::set_guest_registration_enabled(root.path(), true, crate::auth::now_ts())
             .unwrap();
-        let guest_credential = test_credential_2();
+        let mut guest_credential = test_credential_2();
+        guest_credential.rp_id = "localhost".to_string();
         store_test_credential(root.path(), guest_credential.clone());
         let guest = crate::auth::grant_passkey_session(
             root.path(),
@@ -8854,7 +8855,8 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        let unrelated_credential = test_credential();
+        let mut unrelated_credential = test_credential();
+        unrelated_credential.rp_id = "localhost".to_string();
         store_test_credential(root.path(), unrelated_credential.clone());
         let unrelated = crate::auth::grant_passkey_session(
             root.path(),

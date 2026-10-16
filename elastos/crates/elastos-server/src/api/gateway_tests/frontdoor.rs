@@ -155,6 +155,7 @@ async fn frontdoor_public_list_requires_configured_gateway_host() {
         "gateway_allowed_hosts = [\"home.example.test\"]\n",
     )
     .unwrap();
+    super::write_gateway_health_lock(dir.path(), std::process::id());
     let app = app(dir.path());
     let response = app
         .clone()
