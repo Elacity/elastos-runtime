@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Documents · ElastOS</title>
 <script src="./elastos-theme.js"></script>
+<script src="./elastos-drawer.js"></script>
 <link rel="stylesheet" href="./elastos-ui.css">
 <style>
 :root {
@@ -185,13 +186,14 @@ a {
   background: var(--bg);
 }
 
-/* Collapsed: keep leading chrome column so traffic lights stay over material. */
-.documents-shell[data-sidebar-collapsed="true"] {
+/* Collapsed: keep leading chrome column so traffic lights stay over material.
+   The phone drawer always shows the list, whatever the desktop chose. */
+:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] {
   grid-template-columns: 220px minmax(0, 1fr);
 }
 
-.documents-shell[data-sidebar-collapsed="true"] .sidebar-search,
-.documents-shell[data-sidebar-collapsed="true"] .documents-list {
+:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] .sidebar-search,
+:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] .documents-list {
   display: none;
 }
 
@@ -788,6 +790,17 @@ a {
   gap: 0.42rem;
 }
 
+/* The More menu only exists on the phone stage; on wider stages its actions
+   sit in the toolbar row as before. */
+.toolbar-more,
+.more-menu {
+  display: contents;
+}
+
+.more-button {
+  display: none;
+}
+
 .view-toggle,
 .workspace-toggle {
   display: inline-flex;
@@ -1328,22 +1341,180 @@ a {
     padding: 0.52rem;
   }
 }
+
+/* Phone stage: the editor gets the whole width (Apple Notes). The list is the
+   shared push drawer (elastos-drawer.js) led by the toggle beside the title;
+   view and Save sit on one row of 44 px buttons, the rest in a More menu. Split has no room on a phone and
+   reads as Write; the desktop "Hide list" control gives way to the drawer. */
+:root[data-el-form-factor="phone"] .documents-shell {
+  grid-template-columns: minmax(0, 1fr);
+  /* Shows at the pushed-aside view's rounded corners: the drawer's fill. */
+  background: linear-gradient(var(--sidebar-bg), var(--sidebar-bg)) var(--bg);
+}
+
+:root[data-el-form-factor="phone"] .documents-sidebar {
+  padding: calc(12px + env(safe-area-inset-top, 0px)) 12px calc(16px + env(safe-area-inset-bottom, 0px));
+  border: 0;
+  background: linear-gradient(var(--sidebar-bg), var(--sidebar-bg)) var(--bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+:root[data-el-form-factor="phone"] .sidebar-search {
+  font-size: 16px;
+}
+
+:root[data-el-form-factor="phone"] .documents-main {
+  padding: 0 12px calc(8px + env(safe-area-inset-bottom, 0px));
+}
+
+:root[data-el-form-factor="phone"] .documents-toolbar {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 4px 0 8px;
+}
+
+:root[data-el-form-factor="phone"] .documents-identity {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: -8px;
+}
+
+:root[data-el-form-factor="phone"] .title-input {
+  flex: 1 1 auto;
+  min-height: var(--el-touch-target);
+  min-width: 0;
+  max-width: none;
+  font-size: 20px;
+}
+
+:root[data-el-form-factor="phone"] .toolbar-actions {
+  justify-content: flex-start;
+  min-width: 0;
+  max-width: 100%;
+  /* The narrow-window row scrolls, which would clip the More menu. */
+  overflow: visible;
+}
+
+:root[data-el-form-factor="phone"] .more-button {
+  display: inline-grid;
+}
+
+:root[data-el-form-factor="phone"] .toolbar-more {
+  display: block;
+  position: relative;
+  margin-left: auto;
+}
+
+:root[data-el-form-factor="phone"] .more-menu {
+  display: none;
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 220px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+}
+
+:root[data-el-form-factor="phone"] .toolbar-more[data-open="true"] .more-menu {
+  display: flex;
+}
+
+:root[data-el-form-factor="phone"] .more-menu .toolbar-group {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+}
+
+:root[data-el-form-factor="phone"] .more-menu .action-icon-button {
+  display: flex;
+  justify-content: flex-start;
+  gap: 12px;
+  width: 100%;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  text-align: start;
+  white-space: nowrap;
+}
+
+:root[data-el-form-factor="phone"] .more-menu .action-icon-button::after {
+  content: attr(aria-label);
+  font-size: 16px;
+  font-weight: 500;
+}
+
+:root[data-el-form-factor="phone"] .action-icon-button,
+:root[data-el-form-factor="phone"] .copy-link-button {
+  width: var(--el-touch-target);
+  height: var(--el-touch-target);
+  min-height: var(--el-touch-target);
+}
+
+/* Each tab is a full 44 px target; the pill paints only inside its padding,
+   and the ring is a shadow so no border eats into the target. */
+:root[data-el-form-factor="phone"] .workspace-toggle {
+  height: var(--el-touch-target);
+  padding: 0;
+  gap: 0;
+  border: 0;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+:root[data-el-form-factor="phone"] .workspace-tab {
+  width: var(--el-touch-target);
+  height: var(--el-touch-target);
+  padding: 3px;
+  border: 0;
+  background-clip: content-box;
+}
+
+:root[data-el-form-factor="phone"] #mode-split,
+:root[data-el-form-factor="phone"] #sidebar-toggle,
+:root[data-el-form-factor="phone"] .editor-pane > .pane-header {
+  display: none;
+}
+
+:root[data-el-form-factor="phone"] .documents-shell[data-workspace-view="split"] .documents-workspace {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+:root[data-el-form-factor="phone"] .documents-shell[data-workspace-view="split"] .inspector-pane {
+  display: none;
+}
+
+:root[data-el-form-factor="phone"] .editor {
+  font-size: 16px;
+  line-height: 1.55;
+}
 </style>
 </head>
 <body>
 <div class="page-shell">
   <section id="documents-shell" class="documents-shell hidden">
-    <aside id="documents-sidebar" class="documents-sidebar">
+    <aside id="documents-sidebar" class="documents-sidebar" data-el-drawer>
       <div class="sidebar-controls">
-        <button id="new-document" class="sidebar-create" type="button" aria-label="New document" title="New document">+</button>
+        <button id="new-document" class="sidebar-create" type="button" aria-label="New document" title="New document" data-el-drawer-close>+</button>
         <input id="sidebar-search" class="sidebar-search" type="search" placeholder="Search documents" spellcheck="false">
       </div>
-      <div id="documents-list" class="documents-list"></div>
+      <div id="documents-list" class="documents-list" data-el-drawer-close></div>
     </aside>
 
-    <main class="documents-main">
+    <main class="documents-main" data-el-drawer-room="documents-sidebar">
       <header class="documents-toolbar">
         <div class="documents-identity">
+          <button type="button" class="el-drawer-toggle" data-el-drawer-toggle="documents-sidebar" aria-label="Show documents"></button>
           <input id="title-input" class="title-input" type="text" placeholder="Untitled document" spellcheck="false">
         </div>
         <div class="toolbar-actions">
@@ -1362,23 +1533,34 @@ a {
             <button id="save-button" class="action-primary action-icon-button" type="button" aria-label="Save" title="Save">
               <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h12l2 2v14H5z"></path><path d="M8 4v6h8V4"></path><path d="M8 20v-6h8v6"></path></svg>
             </button>
-            <button id="save-as-button" class="action-secondary action-icon-button" type="button" aria-label="Save as" title="Save as">
-              <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h9l3 3v9H8z"></path><path d="M4 4h9v3"></path><path d="M4 4v12h4"></path><path d="M13 12v5"></path><path d="M10.5 14.5h5"></path></svg>
+          </div>
+          <div class="toolbar-more">
+            <button id="more-button" class="action-secondary action-icon-button more-button" type="button" aria-label="More actions" title="More actions" aria-expanded="false" aria-controls="more-menu">
+              <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5.5" cy="12" r="1.3"></circle><circle cx="12" cy="12" r="1.3"></circle><circle cx="18.5" cy="12" r="1.3"></circle></svg>
             </button>
-            <button id="publish-button" class="action-secondary action-icon-button" type="button" aria-label="Publish" title="Publish">
-              <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"></path><path d="m7 9 5-5 5 5"></path><path d="M5 16v4h14v-4"></path></svg>
-            </button>
-            <button id="unpublish-button" class="action-secondary action-icon-button" type="button" aria-label="Unpublish" title="Unpublish">
-              <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12"></path><path d="m7 11 5 5 5-5"></path><path d="M5 20h14"></path></svg>
-            </button>
+            <div id="more-menu" class="more-menu" role="group" aria-label="More actions">
+              <div class="toolbar-group">
+                <button id="save-as-button" class="action-secondary action-icon-button" type="button" aria-label="Save as" title="Save as">
+                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h9l3 3v9H8z"></path><path d="M4 4h9v3"></path><path d="M4 4v12h4"></path><path d="M13 12v5"></path><path d="M10.5 14.5h5"></path></svg>
+                </button>
+                <button id="publish-button" class="action-secondary action-icon-button" type="button" aria-label="Publish" title="Publish">
+                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"></path><path d="m7 9 5-5 5 5"></path><path d="M5 16v4h14v-4"></path></svg>
+                </button>
+                <button id="unpublish-button" class="action-secondary action-icon-button" type="button" aria-label="Unpublish" title="Unpublish">
+                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12"></path><path d="m7 11 5 5 5-5"></path><path d="M5 20h14"></path></svg>
+                </button>
+              </div>
+              <div class="toolbar-group">
+                <button id="copy-published-link" class="action-secondary action-icon-button copy-link-button hidden" type="button" aria-label="Copy Published Link" title="Copy Published Link" disabled>
+                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path></svg>
+                </button>
+                <button id="delete-button" class="action-secondary action-danger action-icon-button" type="button" aria-label="Delete" title="Delete">
+                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14"></path><path d="M9 7V5h6v2"></path><path d="M8 7l1 13h6l1-13"></path><path d="M10.5 11v5"></path><path d="M13.5 11v5"></path></svg>
+                </button>
+              </div>
+            </div>
           </div>
           <div class="toolbar-group">
-            <button id="copy-published-link" class="action-secondary action-icon-button copy-link-button hidden" type="button" aria-label="Copy Published Link" title="Copy Published Link" disabled>
-              <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path></svg>
-            </button>
-            <button id="delete-button" class="action-secondary action-danger action-icon-button" type="button" aria-label="Delete" title="Delete">
-              <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14"></path><path d="M9 7V5h6v2"></path><path d="M8 7l1 13h6l1-13"></path><path d="M10.5 11v5"></path><path d="M13.5 11v5"></path></svg>
-            </button>
             <button id="sidebar-toggle" class="action-secondary action-icon-button sidebar-toggle" type="button" aria-label="Hide list" title="Hide list" aria-controls="documents-sidebar" aria-expanded="true">
               <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"></path><path d="M9 5v14"></path><path d="m15 9-3 3 3 3"></path></svg>
             </button>

@@ -14,8 +14,12 @@ import {
 } from "./shell-windows.js?v=home-20260813a";
 import {
   dismissWithMotion,
+  isDismissing,
   prepareSurfaceOpen,
 } from "./shell-motion.js?v=home-20260813a";
+import { LAYER_STATE, registerStageLayer } from "./shell-popovers.js?v=home-20260813a";
+import { bindSheetHandle, SHEET_DRAG_UP } from "./shell-sheet-handle.js?v=home-20260813a";
+import { FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20260813a";
 
 /* Spotlight: shell-wide search (macOS anatomy — dimmed backdrop, centered
  * floating bar, grouped results that grow beneath it). Searches everything
@@ -36,6 +40,7 @@ import {
 let spotlight = null;
 let spotlightInput = null;
 let spotlightResults = null;
+let spotlightButton = null;
 
 const DOCUMENTS_CACHE_MS = 60_000;
 
@@ -218,9 +223,20 @@ function renderResults() {
     detail.className = "spotlight-detail";
     detail.textContent = item.detail;
     row.append(glyph, title, detail);
+    let openOnClick = false;
     row.addEventListener("pointerdown", (event) => {
       event.preventDefault();
-      activateResult(index);
+      // On the phone a finger landing on a row may be starting a scroll, so
+      // touch opens on click; tablet and desktop open on press as before.
+      openOnClick = event.pointerType === "touch" && isPhone();
+      if (!openOnClick) {
+        activateResult(index);
+      }
+    });
+    row.addEventListener("click", () => {
+      if (openOnClick) {
+        activateResult(index);
+      }
     });
     row.addEventListener("pointerenter", () => {
       setSelection(index);
@@ -288,8 +304,45 @@ export function spotlightOpen() {
   return spotlight ? !spotlight.hidden : false;
 }
 
+function spotlightPanel() {
+  return spotlight?.querySelector(".spotlight-panel") || null;
+}
+
+// Spotlight's own report for Back, read from the panel, which is what its
+// close animates (#spotlight stays shown until the leave ends).
+function spotlightLayerState() {
+  if (!spotlightOpen()) {
+    return LAYER_STATE.closed;
+  }
+  return isDismissing(spotlightPanel()) ? LAYER_STATE.closing : LAYER_STATE.open;
+}
+
+// On the phone Search opens Spotlight as a sheet and says so (popup and
+// expanded state); tablet and desktop keep the base button markup.
+const SEARCH_BUTTON_POPUP_ATTRIBUTES = Object.freeze(["aria-haspopup", "aria-controls", "aria-expanded"]);
+
+function syncSpotlightButton() {
+  if (!spotlightButton) {
+    return;
+  }
+  if (!isPhone()) {
+    for (const name of SEARCH_BUTTON_POPUP_ATTRIBUTES) {
+      spotlightButton.removeAttribute(name);
+    }
+    return;
+  }
+  spotlightButton.setAttribute("aria-haspopup", "dialog");
+  spotlightButton.setAttribute("aria-controls", "spotlight");
+  spotlightButton.setAttribute("aria-expanded", spotlightLayerState() === LAYER_STATE.open ? "true" : "false");
+}
+
 export function showSpotlight() {
-  if (!spotlight || spotlightOpen()) {
+  const panel = spotlightPanel();
+  // On the phone, Search pressed while the sheet is still leaving opens it
+  // again (a fresh open layer for Back); tablet and desktop keep their
+  // behaviour.
+  const reopening = isPhone() && isDismissing(panel);
+  if (!spotlight || (spotlightOpen() && !reopening)) {
     spotlightInput?.focus();
     return;
   }
@@ -297,7 +350,6 @@ export function showSpotlight() {
     document.activeElement && document.activeElement !== document.body
       ? document.activeElement
       : null;
-  const panel = spotlight.querySelector(".spotlight-panel");
   prepareSurfaceOpen(panel);
   if (panel) {
     panel.hidden = false;
@@ -305,6 +357,7 @@ export function showSpotlight() {
   spotlight.hidden = false;
   spotlight.inert = false;
   spotlight.setAttribute("aria-hidden", "false");
+  syncSpotlightButton();
   spotlightInput.value = "";
   runSearch("");
   spotlightInput.focus();
@@ -315,7 +368,7 @@ export function hideSpotlight({ restoreFocus = true } = {}) {
   if (!spotlight || spotlight.hidden) {
     return;
   }
-  const panel = spotlight.querySelector(".spotlight-panel");
+  const panel = spotlightPanel();
   const finish = () => {
     spotlight.hidden = true;
     spotlight.inert = true;
@@ -329,6 +382,7 @@ export function hideSpotlight({ restoreFocus = true } = {}) {
       spotlightState.invoker?.focus?.();
     }
     spotlightState.invoker = null;
+    syncSpotlightButton();
   };
   if (!panel) {
     finish();
@@ -340,6 +394,7 @@ export function hideSpotlight({ restoreFocus = true } = {}) {
     hide: false,
     onDone: finish,
   });
+  syncSpotlightButton();
 }
 
 export function toggleSpotlight() {
@@ -361,11 +416,21 @@ export function bindSpotlight() {
   spotlight = document.querySelector("#spotlight");
   spotlightInput = document.querySelector("#spotlight-input");
   spotlightResults = document.querySelector("#spotlight-results");
+  spotlightButton = document.querySelector("#toolbar-spotlight");
   if (!spotlight || !spotlightInput) {
     return;
   }
+  registerStageLayer("spotlight", { selector: "#spotlight", state: spotlightLayerState, close: () => hideSpotlight() });
+  syncSpotlightButton();
+  window.addEventListener(FORM_FACTOR_EVENT, syncSpotlightButton);
   spotlightInput.addEventListener("input", () => {
     runSearch(spotlightInput.value);
+  });
+  bindSheetHandle(document.querySelector("#spotlight-handle"), {
+    sheet: spotlight.querySelector(".spotlight-panel"),
+    direction: SHEET_DRAG_UP,
+    close: () => hideSpotlight(),
+    tapCloses: true,
   });
   spotlight.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {

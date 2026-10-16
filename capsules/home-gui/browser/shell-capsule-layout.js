@@ -1,5 +1,21 @@
-// Home tells capsule frames when they are visible so hidden Chat views pause reads.
+/* Capsule layout: tells every capsule frame which size class the shell is in,
+   so a capsule can drop its desktop window-chrome safe areas and switch to its
+   phone layout. A capsule cannot tell a phone stage from a narrow desktop
+   window by its own width: only the shell knows whether traffic lights sit
+   over the frame. Presentation only — no authority, nothing a capsule could
+   misuse. The shared theme runtime (capsules/_shared/elastos-theme.js) applies
+   it as html[data-el-form-factor] and html[data-el-pointer]. */
+
+import { FORM_FACTOR_EVENT, formFactor, isCoarsePointer } from "./shell-form-factor.js?v=home-20260813a";
+
 export const SHELL_LAYOUT_MESSAGE = "elastos:shell-layout";
+
+export function shellLayout(view = window) {
+  return {
+    formFactor: formFactor(view),
+    pointer: isCoarsePointer(view) ? "coarse" : "fine",
+  };
+}
 
 export function postShellLayout(frameWindow, layout) {
   try {
@@ -25,7 +41,8 @@ export function capsuleFrameVisible(frame, doc = document, view = window) {
 }
 
 function sameLayout(left, right) {
-  return left?.visible === right?.visible;
+  return left?.formFactor === right?.formFactor && left?.pointer === right?.pointer
+    && left?.visible === right?.visible;
 }
 
 // Returns an unbind. Attribute observations are limited to shell presentation;
@@ -33,7 +50,7 @@ function sameLayout(left, right) {
 export function bindCapsuleLayout(doc = document, view = window) {
   const sent = new WeakMap();
   const postFrame = (frame, force = false) => {
-    const layout = { visible: capsuleFrameVisible(frame, doc, view) };
+    const layout = { ...shellLayout(view), visible: capsuleFrameVisible(frame, doc, view) };
     if (force || !sameLayout(sent.get(frame), layout)) {
       sent.set(frame, layout);
       postShellLayout(frame.contentWindow, layout);
@@ -65,6 +82,7 @@ export function bindCapsuleLayout(doc = document, view = window) {
   doc.addEventListener("visibilitychange", postToAllFrames);
   doc.addEventListener("transitionend", handleTransitionEnd, true);
   view.addEventListener("resize", postToAllFrames);
+  view.addEventListener(FORM_FACTOR_EVENT, postToAllFrames);
   view.addEventListener("message", handleLayoutRequest);
   postToAllFrames();
   return () => {
@@ -73,6 +91,7 @@ export function bindCapsuleLayout(doc = document, view = window) {
     doc.removeEventListener("visibilitychange", postToAllFrames);
     doc.removeEventListener("transitionend", handleTransitionEnd, true);
     view.removeEventListener("resize", postToAllFrames);
+    view.removeEventListener(FORM_FACTOR_EVENT, postToAllFrames);
     view.removeEventListener("message", handleLayoutRequest);
   };
 }

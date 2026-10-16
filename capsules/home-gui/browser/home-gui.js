@@ -1,4 +1,3 @@
-import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20260813a";
 import {
   desktop,
   desktopBackdrop,
@@ -10,6 +9,7 @@ import {
   launcherToggleButton,
   launcherViewToggle,
   identityMenuSystemButton,
+  HOME_GUI_HOST_SELECTORS,
   shellState,
   taskbarTargets,
   toolbarFullscreenButton,
@@ -26,6 +26,7 @@ import {
   shouldIgnoreDesktopKeydown,
   targetById,
 } from "./shell-core.js?v=home-20260813a";
+import { registerStageGesture, registerStageLayer } from "./shell-popovers.js?v=home-20260813a";
 import {
   bindIdentityMenu,
   clearIdentitySurface,
@@ -151,6 +152,11 @@ import {
   retireConnectorSheet,
   showConnectorSheet,
 } from "./shell-connector-sheet.js?v=home-20260813a";
+import { bindFormFactor, FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20260813a";
+import { bindPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
+import { bindPhoneStage, resetPhoneStage } from "./shell-phone-stage.js?v=home-20260813a";
+import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20260813a";
+import { bindTouchLongPress } from "./shell-touch.js?v=home-20260813a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -164,8 +170,6 @@ bindSetupSheet();
 bindQuickLook();
 bindExpose();
 bindSpacePager();
-const unbindCapsuleLayout = bindCapsuleLayout();
-window.addEventListener("beforeunload", unbindCapsuleLayout, { once: true });
 bindSpaceEdgePeek();
 bindShellKeyboard();
 bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
@@ -174,26 +178,6 @@ bindWalletRail();
 bindInboxRail();
 bindConnectorSheet();
 
-const HOME_GUI_HOST_SELECTORS = Object.freeze([
-  ".desktop-backdrop",
-  ".toolbar",
-  ".desktop-workspace",
-  ".taskbar",
-  ".launcher",
-  "#desktop-context-menu",
-  "#home-notification-toast",
-  "#notification-center",
-  "#control-centre",
-  "#wallet-rail",
-  "#inbox-rail",
-  "#setup-sheet",
-  "#connector-sheet",
-  "#spotlight",
-  "#window-switcher",
-  "#quick-look",
-  "#shortcuts-overlay",
-  "#about-overlay",
-]);
 let homeGuiInteractionsBound = false;
 
 export const homeGuiWindowHooks = Object.freeze({
@@ -346,6 +330,8 @@ function startHomeGuiClock() {
     return;
   }
   shellState.clockTimer = window.setInterval(updateClock, 30_000);
+  // The phone bar's clock is date and time spans; a stage reset re-renders it.
+  window.addEventListener(FORM_FACTOR_EVENT, updateClock);
 }
 
 function stopHomeGuiClock() {
@@ -1056,6 +1042,7 @@ function bindAboutOverlay() {
     return;
   }
   aboutOverlayBound = true;
+  registerStageLayer("about", { selector: "#about-overlay", close: () => hideAboutOverlay() });
   document.querySelector("#identity-menu-about")?.addEventListener("click", () => {
     showAboutOverlay();
   });
@@ -1140,6 +1127,11 @@ function trackPointerDown(event) {
     y: event.clientY,
     at: window.performance ? window.performance.now() : Date.now(),
   };
+  // On the phone a tap on Close has no pointermove before it, so the press
+  // itself is the fresh gesture that clears the window close guard.
+  if (isPhone()) {
+    shellState.lastPointerMove = { ...shellState.lastPointer };
+  }
 }
 
 function trackPointerMove(event) {
@@ -1214,6 +1206,22 @@ export function bindHomeGuiInteractions(options = {}) {
     ? options.requestSummaryRefresh
     : null;
   shellState.requestSummaryRefresh = homeGuiHostActions.requestSummaryRefresh;
+
+  // Size class, pointer class and soft-keyboard inset before any surface
+  // binds, so CSS keyed on body[data-form-factor] is right on first paint.
+  // Crossing the phone boundary later is one clean stage reset.
+  bindFormFactor(document, window, { reset: (commit) => resetPhoneStage(commit) });
+  // Phone Dock tuck/peek handle; a no-op on tablet and desktop.
+  bindPhoneDock();
+  // Phone system-back history and the title-bar swipe to the switcher.
+  bindPhoneStage();
+  // Capsule frames learn the size class so they can take their phone layout.
+  bindCapsuleLayout();
+  // A held finger on the phone opens the same menus a right-click does;
+  // desktop icons keep their own long-press, which also arms the touch drag.
+  // Tablet and desktop keep the browser's own touch behaviour.
+  const touchLongPress = bindTouchLongPress(document, { skip: ".desktop-shortcut", active: isPhone });
+  registerStageGesture("long-press", touchLongPress.cancel);
 
   // The brand button itself toggles the ElastOS menu (bound in
   // bindIdentityMenu); the go-home action lives inside it as Show desktop.
@@ -1350,6 +1358,10 @@ export function bindHomeGuiInteractions(options = {}) {
       now >= shellState.contextMenuIgnoreOutsideUntil &&
       !event.target.closest("#desktop-context-menu")
     ) {
+      // The phone menu sheet covers the Dock; a tap beside it only dismisses.
+      if (desktopContextMenu?.classList.contains("context-menu-sheet")) {
+        touchLongPress.swallowNextClick();
+      }
       hideDesktopContextMenu();
     }
     if (launcher.hidden) {

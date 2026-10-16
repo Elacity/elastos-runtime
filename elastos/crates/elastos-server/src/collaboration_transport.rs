@@ -348,6 +348,12 @@ impl CollaborationTransportDriver {
         self.network.restore_missing_bootstrap_peers().await
     }
 
+    pub(crate) fn community_link(
+        &self,
+    ) -> &crate::collaboration_carrier::JoinedCollaborationNetwork {
+        &self.network
+    }
+
     pub(crate) async fn retry_outgoing_once(
         &self,
         now: u64,

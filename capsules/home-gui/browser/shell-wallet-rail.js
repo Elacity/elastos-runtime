@@ -8,6 +8,7 @@ import {
 import {
   closeOtherShellPopovers,
   registerShellPopover,
+  registerStageLayer,
 } from "./shell-popovers.js?v=home-20260813a";
 import {
   iframeAllowForLaunch,
@@ -94,6 +95,7 @@ export function bindWalletRail() {
   }
   if (!registered) {
     registerShellPopover("wallet-rail", () => hideWalletRail({ restoreFocus: false }));
+    registerStageLayer("wallet-rail", { selector: "#wallet-rail", close: () => hideWalletRail({ restoreFocus: false }) });
     registered = true;
   }
   barButton?.addEventListener("click", () => {

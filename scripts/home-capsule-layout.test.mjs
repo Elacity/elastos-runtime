@@ -6,6 +6,7 @@ import {
   bindCapsuleLayout,
   capsuleFrameVisible,
   postShellLayout,
+  shellLayout,
 } from "../capsules/home-gui/browser/shell-capsule-layout.js";
 
 class FakeFrame {
@@ -24,7 +25,7 @@ class FakeFrame {
   }
 }
 
-function fakeView({ width = 390, height = 844 } = {}) {
+function fakeView({ width = 390, height = 844, coarse = true } = {}) {
   const listeners = new Map();
   return {
     innerWidth: width,
@@ -36,6 +37,7 @@ function fakeView({ width = 390, height = 844 } = {}) {
       observe() { listeners.set("mutation", this.callback); }
       disconnect() { listeners.delete("mutation"); }
     },
+    matchMedia: (query) => ({ matches: coarse && (query === "(pointer: coarse)" || query === "(hover: none)") }),
     addEventListener: (type, listener) => listeners.set(type, listener),
     removeEventListener: (type) => listeners.delete(type),
     resize(nextWidth, nextHeight) {
@@ -62,17 +64,22 @@ function fakeDocument(frames) {
   };
 }
 
+test("shellLayout reports the size class and pointer class", () => {
+  assert.deepEqual(shellLayout(fakeView()), { formFactor: "phone", pointer: "coarse" });
+  assert.deepEqual(shellLayout(fakeView({ width: 1440, height: 900, coarse: false })), { formFactor: "desktop", pointer: "fine" });
+});
+
 test("postShellLayout sends the typed message and survives a torn-down frame", () => {
   const frame = new FakeFrame();
-  postShellLayout(frame.contentWindow, { visible: true });
+  postShellLayout(frame.contentWindow, { formFactor: "phone", pointer: "coarse" });
   assert.deepEqual(frame.messages, [
-    { message: { type: SHELL_LAYOUT_MESSAGE, layout: { visible: true } }, targetOrigin: "*" },
+    { message: { type: SHELL_LAYOUT_MESSAGE, layout: { formFactor: "phone", pointer: "coarse" } }, targetOrigin: "*" },
   ]);
   assert.doesNotThrow(() => postShellLayout({ postMessage: () => { throw new Error("detached"); } }, {}));
   assert.doesNotThrow(() => postShellLayout(null, {}));
 });
 
-test("bindCapsuleLayout posts to existing frames, to each frame as it loads, and only on a visibility change", () => {
+test("bindCapsuleLayout posts to existing frames, to each frame as it loads, and only on a size-class change", () => {
   const existing = new FakeFrame();
   const frames = [existing];
   const view = fakeView();
@@ -84,15 +91,15 @@ test("bindCapsuleLayout posts to existing frames, to each frame as it loads, and
   const late = new FakeFrame();
   frames.push(late);
   doc.load(late);
-  assert.deepEqual(late.messages.map((entry) => entry.message.layout), [{ visible: true }]);
+  assert.deepEqual(late.messages.map((entry) => entry.message.layout), [{ formFactor: "phone", pointer: "coarse", visible: true }]);
 
   doc.load({ tagName: "IMG" });
   view.resize(400, 850);
-  assert.equal(existing.messages.length, 1, "a resize with the same visibility posts nothing");
+  assert.equal(existing.messages.length, 1, "a resize inside the same size class posts nothing");
 
   view.resize(820, 1180);
-  assert.deepEqual(existing.messages.at(-1).message.layout, { visible: true });
-  assert.equal(late.messages.length, 1, "a resize that keeps a frame visible posts nothing");
+  assert.deepEqual(existing.messages.at(-1).message.layout, { formFactor: "tablet", pointer: "coarse", visible: true });
+  assert.equal(late.messages.length, 2, "a size-class change reaches every frame");
 
   const beforeRequest = existing.messages.length;
   view.listeners.get("message")({ data:{ type:SHELL_LAYOUT_MESSAGE, request:true }, source:{} });

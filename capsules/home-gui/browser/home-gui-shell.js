@@ -22,6 +22,7 @@ import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
 } from "./home-gui-authority.js?v=home-20260813a";
+import { FORM_FACTOR_EVENT, isPhone, relayKeyboardInset } from "./shell-form-factor.js?v=home-20260813a";
 import { applyHomeLinkStatus } from "./shell-link-status.js?v=home-20260813a";
 
 const route = new URL(window.location.href);
@@ -387,6 +388,10 @@ window.addEventListener("message", (event) => {
     settleRequest(message);
     return;
   }
+  if (message.type === "home:keyboard-inset") {
+    relayKeyboardInset(message.inset);
+    return;
+  }
   if (message.type === "home:link-status") {
     applyHomeLinkStatus(message);
     return;
@@ -409,6 +414,13 @@ window.addEventListener("message", (event) => {
         console.error("home-gui command failed", error);
       });
   }
+});
+
+// The host page owns the top-level viewport tag; it takes the phone variant
+// only while this shell's committed form factor is a phone (also at load:
+// the first commit happens when the interactions bind).
+window.addEventListener(FORM_FACTOR_EVENT, () => {
+  postToHome({ type: "home:form-factor", phone: isPhone() });
 });
 
 bindHomeGuiInteractions({

@@ -26,7 +26,9 @@
 
 import {
   closeOtherShellPopovers,
+  LAYER_STATE,
   registerShellPopover,
+  registerStageLayer,
 } from "./shell-popovers.js?v=home-20260813a";
 import {
   agentStageId,
@@ -35,6 +37,7 @@ import {
   isAgentSpace,
   setActiveStage,
 } from "./shell-stages.js?v=home-20260813a";
+import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
 import {
   createAssistantFrameReadiness,
   normalizeHomeAgentBrowserUrl,
@@ -57,6 +60,10 @@ const RETURN_MS = 160;
 const ROOM_MS = 720;
 const FACE_MIN_W = 320;
 const FACE_MAX_W = 720;
+/* Side gutters of .taskbar.is-assistant-face's max-width. The phone gutter is
+   the Dock's and the Apps face's, so the stretch never narrows the pill. */
+const FACE_GUTTER = 48;
+const FACE_GUTTER_PHONE = 20;
 
 let deps = null;
 let generation = 0;
@@ -137,13 +144,17 @@ function setFaceOpen(open) {
   toggle?.setAttribute("aria-expanded", open ? "true" : "false");
 }
 
+function faceViewportWidth() {
+  return window.innerWidth - (isPhone() ? FACE_GUTTER_PHONE : FACE_GUTTER);
+}
+
 /* Default geometry is the composer's idle pill; the capsule reports the live
    one as soon as its pill lays out, and again whenever it grows. */
 function lockFaceGeometry(taskbar) {
   if (taskbar.style.getPropertyValue("--assistant-face-w")) {
     return;
   }
-  const maxW = Math.max(FACE_MIN_W, window.innerWidth - 48);
+  const maxW = Math.max(FACE_MIN_W, faceViewportWidth());
   taskbar.style.setProperty("--assistant-face-w", `${Math.round(Math.min(maxW, FACE_MAX_W))}px`);
 }
 
@@ -152,7 +163,7 @@ function lockFaceGeometry(taskbar) {
 function faceTargetWidth(taskbar) {
   const locked = parseFloat(taskbar.style.getPropertyValue("--assistant-face-w"));
   const width = Number.isFinite(locked) && locked >= FACE_MIN_W ? locked : FACE_MAX_W;
-  return Math.round(Math.min(width, window.innerWidth - 48));
+  return Math.round(Math.min(width, faceViewportWidth()));
 }
 
 function applyFaceMetrics(metrics) {
@@ -342,6 +353,18 @@ function closeAssistantSpace({ instant = false } = {}) {
   spaceHideTimer = window.setTimeout(park, ROOM_MS + 40);
 }
 
+/* Back on the phone closes the room immediately. The dock morph can already
+   be leaving, or the room can be up without that morph; either way the
+   space has to go. */
+export function dismissAssistantForBack() {
+  const taskbar = taskbarEl();
+  const wasOpen = assistantFaceActive() || Boolean(taskbar?.dataset.assistantMorph);
+  if (wasOpen) {
+    hideAssistantFace({ instant: true });
+  }
+  closeAssistantSpace({ instant: true });
+}
+
 /* Host retires the GUI surface (sign-out, lock): drop the session with it. */
 export function retireAssistantSpace() {
   retirementGeneration += 1;
@@ -514,6 +537,12 @@ export function hideAssistantFace({ instant = false } = {}) {
   if (instant || reducedMotion()) {
     setHandover(false);
     closeAssistantSpace({ instant: true });
+    if (isPhone()) {
+      // clearTimers() cancelled the steps that drop the transient pill width.
+      taskbar.classList.remove("is-dock-width-easing");
+      taskbar.style.removeProperty("width");
+      taskbar.style.removeProperty("--dock-width-ms");
+    }
     finish();
     return;
   }
@@ -587,6 +616,13 @@ export function bindAssistantFace(dependencies) {
   spaceEl = document.querySelector("#assistant-space");
   frame = document.querySelector("#assistant-space-frame");
   registerShellPopover(FACE_ID, () => hideAssistantFace({ instant: true }));
+  registerStageLayer("assistant", {
+    selector: "#assistant-space",
+    state: () => (Boolean(spaceEl && !spaceEl.hidden) || assistantFaceActive() || Boolean(taskbarEl()?.dataset.assistantMorph)
+      ? LAYER_STATE.open
+      : LAYER_STATE.closed),
+    close: () => dismissAssistantForBack(),
+  });
   bindAgentSpace({
     available: () => Boolean(toggleEl()) && !toggleEl().hidden,
     busy: () => Boolean(taskbarEl()?.dataset.assistantMorph),
