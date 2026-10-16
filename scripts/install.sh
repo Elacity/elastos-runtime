@@ -47,8 +47,10 @@ MAINTAINER_DID_PLACEHOLDER="__MAINTAINER""_DID__"
 if [[ "$MAINTAINER_DID" == "$MAINTAINER_DID_PLACEHOLDER" ]]; then
     MAINTAINER_DID=""
 fi
-# Publisher stamp. After signature verification this becomes the UnixFS CIDv0
-# of the verified release-head.json bytes. A stamp that names other bytes is refused.
+# Publisher stamp. A frozen installer leaves this empty, and an empty stamp
+# stays empty so a fresh install stores no head CID. A non-empty stamp must
+# equal the UnixFS CIDv0 of the verified release-head.json bytes. A stamp that
+# names other bytes is refused.
 HEAD_CID="${ELASTOS_HEAD_CID:-__HEAD_CID__}"
 HEAD_CID_PLACEHOLDER="__HEAD""_CID__"
 if [[ "$HEAD_CID" == "$HEAD_CID_PLACEHOLDER" ]]; then
@@ -827,8 +829,9 @@ PY_ED25519
     ok "Signature verified"
 }
 
-# The stored head CID is the UnixFS CIDv0 of the verified release-head.json
-# bytes. A non-empty stamp that names different bytes is refused.
+# Compute the UnixFS CIDv0 of the verified release-head.json bytes. An empty
+# stamp stays empty. A non-empty stamp that names those bytes is kept. A stamp
+# that names different bytes is refused.
 bind_verified_head_cid() {
     local head_path="$1"
     local verified
@@ -859,10 +862,12 @@ while number:
 print(text)
 PY_HEAD_CID
 )" || die "Verified release head has no single-block CID"
-    if [[ -n "$HEAD_CID" && "$HEAD_CID" != "$verified" ]]; then
+    if [[ -z "$HEAD_CID" ]]; then
+        return 0
+    fi
+    if [[ "$HEAD_CID" != "$verified" ]]; then
         die "Stamped head CID differs from the verified release head. Stamp: ${HEAD_CID}. Verified: ${verified}"
     fi
-    HEAD_CID="$verified"
 }
 
 validate_release_identity() {
@@ -1428,7 +1433,7 @@ ok "Checksum and version match the signed release"
 SIGNER_DID=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["signer_did"]')
 
 SOURCES_PATH="${INSTALL_SCRATCH}/sources.json"
-# HEAD_CID is the UnixFS CIDv0 of the verified release-head.json bytes.
+# A matching stamp is the UnixFS CIDv0 of the verified bytes. An empty stamp stays empty.
 PUBLISHER_DID="${SIGNER_DID}" \
 PUBLISHER_GATEWAY="${PUBLISHER_GATEWAY}" \
 INSTALLED_VERSION="${RELEASE_VERSION}" \

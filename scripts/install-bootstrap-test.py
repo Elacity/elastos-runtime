@@ -508,7 +508,7 @@ class ShellTests(unittest.TestCase):
             path = Path(directory, "release-head.json")
             path.write_bytes(vector)
             stored = shell('HEAD_CID=""\nbind_verified_head_cid "$1"\nprintf "%s\\n" "$HEAD_CID"\n', path)
-            self.assertEqual((stored.returncode, stored.stdout.strip()), (0, expected), stored.stderr)
+            self.assertEqual((stored.returncode, stored.stdout.strip()), (0, ""), stored.stderr)
             same = shell('HEAD_CID="$2"\nbind_verified_head_cid "$1"\nprintf "%s\\n" "$HEAD_CID"\n',
                          path, expected)
             self.assertEqual((same.returncode, same.stdout.strip()), (0, expected), same.stderr)
@@ -1105,7 +1105,7 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(source["discovery_uri"],
                          "elastos://source/stable/" + hashlib.sha256(did.encode()).hexdigest()[:32])
         registration = (source["gateways"], source["head_cid"], source["connect_ticket"], source["publisher_node_id"])
-        self.assertEqual(registration, (["https://test.invalid"], unixfs_v0_cid(head), "fixture-ticket", "fixture-node"))
+        self.assertEqual(registration, (["https://test.invalid"], "", "fixture-ticket", "fixture-node"))
         # Apart from the stand-in's Runtime, the shell writes no installation file
         # itself and removes its staged copy.
         self.assertEqual(changed_paths(before, sandbox.home_state()), {".local/bin/elastos"})
