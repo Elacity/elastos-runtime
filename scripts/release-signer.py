@@ -451,6 +451,15 @@ def installer_template(policy, blob_oid, fetch):
 COMPONENT_KEYS = {"x86_64-linux": ("linux-amd64", "x86_64-linux"),
                   "aarch64-linux": ("linux-arm64", "aarch64-linux"),
                   "aarch64-darwin": ("darwin-arm64", "macos-arm64")}
+# Frozen at import. prepare() and the artifact prefix both use this set.
+# A later mutation of COMPONENT_KEYS does not admit a platform by itself.
+RELEASE_PLATFORMS = frozenset(COMPONENT_KEYS)
+
+
+def artifact_prefix_accepted(prefix):
+    names = ["mac" if platform == "aarch64-darwin" else platform for platform in sorted(RELEASE_PLATFORMS)]
+    names.append("seed")
+    return re.fullmatch(r"release-(?:proof-)?(?:" + "|".join(map(re.escape, names)) + ")", prefix) is not None
 
 
 def merge_components(template, manifests):
@@ -619,7 +628,7 @@ def checked_package_run(approval, run_id, fetch):
 
 
 def package_artifact(approval, run, prefix, fetch):
-    require(re.fullmatch(r"release-(?:proof-)?(?:mac|x86_64-linux|aarch64-linux|seed)", prefix), "package artifact prefix refused")
+    require(artifact_prefix_accepted(prefix), "package artifact prefix refused")
     pattern = re.compile(rf"{prefix}-{approval['source']['commit']}-([1-9][0-9]*)\Z")
     matches = []
     for page in range(1, 11):
@@ -1061,6 +1070,10 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
     usage = shutil.disk_usage(snapshot_root)
     require(usage.free >= total + 3 * MAX_JSON,
             "snapshot needs more free space than the volume has")
+    preview = manifest.get("release")
+    preview_platforms = preview.get("platforms") if type(preview) is dict else None
+    require(type(preview_platforms) is dict and preview_platforms
+            and set(preview_platforms) <= RELEASE_PLATFORMS, "release platforms refused")
     verify_release_provenance(policy, manifest, records, held_root, fetch, snapshot_root, root)
     for name, record in sorted(records.items()):
         destination = snapshot_root / name
@@ -1081,7 +1094,7 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
     if release["prev_release_cid"] is not None:
         cid_info(release["prev_release_cid"])
     platforms = release["platforms"]
-    require(type(platforms) is dict and platforms and set(platforms) <= {"x86_64-linux", "aarch64-linux", "aarch64-darwin"}, "release platforms refused")
+    require(type(platforms) is dict and platforms and set(platforms) <= RELEASE_PLATFORMS, "release platforms refused")
     advertised = set()
     approved_refs = {(record["cid"], record["sha256"]) for record in records.values()}
     def admit_ref(cid, digest, size=None, release_path=None):

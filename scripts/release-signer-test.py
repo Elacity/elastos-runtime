@@ -552,6 +552,25 @@ class SignerTests(unittest.TestCase):
         self.assertEqual(set(S.parse_json(prepared.release)["platforms"]),
                          {"aarch64-darwin", "x86_64-linux", "aarch64-linux"})
 
+    def test_prepare_refuses_a_platform_added_only_on_component_keys(self):
+        platform = copy.deepcopy(self.manifest["release"]["platforms"]["x86_64-linux"])
+        self.manifest["release"]["platforms"]["x86_64-darwin"] = platform
+        (self.root / "elastos-x86_64-darwin").write_bytes(self.binary)
+        self.manifest["files"]["elastos-x86_64-darwin"] = copy.deepcopy(
+            self.manifest["files"]["elastos-x86_64-linux"])
+        original = dict(S.COMPONENT_KEYS)
+        S.COMPONENT_KEYS["x86_64-darwin"] = ("darwin-amd64", "x86_64-darwin")
+        try:
+            self.assertNotIn("x86_64-darwin", S.RELEASE_PLATFORMS)
+            self.assertFalse(S.artifact_prefix_accepted("release-x86_64-darwin"))
+            self.assertTrue(S.artifact_prefix_accepted("release-mac"))
+            self.approve_manifest()
+            with self.assertRaisesRegex(ValueError, "release platforms refused"):
+                self.prepare()
+        finally:
+            S.COMPONENT_KEYS.clear()
+            S.COMPONENT_KEYS.update(original)
+
     def test_annotated_tag_and_identical_main_are_supported(self):
         prefix = f"/repos/{S.REPOSITORY}"
         self.policy["tag_oid"] = TAG

@@ -48,11 +48,13 @@ class PackageReleaseNameTest(unittest.TestCase):
     def test_intel_package_key_is_the_release_id_the_signer_refuses(self):
         platforms = json.loads((ROOT / "scripts/release-platforms.json").read_text())
         self.assertEqual(platforms["darwin-amd64"], "x86_64-darwin")
-        signer = (ROOT / "scripts/release-signer.py").read_text()
-        self.assertIn(
-            'set(platforms) <= {"x86_64-linux", "aarch64-linux", "aarch64-darwin"}, "release platforms refused"',
-            signer,
-        )
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "release_signer_platforms", ROOT / "scripts/release-signer.py")
+        signer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(signer)
+        self.assertNotIn("x86_64-darwin", signer.RELEASE_PLATFORMS)
+        self.assertEqual(signer.RELEASE_PLATFORMS, frozenset(signer.COMPONENT_KEYS))
         result = package_name("Darwin", "x86_64")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "darwin-amd64")
