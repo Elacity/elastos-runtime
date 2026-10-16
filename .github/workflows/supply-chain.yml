@@ -1,0 +1,25 @@
+# Supply-chain gates (assurance plan, BASE-SEC-09). Third-party actions run with this
+# repository's token and secrets, so each one is pinned to a full commit SHA with its
+# release tag in a trailing comment; this workflow fails if any reference is mutable.
+name: supply-chain
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actions-pinned:
+    name: actions pinned to commit SHAs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Every uses is pinned to a full commit SHA
+        run: bash .github/scripts/check-actions-pinned.sh

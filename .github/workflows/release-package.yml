@@ -161,7 +161,7 @@ jobs:
           tar -cf - inputs | gzip -1 | split -b 2000m -a 3 - package/release-inputs.tar.gz.part
           (cd package && shasum -a 256 release-inputs.tar.gz.part* > SHA256SUMS)
       - id: upload
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: release-mac-${{ inputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.RELEASE_ROOT }}/package
@@ -218,7 +218,7 @@ jobs:
           bash scripts/build/build-llama-server-bundle.sh "$RUNNER_TEMP/llama-arm64-bundle"
           bash scripts/build/build-llama-server-bundle.sh --verify-archive "$RUNNER_TEMP/llama-arm64-bundle"
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: release-llama-arm64-${{ inputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/llama-arm64-bundle
@@ -349,7 +349,7 @@ jobs:
           tar -cf - inputs | gzip -1 | split -b 2000m -a 3 - package/release-inputs.tar.gz.part
           (cd package && shasum -a 256 -- * > SHA256SUMS)
       - id: upload
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: release-${{ matrix.platform }}-${{ inputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ env.RELEASE_ROOT }}/package
@@ -414,7 +414,7 @@ jobs:
           tar -czf "$package/source.tar.gz" -C "$SEED_SOURCE_ROOT" .
           (cd "$package" && sha256sum elastos ipfs-provider source.tar.gz > SHA256SUMS)
       - id: upload
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: release-seed-${{ inputs.source_commit }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/seed-package
