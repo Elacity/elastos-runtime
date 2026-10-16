@@ -14,6 +14,7 @@ export function plainTextFromClipboardEvent(event) {
 }
 
 export function bindBrowserInputSurface({
+  captureViewerOwnerGuard,
   copyRemoteClipboardToHost,
   friendlyOpenError,
   getCurrentPage,
@@ -28,7 +29,7 @@ export function bindBrowserInputSurface({
   unlockRemoteAudioFromGesture,
 }) {
   let wheelTimer = 0;
-  let wheelDelta = { x: 0, y: 0 };
+  let wheelBatch = null;
   let touchPanState = null;
   let suppressSyntheticClickUntil = 0;
   const hostModifierState = {
@@ -187,7 +188,10 @@ export function bindBrowserInputSurface({
     };
   }
 
-  function sendClickFromEvent(event) {
+  function sendClickFromEvent(event, ownerActive = captureViewerOwnerGuard()) {
+    if (!ownerActive()) {
+      return;
+    }
     unlockRemoteAudioFromGesture();
     const point = browserPointFromEvent(event);
     if (!point) {
@@ -199,7 +203,9 @@ export function bindBrowserInputSurface({
       { type: "click", x: point.x, y: point.y },
       { history: "push" },
     ).catch((error) => {
-      showStatus(friendlyOpenError(error), { sticky: true });
+      if (ownerActive()) {
+        showStatus(friendlyOpenError(error), { sticky: true });
+      }
     });
   }
 
@@ -212,24 +218,45 @@ export function bindBrowserInputSurface({
   }
 
   function queueWheelInput(point, deltaX, deltaY) {
-    wheelDelta.x += deltaX;
-    wheelDelta.y += deltaY;
+    if (wheelBatch && !wheelBatch.ownerActive()) {
+      window.clearTimeout(wheelTimer);
+      wheelBatch = null;
+    }
+    if (!wheelBatch) {
+      const ownerActive = captureViewerOwnerGuard();
+      if (!ownerActive()) {
+        return;
+      }
+      wheelBatch = { ownerActive, x: 0, y: 0, point };
+    }
+    const batch = wheelBatch;
+    batch.x += deltaX;
+    batch.y += deltaY;
+    batch.point = point;
     window.clearTimeout(wheelTimer);
     wheelTimer = window.setTimeout(() => {
-      const delta = wheelDelta;
-      wheelDelta = { x: 0, y: 0 };
+      if (wheelBatch !== batch) {
+        return;
+      }
+      wheelTimer = 0;
+      wheelBatch = null;
+      if (!batch.ownerActive()) {
+        return;
+      }
       sendBrowserInput(
         {
           type: "wheel",
-          x: point?.x,
-          y: point?.y,
-          delta_x: delta.x,
-          delta_y: delta.y,
+          x: batch.point?.x,
+          y: batch.point?.y,
+          delta_x: batch.x,
+          delta_y: batch.y,
         },
         { history: "replace" },
-      ).catch((error) =>
-        showStatus(friendlyOpenError(error), { sticky: true }),
-      );
+      ).catch((error) => {
+        if (batch.ownerActive()) {
+          showStatus(friendlyOpenError(error), { sticky: true });
+        }
+      });
     }, WHEEL_FLUSH_MS);
   }
 
@@ -262,13 +289,22 @@ export function bindBrowserInputSurface({
       if (event.pointerType !== "touch" && event.pointerType !== "pen") {
         return;
       }
+      // Keep the first pointer's owner and release guard until it ends.
+      if (touchPanState) {
+        return;
+      }
       if (!getCurrentPage()) {
+        return;
+      }
+      const ownerActive = captureViewerOwnerGuard();
+      if (!ownerActive()) {
         return;
       }
       event.preventDefault();
       focusKeyboardCapture();
       touchPanState = {
         pointerId: event.pointerId,
+        ownerActive,
         x: event.clientX,
         y: event.clientY,
         moved: false,
@@ -289,6 +325,9 @@ export function bindBrowserInputSurface({
         return;
       }
       event.preventDefault();
+      if (!touchPanState.ownerActive()) {
+        return;
+      }
       const dx = touchPanState.x - event.clientX;
       const dy = touchPanState.y - event.clientY;
       if (Math.abs(dx) < 1 && Math.abs(dy) < 1) {
@@ -310,11 +349,11 @@ export function bindBrowserInputSurface({
       }
       event.preventDefault();
       renderPanel.releasePointerCapture?.(event.pointerId);
-      const moved = touchPanState.moved;
+      const { moved, ownerActive } = touchPanState;
       touchPanState = null;
       suppressSyntheticClickUntil = Date.now() + 700;
       if (!moved) {
-        sendClickFromEvent(event);
+        sendClickFromEvent(event, ownerActive);
       }
     },
     { passive: false },
@@ -333,9 +372,12 @@ export function bindBrowserInputSurface({
         return;
       }
       unlockRemoteAudioFromGesture();
+      const point = browserPointFromEvent(event);
+      if (!point) {
+        return;
+      }
       event.preventDefault();
       focusKeyboardCapture();
-      const point = browserPointFromEvent(event);
       queueWheelInput(point, event.deltaX, event.deltaY);
     },
     { passive: false },

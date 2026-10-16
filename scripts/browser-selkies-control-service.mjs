@@ -5509,7 +5509,10 @@ async function dispatchBrowserInputEvent(browserPage, event, timeoutMs, supplied
     }
     throw new Error("unsupported browser input event");
   };
-  return suppliedCdp ? dispatch(suppliedCdp) : withBrowserCdp(browserPage, timeoutMs, dispatch);
+  // A lost reply can follow an input effect; reconnecting must not replay it.
+  return suppliedCdp
+    ? dispatch(suppliedCdp)
+    : withBrowserCdp(browserPage, timeoutMs, dispatch, { retryAction: false });
 }
 
 function validateBrowserNavigationUrl(value) {

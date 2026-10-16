@@ -2582,6 +2582,10 @@ profileResetCommit?.addEventListener("click", () => {
 });
 
 bindBrowserInputSurface({
+  captureViewerOwnerGuard: () => {
+    const owner = currentRuntimePageOwner();
+    return () => runtimeViewerOwnerActive(owner);
+  },
   copyRemoteClipboardToHost,
   friendlyOpenError,
   getCurrentPage: () => currentPage,
