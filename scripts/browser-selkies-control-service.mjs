@@ -3156,6 +3156,7 @@ class CdpClient {
   }
 
   async connect(timeoutMs) {
+    this._browserDomainsReady = null;
     await this.ws.connect(timeoutMs);
     this.closed = false;
     this.ws.onText((message) => this.handleMessage(message));
@@ -3273,6 +3274,7 @@ class CdpClient {
   }
 
   close() {
+    this._browserDomainsReady = null;
     this.closed = true;
     this.ws.close();
   }
@@ -4501,8 +4503,7 @@ async function refreshBrowserPageState(browserPage, timeoutMs) {
     return cachedBrowserPageState(browserPage);
   }
   return withBrowserCdp(browserPage, timeoutMs, async (cdp) => {
-    await cdp.request("Page.enable");
-    await cdp.request("Runtime.enable");
+    await ensureBrowserCdpDomains(cdp);
     await ensureBrowserFileChooserInterception(cdp, browserPage);
     return browserPageStateFromCdp(browserPage, cdp, timeoutMs);
   });
@@ -5361,6 +5362,28 @@ async function browserRefInput(page, event, isCurrent) {
   }
 }
 
+// Reuse only domain enablement on this connection; chooser and page state stay separate.
+async function ensureBrowserCdpDomains(cdp) {
+  if (cdp.closed) throw new Error("browser CDP WebSocket closed");
+  if (!cdp._browserDomainsReady) {
+    cdp._browserDomainsReady = (async () => {
+      await cdp.request("Page.enable");
+      await cdp.request("Runtime.enable");
+    })();
+  }
+  const pending = cdp._browserDomainsReady;
+  try {
+    await pending;
+    if (cdp.closed) throw new Error("browser CDP WebSocket closed");
+    if (cdp._browserDomainsReady !== pending) {
+      throw new Error("browser CDP preparation was replaced");
+    }
+  } catch (error) {
+    if (cdp._browserDomainsReady === pending) cdp._browserDomainsReady = null;
+    throw error;
+  }
+}
+
 async function withBrowserCdp(browserPage, timeoutMs, action, { retryAction = true } = {}) {
   if (!browserPage?.debugger_url) {
     throw new Error("browser page debugger URL is unavailable");
@@ -5444,8 +5467,7 @@ function keyEventDefinition(key) {
 async function dispatchBrowserInputEvent(browserPage, event, timeoutMs, suppliedCdp = null) {
   const dispatch = async (cdp) => {
     if (!suppliedCdp) {
-    await cdp.request("Page.enable");
-    await cdp.request("Runtime.enable");
+    await ensureBrowserCdpDomains(cdp);
     await ensureBrowserFileChooserInterception(cdp, browserPage);
     }
     await cdp.request("Input.setIgnoreInputEvents", { ignore: false }).catch(() => {});

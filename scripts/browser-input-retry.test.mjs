@@ -59,7 +59,7 @@ function harness({ cached = true, initiallyClosed = false, failRequest = null,
       interceptions.push(cdp.label);
     },
   });
-  vm.runInContext(["withBrowserCdp", "finiteCoordinate", "keyEventDefinition", "dispatchBrowserInputEvent"].map(declaration).join("\n"), context);
+  vm.runInContext(["ensureBrowserCdpDomains", "withBrowserCdp", "finiteCoordinate", "keyEventDefinition", "dispatchBrowserInputEvent"].map(declaration).join("\n"), context);
   return {
     page, cachedClient, clients, requests, interceptions, failure,
     constructed: () => constructed, connected: () => connected,

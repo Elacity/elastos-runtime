@@ -626,6 +626,13 @@ APIs. Browser commands such as address navigation, back, forward, and reload
 remain Runtime/provider input calls; the Selkies control service applies them
 over private CDP and returns the current page state with `direct_network=false`.
 
+Ordinary CDP input and page-state refresh reuse successful Page and Runtime
+domain enablement on the same connection. A failed preparation remains an
+error and may be retried by a later call. A replacement connection prepares its
+own domains. Each input still enables input delivery, and each refresh reads
+current page metadata and navigation history. File chooser setup remains
+separate from domain preparation.
+
 Ordinary CDP click, wheel, and key dispatch reports the connection failure
 without automatically replaying input whose outcome may be uncertain. The
 viewer queue then stops dependent input. A fresh connection, or replacement of
