@@ -224,6 +224,20 @@ struct BinarySnapshot {
     sha256: String,
 }
 
+/// The installed binary was replaced, its path moved, or the file on disk
+/// could not be verified after a change. `docs/LAUNCHER_CONTRACT.md` tells
+/// the launcher to start the gateway again.
+const EXIT_INSTALLED_BINARY_REPLACED: i32 = 75;
+/// The process cannot read its own executable path. That is a failure.
+/// The launcher leaves this process stopped.
+const EXIT_EXECUTABLE_PATH_UNREADABLE: i32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Supersession {
+    reason: String,
+    exit_code: i32,
+}
+
 pub fn spawn_installed_binary_supersession_watch(data_dir: &Path, role: &str) {
     let Some(mut watch) = BinarySupersessionWatch::from_data_dir(data_dir) else {
         return;
@@ -234,9 +248,9 @@ pub fn spawn_installed_binary_supersession_watch(data_dir: &Path, role: &str) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Some(reason) = watch.superseded_reason() {
-                eprintln!("[{}] {}", role, reason);
-                std::process::exit(75);
+            if let Some(event) = watch.superseded_reason() {
+                eprintln!("[{}] {}", role, event.reason);
+                std::process::exit(event.exit_code);
             }
         }
     });
@@ -258,32 +272,45 @@ impl BinarySupersessionWatch {
         })
     }
 
-    fn superseded_reason(&mut self) -> Option<String> {
+    fn superseded_reason(&mut self) -> Option<Supersession> {
         self.superseded_reason_with(&RealBinarySnapshotReader)
     }
 
-    fn superseded_reason_with(&mut self, reader: &impl BinarySnapshotReader) -> Option<String> {
+    fn replaced(&self, reason: String) -> Option<Supersession> {
+        Some(Supersession {
+            reason,
+            exit_code: EXIT_INSTALLED_BINARY_REPLACED,
+        })
+    }
+
+    fn superseded_reason_with(
+        &mut self,
+        reader: &impl BinarySnapshotReader,
+    ) -> Option<Supersession> {
         let current_exe_raw = match reader.current_exe_path_raw() {
             Ok(path) => path,
             Err(err) => {
-                return Some(format!(
-                    "host executable path could not be read for {}: {err:#}. Exiting stale host.",
-                    self.current_exe_path.display()
-                ));
+                return Some(Supersession {
+                    reason: format!(
+                        "host executable path could not be read for {}: {err:#}. Exiting stale host.",
+                        self.current_exe_path.display()
+                    ),
+                    exit_code: EXIT_EXECUTABLE_PATH_UNREADABLE,
+                });
             }
         };
         let raw_text = current_exe_raw.to_string_lossy();
         let current_exe = normalize_deleted_exe_path(&current_exe_raw);
 
         if raw_text.ends_with(" (deleted)") {
-            return Some(format!(
+            return self.replaced(format!(
                 "host executable {} was replaced on disk. Exiting stale host.",
                 self.current_exe_path.display()
             ));
         }
 
         if current_exe != self.current_exe_path {
-            return Some(format!(
+            return self.replaced(format!(
                 "host executable moved from {} to {}. Exiting stale host.",
                 self.current_exe_path.display(),
                 current_exe.display()
@@ -293,7 +320,7 @@ impl BinarySupersessionWatch {
         let current_stamp = match reader.metadata_stamp(&self.current_exe_path) {
             Ok(stamp) => stamp,
             Err(err) => {
-                return Some(format!(
+                return self.replaced(format!(
                     "host executable {} could not be verified on disk: {err:#}. Exiting stale host.",
                     self.current_exe_path.display()
                 ));
@@ -307,14 +334,14 @@ impl BinarySupersessionWatch {
         let current_snapshot = match reader.digest_snapshot(&self.current_exe_path) {
             Ok(snapshot) => snapshot,
             Err(err) => {
-                return Some(format!(
+                return self.replaced(format!(
                     "host executable {} changed on disk and could not be re-verified: {err:#}. Exiting stale host.",
                     self.current_exe_path.display()
                 ));
             }
         };
         if current_snapshot.sha256 != self.current_binary_sha256 {
-            return Some(format!(
+            return self.replaced(format!(
                 "host binary {} changed on disk. Exiting stale host so the newer binary can take over.",
                 self.current_exe_path.display()
             ));
@@ -485,6 +512,7 @@ mod tests {
     struct TestBinarySnapshotReaderState {
         current_exe_raw: RefCell<PathBuf>,
         digest_reads: Cell<usize>,
+        fail_path: Cell<bool>,
     }
 
     impl TestBinarySnapshotReader {
@@ -493,12 +521,17 @@ mod tests {
                 state: Rc::new(TestBinarySnapshotReaderState {
                     current_exe_raw: RefCell::new(path),
                     digest_reads: Cell::new(0),
+                    fail_path: Cell::new(false),
                 }),
             }
         }
 
         fn set_current_exe_raw(&self, path: PathBuf) {
             *self.state.current_exe_raw.borrow_mut() = path;
+        }
+
+        fn fail_current_exe(&self) {
+            self.state.fail_path.set(true);
         }
 
         fn digest_reads(&self) -> usize {
@@ -508,6 +541,9 @@ mod tests {
 
     impl BinarySnapshotReader for TestBinarySnapshotReader {
         fn current_exe_path_raw(&self) -> anyhow::Result<PathBuf> {
+            if self.state.fail_path.get() {
+                anyhow::bail!("fixture path unreadable");
+            }
             Ok(self.state.current_exe_raw.borrow().clone())
         }
 
@@ -669,8 +705,9 @@ mod tests {
         let initial_reads = reader.digest_reads();
         write_file(&exe, b"changed content with a different length");
 
-        let reason = watch.superseded_reason_with(&reader).expect("superseded");
-        assert!(reason.contains("changed on disk"), "{reason}");
+        let event = watch.superseded_reason_with(&reader).expect("superseded");
+        assert!(event.reason.contains("changed on disk"), "{}", event.reason);
+        assert_eq!(event.exit_code, EXIT_INSTALLED_BINARY_REPLACED);
         assert_eq!(reader.digest_reads(), initial_reads + 1);
     }
 
@@ -686,8 +723,9 @@ mod tests {
         write_file(&replacement, b"modified");
         fs::rename(&replacement, &exe).expect("replace file");
 
-        let reason = watch.superseded_reason_with(&reader).expect("superseded");
-        assert!(reason.contains("changed on disk"), "{reason}");
+        let event = watch.superseded_reason_with(&reader).expect("superseded");
+        assert!(event.reason.contains("changed on disk"), "{}", event.reason);
+        assert_eq!(event.exit_code, EXIT_INSTALLED_BINARY_REPLACED);
         assert_eq!(reader.digest_reads(), initial_reads + 1);
     }
 
@@ -701,9 +739,14 @@ mod tests {
         let moved = temp.path().join("elastos-new");
         reader.set_current_exe_raw(moved.clone());
 
-        let reason = watch.superseded_reason_with(&reader).expect("superseded");
-        assert!(reason.contains("moved"), "{reason}");
-        assert!(reason.contains(&moved.display().to_string()), "{reason}");
+        let event = watch.superseded_reason_with(&reader).expect("superseded");
+        assert!(event.reason.contains("moved"), "{}", event.reason);
+        assert!(
+            event.reason.contains(&moved.display().to_string()),
+            "{}",
+            event.reason
+        );
+        assert_eq!(event.exit_code, EXIT_INSTALLED_BINARY_REPLACED);
     }
 
     #[test]
@@ -715,8 +758,13 @@ mod tests {
         let (mut watch, reader) = test_watch(&exe);
         fs::remove_file(&exe).expect("remove file");
 
-        let reason = watch.superseded_reason_with(&reader).expect("superseded");
-        assert!(reason.contains("could not be verified on disk"), "{reason}");
+        let event = watch.superseded_reason_with(&reader).expect("superseded");
+        assert!(
+            event.reason.contains("could not be verified on disk"),
+            "{}",
+            event.reason
+        );
+        assert_eq!(event.exit_code, EXIT_INSTALLED_BINARY_REPLACED);
     }
 
     #[test]
@@ -728,7 +776,30 @@ mod tests {
         let (mut watch, reader) = test_watch(&exe);
         reader.set_current_exe_raw(PathBuf::from(format!("{} (deleted)", exe.display())));
 
-        let reason = watch.superseded_reason_with(&reader).expect("superseded");
-        assert!(reason.contains("replaced on disk"), "{reason}");
+        let event = watch.superseded_reason_with(&reader).expect("superseded");
+        assert!(
+            event.reason.contains("replaced on disk"),
+            "{}",
+            event.reason
+        );
+        assert_eq!(event.exit_code, EXIT_INSTALLED_BINARY_REPLACED);
+    }
+
+    #[test]
+    fn supersession_watch_unreadable_path_is_a_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+
+        let (mut watch, reader) = test_watch(&exe);
+        reader.fail_current_exe();
+
+        let event = watch.superseded_reason_with(&reader).expect("unreadable");
+        assert!(
+            event.reason.contains("could not be read"),
+            "{}",
+            event.reason
+        );
+        assert_eq!(event.exit_code, EXIT_EXECUTABLE_PATH_UNREADABLE);
     }
 }

@@ -152,8 +152,11 @@ Exit status after a requested stop is the signal status. The launcher treats
 a dead `/healthz` as stopped.
 
 While the gateway is running, a replaced installed binary makes that process
-exit 75. The launcher starts `elastos gateway --addr 127.0.0.1:8090` again
-so the new binary takes the lock.
+exit 75. The same exit covers a moved executable path and a file that changed
+and then could not be verified. The launcher starts
+`elastos gateway --addr 127.0.0.1:8090` again so the new binary takes the lock.
+A process that cannot read its own executable path exits 1. The launcher
+leaves that process stopped.
 
 ## Update and rollback
 
@@ -189,8 +192,8 @@ installed binary and `components.json` after signature and hash checks.
 | Code | Meaning |
 | --- | --- |
 | 0 | The command finished. This includes `update --check` with or without a newer release, a declined update prompt, and `install.sh --help`. |
-| 1 | The command failed. This includes the installer `die` path (unknown option, unsupported platform, failed check), a held host lock, a missing trusted source, a failed signature check, and an older release without `--rollback-to`. |
+| 1 | The command failed. This includes the installer `die` path (unknown option, unsupported platform, failed check), a held host lock, a missing trusted source, a failed signature check, an older release without `--rollback-to`, and a running gateway whose executable path cannot be read. |
 | 2 | The `elastos` command line is invalid. Clap reports a usage error with exit 2. |
-| 75 | The running gateway exited because the installed binary was replaced. The launcher starts the gateway again. |
+| 75 | The running gateway exited because the installed binary was replaced, its path moved, or the file on disk could not be verified after a change. The launcher starts the gateway again. |
 
 `install.sh` reports a failed check with exit 1.
