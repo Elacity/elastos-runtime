@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use wasmtime::component::{bindgen, Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
@@ -49,6 +49,7 @@ struct ComponentState {
 /// hostcall configured by Runtime.
 pub struct ComponentProvider {
     instances: Arc<RwLock<HashMap<CapsuleId, ComponentActivation>>>,
+    compile_slot: Arc<Semaphore>,
     bus_hostcall: std::sync::RwLock<Option<BridgeHostcall>>,
     bridge_principals: Arc<RwLock<HashMap<CapsuleId, Option<String>>>>,
 }
@@ -57,6 +58,9 @@ impl ComponentProvider {
     pub fn new() -> Self {
         Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
+            // Wasmtime parallelizes each compile internally. Queue loads so
+            // bursts do not create competing compiler jobs.
+            compile_slot: Arc::new(Semaphore::new(1)),
             bus_hostcall: std::sync::RwLock::new(None),
             bridge_principals: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -154,17 +158,36 @@ impl ComputeProvider for ComponentProvider {
         }
 
         let component_path = path.join(&manifest.entrypoint);
-        if !component_path.exists() {
-            return Err(ElastosError::CapsuleNotFound(format!(
-                "component file not found: {}",
-                component_path.display()
-            )));
-        }
+        // File reads and Wasmtime compilation can take substantial time. Keep
+        // unrelated Runtime work responsive while preparing the activation.
+        let compile_permit = self
+            .compile_slot
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ElastosError::Compute("Component compiler is unavailable".into()))?;
+        let (engine, component) =
+            tokio::task::spawn_blocking(move || -> Result<(Engine, Component)> {
+                // A cancelled caller can leave blocking work in progress. The
+                // work retains its slot until it actually finishes.
+                let _compile_permit = compile_permit;
+                if !component_path.exists() {
+                    return Err(ElastosError::CapsuleNotFound(format!(
+                        "component file not found: {}",
+                        component_path.display()
+                    )));
+                }
 
-        let engine = Self::engine()?;
-        let component = Component::from_file(&engine, &component_path).map_err(|err| {
-            ElastosError::Compute(format!("Failed to compile component capsule: {err}"))
-        })?;
+                let engine = Self::engine()?;
+                let component = Component::from_file(&engine, &component_path).map_err(|err| {
+                    ElastosError::Compute(format!("Failed to compile component capsule: {err}"))
+                })?;
+                Ok((engine, component))
+            })
+            .await
+            .map_err(|err| {
+                ElastosError::Compute(format!("Component load task join error: {err}"))
+            })??;
         let id = CapsuleId::new(format!("component-{}", uuid::Uuid::new_v4()));
 
         self.instances.write().await.insert(
@@ -419,7 +442,174 @@ impl elastos::bus::providers::Host for ComponentState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    fn component_fixture() -> (std::path::PathBuf, CapsuleManifest) {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/components/bus-v1");
+        let manifest =
+            serde_json::from_slice(&std::fs::read(path.join("capsule.json")).unwrap()).unwrap();
+        (path, manifest)
+    }
+
+    #[test]
+    fn component_load_keeps_async_work_responsive() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            let _ = waiting.recv();
+        });
+        let provider = Arc::new(ComponentProvider::new());
+        let (path, manifest) = component_fixture();
+
+        runtime.block_on(async {
+            let (started, observing) = tokio::sync::oneshot::channel();
+            let loading_provider = provider.clone();
+            let loading = tokio::spawn(async move {
+                started.send(()).unwrap();
+                loading_provider.load(&path, manifest).await
+            });
+            observing.await.unwrap();
+            tokio::task::yield_now().await;
+            let yielded_before_loading_finished = !loading.is_finished();
+
+            // Always release the worker before checking the result, including
+            // when a regression makes load run on the async executor.
+            release.send(()).unwrap();
+            let handle = loading.await.unwrap().unwrap();
+            blocker.await.unwrap();
+            assert_eq!(
+                provider.status(&handle).await.unwrap(),
+                CapsuleStatus::Loading
+            );
+            provider.stop(&handle).await.unwrap();
+            assert!(matches!(
+                provider.status(&handle).await,
+                Err(ElastosError::CapsuleNotFound(_))
+            ));
+            assert!(
+                yielded_before_loading_finished,
+                "component loading prevented unrelated async work from running"
+            );
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_load_reports_heartbeat_delay() {
+        let provider = ComponentProvider::new();
+        let (path, manifest) = component_fixture();
+        let completed = AtomicBool::new(false);
+        let started = Instant::now();
+        let loading = async {
+            let result = provider.load(&path, manifest).await;
+            completed.store(true, Ordering::Relaxed);
+            result
+        };
+        let heartbeat = async {
+            let mut previous = started;
+            let mut max_delay = Duration::ZERO;
+            let mut ticks = 0;
+            loop {
+                let now = Instant::now();
+                max_delay = max_delay.max(now.duration_since(previous));
+                if completed.load(Ordering::Relaxed) {
+                    break;
+                }
+                ticks += 1;
+                previous = now;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            (ticks, max_delay)
+        };
+        let (handle, (ticks, max_delay)) = tokio::join!(biased; loading, heartbeat);
+        println!(
+            "component load: elapsed={:?}, heartbeat_ticks={}, max_heartbeat_delay={:?}",
+            started.elapsed(),
+            ticks,
+            max_delay
+        );
+        provider.stop(&handle.unwrap()).await.unwrap();
+    }
+
+    #[test]
+    fn component_load_retains_compile_slot_after_cancellation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            let _ = waiting.recv();
+        });
+        let provider = Arc::new(ComponentProvider::new());
+        let (path, manifest) = component_fixture();
+
+        runtime.block_on(async {
+            let (started, observing) = tokio::sync::oneshot::channel();
+            let loading_provider = provider.clone();
+            let first_path = path.clone();
+            let first_manifest = manifest.clone();
+            let loading = tokio::spawn(async move {
+                started.send(()).unwrap();
+                loading_provider.load(&first_path, first_manifest).await
+            });
+            observing.await.unwrap();
+            tokio::task::yield_now().await;
+            let slot_held_during_load = provider.compile_slot.available_permits() == 0;
+            loading.abort();
+            let cancelled = loading.await.unwrap_err().is_cancelled();
+            let slot_held_after_cancellation = provider.compile_slot.available_permits() == 0;
+
+            let (started, observing) = tokio::sync::oneshot::channel();
+            let loading_provider = provider.clone();
+            let next_load = tokio::spawn(async move {
+                started.send(()).unwrap();
+                loading_provider.load(&path, manifest).await
+            });
+            observing.await.unwrap();
+            tokio::task::yield_now().await;
+            let next_load_waited = !next_load.is_finished();
+
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            let handle = next_load.await.unwrap().unwrap();
+            provider.stop(&handle).await.unwrap();
+
+            assert!(slot_held_during_load);
+            assert!(cancelled);
+            assert!(slot_held_after_cancellation);
+            assert!(next_load_waited);
+            assert_eq!(provider.compile_slot.available_permits(), 1);
+            assert!(provider.instances.read().await.is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn component_load_preserves_artifact_errors() {
+        let provider = ComponentProvider::new();
+        let (_, manifest) = component_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            provider.load(directory.path(), manifest.clone()).await,
+            Err(ElastosError::CapsuleNotFound(message))
+                if message.starts_with("component file not found: ")
+        ));
+        std::fs::write(directory.path().join(&manifest.entrypoint), b"invalid wasm").unwrap();
+        assert!(matches!(
+            provider.load(directory.path(), manifest).await,
+            Err(ElastosError::Compute(message))
+                if message.starts_with("Failed to compile component capsule: ")
+        ));
+        assert!(provider.instances.read().await.is_empty());
+        assert_eq!(provider.compile_slot.available_permits(), 1);
+    }
 
     fn json_line(line: &str) -> serde_json::Value {
         serde_json::from_str(line).expect("captured bridge line must be JSON")
