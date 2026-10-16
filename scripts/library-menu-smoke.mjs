@@ -291,6 +291,7 @@ const localVideoFile = object(`${documentsUri}/Clip.mp4`, "Clip.mp4", "file", [
   "move",
   "copy",
   "publish",
+  "protect",
   "trash",
   "properties",
 ], {
@@ -1813,6 +1814,101 @@ function excludesAll(actual, forbidden, context) {
   }
 }
 
+async function assertKeyboardJourney(page) {
+  const content = page.locator("#content");
+  const rows = page.locator("#content .item");
+  const selected = page.locator('#content .item[aria-selected="true"]');
+  const focusedUri = () => page.evaluate(() => document.activeElement?.dataset.uri || "");
+  const rowUri = (index) => rows.nth(index).getAttribute("data-uri");
+  assert(await content.getAttribute("role") === "listbox", "Library items must expose a selectable collection");
+  assert(await content.getAttribute("aria-multiselectable") === "true", "Library must expose multiple selection");
+  assert(await rows.first().getAttribute("role") === "option", "Library rows must expose selectable item semantics");
+  await page.locator("#more-button").focus();
+  await page.keyboard.press("Tab");
+  assert(await focusedUri() === await rowUri(0), "Tab must enter Library at its current item");
+  assert(await page.locator('#content .item[tabindex="0"]').count() === 1, "Library must have one item in the Tab order");
+  await page.keyboard.press("ArrowDown");
+  assert(await focusedUri() === await rowUri(1), "ArrowDown must focus the next details row");
+  assert(await selected.count() === 1 && await selected.first().getAttribute("data-uri") === await rowUri(1),
+    "ArrowDown must select the focused row");
+  await page.keyboard.press("Shift+ArrowDown");
+  assert(await selected.count() === 2, "Shift+ArrowDown must extend the visible selection");
+  await page.keyboard.press("Shift+ArrowUp");
+  assert(await selected.count() === 1, "Shift+ArrowUp must shrink the selection toward its anchor");
+  await page.keyboard.press(`${multiSelectModifier}+End`);
+  assert(await focusedUri() === await rows.last().getAttribute("data-uri") && await selected.count() === 1,
+    "Modified End must move focus while keeping the selection");
+  await page.keyboard.press("Space");
+  assert(await selected.count() === 2, "Space must add the focused row to the selection");
+  await page.keyboard.press("Space");
+  assert(await selected.count() === 1, "Space must remove the focused row from the selection");
+  await page.keyboard.press("Home");
+  assert(await focusedUri() === await rowUri(0) && await selected.count() === 1, "Home must focus and select the first row");
+
+  const readme = rows.filter({ hasText: "Readme.md" }).first();
+  const published = rows.filter({ hasText: "Published.md" }).first();
+  await readme.click();
+  await published.focus();
+  const readsBefore = ops.filter((entry) => entry.op === "read").length;
+  await page.keyboard.press("Enter");
+  await page.locator(".dialog-card").filter({ hasText: "Published.md" }).first().waitFor();
+  assert(ops.filter((entry) => entry.op === "read").length === readsBefore + 1
+    && ops.filter((entry) => entry.op === "read").at(-1).payload.uri === `${documentsUri}/Published.md`,
+    "Enter must open the focused item when a different item was selected");
+  await page.keyboard.press("Escape");
+  await readme.focus();
+  await page.keyboard.press("F2");
+  const editor = page.locator(".rename-input");
+  await editor.waitFor();
+  assert(await editor.inputValue() === "Readme.md", "F2 must rename the focused item");
+  await page.keyboard.press(`${multiSelectModifier}+a`);
+  assert(await selected.count() === 1, "Select all inside the name editor must keep item selection unchanged");
+  await page.keyboard.press("ArrowLeft");
+  assert(await editor.evaluate((input) => document.activeElement === input), "Arrow keys must remain in the name editor");
+  await page.keyboard.press("Escape");
+  assert(await focusedUri() === `${documentsUri}/Readme.md`, "Cancel rename must return focus to its item");
+  await page.keyboard.press("Shift+F10");
+  assert(await page.evaluate(() => document.activeElement?.matches("#context-menu .menu-item")),
+    "The keyboard context menu must focus its first action");
+  await page.keyboard.press("Escape");
+  assert(await focusedUri() === `${documentsUri}/Readme.md`, "Escape from a keyboard menu must return focus to its item");
+  await page.keyboard.press("Shift+F10");
+  await page.keyboard.press("Enter");
+  await page.locator(".dialog-card").filter({ hasText: "Readme.md" }).first().waitFor();
+  await page.keyboard.press("Escape");
+  assert(await focusedUri() === `${documentsUri}/Readme.md`, "Keyboard menu Open must preserve an item focus target");
+
+  await page.locator("#grid-button").click();
+  await rows.first().focus();
+  const columnCount = await rows.evaluateAll((items) => {
+    const nextRow = items.findIndex((item) => item.offsetTop > items[0].offsetTop);
+    return nextRow < 0 ? items.length : nextRow;
+  });
+  assert(columnCount > 1 && columnCount < await rows.count(), "Keyboard grid fixture must contain multiple columns and rows");
+  await page.keyboard.press("ArrowRight");
+  assert(await focusedUri() === await rowUri(1), "ArrowRight must focus the next icon");
+  await page.keyboard.press("ArrowDown");
+  assert(await focusedUri() === await rowUri(1 + columnCount), "ArrowDown must focus the icon in the next row");
+  await page.keyboard.press("ArrowUp");
+  assert(await focusedUri() === await rowUri(1), "ArrowUp must return to the previous icon row");
+  await page.keyboard.press("ArrowLeft");
+  assert(await focusedUri() === await rowUri(0), "ArrowLeft must focus the previous icon");
+  await page.locator("#list-button").click();
+  const projects = rows.filter({ hasText: "Projects" }).first();
+  await projects.focus();
+  await page.keyboard.press("Enter");
+  await page.locator(".crumb-current").filter({ hasText: "Projects" }).first().waitFor();
+  await page.locator("#back-button").focus();
+  await page.keyboard.press("Enter");
+  await page.locator(".crumb-current").filter({ hasText: "Documents" }).first().waitFor();
+  await page.locator("#more-button").focus();
+  await page.keyboard.press("Tab");
+  assert(await focusedUri() !== "", "Tab must re-enter Library after returning from a folder");
+  await page.keyboard.press("Tab");
+  assert(await focusedUri() === "", "One Tab must leave the item collection");
+  await page.keyboard.press("Escape");
+}
+
 async function run() {
   const server = createServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -1876,6 +1972,8 @@ async function run() {
         )}`,
       );
     }
+
+    await assertKeyboardJourney(page);
 
     for (const label of ["Home", "Desktop", "Documents", "Pictures", "Videos", "Downloads", "Public", "Trash", "Spaces"]) {
       await page.locator(".place").filter({ hasText: label }).first().click();

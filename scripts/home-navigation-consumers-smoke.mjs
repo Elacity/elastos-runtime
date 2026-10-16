@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { webcrypto } from "node:crypto";
 import { createHomeNavigationClient } from "../capsules/home/browser/home-navigation-client.js";
+import { createLibraryFolders } from "../capsules/library/browser/src/folders.js";
+import { setLibraryObjects } from "../capsules/library/browser/src/state.js";
 
 export function navigationClientFixture({ homeToken, homeOrigin, parent, top, enabled = true }) {
   const listeners = new Map();
@@ -28,15 +30,18 @@ export async function exerciseNavigationConsumers(makeClient) {
     const transport = makeClient?.(target);
     return { setQuery(query) { reports[target] = JSON.parse(JSON.stringify(query)); transport?.setQuery(query); } };
   };
-  const library = vm.createContext({
+  const library = {
     state: { currentUri: "localhost://Users/fixture/Documents/B", loadSeq: 0, mode: "browse",
-      folderCache: new Map(), selectedUris: new Set(), objects: [] }, perf: {},
+      folderCache: new Map(), selectedUris: new Set(), objects: [], objectsVersion: 0 }, perf: {},
     homeNavigation: client("library"),
     providerApi: async (_op, { uri }) => ({ object: { uri, kind: "directory" }, objects: [] }),
-    cacheFolderListing: () => ({}), setObjects() {}, setStatus() {}, setFolderStatus() {}, renderAll() {}, runInitialObjectAction() {},
-    isDirectory: object => object?.kind === "directory",
-  });
-  vm.runInContext(selectionFunction(read("capsules/library/browser/src/app.js"), "loadCurrentFolder"), library);
+    setStatus() {}, setFolderStatus() {}, renderAll() {}, runInitialObjectAction() {},
+  };
+  Object.assign(library, createLibraryFolders({
+    ...library,
+    providerApi: (...args) => library.providerApi(...args),
+    setObjects: (objects) => setLibraryObjects(library.state, objects),
+  }));
   await library.loadCurrentFolder();
   assert.deepEqual(reports.library, { uri: library.state.currentUri });
   const folderB = library.state.currentUri;
