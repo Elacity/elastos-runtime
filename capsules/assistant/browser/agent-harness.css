@@ -3778,6 +3778,19 @@ html[data-agent-reasoning="off"] .agent-thinking {
     transform: none !important;
   }
 
+  /* The phone drawer (max-width: 900px above) is placed by its transform:
+     keep its closed and open positions and drop only the slide. */
+  @media (max-width: 900px) {
+    :root[data-el-form-factor="phone"] .agent-harness-sidebar {
+      transform: translateX(-105%) !important;
+      transition: none !important;
+    }
+
+    :root[data-el-form-factor="phone"] body.agent-harness-drawer-open .agent-harness-sidebar {
+      transform: translateX(0) !important;
+    }
+  }
+
   .agent-home-drop-canvas {
     display: none !important;
   }

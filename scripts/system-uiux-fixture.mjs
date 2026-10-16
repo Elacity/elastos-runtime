@@ -143,6 +143,9 @@ export function inertSystemApiResponse(pathname) {
   if (pathname === "/api/provider/chain/networks") {
     return { status: "ok", data: { networks: [] } };
   }
+  if (pathname === "/api/apps/system/community") {
+    return { schema: "elastos.community-membership/v1", configured: false, joined: false, detail: "" };
+  }
   if (pathname === "/api/apps/system/ai-provider") {
     return {
       hosted_external_https: "paused",

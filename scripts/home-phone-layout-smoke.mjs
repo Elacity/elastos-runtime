@@ -1907,14 +1907,40 @@ async function probeKeyboardInset(page, frame) {
   await postFromHost(0);
   await sleep(KEYBOARD_SETTLE_MS);
   const lowered = await readRoom();
-  return { raised, spoofed, lowered, capsuleFrame: Boolean(capsuleFrame) };
+  const drawer = await probeAssistantDrawer(capsuleFrame);
+  return { raised, spoofed, lowered, capsuleFrame: Boolean(capsuleFrame), drawer };
+}
+
+// The context runs with reduced motion: the phone drawer must still sit off
+// screen when closed (clear of the conversation) and on screen when open.
+async function probeAssistantDrawer(capsuleFrame) {
+  if (!capsuleFrame) return null;
+  const read = () => capsuleFrame.evaluate(() => {
+    const box = (el) => {
+      const r = el.getBoundingClientRect();
+      return { left: Math.round(r.left), right: Math.round(r.right), width: Math.round(r.width) };
+    };
+    return {
+      sidebar: box(document.querySelector(".agent-harness-sidebar")),
+      main: box(document.querySelector(".agent-harness-main")),
+      open: document.body.classList.contains("agent-harness-drawer-open"),
+    };
+  });
+  const toggle = () => capsuleFrame.evaluate(() => document.querySelector("#agent-harness-drawer-open").click());
+  const closed = await read();
+  await toggle();
+  await sleep(KEYBOARD_SETTLE_MS);
+  const opened = await read();
+  await toggle();
+  await sleep(KEYBOARD_SETTLE_MS);
+  return { closed, opened, reclosed: await read() };
 }
 
 function phoneKeyboardFailures(run) {
   if (!run.keyboard) {
     return [];
   }
-  const { raised, spoofed, lowered, capsuleFrame } = run.keyboard;
+  const { raised, spoofed, lowered, capsuleFrame, drawer } = run.keyboard;
   const label = `${run.engine}/${run.profile}/keyboard`;
   const failures = [];
   if (raised.inset !== `${KEYBOARD_PROBE_INSET_PX}px` || raised.roomBottom !== raised.viewportHeight - KEYBOARD_PROBE_INSET_PX) {
@@ -1925,6 +1951,11 @@ function phoneKeyboardFailures(run) {
   }
   if (lowered.inset !== "0px" || lowered.roomBottom !== lowered.viewportHeight) {
     failures.push(`${label}: an inset of 0 must give the room back. Got ${JSON.stringify(lowered)}`);
+  }
+  const clear = (state) => state && !state.open && state.sidebar.right <= state.main.left;
+  if (!drawer || !clear(drawer.closed) || !clear(drawer.reclosed)
+    || !drawer.opened.open || drawer.opened.sidebar.left !== 0 || drawer.opened.sidebar.width <= 0) {
+    failures.push(`${label}/drawer: with reduced motion the closed Assistant drawer must sit clear of the conversation and the open drawer on screen. Got ${JSON.stringify(drawer)}`);
   }
   return failures;
 }
