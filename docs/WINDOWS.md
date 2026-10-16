@@ -23,8 +23,8 @@ The first honest Windows product should run the Linux Runtime locally inside
 WSL2.
 
 - Package the Runtime as a signed or importable ElastOS WSL distribution.
-- Provide a small Windows launcher that starts, stops, updates, health-checks,
-  and opens `http://localhost:61180/apps/home/`.
+- A Windows launcher must start, stop, update, and health-check the Linux
+  Runtime, and open `http://localhost:8090/home/`.
 - Keep Runtime state in the Linux filesystem, not in mixed host paths.
 - Enforce explicit storage budgets and cleanup.
 - Keep localhost and passkey origin stable.
@@ -35,52 +35,45 @@ WSL2 is a host substrate, not a new capsule API and not a substitute for
 capsule isolation. Capsules keep the same Runtime, Carrier, provider,
 identity, and capability contracts.
 
-Do not leak WSL paths, host ports, or shell commands into capsule, provider, or
-object contracts.
+Capsule, provider, and object contracts stay on the Runtime surface. WSL paths,
+host ports, and shell commands stay in the host launcher.
 
 ## Linux build inside WSL2
 
-This note is from the Linux installer and Runtime on `develop`. It was read
-from code. It was not executed on a Windows machine or inside a WSL2 distro.
+A Windows launcher must run the Linux Runtime inside a WSL2 distro. This
+section states the installer behavior that exists today and the launcher
+behavior a future Windows program must provide. An executed Windows proof is
+an owning issue.
 
-Inside a distro, `uname -s` is `Linux`. `scripts/install.sh` therefore selects
-the Linux release for that architecture (`x86_64-linux` or `aarch64-linux`)
-and writes the Linux data directory: `$XDG_DATA_HOME/elastos` or
-`~/.local/share/elastos`. The published Linux binary is the musl target
-(`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`), so the distro
-glibc is not the loader. The same `elastos gateway --addr 127.0.0.1:8090`
-command and `GET /healthz` body `OK` apply. `healthz` in
-`elastos/crates/elastos-server/src/api/gateway_site.rs` returns that body.
+Inside a distro, `uname -s` is `Linux`. `scripts/install.sh` selects the Linux
+release for that architecture (`x86_64-linux` or `aarch64-linux`). It verifies
+the release signature and hash before it installs the binary. It writes the
+Linux data directory: `$XDG_DATA_HOME/elastos` or `~/.local/share/elastos`.
+The published Linux binary is the musl target
+(`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`).
 
-The launcher keeps `HOME` and the data directory on the distro filesystem.
-The host lock is an exclusive `flock` on `{data}/host-process.lock`. That lock
-belongs on the Linux filesystem. A data directory on `/mnt/c` is a different
-filesystem and is outside this install path.
+A Windows launcher must keep `HOME` and the data directory on the distro
+filesystem. It must start Home with `elastos gateway --addr localhost:8090`
+and open one origin, `http://localhost:8090/home/`. The passkey relying party
+id for that origin is `localhost`.
 
-`elastos gateway` leaves the browser closed. On Linux, `elastos home --browser`
-tries `wslview` and then `xdg-open`. The Windows launcher opens
-`http://127.0.0.1:8090/home/` itself and keeps that exact origin for the
-passkey. `localhost` and `127.0.0.1` are different WebAuthn origins.
+`elastos gateway` leaves the browser closed. That is the one browser-open
+path for this host: the Windows launcher opens the Home origin above.
+`elastos home --browser` on Linux tries `wslview` and then `xdg-open`. A
+Windows launcher must not open a second origin through that command.
 
-The Windows supervisor signals the Linux gateway process. `SIGTERM` to the
-`wsl` parent, with the gateway left running inside the distro, skips the
-Runtime's process-group shutdown. The launcher sends `SIGTERM` to the gateway
-pid inside the distro, then waits until `/healthz` fails.
+A Windows launcher must stop the gateway by a method the owning issue
+specifies, and it must confirm the process has exited. This note does not
+define a signal path.
 
-Home's HTTP gateway does not need `/dev/kvm` or systemd. Two later paths do:
+The HTTP gateway is the Home path inside the distro. A local Browser engine
+is a separate host decision. This note claims no Windows Browser engine.
+`scripts/install.sh` runs `scripts/browser-vm-linux-network.py` when that
+helper is installed and `/dev/kvm` exists. That helper writes systemd and
+udev units.
 
-- Local Browser and crosvm open `/dev/kvm` and fail closed when the device is
-  absent. Nested virtualization is a separate Windows setting. Without it, the
-  honest report is that the local Browser engine is unavailable and a remote
-  engine is the viewer path.
-- `scripts/install.sh` runs `scripts/browser-vm-linux-network.py` only when
-  that helper is installed and `/dev/kvm` exists. The helper's setup writes
-  systemd and udev units. A distro without systemd keeps the HTTP Home and
-  leaves that Browser host setup incomplete.
-
-Native `elastos.exe` is still absent. `install.sh` stops when `uname` is not
-Linux or Darwin. A Windows launcher that wants this Runtime starts the distro
-and runs the Linux binary there.
+`install.sh` stops when `uname` is not Linux or Darwin. A Windows launcher
+must start the distro and run the Linux binary there.
 
 ## Later native Windows direction
 
