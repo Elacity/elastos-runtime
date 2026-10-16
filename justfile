@@ -244,8 +244,17 @@ product-data:
 
 # Verify the checked-in ElastOS Bus contract and real Component fixture
 bus-conformance:
+    #!/usr/bin/env bash
+    set -euo pipefail
     node scripts/check-elastos-bus-wit.mjs
-    cd elastos && cargo test -p elastos-server component_runs_through_real_bus_authority_provider_and_audit_paths -- --nocapture
+    cd elastos
+    test_name=runtime::tests::component_conformance_exercises_bus_authorization_dispatch_and_audit
+    matches="$(cargo test --locked -p elastos-server --lib "$test_name" -- --exact --list | awk -v expected="$test_name: test" '$0 == expected { count++ } END { print count + 0 }')"
+    if [[ "$matches" != 1 ]]; then
+      echo "Bus conformance must select exactly one test; found $matches" >&2
+      exit 1
+    fi
+    cargo test --locked -p elastos-server --lib "$test_name" -- --exact --include-ignored --nocapture
 
 # Validate canonical capsule scaffolds against the current manifest and WIT contracts
 capsule-templates:

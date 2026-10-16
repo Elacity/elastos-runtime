@@ -192,13 +192,61 @@ impl PendingCapabilityRequest {
     }
 }
 
+#[derive(Default)]
+struct PendingRequestState {
+    /// Requests and their index change together under the store's lock.
+    requests: HashMap<String, PendingCapabilityRequest>,
+    /// Index from session ID to request IDs (for listing)
+    session_requests: HashMap<String, Vec<String>>,
+}
+
+impl PendingRequestState {
+    fn cleanup_expired(&mut self, now: &SecureTimestamp) -> usize {
+        let mut expired = 0;
+        for request in self.requests.values_mut() {
+            if matches!(request.status, RequestStatus::Pending) && request.expires_at.is_before(now)
+            {
+                request.status = RequestStatus::Expired;
+                expired += 1;
+            }
+        }
+        expired
+    }
+
+    fn cleanup_old(&mut self, now: &SecureTimestamp, retention_secs: u64) -> usize {
+        let previous_len = self.requests.len();
+        self.requests.retain(|_, request| {
+            // Request expiry alone says nothing about token validity. Only an
+            // explicit token expiry or revocation makes a grant reclaimable.
+            let resolved = match &request.status {
+                RequestStatus::Pending => false,
+                RequestStatus::Granted { token, .. } => {
+                    token.expiry().is_some_and(|expiry| expiry.is_before(now))
+                }
+                RequestStatus::Denied { .. } | RequestStatus::Expired => true,
+            };
+            if !resolved {
+                return true;
+            }
+            let age_secs = now.unix_secs.saturating_sub(request.requested_at.unix_secs);
+            retention_secs != 0 && age_secs <= retention_secs
+        });
+
+        let removed = previous_len - self.requests.len();
+        if removed != 0 {
+            let requests = &self.requests;
+            self.session_requests.retain(|_, ids| {
+                ids.retain(|id| requests.contains_key(id));
+                !ids.is_empty()
+            });
+        }
+        removed
+    }
+}
+
 /// Store for pending capability requests
 pub struct PendingRequestStore {
-    /// Pending requests indexed by request ID
-    requests: RwLock<HashMap<String, PendingCapabilityRequest>>,
-
-    /// Index from session ID to request IDs (for listing)
-    session_requests: RwLock<HashMap<String, Vec<String>>>,
+    state: RwLock<PendingRequestState>,
 
     /// Audit log
     audit_log: Arc<AuditLog>,
@@ -211,8 +259,7 @@ impl PendingRequestStore {
     /// Create a new pending request store
     pub fn new(audit_log: Arc<AuditLog>) -> Self {
         Self {
-            requests: RwLock::new(HashMap::new()),
-            session_requests: RwLock::new(HashMap::new()),
+            state: RwLock::new(PendingRequestState::default()),
             audit_log,
             timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
         }
@@ -226,8 +273,7 @@ impl PendingRequestStore {
     /// Create with custom timeout
     pub fn with_timeout(audit_log: Arc<AuditLog>, timeout_secs: u64) -> Self {
         Self {
-            requests: RwLock::new(HashMap::new()),
-            session_requests: RwLock::new(HashMap::new()),
+            state: RwLock::new(PendingRequestState::default()),
             audit_log,
             timeout_secs,
         }
@@ -255,83 +301,52 @@ impl PendingRequestStore {
         action: Action,
         reason: String,
     ) -> PendingCapabilityRequest {
-        // Capacity guard: evict expired if at limit
-        {
-            let count = self.requests.read().await.len();
-            if count >= MAX_PENDING_REQUESTS {
-                self.cleanup_expired().await;
-                self.cleanup_old(0).await;
-            }
-        }
-        // Re-check after cleanup — reject if still at capacity
-        {
-            let count = self.requests.read().await.len();
-            if count >= MAX_PENDING_REQUESTS {
-                let mut request = PendingCapabilityRequest::new_with_reason(
-                    session_id.clone(),
-                    resource.clone(),
-                    action,
-                    reason.clone(),
-                    self.timeout_secs,
-                );
-                request.status = RequestStatus::Denied {
-                    reason: "Too many pending requests".to_string(),
-                };
-                return request;
-            }
+        // Admission, cleanup, and both index updates are one state transition.
+        let mut state = self.state.write().await;
+        let now = SecureTimestamp::now();
+        if state.requests.len() >= MAX_PENDING_REQUESTS {
+            state.cleanup_expired(&now);
+            state.cleanup_old(&now, 0);
         }
 
-        // Per-session rate limit: prevent one session from starving others
-        {
-            let session_requests = self.session_requests.read().await;
-            if let Some(ids) = session_requests.get(&session_id.0) {
-                let requests = self.requests.read().await;
-                let pending_count = ids
-                    .iter()
+        let denial = if state.requests.len() >= MAX_PENDING_REQUESTS {
+            Some("Too many pending requests")
+        } else {
+            let pending_count = state.session_requests.get(&session_id.0).map_or(0, |ids| {
+                ids.iter()
                     .filter(|id| {
-                        requests
-                            .get(*id)
-                            .is_some_and(|r| matches!(r.status, RequestStatus::Pending))
+                        state.requests.get(*id).is_some_and(|request| {
+                            matches!(request.status, RequestStatus::Pending)
+                                && !request.expires_at.is_before(&now)
+                        })
                     })
-                    .count();
-                if pending_count >= MAX_PENDING_PER_SESSION {
-                    let mut request = PendingCapabilityRequest::new_with_reason(
-                        session_id.clone(),
-                        resource.clone(),
-                        action,
-                        reason.clone(),
-                        self.timeout_secs,
-                    );
-                    request.status = RequestStatus::Denied {
-                        reason: "Too many pending requests for this session".to_string(),
-                    };
-                    return request;
-                }
-            }
-        }
+                    .count()
+            });
+            (pending_count >= MAX_PENDING_PER_SESSION)
+                .then_some("Too many pending requests for this session")
+        };
 
-        let request = PendingCapabilityRequest::new_with_reason(
+        let mut request = PendingCapabilityRequest::new_with_reason(
             session_id.clone(),
             resource.clone(),
             action,
             reason,
             self.timeout_secs,
         );
-
-        // Store request
-        {
-            let mut requests = self.requests.write().await;
-            requests.insert(request.id.0.clone(), request.clone());
+        if let Some(reason) = denial {
+            request.status = RequestStatus::Denied {
+                reason: reason.to_string(),
+            };
+            return request;
         }
 
-        // Add to session index
-        {
-            let mut session_requests = self.session_requests.write().await;
-            session_requests
-                .entry(session_id.0.clone())
-                .or_default()
-                .push(request.id.0.clone());
-        }
+        state.requests.insert(request.id.0.clone(), request.clone());
+        state
+            .session_requests
+            .entry(session_id.0.clone())
+            .or_default()
+            .push(request.id.0.clone());
+        drop(state);
 
         // Audit
         self.audit_log
@@ -348,8 +363,8 @@ impl PendingRequestStore {
 
     /// Get a request by ID
     pub async fn get_request(&self, request_id: &str) -> Option<PendingCapabilityRequest> {
-        let requests = self.requests.read().await;
-        requests.get(request_id).cloned()
+        let state = self.state.read().await;
+        state.requests.get(request_id).cloned()
     }
 
     /// Grant a pending request
@@ -359,9 +374,10 @@ impl PendingRequestStore {
         token: CapabilityToken,
         duration: GrantDuration,
     ) -> Result<(), String> {
-        let mut requests = self.requests.write().await;
+        let mut state = self.state.write().await;
 
-        let request = requests
+        let request = state
+            .requests
             .get_mut(request_id)
             .ok_or_else(|| format!("Request not found: {}", request_id))?;
 
@@ -384,9 +400,10 @@ impl PendingRequestStore {
 
     /// Deny a pending request
     pub async fn deny_request(&self, request_id: &str, reason: &str) -> Result<(), String> {
-        let mut requests = self.requests.write().await;
+        let mut state = self.state.write().await;
 
-        let request = requests
+        let request = state
+            .requests
             .get_mut(request_id)
             .ok_or_else(|| format!("Request not found: {}", request_id))?;
 
@@ -397,13 +414,15 @@ impl PendingRequestStore {
         request.status = RequestStatus::Denied {
             reason: reason.to_string(),
         };
+        let session_id = request.session_id.to_string();
+        drop(state);
 
         // Audit
         self.audit_log
             .emit(crate::primitives::audit::AuditEvent::CapabilityDenied {
                 timestamp: SecureTimestamp::now(),
                 request_id: request_id.to_string(),
-                session_id: request.session_id.to_string(),
+                session_id,
                 reason: reason.to_string(),
             });
 
@@ -412,8 +431,9 @@ impl PendingRequestStore {
 
     /// List all pending requests (for shell to display)
     pub async fn list_pending(&self) -> Vec<PendingCapabilityRequest> {
-        let requests = self.requests.read().await;
-        requests
+        let state = self.state.read().await;
+        state
+            .requests
             .values()
             .filter(|r| r.is_pending())
             .cloned()
@@ -422,14 +442,14 @@ impl PendingRequestStore {
 
     /// List pending requests for a specific session
     pub async fn list_session_pending(&self, session_id: &str) -> Vec<PendingCapabilityRequest> {
-        let session_requests = self.session_requests.read().await;
-        let requests = self.requests.read().await;
+        let state = self.state.read().await;
 
-        session_requests
+        state
+            .session_requests
             .get(session_id)
             .map(|ids| {
                 ids.iter()
-                    .filter_map(|id| requests.get(id))
+                    .filter_map(|id| state.requests.get(id))
                     .filter(|r| r.is_pending())
                     .cloned()
                     .collect()
@@ -441,80 +461,35 @@ impl PendingRequestStore {
     ///
     /// Returns the number of requests cleaned up
     pub async fn cleanup_expired(&self) -> usize {
-        let mut expired_ids = Vec::new();
-
-        // Find expired requests
-        {
-            let requests = self.requests.read().await;
-            for (id, request) in requests.iter() {
-                if request.is_expired() && matches!(request.status, RequestStatus::Pending) {
-                    expired_ids.push(id.clone());
-                }
-            }
-        }
-
-        // Mark them as expired
-        {
-            let mut requests = self.requests.write().await;
-            for id in &expired_ids {
-                if let Some(request) = requests.get_mut(id) {
-                    request.status = RequestStatus::Expired;
-                }
-            }
-        }
-
-        expired_ids.len()
+        let mut state = self.state.write().await;
+        state.cleanup_expired(&SecureTimestamp::now())
     }
 
-    /// Remove old completed/expired requests
+    /// Remove old denied/expired requests and explicitly expired grants.
     ///
-    /// Keeps requests for `retention_secs` after they're resolved
+    /// Retention is measured from request creation. Zero removes resolved records
+    /// immediately; active grants stay available for listing and revocation.
     pub async fn cleanup_old(&self, retention_secs: u64) -> usize {
-        let now = SecureTimestamp::now();
-        let mut removed = Vec::new();
-
-        {
-            let mut requests = self.requests.write().await;
-            requests.retain(|id, request| {
-                // Keep pending requests
-                if matches!(request.status, RequestStatus::Pending) {
-                    return true;
-                }
-
-                // Remove old resolved requests
-                let age_secs = now.unix_secs.saturating_sub(request.requested_at.unix_secs);
-                if age_secs > retention_secs {
-                    removed.push(id.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-
-        // Clean up session index
-        if !removed.is_empty() {
-            let mut session_requests = self.session_requests.write().await;
-            for ids in session_requests.values_mut() {
-                ids.retain(|id| !removed.contains(id));
-            }
-        }
-
-        removed.len()
+        let mut state = self.state.write().await;
+        state.cleanup_old(&SecureTimestamp::now(), retention_secs)
     }
 
     /// Get the number of pending requests
     pub async fn pending_count(&self) -> usize {
-        let requests = self.requests.read().await;
-        requests.values().filter(|r| r.is_pending()).count()
+        let state = self.state.read().await;
+        state.requests.values().filter(|r| r.is_pending()).count()
     }
 
     /// List granted requests for a specific session
     pub async fn list_session_granted(&self, session_id: &str) -> Vec<PendingCapabilityRequest> {
-        let requests = self.requests.read().await;
-        requests
-            .values()
-            .filter(|r| r.session_id.to_string() == session_id && r.is_granted())
+        let state = self.state.read().await;
+        state
+            .session_requests
+            .get(session_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| state.requests.get(id))
+            .filter(|request| request.is_granted())
             .cloned()
             .collect()
     }
@@ -523,19 +498,21 @@ impl PendingRequestStore {
     ///
     /// This changes the status to Denied with reason "Revoked"
     pub async fn revoke_request(&self, request_id: &str) {
-        let mut requests = self.requests.write().await;
-        if let Some(request) = requests.get_mut(request_id) {
+        let mut state = self.state.write().await;
+        if let Some(request) = state.requests.get_mut(request_id) {
             if request.is_granted() {
                 request.status = RequestStatus::Denied {
                     reason: "Revoked by user".to_string(),
                 };
+                let session_id = request.session_id.to_string();
+                drop(state);
 
                 // Audit
                 self.audit_log
                     .emit(crate::primitives::audit::AuditEvent::CapabilityDenied {
                         timestamp: SecureTimestamp::now(),
                         request_id: request_id.to_string(),
-                        session_id: request.session_id.to_string(),
+                        session_id,
                         reason: "Revoked by user".to_string(),
                     });
             }
@@ -546,23 +523,27 @@ impl PendingRequestStore {
     ///
     /// Called when epoch is advanced to revoke all capabilities
     pub async fn revoke_all_granted(&self) {
-        let mut requests = self.requests.write().await;
+        let mut state = self.state.write().await;
         let now = SecureTimestamp::now();
+        let mut events = Vec::new();
 
-        for (request_id, request) in requests.iter_mut() {
+        for (request_id, request) in state.requests.iter_mut() {
             if request.is_granted() {
                 request.status = RequestStatus::Denied {
                     reason: "Epoch advanced - all capabilities revoked".to_string(),
                 };
 
-                self.audit_log
-                    .emit(crate::primitives::audit::AuditEvent::CapabilityDenied {
-                        timestamp: now,
-                        request_id: request_id.clone(),
-                        session_id: request.session_id.to_string(),
-                        reason: "Epoch advanced - all capabilities revoked".to_string(),
-                    });
+                events.push(crate::primitives::audit::AuditEvent::CapabilityDenied {
+                    timestamp: now,
+                    request_id: request_id.clone(),
+                    session_id: request.session_id.to_string(),
+                    reason: "Epoch advanced - all capabilities revoked".to_string(),
+                });
             }
+        }
+        drop(state);
+        for event in events {
+            self.audit_log.emit(event);
         }
     }
 }
@@ -573,6 +554,282 @@ mod tests {
 
     fn create_test_store() -> PendingRequestStore {
         PendingRequestStore::new(Arc::new(AuditLog::new()))
+    }
+
+    async fn request_for(store: &PendingRequestStore, session: &str) -> PendingCapabilityRequest {
+        store
+            .create_request(
+                SessionId::from_string(session),
+                ResourceId::new("localhost://Users/self/Documents/test"),
+                Action::Read,
+            )
+            .await
+    }
+
+    fn token_for(request: &PendingCapabilityRequest) -> CapabilityToken {
+        CapabilityToken::new(
+            "test-capsule".to_string(),
+            [0u8; 32],
+            request.resource.clone(),
+            request.action,
+            Default::default(),
+            SecureTimestamp::now(),
+            None,
+        )
+    }
+
+    async fn concurrent_admissions(store: Arc<PendingRequestStore>, shared_session: bool) -> usize {
+        const CONTENDERS: usize = 64;
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONTENDERS + 1));
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..CONTENDERS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            tasks.spawn(async move {
+                barrier.wait().await;
+                let session = if shared_session {
+                    "shared-session".to_string()
+                } else {
+                    format!("concurrent-{index}")
+                };
+                request_for(&store, &session).await.is_pending()
+            });
+        }
+        barrier.wait().await;
+        let mut admitted = 0;
+        while let Some(result) = tasks.join_next().await {
+            admitted += usize::from(result.unwrap());
+        }
+        admitted
+    }
+
+    #[tokio::test]
+    async fn test_expired_requests_release_session_capacity() {
+        let store = create_test_store();
+        for _ in 0..MAX_PENDING_PER_SESSION {
+            assert!(request_for(&store, "shared-session").await.is_pending());
+        }
+        {
+            let mut state = store.state.write().await;
+            for request in state.requests.values_mut() {
+                request.expires_at = SecureTimestamp::at(0);
+            }
+        }
+        assert_eq!(store.pending_count().await, 0);
+
+        let recovered = request_for(&store, "shared-session").await;
+        assert!(recovered.is_pending());
+        assert!(store.get_request(recovered.id.as_str()).await.is_some());
+        assert_eq!(store.list_session_pending("shared-session").await.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_admission_respects_session_limit() {
+        let store = Arc::new(create_test_store());
+        for _ in 0..MAX_PENDING_PER_SESSION - 1 {
+            request_for(&store, "shared-session").await;
+        }
+
+        assert_eq!(concurrent_admissions(Arc::clone(&store), true).await, 1);
+        assert_eq!(store.pending_count().await, MAX_PENDING_PER_SESSION);
+        assert_eq!(
+            store.list_session_pending("shared-session").await.len(),
+            MAX_PENDING_PER_SESSION
+        );
+        assert!(request_for(&store, "other-session").await.is_pending());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_admission_respects_global_limit() {
+        let store = Arc::new(create_test_store());
+        for index in 0..MAX_PENDING_REQUESTS - 1 {
+            request_for(&store, &format!("prefill-{index}")).await;
+        }
+
+        assert_eq!(concurrent_admissions(Arc::clone(&store), false).await, 1);
+        assert_eq!(store.pending_count().await, MAX_PENDING_REQUESTS);
+        let state = store.state.read().await;
+        assert_eq!(state.requests.len(), MAX_PENDING_REQUESTS);
+        assert_eq!(state.session_requests.len(), MAX_PENDING_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_preserves_grants_and_removes_empty_session_indexes() {
+        let store = create_test_store();
+        let pending = request_for(&store, "mixed-session").await;
+        let once = request_for(&store, "mixed-session").await;
+        let session = request_for(&store, "grant-session").await;
+        let denied = request_for(&store, "mixed-session").await;
+        let expired = request_for(&store, "expired-session").await;
+        store
+            .grant_request(once.id.as_str(), token_for(&once), GrantDuration::Once)
+            .await
+            .unwrap();
+        store
+            .grant_request(
+                session.id.as_str(),
+                token_for(&session),
+                GrantDuration::Session,
+            )
+            .await
+            .unwrap();
+        store
+            .deny_request(denied.id.as_str(), "test denial")
+            .await
+            .unwrap();
+        {
+            let mut state = store.state.write().await;
+            for request in state.requests.values_mut() {
+                request.requested_at = SecureTimestamp::at(0);
+                if request.id != pending.id {
+                    request.expires_at = SecureTimestamp::at(0);
+                }
+            }
+        }
+
+        // Request expiry never expires a granted token or changes its status.
+        assert_eq!(store.cleanup_expired().await, 1);
+        assert_eq!(store.cleanup_old(60).await, 2);
+        assert!(store.get_request(denied.id.as_str()).await.is_none());
+        assert!(store.get_request(expired.id.as_str()).await.is_none());
+        assert_eq!(store.list_session_pending("mixed-session").await.len(), 1);
+        assert_eq!(
+            store.list_session_granted("mixed-session").await[0].id,
+            once.id
+        );
+        assert_eq!(
+            store.list_session_granted("grant-session").await[0].id,
+            session.id
+        );
+        assert!(!store
+            .state
+            .read()
+            .await
+            .session_requests
+            .contains_key("expired-session"));
+
+        // Individual and epoch revocation make grant records eligible for cleanup.
+        store.revoke_request(once.id.as_str()).await;
+        assert_eq!(store.cleanup_old(0).await, 1);
+        assert!(store.list_session_granted("mixed-session").await.is_empty());
+        store.revoke_all_granted().await;
+        assert_eq!(store.cleanup_old(0).await, 1);
+        assert!(!store
+            .state
+            .read()
+            .await
+            .session_requests
+            .contains_key("grant-session"));
+        assert_eq!(store.cleanup_old(0).await, 0);
+        assert_eq!(
+            store.list_session_pending("mixed-session").await[0].id,
+            pending.id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pressure_cleanup_preserves_grants_and_reclaims_fresh_denials() {
+        let store = create_test_store();
+        let granted = request_for(&store, "grant-session").await;
+        let token = token_for(&granted);
+        let token_id = token.id;
+        store
+            .grant_request(granted.id.as_str(), token, GrantDuration::Session)
+            .await
+            .unwrap();
+        for index in 0..MAX_PENDING_REQUESTS - 1 {
+            let request = request_for(&store, &format!("denied-{index}")).await;
+            store
+                .deny_request(request.id.as_str(), "test denial")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.state.read().await.requests.len(),
+            MAX_PENDING_REQUESTS
+        );
+
+        assert!(request_for(&store, "new-session").await.is_pending());
+        let retained = store.get_request(granted.id.as_str()).await.unwrap();
+        assert_eq!(retained.granted_token().unwrap().id, token_id);
+        assert_eq!(store.list_session_granted("grant-session").await.len(), 1);
+        let state = store.state.read().await;
+        assert_eq!(state.requests.len(), 2);
+        assert_eq!(state.session_requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_live_grants_fill_capacity_until_explicit_revocation() {
+        let store = create_test_store();
+        for _ in 0..MAX_PENDING_REQUESTS {
+            let request = request_for(&store, "grant-session").await;
+            assert!(request.is_pending());
+            store
+                .grant_request(
+                    request.id.as_str(),
+                    token_for(&request),
+                    GrantDuration::Session,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(request_for(&store, "new-session").await.is_denied());
+        assert_eq!(
+            store.list_session_granted("grant-session").await.len(),
+            MAX_PENDING_REQUESTS
+        );
+        assert_eq!(store.cleanup_old(0).await, 0);
+
+        store.revoke_all_granted().await;
+        assert!(request_for(&store, "new-session").await.is_pending());
+        assert!(store.list_session_granted("grant-session").await.is_empty());
+        assert_eq!(store.state.read().await.requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_reclaims_only_explicitly_expired_grants() {
+        let store = create_test_store();
+        let expired = request_for(&store, "expired-grant-session").await;
+        let live = request_for(&store, "live-grant-session").await;
+        let mut expired_token = token_for(&expired);
+        expired_token.expiry = Some(SecureTimestamp::at(0));
+        let mut live_token = token_for(&live);
+        live_token.expiry = Some(SecureTimestamp::after_secs(300));
+        store
+            .grant_request(expired.id.as_str(), expired_token, GrantDuration::Session)
+            .await
+            .unwrap();
+        store
+            .grant_request(live.id.as_str(), live_token, GrantDuration::Once)
+            .await
+            .unwrap();
+
+        assert_eq!(store.cleanup_old(0).await, 1);
+        assert!(store.get_request(expired.id.as_str()).await.is_none());
+        assert_eq!(
+            store.list_session_granted("live-grant-session").await[0].id,
+            live.id
+        );
+        assert!(!store
+            .state
+            .read()
+            .await
+            .session_requests
+            .contains_key("expired-grant-session"));
+    }
+
+    #[tokio::test]
+    async fn test_expired_capacity_recovers_without_waiting_for_next_second() {
+        let store = PendingRequestStore::with_timeout(Arc::new(AuditLog::new()), 0);
+        for index in 0..MAX_PENDING_REQUESTS {
+            request_for(&store, &format!("expired-{index}")).await;
+        }
+        let recovered = request_for(&store, "new-session").await;
+        assert!(!recovered.is_denied());
+        assert!(store.get_request(recovered.id.as_str()).await.is_some());
+        let state = store.state.read().await;
+        assert_eq!(state.requests.len(), 1);
+        assert_eq!(state.session_requests.len(), 1);
     }
 
     #[tokio::test]
