@@ -32,6 +32,8 @@ from unittest import mock
 INSTALLER = Path(__file__).with_name("install.sh")
 SANDBOX_BASE = Path(__file__).resolve().parent.parent / "target/installer-sandboxes"
 SOURCE = INSTALLER.read_text()
+if "# ── Main" not in SOURCE:
+    raise SystemExit("install.sh is missing the '# ── Main' helper marker")
 HELPERS = SOURCE.split("# ── Main", 1)[0]
 PYTHON = SOURCE.split("<<'PY_ED25519'\n", 1)[1].split("\nPY_ED25519", 1)[0]
 CRYPTO = {"__name__": "installer_test"}
@@ -44,6 +46,22 @@ UNINSTALL_SOURCE = SOURCE.split("<<'PY_UNINSTALL'\n", 1)[1].split("\nPY_UNINSTAL
 PUBLISHER_DID = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe"
 
 FIXTURE_DID = "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
+
+
+def unixfs_v0_cid(data):
+    """CIDv0 from scripts/release-signer.py, the publisher's implementation."""
+    global _SIGNER_CID
+    if _SIGNER_CID is None:
+        import importlib.util
+        path = Path(__file__).with_name("release-signer.py")
+        spec = importlib.util.spec_from_file_location("release_signer_cid", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SIGNER_CID = module
+    return _SIGNER_CID.unixfs_metadata_cid(data)
+
+
+_SIGNER_CID = None
 
 
 def binding_fixture():
@@ -482,6 +500,28 @@ class ShellTests(unittest.TestCase):
                 with self.subTest(case=index):
                     self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
 
+    def test_verified_head_cid_is_the_hashed_bytes(self):
+        vector = b'{"payload":{"version":"0.7.1-rc.2"}}\n'
+        expected = "QmZFMnZjkiTqy9VY5FDdKudvpsKtKxifk1poBrV7k4sqp8"
+        self.assertEqual(unixfs_v0_cid(vector), expected)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "release-head.json")
+            path.write_bytes(vector)
+            stored = shell('HEAD_CID=""\nbind_verified_head_cid "$1"\nprintf "%s\\n" "$HEAD_CID"\n', path)
+            self.assertEqual((stored.returncode, stored.stdout.strip()), (0, expected), stored.stderr)
+            same = shell('HEAD_CID="$2"\nbind_verified_head_cid "$1"\nprintf "%s\\n" "$HEAD_CID"\n',
+                         path, expected)
+            self.assertEqual((same.returncode, same.stdout.strip()), (0, expected), same.stderr)
+            mismatch = shell('HEAD_CID="QmStampNamesOtherBytes"\nbind_verified_head_cid "$1"\n', path)
+            self.assertEqual(mismatch.returncode, 1, mismatch.stdout)
+            self.assertIn("Stamped head CID differs from the verified release head", mismatch.stderr)
+            self.assertIn("Stamp: QmStampNamesOtherBytes", mismatch.stderr)
+            self.assertIn("Verified: " + expected, mismatch.stderr)
+            path.write_bytes(b"")
+            empty = shell('HEAD_CID=""\nbind_verified_head_cid "$1"\n', path)
+            self.assertEqual(empty.returncode, 1, empty.stdout)
+            self.assertIn("no single-block CID", empty.stderr)
+
 
 class InstallerSandbox:
     """Disposable HOME, data root, install dir, temp dir and logs for the complete installer.
@@ -557,18 +597,18 @@ if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"
     def requests(self):
         return (self.root / "requests").read_text().splitlines()
 
-    def run(self, *options, umask="0022"):
+    def run(self, *options, umask="0022", head_cid=""):
         seen = len(self.requests())
         result = shell('umask "$6"\n' + '''
 export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$1/tmp" FIXTURES="$1" PATH="$1/mocks:$PATH"
 # Apple Python otherwise adds bytecode caches to HOME during file-preservation checks.
 export PYTHONDONTWRITEBYTECODE=1
-export ELASTOS_PUBLISHER_GATEWAY="" ELASTOS_HEAD_CID=""
+export ELASTOS_PUBLISHER_GATEWAY="" ELASTOS_HEAD_CID="$7"
 export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID="" ELASTOS_INSTALL_ONLY=""
 export ELASTOS_TEST_CALLS="$1/calls" ELASTOS_TEST_SETUP_MARKER="$1/setup-marker" MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
 # Feed the complete stamped script through stdin, as curl | bash does.
-cat "$3" | "$2" --noprofile --norc -s -- "${@:7}"
-''', self.root, OPTIONS.bash, self.installer, self.system, self.machine, umask,
+cat "$3" | "$2" --noprofile --norc -s -- "${@:8}"
+''', self.root, OPTIONS.bash, self.installer, self.system, self.machine, umask, head_cid,
                        "--maintainer-did", self.did, "--publisher-gateway", "https://test.invalid", *options)
         return result, self.requests()[seen:]
 
@@ -789,6 +829,23 @@ class InstallationTests(unittest.TestCase):
                 self.assertIn("MAINTAINER_DID must be a did:key value", result.stderr)
                 self.assertNotIn("Maintainer DID:", result.stdout)
                 self.assertNotIn("\x1b]", result.stdout + result.stderr)
+
+    def test_stamped_head_cid_must_match_the_verified_head(self):
+        did, head, release = installable_fixture()
+        verified = unixfs_v0_cid(head)
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            refused, requests = sandbox.run("--install-only", head_cid="QmStampNamesOtherBytes")
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("Stamped head CID differs from the verified release head", refused.stderr)
+            self.assertIn(verified, refused.stderr)
+            self.assertEqual(requests, ["https://test.invalid/release-head.json"])
+            self.assertFalse(sandbox.binary.exists())
+            accepted, accepted_requests = sandbox.run("--install-only", head_cid=verified)
+            self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+            self.assertEqual(accepted_requests, self.REQUESTS)
+            sources = json.loads((sandbox.root / "candidate" / "sources.json").read_text())
+            self.assertEqual(sources["sources"][0]["head_cid"], verified)
 
     def test_installer_prints_the_selected_maintainer_did_before_verification(self):
         did, head, release = installable_fixture()
@@ -1048,7 +1105,7 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(source["discovery_uri"],
                          "elastos://source/stable/" + hashlib.sha256(did.encode()).hexdigest()[:32])
         registration = (source["gateways"], source["head_cid"], source["connect_ticket"], source["publisher_node_id"])
-        self.assertEqual(registration, (["https://test.invalid"], "", "fixture-ticket", "fixture-node"))
+        self.assertEqual(registration, (["https://test.invalid"], unixfs_v0_cid(head), "fixture-ticket", "fixture-node"))
         # Apart from the stand-in's Runtime, the shell writes no installation file
         # itself and removes its staged copy.
         self.assertEqual(changed_paths(before, sandbox.home_state()), {".local/bin/elastos"})

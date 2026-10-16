@@ -47,6 +47,8 @@ MAINTAINER_DID_PLACEHOLDER="__MAINTAINER""_DID__"
 if [[ "$MAINTAINER_DID" == "$MAINTAINER_DID_PLACEHOLDER" ]]; then
     MAINTAINER_DID=""
 fi
+# Publisher stamp. After signature verification this becomes the UnixFS CIDv0
+# of the verified release-head.json bytes. A stamp that names other bytes is refused.
 HEAD_CID="${ELASTOS_HEAD_CID:-__HEAD_CID__}"
 HEAD_CID_PLACEHOLDER="__HEAD""_CID__"
 if [[ "$HEAD_CID" == "$HEAD_CID_PLACEHOLDER" ]]; then
@@ -824,6 +826,44 @@ PY_ED25519
     ok "Signature verified"
 }
 
+# The stored head CID is the UnixFS CIDv0 of the verified release-head.json
+# bytes. A non-empty stamp that names different bytes is refused.
+bind_verified_head_cid() {
+    local head_path="$1"
+    local verified
+    verified="$(python3 - "$head_path" <<'PY_HEAD_CID'
+import hashlib
+import sys
+
+def varint(value):
+    encoded = bytearray()
+    while value >= 128:
+        encoded.append((value & 127) | 128)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+data = open(sys.argv[1], "rb").read()
+if not data or len(data) > 256 * 1024:
+    print("release head is outside the single-block UnixFS bound", file=sys.stderr)
+    sys.exit(1)
+unixfs = b"\x08\x02\x12" + varint(len(data)) + data + b"\x18" + varint(len(data))
+node = b"\x0a" + varint(len(unixfs)) + unixfs
+number = int.from_bytes(b"\x12\x20" + hashlib.sha256(node).digest(), "big")
+alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+text = ""
+while number:
+    number, digit = divmod(number, 58)
+    text = alphabet[digit] + text
+print(text)
+PY_HEAD_CID
+)" || die "Verified release head has no single-block CID"
+    if [[ -n "$HEAD_CID" && "$HEAD_CID" != "$verified" ]]; then
+        die "Stamped head CID differs from the verified release head. Stamp: ${HEAD_CID}. Verified: ${verified}"
+    fi
+    HEAD_CID="$verified"
+}
+
 validate_release_identity() {
     # Both envelopes are verified before this check, on every transport.
     # The signed digest binds exact envelope bytes; the CID stays content identity.
@@ -1284,6 +1324,7 @@ HEAD_SCHEMA=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"]["sch
 
 info "Verifying release head signature..."
 verify_signature "${INSTALL_SCRATCH}/release-head.json" "elastos.release.head.v1" "$MAINTAINER_DID"
+bind_verified_head_cid "${INSTALL_SCRATCH}/release-head.json"
 
 RELEASE_CID=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"]["latest_release_cid"]')
 RELEASE_VERSION=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"]["version"]')
@@ -1386,6 +1427,7 @@ ok "Checksum and version match the signed release"
 SIGNER_DID=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["signer_did"]')
 
 SOURCES_PATH="${INSTALL_SCRATCH}/sources.json"
+# HEAD_CID is the UnixFS CIDv0 of the verified release-head.json bytes.
 PUBLISHER_DID="${SIGNER_DID}" \
 PUBLISHER_GATEWAY="${PUBLISHER_GATEWAY}" \
 INSTALLED_VERSION="${RELEASE_VERSION}" \
