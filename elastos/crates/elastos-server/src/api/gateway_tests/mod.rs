@@ -86,12 +86,9 @@ fn test_launch_token_from_route(route: &str) -> String {
     .expect("launch route home token")
 }
 
-pub(super) fn write_gateway_health_lock(data_dir: &std::path::Path, pid: u32) {
-    std::fs::write(
-        data_dir.join("host-process.lock"),
-        format!("{{\"pid\":{pid},\"role\":\"gateway\",\"addr\":\"localhost:8090\"}}\n"),
-    )
-    .unwrap();
+/// Takes the host lock as this test process's gateway, as `elastos gateway` does.
+pub(super) fn hold_gateway_health_lock(data_dir: &std::path::Path) -> crate::host_lock::FileLock {
+    crate::host_lock::acquire_host_process_lock(data_dir, "gateway", "localhost:8090").unwrap()
 }
 
 fn test_state(cache_dir: &std::path::Path) -> GatewayState {
