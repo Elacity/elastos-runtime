@@ -7,12 +7,15 @@
 #   ./scripts/install.sh --publisher-gateway https://<publisher-origin> --maintainer-did did:key:z6Mk...
 #   ./scripts/install.sh --help
 #
-# Required (stamped into published installers):
+# Required (stamped into published installers by render_installer in
+# scripts/release-signer.py):
 #   ELASTOS_PUBLISHER_GATEWAY env var   or   --publisher-gateway <url>
-#   ELASTOS_MAINTAINER_DID env var   or   --maintainer-did <did:key:...>
-#
-# Trust anchors can be provided via env vars or CLI flags. In the canonical
-# bootstrap flow, they should already be stamped into install.sh.
+#   The maintainer DID. A published (stamped) installer has it built in, and
+#   ELASTOS_MAINTAINER_DID or --maintainer-did with a different DID is refused
+#   before any download. Compare its "Maintainer DID:" line with the DID in
+#   the README ("Install from the publisher"). Only this unstamped repository
+#   copy, which repo smokes and tests run, takes the DID from
+#   ELASTOS_MAINTAINER_DID or --maintainer-did <did:key:...>.
 #
 # Downloads the signed release head, release envelope, and Runtime binary.
 # Runtime setup fetches component metadata over Carrier.
@@ -40,13 +43,12 @@ set -euo pipefail
 
 # ── Trust anchors (baked in by publish-release.sh) ────────────────────
 # These placeholders are replaced with real values at publish time.
-# Override via env vars or CLI flags if needed.
 
-MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-__MAINTAINER_DID__}"
-MAINTAINER_DID_PLACEHOLDER="__MAINTAINER""_DID__"
-if [[ "$MAINTAINER_DID" == "$MAINTAINER_DID_PLACEHOLDER" ]]; then
-    MAINTAINER_DID=""
-fi
+# The trust root. The stamp reads no environment: select_maintainer_did
+# decides from this baked value alone whether the installer is stamped.
+MAINTAINER_DID_STAMP="__MAINTAINER_DID__"
+MAINTAINER_DID_FROM_FLAG=""
+MAINTAINER_DID=""
 # Publisher stamp. A frozen installer leaves this empty, and an empty stamp
 # stays empty so a fresh install stores no head CID. A non-empty stamp must
 # equal the UnixFS CIDv0 of the verified release-head.json bytes. A stamp that
@@ -118,7 +120,10 @@ show_help() {
     echo "  ./scripts/install.sh [options]"
     echo ""
     echo -e "${BOLD}Options:${NC}"
-    echo "  --maintainer-did DID Override maintainer DID trust anchor"
+    echo "  --maintainer-did DID Repository copy only: the maintainer DID to trust."
+    echo "                       A published installer has its DID built in and refuses"
+    echo "                       a different one. Compare its \"Maintainer DID:\" line"
+    echo "                       with the DID in the ElastOS README."
     echo "  --publisher-gateway URL  Bootstrap publisher URL (stamped for normal installs)"
     echo "  --install-dir PATH    Binary install directory (default: ~/.local/bin)"
     echo "  --install-only        Install Runtime without setup or opening Home"
@@ -157,6 +162,25 @@ die()  { echo -e "${RED:-}Error:${NC:-} $*" >&2; exit 1; }
 die_exact() { printf '%bError:%b %s\n' "${RED:-}" "${NC:-}" "$*" >&2; exit 1; }
 # The staged Runtime must stay the file whose SHA-256 was checked.
 RUNTIME_CHANGED="The downloaded Runtime changed on this computer after its check. Nothing was installed. Run the installer again."
+# A stamped installer has one trust root, its built-in maintainer DID.
+MAINTAINER_DID_BUILT_IN="This installer has its maintainer DID built in. It does not accept a different DID from ELASTOS_MAINTAINER_DID or --maintainer-did. The installer stopped before it downloaded or changed anything. Remove that setting and run the installer again. When the installer runs, it shows the built-in DID on its \"Maintainer DID:\" line. Compare that line with the DID in the ElastOS README."
+
+# The DID that verifies the release. STAMP is the value render_installer baked
+# in; the split placeholder below survives stamping, so only the unstamped
+# repository template matches it. That template takes the flag, then the
+# environment. A stamped installer keeps its stamp and refuses a request for
+# any other DID; a request for the same DID changes nothing.
+select_maintainer_did() {
+    local stamp="$1" from_env="$2" from_flag="$3" requested
+    if [[ "$stamp" == "__MAINTAINER""_DID__" ]]; then
+        MAINTAINER_DID="${from_flag:-$from_env}"
+        return 0
+    fi
+    for requested in "$from_env" "$from_flag"; do
+        [[ -z "$requested" || "$requested" == "$stamp" ]] || die "$MAINTAINER_DID_BUILT_IN"
+    done
+    MAINTAINER_DID="$stamp"
+}
 # Every read of a verified envelope must see the SHA-256 its signature check saw.
 RELEASE_CHANGED="The release files changed on this computer after they were checked. Nothing was installed. Run the installer again."
 
@@ -1264,7 +1288,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h) show_help ;;
         --maintainer-did)
             [[ -z "${2:-}" ]] && die "Usage: --maintainer-did did:key:z6Mk..."
-            MAINTAINER_DID="$2"; shift 2 ;;
+            MAINTAINER_DID_FROM_FLAG="$2"; shift 2 ;;
         --publisher-gateway)
             [[ -z "${2:-}" ]] && die "Usage: --publisher-gateway https://<url>"
             PUBLISHER_GATEWAY="${2%/}"; shift 2 ;;
@@ -1278,6 +1302,8 @@ while [[ $# -gt 0 ]]; do
         *) die "Unknown option: $1. Run --help for usage." ;;
     esac
 done
+# Before any other step, so a refused DID request downloads and changes nothing.
+select_maintainer_did "$MAINTAINER_DID_STAMP" "${ELASTOS_MAINTAINER_DID:-}" "$MAINTAINER_DID_FROM_FLAG"
 
 if [[ "$REMOVE_DATA" == true && "$UNINSTALL" != true ]]; then
     die "--remove-data deletes your data and works only with --uninstall"
@@ -1304,7 +1330,7 @@ fi
 PG="${PUBLISHER_GATEWAY%/}"
 
 if [[ -z "$MAINTAINER_DID" ]]; then
-    die "MAINTAINER_DID not set. Either:\n  1. Set ELASTOS_MAINTAINER_DID env var, or\n  2. Pass --maintainer-did <did:key:...>."
+    die "MAINTAINER_DID not set. This repository copy of install.sh has no built-in DID. Either:\n  1. Set ELASTOS_MAINTAINER_DID env var, or\n  2. Pass --maintainer-did <did:key:...>."
 fi
 # The DID reaches the terminal before its signature check, so only base58 did:key text passes.
 if [[ ! "$MAINTAINER_DID" =~ ^did:key:z[1-9A-HJ-NP-Za-km-z]{1,128}$ ]]; then

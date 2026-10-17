@@ -640,12 +640,16 @@ def cli_environment(home_path):
 def cli_installer_metadata(installer, env):
     # The stamped defaults live inside the executable guard; sourcing skips it.
     # Read the two literal defaults without running any installer action.
+    # Installers before #434 default MAINTAINER_DID from the environment; later
+    # ones keep the stamp in MAINTAINER_DID_STAMP and read no environment for it.
     text = installer.read_text()
     values = []
     for variable in ("MAINTAINER_DID", "HEAD_CID"):
         need("ELASTOS_" + variable not in env, "fixture trust override is unavailable")
         matches = re.findall(r'^' + variable + r'="\$\{ELASTOS_' + variable +
                              r':-([^$\\"\r\n}]*)\}"$', text, re.M)
+        if variable == "MAINTAINER_DID":
+            matches += re.findall(r'^MAINTAINER_DID_STAMP="([^$\\"\r\n}]*)"$', text, re.M)
         need(len(matches) == 1, "frozen installer literal trust default unavailable")
         value = matches[0]
         values.append("" if value == "__" + variable + "__" else value)
