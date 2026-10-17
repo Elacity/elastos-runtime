@@ -1831,21 +1831,61 @@ fn check_owner_claim(
     Ok(())
 }
 
+/// A passkey ceremony from a page address that cannot use the stored or local passkey.
+/// The text is the reply body, so it tells the person which address to open.
+#[derive(Debug)]
+pub(crate) struct PasskeyOriginRefused {
+    local_home: Option<String>,
+}
+impl std::fmt::Display for PasskeyOriginRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.local_home {
+            Some(home) => write!(
+                f,
+                "Passkeys work on this computer only at the localhost address. Open {home} and try again."
+            ),
+            None => f.write_str(
+                "This passkey works only at the Home address where you made it. Open Home at that address and try again.",
+            ),
+        }
+    }
+}
+impl std::error::Error for PasskeyOriginRefused {}
+
+/// The Home URL at `localhost` with the same port, for a loopback page address.
+fn local_home_for(url: &url::Url) -> Option<String> {
+    let loopback = match url.host()? {
+        url::Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(address) => address.is_loopback(),
+        url::Host::Ipv6(address) => address.is_loopback(),
+    };
+    loopback.then(|| match url.port() {
+        Some(port) => format!("http://localhost:{port}/home/"),
+        None => "http://localhost/home/".to_string(),
+    })
+}
+
 fn require_localhost_origin(origin: &str, rp_id: &str) -> anyhow::Result<()> {
     let url = url::Url::parse(origin).map_err(|_| OwnerEnrollmentDenied)?;
     if url.scheme() != "http" || url.host_str() != Some("localhost") || rp_id != "localhost" {
-        return enrollment_denied();
+        return Err(PasskeyOriginRefused {
+            local_home: local_home_for(&url),
+        }
+        .into());
     }
     Ok(())
 }
 
+/// Browsers bind a passkey to the page host (its relying party id) and refuse an
+/// IP address as that id. Sign-in accepts the stored host on any port.
 fn require_passkey_origin(origin: &str, rp_id: &str) -> anyhow::Result<()> {
     let url = url::Url::parse(origin).map_err(|_| OwnerEnrollmentDenied)?;
-    let Some(host) = url.host_str() else {
-        return enrollment_denied();
-    };
-    if host.parse::<std::net::IpAddr>().is_ok() || host != rp_id {
-        return enrollment_denied();
+    let matches = matches!(url.host(), Some(url::Host::Domain(host)) if host == rp_id);
+    if !matches {
+        let local_home = (rp_id == "localhost")
+            .then(|| local_home_for(&url))
+            .flatten();
+        return Err(PasskeyOriginRefused { local_home }.into());
     }
     Ok(())
 }
