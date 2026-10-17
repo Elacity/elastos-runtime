@@ -3,8 +3,8 @@ import test from "node:test";
 import { createHash, createPublicKey, verify } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { buildEntry, canonical, contentManifest, download, fileRecord, loadFixture, ownedDirectory, producePackage, rawCid, signedCatalog, SMOL_FIXTURE, verifyInstalledKubo, writeCatalogPayload } from "./ci-model-package.mjs";
+import { dirname, join } from "node:path";
+import { buildEntry, canonical, contentManifest, copyVendored, download, fileRecord, loadFixture, ownedDirectory, producePackage, rawCid, signedCatalog, SMOL_FIXTURE, verifyInstalledKubo, writeCatalogPayload } from "./ci-model-package.mjs";
 
 const QWEN_FIXTURE = loadFixture(new URL("./pinned-qwen2.5-1.5b-fixture.json", import.meta.url));
 
@@ -64,7 +64,10 @@ test("fixture loading refuses escaping names, injected text, unpinned weights an
   refused(f => { provenance(f).quantized_repository = "Qwen/Qwen2.5\nSigned by someone else."; }, /owner\/name identifiers/);
   refused(f => { provenance(f).base_repository = "Qwen/../../etc"; }, /owner\/name identifiers/);
   refused(f => { f.model.url = f.model.url.replace(/resolve\/[0-9a-f]+\//, "resolve/main/"); }, /pinned quantized repository revision/);
-  refused(f => { f.license.url = "https://example.com/LICENSE"; }, /pinned revision or apache\.org/);
+  refused(f => { f.license.url = "https://example.com/LICENSE"; }, /pinned revision or the vendored Apache License text/);
+  refused(f => { f.license.url = "https://www.apache.org/licenses/LICENSE-2.0.txt"; }, /pinned revision or the vendored Apache License text/);
+  refused(f => { delete f.license.url; f.license.path = "../../outside/LICENSE"; }, /pinned revision or the vendored Apache License text/);
+  refused(f => { f.license.path = "fixtures/licenses/Apache-2.0.txt"; }, /pinned revision or the vendored Apache License text/);
   refused(f => { provenance(f).quantized_revision = "91cad511"; }, /full commit hashes/);
   refused(f => { f.capsule_manifest.description = "one\nline"; }, /one bounded line/);
   refused(f => { f.display_name = "Qwen 1.5B"; }, /display_name/);
@@ -227,9 +230,24 @@ test("download refuses a pre-placed symlink partial and leaves its target untouc
   symlinkSync(victim, join(inputs, "LICENSE.partial"));
   let fetched = false;
   const get = async () => { fetched = true; return new Response("replaced"); };
-  await assert.rejects(download(SMOL_FIXTURE.license, join(inputs, "LICENSE"), get), /EEXIST/);
+  await assert.rejects(download(QWEN_FIXTURE.license, join(inputs, "LICENSE"), get), /EEXIST/);
   assert.equal(readFileSync(victim, "utf8"), "keep");
   assert.equal(fetched, false);
+});
+
+test("the SmolLM2 license is the vendored Apache text, copied only after its pin matches", t => {
+  assert.equal(SMOL_FIXTURE.license.url, undefined, "the SmolLM2 license has no network source");
+  const root = temporary(t), base = join(root, "scripts");
+  mkdirSync(join(root, "good")); mkdirSync(join(root, "tampered"));
+  const copied = copyVendored(SMOL_FIXTURE.license, join(root, "good/LICENSE"));
+  assert.deepEqual(copied, { path: "LICENSE", size: SMOL_FIXTURE.license.size, sha256: SMOL_FIXTURE.license.sha256 });
+  mkdirSync(dirname(join(base, SMOL_FIXTURE.license.path)), { recursive: true });
+  const text = readFileSync(join(root, "good/LICENSE"), "utf8");
+  for (const [name, changed] of [["same size", text.replace("Apache License", "Apache Licanse")], ["appended", text + "extra grant\n"]]) {
+    writeFileSync(join(base, SMOL_FIXTURE.license.path), changed);
+    assert.throws(() => copyVendored(SMOL_FIXTURE.license, join(root, "tampered/LICENSE"), base), /pinned (checksum|size)/, name);
+    assert.throws(() => lstatSync(join(root, "tampered/LICENSE")), /ENOENT/, name);
+  }
 });
 
 test("output directory refuses a symlinked ancestor", t => {

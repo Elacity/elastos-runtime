@@ -57,6 +57,85 @@ def private_json(path, value=None):
     return json.loads(encoded)
 
 
+# A kept last path part must look like a harness file (request.json,
+# memory.events). Any other last part can be a user, device or key name.
+KEPT_PATH_SUFFIXES = {"json", "log", "txt", "events", "max", "current", "peak", "stat", "status",
+                      "service", "sock", "lock", "pid", "bin", "data", "gguf", "car", "toml", "mjs", "py", "sh"}
+SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|passphrase|api[_-]?key|private[_-]?key|credential|cookie|session|signature|auth)[A-Za-z0-9_.-]*"
+# A path runs until a mark that ends a path in an error message: a quote,
+# a bracket, a comma, a semicolon, a pipe, a line end, or a colon followed by
+# a space or the end ("open /a b/c: denied"). Spaces inside the path stay in
+# it, so a folder name with a space is redacted whole ("/Volumes/Backup Disk").
+# A path that is not quoted or followed by such a mark takes the rest of the
+# text with it: losing words is better than leaking a folder name.
+PATH_STOP = "\\r\\n'\"`,;()\\[\\]{}<>|"
+PATH_TAIL = rf"(?:[^{PATH_STOP}\s:]|:(?!\s|$)|[ \t]+(?=[^{PATH_STOP}\s:]|:(?!\s|$)))*"
+PATH_START = "|".join((
+    r"\bfile:/+",
+    r"(?<!\S)~[A-Za-z0-9._-]*/",
+    # Windows network and device paths: \\server\share, \\?\C:\..., \\.\pipe\...
+    r"(?<![\w\\])\\\\(?=[^\s\\])",
+    # A network path written with slashes (//server/share). A URL's "//" follows a colon.
+    r"(?<![\w.:/\\-])//(?=[^/\s])",
+    # A drive path with either slash (C:\Program Files, C:/Users).
+    r"\b[A-Za-z]:[\\/]",
+    r"(?<![\w.~<>/\\-])/(?![/\s])",
+))
+# The user part of a URL (scheme://user:password@host) is a credential.
+URL_USERINFO = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)[^\s/?#'\"`<>]*@")
+REDACTIONS = (
+    # Credentials after an auth scheme or a secret-named key (token=..., password: ...).
+    (re.compile(r"\b(Bearer|Basic|Token)\s+[^\s'\",;]+", re.I), r"\1 <redacted>"),
+    (re.compile(rf"\b({SECRET_NAME})(\s*[=:]\s*)(?!(?:Bearer|Basic|Token)\s)(['\"]?)[^\s'\",;]+\3", re.I), r"\1\2<redacted>"),
+    # A DID names a key, so a person or a device: keep only its method.
+    (re.compile(r"\bdid:([a-z0-9]+):[^\s'\",;]+"), r"did:\1:<redacted>"),
+    # Long hex, base64 or base58 runs: digests, keys, tokens, CIDs, unit and session ids.
+    (re.compile(r"(?<![A-Za-z0-9+/=_-])(?=[A-Za-z0-9+/=_-]*[0-9])(?=[A-Za-z0-9+/=_-]*[A-Za-z])[A-Za-z0-9+/=_-]{20,}"),
+     "<redacted>"),
+)
+
+
+def redacted_path(path):
+    name = re.split(r"[/\\]", path.rstrip("/\\"))[-1]
+    found = re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.([A-Za-z0-9]{1,8})", name)
+    return "<path>/" + name if found and found[1].lower() in KEPT_PATH_SUFFIXES else "<path>"
+
+
+def redact(text, roots=()):
+    """Remove local paths, home folders and token-like values from text that
+    leaves the runner (receipts and CI log lines)."""
+    known = set()
+    for root in (*roots, os.environ.get("HOME")):
+        if root:
+            known.update({str(root), os.path.realpath(root)})
+    try:
+        known.add(str(Path.home()))
+    except (KeyError, RuntimeError):
+        pass
+    text = URL_USERINFO.sub(r"\1<redacted>@", text)
+    # Known roots first and longest first: a home or data folder may hold a space.
+    for root in sorted((root.rstrip("/") for root in known if len(root.rstrip("/")) > 1), key=len, reverse=True):
+        text = re.sub(re.escape(root) + rf"(?![^/\\{PATH_STOP}\s:]){PATH_TAIL}", lambda found: redacted_path(found[0]), text)
+    text = re.sub(rf"(?:{PATH_START}){PATH_TAIL}", lambda found: redacted_path(found[0]), text)
+    for pattern, replacement in REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def observer_failure(phase, error, roots=(), limit=480):
+    """Public cause of an observer failure. The harness writes these messages
+    and no observer reads the private Runtime log; the text is still redacted,
+    because an OSError names local paths."""
+    message = redact(" ".join(str(error).split()), roots)
+    if len(message) > limit:
+        message = message[:limit] + "..."
+    return {"phase": phase, "type": type(error).__name__, "message": message}
+
+
+def failure_suffix(failure):
+    return f" ({failure['phase']}: {failure['type']}: {failure['message']})" if failure else ""
+
+
 def linux_process_identity(pid, proc=Path("/proc"), retained=None):
     """Bind a live process by UID, kernel start tick and executable inode."""
     directory = proc / str(pid)
@@ -237,6 +316,7 @@ class FiniteRuntime:
         self.metric_fds = {}
         self.stop = threading.Event()
         self.error = None
+        self.failure = None
         self.thread = None
         self.outside = [os.getpid()]
         self.engine = None
@@ -488,24 +568,39 @@ class FiniteRuntime:
                              "engine_pid": self.engine, "engine_start_ticks": self.known[self.engine]["start_ticks"]})
         private_json(self.control / "response.json", {"id": self.last_action, "status": "passed", "engine_start_ticks": self.known[self.engine]["start_ticks"], "engine_pid": self.engine})
 
+    def runtime_exited(self):
+        try:
+            return self.pid in self.fds and pidfd_exited(self.fds[self.pid])
+        except OSError:
+            return None
+
     def observe(self):
+        phase = "census"
         try:
             while not self.stop.is_set() and time.monotonic() - self.started < 1800:
+                phase = "census"
                 self.observe_once()
                 path = self.control / "request.json"
                 if path.exists():
+                    phase = "stage_request"
                     request = private_json(path)
                     if request.get("id") != self.last_action:
+                        phase = "stage_" + str(request.get("action"))[:32]
                         self.action(request)
                 self.stop.wait(.1)
             if not self.stop.is_set():
+                phase = "deadline"
                 raise RuntimeError("finite journey observer deadline")
-        except BaseException:
+        except BaseException as error:
+            # "census" with "Runtime left its unit" and runtime_exited true means
+            # Runtime itself ended; other census messages name the failed check.
+            self.failure = {**observer_failure(phase, error, (self.home, self.data)), "runtime_exited": self.runtime_exited()}
             self.error = "finite_resource_observation_failed"
             private_json(self.control / "response.json", {"id": self.last_action + 1, "status": "failed"})
             private_json(self.control / "stop.json", {"stop": True})
 
     def finish(self):
+        runtime_exited = self.runtime_exited() if self.pid is not None else None
         self.stop.set()
         if self.thread:
             self.thread.join(timeout=3)
@@ -513,6 +608,10 @@ class FiniteRuntime:
                   "status": "failed", "cgroup_empty": False,
                   "observer_complete": self.thread is None or not self.thread.is_alive(),
                   "actions": self.actions, "outside_runtime_unit": True}
+        if self.failure:
+            record["observer_failure"] = self.failure
+        if runtime_exited:
+            record["runtime_exited_before_cleanup"] = True
         phase = "unit_binding"
         try:
             if not self.launch_requested:
@@ -865,7 +964,7 @@ def free_port(kind=socket.SOCK_STREAM):
 def wait_healthy(child, address, label, stop=None):
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not (stop and stop.is_set()):
-        assert child.poll() is None, f"installed {label} exited before health"
+        assert child.poll() is None, f"installed {label} exited before health" + failure_suffix(getattr(child, "failure", None))
         try:
             with urllib.request.urlopen(f"http://{address}/healthz", timeout=1) as response:
                 if response.status == 200:
@@ -943,6 +1042,7 @@ class RepairRuntime:
         self.stop = threading.Event()
         self.launch_lock = threading.Lock()
         self.error = None
+        self.failure = None
         try:
             self.launch()
             self.record = {"runtime_episodes": [self.identity()], "actions": []}
@@ -1066,7 +1166,7 @@ class RepairRuntime:
         return {**self.kept, "home_restarted": True}
 
     def observe(self):
-        previous = 0
+        previous, phase = 0, "control_request"
         try:
             while not self.stop.wait(.05):
                 try:
@@ -1080,11 +1180,15 @@ class RepairRuntime:
                 action = request["action"]
                 if action not in ("engine_running", "engine_stopped", "restart_get") or action in self.record["actions"]:
                     raise RuntimeError("repair journey control action differs")
+                phase = "stage_" + action
                 response = getattr(self, action)()
+                phase = "control_request"
                 previous = request["id"]
                 self.record["actions"].append(action)
                 private_json(self.control / "response.json", {"id": previous, "status": "passed", **response})
-        except BaseException:
+        except BaseException as error:
+            self.failure = observer_failure(phase, error, (self.home, self.data))
+            self.record["control_failure"] = self.failure
             self.error = "installed_model_repair_control_failed"
             private_json(self.control / "response.json", {"id": previous + 1, "status": "failed"})
 
@@ -1258,7 +1362,7 @@ def run(home, data, evidence, model=True, carrier=False, memory_gib=0, repair=Fa
                             while browser_owner.poll() is None and time.monotonic() < deadline and not finite.error:
                                 time.sleep(.1)
                             if browser_owner.poll() != 0 or finite.error:
-                                raise RuntimeError("finite installed UI journey failed")
+                                raise RuntimeError("finite installed UI journey failed" + failure_suffix(finite.failure))
                         finally:
                             if browser_owner.poll() is None:
                                 browser_owner.terminate()
