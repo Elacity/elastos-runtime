@@ -95,7 +95,12 @@ const settle = async () => {
   for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve));
 };
 
-const { addAccountPasskey, bindHomeUnlock, showHomeUnlock } = await import("./shell-auth.js");
+const {
+  addAccountPasskey,
+  bindHomeUnlock,
+  recoveryImportIncompleteMessage,
+  showHomeUnlock,
+} = await import("./shell-auth.js");
 
 routes["/api/auth/passkey/status"] = () => ({ body: { registered: true, guest_registration_enabled: false } });
 await showHomeUnlock(() => {});
@@ -192,4 +197,27 @@ test("a refused or cancelled passkey add is one plain sentence", async () => {
   await assert.rejects(addAccountPasskey("system-launch"), {
     message: "Home did not add the passkey. Select Add passkey to try again.",
   });
+});
+
+test("recovery says it worked when only the Home's recovery record is missing", () => {
+  const imported = (wallet, people, audit) => ({
+    schema: "elastos.full-recovery-bundle.import.response/v2",
+    wallet_restore: { status: wallet },
+    people_identity_restore: { status: people },
+    runtime_audit: { status: audit },
+  });
+  assert.equal(recoveryImportIncompleteMessage(imported("complete", "restored", "complete")), "");
+  const auditOnly = recoveryImportIncompleteMessage(imported("complete", "restored", "incomplete"));
+  assert.match(auditOnly, /^Your account, Profile and Wallet were recovered\./);
+  assert.doesNotMatch(auditOnly, /could not finish|failed|needs completion/i);
+  assert.match(auditOnly, /Choose the same kit again to finish it\.$/);
+  for (const response of [
+    imported("incomplete", "restored", "complete"),
+    imported("complete", "incomplete", "incomplete"),
+  ]) {
+    assert.equal(recoveryImportIncompleteMessage(response),
+      "The root was recovered. Profile or Wallet recovery still needs completion. Choose the same kit again to retry safely.");
+  }
+  assert.match(recoveryImportIncompleteMessage(imported("complete", "absent", "complete")),
+    /has no signed Profile or name/);
 });

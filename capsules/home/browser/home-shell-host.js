@@ -57,7 +57,6 @@ const HOME_EVENTS_RECONNECT_TIMEOUT_MS = 10_000;
 const HOME_EVENTS_POLL_TIMEOUT_MS = HOME_EVENTS_WAIT_MS + HOME_EVENTS_RECONNECT_TIMEOUT_MS;
 const HOME_EVENTS_STREAM_URL = "/api/apps/home/events/stream";
 const SESSION_REFRESH_MS = 10 * 60 * 1000;
-const PRESENCE_HEARTBEAT_MS = 15_000;
 const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
 const ACTIVE_SHELL_READY_TIMEOUT_MS = 5_000;
 const HOME_CLI_SHELL_ID = "home-cli";
@@ -248,7 +247,6 @@ function settleChatReconnect(old, record, error = null) {
 
 function enterHostAuthGate() {
   document.body.dataset.homeAuthority = "unsigned";
-  stopHomePresenceHeartbeat();
   shellState.activeShellRootLaunchSeq += 1;
   resetActiveShellReadyState();
   shellState.pendingAppliedShellTarget = "";
@@ -2423,60 +2421,6 @@ function homeSummaryHasProofBoundSession(summary) {
   );
 }
 
-function stopHomePresenceHeartbeat() {
-  if (shellState.presenceHeartbeatTimer !== null) {
-    window.clearInterval(shellState.presenceHeartbeatTimer);
-    shellState.presenceHeartbeatTimer = null;
-  }
-}
-
-function publishHomePresence() {
-  if (
-    !homeSummaryHasProofBoundSession(shellState.currentSummary) ||
-    shellState.presenceHeartbeatInFlight
-  ) {
-    return shellState.presenceHeartbeatInFlight || Promise.resolve(null);
-  }
-  const pending = fetchJson("/api/apps/home/collaboration/presence", {
-    method: "POST",
-    body: JSON.stringify({}),
-  })
-    .catch((error) => {
-      if (isHomeAuthError(error)) {
-        stopHomePresenceHeartbeat();
-      }
-      // Presence needs a saved Profile. Before one exists the Runtime
-      // answers 409 every heartbeat, so a first run scrolls its console
-      // with a refusal it already predicted. Stop asking until something
-      // about this Home changes.
-      if (error?.status === 409) {
-        stopHomePresenceHeartbeat();
-      }
-      return null;
-    })
-    .finally(() => {
-      if (shellState.presenceHeartbeatInFlight === pending) {
-        shellState.presenceHeartbeatInFlight = null;
-      }
-    });
-  shellState.presenceHeartbeatInFlight = pending;
-  return pending;
-}
-
-function syncHomePresenceHeartbeat(summary) {
-  if (!homeSummaryHasProofBoundSession(summary)) {
-    stopHomePresenceHeartbeat();
-    return;
-  }
-  if (shellState.presenceHeartbeatTimer === null) {
-    shellState.presenceHeartbeatTimer = window.setInterval(
-      publishHomePresence,
-      PRESENCE_HEARTBEAT_MS,
-    );
-    publishHomePresence();
-  }
-}
-
 function refreshSignedHomeSession() {
   if (!homeSummaryHasProofBoundSession(shellState.currentSummary)) {
     return Promise.resolve(null);
@@ -2504,8 +2448,6 @@ async function refreshShellSummary({
   shellState.currentSummary = summary;
   shellState.requestSummaryRefresh = refreshShellSummary;
   document.body.dataset.homeAuthority = homeSummarySignedIn(summary) ? "signed" : "unsigned";
-  syncHomePresenceHeartbeat(summary);
-
   if (homeSummarySignedIn(summary)) {
     ensureHomeEventChannel();
   } else {

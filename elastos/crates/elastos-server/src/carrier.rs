@@ -128,6 +128,16 @@ const MAX_CARRIER_OBJECT_IMPORT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REMOTE_RECEIPT_REPLICA_SUMMARY_ROWS: usize = 5;
 const GOSSIP_SEND_TIMEOUT: Duration = Duration::from_millis(1_500);
 const GOSSIP_JOIN_PEERS_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// Bounds one topic subscription. Subscribing only queues a Join on the local
+/// actor, so it stalls only when that actor does; a stalled actor must not
+/// hold the gossip state lock that recovery and shutdown need.
+const GOSSIP_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds one hand-off to the local gossip actor (a connection, a shutdown);
+/// a stalled actor never answers either.
+const GOSSIP_ACTOR_TIMEOUT: Duration = Duration::from_secs(2);
+/// A gossip recovery that cannot take the state within this gives up rather
+/// than running later, right after another one.
+const GOSSIP_RECOVERY_START_TIMEOUT: Duration = Duration::from_secs(2);
 /// A consumer that joins a CID topic after the holder announced still needs a
 /// window for DHT/mDNS to form a gossip neighbor and for the signed fetch
 /// ticket to arrive. One absolute deadline covers late holders. Operator peer
@@ -450,6 +460,62 @@ struct TopicBuffer {
     messages: VecDeque<GossipMessage>,
     base_index: u64,
     retained_bytes: usize,
+    /// Gossip frames received from peers on this topic, kept across a rejoin
+    /// or a gossip rebuild. Local sends never count.
+    remote_frames: u64,
+}
+
+/// How a topic was joined, so a gossip rebuild can join it again the same way.
+#[derive(Clone)]
+enum TopicJoin {
+    Direct(Vec<iroh::EndpointId>),
+    Discovered,
+}
+
+/// The Router's gossip entry. A gossip rebuild swaps the actor behind it, so
+/// new peer connections reach the new actor and the old one can be dropped.
+#[derive(Debug, Clone)]
+struct CarrierGossipHandler(Arc<std::sync::RwLock<Gossip>>);
+
+impl CarrierGossipHandler {
+    fn new(gossip: Gossip) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(gossip)))
+    }
+
+    fn current(&self) -> Gossip {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn replace(&self, gossip: Gossip) -> Gossip {
+        std::mem::replace(
+            &mut *self
+                .0
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            gossip,
+        )
+    }
+}
+
+impl ProtocolHandler for CarrierGossipHandler {
+    async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), AcceptError> {
+        // Bounded, so a waiting accept never keeps a replaced actor alive.
+        let gossip = self.current();
+        match tokio::time::timeout(GOSSIP_ACTOR_TIMEOUT, gossip.handle_connection(connection)).await
+        {
+            Ok(handled) => handled.map_err(AcceptError::from_err),
+            Err(_) => Err(AcceptError::from_err(std::io::Error::other(
+                "gossip actor did not take the connection",
+            ))),
+        }
+    }
+
+    async fn shutdown(&self) {
+        ProtocolHandler::shutdown(&self.current()).await;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -550,10 +616,36 @@ fn push_gossip_buffer_message(buffer: &mut TopicBuffer, message: GossipMessage) 
     true
 }
 
-fn spawn_carrier_gossip(endpoint: &Endpoint) -> Gossip {
+/// Active neighbours a Community bootstrap node keeps. Homes behind NAT reach
+/// each other only through it, so with iroh-gossip's default of 5 a sixth
+/// Home's join evicts a random Home, which then has no neighbour at all.
+/// Each active neighbour costs the hub one QUIC connection (already held for
+/// the topic) plus a bounded per-peer send queue, so 512 Homes stay cheap.
+const COMMUNITY_HUB_ACTIVE_VIEW_CAPACITY: usize = 512;
+/// Passive view of the hub: contact info only (no connection).
+const COMMUNITY_HUB_PASSIVE_VIEW_CAPACITY: usize = 1024;
+
+/// A Home keeps iroh-gossip's default membership; only a Community bootstrap
+/// node (its endpoint is one of the profile's bootstrap peers) is the hub.
+fn carrier_gossip_membership(community_hub: bool) -> iroh_gossip::proto::HyparviewConfig {
+    let mut membership = iroh_gossip::proto::HyparviewConfig::default();
+    if community_hub {
+        membership.active_view_capacity = COMMUNITY_HUB_ACTIVE_VIEW_CAPACITY;
+        membership.passive_view_capacity = COMMUNITY_HUB_PASSIVE_VIEW_CAPACITY;
+    }
+    membership
+}
+
+fn spawn_carrier_gossip_for(endpoint: &Endpoint, community_hub: bool) -> Gossip {
     Gossip::builder()
         .max_message_size(GOSSIP_WIRE_MESSAGE_MAX_BYTES)
+        .membership_config(carrier_gossip_membership(community_hub))
         .spawn(endpoint.clone())
+}
+
+#[cfg(test)]
+fn spawn_carrier_gossip(endpoint: &Endpoint) -> Gossip {
+    spawn_carrier_gossip_for(endpoint, false)
 }
 
 fn now_secs() -> u64 {
@@ -570,7 +662,6 @@ fn now_secs() -> u64 {
 /// works like a virtual LAN. Join a topic, discover peers automatically.
 pub struct CarrierNode {
     pub endpoint: Endpoint,
-    pub gossip: Gossip,
     _router: Router,
     pub gossip_state: Arc<Mutex<GossipState>>,
     pub memory_lookup: MemoryLookup,
@@ -578,23 +669,17 @@ pub struct CarrierNode {
 
 impl CarrierNode {
     pub(crate) async fn shutdown(self) {
-        let tasks = {
-            let mut state = self.gossip_state.lock().await;
-            let tasks = state
-                .receiver_tasks
-                .drain()
-                .map(|(_, task)| task)
-                .collect::<Vec<_>>();
-            state.senders.clear();
-            state.joined_topics.clear();
-            tasks
-        };
+        let (tasks, gossip) = self.gossip_state.lock().await.close();
         for task in tasks {
             task.abort();
             let _ = task.await;
         }
-        if let Err(err) = self.gossip.shutdown().await {
-            tracing::warn!(error = %err, "carrier gossip shutdown failed during runtime shutdown");
+        match tokio::time::timeout(GOSSIP_ACTOR_TIMEOUT, gossip.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "carrier gossip shutdown failed during runtime shutdown");
+            }
+            Err(_) => tracing::warn!("carrier gossip did not shut down in time; dropping it"),
         }
         self.endpoint.close().await;
     }
@@ -651,6 +736,9 @@ impl CarrierRuntimeService {
 pub struct GossipState {
     endpoint: Endpoint,
     gossip: Gossip,
+    gossip_handler: CarrierGossipHandler,
+    topic_joins: HashMap<String, TopicJoin>,
+    closed: bool,
     memory_lookup: MemoryLookup,
     signing_key: Option<ed25519_dalek::SigningKey>,
     joined_topics: std::collections::HashSet<String>,
@@ -665,6 +753,8 @@ pub struct GossipState {
     topic_peers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     did: Option<String>,
     direct_only: bool,
+    /// Set on a Community bootstrap node; every gossip actor it spawns is a hub.
+    community_hub: bool,
     browser_exit_network: Option<crate::collaboration_network::VerifiedCollaborationNetworkProfile>,
     browser_exit_reservations: browser_exit::BrowserExitReservations,
     browser_engine_probe_slots: Arc<tokio::sync::Semaphore>,
@@ -683,7 +773,10 @@ impl GossipState {
             browser_exit_reservations: browser_exit::BrowserExitReservations::default(),
             browser_engine_probe_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             endpoint,
+            gossip_handler: CarrierGossipHandler::new(gossip.clone()),
             gossip,
+            topic_joins: HashMap::new(),
+            closed: false,
             memory_lookup,
             signing_key,
             joined_topics: std::collections::HashSet::new(),
@@ -698,7 +791,19 @@ impl GossipState {
             topic_peers: Arc::new(Mutex::new(HashMap::new())),
             did,
             direct_only: false,
+            community_hub: false,
         }
+    }
+
+    /// Stops every topic for shutdown. Recovery that was waiting for this
+    /// state finds it closed and starts no new gossip actor.
+    fn close(&mut self) -> (Vec<tokio::task::JoinHandle<()>>, Gossip) {
+        self.closed = true;
+        self.senders.clear();
+        self.joined_topics.clear();
+        self.topic_joins.clear();
+        let tasks = self.receiver_tasks.drain().map(|(_, task)| task).collect();
+        (tasks, self.gossip.clone())
     }
 }
 
@@ -911,7 +1016,8 @@ async fn connect_ticket_endpoints(
     for addr in endpoints {
         match endpoint.connect(addr.clone(), iroh_gossip::ALPN).await {
             Ok(conn) => {
-                gossip.handle_connection(conn).await.ok();
+                let _ = tokio::time::timeout(GOSSIP_ACTOR_TIMEOUT, gossip.handle_connection(conn))
+                    .await;
                 let peer_id = addr.id.to_string();
                 connected.push(peer_id.clone());
                 let mut known = peers.lock().await;
@@ -1129,10 +1235,12 @@ fn is_trusted_source_runtime(data_dir: &std::path::Path) -> bool {
 async fn register_topic_state(
     state: &mut GossipState,
     topic_name: &str,
+    join: TopicJoin,
     sender: distributed_topic_tracker::GossipSender,
     receiver_task: tokio::task::JoinHandle<()>,
 ) {
     state.joined_topics.insert(topic_name.to_string());
+    state.topic_joins.insert(topic_name.to_string(), join);
     state.senders.insert(topic_name.to_string(), sender);
     if let Some(existing) = state
         .receiver_tasks
@@ -1141,6 +1249,67 @@ async fn register_topic_state(
         existing.abort();
         let _ = existing.await;
     }
+}
+
+/// Joins one recorded topic again on the current gossip actor. Its buffer and
+/// consumer cursors stay; its neighbours are relearned from the new join.
+async fn rejoin_topic(state: &mut GossipState, topic_name: &str, join: TopicJoin) -> Result<()> {
+    state.topic_peers.lock().await.remove(topic_name);
+    match join {
+        TopicJoin::Direct(peers) => join_gossip_topic_direct(state, topic_name, peers).await,
+        TopicJoin::Discovered => join_gossip_topic(state, topic_name, false).await,
+    }
+}
+
+/// Leaves one topic and joins it again with the peers it was joined with.
+/// Dropping the topic's only sender and receiver makes the actor quit it and
+/// send a fresh Join; a stalled actor needs `rebuild_carrier_gossip` instead.
+async fn leave_and_rejoin_topic(state: &mut GossipState, topic_name: &str) -> Result<()> {
+    anyhow::ensure!(!state.closed, "Carrier gossip is shut down");
+    let join = state
+        .topic_joins
+        .get(topic_name)
+        .cloned()
+        .context("gossip topic is not joined")?;
+    state.senders.remove(topic_name);
+    if let Some(task) = state.receiver_tasks.remove(topic_name) {
+        task.abort();
+        let _ = task.await;
+    }
+    rejoin_topic(state, topic_name, join).await
+}
+
+/// Replaces the gossip actor and joins every recorded topic on the new one.
+/// iroh-gossip 0.101 can hold a peer forever (a full per-peer send queue, or
+/// a peer left pending after a failed dial); only a new actor drops that.
+/// Returns how many topics joined again.
+async fn rebuild_carrier_gossip(state: &mut GossipState) -> Result<usize> {
+    anyhow::ensure!(!state.closed, "Carrier gossip is shut down");
+    // Leave first, so the old actor's Disconnects precede the new Joins.
+    let previous = state.gossip.clone();
+    if tokio::time::timeout(GOSSIP_ACTOR_TIMEOUT, previous.shutdown())
+        .await
+        .is_err()
+    {
+        warn!("carrier: gossip actor did not shut down for the rebuild; dropping it");
+    }
+    let replacement = spawn_carrier_gossip_for(&state.endpoint, state.community_hub);
+    state.gossip = replacement.clone();
+    drop(state.gossip_handler.replace(replacement));
+    drop(previous);
+    let topics = state
+        .topic_joins
+        .iter()
+        .map(|(topic, join)| (topic.clone(), join.clone()))
+        .collect::<Vec<_>>();
+    let mut rejoined = 0;
+    for (topic, join) in topics {
+        match rejoin_topic(state, &topic, join).await {
+            Ok(()) => rejoined += 1,
+            Err(err) => warn!("carrier: gossip rebuild could not rejoin '{topic}': {err:#}"),
+        }
+    }
+    Ok(rejoined)
 }
 
 async fn join_gossip_topic_direct(
@@ -1165,13 +1334,15 @@ async fn join_gossip_topic_direct(
             bootstrap_peers.len()
         );
     }
-    let joined = state
-        .gossip
-        .subscribe_with_opts(
+    let joined = tokio::time::timeout(
+        GOSSIP_SUBSCRIBE_TIMEOUT,
+        state.gossip.subscribe_with_opts(
             topic,
-            iroh_gossip::api::JoinOptions::with_bootstrap(bootstrap_peers),
-        )
-        .await?;
+            iroh_gossip::api::JoinOptions::with_bootstrap(bootstrap_peers.clone()),
+        ),
+    )
+    .await
+    .context("gossip subscription timed out")??;
     let (iroh_sender, iroh_receiver) = joined.split();
     let dtt_sender =
         distributed_topic_tracker::GossipSender::new(iroh_sender, TimeoutConfig::default());
@@ -1199,7 +1370,14 @@ async fn join_gossip_topic_direct(
         )
         .await;
     });
-    register_topic_state(state, topic_name, dtt_sender, receiver_task).await;
+    register_topic_state(
+        state,
+        topic_name,
+        TopicJoin::Direct(bootstrap_peers),
+        dtt_sender,
+        receiver_task,
+    )
+    .await;
     Ok(())
 }
 
@@ -1231,11 +1409,15 @@ async fn join_gossip_topic(
         topic_name,
         bootstrap_peers.len()
     );
-    let topic = state
-        .gossip
-        .subscribe_and_join_with_auto_discovery_no_wait(record_publisher)
-        .await?;
-    let (sender, receiver) = topic.split().await?;
+    let (sender, receiver) = tokio::time::timeout(GOSSIP_SUBSCRIBE_TIMEOUT, async {
+        let topic = state
+            .gossip
+            .subscribe_and_join_with_auto_discovery_no_wait(record_publisher)
+            .await?;
+        topic.split().await
+    })
+    .await
+    .context("gossip subscription timed out")??;
     state
         .buffers
         .lock()
@@ -1260,7 +1442,14 @@ async fn join_gossip_topic(
         )
         .await;
     });
-    register_topic_state(state, topic_name, sender, receiver_task).await;
+    register_topic_state(
+        state,
+        topic_name,
+        TopicJoin::Discovered,
+        sender,
+        receiver_task,
+    )
+    .await;
     Ok(())
 }
 
@@ -1742,7 +1931,7 @@ pub async fn start_carrier_node_with_registry(
     data_dir: PathBuf,
     provider_registry: Option<Weak<ProviderRegistry>>,
 ) -> Result<CarrierNode> {
-    start_carrier_node_with_registry_bound(signing_key, did, data_dir, provider_registry, None)
+    start_carrier_node_with_registry_bound(signing_key, did, data_dir, provider_registry, None, &[])
         .await
 }
 
@@ -1750,6 +1939,8 @@ pub async fn start_carrier_node_with_registry(
 ///
 /// `bind_addr` of `None` keeps the well-known [`DEFAULT_CARRIER_BIND_ADDR`]
 /// attempt. When supplied, the explicit address must bind successfully.
+/// `community_bootstrap_node_ids` are the verified Community profile's
+/// bootstrap peers; a node whose endpoint is one of them is the Community hub.
 /// Every caller shares this path, so the operator peer-store address
 /// book seeding and provider-invoke dispatch are identical for a runtime host
 /// and a standalone provider host.
@@ -1759,6 +1950,7 @@ pub async fn start_carrier_node_with_registry_bound(
     data_dir: PathBuf,
     provider_registry: Option<Weak<ProviderRegistry>>,
     bind_addr: Option<std::net::SocketAddr>,
+    community_bootstrap_node_ids: &[String],
 ) -> Result<CarrierNode> {
     let network =
         parse_elastos_carrier_network(std::env::var("ELASTOS_CARRIER_NETWORK").ok().as_deref())?;
@@ -1773,6 +1965,7 @@ pub async fn start_carrier_node_with_registry_bound(
         provider_registry,
         network,
         bind_addr,
+        community_bootstrap_node_ids,
     )
     .await
 }
@@ -1791,6 +1984,7 @@ pub(crate) async fn start_isolated_carrier_node_with_registry(
         provider_registry,
         CarrierNodeNetwork::Isolated,
         Some("0.0.0.0:0".parse()?),
+        &[],
     )
     .await
 }
@@ -1802,6 +1996,7 @@ async fn start_carrier_node_with_network(
     provider_registry: Option<Weak<ProviderRegistry>>,
     network: CarrierNodeNetwork,
     bind_addr: Option<std::net::SocketAddr>,
+    community_bootstrap_node_ids: &[String],
 ) -> Result<CarrierNode> {
     let expected_did = crate::crypto::encode_signing_key_did(signing_key);
     let decoded_did =
@@ -1853,20 +2048,29 @@ async fn start_carrier_node_with_network(
     let bootstrap_peers =
         seed_address_book_from_operator_peer_store(&memory_lookup, &data_dir, network);
 
-    let gossip = spawn_carrier_gossip(&endpoint);
-
+    // The Community watchdog uses the same rule to tell the seed from a Home.
+    let local_node_id = endpoint.id().to_string();
+    let community_hub = community_bootstrap_node_ids.contains(&local_node_id);
+    if community_hub {
+        info!(
+            active_view = COMMUNITY_HUB_ACTIVE_VIEW_CAPACITY,
+            "carrier: this node is a Community bootstrap node; gossip runs as the hub"
+        );
+    }
     let gossip_state = Arc::new(Mutex::new(GossipState::new(
         endpoint.clone(),
-        gossip.clone(),
+        spawn_carrier_gossip_for(&endpoint, community_hub),
         memory_lookup.clone(),
         Some(signing_key.clone()),
         Some(did.to_string()),
     )));
-    {
+    let gossip_handler = {
         let mut state = gossip_state.lock().await;
         state.bootstrap_peers = bootstrap_peers;
         state.direct_only = network == CarrierNodeNetwork::Isolated;
-    }
+        state.community_hub = community_hub;
+        state.gossip_handler.clone()
+    };
 
     let file_handler = FileHandler {
         data_dir: data_dir.clone(),
@@ -1883,7 +2087,7 @@ async fn start_carrier_node_with_network(
     let router = Router::builder(endpoint.clone())
         .accept(CARRIER_ALPN, file_handler)
         .accept(OPERATOR_ALPN, operator_handler)
-        .accept(iroh_gossip::ALPN, gossip.clone())
+        .accept(iroh_gossip::ALPN, gossip_handler)
         .spawn();
 
     let bound_port = endpoint
@@ -1944,7 +2148,6 @@ async fn start_carrier_node_with_network(
 
     Ok(CarrierNode {
         endpoint,
-        gossip,
         _router: router,
         gossip_state,
         memory_lookup,
@@ -7161,6 +7364,38 @@ impl CarrierGossipProvider {
     pub fn new(state: Arc<Mutex<GossipState>>) -> Self {
         Self { state }
     }
+
+    /// Runtime-only Community recovery (`gossip_rejoin`, `gossip_rebuild`);
+    /// capsule resources never name these operations. Each runs on its own
+    /// task, so a caller that stops waiting (shutdown, Community leave)
+    /// cannot leave a topic half joined, and starts within
+    /// `GOSSIP_RECOVERY_START_TIMEOUT` or not at all.
+    async fn recover_gossip(&self, rebuild: bool, topic: String) -> serde_json::Value {
+        let state = self.state.clone();
+        let recovery = tokio::spawn(async move {
+            let mut state = tokio::time::timeout(GOSSIP_RECOVERY_START_TIMEOUT, state.lock())
+                .await
+                .context("Carrier gossip is busy")?;
+            if rebuild {
+                rebuild_carrier_gossip(&mut state)
+                    .await
+                    .map(|topics| serde_json::json!({"status":"ok","data":{"topics": topics}}))
+            } else {
+                leave_and_rejoin_topic(&mut state, &topic)
+                    .await
+                    .map(|()| serde_json::json!({"status":"ok","data":{"topic": topic}}))
+            }
+        });
+        match recovery.await {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => serde_json::json!({
+                "status":"error","code":"recovery_failed","message": format!("{err:#}")
+            }),
+            Err(_) => serde_json::json!({
+                "status":"error","code":"recovery_failed","message":"gossip recovery stopped"
+            }),
+        }
+    }
 }
 
 impl std::fmt::Debug for CarrierGossipProvider {
@@ -7189,6 +7424,10 @@ impl Provider for CarrierGossipProvider {
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
         let op = request.get("op").and_then(|v| v.as_str()).unwrap_or("");
+        if matches!(op, "gossip_rejoin" | "gossip_rebuild") {
+            let topic = request["topic"].as_str().unwrap_or_default().to_string();
+            return Ok(self.recover_gossip(op == "gossip_rebuild", topic).await);
+        }
         let mut state = self.state.lock().await;
 
         match op {
@@ -7266,6 +7505,7 @@ impl Provider for CarrierGossipProvider {
                 let removed_sender = state.senders.remove(topic_name);
                 let removed_task = state.receiver_tasks.remove(topic_name);
                 let was_joined = state.joined_topics.remove(topic_name);
+                state.topic_joins.remove(topic_name);
                 if removed_sender.is_none() && removed_task.is_none() && !was_joined {
                     return Ok(
                         serde_json::json!({"status":"error","code":"not_joined","message":"not joined"}),
@@ -7796,6 +8036,34 @@ impl Provider for CarrierGossipProvider {
                 Ok(serde_json::json!({"status":"ok","data":{"topic": topic_name, "peers": peers}}))
             }
 
+            // Runtime-only, like `gossip_peek`: capsule resources never name it.
+            "gossip_topic_health" => {
+                let topic_name = request["topic"].as_str().unwrap_or_default();
+                if !state.joined_topics.contains(topic_name) {
+                    return Ok(gossip_cursor_error(
+                        "not_joined",
+                        "gossip topic is not joined",
+                    ));
+                }
+                let peer_count = state
+                    .topic_peers
+                    .lock()
+                    .await
+                    .get(topic_name)
+                    .map_or(0, HashSet::len);
+                let received_frames = state
+                    .buffers
+                    .lock()
+                    .await
+                    .get(topic_name)
+                    .map_or(0, |buffer| buffer.remote_frames);
+                Ok(serde_json::json!({"status":"ok","data":{
+                    "topic": topic_name,
+                    "peer_count": peer_count,
+                    "received_frames": received_frames,
+                }}))
+            }
+
             "gossip_join_peers" => {
                 let topic_name = request["topic"].as_str().unwrap_or_default();
                 if topic_name.is_empty() {
@@ -7932,18 +8200,17 @@ async fn handle_gossip_event(
 ) {
     match event {
         iroh_gossip::api::Event::Received(msg) => {
-            if msg.content.len() > GOSSIP_WIRE_MESSAGE_MAX_BYTES {
-                return;
-            }
-            let Ok(gossip_msg) = serde_json::from_slice::<GossipMessage>(&msg.content) else {
-                return;
-            };
-            if serialize_gossip_wire_message(&gossip_msg).is_err() {
-                return;
-            }
+            // Any frame from a peer proves the link; only well-formed ones are kept.
+            let gossip_msg = (msg.content.len() <= GOSSIP_WIRE_MESSAGE_MAX_BYTES)
+                .then(|| serde_json::from_slice::<GossipMessage>(&msg.content).ok())
+                .flatten()
+                .filter(|message| serialize_gossip_wire_message(message).is_ok());
             let mut bufs = buffers.lock().await;
             if let Some(buf) = bufs.get_mut(topic) {
-                push_gossip_buffer_message(buf, gossip_msg);
+                buf.remote_frames = buf.remote_frames.wrapping_add(1);
+                if let Some(gossip_msg) = gossip_msg {
+                    push_gossip_buffer_message(buf, gossip_msg);
+                }
             }
         }
         iroh_gossip::api::Event::NeighborUp(peer) => {
@@ -9344,6 +9611,7 @@ pub(crate) mod tests {
             messages,
             base_index,
             retained_bytes,
+            remote_frames: 0,
         }
     }
 
@@ -9357,6 +9625,7 @@ pub(crate) mod tests {
             messages,
             base_index,
             retained_bytes,
+            remote_frames: 0,
         }
     }
 
@@ -9371,22 +9640,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn shutdown_test_carrier_node(node: CarrierNode) {
-        let tasks = {
-            let mut state = node.gossip_state.lock().await;
-            let tasks = state
-                .receiver_tasks
-                .drain()
-                .map(|(_, task)| task)
-                .collect::<Vec<_>>();
-            state.senders.clear();
-            state.joined_topics.clear();
-            tasks
-        };
+        let (tasks, gossip) = node.gossip_state.lock().await.close();
         for task in tasks {
             task.abort();
             let _ = task.await;
         }
-        tokio::time::timeout(Duration::from_secs(5), node.gossip.shutdown())
+        tokio::time::timeout(Duration::from_secs(5), gossip.shutdown())
             .await
             .expect("test gossip shutdown timed out")
             .expect("test gossip shutdown failed");
@@ -17975,6 +18234,7 @@ pub(crate) mod tests {
             dir.path().to_path_buf(),
             None,
             Some(address),
+            &[],
         )
         .await;
         match result {
@@ -18067,10 +18327,11 @@ pub(crate) mod tests {
         node2.memory_lookup.add_endpoint_info(addr1.clone());
 
         let topic = topic_hash("#test");
+        let gossip1 = node1.gossip_state.lock().await.gossip.clone();
+        let gossip2 = node2.gossip_state.lock().await.gossip.clone();
 
         // node1 subscribes (no peers yet)
-        let topic1 = node1
-            .gossip
+        let topic1 = gossip1
             .subscribe_with_opts(topic, iroh_gossip::api::JoinOptions::with_bootstrap(vec![]))
             .await
             .unwrap();
@@ -18080,7 +18341,7 @@ pub(crate) mod tests {
         let peer1_id: iroh::EndpointId = addr1.id;
         let topic2 = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            node2.gossip.subscribe_and_join(topic, vec![peer1_id]),
+            gossip2.subscribe_and_join(topic, vec![peer1_id]),
         )
         .await
         .unwrap()
@@ -18136,14 +18397,8 @@ pub(crate) mod tests {
             "near-maximum collaboration transport frame must exceed iroh's old 4 KiB default"
         );
         assert!(near_max_bytes.len() <= GOSSIP_WIRE_MESSAGE_MAX_BYTES);
-        assert_eq!(
-            node1.gossip.max_message_size(),
-            GOSSIP_WIRE_MESSAGE_MAX_BYTES
-        );
-        assert_eq!(
-            node2.gossip.max_message_size(),
-            GOSSIP_WIRE_MESSAGE_MAX_BYTES
-        );
+        assert_eq!(gossip1.max_message_size(), GOSSIP_WIRE_MESSAGE_MAX_BYTES);
+        assert_eq!(gossip2.max_message_size(), GOSSIP_WIRE_MESSAGE_MAX_BYTES);
         sender2
             .broadcast(near_max_bytes.clone().into())
             .await
@@ -18248,6 +18503,136 @@ pub(crate) mod tests {
         shutdown_test_carrier_node(node1).await;
         shutdown_test_carrier_node(node2).await;
         panic!("provider gossip bootstrap sequence did not deliver marker");
+    }
+
+    async fn remote_frames(provider: &CarrierGossipProvider, topic: &str) -> u64 {
+        let health = provider
+            .send_raw(&serde_json::json!({"op": "gossip_topic_health", "topic": topic}))
+            .await
+            .unwrap();
+        assert_eq!(health["status"], "ok", "{health}");
+        health["data"]["received_frames"].as_u64().unwrap()
+    }
+
+    /// Sends until the receiver counts a frame beyond `after`.
+    async fn frames_flow(
+        sender: &CarrierGossipProvider,
+        receiver: &CarrierGossipProvider,
+        topic: &str,
+        after: u64,
+    ) -> bool {
+        for attempt in 0..40 {
+            sender
+                .send_raw(&serde_json::json!({
+                    "op": "gossip_send",
+                    "topic": topic,
+                    "message": format!("community link frame {attempt}"),
+                }))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if remote_frames(receiver, topic).await > after {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn test_community_gossip_rejoin_and_rebuild_keep_frames_flowing() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let (sk1, did1) = elastos_identity::derive_did(&[41u8; 32]);
+        let (sk2, did2) = elastos_identity::derive_did(&[42u8; 32]);
+        let node1 = start_carrier_node(&sk1, &did1, dir1.path().to_path_buf())
+            .await
+            .unwrap();
+        let node2 = start_carrier_node(&sk2, &did2, dir2.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider1 = CarrierGossipProvider::new(node1.gossip_state.clone());
+        let provider2 = CarrierGossipProvider::new(node2.gossip_state.clone());
+        let topic = "__test/community-link-recovery";
+        let joined = provider1
+            .send_raw(&serde_json::json!({"op": "gossip_join_exact", "topic": topic, "peers": []}))
+            .await
+            .unwrap();
+        assert_eq!(joined["status"], "ok");
+        let ticket = provider1
+            .send_raw(&serde_json::json!({"op": "get_ticket"}))
+            .await
+            .unwrap()["data"]["ticket"]
+            .clone();
+        let remembered = provider2
+            .send_raw(&serde_json::json!({"op": "remember_peer", "ticket": ticket}))
+            .await
+            .unwrap();
+        let joined = provider2
+            .send_raw(&serde_json::json!({
+                "op": "gossip_join_exact",
+                "topic": topic,
+                "peers": remembered["data"]["added"],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(joined["status"], "ok");
+        assert!(frames_flow(&provider1, &provider2, topic, 0).await);
+
+        let before = remote_frames(&provider2, topic).await;
+        let rejoined = provider2
+            .send_raw(&serde_json::json!({"op": "gossip_rejoin", "topic": topic}))
+            .await
+            .unwrap();
+        assert_eq!(
+            rejoined,
+            serde_json::json!({"status": "ok", "data": {"topic": topic}})
+        );
+        assert!(
+            frames_flow(&provider1, &provider2, topic, before).await,
+            "frames flow after the topic rejoin"
+        );
+
+        let before = remote_frames(&provider2, topic).await;
+        let rebuilt = provider2
+            .send_raw(&serde_json::json!({"op": "gossip_rebuild"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            rebuilt,
+            serde_json::json!({"status": "ok", "data": {"topics": 1}})
+        );
+        assert!(
+            frames_flow(&provider1, &provider2, topic, before).await,
+            "frames reach the rebuilt actor"
+        );
+        let before = remote_frames(&provider1, topic).await;
+        assert!(
+            frames_flow(&provider2, &provider1, topic, before).await,
+            "frames leave the rebuilt actor"
+        );
+
+        // A recovery that cannot take the gossip state gives up instead of
+        // running later, right after another one.
+        let held = node2.gossip_state.lock().await;
+        let busy = provider2
+            .send_raw(&serde_json::json!({"op": "gossip_rebuild"}))
+            .await
+            .unwrap();
+        drop(held);
+        assert_eq!(busy["code"], "recovery_failed", "{busy}");
+        let before = remote_frames(&provider2, topic).await;
+        assert!(
+            frames_flow(&provider1, &provider2, topic, before).await,
+            "a refused recovery leaves the link alone"
+        );
+
+        shutdown_test_carrier_node(node2).await;
+        let after_shutdown = provider2
+            .send_raw(&serde_json::json!({"op": "gossip_rebuild"}))
+            .await
+            .unwrap();
+        assert_eq!(after_shutdown["status"], "error");
+        shutdown_test_carrier_node(node1).await;
     }
 
     #[tokio::test]
@@ -19447,5 +19832,243 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(5), shutdown_test_carrier_node(node))
             .await
             .expect("direct Carrier shutdown deadline");
+    }
+
+    /// iroh-gossip's own membership state machine on a deterministic
+    /// in-memory network: Homes sit behind NAT and reach only the hub (the
+    /// seed's Community node), except Homes on one LAN, which also reach
+    /// each other. A send to an unreachable node fails like a failed dial.
+    mod community_hub_membership {
+        use super::super::carrier_gossip_membership;
+        use gossip_rand::{rngs::StdRng, SeedableRng};
+        use iroh_gossip::proto::{
+            self, topic, Command, InEvent, OutEvent, PeerData, Scope, State, TopicId,
+        };
+        use std::collections::{BTreeMap, BTreeSet, VecDeque};
+        use tokio::time::{Duration, Instant};
+
+        const HUB: u64 = 0;
+        const HOMES: u64 = 8;
+        const MAX_EVENTS: usize = 2_000_000;
+
+        struct Network {
+            hub_membership: bool,
+            lan: Vec<(u64, u64)>,
+            topic: TopicId,
+            nodes: BTreeMap<u64, (u64, State<u64, StdRng>)>,
+            queue: VecDeque<(u64, InEvent<u64>)>,
+            timers: Vec<(Instant, u64, u64, proto::Timer<u64>)>,
+            now: Instant,
+            events: usize,
+            neighbours: BTreeMap<u64, BTreeSet<u64>>,
+            leaving: Option<u64>,
+            /// `(when, home)`: a Home's last neighbour went down.
+            isolated: Vec<(&'static str, u64)>,
+            phase: &'static str,
+            received: BTreeSet<u64>,
+        }
+
+        impl Network {
+            fn new(hub_membership: bool, lan: &[(u64, u64)]) -> Self {
+                Self {
+                    hub_membership,
+                    lan: lan.to_vec(),
+                    topic: TopicId::from_bytes([7; 32]),
+                    nodes: BTreeMap::new(),
+                    queue: VecDeque::new(),
+                    timers: Vec::new(),
+                    now: Instant::now(),
+                    events: 0,
+                    neighbours: BTreeMap::new(),
+                    leaving: None,
+                    isolated: Vec::new(),
+                    phase: "join",
+                    received: BTreeSet::new(),
+                }
+            }
+
+            fn reachable(&self, a: u64, b: u64) -> bool {
+                a == HUB || b == HUB || self.lan.contains(&(a.min(b), a.max(b)))
+            }
+
+            /// Starts (or restarts) `id` and joins the topic through the hub.
+            fn start(&mut self, id: u64) {
+                let generation = self.nodes.get(&id).map_or(0, |(g, _)| g + 1);
+                if self.nodes.contains_key(&id) {
+                    // The old process is gone: its connections close.
+                    for peer in self.neighbours.remove(&id).unwrap_or_default() {
+                        self.queue.push_back((peer, InEvent::PeerDisconnected(id)));
+                    }
+                }
+                let config = proto::Config {
+                    membership: carrier_gossip_membership(id == HUB && self.hub_membership),
+                    ..Default::default()
+                };
+                let rng = StdRng::seed_from_u64(id * 1_000 + generation);
+                let state = State::new(id, PeerData::default(), config, rng);
+                self.nodes.insert(id, (generation, state));
+                let bootstrap = if id == HUB { Vec::new() } else { vec![HUB] };
+                self.queue
+                    .push_back((id, InEvent::Command(self.topic, Command::Join(bootstrap))));
+            }
+
+            /// Carrier's topic rejoin: leave, then join through the hub again.
+            fn rejoin(&mut self, id: u64) {
+                self.leaving = Some(id);
+                self.queue
+                    .push_back((id, InEvent::Command(self.topic, Command::Quit)));
+                self.run_for(Duration::from_secs(1));
+                self.leaving = None;
+                self.neighbours.remove(&id);
+                self.queue
+                    .push_back((id, InEvent::Command(self.topic, Command::Join(vec![HUB]))));
+            }
+
+            fn broadcast_from(&mut self, id: u64) {
+                self.received.clear();
+                self.queue.push_back((
+                    id,
+                    InEvent::Command(
+                        self.topic,
+                        Command::Broadcast(b"community".to_vec().into(), Scope::Swarm),
+                    ),
+                ));
+            }
+
+            fn handle(&mut self, node: u64, event: InEvent<u64>) {
+                self.events += 1;
+                assert!(self.events < MAX_EVENTS, "the membership never settled");
+                let now = self.now;
+                let Some((generation, state)) = self.nodes.get_mut(&node) else {
+                    return;
+                };
+                let generation = *generation;
+                let out: Vec<_> = state.handle(event, now, None).collect();
+                for event in out {
+                    match event {
+                        OutEvent::SendMessage(to, message) => {
+                            if self.reachable(node, to) && self.nodes.contains_key(&to) {
+                                self.queue
+                                    .push_back((to, InEvent::RecvMessage(node, message)));
+                            } else {
+                                self.queue.push_back((node, InEvent::PeerDisconnected(to)));
+                            }
+                        }
+                        OutEvent::EmitEvent(_, topic::Event::NeighborUp(peer)) => {
+                            self.neighbours.entry(node).or_default().insert(peer);
+                        }
+                        OutEvent::EmitEvent(_, topic::Event::NeighborDown(peer)) => {
+                            let left = self.neighbours.entry(node).or_default();
+                            left.remove(&peer);
+                            if left.is_empty() && node != HUB && self.leaving != Some(node) {
+                                self.isolated.push((self.phase, node));
+                            }
+                        }
+                        OutEvent::EmitEvent(_, topic::Event::Received(_)) => {
+                            self.received.insert(node);
+                        }
+                        OutEvent::ScheduleTimer(after, timer) => {
+                            self.timers.push((now + after, node, generation, timer));
+                        }
+                        OutEvent::DisconnectPeer(peer) => {
+                            self.queue
+                                .push_back((peer, InEvent::PeerDisconnected(node)));
+                        }
+                        OutEvent::PeerData(..) => {}
+                    }
+                }
+            }
+
+            fn run_for(&mut self, duration: Duration) {
+                let until = self.now + duration;
+                loop {
+                    while let Some((node, event)) = self.queue.pop_front() {
+                        self.handle(node, event);
+                    }
+                    let next = self
+                        .timers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (at, ..))| *at <= until)
+                        .min_by_key(|(_, (at, ..))| *at)
+                        .map(|(index, _)| index);
+                    let Some(index) = next else { break };
+                    let (at, node, generation, timer) = self.timers.swap_remove(index);
+                    self.now = self.now.max(at);
+                    if self.nodes.get(&node).is_some_and(|(g, _)| *g == generation) {
+                        self.handle(node, InEvent::TimerExpired(timer));
+                    }
+                }
+                self.now = until;
+            }
+        }
+
+        /// A hub and 8 Homes join one after another; then one Home restarts,
+        /// one rejoins, and the hub broadcasts. Returns the network after it.
+        fn community(hub_membership: bool, lan: &[(u64, u64)]) -> Network {
+            let mut network = Network::new(hub_membership, lan);
+            network.start(HUB);
+            network.run_for(Duration::from_secs(1));
+            for home in 1..=HOMES {
+                network.start(home);
+                network.run_for(Duration::from_secs(5));
+            }
+            network.run_for(Duration::from_secs(180));
+            network.phase = "restart";
+            network.start(3);
+            network.run_for(Duration::from_secs(180));
+            network.phase = "rejoin";
+            network.rejoin(5);
+            network.run_for(Duration::from_secs(180));
+            network.broadcast_from(HUB);
+            network.run_for(Duration::from_secs(30));
+            network
+        }
+
+        fn assert_every_home_keeps_the_hub(network: &Network) {
+            assert_eq!(network.isolated, [], "no Home may lose its only neighbour");
+            for home in 1..=HOMES {
+                assert!(
+                    network
+                        .neighbours
+                        .get(&home)
+                        .is_some_and(|n| n.contains(&HUB)),
+                    "Home {home} keeps the hub as a neighbour: {:?}",
+                    network.neighbours.get(&home)
+                );
+            }
+            let homes: BTreeSet<u64> = (1..=HOMES).collect();
+            assert_eq!(
+                network.received, homes,
+                "a hub broadcast reaches all 8 Homes"
+            );
+        }
+
+        #[test]
+        fn default_membership_cuts_homes_off_a_hub_with_more_than_five() {
+            let network = community(false, &[]);
+            // Homes 6..8 already evict earlier ones while joining, and the
+            // restart of Home 3 evicts another.
+            let phases: BTreeSet<&str> = network.isolated.iter().map(|(p, _)| *p).collect();
+            assert!(
+                phases.contains("join") && phases.contains("restart"),
+                "iroh-gossip's default 5 active neighbours evict Homes from the hub: {:?}",
+                network.isolated
+            );
+            assert!(network.neighbours[&HUB].len() <= 5);
+        }
+
+        #[test]
+        fn hub_membership_keeps_every_home_through_joins_restarts_and_rejoins() {
+            let network = community(true, &[]);
+            assert_every_home_keeps_the_hub(&network);
+            assert_eq!(network.neighbours[&HUB].len(), HOMES as usize);
+        }
+
+        #[test]
+        fn homes_on_one_lan_keep_default_membership_and_still_reach_everyone() {
+            let network = community(true, &[(1, 2), (3, 4), (6, 7)]);
+            assert_every_home_keeps_the_hub(&network);
+        }
     }
 }

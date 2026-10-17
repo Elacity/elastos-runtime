@@ -13,7 +13,10 @@ use elastos_runtime::signature::SigningKey;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::collaboration_carrier::join_collaboration_network;
+use crate::collaboration_carrier::{
+    join_collaboration_network, CommunityLink, CommunityLinkStep, CommunityLinkWatchdog,
+    COMMUNITY_LINK_SILENCE,
+};
 use crate::collaboration_core::CollaborationCore;
 use crate::collaboration_default_conversation::MAX_DEFAULT_CONVERSATION_GRANT_BYTES;
 use crate::collaboration_discovery_runtime::CollaborationDiscoveryService;
@@ -36,6 +39,10 @@ pub(crate) const MAX_STARTUP_CONFIG_BYTES: usize = 3 * 1024 * 1024;
 const COLLABORATION_WORKER_CADENCE: Duration = Duration::from_secs(5);
 const COLLABORATION_LIVE_CADENCE: Duration = Duration::from_millis(500);
 const COLLABORATION_BOOTSTRAP_CADENCE: Duration = Duration::from_secs(1);
+const COMMUNITY_LINK_WATCHDOG_CADENCE: Duration = Duration::from_secs(5);
+const COMMUNITY_LINK_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// A rebuild leaves the old actor (2 s) and joins each topic (5 s each).
+const COMMUNITY_LINK_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 const COLLABORATION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNTIME_OWNED_PRESENCE_CADENCE: Duration = Duration::from_secs(15);
 const MAX_COLLABORATION_DIAGNOSTIC_CHARS: usize = 160;
@@ -65,6 +72,23 @@ impl ValidatedCollaborationStartupConfiguration {
 /// profile, grant, topology, or trust roots between loading and construction.
 pub struct CollaborationStartupConfiguration {
     configuration: CollaborationNetworkConfiguration,
+}
+
+impl CollaborationStartupConfiguration {
+    /// Node ids of the verified Community profile's bootstrap peers; empty
+    /// when this Home is isolated. Carrier runs as the Community hub when its
+    /// own endpoint is one of them.
+    pub fn community_bootstrap_node_ids(&self) -> Vec<String> {
+        match &self.configuration {
+            CollaborationNetworkConfiguration::Isolated => Vec::new(),
+            CollaborationNetworkConfiguration::Configured { profile, .. } => profile
+                .profile()
+                .bootstrap_peers
+                .iter()
+                .map(|peer| peer.node_id.clone())
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +259,7 @@ pub async fn start_collaboration_runtime_service(
     configuration: CollaborationStartupConfiguration,
     carrier: Option<Arc<dyn Provider>>,
     provider_registry: Arc<elastos_runtime::provider::ProviderRegistry>,
+    capability_manager: Option<Arc<elastos_runtime::capability::CapabilityManager>>,
 ) -> anyhow::Result<Option<CollaborationRuntimeService>> {
     let CollaborationNetworkConfiguration::Configured {
         profile,
@@ -262,7 +287,10 @@ pub async fn start_collaboration_runtime_service(
     .await?
     .with_community_membership(core.community_membership().clone());
     let product_port = CollaborationChatProductPort::new(core.clone())?;
-    let presence_port = CollaborationPresenceProductPort::new(core.clone())?;
+    // The Runtime's own capability manager: the presence grant is a token it
+    // mints for the deciding person and validates on every announcement.
+    let presence_port = CollaborationPresenceProductPort::new(core.clone())?
+        .with_capability_manager(capability_manager);
     let history_service = CollaborationHistoryService::new(
         product_port.clone(),
         presence_port.clone(),
@@ -297,7 +325,6 @@ pub async fn start_collaboration_runtime_service(
     let presence_task = tokio::spawn(run_runtime_owned_presence_worker(
         data_root.to_path_buf(),
         presence_port.clone(),
-        discovery_service.clone(),
         presence_shutdown_rx,
     ));
     let history_task = tokio::spawn(run_collaboration_history_worker(
@@ -464,7 +491,8 @@ async fn run_collaboration_worker(
             COLLABORATION_LIVE_CADENCE,
             || async {
                 let now = now_secs();
-                project_collaboration_outgoing(&product_port, &presence_port, &data_root, now);
+                project_collaboration_outgoing(&product_port, &presence_port, &data_root, now)
+                    .await;
                 if driver.retry_outgoing_once(now).await.is_err() {
                     tracing::warn!("collaboration outgoing retry cycle failed");
                 }
@@ -497,11 +525,12 @@ async fn run_collaboration_worker(
                     &presence_port,
                     &data_root,
                     now_secs(),
-                );
+                )
+                .await;
             }
         ),
         run_community_periodic(
-            shutdown,
+            shutdown.clone(),
             membership.subscribe(),
             COLLABORATION_BOOTSTRAP_CADENCE,
             || async {
@@ -510,7 +539,106 @@ async fn run_collaboration_worker(
                 }
             }
         ),
+        run_community_link_watchdog(shutdown, membership.subscribe(), driver.community_link()),
     );
+}
+
+/// Repairs a joined Home's Community link when it keeps no peer, whatever
+/// stalled it. The missing-peer rejoin above cannot clear a gossip actor
+/// that holds the bootstrap peer pending or no longer sends.
+async fn run_community_link_watchdog<L: CommunityLink>(
+    shutdown: watch::Receiver<bool>,
+    joined: watch::Receiver<bool>,
+    link: &L,
+) {
+    let watchdog = std::sync::Mutex::new(CommunityLinkWatchdog::new(COMMUNITY_LINK_SILENCE));
+    let recovers = tokio::sync::OnceCell::<bool>::new();
+    run_community_periodic(
+        shutdown,
+        joined,
+        COMMUNITY_LINK_WATCHDOG_CADENCE,
+        || async {
+            let recovers = recovers
+                .get_or_try_init(|| async {
+                    let recovers = tokio::time::timeout(
+                        COMMUNITY_LINK_HEALTH_TIMEOUT,
+                        link.recovers_its_link(),
+                    )
+                    .await
+                    .map_err(|_| ())?
+                    .map_err(|_| ())?;
+                    if !recovers {
+                        tracing::info!(
+                        "Community link watchdog is off: this Runtime is a Community bootstrap node"
+                    );
+                    }
+                    Ok::<_, ()>(recovers)
+                })
+                .await;
+            if recovers != Ok(&true) {
+                return;
+            }
+            let health = tokio::time::timeout(COMMUNITY_LINK_HEALTH_TIMEOUT, link.link_health())
+                .await
+                .ok()
+                .and_then(Result::ok);
+            // Frames that trickle in without a peer are shown, never trusted.
+            let received_frames = health.map(|health| health.received_frames);
+            let step = watchdog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe(health, tokio::time::Instant::now());
+            let Some(step) = step else {
+                return;
+            };
+            let silence_secs = COMMUNITY_LINK_SILENCE.as_secs();
+            let reason = "no Community peer";
+            let diagnostic = |err: anyhow::Error| {
+                bounded_one_line_diagnostic(&format!("{err:#}"), MAX_COLLABORATION_DIAGNOSTIC_CHARS)
+            };
+            match step {
+                CommunityLinkStep::Rejoin => {
+                    tracing::info!(
+                        reason,
+                        received_frames,
+                        silence_secs,
+                        "Community link looks dead; leaving and rejoining the Community topic"
+                    );
+                    match tokio::time::timeout(COMMUNITY_LINK_STEP_TIMEOUT, link.rejoin()).await {
+                        Ok(Ok(())) => tracing::info!("Community topic rejoined"),
+                        Ok(Err(err)) => tracing::warn!(
+                            diagnostic = %diagnostic(err),
+                            "Community topic rejoin failed"
+                        ),
+                        Err(_) => tracing::warn!("Community topic rejoin timed out"),
+                    }
+                }
+                CommunityLinkStep::Rebuild => {
+                    tracing::info!(
+                        reason,
+                        received_frames,
+                        silence_secs,
+                        "Community link still dead after a rejoin; rebuilding Carrier gossip"
+                    );
+                    match tokio::time::timeout(COMMUNITY_LINK_STEP_TIMEOUT, link.rebuild_gossip())
+                        .await
+                    {
+                        Ok(Ok(topics)) => tracing::info!(topics, "Carrier gossip rebuilt"),
+                        Ok(Err(err)) => tracing::warn!(
+                            diagnostic = %diagnostic(err),
+                            "Carrier gossip rebuild failed"
+                        ),
+                        Err(_) => tracing::warn!("Carrier gossip rebuild timed out"),
+                    }
+                }
+            }
+            watchdog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .step_finished(tokio::time::Instant::now());
+        },
+    )
+    .await;
 }
 
 /// Cancels a pending Community cycle when its Home leaves. Direct has its own
@@ -616,7 +744,6 @@ pub(crate) async fn run_collaboration_discovery_sync_worker(
 async fn run_runtime_owned_presence_worker(
     data_root: PathBuf,
     presence_port: CollaborationPresenceProductPort,
-    discovery_service: CollaborationDiscoveryService,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
@@ -636,9 +763,10 @@ async fn run_runtime_owned_presence_worker(
         if let Err(err) = crate::api::gateway::publish_runtime_owned_presence(
             &data_root,
             &presence_port,
-            Some(&discovery_service),
             now_secs(),
-        ) {
+        )
+        .await
+        {
             tracing::debug!(error = %err, "runtime presence refresh failed");
         }
     }
@@ -679,7 +807,7 @@ async fn run_collaboration_history_worker(
     }
 }
 
-fn project_collaboration_outgoing(
+async fn project_collaboration_outgoing(
     product_port: &CollaborationChatProductPort,
     presence_port: &CollaborationPresenceProductPort,
     data_root: &Path,
@@ -704,7 +832,10 @@ fn project_collaboration_outgoing(
     match presence_port.pending_outgoing_presences(now) {
         Ok(presences) => {
             for presence in &presences {
-                if let Err(err) = presence_port.project_prepared_presence(presence, now) {
+                if let Err(err) = presence_port
+                    .project_authorized_presence(presence, now)
+                    .await
+                {
                     tracing::warn!(
                         diagnostic = %bounded_presence_projection_diagnostic(&err),
                         "collaboration presence outgoing projection cycle failed"
@@ -719,7 +850,7 @@ fn project_collaboration_outgoing(
     }
 }
 
-fn project_collaboration_handoffs(
+async fn project_collaboration_handoffs(
     product_port: &CollaborationChatProductPort,
     presence_port: &CollaborationPresenceProductPort,
     data_root: &Path,
@@ -747,7 +878,11 @@ fn project_collaboration_handoffs(
     match presence_port.pending_presences() {
         Ok(handoffs) => {
             for handoff in &handoffs {
-                if presence_port.project_handoff(handoff, now).is_err() {
+                if presence_port
+                    .project_authorized_handoff(handoff, now)
+                    .await
+                    .is_err()
+                {
                     tracing::warn!("collaboration presence projection cycle failed");
                 }
             }
@@ -764,14 +899,14 @@ async fn run_collaboration_worker_cycle_with_presence(
     data_root: &Path,
     now: u64,
 ) {
-    project_collaboration_outgoing(product_port, presence_port, data_root, now);
+    project_collaboration_outgoing(product_port, presence_port, data_root, now).await;
     if driver.retry_outgoing_once(now).await.is_err() {
         tracing::warn!("collaboration outgoing retry cycle failed");
     }
     if driver.process_incoming_once(now).await.is_err() {
         tracing::warn!("collaboration incoming cycle failed");
     }
-    project_collaboration_handoffs(product_port, presence_port, data_root, now);
+    project_collaboration_handoffs(product_port, presence_port, data_root, now).await;
 }
 
 #[cfg(test)]
@@ -917,7 +1052,7 @@ mod tests {
     use elastos_runtime::signature::{generate_keypair, SigningKey};
     use sha2::{Digest, Sha256};
 
-    use crate::collaboration_carrier::join_collaboration_network;
+    use crate::collaboration_carrier::CommunityLinkHealth;
     use crate::collaboration_core::{CollaborationCore, WriteFault};
     use crate::collaboration_default_conversation::{
         canonical_default_conversation_grant_bytes, DefaultConversationAdmissionPolicy,
@@ -978,6 +1113,56 @@ mod tests {
             vec![crate::crypto::encode_signing_key_did(endpoint_key)],
         )
         .unwrap()
+    }
+
+    async fn grant_local_presence(
+        data_dir: &Path,
+        port: &CollaborationPresenceProductPort,
+        principal: &str,
+        now: u64,
+    ) -> (
+        crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+        crate::collaboration_presence_grant::GrantedPresence,
+    ) {
+        use crate::collaboration_presence_grant::{
+            set_presence_grant, store_test_profile, PresenceDecision,
+        };
+        crate::auth::store_test_principal_root_protection(data_dir, principal);
+        let (key, _) = generate_keypair();
+        let profile = crate::collaboration_profile_authority::signed_profile_document_for_test(
+            &key,
+            "Local",
+            None,
+            1,
+            None,
+            now,
+            vec![port.test_core().local_device_did()],
+        )
+        .unwrap();
+        store_test_profile(data_dir, principal, &key, &profile);
+        set_presence_grant(
+            port.presence_authority().unwrap(),
+            data_dir,
+            principal,
+            &profile.document().profile_did,
+            &port.presence_scope(),
+            PresenceDecision::Always,
+            now,
+        )
+        .await
+        .unwrap();
+        let grant = crate::collaboration_presence_grant::presence_grant(
+            port.presence_authority().unwrap(),
+            data_dir,
+            principal,
+            &profile.document().profile_did,
+            &port.presence_scope(),
+            crate::collaboration_presence_grant::PresencePublisher::Runtime,
+            now,
+        )
+        .await
+        .unwrap();
+        (profile, grant)
     }
 
     struct ConfigMaterial {
@@ -1192,7 +1377,14 @@ mod tests {
     }
 
     fn configured_root(with_grant: bool) -> (tempfile::TempDir, ConfigMaterial) {
-        let temp = tempfile::tempdir().unwrap();
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let temp = builder.tempdir().unwrap();
+        crate::collaboration_core::ensure_owner_only_directory(temp.path()).unwrap();
         let material = config_material(with_grant);
         write_config(
             temp.path(),
@@ -1390,6 +1582,7 @@ mod tests {
             isolated,
             None,
             Arc::new(ProviderRegistry::new()),
+            None,
         )
         .await
         .unwrap()
@@ -1405,6 +1598,7 @@ mod tests {
             configuration,
             None,
             Arc::new(ProviderRegistry::new()),
+            None,
         )
         .await
         .unwrap();
@@ -1426,12 +1620,14 @@ mod tests {
         carrier.push_for("gossip_send", [send_remote()]);
         carrier.push_for("gossip_peek", [peek(0, 0, Vec::new())]);
         carrier.push_for("gossip_ack", [ack(0, 0, false)]);
+        let presence_authority = crate::collaboration_presence_grant::test_authority();
         let mut service = start_collaboration_runtime_service(
             temp.path(),
             device_key,
             configuration,
             Some(carrier.clone()),
             Arc::new(ProviderRegistry::new()),
+            Some(presence_authority.manager().clone()),
         )
         .await
         .unwrap()
@@ -1489,9 +1685,13 @@ mod tests {
         ));
 
         let now = now_secs();
-        let person_profile = service
-            .chat_product_port()
-            .test_person_profile("Local", None);
+        let (person_profile, presence_grant) = grant_local_presence(
+            temp.path(),
+            &service_presence_port,
+            "runtime-principal",
+            now,
+        )
+        .await;
         let binding = chat_message_request_binding(
             "startup-product-request",
             "runtime-principal",
@@ -1514,7 +1714,7 @@ mod tests {
         let presence = service_presence_port
             .prepare_presence(
                 presence_request_binding(
-                    "startup-presence-request",
+                    &presence_grant.bind_request_id("startup-presence-request"),
                     "runtime-principal",
                     &person_profile,
                 )
@@ -1618,7 +1818,9 @@ mod tests {
             .unwrap(),
         );
         let chat_port = CollaborationChatProductPort::new(core.clone()).unwrap();
-        let presence_port = CollaborationPresenceProductPort::new(core.clone()).unwrap();
+        let presence_port = CollaborationPresenceProductPort::new(core.clone())
+            .unwrap()
+            .with_presence_authority(crate::collaboration_presence_grant::test_authority());
         let gateway_state = crate::api::gateway::GatewayState {
             provider_registry: None,
             collaboration_chat_product_port: Some(chat_port.clone()),
@@ -1634,10 +1836,14 @@ mod tests {
             .as_ref()
             .unwrap();
         assert!(gateway_presence_port.test_shares_core_with(chat_port.test_core()));
-        let person_profile = chat_port.test_person_profile("Local", None);
-        let binding =
-            presence_request_binding("local-presence", "runtime-principal", &person_profile)
-                .unwrap();
+        let (person_profile, presence_grant) =
+            grant_local_presence(temp.path(), &presence_port, "runtime-principal", NOW).await;
+        let binding = presence_request_binding(
+            &presence_grant.bind_request_id("local-presence"),
+            "runtime-principal",
+            &person_profile,
+        )
+        .unwrap();
         gateway_presence_port
             .prepare_presence(binding, &person_profile, NOW)
             .unwrap();
@@ -1646,7 +1852,10 @@ mod tests {
         let joined = join_collaboration_network(carrier.clone(), &profile)
             .await
             .unwrap();
-        let driver = CollaborationTransportDriver::new(core.clone(), joined);
+        let driver = CollaborationTransportDriver::new(core.clone(), joined)
+            .with_home_delivery(presence_port.clone(), Arc::new(ProviderRegistry::new()))
+            .await
+            .unwrap();
         carrier.push([send_remote(), peek(0, 0, Vec::new()), ack(0, 0, false)]);
         run_collaboration_worker_cycle_with_presence(
             &driver,
@@ -2116,8 +2325,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn worker_handoff_failure_does_not_block_later_chat_or_presence_and_retries_next_cycle() {
+    #[tokio::test]
+    async fn worker_handoff_failure_does_not_block_later_chat_or_presence_and_retries_next_cycle() {
         let (temp, _) = configured_root(true);
         let configuration =
             load_and_accept_collaboration_startup_configuration(temp.path()).unwrap();
@@ -2186,7 +2395,7 @@ mod tests {
             crate::room_service::CollaborationProjectionWriteFault::BeforeFileSync,
         )
         .unwrap();
-        project_collaboration_handoffs(&product, &presence, temp.path(), now);
+        project_collaboration_handoffs(&product, &presence, temp.path(), now).await;
         let pending = product.pending_messages().unwrap();
         assert_eq!(pending.len(), 1);
         assert!(presence.pending_presences().unwrap().is_empty());
@@ -2206,7 +2415,7 @@ mod tests {
         assert_eq!(core.summary().unwrap().pending_product_handoffs, 1);
         // One attempt per handoff in this bounded cycle; the genuine IO failure
         // retains its original until the next cycle completes its durable work.
-        project_collaboration_handoffs(&product, &presence, temp.path(), now);
+        project_collaboration_handoffs(&product, &presence, temp.path(), now).await;
         assert_eq!(core.summary().unwrap().pending_product_handoffs, 0);
         let completed = product
             .conversation_poll(temp.path(), &session.token, 0)
@@ -2214,7 +2423,7 @@ mod tests {
         assert_eq!(completed.objects.len(), 2);
         assert_eq!(completed.objects[0].seq, first_poll.objects[0].seq);
         assert_eq!(completed.objects[1].body.as_deref(), Some("retry first"));
-        project_collaboration_handoffs(&product, &presence, temp.path(), now);
+        project_collaboration_handoffs(&product, &presence, temp.path(), now).await;
         assert_eq!(
             product
                 .conversation_poll(temp.path(), &session.token, 0)
@@ -2236,6 +2445,7 @@ mod tests {
             missing_configuration,
             None,
             Arc::new(ProviderRegistry::new()),
+            None,
         )
         .await
         .is_err());
@@ -2263,6 +2473,7 @@ mod tests {
             configuration,
             Some(carrier.clone()),
             Arc::new(ProviderRegistry::new()),
+            None,
         )
         .await
         .unwrap()
@@ -2301,6 +2512,7 @@ mod tests {
             same_configuration,
             Some(restart_carrier.clone()),
             Arc::new(ProviderRegistry::new()),
+            None,
         )
         .await
         .unwrap()
@@ -2326,6 +2538,7 @@ mod tests {
             configuration,
             Some(carrier.clone()),
             Arc::new(ProviderRegistry::new()),
+            None,
         )
         .await
         .unwrap()
@@ -2370,6 +2583,7 @@ mod tests {
             configuration,
             Some(carrier.clone()),
             Arc::new(ProviderRegistry::new()),
+            None,
         )
         .await
         .unwrap()
@@ -2449,12 +2663,15 @@ mod tests {
             .unwrap(),
         );
         let chat = CollaborationChatProductPort::new(core.clone()).unwrap();
-        let presence = CollaborationPresenceProductPort::new(core.clone()).unwrap();
-        let local_profile = profile_for_endpoint(&key, "Local");
+        let presence = CollaborationPresenceProductPort::new(core.clone())
+            .unwrap()
+            .with_presence_authority(crate::collaboration_presence_grant::test_authority());
+        let (local_profile, presence_grant) =
+            grant_local_presence(temp.path(), &presence, "test-principal", now).await;
         let prepared = presence
             .prepare_presence(
                 presence_request_binding(
-                    "local-history-presence",
+                    &presence_grant.bind_request_id("local-history-presence"),
                     "test-principal",
                     &local_profile,
                 )
@@ -2527,7 +2744,10 @@ mod tests {
         let joined = join_collaboration_network(carrier.clone(), &profile)
             .await
             .unwrap();
-        let driver = CollaborationTransportDriver::new(core, joined);
+        let driver = CollaborationTransportDriver::new(core, joined)
+            .with_home_delivery(presence.clone(), Arc::new(ProviderRegistry::new()))
+            .await
+            .unwrap();
         tokio::time::timeout(
             Duration::from_secs(1),
             run_collaboration_worker_cycle_with_presence(
@@ -2609,12 +2829,20 @@ mod tests {
                 .unwrap(),
             );
             let chat = CollaborationChatProductPort::new(core.clone()).unwrap();
-            let presence = CollaborationPresenceProductPort::new(core.clone()).unwrap();
+            let presence = CollaborationPresenceProductPort::new(core.clone())
+                .unwrap()
+                .with_presence_authority(crate::collaboration_presence_grant::test_authority());
             let local_metadata = if blocked_outgoing {
+                let (local_profile, presence_grant) =
+                    grant_local_presence(temp.path(), &presence, "principal", now).await;
                 let prepared = presence
                     .prepare_presence(
-                        presence_request_binding("blocked-presence", "principal", &local_profile)
-                            .unwrap(),
+                        presence_request_binding(
+                            &presence_grant.bind_request_id("blocked-presence"),
+                            "principal",
+                            &local_profile,
+                        )
+                        .unwrap(),
                         &local_profile,
                         now,
                     )
@@ -2673,7 +2901,10 @@ mod tests {
                     )],
                 );
             }
-            let driver = CollaborationTransportDriver::new(core.clone(), joined);
+            let driver = CollaborationTransportDriver::new(core.clone(), joined)
+                .with_home_delivery(presence.clone(), Arc::new(ProviderRegistry::new()))
+                .await
+                .unwrap();
             let session = crate::room_service::start_local_runtime_session(
                 temp.path(),
                 &local_did,
@@ -2713,10 +2944,8 @@ mod tests {
             assert!(!worker.is_finished());
             assert_eq!(*carrier.pending_ops.lock().unwrap(), ["gossip_send"]);
             assert_eq!(core.summary().unwrap().pending_product_handoffs, 0);
-            assert_eq!(
-                core.summary().unwrap().replay_tombstones,
-                if blocked_outgoing { 1 } else { 2 }
-            );
+            // Only the chat leaves a replay tombstone; presence leaves none.
+            assert_eq!(core.summary().unwrap().replay_tombstones, 1);
             let requests = carrier.requests();
             assert_eq!(
                 requests
@@ -2853,6 +3082,7 @@ mod tests {
             configuration,
             Some(carrier.clone()),
             Arc::new(ProviderRegistry::new()),
+            None,
         )
         .await
         .unwrap()
@@ -2882,16 +3112,6 @@ mod tests {
         // The real Chat projection retains history at the current wall clock.
         let now = now_secs();
         let (device_key, _) = generate_keypair();
-        let local_profile = profile_for_endpoint(&device_key, "Local");
-        let local_did = local_profile.document().profile_did.clone();
-        crate::room_service::seed_room_owner(
-            temp.path(),
-            &local_profile,
-            crate::room_service::RoomOwnerSeedInput {
-                title: "Chat".to_string(),
-            },
-        )
-        .unwrap();
         let core = Arc::new(
             CollaborationCore::new(
                 temp.path(),
@@ -2902,6 +3122,21 @@ mod tests {
             )
             .unwrap(),
         );
+        let product_port = CollaborationChatProductPort::new(core.clone()).unwrap();
+        let presence_port = CollaborationPresenceProductPort::new(core.clone())
+            .unwrap()
+            .with_presence_authority(crate::collaboration_presence_grant::test_authority());
+        let (local_profile, presence_grant) =
+            grant_local_presence(temp.path(), &presence_port, "runtime-principal", now).await;
+        let local_did = local_profile.document().profile_did.clone();
+        crate::room_service::seed_room_owner(
+            temp.path(),
+            &local_profile,
+            crate::room_service::RoomOwnerSeedInput {
+                title: "Chat".to_string(),
+            },
+        )
+        .unwrap();
         let binding = |request_id: &str, payload_type: &str, payload: &serde_json::Value| {
             let authenticated_payload = crate::collaboration_default_conversation::
                 profile_authenticated_conversation_payload(&local_profile, payload.clone())
@@ -2957,12 +3192,10 @@ mod tests {
                 .len(),
             1
         );
-        let product_port = CollaborationChatProductPort::new(core.clone()).unwrap();
-        let presence_port = CollaborationPresenceProductPort::new(core.clone()).unwrap();
         let presence = presence_port
             .prepare_presence(
                 presence_request_binding(
-                    "startup-worker-presence",
+                    &presence_grant.bind_request_id("startup-worker-presence"),
                     "runtime-principal",
                     &local_profile,
                 )
@@ -3009,7 +3242,10 @@ mod tests {
         let joined = join_collaboration_network(carrier.clone(), &profile)
             .await
             .unwrap();
-        let driver = CollaborationTransportDriver::new(core.clone(), joined);
+        let driver = CollaborationTransportDriver::new(core.clone(), joined)
+            .with_home_delivery(presence_port.clone(), Arc::new(ProviderRegistry::new()))
+            .await
+            .unwrap();
         carrier.push_for(
             "gossip_send",
             [
@@ -3018,7 +3254,14 @@ mod tests {
             ],
         );
         carrier.push_for("gossip_peek", [FakeReply::Error("peek failed")]);
-        run_collaboration_worker_cycle(&driver, &product_port, temp.path(), now + 1).await;
+        run_collaboration_worker_cycle_with_presence(
+            &driver,
+            &product_port,
+            &presence_port,
+            temp.path(),
+            now + 1,
+        )
+        .await;
         assert_eq!(core.pending_outgoing(now + 1).unwrap().len(), 2);
         assert!(core
             .pending_outgoing_product_projections(now + 1)
@@ -3048,7 +3291,14 @@ mod tests {
             accept_shared(&core, &remote_authority, incoming.envelope_bytes(), now + 1).unwrap();
         // Unanswered gossip waits 5 s before a resend, so these cycles send none.
         carrier.push([peek(0, 0, Vec::new()), FakeReply::Error("ack failed")]);
-        run_collaboration_worker_cycle(&driver, &product_port, temp.path(), now + 1).await;
+        run_collaboration_worker_cycle_with_presence(
+            &driver,
+            &product_port,
+            &presence_port,
+            temp.path(),
+            now + 1,
+        )
+        .await;
         assert_eq!(core.summary().unwrap().pending_product_handoffs, 0);
         assert_eq!(core.summary().unwrap().remotely_accepted_outgoing, 0);
         assert_eq!(core.pending_outgoing(now + 1).unwrap().len(), 2);
@@ -3071,7 +3321,14 @@ mod tests {
             receipt,
         );
         carrier.push([peek(0, 0, Vec::new()), ack(0, 0, false)]);
-        run_collaboration_worker_cycle(&driver, &product_port, temp.path(), now + 1).await;
+        run_collaboration_worker_cycle_with_presence(
+            &driver,
+            &product_port,
+            &presence_port,
+            temp.path(),
+            now + 1,
+        )
+        .await;
         assert_eq!(core.summary().unwrap().pending_product_handoffs, 0);
         assert_eq!(core.pending_outgoing(now + 1).unwrap().len(), 2);
         assert_eq!(
@@ -3094,7 +3351,14 @@ mod tests {
             ),
             ack(0, 2, true),
         ]);
-        run_collaboration_worker_cycle(&driver, &product_port, temp.path(), now + 1).await;
+        run_collaboration_worker_cycle_with_presence(
+            &driver,
+            &product_port,
+            &presence_port,
+            temp.path(),
+            now + 1,
+        )
+        .await;
         let pending = core.pending_outgoing(now + 1).unwrap();
         // Shared still owes other Homes' direct delivery; this peer's gossip
         // receipt is durable and ends its gossip.
@@ -3110,7 +3374,14 @@ mod tests {
         assert!(product_port.pending_messages().unwrap().is_empty());
         let before_settled = request_ops(&carrier).len();
         carrier.push([peek(2, 2, Vec::new()), ack(2, 2, false)]);
-        run_collaboration_worker_cycle(&driver, &product_port, temp.path(), now + 1).await;
+        run_collaboration_worker_cycle_with_presence(
+            &driver,
+            &product_port,
+            &presence_port,
+            temp.path(),
+            now + 1,
+        )
+        .await;
         assert_eq!(
             &request_ops(&carrier)[before_settled..],
             &["gossip_peek", "gossip_ack"]
@@ -3144,5 +3415,293 @@ mod tests {
             outgoing.envelope_sha256()
         );
         assert!(!request_ops(&carrier).iter().any(|op| op == "gossip_recv"));
+    }
+
+    #[derive(Default)]
+    struct FakeLinkScript {
+        /// The bootstrap peer is listed while the link works.
+        peers: bool,
+        /// Someone announces presence every 15 s while the link works.
+        presence: bool,
+        /// Presence stops here although the link keeps working.
+        presence_until: Option<Duration>,
+        bootstrap_node: bool,
+        /// From here on the link carries nothing and lists no peer.
+        stall_from: Option<Duration>,
+        /// A gossip rebuild ends the stall.
+        rebuild_heals: bool,
+        pending_rebuild: bool,
+    }
+
+    #[derive(Default)]
+    struct FakeLinkState {
+        presence_sent: u64,
+        frames: u64,
+        rebuilt: bool,
+        steps: Vec<(CommunityLinkStep, u64)>,
+        health_reads: usize,
+    }
+
+    /// A Community link whose gossip can stall; a topic rejoin does not
+    /// help, a rebuild does when the script says so.
+    struct FakeCommunityLink {
+        script: FakeLinkScript,
+        started: tokio::time::Instant,
+        state: Mutex<FakeLinkState>,
+    }
+
+    impl FakeCommunityLink {
+        fn new(script: FakeLinkScript) -> Self {
+            Self {
+                script,
+                started: tokio::time::Instant::now(),
+                state: Mutex::new(FakeLinkState::default()),
+            }
+        }
+
+        fn steps(&self) -> Vec<(CommunityLinkStep, u64)> {
+            self.state.lock().unwrap().steps.clone()
+        }
+
+        fn frames(&self) -> u64 {
+            self.state.lock().unwrap().frames
+        }
+
+        fn stalled(&self, state: &FakeLinkState, at: Duration) -> bool {
+            self.script.stall_from.is_some_and(|from| at >= from)
+                && !(self.script.rebuild_heals && state.rebuilt)
+        }
+    }
+
+    impl CommunityLink for FakeCommunityLink {
+        async fn recovers_its_link(&self) -> anyhow::Result<bool> {
+            Ok(!self.script.bootstrap_node)
+        }
+
+        async fn link_health(&self) -> anyhow::Result<CommunityLinkHealth> {
+            let now = self.started.elapsed();
+            let mut state = self.state.lock().unwrap();
+            state.health_reads += 1;
+            while (state.presence_sent + 1) * 15 <= now.as_secs() {
+                state.presence_sent += 1;
+                let sent_at = Duration::from_secs(state.presence_sent * 15);
+                let announced = self.script.presence
+                    && self
+                        .script
+                        .presence_until
+                        .is_none_or(|until| sent_at < until);
+                if announced && !self.stalled(&state, sent_at) {
+                    state.frames += 1;
+                }
+            }
+            let listed = self.script.peers && !self.stalled(&state, now);
+            Ok(CommunityLinkHealth {
+                peer_count: usize::from(listed),
+                received_frames: state.frames,
+            })
+        }
+
+        async fn rejoin(&self) -> anyhow::Result<()> {
+            let at = self.started.elapsed().as_secs();
+            let mut state = self.state.lock().unwrap();
+            state.steps.push((CommunityLinkStep::Rejoin, at));
+            Ok(())
+        }
+
+        async fn rebuild_gossip(&self) -> anyhow::Result<usize> {
+            let at = self.started.elapsed().as_secs();
+            {
+                let mut state = self.state.lock().unwrap();
+                state.steps.push((CommunityLinkStep::Rebuild, at));
+                state.rebuilt = true;
+            }
+            if self.script.pending_rebuild {
+                std::future::pending::<()>().await;
+            }
+            Ok(1)
+        }
+    }
+
+    async fn run_link_watchdog_for(link: &FakeCommunityLink, run: u64) {
+        let (_membership, joined) = watch::channel(true);
+        let (_shutdown, shutdown_rx) = watch::channel(false);
+        tokio::select! {
+            _ = run_community_link_watchdog(shutdown_rx, joined, link) => {
+                panic!("the watchdog stopped before shutdown");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(run)) => {}
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn community_link_watchdog_rejoins_then_rebuilds_a_dead_link_until_it_works_again() {
+        // From 30 s the link lists no peer and carries nothing; a rebuild heals it.
+        let link = FakeCommunityLink::new(FakeLinkScript {
+            peers: true,
+            presence: true,
+            stall_from: Some(Duration::from_secs(30)),
+            rebuild_heals: true,
+            ..FakeLinkScript::default()
+        });
+        // Stops between two 5 s ticks, so the last read is at 900 s.
+        run_link_watchdog_for(&link, 902).await;
+        assert_eq!(
+            link.steps(),
+            [
+                (CommunityLinkStep::Rejoin, 90),
+                (CommunityLinkStep::Rebuild, 150)
+            ],
+            "one rejoin a silence after the peer went, one rebuild a silence later"
+        );
+        // The peer is back and every presence after the rebuild arrives (the
+        // one at 15 s plus 50 from 165 s to 900 s); that flow causes no step.
+        assert_eq!(link.frames(), 51);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn community_link_watchdog_leaves_a_link_with_a_peer_alone() {
+        let presence = FakeCommunityLink::new(FakeLinkScript {
+            peers: true,
+            presence: true,
+            ..FakeLinkScript::default()
+        });
+        run_link_watchdog_for(&presence, 1802).await;
+        assert!(presence.steps().is_empty());
+        // Presence from 15 s to 1800 s; the last read is at 1800 s.
+        assert_eq!(presence.frames(), 120);
+
+        // Discovery is off everywhere: a peer and no frame at all.
+        let quiet = FakeCommunityLink::new(FakeLinkScript {
+            peers: true,
+            ..FakeLinkScript::default()
+        });
+        run_link_watchdog_for(&quiet, 1800).await;
+        assert!(quiet.steps().is_empty());
+
+        // The last person with Discovery on goes offline: frames stop, the
+        // peer stays, and no Home rejoins or rebuilds.
+        let last_publisher = FakeCommunityLink::new(FakeLinkScript {
+            peers: true,
+            presence: true,
+            presence_until: Some(Duration::from_secs(60)),
+            ..FakeLinkScript::default()
+        });
+        run_link_watchdog_for(&last_publisher, 1800).await;
+        assert_eq!(last_publisher.frames(), 3);
+        assert!(last_publisher.steps().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn community_link_watchdog_repairs_a_home_without_peers_while_frames_trickle_in() {
+        // The hub evicted this Home: no neighbour listed, yet a presence frame
+        // still arrives every 15 s. Frames do not count as a link.
+        let unlisted = FakeCommunityLink::new(FakeLinkScript {
+            presence: true,
+            ..FakeLinkScript::default()
+        });
+        run_link_watchdog_for(&unlisted, 302).await;
+        assert!(unlisted.frames() > 0, "frames kept arriving");
+        assert_eq!(
+            unlisted.steps(),
+            [
+                (CommunityLinkStep::Rejoin, 60),
+                (CommunityLinkStep::Rebuild, 120),
+                (CommunityLinkStep::Rebuild, 240),
+            ],
+            "the 60 s spacing and backoff hold although frames arrive"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn community_link_watchdog_paces_a_home_without_peers_and_caps_rebuilds() {
+        let link = FakeCommunityLink::new(FakeLinkScript::default());
+        run_link_watchdog_for(&link, 3600).await;
+        use CommunityLinkStep::{Rebuild, Rejoin};
+        assert_eq!(
+            link.steps(),
+            [
+                (Rejoin, 60),
+                (Rebuild, 120),
+                (Rebuild, 240),
+                (Rebuild, 480),
+                (Rebuild, 780),
+                (Rebuild, 1080),
+                (Rebuild, 1380),
+                (Rejoin, 1680),
+                (Rejoin, 1980),
+                (Rejoin, 2280),
+                (Rejoin, 2580),
+                (Rejoin, 2880),
+                (Rejoin, 3180),
+                (Rejoin, 3480),
+            ],
+            "{} rebuilds, then only rejoins every 5 minutes",
+            crate::collaboration_carrier::MAX_COMMUNITY_GOSSIP_REBUILDS
+        );
+
+        let seed = FakeCommunityLink::new(FakeLinkScript {
+            bootstrap_node: true,
+            ..FakeLinkScript::default()
+        });
+        run_link_watchdog_for(&seed, 1200).await;
+        assert!(seed.steps().is_empty());
+        assert_eq!(seed.state.lock().unwrap().health_reads, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn community_link_rebuild_cap_holds_across_recoveries_and_leaves() {
+        use crate::collaboration_carrier::MAX_COMMUNITY_GOSSIP_REBUILDS;
+        let mut watchdog = CommunityLinkWatchdog::new(COMMUNITY_LINK_SILENCE);
+        let start = tokio::time::Instant::now();
+        let mut rebuilds = 0;
+        let mut rejoins = 0;
+        // A peer shows up every ten minutes, so each outage alone would use
+        // three rebuilds; the process cap still holds across all of them.
+        for second in (0..40_000).step_by(5) {
+            let now = start + Duration::from_secs(second);
+            if (20_000..20_600).contains(&second) {
+                continue; // Community left for ten minutes
+            }
+            let health = (second % 600 == 0).then_some(CommunityLinkHealth {
+                peer_count: 1,
+                received_frames: 0,
+            });
+            let step = watchdog.observe(health, now);
+            match step {
+                Some(CommunityLinkStep::Rebuild) => rebuilds += 1,
+                Some(CommunityLinkStep::Rejoin) => rejoins += 1,
+                None => continue,
+            }
+            watchdog.step_finished(now);
+        }
+        assert_eq!(rebuilds, MAX_COMMUNITY_GOSSIP_REBUILDS);
+        assert!(rejoins > 60, "outages keep getting rejoins: {rejoins}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn community_link_watchdog_stops_at_shutdown_during_a_rebuild() {
+        let link = FakeCommunityLink::new(FakeLinkScript {
+            pending_rebuild: true,
+            ..FakeLinkScript::default()
+        });
+        let (_membership, joined) = watch::channel(true);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let watchdog = run_community_link_watchdog(shutdown_rx, joined, &link);
+        tokio::pin!(watchdog);
+        tokio::select! {
+            _ = &mut watchdog => panic!("the watchdog stopped before shutdown"),
+            _ = tokio::time::sleep(Duration::from_secs(125)) => {}
+        }
+        assert_eq!(
+            link.steps(),
+            [
+                (CommunityLinkStep::Rejoin, 60),
+                (CommunityLinkStep::Rebuild, 120)
+            ]
+        );
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_millis(1), watchdog)
+            .await
+            .expect("shutdown cancels the pending rebuild wait");
     }
 }
