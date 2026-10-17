@@ -553,7 +553,10 @@ async function waitForStatus(frame, expectedText) {
 }
 
 async function assertFirstRunScenario(frame, width) {
-  await waitFor(() => frame.evaluate(() => document.querySelector("#profile-title")?.textContent === "Create your Profile"));
+  // The static page already says "Create your Profile". Wait for the text only people.js writes,
+  // so the checks below read the rendered first-run state, not the HTML before the script runs.
+  await waitFor(() => frame.evaluate(() => document.querySelector("#profile-description")?.textContent?.trim()
+    === "Confirm the name people will see in People and Chat. Discovery stays off until you enable it."));
   await assertNoOverflow(frame, `first run at ${width}px`);
   await assertVisible(frame, [
     "#people-count",
