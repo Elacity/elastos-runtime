@@ -5707,8 +5707,10 @@ async fn test_home_background_from_object_requires_library_capability_and_unprot
         crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
     let _guest_protection =
         crate::auth::store_test_principal_root_protection(dir.path(), &guest.principal_id);
-    let picture = test_png_picture(800, 600, b"own-picture");
+    // Each file holds different bytes: protection follows the bytes, so a
+    // file with the same bytes as a protected one is refused too.
     let write = |relative: &str| {
+        let picture = test_png_picture(800, 600, relative.as_bytes());
         write_home_principal_object_bytes_for_authority(dir.path(), &admin, relative, &picture)
     };
     let picture_uri = write("Pictures/hills.png");
@@ -5743,11 +5745,6 @@ async fn test_home_background_from_object_requires_library_capability_and_unprot
         &admin.principal_id,
         &public_uri,
         serde_json::json!({ "published_payload": "plain_content", "key_release_required": false }),
-    );
-    crate::library::write_test_broken_publish_record(
-        dir.path(),
-        &admin.principal_id,
-        &broken_record_uri,
     );
 
     let library_token =
@@ -5794,7 +5791,6 @@ async fn test_home_background_from_object_requires_library_capability_and_unprot
         (&protected_uri, "protected"),
         (&unknown_uri, "protected"),
         (&key_release_uri, "protected"),
-        (&broken_record_uri, "protected"),
         (&trash_uri, "Trash"),
         (&private_uri, "own Library files"),
     ] {
@@ -5809,6 +5805,177 @@ async fn test_home_background_from_object_requires_library_capability_and_unprot
         let (status, text) =
             set_background_from_object(&app, home(), Some(library_token.clone()), uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {text}");
+    }
+
+    // A record that cannot be read leaves its protection unknown. Its object
+    // is refused, and because the bytes it protects are unknown too, so is
+    // every other picture until the record is readable again.
+    crate::library::write_test_broken_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &broken_record_uri,
+    );
+    for uri in [&broken_record_uri, &picture_uri] {
+        let (status, text) =
+            set_background_from_object(&app, home(), Some(library_token.clone()), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {text}");
+        assert!(text.contains("protected"), "{uri}: {text}");
+    }
+}
+
+/// Runs one Library object operation the way Library's provider does, and
+/// returns the resulting object's URI.
+fn library_object_op(
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    request: serde_json::Value,
+) -> String {
+    let mut request = request;
+    request["principal_id"] = serde_json::Value::String(authority.principal_id.clone());
+    let response = crate::library::handle_object_provider_raw_request(data_dir, &request);
+    assert_eq!(response["status"], "ok", "{response}");
+    response["data"]["object"]["uri"]
+        .as_str()
+        .expect("object uri")
+        .to_string()
+}
+
+/// A copy, rename or move gives protected bytes a new URI with no publish
+/// record of its own. Protection follows the bytes, so each is still refused,
+/// while a different picture is still allowed.
+#[tokio::test]
+async fn test_home_background_from_object_refuses_protected_bytes_after_copy_rename_and_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let _protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let root = crate::auth::principal_localhost_root(&admin.principal_id);
+    let protected_bytes = test_png_picture(800, 600, b"protected-picture");
+    let protected_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/protected.png",
+        &protected_bytes,
+    );
+    let other_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/other.png",
+        &test_png_picture(800, 600, b"other-picture"),
+    );
+    crate::library::write_test_publish_record_with_source(
+        dir.path(),
+        &admin.principal_id,
+        &protected_uri,
+        serde_json::json!({ "published_payload": "runtime_custody_encrypted", "key_release_required": false }),
+        Some(&protected_bytes),
+    );
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let set = |uri: String| {
+        let app = app.clone();
+        let home = admin.home_token.clone();
+        let library = library_token.clone();
+        async move { set_background_from_object(&app, home, Some(library), &uri).await }
+    };
+
+    let copy_uri = library_object_op(
+        dir.path(),
+        &admin,
+        serde_json::json!({ "op": "copy", "uri": protected_uri, "target_parent_uri": format!("{root}/Documents") }),
+    );
+    assert_ne!(copy_uri, protected_uri);
+    let (status, text) = set(copy_uri.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "copy: {text}");
+    assert!(text.contains("protected content cannot be"), "copy: {text}");
+
+    let renamed_uri = library_object_op(
+        dir.path(),
+        &admin,
+        serde_json::json!({ "op": "rename", "uri": protected_uri, "name": "renamed.png" }),
+    );
+    assert_eq!(renamed_uri, format!("{root}/Pictures/renamed.png"));
+    let (status, text) = set(renamed_uri.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "rename: {text}");
+    assert!(
+        text.contains("protected content cannot be"),
+        "rename: {text}"
+    );
+
+    let moved_uri = library_object_op(
+        dir.path(),
+        &admin,
+        serde_json::json!({ "op": "move", "uri": copy_uri, "target_parent_uri": format!("{root}/Desktop") }),
+    );
+    let (status, text) = set(moved_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "move: {text}");
+    assert!(text.contains("protected content cannot be"), "move: {text}");
+
+    // A different picture is not affected.
+    let (status, text) = set(other_uri).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+}
+
+/// A protected record written before records named their digest: a copy is
+/// found by reading the source the record names; once that source is renamed
+/// away, the protected bytes are unknown, so every picture is refused.
+#[tokio::test]
+async fn test_home_background_from_object_legacy_protected_record_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let _protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let root = crate::auth::principal_localhost_root(&admin.principal_id);
+    let protected_bytes = test_png_picture(800, 600, b"legacy-protected");
+    let protected_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/legacy.png",
+        &protected_bytes,
+    );
+    let other_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/other.png",
+        &test_png_picture(800, 600, b"other-picture"),
+    );
+    crate::library::write_test_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &protected_uri,
+        serde_json::json!({ "published_payload": "runtime_custody_encrypted", "key_release_required": false }),
+    );
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let set = |uri: String| {
+        let app = app.clone();
+        let home = admin.home_token.clone();
+        let library = library_token.clone();
+        async move { set_background_from_object(&app, home, Some(library), &uri).await }
+    };
+
+    let copy_uri = library_object_op(
+        dir.path(),
+        &admin,
+        serde_json::json!({ "op": "copy", "uri": protected_uri, "target_parent_uri": format!("{root}/Documents") }),
+    );
+    let (status, text) = set(copy_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "copy: {text}");
+    assert!(text.contains("protected content cannot be"), "copy: {text}");
+    let (status, text) = set(other_uri.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let renamed_uri = library_object_op(
+        dir.path(),
+        &admin,
+        serde_json::json!({ "op": "rename", "uri": protected_uri, "name": "renamed.png" }),
+    );
+    for uri in [renamed_uri, other_uri] {
+        let (status, text) = set(uri.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {text}");
+        assert!(text.contains("cannot confirm"), "{uri}: {text}");
     }
 }
 

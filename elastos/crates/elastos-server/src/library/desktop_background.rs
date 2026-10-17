@@ -5,6 +5,11 @@
 //! applies Library's own scope: the signed-in principal's root, never Trash,
 //! never Runtime-private areas, never a link, and never protected content.
 //! Protection status that cannot be read is treated as protected.
+//!
+//! Protection is checked twice: by the object's own publish record, and by its
+//! bytes. A copy, rename or move gives the bytes a new URI with no record of
+//! its own, so the bytes are also compared with the source of every protected
+//! record the person holds.
 
 use std::path::{Component, Path};
 
@@ -25,6 +30,7 @@ pub(crate) enum DesktopBackgroundSourceRefusal {
     NotFile,
     TooLarge,
     Protected,
+    ProtectionUnknown,
     Unreadable,
 }
 
@@ -39,6 +45,9 @@ impl DesktopBackgroundSourceRefusal {
             Self::TooLarge => "background image is larger than 5 MB",
             Self::Protected => {
                 "protected content cannot be the desktop background; choose a picture that is not protected"
+            }
+            Self::ProtectionUnknown => {
+                "Library cannot confirm that this picture is not protected content, so it cannot be the desktop background"
             }
             Self::Unreadable => "background image source could not be read",
         }
@@ -90,7 +99,6 @@ pub(crate) fn read_library_object_for_desktop_background(
     if metadata.len() > max_stored_bytes {
         return Err(Refusal::TooLarge);
     }
-    require_unprotected(data_dir, principal_id, &target.localhost_root, &target.uri)?;
     // Read without Library's legacy-plaintext migration: a file that is not
     // under principal-root protection is blocked in Library, so it is refused
     // here and left untouched. The read is bounded through the one open
@@ -104,6 +112,14 @@ pub(crate) fn read_library_object_for_desktop_background(
         max_stored_bytes,
     )
     .map_err(|_| Refusal::Unreadable)?;
+    require_unprotected(
+        data_dir,
+        principal_id,
+        &target.localhost_root,
+        &target.uri,
+        &bytes,
+        max_stored_bytes,
+    )?;
     Ok(bytes)
 }
 
@@ -186,39 +202,106 @@ fn require_no_links(root: &Path, path: &Path) -> Result<(), DesktopBackgroundSou
     Ok(())
 }
 
+/// Most publish records this check reads. More than this counts as unknown.
+const MAX_PUBLISH_RECORDS_CHECKED: usize = 16_384;
+
 /// Allows only content with no publish record, or one published as plain
-/// content with no key release. Anything else, including a record that cannot
-/// be read, is treated as protected.
+/// content with no key release, and whose bytes are not the source of any
+/// protected record. Anything else, including a record that cannot be read,
+/// is treated as protected.
 fn require_unprotected(
     data_dir: &Path,
     principal_id: &str,
     localhost_root: &str,
     uri: &str,
+    bytes: &[u8],
+    max_stored_bytes: u64,
 ) -> Result<(), DesktopBackgroundSourceRefusal> {
     use DesktopBackgroundSourceRefusal as Refusal;
+    // The object's own record.
     let record_uri = super::publish_record_uri(localhost_root, uri);
     let record_path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &record_uri)
         .ok_or(Refusal::Protected)?;
     match std::fs::symlink_metadata(&record_path) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(Refusal::Protected),
-        Ok(_) => {}
+        Ok(_) => {
+            let record =
+                read_publish_record(data_dir, principal_id, uri).map_err(|_| Refusal::Protected)?;
+            if is_protected(&record.content_security) {
+                return Err(Refusal::Protected);
+            }
+        }
     }
-    let record =
-        read_publish_record(data_dir, principal_id, uri).map_err(|_| Refusal::Protected)?;
-    let security = &record.content_security;
+    // The bytes: protection follows the content through copy, rename and move.
+    let digest = super::content_sha256_label(bytes);
+    let records =
+        super::read_all_publish_records(data_dir, principal_id, MAX_PUBLISH_RECORDS_CHECKED)
+            .map_err(|_| Refusal::ProtectionUnknown)?;
+    for record in records
+        .iter()
+        .filter(|record| is_protected(&record.content_security))
+    {
+        let source_digest = match &record.source_sha256 {
+            Some(source_digest) => Some(source_digest.clone()),
+            None => legacy_source_digest(data_dir, principal_id, record, max_stored_bytes)?,
+        };
+        if source_digest.as_deref() == Some(digest.as_str()) {
+            return Err(Refusal::Protected);
+        }
+    }
+    Ok(())
+}
+
+/// The digest of a protected record's source for a record written before
+/// records named it. `None` when the source is larger than any desktop
+/// background can be, so it cannot hold the same bytes. A source that is
+/// missing or cannot be read (for example, it was renamed before records
+/// named their digest) leaves the protected bytes unknown, so this refuses.
+fn legacy_source_digest(
+    data_dir: &Path,
+    principal_id: &str,
+    record: &super::LibraryPublishRecord,
+    max_stored_bytes: u64,
+) -> Result<Option<String>, DesktopBackgroundSourceRefusal> {
+    use DesktopBackgroundSourceRefusal as Refusal;
+    let source = library_target(data_dir, principal_id, &record.object_uri)
+        .map_err(|_| Refusal::ProtectionUnknown)?;
+    let metadata =
+        std::fs::symlink_metadata(&source.path).map_err(|_| Refusal::ProtectionUnknown)?;
+    if !metadata.is_file() {
+        return Err(Refusal::ProtectionUnknown);
+    }
+    // `max_stored_bytes` is the stored size a desktop background may have.
+    // The caller sets it with room for the principal-root envelope (base64
+    // plus a fixed header), so a source stored larger than it holds more
+    // bytes than a desktop background may be and cannot match.
+    if metadata.len() > max_stored_bytes {
+        return Ok(None);
+    }
+    let bytes = crate::auth::read_principal_root_object_limited(
+        data_dir,
+        principal_id,
+        &source.localhost_root,
+        &source.uri,
+        &source.path,
+        max_stored_bytes,
+    )
+    .map_err(|_| Refusal::ProtectionUnknown)?;
+    Ok(Some(super::content_sha256_label(&bytes)))
+}
+
+/// Only plain content with no key release is unprotected; anything else,
+/// including a form this check does not know, is protected.
+fn is_protected(security: &Value) -> bool {
     let payload = security.get("published_payload").and_then(Value::as_str);
     let key_release = security
         .get("key_release_required")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    if payload == Some(RUNTIME_CUSTODY_PUBLISHED_PAYLOAD)
+    payload == Some(RUNTIME_CUSTODY_PUBLISHED_PAYLOAD)
         || payload != Some("plain_content")
         || key_release
-    {
-        return Err(Refusal::Protected);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

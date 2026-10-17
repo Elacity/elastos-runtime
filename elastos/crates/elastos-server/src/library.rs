@@ -116,6 +116,13 @@ struct LibraryPublishRecord {
     availability: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     listing_uri: Option<String>,
+    /// `sha256:<hex>` of the object's bytes when it was protected. Protection
+    /// then follows the content: a copy, rename or move gets a new URI and no
+    /// record of its own, but its bytes still match this digest. Records
+    /// written before this field have none; see
+    /// `desktop_background::require_unprotected` for how they are handled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,6 +676,25 @@ pub(crate) fn write_test_publish_record(
     object_uri: &str,
     content_security: Value,
 ) {
+    write_test_publish_record_with_source(
+        data_dir,
+        principal_id,
+        object_uri,
+        content_security,
+        None,
+    );
+}
+
+/// Test fixture: a publish record that also names the digest of the source
+/// bytes, the way a protected publish records it.
+#[cfg(test)]
+pub(crate) fn write_test_publish_record_with_source(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+    content_security: Value,
+    source_bytes: Option<&[u8]>,
+) {
     let record = LibraryPublishRecord {
         schema: "elastos.library.publish-record/v1".to_string(),
         object_uri: object_uri.to_string(),
@@ -682,6 +708,7 @@ pub(crate) fn write_test_publish_record(
         receipt: json!({}),
         availability: json!({ "status": "pinned" }),
         listing_uri: None,
+        source_sha256: source_bytes.map(content_sha256_label),
     };
     write_publish_record(data_dir, principal_id, &record).unwrap();
 }
@@ -2056,6 +2083,10 @@ async fn library_publish(
         );
         let loaded =
             validate_runtime_custody_publish_input(data_dir, principal_id, &target, protection)?;
+        // Remember the protected bytes, so protection follows them through a
+        // copy, rename or move (see `LibraryPublishRecord::source_sha256`).
+        let source_sha256 =
+            content_sha256_label(&read_library_file_bytes(data_dir, principal_id, &target)?);
         let source_storage = published_source_storage(data_dir, principal_id, &target)?.to_string();
         let Some((state, authority)) = gateway_authority else {
             anyhow::bail!(
@@ -2101,6 +2132,7 @@ async fn library_publish(
             receipt: facts.receipt,
             availability: facts.availability,
             listing_uri: facts.listing_uri,
+            source_sha256: Some(source_sha256),
         };
         write_publish_record(data_dir, principal_id, &record)?;
         let object = library_object(data_dir, principal_id, &target.uri)?;
@@ -2192,6 +2224,7 @@ async fn library_publish(
         receipt,
         availability,
         listing_uri: None,
+        source_sha256: None,
     };
     write_publish_record(data_dir, principal_id, &record)?;
     let object = library_object(data_dir, principal_id, &target.uri)?;
@@ -6883,9 +6916,64 @@ fn remove_trash_record(data_dir: &Path, principal_id: &str, trash_uri: &str) -> 
     }
 }
 
+fn publish_records_dir_uri(localhost_root: &str) -> String {
+    format!("{localhost_root}/.AppData/LocalHost/.Runtime/Library/Published")
+}
+
 fn publish_record_uri(localhost_root: &str, object_uri: &str) -> String {
     let digest = hex::encode(Sha256::digest(object_uri.as_bytes()));
-    format!("{localhost_root}/.AppData/LocalHost/.Runtime/Library/Published/{digest}.json")
+    format!("{}/{digest}.json", publish_records_dir_uri(localhost_root))
+}
+
+/// `sha256:<hex>` of `bytes`.
+fn content_sha256_label(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+/// Every publish record `principal_id` holds. Fails when the record store
+/// cannot be listed, holds more than `limit` records, or holds a record that
+/// cannot be read. Staged writes (`.<name>.tmp`) and names that are not a
+/// record's are skipped, the same as `read_publish_record` never reads them.
+fn read_all_publish_records(
+    data_dir: &Path,
+    principal_id: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<LibraryPublishRecord>> {
+    let root = crate::auth::principal_localhost_root(principal_id);
+    let dir_uri = publish_records_dir_uri(&root);
+    let dir_path = rooted_localhost_fs_path(data_dir, &dir_uri)
+        .ok_or_else(|| anyhow!("invalid library publish record path"))?;
+    let entries = match fs::read_dir(&dir_path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let is_record_name = name.strip_suffix(".json").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        if !is_record_name {
+            continue;
+        }
+        if records.len() >= limit {
+            bail!("library holds more publish records than this check reads");
+        }
+        let record_uri = format!("{dir_uri}/{name}");
+        let bytes = crate::auth::read_principal_root_object(
+            data_dir,
+            principal_id,
+            &root,
+            &record_uri,
+            &entry.path(),
+        )?;
+        records.push(serde_json::from_slice(&bytes)?);
+    }
+    Ok(records)
 }
 
 fn read_publish_record(
