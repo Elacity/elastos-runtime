@@ -6,13 +6,14 @@ artifacts, and `.dmg` packaging work.
 
 ## Intel Mac
 
-The public release id for an Intel Mac is `x86_64-darwin`. The signed installer
+The public release id for an Intel Mac is `x86_64-darwin`. `scripts/install.sh`
 stops on that host before a download lookup. The message is
 `macOS release lookup requires Apple silicon`.
 
 A person with an Intel Mac has no signed download. The next step is the signed
 installer on an Apple silicon Mac. The source-home commands later in this
-runbook are a developer build. They are not the installer.
+runbook are a developer build. They are not the installer, and this note does
+not claim that build has passed on Intel.
 
 The signed platform set is `SIGNED_RELEASE_PLATFORMS` in
 `scripts/release-signer.py`. `scripts/release-platforms.json` maps the package
@@ -22,10 +23,19 @@ on Darwin x86_64 and writes nothing. The packaging path refuses to write a
 tarball for that key, including when a Rosetta shell reports `x86_64`.
 
 CI job `gateway-smoke-macos-intel` builds the native `elastos` binary on
-`macos-15-intel` and checks the `/healthz` owner response in
-[the launcher contract](LAUNCHER_CONTRACT.md). That job uploads no release
-tarball. This runbook claims no local Intel Browser engine. See
-[Browser support](BROWSER_SUPPORT.md).
+`macos-15-intel`. It requires `GET /healthz` to return HTTP 200 and the two
+bytes `OK` from the process that owns `host-process.lock`. That is the owner
+check in [the launcher contract](LAUNCHER_CONTRACT.md). The job uses an empty
+Home, so a passing probe does not prove providers, capsules, or a signed
+install. `elastos serve` reports operator status at `GET /api/health`.
+
+The product command is `elastos gateway --addr localhost:8090`. The smoke
+binds one numeric loopback address on a free port. It does not open
+`localhost:8090`. On macOS, `localhost` can resolve to `::1` while that bind
+is `127.0.0.1` or `[::1]`. That name and port gap remains.
+
+This runbook claims no local Intel Browser engine. See
+[Browser support](BROWSER_SUPPORT.md). The job uploads no release tarball.
 
 ## From Fresh Mac To Home
 

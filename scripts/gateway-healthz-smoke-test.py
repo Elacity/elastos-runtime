@@ -38,6 +38,18 @@ STUB = textwrap.dedent(
             sys.exit(0)
         time.sleep(30)
         sys.exit(0)
+    if mode == "ignore-term":
+        import signal
+        import time
+        child = os.fork()
+        if child == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            with open(os.environ["SMOKE_CHILD_PID"], "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
+            time.sleep(30)
+            sys.exit(0)
+        time.sleep(30)
+        sys.exit(0)
     args = sys.argv[1:]
     if args[:1] != ["gateway"] or "--addr" not in args:
         sys.exit(2)
@@ -47,12 +59,16 @@ STUB = textwrap.dedent(
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if mode == "newline":
-                body = b"OK\\n"
+                status, body = 200, b"OK\\n"
+            elif mode == "redirect":
+                status, body = 302, b"OK"
+            elif mode == "no-content":
+                status, body = 204, b"OK"
             elif mode == "ok":
-                body = b"OK"
+                status, body = 200, b"OK"
             else:
-                body = b"NO"
-            self.send_response(200)
+                status, body = 200, b"NO"
+            self.send_response(status)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -143,7 +159,7 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
             timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("two bytes OK from pid", result.stdout)
+        self.assertIn("HTTP 200 and the two bytes OK from pid", result.stdout)
         self.assertNotIn(":8090", result.stdout)
 
     def test_address_injection_exits_two(self):
@@ -222,6 +238,82 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
         self.assertNotIn("planted-secret", result.stdout)
         self.assertNotIn("planted-secret", result.stderr)
         self.assertIn("planted-secret", log.read_text())
+
+    def test_deadline_must_be_a_positive_integer(self):
+        marker = Path(self.tmp.name) / "pwned"
+        for value in ("abc", "-5", "", "0", "x[$(touch %s)]" % marker):
+            with self.subTest(value=value):
+                result = self.run_smoke("ok", deadline=value)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("ELASTOS_GATEWAY_HEALTH_DEADLINE", result.stderr)
+                self.assertFalse(marker.exists())
+
+    def test_redirect_and_no_content_are_not_success(self):
+        for stub in ("redirect", "no-content"):
+            with self.subTest(stub=stub):
+                result = self.run_smoke(stub)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("HTTP", result.stderr)
+
+    def test_proxy_cannot_supply_the_ok_body(self):
+        import threading
+
+        proxy = socket.socket()
+        proxy.bind(("127.0.0.1", 0))
+        proxy.listen(1)
+        proxy_port = proxy.getsockname()[1]
+
+        def serve_proxy():
+            try:
+                connection, _ = proxy.accept()
+            except OSError:
+                return
+            connection.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+            connection.close()
+
+        thread = threading.Thread(target=serve_proxy, daemon=True)
+        thread.start()
+        self.addCleanup(proxy.close)
+        env = os.environ.copy()
+        env["SMOKE_STUB"] = "other"
+        env["ELASTOS_GATEWAY_ADDR"] = f"127.0.0.1:{self.port}"
+        env["ELASTOS_GATEWAY_HEALTH_DEADLINE"] = "3"
+        env["http_proxy"] = f"http://127.0.0.1:{proxy_port}"
+        env["HTTP_PROXY"] = env["http_proxy"]
+        result = subprocess.run(
+            ["bash", str(SMOKE), str(self.binary)],
+            env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("two bytes OK", result.stderr)
+
+    def test_child_ignoring_term_is_killed(self):
+        child_pid = Path(self.tmp.name) / "ignore.pid"
+        env = os.environ.copy()
+        env["SMOKE_STUB"] = "ignore-term"
+        env["SMOKE_CHILD_PID"] = str(child_pid)
+        env["ELASTOS_GATEWAY_ADDR"] = f"127.0.0.1:{self.port}"
+        env["ELASTOS_GATEWAY_HEALTH_DEADLINE"] = "1"
+        result = subprocess.run(
+            ["bash", str(SMOKE), str(self.binary)],
+            env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertTrue(child_pid.exists(), result.stderr)
+        grandchild = int(child_pid.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(grandchild, 0)
+
+    def test_contract_keeps_localhost_and_this_smoke_does_not_bind_it(self):
+        contract = (ROOT / "docs/LAUNCHER_CONTRACT.md").read_text()
+        self.assertIn("elastos gateway --addr localhost:8090", contract)
+        self.assertIn("host-process.lock", contract)
+        mac = (ROOT / "docs/MAC.md").read_text()
+        install = (ROOT / "scripts/install.sh").read_text()
+        self.assertIn('die "macOS release lookup requires Apple silicon"', install)
+        self.assertIn("macOS release lookup requires Apple silicon", mac)
+        self.assertIn("Apple silicon Mac", mac)
+        self.assertNotIn("gates move together", mac)
+        result = self.run_smoke("ok", addr="localhost:8090")
+        self.assertEqual(result.returncode, 2, result.stderr)
 
     def test_ipv6_loopback_ok(self):
         with socket.socket(socket.AF_INET6) as sock:
