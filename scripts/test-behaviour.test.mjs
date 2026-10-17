@@ -101,3 +101,45 @@ test("behaviour inputs reject a missing pinned installer binary instead of using
   assert.notEqual(result.status, 0, result.stderr);
   assert.match(result.stderr, /node\/bin\/node.*(?:No such file|not found)/);
 });
+
+
+const lifecycleSmokes = [
+  "scripts/browser-window-close-headless-smoke.mjs",
+  "scripts/home-browser-restored-lifecycle-headless-smoke.mjs",
+];
+for (const failedScript of [null, ...lifecycleSmokes]) {
+  test(`behaviour runner ${failedScript ? `stops when ${failedScript} fails` : "runs both lifecycle smokes with pinned Playwright"}`, t => {
+    const { env, log } = fixture(t);
+    const bin = env.PATH.split(":")[0];
+    const shim = `#!${process.execPath}
+      const fs = require("node:fs"), childProcess = require("node:child_process");
+      const args = process.argv.slice(2);
+      if (args[0] === "-p") {
+        const result = childProcess.spawnSync(process.execPath, args, { stdio: "inherit" });
+        process.exit(result.status ?? 1);
+      }
+      fs.appendFileSync(process.env.INPUTS_LOG, JSON.stringify({
+        args, playwrightModule: process.env.ELASTOS_PLAYWRIGHT_MODULE,
+      }) + "\\n");
+      process.exit(args[0] === process.env.FAILED_SCRIPT ? 73 : 0);
+    `;
+    writeFileSync(join(bin, "node"), shim, { mode: 0o755 });
+    // Other sequential shell smokes can share this runner after integration.
+    // Record their invocation without starting an unrelated process fixture.
+    writeFileSync(join(bin, "bash"), shim, { mode: 0o755 });
+    const result = spawnSync("/bin/bash", [script], {
+      env: { ...env, FAILED_SCRIPT: failedScript || "", ELASTOS_PLAYWRIGHT_MODULE: "/wrong/ambient/playwright.mjs" },
+      encoding: "utf8", timeout: 10_000,
+    });
+    assert.equal(result.status, failedScript ? 73 : 0, result.stderr);
+    const commands = readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
+    const expected = failedScript ? lifecycleSmokes.slice(0, lifecycleSmokes.indexOf(failedScript) + 1) : lifecycleSmokes;
+    assert.deepEqual(commands.filter(command => lifecycleSmokes.includes(command.args[0])).map(command => command.args),
+      expected.map(name => [name]));
+    for (const command of commands.filter(command => lifecycleSmokes.includes(command.args[0]))) {
+      assert.equal(command.playwrightModule, join(env.BEHAVIOUR_INPUTS, "browser/node_modules/playwright/index.mjs"));
+    }
+    if (failedScript) assert.equal(commands.at(-1).args[0], failedScript, "failure stops every later check");
+    else assert.equal(commands.at(-1).args[0], "--test", "both smoke results precede the Node suite");
+  });
+}

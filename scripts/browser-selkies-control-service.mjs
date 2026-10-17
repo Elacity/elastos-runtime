@@ -5509,7 +5509,10 @@ async function dispatchBrowserInputEvent(browserPage, event, timeoutMs, supplied
     }
     throw new Error("unsupported browser input event");
   };
-  return suppliedCdp ? dispatch(suppliedCdp) : withBrowserCdp(browserPage, timeoutMs, dispatch);
+  // A lost reply can follow an input effect; reconnecting must not replay it.
+  return suppliedCdp
+    ? dispatch(suppliedCdp)
+    : withBrowserCdp(browserPage, timeoutMs, dispatch, { retryAction: false });
 }
 
 function validateBrowserNavigationUrl(value) {
@@ -6304,9 +6307,10 @@ async function main() {
       const displayStatus = Object.hasOwn(DISPLAY_CONTROL_HTTP_STATUS, error?.code)
         ? DISPLAY_CONTROL_HTTP_STATUS[error.code] : null;
       const inspectionStatus = Object.hasOwn(INSPECTION_HTTP_STATUS, error?.code) ? INSPECTION_HTTP_STATUS[error.code] : null;
-      httpJson(res, inspectionStatus || displayStatus || (error?.code === "invalid_request" ? 400 : 500), {
+      const inputUncertain = error?.code === "operator_outcome_uncertain";
+      httpJson(res, inspectionStatus || displayStatus || (inputUncertain ? 503 : error?.code === "invalid_request" ? 400 : 500), {
         error: error instanceof Error ? error.message : String(error),
-        ...(displayStatus || inspectionStatus ? { code: error.code } : {}),
+        ...(displayStatus || inspectionStatus || inputUncertain ? { code: error.code } : {}),
       });
     }
   });
