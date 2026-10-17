@@ -5473,26 +5473,31 @@ fn extract_zip_archive(
 }
 
 /// The path a whole-archive ZIP extract writes for an entry name, or `None`
-/// when the name holds a NUL byte, is absolute (a root or a drive prefix), or
-/// climbs above the archive root. `archive_entry_uri` then refuses any `..`
-/// that is left. This keeps the rule in the runtime: zip 9 `enclosed_name`
-/// strips a leading `/` or drive prefix and folds `..` instead, which would
-/// write entries that this extract refuses.
+/// when the name holds a NUL byte, is absolute, or climbs above the archive
+/// root. Absolute means a leading `/` or `\` (this includes `\\server\share`
+/// and `\\?\` names) or a drive letter (`C:\x`, `C:/x`, `C:x`). The rule is
+/// the same on every platform: `\` counts as a separator, and a drive letter
+/// is refused also where `Path` has no drive prefix (Linux and macOS).
+/// `archive_entry_uri` then refuses any `..` or `\` that is left. This keeps
+/// the rule in the runtime: zip 9 `enclosed_name` strips a root or drive
+/// prefix and folds `..` instead, which would write entries that this
+/// extract refuses.
 fn zip_entry_enclosed_path(name: &str) -> Option<PathBuf> {
-    if name.contains('\0') {
+    let bytes = name.as_bytes();
+    let rooted = matches!(bytes.first(), Some(b'/' | b'\\'));
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if name.contains('\0') || rooted || drive {
         return None;
     }
-    let path = PathBuf::from(name);
     let mut depth = 0usize;
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => return None,
-            Component::ParentDir => depth = depth.checked_sub(1)?,
-            Component::Normal(_) => depth += 1,
-            Component::CurDir => {}
+    for part in name.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => depth = depth.checked_sub(1)?,
+            _ => depth += 1,
         }
     }
-    Some(path)
+    Some(PathBuf::from(name))
 }
 
 fn archive_entry_uri(destination_uri: &str, path: &Path) -> anyhow::Result<String> {
@@ -7211,6 +7216,46 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn zip_entry_enclosed_path_refuses_root_drive_and_climb_on_every_platform() {
+        let refused = [
+            "/a.txt",
+            "\\a.txt",
+            "C:\\a.txt",
+            "C:/a.txt",
+            "C:a.txt",
+            "c:",
+            "\\\\server\\share\\a.txt",
+            "//server/share/a.txt",
+            "\\\\?\\C:\\a.txt",
+            "\\\\.\\C:\\a.txt",
+            "../a.txt",
+            "..\\a.txt",
+            "Nested/../../a.txt",
+            "Nested\\..\\..\\a.txt",
+            "a\0.txt",
+        ];
+        let accepted: Vec<&str> = refused
+            .into_iter()
+            .filter(|name| zip_entry_enclosed_path(name).is_some())
+            .collect();
+        assert!(accepted.is_empty(), "accepted hostile names: {accepted:?}");
+
+        for name in [
+            "a.txt",
+            "./a.txt",
+            "Nested/a.txt",
+            "Nested/",
+            "Nested/C:a.txt",
+        ] {
+            assert_eq!(
+                zip_entry_enclosed_path(name),
+                Some(PathBuf::from(name)),
+                "{name:?}"
+            );
+        }
+    }
 
     #[test]
     fn object_provider_exposes_object_scheme_only() {

@@ -3921,7 +3921,7 @@ async fn test_library_provider_extract_zip_refuses_absolute_dotdot_and_symlink_e
     // Each archive holds one hostile entry. The whole-archive extract must
     // refuse it and write nothing for it, inside or outside the Library.
     // (archive name, entry kind, entry name, symlink target, expected message)
-    let cases: [(&str, &str, &str, &str, &str); 5] = [
+    let cases: [(&str, &str, &str, &str, &str); 9] = [
         (
             "Absolute.zip",
             "file",
@@ -3948,7 +3948,37 @@ async fn test_library_provider_extract_zip_refuses_absolute_dotdot_and_symlink_e
             "file",
             "..\\backslash-escape.txt",
             "",
-            "invalid library object name",
+            "relative and safe",
+        ),
+        // Windows path forms. Linux and macOS read each as an ordinary name,
+        // so the extract must refuse them by its own rule.
+        (
+            "DriveBackslash.zip",
+            "file",
+            "C:\\drive-backslash-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "DriveSlash.zip",
+            "file",
+            "C:/drive-slash-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "Unc.zip",
+            "file",
+            "\\\\server\\share\\unc-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "Verbatim.zip",
+            "file",
+            "\\\\?\\C:\\verbatim-escape.txt",
+            "",
+            "relative and safe",
         ),
         (
             "Symlink.zip",
