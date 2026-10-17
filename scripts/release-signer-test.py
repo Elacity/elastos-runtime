@@ -2,6 +2,7 @@
 """Public-data/fake-backend refusal tests. One model catalogue round trip signs
 with a throwaway OpenSSL key; no other private keys or real signing."""
 
+import ast
 import base64
 import copy
 import hashlib
@@ -19,28 +20,22 @@ import unittest
 from unittest import mock
 
 SOURCE = Path(__file__).with_name("release-signer.py").resolve()
-OPTIMIZED_SIGNER_RUN = r"""
-import os, shutil, subprocess, sys, tempfile
+# The child loads this test file from a private copy, runs main() on an Intel
+# Mac release input and writes what happened as JSON. It asserts nothing, so a
+# refusal that python -O strips shows up as a signed publication.
+OPTIMIZED_CLI_CHILD = r"""
+import importlib.util, json, sys
 from pathlib import Path
-source_test = Path(sys.argv[1]).resolve()
-root = Path(tempfile.mkdtemp(prefix="elastos-signer-", dir=Path.home()))
-os.chmod(root, 0o700)
-scripts = root / "scripts"
-scripts.mkdir(mode=0o700)
-for name in ("release-signer.py", "release-signer-test.py"):
-    destination = scripts / name
-    destination.write_bytes((source_test.parent / name).read_bytes())
-    destination.chmod(0o700)
-env = os.environ.copy()
-env["ELASTOS_SIGNER_OPT_CHILD"] = "1"
+spec = importlib.util.spec_from_file_location("signer_optimized_child", sys.argv[1])
+tests = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tests)
+case = tests.SignerTests("x86_64_darwin_cli_outcome")
+case.setUp()
 try:
-    completed = subprocess.run(
-        [sys.executable, "-O", str(scripts / "release-signer-test.py"),
-         "SignerTests.test_prepare_refuses_x86_64_darwin_without_a_signature"],
-        cwd=root, env=env)
-    raise SystemExit(completed.returncode)
+    outcome = case.x86_64_darwin_cli_outcome()
 finally:
-    shutil.rmtree(root)
+    case.doCleanups()
+Path(sys.argv[2]).write_text(json.dumps(outcome))
 """
 spec = importlib.util.spec_from_file_location("release_signer", SOURCE)
 S = importlib.util.module_from_spec(spec)
@@ -561,37 +556,99 @@ class SignerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "release fields refused"):
             self.prepare()
 
-    def test_prepare_refuses_x86_64_darwin_without_a_signature(self):
-        # python -O strips assert statements. This refusal must survive that.
-        # The signer walks parent directories and refuses a world-writable
-        # parent, so the optimized run uses a private directory under $HOME.
-        if os.environ.get("ELASTOS_SIGNER_OPT_CHILD") != "1":
-            self.no_process.stop()
+    def x86_64_darwin_cli_outcome(self):
+        """Run main() on an x86_64-darwin input that is valid in every other way."""
+        # Component keys admit the Intel package here, so the platform
+        # allowlist is the only check left that can refuse this input.
+        intel_components = mock.patch.dict(S.COMPONENT_KEYS, {"x86_64-darwin": ("darwin-amd64", "x86_64-darwin")})
+        intel_components.start()
+        self.addCleanup(intel_components.stop)
+        platform = copy.deepcopy(self.manifest["release"]["platforms"]["x86_64-linux"])
+        self.manifest["release"]["platforms"]["x86_64-darwin"] = platform
+        (self.root / "elastos-x86_64-darwin").write_bytes(self.binary)
+        self.manifest["files"]["elastos-x86_64-darwin"] = copy.deepcopy(
+            self.manifest["files"]["elastos-x86_64-linux"])
+        self.approve_manifest()
+        policy_path = self.base / "operator-policy.json"
+        policy_path.write_bytes(S.json_bytes(self.policy))
+        output = self.base / "publication"
+        argv = [str(SOURCE), "--policy", str(policy_path), "--input-root", str(self.root),
+                "--output-root", str(output)]
+        error = None
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(S, "pinned_tools"), \
+             mock.patch.object(S, "github_json", side_effect=self.fetch), \
+             mock.patch.object(sys, "stdin", io.StringIO(DID + "\n")), \
+             mock.patch.object(sys, "stderr", io.StringIO()), mock.patch("builtins.print"), \
+             mock.patch.object(S, "OpenSSLBackend", return_value=FakeBackend()) as backend:
             try:
-                result = subprocess.run(
-                    [sys.executable, "-O", "-c", OPTIMIZED_SIGNER_RUN, str(Path(__file__).resolve())],
-                    text=True, capture_output=True, timeout=120)
-            finally:
-                self.no_process.start()
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("ok", result.stderr.lower())
-            return
-        self.assertGreaterEqual(sys.flags.optimize, 1)
-        self.assertNotIn("x86_64-darwin", S.SIGNED_RELEASE_PLATFORMS)
-        manifest_path = self.root / "signing-input.json"
-        manifest = S.parse_json(manifest_path.read_bytes())
-        manifest["release"]["platforms"]["x86_64-darwin"] = copy.deepcopy(
-            manifest["release"]["platforms"]["x86_64-linux"])
-        data = S.json_bytes(manifest)
-        manifest_path.write_bytes(data)
-        self.policy["manifest_sha256"] = S.sha256(data)
-        signed = self.base / "signed"
-        self.assertFalse(signed.exists())
-        with self.assertRaisesRegex(ValueError, "release platforms refused"):
-            self.prepare()
-        self.assertFalse(signed.exists())
-        self.assertFalse(any(path.name in {"release.json", "release-head.json"}
-                             for path in self.snapshot.rglob("*")))
+                S.main()
+            except Exception as refusal:  # The parent decides which refusal is correct.
+                error = f"{type(refusal).__name__}: {refusal}"
+        return {"optimize": sys.flags.optimize, "isolated": sys.flags.isolated, "error": error,
+                "backend": backend.call_count,
+                "outputs": sorted(path.name for path in output.iterdir()) if output.exists() else None}
+
+    def optimized_cli_outcome(self, signer_source, optimize=True):
+        """Run x86_64_darwin_cli_outcome under python -I -S -O with this signer source."""
+        # The signer refuses a writable output parent, so the copy is private
+        # and sits beside the checkout like the other fixtures.
+        private = Path(tempfile.mkdtemp(prefix=".signer-optimized-", dir=SOURCE.parent.parent))
+        self.addCleanup(shutil.rmtree, private)
+        private.chmod(0o700)
+        scripts = private / "scripts"
+        scripts.mkdir(mode=0o700)
+        (scripts / "release-signer.py").write_text(signer_source)
+        (scripts / "release-signer-test.py").write_bytes(Path(__file__).read_bytes())
+        result_path = private / "outcome.json"
+        self.no_process.stop()
+        try:
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", *(["-O"] if optimize else []), "-c", OPTIMIZED_CLI_CHILD,
+                 str(scripts / "release-signer-test.py"), str(result_path)],
+                text=True, capture_output=True, timeout=120)
+        finally:
+            self.no_process.start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        outcome = json.loads(result_path.read_text())
+        self.assertEqual(outcome["optimize"], 1 if optimize else 0, outcome)
+        return outcome
+
+    def test_optimized_cli_refuses_x86_64_darwin_and_signs_nothing(self):
+        # python -O strips assert statements. The Intel refusal must not.
+        outcome = self.optimized_cli_outcome(SOURCE.read_text())
+        self.assertEqual((outcome["optimize"], outcome["isolated"]), (1, 1), outcome)
+        self.assertEqual(outcome["error"], "ValueError: release platforms refused", outcome)
+        self.assertEqual(outcome["backend"], 0, outcome)
+        self.assertIsNone(outcome["outputs"], outcome)
+
+    def test_optimized_cli_detects_a_refusal_written_as_assert(self):
+        # Rewrite every "release platforms refused" require() as an assert
+        # statement. Without -O that signer still refuses. Under -O the
+        # refusal is gone, so the check in the test above must fail. A later
+        # gate (the package artifact prefix) can still stop this input, which
+        # is why the test above names the refusal it expects.
+        class AssertRefusal(ast.NodeTransformer):
+            count = 0
+
+            def visit_Expr(self, node):
+                call = node.value
+                if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "require"
+                        and len(call.args) == 2 and isinstance(call.args[1], ast.Constant)
+                        and call.args[1].value == "release platforms refused"):
+                    self.count += 1
+                    return ast.copy_location(ast.Assert(test=call.args[0], msg=call.args[1]), node)
+                return self.generic_visit(node)
+
+        transform = AssertRefusal()
+        tree = ast.fix_missing_locations(transform.visit(ast.parse(SOURCE.read_text())))
+        self.assertGreaterEqual(transform.count, 1)
+        weakened = ast.unparse(tree)
+        plain = self.optimized_cli_outcome(weakened, optimize=False)
+        self.assertEqual(plain["error"], "AssertionError: release platforms refused", plain)
+        optimized = self.optimized_cli_outcome(weakened)
+        self.assertEqual(optimized["optimize"], 1, optimized)
+        self.assertNotEqual(optimized["error"], "ValueError: release platforms refused", optimized)
+        self.assertNotEqual(optimized["error"], "AssertionError: release platforms refused", optimized)
 
     def test_signer_accepts_all_three_release_platforms(self):
         platform = self.manifest["release"]["platforms"]["x86_64-linux"]
