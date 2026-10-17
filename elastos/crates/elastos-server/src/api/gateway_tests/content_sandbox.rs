@@ -287,7 +287,7 @@ async fn content_sandbox_site_files_and_admitted_bundle_preserve_provenance() {
     assert_eq!(home.status(), StatusCode::OK);
     assert_eq!(home.headers().get("content-security-policy").unwrap(),
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
-    super::write_gateway_health_lock(dir.path(), std::process::id());
+    let _gateway_lock = super::hold_gateway_health_lock(dir.path());
     let health = app
         .oneshot(
             Request::builder()
