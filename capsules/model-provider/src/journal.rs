@@ -4220,7 +4220,10 @@ mod tests {
             }
             let temp_before = file_bytes(&temp);
             let writer = open_journal_directory(&directory).unwrap();
-            writer.try_lock().unwrap();
+            // A child forked on another test thread can briefly hold a copy of an
+            // earlier lock fd on this directory (#381); take the lock with the
+            // provider's own bounded retry instead of one try.
+            lock_journal_directory(&writer).unwrap();
             assert_eq!(
                 RunJournal::open(root.clone()).err().unwrap().code(),
                 "selection_unavailable"
