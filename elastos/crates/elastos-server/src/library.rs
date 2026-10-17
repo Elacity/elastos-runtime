@@ -666,7 +666,12 @@ pub(crate) fn handle_library_download_selection_bytes_with_format(
 }
 
 mod desktop_background;
-pub(crate) use desktop_background::read_library_object_for_desktop_background;
+#[cfg(test)]
+pub(crate) use desktop_background::PROTECTION_CHECK_LEGACY_SOURCES;
+pub(crate) use desktop_background::{
+    read_library_object_for_desktop_background, DesktopBackgroundSourceRefusal,
+    ProtectionCheckBudget,
+};
 
 /// Test fixture: a publish record for `object_uri` with `content_security`.
 #[cfg(test)]
@@ -683,6 +688,18 @@ pub(crate) fn write_test_publish_record(
         content_security,
         None,
     );
+}
+
+/// Test probe: the source digest a publish record names, if any.
+#[cfg(test)]
+pub(crate) fn test_publish_record_source_sha256(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+) -> Option<String> {
+    read_publish_record(data_dir, principal_id, object_uri)
+        .unwrap()
+        .source_sha256
 }
 
 /// Test fixture: a publish record that also names the digest of the source
@@ -6938,15 +6955,26 @@ fn digest32_sha256_label(digest: elastos_protected_content_contracts::Digest32) 
     format!("sha256:{}", hex::encode(digest.as_bytes()))
 }
 
+/// One publish record as stored, with the revision its bytes had when read,
+/// so a later write can replace it only if nothing changed it since.
+struct StoredPublishRecord {
+    record_uri: String,
+    record_path: PathBuf,
+    revision: String,
+    record: LibraryPublishRecord,
+}
+
 /// Every publish record `principal_id` holds. Fails when the record store
-/// cannot be listed, holds more than `limit` records, or holds a record that
-/// cannot be read. Staged writes (`.<name>.tmp`) and names that are not a
-/// record's are skipped, the same as `read_publish_record` never reads them.
+/// cannot be listed, holds more than `limit` records, holds a record that
+/// cannot be read, or `deadline` passes. Staged writes (`.<name>.tmp`) and
+/// names that are not a record's are skipped, the same as
+/// `read_publish_record` never reads them.
 fn read_all_publish_records(
     data_dir: &Path,
     principal_id: &str,
     limit: usize,
-) -> anyhow::Result<Vec<LibraryPublishRecord>> {
+    deadline: std::time::Instant,
+) -> anyhow::Result<Vec<StoredPublishRecord>> {
     let root = crate::auth::principal_localhost_root(principal_id);
     let dir_uri = publish_records_dir_uri(&root);
     let dir_path = rooted_localhost_fs_path(data_dir, &dir_uri)
@@ -6958,6 +6986,9 @@ fn read_all_publish_records(
     };
     let mut records = Vec::new();
     for entry in entries {
+        if std::time::Instant::now() >= deadline {
+            bail!("library publish records were not all read in time");
+        }
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
@@ -6972,16 +7003,47 @@ fn read_all_publish_records(
             bail!("library holds more publish records than this check reads");
         }
         let record_uri = format!("{dir_uri}/{name}");
+        let record_path = entry.path();
         let bytes = crate::auth::read_principal_root_object(
             data_dir,
             principal_id,
             &root,
             &record_uri,
-            &entry.path(),
+            &record_path,
         )?;
-        records.push(serde_json::from_slice(&bytes)?);
+        let revision =
+            crate::auth::principal_root_object_revision(principal_id, &record_uri, &bytes);
+        records.push(StoredPublishRecord {
+            record: serde_json::from_slice(&bytes)?,
+            record_uri,
+            record_path,
+            revision,
+        });
     }
     Ok(records)
+}
+
+/// Writes `record` back with the digest of its source, only if the stored
+/// record is still the one read (same revision). A record changed since then
+/// is left as it is; the digest is found again on the next check.
+fn remember_publish_record_source_digest(
+    data_dir: &Path,
+    principal_id: &str,
+    stored: &StoredPublishRecord,
+    source_sha256: &str,
+) -> anyhow::Result<()> {
+    let mut record = stored.record.clone();
+    record.source_sha256 = Some(source_sha256.to_string());
+    let bytes = serde_json::to_vec_pretty(&record)?;
+    crate::auth::write_principal_root_object_if_revision(
+        data_dir,
+        principal_id,
+        &crate::auth::principal_localhost_root(principal_id),
+        &stored.record_uri,
+        &stored.record_path,
+        &bytes,
+        crate::auth::PrincipalRootObjectPrecondition::Revision(&stored.revision),
+    )
 }
 
 fn read_publish_record(

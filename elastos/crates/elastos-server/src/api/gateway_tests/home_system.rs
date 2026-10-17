@@ -6067,66 +6067,327 @@ async fn test_home_background_from_object_refuses_protected_bytes_after_copy_ren
     assert_eq!(status, StatusCode::OK, "{text}");
 }
 
-/// A protected record written before records named their digest: a copy is
-/// found by reading the source the record names; once that source is renamed
-/// away, the protected bytes are unknown, so every picture is refused.
-#[tokio::test]
-async fn test_home_background_from_object_legacy_protected_record_fails_closed() {
-    let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(test_state(dir.path()));
-    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
-    let _protection =
-        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
-    let root = crate::auth::principal_localhost_root(&admin.principal_id);
-    let protected_bytes = test_png_picture(800, 600, b"legacy-protected");
-    let protected_uri = write_home_principal_object_bytes_for_authority(
-        dir.path(),
-        &admin,
-        "Pictures/legacy.png",
-        &protected_bytes,
-    );
-    let other_uri = write_home_principal_object_bytes_for_authority(
-        dir.path(),
-        &admin,
-        "Pictures/other.png",
-        &test_png_picture(800, 600, b"other-picture"),
-    );
-    crate::library::write_test_publish_record(
-        dir.path(),
-        &admin.principal_id,
-        &protected_uri,
-        serde_json::json!({ "published_payload": "runtime_custody_encrypted", "key_release_required": false }),
-    );
-    let library_token =
-        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
-    let set = |uri: String| {
-        let app = app.clone();
-        let home = admin.home_token.clone();
-        let library = library_token.clone();
-        async move { set_background_from_object(&app, home, Some(library), &uri).await }
-    };
+/// Builds a Library with one protected picture whose publish record was
+/// written before records named their digest, plus one ordinary picture.
+struct LegacyProtectedLibrary {
+    _dir: tempfile::TempDir,
+    data_dir: std::path::PathBuf,
+    app: axum::Router,
+    admin: TestPasskeyAuthority,
+    root: String,
+    library_token: String,
+    protected_bytes: Vec<u8>,
+    protected_uri: String,
+    other_uri: String,
+}
 
-    let copy_uri = library_object_op(
-        dir.path(),
-        &admin,
-        serde_json::json!({ "op": "copy", "uri": protected_uri, "target_parent_uri": format!("{root}/Documents") }),
-    );
-    let (status, text) = set(copy_uri).await;
+impl LegacyProtectedLibrary {
+    fn new(content_security: serde_json::Value) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let app = gateway_router(test_state(&data_dir));
+        let admin = passkey_authority_with_name(&data_dir, Some("admin"));
+        let _protection =
+            crate::auth::store_test_principal_root_protection(&data_dir, &admin.principal_id);
+        let root = crate::auth::principal_localhost_root(&admin.principal_id);
+        let protected_bytes = test_png_picture(800, 600, b"legacy-protected");
+        let protected_uri = write_home_principal_object_bytes_for_authority(
+            &data_dir,
+            &admin,
+            "Pictures/legacy.png",
+            &protected_bytes,
+        );
+        let other_uri = write_home_principal_object_bytes_for_authority(
+            &data_dir,
+            &admin,
+            "Pictures/other.png",
+            &test_png_picture(800, 600, b"other-picture"),
+        );
+        crate::library::write_test_publish_record(
+            &data_dir,
+            &admin.principal_id,
+            &protected_uri,
+            content_security,
+        );
+        let library_token =
+            projection_launch_token_for_authority_context(&data_dir, LIBRARY_CAPSULE_ID, &admin);
+        Self {
+            _dir: dir,
+            data_dir,
+            app,
+            admin,
+            root,
+            library_token,
+            protected_bytes,
+            protected_uri,
+            other_uri,
+        }
+    }
+
+    async fn set(&self, uri: &str) -> (StatusCode, String) {
+        set_background_from_object(
+            &self.app,
+            self.admin.home_token.clone(),
+            Some(self.library_token.clone()),
+            uri,
+        )
+        .await
+    }
+
+    fn op(&self, request: serde_json::Value) -> String {
+        library_object_op(&self.data_dir, &self.admin, request)
+    }
+
+    fn recorded_digest(&self) -> Option<String> {
+        crate::library::test_publish_record_source_sha256(
+            &self.data_dir,
+            &self.admin.principal_id,
+            &self.protected_uri,
+        )
+    }
+}
+
+fn legacy_custody_security() -> serde_json::Value {
+    serde_json::json!({ "published_payload": "runtime_custody_encrypted", "key_release_required": false })
+}
+
+fn sha256_label(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+/// A protected record written before records named their digest: its source
+/// is read once while it is still in place, a copy is refused, and the digest
+/// is kept in the record. After that the source can move and its bytes are
+/// still refused, while other pictures are allowed.
+#[tokio::test]
+async fn test_home_background_from_object_legacy_protected_record_is_checked_once_and_kept() {
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let root = library.root.clone();
+    assert_eq!(library.recorded_digest(), None);
+
+    let copy_uri = library.op(serde_json::json!({
+        "op": "copy", "uri": library.protected_uri, "target_parent_uri": format!("{root}/Documents"),
+    }));
+    let (status, text) = library.set(&copy_uri).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "copy: {text}");
     assert!(text.contains("protected content cannot be"), "copy: {text}");
-    let (status, text) = set(other_uri.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{text}");
-
-    let renamed_uri = library_object_op(
-        dir.path(),
-        &admin,
-        serde_json::json!({ "op": "rename", "uri": protected_uri, "name": "renamed.png" }),
+    assert_eq!(
+        library.recorded_digest(),
+        Some(sha256_label(&library.protected_bytes)),
+        "the digest found is kept in the record"
     );
-    for uri in [renamed_uri, other_uri] {
-        let (status, text) = set(uri.clone()).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {text}");
-        assert!(text.contains("cannot confirm"), "{uri}: {text}");
+
+    let renamed_uri = library.op(serde_json::json!({
+        "op": "rename", "uri": library.protected_uri, "name": "renamed.png",
+    }));
+    let (status, text) = library.set(&renamed_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "renamed: {text}");
+    assert!(
+        text.contains("protected content cannot be"),
+        "renamed: {text}"
+    );
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::OK, "other: {text}");
+}
+
+/// Recovery: a legacy protected record whose file was moved before Runtime
+/// kept its digest. Its bytes are unknown, so every picture is refused, and the
+/// refusal names the file, its folder and the next step. When the person moves
+/// the file back, the check passes, the digest is kept, and the file can then
+/// move again without blocking anything.
+#[tokio::test]
+async fn test_home_background_from_object_legacy_record_not_in_place_names_the_file_and_recovers() {
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let root = library.root.clone();
+    let moved_uri = library.op(serde_json::json!({
+        "op": "move", "uri": library.protected_uri, "target_parent_uri": format!("{root}/Documents"),
+    }));
+
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert_eq!(
+        text,
+        "Library cannot check your protected file \"legacy.png\" because it is not in \"Pictures\". \
+         Move it back to \"Pictures\", then try again. \
+         Or upload the picture in System > Background > Choose image."
+    );
+    let (status, text) = library.set(&moved_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "moved: {text}");
+    assert_eq!(library.recorded_digest(), None, "nothing is guessed");
+
+    // The person follows the message.
+    let back_uri = library.op(serde_json::json!({
+        "op": "move", "uri": moved_uri, "target_parent_uri": format!("{root}/Pictures"),
+    }));
+    assert_eq!(back_uri, library.protected_uri);
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::OK, "after move back: {text}");
+    assert_eq!(
+        library.recorded_digest(),
+        Some(sha256_label(&library.protected_bytes))
+    );
+
+    // Now the file can move again; its bytes stay refused.
+    let moved_again_uri = library.op(serde_json::json!({
+        "op": "move", "uri": library.protected_uri, "target_parent_uri": format!("{root}/Desktop"),
+    }));
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::OK, "after second move: {text}");
+    let (status, text) = library.set(&moved_again_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "moved again: {text}");
+    assert!(
+        text.contains("protected content cannot be"),
+        "moved again: {text}"
+    );
+}
+
+/// The refusal names one file and counts the others that need the same step.
+#[tokio::test]
+async fn test_home_background_from_object_legacy_records_not_in_place_are_counted() {
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    for name in ["second.png", "third.png"] {
+        let uri = write_home_principal_object_bytes_for_authority(
+            &library.data_dir,
+            &library.admin,
+            &format!("Pictures/{name}"),
+            &test_png_picture(800, 600, name.as_bytes()),
+        );
+        crate::library::write_test_publish_record(
+            &library.data_dir,
+            &library.admin.principal_id,
+            &uri,
+            legacy_custody_security(),
+        );
+        library.op(serde_json::json!({ "op": "trash", "uri": uri }));
     }
+    library.op(serde_json::json!({ "op": "trash", "uri": library.protected_uri }));
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(
+        text.starts_with("Library cannot check your protected file \""),
+        "{text}"
+    );
+    assert!(
+        text.contains("Then do the same for 2 more protected files."),
+        "{text}"
+    );
+}
+
+/// A legacy Runtime custody record needs no file at all: custody's journal
+/// holds the digest of the exact bytes it protected. A file that was moved or
+/// deleted before Runtime kept the digest then blocks nothing, and a copy of
+/// those bytes is still refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_home_background_from_object_legacy_custody_record_uses_custody_journal() {
+    use std::os::unix::fs::PermissionsExt;
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let root = library.root.clone();
+    let protected_content_root = library.data_dir.join("protected-content");
+    std::fs::create_dir_all(&protected_content_root).unwrap();
+    std::fs::set_permissions(
+        &protected_content_root,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    use sha2::Digest as _;
+    let preparation = elastos_protected_content_runtime::RuntimeMediaPreparationRecord::new(
+        &library.admin.principal_id,
+        &library.protected_uri,
+        "protected_principal_root",
+        elastos_protected_content_contracts::Digest32::new(
+            sha2::Sha256::digest(&library.protected_bytes).into(),
+        ),
+        "media",
+        "creator-account",
+        "0x00000000000000000000000000000000000000a1",
+        elastos_protected_content_contracts::Digest32::new([0x71; 32]),
+    )
+    .unwrap();
+    crate::protected_content_runtime::runtime_mint_journal(&library.data_dir)
+        .persist_media_preparation(&preparation)
+        .unwrap();
+    let copy_uri = library.op(serde_json::json!({
+        "op": "copy", "uri": library.protected_uri, "target_parent_uri": format!("{root}/Documents"),
+    }));
+    library.op(serde_json::json!({ "op": "trash", "uri": library.protected_uri }));
+
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::OK, "other: {text}");
+    let (status, text) = library.set(&copy_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "copy: {text}");
+    assert!(text.contains("protected content cannot be"), "copy: {text}");
+    assert_eq!(
+        library.recorded_digest(),
+        Some(sha256_label(&library.protected_bytes))
+    );
+}
+
+/// The legacy check is bounded per request: at most 8 sources hashed, at
+/// most 32 MiB read, and a deadline. Past a limit it fails closed with a plain
+/// message; the digests found so far are kept, so the next try goes on.
+#[tokio::test]
+async fn test_home_background_from_object_legacy_check_is_bounded() {
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    for index in 0..crate::library::PROTECTION_CHECK_LEGACY_SOURCES {
+        let name = format!("Pictures/legacy-{index}.png");
+        let uri = write_home_principal_object_bytes_for_authority(
+            &library.data_dir,
+            &library.admin,
+            &name,
+            &test_png_picture(800, 600, name.as_bytes()),
+        );
+        crate::library::write_test_publish_record(
+            &library.data_dir,
+            &library.admin.principal_id,
+            &uri,
+            legacy_custody_security(),
+        );
+    }
+    // Nine legacy sources: the first request hashes eight, then stops.
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert_eq!(
+        text,
+        "Library did not finish the check of your protected files. Try again."
+    );
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::OK, "second try: {text}");
+
+    // The byte limit and the deadline, on a fresh legacy record.
+    let fresh = LegacyProtectedLibrary::new(legacy_custody_security());
+    let read = |budget: crate::library::ProtectionCheckBudget| {
+        crate::library::read_library_object_for_desktop_background(
+            &fresh.data_dir,
+            &fresh.admin.principal_id,
+            &fresh.other_uri,
+            10 * 1024 * 1024,
+            budget,
+        )
+    };
+    let now = std::time::Instant::now();
+    let full = crate::library::ProtectionCheckBudget::for_request(now);
+    assert_eq!(
+        read(crate::library::ProtectionCheckBudget {
+            legacy_bytes: 16,
+            ..full
+        }),
+        Err(crate::library::DesktopBackgroundSourceRefusal::CheckUnfinished)
+    );
+    assert_eq!(
+        read(crate::library::ProtectionCheckBudget {
+            deadline: now,
+            ..full
+        }),
+        Err(crate::library::DesktopBackgroundSourceRefusal::CheckUnfinished)
+    );
+    assert_eq!(fresh.recorded_digest(), None);
+    assert!(read(full).is_ok());
+    assert_eq!(
+        fresh.recorded_digest(),
+        Some(sha256_label(&fresh.protected_bytes))
+    );
 }
 
 /// The set-from-object path reads a file from disk on Home's request, so every

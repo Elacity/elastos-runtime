@@ -8091,20 +8091,47 @@ fn require_bounded_background_image(bytes: &[u8]) -> anyhow::Result<&'static str
 const HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES: u64 =
     (HOME_BACKGROUND_IMAGE_MAX_BYTES as u64) * 2;
 
-fn home_save_background_image_from_object(
+/// Longest a desktop background request waits for Library's read and
+/// protection check. The check stops itself earlier (its own budget); this
+/// bounds the wait if the disk itself stalls.
+const HOME_BACKGROUND_IMAGE_SOURCE_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// Library's read, under Library's scope rules: the principal's own files,
+/// never Trash, Runtime-private areas, links, or protected content. It reads
+/// and hashes files, so it runs on a blocking thread, never on this handler's.
+/// Nothing is saved from a read that did not answer in time.
+async fn read_desktop_background_source(
+    data_dir: std::path::PathBuf,
+    principal_id: String,
+    source_uri: String,
+) -> Result<Vec<u8>, Response> {
+    use crate::library::DesktopBackgroundSourceRefusal as Refusal;
+    let read = tokio::task::spawn_blocking(move || {
+        crate::library::read_library_object_for_desktop_background(
+            &data_dir,
+            &principal_id,
+            &source_uri,
+            HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES,
+            crate::library::ProtectionCheckBudget::for_request(std::time::Instant::now()),
+        )
+    });
+    let refused = |refusal: Refusal| {
+        (StatusCode::BAD_REQUEST, refusal.message().into_owned()).into_response()
+    };
+    match tokio::time::timeout(HOME_BACKGROUND_IMAGE_SOURCE_READ_TIMEOUT, read).await {
+        Ok(Ok(Ok(bytes))) => Ok(bytes),
+        Ok(Ok(Err(refusal))) => Err(refused(refusal)),
+        Ok(Err(_)) => Err(refused(Refusal::Unreadable)),
+        Err(_) => Err(refused(Refusal::CheckUnfinished)),
+    }
+}
+
+fn home_save_background_image_from_library_bytes(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
-    source_uri: &str,
+    bytes: Vec<u8>,
 ) -> anyhow::Result<HomeAppearanceSummary> {
-    // Library's read, under Library's scope rules: the principal's own files,
-    // never Trash, Runtime-private areas, links, or protected content.
-    let bytes = crate::library::read_library_object_for_desktop_background(
-        data_dir,
-        &home_browser_principal_id(context),
-        source_uri.trim(),
-        HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES,
-    )
-    .map_err(|refusal| home_appearance_preference_request_error(refusal.message()))?;
     validate_background_image_len(bytes.len())?;
     let file_name = require_bounded_background_image(&bytes)?;
     home_save_background_image(data_dir, context, file_name, bytes)
@@ -8437,7 +8464,31 @@ pub(super) async fn home_background_image_set_from_object(
     ) {
         return home_error_response(anyhow::anyhow!("object provider audit failed: {err}"));
     }
-    match home_save_background_image_from_object(&state.data_dir, &context, &req.source_uri) {
+    let bytes = match read_desktop_background_source(
+        state.data_dir.clone(),
+        home_browser_principal_id(&context),
+        req.source_uri.trim().to_string(),
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(response) => {
+            let _ = audit(
+                "object.provider.failed",
+                "failed",
+                "Library refused an object for the desktop background",
+            );
+            return response;
+        }
+    };
+    let saved = tokio::task::spawn_blocking({
+        let data_dir = state.data_dir.clone();
+        let context = context.clone();
+        move || home_save_background_image_from_library_bytes(&data_dir, &context, bytes)
+    })
+    .await
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("background image could not be saved")));
+    match saved {
         Ok(summary) => {
             let _ = audit(
                 "object.provider.completed",
