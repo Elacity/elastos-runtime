@@ -5013,7 +5013,7 @@ async fn test_home_summary_and_events_include_browser_wallet_approvals() {
 
 /// A PNG whose header declares `width` x `height`, followed by `marker` so a
 /// test can find (or prove it cannot find) the bytes on disk.
-fn test_png_picture(width: u32, height: u32, marker: &[u8]) -> Vec<u8> {
+pub(super) fn test_png_picture(width: u32, height: u32, marker: &[u8]) -> Vec<u8> {
     let mut bytes = crate::image_bounds::tests::png_header(width, height);
     bytes.extend_from_slice(marker);
     bytes
@@ -5725,7 +5725,7 @@ async fn post_background_from_object(
 /// The whole flow: Library asks for a ticket with `library_token` (when set),
 /// then Home sends it with its own authority. A refused ticket request returns
 /// that refusal.
-async fn set_background_from_object(
+pub(super) async fn set_background_from_object(
     app: &axum::Router,
     home_token: String,
     library_token: Option<String>,

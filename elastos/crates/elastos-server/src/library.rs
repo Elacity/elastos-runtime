@@ -2083,10 +2083,6 @@ async fn library_publish(
         );
         let loaded =
             validate_runtime_custody_publish_input(data_dir, principal_id, &target, protection)?;
-        // Remember the protected bytes, so protection follows them through a
-        // copy, rename or move (see `LibraryPublishRecord::source_sha256`).
-        let source_sha256 =
-            content_sha256_label(&read_library_file_bytes(data_dir, principal_id, &target)?);
         let source_storage = published_source_storage(data_dir, principal_id, &target)?.to_string();
         let Some((state, authority)) = gateway_authority else {
             anyhow::bail!(
@@ -2112,13 +2108,20 @@ async fn library_publish(
             price: loaded.price,
             source_storage,
         };
-        let facts = crate::api::gateway::runtime_custody_publish_via_gateway(
-            state,
-            authority,
-            registry,
-            runtime_input,
-        )
-        .await?;
+        // Custody returns the digest of the exact plaintext bytes it read and
+        // protected, from the same read, so the record names those bytes and
+        // not a second read of a source that may change in between. Protection
+        // then follows them through a copy, rename or move (see
+        // `LibraryPublishRecord::source_sha256`).
+        let (facts, source_object_digest) =
+            crate::api::gateway::runtime_custody_publish_via_gateway(
+                state,
+                authority,
+                registry,
+                runtime_input,
+            )
+            .await?;
+        let source_sha256 = digest32_sha256_label(source_object_digest);
         let record = LibraryPublishRecord {
             schema: "elastos.library.publish-record/v1".to_string(),
             object_uri: target.uri.clone(),
@@ -6928,6 +6931,11 @@ fn publish_record_uri(localhost_root: &str, object_uri: &str) -> String {
 /// `sha256:<hex>` of `bytes`.
 fn content_sha256_label(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+/// `sha256:<hex>` of a SHA-256 digest that custody already computed.
+fn digest32_sha256_label(digest: elastos_protected_content_contracts::Digest32) -> String {
+    format!("sha256:{}", hex::encode(digest.as_bytes()))
 }
 
 /// Every publish record `principal_id` holds. Fails when the record store

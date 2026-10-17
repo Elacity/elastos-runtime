@@ -10315,3 +10315,171 @@ async fn test_library_provider_unpublish_and_repair_update_status() {
         "local_pinned"
     );
 }
+
+/// The record of a protected publish names the bytes custody read and
+/// protected, from that same read. Here the source changes after Library starts
+/// the publish and before custody reads it: the record must name what custody
+/// protected, so a copy of those bytes is refused as the desktop background.
+/// It is still refused after the source file changes again later.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_runtime_custody_publish_records_the_bytes_custody_protected() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    reset_mock_content_publish_requests();
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                dir.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
+    let _process_fixture = crate::protected_content_runtime::tests::register_runtime_custody_process_providers_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
+    crate::protected_content_runtime::tests::register_runtime_custody_mock_media_provider_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
+    let creator = passkey_authority_with_profile_role_credential(
+        dir.path(),
+        "creator",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-creator",
+    );
+    let creator_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &creator);
+    let creator_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 1)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &creator.principal_id,
+        "eip155:8453",
+        &creator_account_id,
+        10,
+    )
+    .await;
+    let app = gateway_router(state.clone());
+    let root = crate::auth::principal_localhost_root(&creator.principal_id);
+    let uri = format!("{root}/Pictures/protected.png");
+    let protected_bytes = super::home_system::test_png_picture(800, 600, b"custody-protected");
+    let earlier_bytes = super::home_system::test_png_picture(800, 600, b"earlier-version");
+    let later_bytes = super::home_system::test_png_picture(800, 600, b"later-version");
+    write_library_bytes(&app, &creator_token, &uri, &protected_bytes).await;
+    let publish_body = json!({
+        "uri": uri,
+        "protection": {
+            "mode": "runtime_custody",
+            "copies": "0x2",
+            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+        },
+    });
+    // Custody prepares `protected_bytes`, then waits for the Wallet.
+    let (_, pending) =
+        post_library(app.clone(), &creator_token, "publish", publish_body.clone()).await;
+    assert_eq!(
+        pending["message"],
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement",
+        "{pending}"
+    );
+    let _ = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    // The publish starts while the file holds other bytes; they change back
+    // to the prepared bytes before custody reads them.
+    write_library_bytes(&app, &creator_token, &uri, &earlier_bytes).await;
+    {
+        let data_dir = dir.path().to_path_buf();
+        let principal_id = creator.principal_id.clone();
+        let uri = uri.clone();
+        let protected_bytes = protected_bytes.clone();
+        set_mock_creator_mint_source_describe_hook(move || {
+            crate::auth::write_principal_root_object(
+                &data_dir,
+                &principal_id,
+                &crate::auth::principal_localhost_root(&principal_id),
+                &uri,
+                &library_object_path(&data_dir, &uri),
+                &protected_bytes,
+            )
+            .unwrap();
+        });
+    }
+    let (status, published) =
+        post_library(app.clone(), &creator_token, "publish", publish_body).await;
+    let hook_left = mock_creator_mint_source_describe_hook()
+        .lock()
+        .unwrap()
+        .take()
+        .is_some();
+    assert!(!hook_left, "the source change ran inside the publish");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(published["status"], "ok", "{published}");
+
+    // A copy of the bytes custody protected is refused; so is the file
+    // itself. Another picture is allowed.
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &creator);
+    let set = |uri: String| {
+        let app = app.clone();
+        let home = creator.home_token.clone();
+        let library = library_token.clone();
+        async move {
+            super::home_system::set_background_from_object(&app, home, Some(library), &uri).await
+        }
+    };
+    let copy_uri = format!("{root}/Documents/copy.png");
+    write_library_bytes(&app, &creator_token, &copy_uri, &protected_bytes).await;
+    let other_uri = format!("{root}/Pictures/other.png");
+    write_library_bytes(
+        &app,
+        &creator_token,
+        &other_uri,
+        &super::home_system::test_png_picture(800, 600, b"other-picture"),
+    )
+    .await;
+    let (status, text) = set(copy_uri.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "copy: {text}");
+    assert!(text.contains("protected content cannot be"), "copy: {text}");
+    let (status, text) = set(other_uri.clone()).await;
+    assert_eq!(status, StatusCode::OK, "other: {text}");
+
+    // The source changes after the publish. The record still names the bytes
+    // custody protected, so their copy is still refused.
+    crate::auth::write_principal_root_object(
+        dir.path(),
+        &creator.principal_id,
+        &root,
+        &uri,
+        &library_object_path(dir.path(), &uri),
+        &later_bytes,
+    )
+    .unwrap();
+    let (status, text) = set(copy_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "copy after edit: {text}");
+    assert!(
+        text.contains("protected content cannot be"),
+        "copy after edit: {text}"
+    );
+    let (status, text) = set(other_uri).await;
+    assert_eq!(status, StatusCode::OK, "other after edit: {text}");
+}
