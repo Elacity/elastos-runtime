@@ -1596,7 +1596,12 @@ function createWindow({
     toggleWindowMaximize(id);
   });
   attachWindowDrag(node, handle, focusWindow, persistBrowserSession);
-  node.detachForwardedWindowDrag = attachForwardedWindowDrag(node, focusWindow, persistBrowserSession);
+  node.detachForwardedWindowDrag = attachForwardedWindowDrag(
+    node,
+    focusWindow,
+    persistBrowserSession,
+    () => browserLaunchAuthority(node.querySelector(".window-frame")?.dataset.route || "")?.homeToken || "",
+  );
   attachWindowResize(node, focusWindow, persistBrowserSession);
 
   if (maximizeByDefault && shouldOpenMaximizedByDefault()) {

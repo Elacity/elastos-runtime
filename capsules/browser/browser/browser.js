@@ -846,13 +846,20 @@ function postHomeBrowserWindowCloseResult(message, owner, outcome, error = null)
 /** Home draws only the window dots over this bar, so a press on an empty part
  * of it moves the window the way a title bar does. */
 function installChromeWindowDrag(chrome) {
-  if (!chrome || window.parent === window) {
+  // Home moves the window only for the launch token it gave this frame.
+  if (!chrome || window.parent === window || !launchToken) {
     return;
   }
   let pointerId = null;
   const send = (phase, event) => {
     window.parent.postMessage(
-      { type: WINDOW_DRAG_MESSAGE_TYPE, phase, clientX: event.clientX, clientY: event.clientY },
+      {
+        type: WINDOW_DRAG_MESSAGE_TYPE,
+        homeToken: launchToken,
+        phase,
+        clientX: event.clientX,
+        clientY: event.clientY,
+      },
       "*",
     );
   };

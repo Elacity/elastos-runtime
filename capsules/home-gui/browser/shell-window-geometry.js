@@ -419,10 +419,18 @@ export function attachWindowDrag(windowNode, handle, focusWindow, onWindowGeomet
 export const WINDOW_DRAG_MESSAGE_TYPE = "elastos.home.window-drag/v1";
 
 /** A unified-toolbar capsule draws its own top bar, so a press on an empty
- * part of that bar arrives as messages. Only this window's frame can move it.
+ * part of that bar arrives as messages. Only this window's frame can move it:
+ * the message must come from that frame's WindowProxy with the opaque origin
+ * and carry the launch token Home gave that frame (`frameHomeToken`), in the
+ * exact `elastos.home.window-drag/v1` shape. Anything else is ignored.
  * Positions are frame-relative and are added to the frame's current place,
  * because some engines report screen positions offset or flipped. */
-export function attachForwardedWindowDrag(windowNode, focusWindow, onWindowGeometryChange = null) {
+export function attachForwardedWindowDrag(
+  windowNode,
+  focusWindow,
+  onWindowGeometryChange = null,
+  frameHomeToken = null,
+) {
   let dragging = null;
   const finish = () => {
     if (!dragging) {
@@ -436,15 +444,27 @@ export function attachForwardedWindowDrag(windowNode, focusWindow, onWindowGeome
   };
   const listener = (event) => {
     const data = event.data;
-    if (!data || data.type !== WINDOW_DRAG_MESSAGE_TYPE) {
+    // Capsule frames are sandboxed without allow-same-origin: origin "null".
+    if (
+      event.origin !== "null" ||
+      !data ||
+      typeof data !== "object" ||
+      data.type !== WINDOW_DRAG_MESSAGE_TYPE ||
+      Object.keys(data).sort().join(",") !== "clientX,clientY,homeToken,phase,type" ||
+      !["start", "move", "end"].includes(data.phase)
+    ) {
       return;
     }
     const frame = windowNode.querySelector(".window-frame");
+    const homeToken = typeof frameHomeToken === "function" ? frameHomeToken() : "";
     if (
       windowNode.dataset.windowChromeMode !== WINDOW_CHROME_UNIFIED_TOOLBAR ||
       !windowNode.isConnected ||
       !frame?.contentWindow ||
-      event.source !== frame.contentWindow
+      event.source !== frame.contentWindow ||
+      typeof homeToken !== "string" ||
+      !homeToken ||
+      data.homeToken !== homeToken
     ) {
       return;
     }

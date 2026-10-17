@@ -27,7 +27,7 @@ test("Browser and Home name the same window-drag message", () => {
   assert.equal(stringConstant(browserSource, "WINDOW_DRAG_MESSAGE_TYPE"), MESSAGE_TYPE);
 });
 
-function browserToolbar() {
+function browserToolbar({ launchToken = "frame-token" } = {}) {
   const posted = [];
   const listeners = {};
   const captured = [];
@@ -37,6 +37,7 @@ function browserToolbar() {
   };
   const context = vm.createContext({
     WINDOW_DRAG_MESSAGE_TYPE: MESSAGE_TYPE,
+    launchToken,
     window: { parent: { postMessage: (message, origin) => posted.push({ message, origin }) } },
   });
   vm.runInContext(`${declaration(browserSource, "installChromeWindowDrag")}\nthis.install = installChromeWindowDrag;`, context);
@@ -51,7 +52,7 @@ function browserToolbar() {
     });
     return prevented;
   };
-  return { posted, captured, press };
+  return { posted, captured, press, listeners };
 }
 
 test("an empty part of the Browser toolbar sends start, move and end to Home", () => {
@@ -69,6 +70,13 @@ test("an empty part of the Browser toolbar sends start, move and end to Home", (
       [MESSAGE_TYPE, "end", 180, 100, "*"],
     ],
   );
+  assert.ok(toolbar.posted.every(({ message }) => message.homeToken === "frame-token"), "each message carries the frame's launch token");
+});
+
+test("a Browser frame without a launch token sends no drag messages", () => {
+  const toolbar = browserToolbar({ launchToken: "" });
+  assert.deepEqual(Object.keys(toolbar.listeners), []);
+  assert.deepEqual(toolbar.posted, []);
 });
 
 test("toolbar controls, other buttons and a second pointer keep their own behavior", () => {
@@ -86,7 +94,7 @@ test("toolbar controls, other buttons and a second pointer keep their own behavi
   assert.deepEqual(toolbar.posted.map(({ message }) => message.phase), ["start"]);
 });
 
-function homeWindow({ mode = "unified-toolbar", maximized = false, hidden = false } = {}) {
+function homeWindow({ mode = "unified-toolbar", maximized = false, hidden = false, frameToken = "frame-token" } = {}) {
   const listeners = new Set();
   const interactions = { begun: 0, ended: 0, saved: 0, focused: [] };
   const frameWindow = {};
@@ -122,12 +130,21 @@ function homeWindow({ mode = "unified-toolbar", maximized = false, hidden = fals
     `${declaration(geometrySource, "safeClamp")}\n${declaration(geometrySource, "attachForwardedWindowDrag")}\nthis.attach = attachForwardedWindowDrag;`,
     context,
   );
-  const detach = context.attach(node, (id) => interactions.focused.push(id), () => { interactions.saved += 1; });
+  const detach = context.attach(
+    node,
+    (id) => interactions.focused.push(id),
+    () => { interactions.saved += 1; },
+    () => frameToken,
+  );
   // The Browser reports positions inside its own frame, which moves with the window.
-  const send = (phase, screenX, screenY, source = frameWindow) => {
+  const send = (phase, screenX, screenY, source = frameWindow, { origin = "null", homeToken = "frame-token", extra = {} } = {}) => {
     const rect = frame.getBoundingClientRect();
     for (const listener of [...listeners]) {
-      listener({ source, data: { type: MESSAGE_TYPE, phase, clientX: screenX - rect.left, clientY: screenY - rect.top } });
+      listener({
+        source,
+        origin,
+        data: { type: MESSAGE_TYPE, homeToken, phase, clientX: screenX - rect.left, clientY: screenY - rect.top, ...extra },
+      });
     }
   };
   const position = () => [parseFloat(node.style.left), parseFloat(node.style.top)];
@@ -192,4 +209,34 @@ test("closing the window removes its drag listener and ends an active drag", () 
   home.detach();
   assert.equal(home.listeners.size, 0);
   assert.equal(home.interactions.ended, 1);
+});
+
+test("Home ignores drag messages that are not bound to this frame's launch", () => {
+  const cases = [
+    ["another origin", { origin: "https://evil.example" }],
+    ["the Home origin", { origin: "http://127.0.0.1:3000" }],
+    ["another launch token", { homeToken: "other-token" }],
+    ["no launch token", { homeToken: "" }],
+    ["an extra field", { extra: { windowId: "browser-2" } }],
+  ];
+  for (const [name, fields] of cases) {
+    const home = homeWindow();
+    home.send("start", 400, 80, undefined, fields);
+    home.send("move", 280, 160, undefined, fields);
+    home.send("end", 280, 160, undefined, fields);
+    assert.deepEqual(home.position(), [100, 50], name);
+    assert.deepEqual(home.interactions, { begun: 0, ended: 0, saved: 0, focused: [] }, name);
+  }
+
+  // A window whose frame Home holds no launch token for cannot be moved at all.
+  const unlaunched = homeWindow({ frameToken: "" });
+  unlaunched.send("start", 400, 80, undefined, { homeToken: "" });
+  unlaunched.send("move", 280, 160, undefined, { homeToken: "" });
+  assert.deepEqual(unlaunched.position(), [100, 50]);
+
+  const badPhase = homeWindow();
+  badPhase.send("start", 400, 80);
+  badPhase.send("teleport", 0, 0);
+  assert.deepEqual(badPhase.position(), [100, 50], "an unknown phase is ignored, not treated as a move");
+  assert.equal(badPhase.interactions.ended, 0, "and does not end the drag");
 });
