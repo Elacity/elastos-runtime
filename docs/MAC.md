@@ -29,13 +29,11 @@ The job uses an empty Home. A pass does not prove providers, capsules,
 sign-in, or a signed install. `elastos serve` reports operator status at
 `GET /api/health`.
 
-`--addr localhost:8090` binds one address only: the first address that the
-system lookup gives for `localhost` and that can be bound. When `localhost`
-gives `::1` first, `http://127.0.0.1:8090` does not reach the gateway, and
-another process can hold that address. After the readiness check, the job log
-prints facts, not pass or fail: that lookup order, the address the gateway
-listens on, and what `GET /healthz` returns at `localhost:8090`,
-`127.0.0.1:8090` and `[::1]:8090`.
+For `--addr localhost:8090` the gateway listens on every loopback address that
+[the launcher contract](LAUNCHER_CONTRACT.md) names for `localhost`. After the
+readiness check, the job log prints facts, not pass or fail: the `localhost`
+lookup order, the addresses the gateway listens on, and what `GET /healthz`
+returns at `localhost:8090`, `127.0.0.1:8090` and `[::1]:8090`.
 
 This runbook claims no local Intel Browser engine. See
 [Browser support](BROWSER_SUPPORT.md). The job uploads no release tarball.
