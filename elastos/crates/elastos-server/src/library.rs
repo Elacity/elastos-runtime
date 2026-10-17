@@ -658,6 +658,56 @@ pub(crate) fn handle_library_download_selection_bytes_with_format(
     })
 }
 
+mod desktop_background;
+pub(crate) use desktop_background::read_library_object_for_desktop_background;
+
+/// Test fixture: a publish record for `object_uri` with `content_security`.
+#[cfg(test)]
+pub(crate) fn write_test_publish_record(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+    content_security: Value,
+) {
+    let record = LibraryPublishRecord {
+        schema: "elastos.library.publish-record/v1".to_string(),
+        object_uri: object_uri.to_string(),
+        cid: "bafkreitestrecord".to_string(),
+        published_at: 1,
+        unpublished_at: None,
+        shared_at: None,
+        share_policy: None,
+        share_grants: Vec::new(),
+        content_security,
+        receipt: json!({}),
+        availability: json!({ "status": "pinned" }),
+        listing_uri: None,
+    };
+    write_publish_record(data_dir, principal_id, &record).unwrap();
+}
+
+/// Test fixture: a publish record for `object_uri` whose contents cannot be parsed.
+#[cfg(test)]
+pub(crate) fn write_test_broken_publish_record(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+) {
+    let root = crate::auth::principal_localhost_root(principal_id);
+    let record_uri = publish_record_uri(&root, object_uri);
+    let record_path = rooted_localhost_fs_path(data_dir, &record_uri).unwrap();
+    fs::create_dir_all(record_path.parent().unwrap()).unwrap();
+    crate::auth::write_principal_root_object(
+        data_dir,
+        principal_id,
+        &root,
+        &record_uri,
+        &record_path,
+        b"{not a record",
+    )
+    .unwrap();
+}
+
 pub(crate) async fn handle_library_download_bytes_runtime(
     data_dir: &Path,
     registry: Arc<ProviderRegistry>,

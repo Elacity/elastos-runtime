@@ -5553,60 +5553,73 @@ async fn test_home_sets_background_image_from_own_object() {
         "Pictures/guest.png",
         &picture,
     );
-
-    let set_background = |token: String, source_uri: String| {
-        let app = app.clone();
-        async move {
-            app.oneshot(
-                test_browser_request("localhost:61180", "http://localhost:61180")
-                    .method("POST")
-                    .uri("/api/apps/home/appearance/background-image")
-                    .header("x-elastos-home-token", token)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "source_uri": source_uri }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-        }
-    };
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
 
     // Library only expresses the intent; it never holds appearance authority.
-    let library_token =
-        projection_launch_token_for_authority_context(dir.path(), "library", &admin);
-    let from_library = set_background(library_token, picture_uri.clone()).await;
-    assert_eq!(from_library.status(), StatusCode::FORBIDDEN);
-
-    let foreign = set_background(admin.home_token.clone(), guest_picture_uri).await;
-    assert_eq!(foreign.status(), StatusCode::BAD_REQUEST);
-    let not_image = set_background(admin.home_token.clone(), text_uri).await;
-    assert_eq!(not_image.status(), StatusCode::BAD_REQUEST);
-    let bomb = set_background(admin.home_token.clone(), bomb_uri).await;
-    assert_eq!(bomb.status(), StatusCode::BAD_REQUEST);
-    let not_localhost = set_background(
-        admin.home_token.clone(),
-        "elastos://bafy/hills.png".to_string(),
+    let from_library = set_background_from_object(
+        &app,
+        library_token.clone(),
+        Some(library_token.clone()),
+        &picture_uri,
     )
     .await;
-    assert_eq!(not_localhost.status(), StatusCode::BAD_REQUEST);
-    let missing = set_background(
+    assert_eq!(from_library.0, StatusCode::FORBIDDEN);
+
+    let foreign = set_background_from_object(
+        &app,
         admin.home_token.clone(),
-        format!(
+        Some(library_token.clone()),
+        &guest_picture_uri,
+    )
+    .await;
+    assert_eq!(foreign.0, StatusCode::BAD_REQUEST, "{}", foreign.1);
+    let not_image = set_background_from_object(
+        &app,
+        admin.home_token.clone(),
+        Some(library_token.clone()),
+        &text_uri,
+    )
+    .await;
+    assert_eq!(not_image.0, StatusCode::BAD_REQUEST);
+    let bomb = set_background_from_object(
+        &app,
+        admin.home_token.clone(),
+        Some(library_token.clone()),
+        &bomb_uri,
+    )
+    .await;
+    assert_eq!(bomb.0, StatusCode::BAD_REQUEST);
+    assert!(bomb.1.contains("too large to show"), "{}", bomb.1);
+    let not_localhost = set_background_from_object(
+        &app,
+        admin.home_token.clone(),
+        Some(library_token.clone()),
+        "elastos://bafy/hills.png",
+    )
+    .await;
+    assert_eq!(not_localhost.0, StatusCode::BAD_REQUEST);
+    let missing = set_background_from_object(
+        &app,
+        admin.home_token.clone(),
+        Some(library_token.clone()),
+        &format!(
             "{}/Pictures/missing.png",
             crate::auth::principal_localhost_root(&admin.principal_id)
         ),
     )
     .await;
-    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(missing.0, StatusCode::BAD_REQUEST);
 
-    let updated = set_background(admin.home_token.clone(), picture_uri).await;
-    assert_eq!(updated.status(), StatusCode::OK);
-    let updated_body = axum::body::to_bytes(updated.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let updated_payload: serde_json::Value = serde_json::from_slice(&updated_body).unwrap();
+    let updated = set_background_from_object(
+        &app,
+        admin.home_token.clone(),
+        Some(library_token.clone()),
+        &picture_uri,
+    )
+    .await;
+    assert_eq!(updated.0, StatusCode::OK, "{}", updated.1);
+    let updated_payload: serde_json::Value = serde_json::from_str(&updated.1).unwrap();
     let background_url = updated_payload["background_image_url"]
         .as_str()
         .expect("background url");
@@ -5641,6 +5654,162 @@ async fn test_home_sets_background_image_from_own_object() {
         .await
         .unwrap();
     assert_eq!(image_body.as_ref(), picture.as_slice());
+}
+
+/// POSTs a set-from-object request the way Home does: Home's own authority in
+/// `x-elastos-home-token`, and the launched Library frame's capability carried
+/// in the body when `library_token` is set.
+async fn set_background_from_object(
+    app: &axum::Router,
+    home_token: String,
+    library_token: Option<String>,
+    source_uri: &str,
+) -> (StatusCode, String) {
+    let mut body = serde_json::json!({ "source_uri": source_uri });
+    if let Some(library_token) = library_token {
+        body["library_token"] = serde_json::Value::String(library_token);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/apps/home/appearance/background-image")
+                .header("x-elastos-home-token", home_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Home's appearance authority alone cannot read a Library object: the
+/// Library capability must come with it, for the same person and session.
+/// Inside that capability, Trash, Runtime-private areas and protected content
+/// stay out of reach, and unknown protection counts as protected.
+#[tokio::test]
+async fn test_home_background_from_object_requires_library_capability_and_unprotected_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let _admin_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let _guest_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &guest.principal_id);
+    let picture = test_png_picture(800, 600, b"own-picture");
+    let write = |relative: &str| {
+        write_home_principal_object_bytes_for_authority(dir.path(), &admin, relative, &picture)
+    };
+    let picture_uri = write("Pictures/hills.png");
+    let protected_uri = write("Pictures/protected.png");
+    let unknown_uri = write("Pictures/unknown-protection.png");
+    let key_release_uri = write("Pictures/key-release.png");
+    let broken_record_uri = write("Pictures/broken-record.png");
+    let public_uri = write("Pictures/public.png");
+    let trash_uri = write(".Trash/old.png");
+    let private_uri = write(".AppData/LocalHost/secret.png");
+
+    crate::library::write_test_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &protected_uri,
+        serde_json::json!({ "published_payload": "runtime_custody_encrypted", "key_release_required": true }),
+    );
+    crate::library::write_test_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &unknown_uri,
+        serde_json::json!({ "published_payload": "a_future_protection_format" }),
+    );
+    crate::library::write_test_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &key_release_uri,
+        serde_json::json!({ "published_payload": "plain_content", "key_release_required": true }),
+    );
+    crate::library::write_test_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &public_uri,
+        serde_json::json!({ "published_payload": "plain_content", "key_release_required": false }),
+    );
+    crate::library::write_test_broken_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &broken_record_uri,
+    );
+
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let guest_library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &guest);
+    let documents_token =
+        projection_launch_token_for_authority_context(dir.path(), DOCUMENTS_CAPSULE_ID, &admin);
+    let home = || admin.home_token.clone();
+
+    // Shell token alone: refused before any read.
+    let (status, text) = set_background_from_object(&app, home(), None, &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+    // The active Home GUI shell token alone is refused too.
+    let shell_token =
+        projection_launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &admin);
+    let (status, _) = set_background_from_object(&app, shell_token, None, &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Another app's capability is not Library's.
+    let (status, _) =
+        set_background_from_object(&app, home(), Some(documents_token), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Another person's Library capability does not combine with this Home.
+    let (status, _) =
+        set_background_from_object(&app, home(), Some(guest_library_token), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A Library capability from another session of the same person does not
+    // combine with this Home session.
+    let other_session_library = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let (status, _) =
+        set_background_from_object(&app, home(), Some(other_session_library), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A forged or truncated capability is refused.
+    let (status, _) = set_background_from_object(
+        &app,
+        home(),
+        Some(library_token[..library_token.len() - 4].to_string()),
+        &picture_uri,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    for (uri, reason) in [
+        (&protected_uri, "protected"),
+        (&unknown_uri, "protected"),
+        (&key_release_uri, "protected"),
+        (&broken_record_uri, "protected"),
+        (&trash_uri, "Trash"),
+        (&private_uri, "own Library files"),
+    ] {
+        let (status, text) =
+            set_background_from_object(&app, home(), Some(library_token.clone()), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {text}");
+        assert!(text.contains(reason), "{uri}: {text}");
+    }
+
+    // Plain published content and an unpublished own picture are allowed.
+    for uri in [&public_uri, &picture_uri] {
+        let (status, text) =
+            set_background_from_object(&app, home(), Some(library_token.clone()), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {text}");
+    }
 }
 
 #[tokio::test]

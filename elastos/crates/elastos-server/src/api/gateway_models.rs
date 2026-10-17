@@ -371,12 +371,16 @@ struct SystemBackgroundOverlayRequest {
     opacity: f64,
 }
 
-/// Sets the wallpaper from an object the caller already owns; the Runtime
-/// reads the bytes itself so they never traverse a capsule.
+/// Sets the wallpaper from one of the caller's own Library files. Runtime reads
+/// it through Library's capability (forwarded by Home), so the bytes never
+/// traverse a capsule and Library's scope and protection rules apply.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HomeBackgroundImageSourceRequest {
     source_uri: String,
+    /// The launch token of the Library frame that asked, carried by Home.
+    #[serde(default)]
+    library_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

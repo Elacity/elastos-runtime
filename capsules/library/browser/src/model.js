@@ -65,12 +65,17 @@ export function hasCapability(object, capability) {
 }
 
 // Mirrors the Runtime's wallpaper rules so the menu only offers what will save.
+// Runtime decides; this only hides an action that would be refused.
 const DESKTOP_BACKGROUND_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const DESKTOP_BACKGROUND_MAX_BYTES = 5 * 1024 * 1024;
 
 export function isDesktopBackgroundCandidate(object) {
   if (!object || isDirectory(object) || inTrash(object)) return false;
   if (!String(object.uri || "").startsWith("localhost://Users/")) return false;
+  if (!hasCapability(object, "read") || object.blocked_reason) return false;
+  // Protected content is never the desktop background.
+  if (object.metadata?.protected_content) return false;
+  if (object.metadata?.visibility?.placement === "runtime_private") return false;
   if (!DESKTOP_BACKGROUND_MIME_TYPES.has(String(object.mime || ""))) return false;
   return Number(object.size || 0) <= DESKTOP_BACKGROUND_MAX_BYTES;
 }

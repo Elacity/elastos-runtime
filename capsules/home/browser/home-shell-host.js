@@ -2264,8 +2264,11 @@ function canOpenTargetFromHomeMessage(context, target) {
 }
 
 // The app expresses intent; Home performs the change with its own appearance
-// authority, so the app never gains one. The Runtime re-checks that the object
-// belongs to the signed-in person and is an image.
+// authority, so the app never gains one. Home carries the launched Library
+// frame's own capability (the token this message was bound to), and Runtime
+// reads the object only through that Library capability: the same scope,
+// Trash, and protection rules Library's read applies. Home never reads or
+// decrypts the object itself.
 function handleSetDesktopBackgroundMessage(event, context, data) {
   const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
   const uri = typeof data.uri === "string" ? data.uri.trim() : "";
@@ -2284,7 +2287,7 @@ function handleSetDesktopBackgroundMessage(event, context, data) {
   }
   fetchJson("/api/apps/home/appearance/background-image", {
     method: "POST",
-    body: JSON.stringify({ source_uri: uri }),
+    body: JSON.stringify({ source_uri: uri, library_token: context.homeToken }),
   })
     .then(() => {
       requestShellSummaryRefresh({ reason: "desktop-background" });

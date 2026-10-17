@@ -5209,6 +5209,36 @@ pub fn read_principal_root_object(
     read_principal_root_object_locked(data_dir, principal_id, localhost_root, object_uri, path)
 }
 
+/// Same as [`read_principal_root_object`], but refuses a stored object larger
+/// than `max_stored_bytes` while reading it through the one open descriptor,
+/// so a file that grows after a size check cannot force an unbounded read.
+pub fn read_principal_root_object_limited(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    max_stored_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
+    let _guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    let bytes = read_principal_root_object_bytes_limited(path, Some(max_stored_bytes))?;
+    let Some(protection) = load_principal_root_protection(data_dir, principal_id, localhost_root)?
+    else {
+        return Ok(bytes);
+    };
+    decrypt_principal_root_object_bytes(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        &protection,
+        &bytes,
+    )
+}
+
 /// Reads only under current principal-root protection. Missing protection
 /// returns None before object bytes are read; each call loads fresh authority.
 pub(crate) fn read_protected_principal_root_object(
@@ -5296,6 +5326,13 @@ fn decrypt_principal_root_object_bytes(
 }
 
 fn read_principal_root_object_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
+    read_principal_root_object_bytes_limited(path, None)
+}
+
+fn read_principal_root_object_bytes_limited(
+    path: &Path,
+    max_bytes: Option<u64>,
+) -> anyhow::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -5314,8 +5351,21 @@ fn read_principal_root_object_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("principal-root object must be a regular file");
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {path:?}"))?;
+    match max_bytes {
+        Some(limit) => {
+            (&mut file)
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("failed to read {path:?}"))?;
+            if bytes.len() as u64 > limit {
+                anyhow::bail!("principal-root object is larger than its read limit");
+            }
+        }
+        None => {
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("failed to read {path:?}"))?;
+        }
+    }
     Ok(bytes)
 }
 

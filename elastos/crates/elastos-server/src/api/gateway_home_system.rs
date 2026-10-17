@@ -8096,44 +8096,15 @@ fn home_save_background_image_from_object(
     context: &HomeLaunchTokenContext,
     source_uri: &str,
 ) -> anyhow::Result<HomeAppearanceSummary> {
-    let source_uri = source_uri.trim();
-    if source_uri.is_empty() || source_uri.len() > 2048 || !source_uri.starts_with("localhost://") {
-        return Err(home_appearance_preference_request_error(
-            "background image source must be a localhost:// object",
-        ));
-    }
-    let localhost_root = home_browser_localhost_root(context);
-    let under_root = source_uri
-        .strip_prefix(localhost_root.as_str())
-        .is_some_and(|rest| rest.starts_with('/'));
-    if !under_root {
-        return Err(home_appearance_preference_request_error(
-            "background image source must be one of your own objects",
-        ));
-    }
-    let path = rooted_localhost_fs_path(data_dir, source_uri).ok_or_else(|| {
-        home_appearance_preference_request_error("background image source path is invalid")
-    })?;
-    let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
-        home_appearance_preference_request_error("background image source was not found")
-    })?;
-    if !metadata.is_file() {
-        return Err(home_appearance_preference_request_error(
-            "background image source must be a file",
-        ));
-    }
-    if metadata.len() > HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES {
-        return Err(home_appearance_preference_request_error(
-            "background image is larger than 5 MB",
-        ));
-    }
-    let bytes = crate::auth::read_principal_root_object(
+    // Library's read, under Library's scope rules: the principal's own files,
+    // never Trash, Runtime-private areas, links, or protected content.
+    let bytes = crate::library::read_library_object_for_desktop_background(
         data_dir,
         &home_browser_principal_id(context),
-        &localhost_root,
-        source_uri,
-        &path,
-    )?;
+        source_uri.trim(),
+        HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES,
+    )
+    .map_err(|refusal| home_appearance_preference_request_error(refusal.message()))?;
     validate_background_image_len(bytes.len())?;
     let file_name = require_bounded_background_image(&bytes)?;
     home_save_background_image(data_dir, context, file_name, bytes)
@@ -8261,9 +8232,14 @@ pub(super) async fn system_background_overlay_update(
     }
 }
 
-/// Home arbitrates "set as desktop background" intents from apps and holds the
-/// same appearance authority as the preferences update; the app that asked
-/// never gains one. The source object must already belong to the caller.
+/// Home arbitrates "set as desktop background" intents from Library. Two
+/// authorities must both be present, for the same person and session:
+/// Home's appearance authority (the caller), and Library's read capability
+/// (carried by Home from the Library frame that asked). Home alone cannot
+/// read a Library object, and Library alone cannot change the desktop. The
+/// carried token follows the same rule as the Home wallet connector and the
+/// passkey step-up: verified on its own, launched by Home, and bound to the
+/// caller's person and session.
 pub(super) async fn home_background_image_set_from_object(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -8273,9 +8249,72 @@ pub(super) async fn home_background_image_set_from_object(
         Ok(context) => context,
         Err(err) => return home_error_response(err),
     };
+    let library_token = req.library_token.as_deref().map(str::trim).unwrap_or("");
+    if library_token.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            "missing Library launch token; use Set as Desktop Background in Library",
+        )
+            .into_response();
+    }
+    let library = match require_carried_home_launch_token(
+        &state.data_dir,
+        library_token,
+        &[LIBRARY_CAPSULE_ID],
+    ) {
+        Ok(library) => library,
+        Err(err) => return home_error_response(err),
+    };
+    if library.launch_context.executable_actor != LIBRARY_CAPSULE_ID
+        || library.launch_context.authority_actor != HOME_CAPSULE_ID
+        || library.context.principal_id != context.principal_id
+        || library.context.session_id != context.session_id
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "the Library home launch token belongs to another person, session or launcher",
+        )
+            .into_response();
+    }
+    let request_id = format!("object:desktop-background:{}", now_ts());
+    let audit = |event_type: &'static str, result: &'static str, reason: &'static str| {
+        append_provider_effect_audit(
+            &state.data_dir,
+            ProviderEffectAuditInput {
+                capsule_id: LIBRARY_CAPSULE_ID,
+                event_type,
+                principal_id: &context.principal_id,
+                session_id: &context.session_id,
+                request_id: &request_id,
+                result,
+                reason,
+            },
+        )
+    };
+    if let Err(err) = audit(
+        "object.provider.requested",
+        "requested",
+        "Home asked Library to read an object for the desktop background",
+    ) {
+        return home_error_response(anyhow::anyhow!("object provider audit failed: {err}"));
+    }
     match home_save_background_image_from_object(&state.data_dir, &context, &req.source_uri) {
-        Ok(summary) => Json(summary).into_response(),
-        Err(err) => home_error_response(err),
+        Ok(summary) => {
+            let _ = audit(
+                "object.provider.completed",
+                "completed",
+                "Library read an object for the desktop background",
+            );
+            Json(summary).into_response()
+        }
+        Err(err) => {
+            let _ = audit(
+                "object.provider.failed",
+                "failed",
+                "Library refused an object for the desktop background",
+            );
+            home_error_response(err)
+        }
     }
 }
 
