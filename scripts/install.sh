@@ -155,6 +155,8 @@ fi
 die()  { echo -e "${RED:-}Error:${NC:-} $*" >&2; exit 1; }
 # For messages holding %q-quoted paths: print them byte for byte.
 die_exact() { printf '%bError:%b %s\n' "${RED:-}" "${NC:-}" "$*" >&2; exit 1; }
+# The staged Runtime must stay the file whose SHA-256 was checked.
+RUNTIME_CHANGED="The downloaded Runtime changed on this computer after its check. Nothing was installed. Run the installer again."
 # Every read of a verified envelope must see the SHA-256 its signature check saw.
 RELEASE_CHANGED="The release files changed on this computer after they were checked. Nothing was installed. Run the installer again."
 
@@ -396,6 +398,56 @@ sha256_file() {
     else
         die "Neither sha256sum nor shasum found"
     fi
+}
+
+# The staged Runtime is held open on fd 9 (see the install step).
+#   held_runtime hash PATH SHA256  hashes the bytes of the held file; prints its identity
+#   held_runtime check PATH ID     the held file is unchanged and PATH still names it
+# Both refuse (exit 3) unless the held file is a regular file of this user,
+# mode 0500, with one link, and PATH names that same file.
+held_runtime() {
+    python3 - "$@" <<'PY_HELD_RUNTIME'
+import hashlib
+import os
+import stat
+import sys
+
+mode, path, expected = sys.argv[1:4]
+try:
+    held, named = os.fstat(9), os.lstat(path)
+except OSError:
+    sys.exit(3)
+
+
+def identity(info):
+    return ":".join(str(value) for value in (
+        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+
+
+if (not stat.S_ISREG(held.st_mode) or held.st_uid != os.geteuid()
+        or stat.S_IMODE(held.st_mode) != 0o500 or held.st_nlink != 1
+        or identity(named) != identity(held)):
+    sys.exit(3)
+if mode == "hash":
+    digest, offset = hashlib.sha256(), 0
+    while True:
+        chunk = os.pread(9, 1 << 20, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    if digest.hexdigest() != expected or offset != held.st_size or identity(os.fstat(9)) != identity(held):
+        sys.exit(3)
+    print(identity(held))
+elif mode != "check" or identity(held) != expected:
+    sys.exit(3)
+PY_HELD_RUNTIME
+}
+
+# Run the held staged Runtime: the open file itself where HELD_RUNTIME is
+# /proc/self/fd/9, else its path. argv[0] stays the staged path.
+run_held_runtime() {
+    (exec -a "${TMP_INSTALL_BIN}" "${HELD_RUNTIME}" "$@")
 }
 
 installer_runtime_control() {
@@ -1461,21 +1513,32 @@ sha256_check "${INSTALL_SCRATCH}/elastos" "$BINARY_SHA256"
 (umask 077; mkdir -p "$DATA_DIR")
 
 require_install_space "$INSTALL_DIR" "$BINARY_SIZE"
-TMP_INSTALL_BIN="$(mktemp "${INSTALL_DIR}/.elastos.install.XXXXXX")"
-trap 'rm -rf "$INSTALL_SCRATCH" "$TMP_INSTALL_BIN"' EXIT
+# Stage the Runtime in a new folder only this user can open (mktemp -d makes
+# it 0700) inside the checked install directory, read-only and executable.
+STAGE_DIR="$(mktemp -d "${INSTALL_DIR}/.elastos.install.XXXXXX")"
+trap 'rm -rf "$INSTALL_SCRATCH" "$STAGE_DIR"' EXIT
+TMP_INSTALL_BIN="${STAGE_DIR}/elastos"
 cp "${INSTALL_SCRATCH}/elastos" "${TMP_INSTALL_BIN}"
-# Check the staged copy: it is the file this installer runs and hands to the
-# writer. The check above refused a bad download before anything was written.
-if [[ "$(sha256_file "${TMP_INSTALL_BIN}")" != "$BINARY_SHA256" ]]; then
-    die "The downloaded Runtime changed on this computer after its check. Nothing was installed. Run the installer again."
+chmod 0500 "${TMP_INSTALL_BIN}"
+# Open the staged copy once and hold it on fd 9. Its hash is taken from that
+# open file, and every later run of it is checked against that open file. The
+# check above refused a bad download before anything was written.
+exec 9<"${TMP_INSTALL_BIN}"
+HELD_RUNTIME_ID="$(held_runtime hash "${TMP_INSTALL_BIN}" "$BINARY_SHA256")" || die "$RUNTIME_CHANGED"
+# Where the kernel can start an open file (Linux /proc/self/fd), the held file
+# runs, so a path swapped after the last check cannot run. Elsewhere (macOS)
+# the path runs, right after a check that it still names the held file.
+HELD_RUNTIME="${TMP_INSTALL_BIN}"
+if [[ -r /proc/self/fd/9 ]]; then
+    HELD_RUNTIME=/proc/self/fd/9
 fi
-chmod +x "${TMP_INSTALL_BIN}"
 
 # The staged executable must report the exact release version on stdout with
 # empty stderr before it can write this installation.
 STAGED_VERSION_STATUS=0
 STAGED_VERSION_STDERR_PATH="${INSTALL_SCRATCH}/elastos-version.stderr"
-STAGED_VERSION_OUTPUT="$("${TMP_INSTALL_BIN}" --version 2>"${STAGED_VERSION_STDERR_PATH}")" || STAGED_VERSION_STATUS=$?
+held_runtime check "${TMP_INSTALL_BIN}" "$HELD_RUNTIME_ID" || die "$RUNTIME_CHANGED"
+STAGED_VERSION_OUTPUT="$(run_held_runtime --version 2>"${STAGED_VERSION_STDERR_PATH}")" || STAGED_VERSION_STATUS=$?
 STAGED_VERSION_ERROR="$(cat "${STAGED_VERSION_STDERR_PATH}")"
 if [[ "${STAGED_VERSION_STATUS}" -ne 0 ]]; then
     die "Downloaded binary failed its version check (exit ${STAGED_VERSION_STATUS}); the current installation was preserved\n  Output: ${STAGED_VERSION_OUTPUT:-<no output>}\n  Stderr: ${STAGED_VERSION_ERROR:-<no output>}"
@@ -1550,11 +1613,14 @@ PY
 # It reads each file below once, checks those bytes against the pin, the
 # version, the channel and any head CID stamp in sources.json, and installs
 # those same bytes (update.rs install_release).
-INSTALL_RELEASE=("${TMP_INSTALL_BIN}" install-release --data-dir "$DATA_DIR"
+# The writer reads the candidate once and admits it only if those bytes have
+# the signed SHA-256 (installed_release.rs admit_candidate).
+INSTALL_RELEASE=(install-release --data-dir "$DATA_DIR"
     --binary "${INSTALL_DIR}/elastos" --candidate "${TMP_INSTALL_BIN}" "$SOURCES_PATH"
     "${INSTALL_SCRATCH}/release-head.json" "${INSTALL_SCRATCH}/release.json")
 step 4 "Install"
-"${INSTALL_RELEASE[@]}" --check || die "This installation was not changed"
+held_runtime check "${TMP_INSTALL_BIN}" "$HELD_RUNTIME_ID" || die "$RUNTIME_CHANGED"
+run_held_runtime "${INSTALL_RELEASE[@]}" --check || die "This installation was not changed"
 
 info "Stopping verified Runtime processes for this installation so the new version can be installed..."
 installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
@@ -1566,7 +1632,10 @@ fi
 # One journaled transaction replaces the Runtime, trusted sources and the
 # verified release pair; an interrupted run restores the previous set.
 info "Installing binary to $(display_path "${INSTALL_DIR}/elastos")..."
-"${INSTALL_RELEASE[@]}" || die "The previous installation was preserved"
+held_runtime check "${TMP_INSTALL_BIN}" "$HELD_RUNTIME_ID" || die "$RUNTIME_CHANGED"
+run_held_runtime "${INSTALL_RELEASE[@]}" || die "The previous installation was preserved"
+# Later commands run the installed Runtime; they do not need the staged copy.
+exec 9<&-
 ok "Installed ElastOS ${RELEASE_VERSION} to $(display_path "${INSTALL_DIR}/elastos")"
 
 PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
