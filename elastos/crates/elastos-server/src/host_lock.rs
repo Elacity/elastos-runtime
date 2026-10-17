@@ -220,6 +220,44 @@ pub fn holds_gateway_host_lock(data_dir: &Path) -> bool {
     held_host_role(data_dir).is_some_and(|role| is_gateway_role(&role))
 }
 
+/// A new descriptor of the gateway host lock this process holds for
+/// `data_dir`, for a child process that must prove its parent gateway holds
+/// the lock (see [`inherited_gateway_host_lock_is_held`]). `None` when this
+/// process does not hold that lock as a gateway now.
+pub fn gateway_host_lock_for_child(data_dir: &Path) -> Option<fs::File> {
+    let held = held_host_locks();
+    proven_held_host_lock(&held, data_dir)
+        .filter(|entry| is_gateway_role(&entry.role))
+        .and_then(|entry| entry.file.try_clone().ok())
+}
+
+/// Whether the inherited descriptor `fd`, which a gateway gave this process
+/// with [`gateway_host_lock_for_child`], still holds the host lock of
+/// `data_dir`. The check is the same flock proof the gateway uses for
+/// `/healthz`, run against the gateway's own open file description. The JSON
+/// record is not read. After the gateway releases its lock, or after another
+/// process takes the lock, the answer is `false`.
+///
+/// The check marks `fd` close-on-exec, so commands this process starts later
+/// do not receive it. This process never closes `fd`. If the gateway releases
+/// its lock in the short time between the two probes, the second probe takes
+/// the lock again through the shared open file, and this process keeps the
+/// home locked until it exits. That fails closed: no second host can start.
+#[cfg(unix)]
+pub fn inherited_gateway_host_lock_is_held(data_dir: &Path, fd: std::os::fd::RawFd) -> bool {
+    use std::os::fd::FromRawFd as _;
+    if fd <= libc::STDERR_FILENO {
+        return false;
+    }
+    // A descriptor number from the environment may be closed or reused.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return false;
+    }
+    // Borrow the descriptor: this process did not open it and never closes it.
+    let inherited = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(fd) });
+    description_holds_lock(&host_lock_path(data_dir), &inherited)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostProcessInfo {
     pub pid: u32,
@@ -794,6 +832,7 @@ mod tests {
         let foreign = FileLock::try_exclusive(fs::File::open(&path).unwrap()).expect("foreign");
         assert!(fs::read_to_string(&path).unwrap().contains("\"serve\""));
         assert_eq!(held_host_role(temp.path()), None, "foreign holder");
+        assert!(gateway_host_lock_for_child(temp.path()).is_none());
         drop(foreign);
 
         let gateway = acquire_host_process_lock(temp.path(), "gateway", "localhost:8090")
@@ -819,6 +858,7 @@ mod tests {
         assert!(!test_support::lock_is_free(&path));
         assert_eq!(held_host_role(temp.path()), None);
         assert!(!holds_gateway_host_lock(temp.path()));
+        assert!(gateway_host_lock_for_child(temp.path()).is_none());
         drop(foreign);
         drop(gateway);
     }
@@ -882,6 +922,85 @@ mod tests {
         assert_eq!(held_host_role(temp.path()), None);
         finish_tx.send(()).unwrap();
         releaser.join().unwrap();
+    }
+
+    /// A Home terminal proves its parent gateway holds the lock from the
+    /// descriptor the gateway gave it, never from the record.
+    #[test]
+    fn inherited_gateway_descriptor_proves_only_a_lock_its_gateway_still_holds() {
+        use std::os::fd::AsRawFd as _;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = host_lock_path(temp.path());
+
+        // No gateway: a serve lock gives the child nothing.
+        let serve =
+            acquire_host_process_lock(temp.path(), "serve", "127.0.0.1:3000").expect("serve");
+        assert!(gateway_host_lock_for_child(temp.path()).is_none());
+        drop(serve);
+
+        let gateway = acquire_host_process_lock(temp.path(), "gateway", "localhost:8090")
+            .expect("gateway lock");
+        let inherited = gateway_host_lock_for_child(temp.path()).expect("descriptor for child");
+        assert!(inherited_gateway_host_lock_is_held(
+            temp.path(),
+            inherited.as_raw_fd()
+        ));
+
+        // A descriptor of the same file that does not hold the lock, with a
+        // record that names this gateway, is refused.
+        let plain = fs::File::open(&path).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("\"gateway\""));
+        assert!(!inherited_gateway_host_lock_is_held(
+            temp.path(),
+            plain.as_raw_fd()
+        ));
+        // Standard streams and closed or unrelated descriptors are refused.
+        let other = tempfile::tempfile().unwrap();
+        assert!(!inherited_gateway_host_lock_is_held(
+            temp.path(),
+            other.as_raw_fd()
+        ));
+        assert!(!inherited_gateway_host_lock_is_held(temp.path(), 0));
+        assert!(!inherited_gateway_host_lock_is_held(temp.path(), 2));
+        assert!(!inherited_gateway_host_lock_is_held(temp.path(), -1));
+
+        // The gateway releases its lock: the child's descriptor proves nothing.
+        drop(gateway);
+        assert!(!inherited_gateway_host_lock_is_held(
+            temp.path(),
+            inherited.as_raw_fd()
+        ));
+        assert!(test_support::lock_is_free(&path), "the check took no lock");
+
+        // Another holder retakes it: refused for the old descriptor.
+        let foreign = FileLock::try_exclusive(fs::File::open(&path).unwrap()).expect("foreign");
+        assert!(!inherited_gateway_host_lock_is_held(
+            temp.path(),
+            inherited.as_raw_fd()
+        ));
+        drop(foreign);
+
+        // The gateway takes the lock again: only a new descriptor proves it.
+        let gateway = acquire_host_process_lock(temp.path(), "gateway", "localhost:8090")
+            .expect("gateway retakes");
+        assert!(!inherited_gateway_host_lock_is_held(
+            temp.path(),
+            inherited.as_raw_fd()
+        ));
+        let renewed = gateway_host_lock_for_child(temp.path()).expect("new descriptor");
+        assert!(inherited_gateway_host_lock_is_held(
+            temp.path(),
+            renewed.as_raw_fd()
+        ));
+
+        // A replaced lock file is not the file the gateway locked.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "{}").unwrap();
+        assert!(!inherited_gateway_host_lock_is_held(
+            temp.path(),
+            renewed.as_raw_fd()
+        ));
+        drop(gateway);
     }
 
     #[test]

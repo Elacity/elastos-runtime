@@ -40,6 +40,11 @@ pub const RUNTIME_KIND_MANAGED_HOME: &str = "managed-home";
 pub const OPERATOR_RUNTIME_REQUIRED_MESSAGE: &str =
     "This command requires a running runtime.\n\n  elastos serve\n\nThen run this command again.";
 pub const GATEWAY_OWNED_HOME_TERMINAL_ENV: &str = "ELASTOS_GATEWAY_OWNED_HOME_TERMINAL";
+/// The pid of the gateway that started this Home terminal.
+pub const GATEWAY_HOST_PID_ENV: &str = "ELASTOS_GATEWAY_HOST_PID";
+/// A descriptor this Home terminal inherits from its gateway: the open file
+/// that holds the gateway's host lock.
+pub const GATEWAY_HOST_LOCK_FD_ENV: &str = "ELASTOS_GATEWAY_HOST_LOCK_FD";
 const MANAGED_RUNTIME_REQUIRED_NATIVE_PROVIDERS: &[&str] = &["localhost-provider", "did-provider"];
 const MANAGED_RUNTIME_REQUIRED_COMPONENTS: &[&str] = &["shell"];
 
@@ -354,17 +359,69 @@ fn managed_runtime_lane_conflict_message(
     )
 }
 
-fn gateway_owner_allows_subordinate_managed_runtime(
-    owner: &crate::host_lock::HostProcessInfo,
+/// Whether a managed runtime that starts here runs under a gateway that holds
+/// the host lock of `data_dir`: this process (a gateway serving Home), or the
+/// parent gateway of a Home terminal. The proof is the held flock, the same
+/// proof as `/healthz` (`docs/LAUNCHER_CONTRACT.md`, "Readiness and Home
+/// URL"). The JSON record in the lock file is not proof; it only names the
+/// holder in the refusal.
+fn subordinate_gateway_host(data_dir: &Path, surface_name: &str) -> anyhow::Result<bool> {
+    if crate::host_lock::holds_gateway_host_lock(data_dir)
+        || parent_gateway_holds_host_lock(data_dir)
+    {
+        return Ok(true);
+    }
+    match crate::host_lock::active_host_process(data_dir)? {
+        Some(owner) => anyhow::bail!(managed_runtime_lane_conflict_message(surface_name, &owner)),
+        None => Ok(false),
+    }
+}
+
+/// Whether this process is a Home terminal that its gateway started, and that
+/// gateway still holds the host lock of `data_dir`.
+fn parent_gateway_holds_host_lock(data_dir: &Path) -> bool {
+    parent_gateway_lock_proven(
+        data_dir,
+        std::env::var_os(GATEWAY_OWNED_HOME_TERMINAL_ENV).as_deref(),
+        std::env::var_os(GATEWAY_HOST_PID_ENV).as_deref(),
+        std::env::var_os(GATEWAY_HOST_LOCK_FD_ENV).as_deref(),
+        parent_process_id(),
+    )
+}
+
+/// The gateway starts a Home terminal with the marker, its own pid, and a
+/// descriptor of the open file that holds its host lock
+/// (`gateway_home_terminal.rs`). This process must be that direct child, and
+/// that descriptor must hold the flock now.
+fn parent_gateway_lock_proven(
+    data_dir: &Path,
+    marker: Option<&std::ffi::OsStr>,
+    gateway_pid: Option<&std::ffi::OsStr>,
+    lock_fd: Option<&std::ffi::OsStr>,
+    parent_pid: Option<u32>,
 ) -> bool {
-    if !matches!(owner.role.as_str(), "gateway" | "gateway-public") {
+    if marker != Some(std::ffi::OsStr::new("1")) {
         return false;
     }
-    if owner.pid == std::process::id() {
-        return true;
+    let number = |value: Option<&std::ffi::OsStr>| value?.to_str()?.parse::<u32>().ok();
+    let (Some(gateway_pid), Some(lock_fd)) = (number(gateway_pid), number(lock_fd)) else {
+        return false;
+    };
+    if parent_pid != Some(gateway_pid) {
+        return false;
     }
-    std::env::var_os(GATEWAY_OWNED_HOME_TERMINAL_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
-        && parent_process_id() == Some(owner.pid)
+    #[cfg(unix)]
+    {
+        let Ok(lock_fd) = std::os::fd::RawFd::try_from(lock_fd) else {
+            return false;
+        };
+        crate::host_lock::inherited_gateway_host_lock_is_held(data_dir, lock_fd)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (data_dir, lock_fd);
+        false
+    }
 }
 
 fn parent_process_id() -> Option<u32> {
@@ -1219,11 +1276,7 @@ async fn ensure_managed_runtime(
         }
     }
 
-    let subordinate_gateway_host = match crate::host_lock::active_host_process(data_dir)? {
-        Some(owner) if gateway_owner_allows_subordinate_managed_runtime(&owner) => true,
-        Some(owner) => anyhow::bail!(managed_runtime_lane_conflict_message(surface_name, &owner)),
-        None => false,
-    };
+    let subordinate_gateway_host = subordinate_gateway_host(data_dir, surface_name)?;
     let gateway_owner = subordinate_gateway_host
         .then(|| gateway_children::Owner::read(data_dir))
         .transpose()?;
@@ -1983,17 +2036,6 @@ mod tests {
         assert!(message.contains("managed chat lane"));
     }
 
-    #[test]
-    fn current_gateway_host_allows_subordinate_managed_runtime() {
-        let owner = crate::host_lock::HostProcessInfo {
-            pid: std::process::id(),
-            role: "gateway".to_string(),
-            addr: "127.0.0.1:8090".to_string(),
-        };
-
-        assert!(gateway_owner_allows_subordinate_managed_runtime(&owner));
-    }
-
     fn write_managed_runtime_parent_support_artifacts(data_dir: &Path) -> Vec<u8> {
         let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
             ("linux", "x86_64") => "linux-amd64",
@@ -2072,74 +2114,144 @@ mod tests {
         pin_parent_model_catalog_head(data_dir, &crate::setup::catalog_head_cid(catalog).unwrap());
     }
 
+    fn forge_host_lock_record(data_dir: &Path, pid: u32, role: &str) {
+        std::fs::write(
+            data_dir.join("host-process.lock"),
+            format!("{{\"pid\":{pid},\"role\":\"{role}\",\"addr\":\"localhost:8090\"}}\n"),
+        )
+        .unwrap();
+    }
+
+    /// Another holder, here a separate open file in place of another process.
+    fn foreign_host_lock(data_dir: &Path) -> crate::host_lock::FileLock {
+        crate::host_lock::FileLock::try_exclusive(
+            std::fs::File::open(data_dir.join("host-process.lock")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// The gateway that serves Home in this process proves the lane from the
+    /// flock it holds, the same proof as `/healthz`. A record naming this pid
+    /// as a gateway, written by any process of the same user, is refused.
+    #[test]
+    fn subordinate_lane_in_this_process_needs_the_held_gateway_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        let pid = std::process::id();
+
+        // No holder: the forged record does not make a gateway.
+        forge_host_lock_record(data, pid, "gateway");
+        assert!(!subordinate_gateway_host(data, "home").unwrap());
+
+        // Another holder has the lock; the record names this gateway.
+        let foreign = foreign_host_lock(data);
+        for role in ["gateway", "gateway-public"] {
+            forge_host_lock_record(data, pid, role);
+            let err = subordinate_gateway_host(data, "home").unwrap_err();
+            assert!(
+                err.to_string().contains("already owns this identity"),
+                "forged {role}: {err}"
+            );
+        }
+        drop(foreign);
+
+        // This process holds the gateway lock: the lane is open, whatever the record says.
+        let gateway =
+            crate::host_lock::acquire_host_process_lock(data, "gateway", "localhost:8090").unwrap();
+        assert!(subordinate_gateway_host(data, "home").unwrap());
+        forge_host_lock_record(data, pid.wrapping_add(1), "serve");
+        assert!(subordinate_gateway_host(data, "home").unwrap());
+
+        // After the release, the record this gateway left is not proof.
+        drop(gateway);
+        forge_host_lock_record(data, pid, "gateway");
+        let foreign = foreign_host_lock(data);
+        assert!(subordinate_gateway_host(data, "home").is_err());
+        drop(foreign);
+
+        // This process holds the lock as `serve`: the lane is refused.
+        let serve =
+            crate::host_lock::acquire_host_process_lock(data, "serve", "127.0.0.1:3000").unwrap();
+        forge_host_lock_record(data, pid, "gateway");
+        let err = subordinate_gateway_host(data, "home").unwrap_err();
+        assert!(
+            err.to_string().contains("already owns this identity"),
+            "{err}"
+        );
+        drop(serve);
+    }
+
+    /// A Home terminal proves its parent gateway holds the lock from the
+    /// descriptor that gateway gave it. A record naming the parent as a
+    /// gateway is refused.
     #[test]
     #[cfg(unix)]
-    fn gateway_owned_terminal_child_allows_parent_gateway_subordinate_runtime() {
-        let _guard = EnvRestore::set(GATEWAY_OWNED_HOME_TERMINAL_ENV, "1");
-        let owner = crate::host_lock::HostProcessInfo {
-            pid: parent_process_id().expect("test process should have a parent"),
-            role: "gateway".to_string(),
-            addr: "127.0.0.1:8090".to_string(),
+    fn subordinate_lane_for_a_home_terminal_needs_its_gateway_lock_descriptor() {
+        use std::ffi::OsStr;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        let parent = 4242_u32;
+        let parent_text = parent.to_string();
+        let marker = Some(OsStr::new("1"));
+        let proven = |fd: &dyn std::os::fd::AsRawFd,
+                      marker: Option<&OsStr>,
+                      pid: &str,
+                      ppid: Option<u32>| {
+            let fd = fd.as_raw_fd().to_string();
+            parent_gateway_lock_proven(
+                data,
+                marker,
+                Some(OsStr::new(pid)),
+                Some(OsStr::new(&fd)),
+                ppid,
+            )
         };
 
-        assert!(gateway_owner_allows_subordinate_managed_runtime(&owner));
-    }
+        // The record names the parent as a gateway; another process holds the
+        // lock; the descriptor is a plain open of the lock file.
+        forge_host_lock_record(data, parent, "gateway");
+        let foreign = foreign_host_lock(data);
+        let plain = std::fs::File::open(data.join("host-process.lock")).unwrap();
+        assert!(!proven(&plain, marker, &parent_text, Some(parent)));
+        drop(foreign);
 
-    #[test]
-    #[cfg(unix)]
-    fn unmarked_terminal_child_does_not_bypass_foreign_gateway_owner() {
-        let _guard = EnvRestore::remove(GATEWAY_OWNED_HOME_TERMINAL_ENV);
-        let owner = crate::host_lock::HostProcessInfo {
-            pid: parent_process_id().expect("test process should have a parent"),
-            role: "gateway".to_string(),
-            addr: "127.0.0.1:8090".to_string(),
-        };
+        // The parent gateway holds the lock and gave this descriptor.
+        let gateway =
+            crate::host_lock::acquire_host_process_lock(data, "gateway", "localhost:8090").unwrap();
+        let inherited = crate::host_lock::gateway_host_lock_for_child(data).unwrap();
+        assert!(proven(&inherited, marker, &parent_text, Some(parent)));
+        // Without the marker, from a process that is not the gateway's child,
+        // or without a descriptor, the lane stays closed.
+        assert!(!proven(&inherited, None, &parent_text, Some(parent)));
+        assert!(!proven(
+            &inherited,
+            Some(OsStr::new("0")),
+            &parent_text,
+            Some(parent)
+        ));
+        assert!(!proven(&inherited, marker, &parent_text, Some(parent + 1)));
+        assert!(!proven(&inherited, marker, &parent_text, None));
+        assert!(!parent_gateway_lock_proven(
+            data,
+            marker,
+            Some(OsStr::new(&parent_text)),
+            None,
+            Some(parent)
+        ));
+        assert!(!parent_gateway_lock_proven(
+            data,
+            marker,
+            Some(OsStr::new(&parent_text)),
+            Some(OsStr::new("not-a-number")),
+            Some(parent)
+        ));
 
-        assert!(!gateway_owner_allows_subordinate_managed_runtime(&owner));
-    }
-
-    #[test]
-    fn foreign_gateway_host_still_conflicts_with_managed_runtime() {
-        let owner = crate::host_lock::HostProcessInfo {
-            pid: std::process::id().saturating_add(1),
-            role: "gateway-public".to_string(),
-            addr: "127.0.0.1:8090".to_string(),
-        };
-
-        assert!(!gateway_owner_allows_subordinate_managed_runtime(&owner));
-    }
-
-    struct EnvRestore {
-        key: &'static str,
-        value: Option<std::ffi::OsString>,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self {
-                key,
-                value: previous,
-            }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self {
-                key,
-                value: previous,
-            }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match &self.value {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
+        // The gateway releases: refused. Another holder retakes: refused.
+        drop(gateway);
+        assert!(!proven(&inherited, marker, &parent_text, Some(parent)));
+        let foreign = foreign_host_lock(data);
+        forge_host_lock_record(data, parent, "gateway");
+        assert!(!proven(&inherited, marker, &parent_text, Some(parent)));
+        drop(foreign);
     }
 }
