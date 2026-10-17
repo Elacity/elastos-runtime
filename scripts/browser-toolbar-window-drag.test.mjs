@@ -21,7 +21,14 @@ function stringConstant(source, name) {
   return match[1];
 }
 
+function numberConstant(source, name) {
+  const match = source.match(new RegExp(`const ${name} = (\\d+);`));
+  assert.ok(match, name);
+  return Number(match[1]);
+}
+
 const MESSAGE_TYPE = stringConstant(geometrySource, "WINDOW_DRAG_MESSAGE_TYPE");
+const SNAP_ACTIVATION_DISTANCE = numberConstant(geometrySource, "WINDOW_SNAP_ACTIVATION_DISTANCE");
 
 test("Browser and Home name the same window-drag message", () => {
   assert.equal(stringConstant(browserSource, "WINDOW_DRAG_MESSAGE_TYPE"), MESSAGE_TYPE);
@@ -94,9 +101,22 @@ test("toolbar controls, other buttons and a second pointer keep their own behavi
   assert.deepEqual(toolbar.posted.map(({ message }) => message.phase), ["start"]);
 });
 
-function homeWindow({ mode = "unified-toolbar", maximized = false, hidden = false, frameToken = "frame-token" } = {}) {
+const SNAP_EDGE = 8;
+
+function homeWindow({
+  mode = "unified-toolbar",
+  maximized = false,
+  browserMaximized = false,
+  snap = "",
+  hidden = false,
+  phone = false,
+  frameToken = "frame-token",
+} = {}) {
   const listeners = new Set();
   const interactions = { begun: 0, ended: 0, saved: 0, focused: [] };
+  const restores = [];
+  const previews = [];
+  const snaps = [];
   const frameWindow = {};
   const classes = new Set(hidden ? ["window", "hidden"] : ["window"]);
   const nodeListeners = new Set();
@@ -106,7 +126,13 @@ function homeWindow({ mode = "unified-toolbar", maximized = false, hidden = fals
     removeEventListener: (type, listener, capture) => type === "load" && capture === true && nodeListeners.delete(listener),
     offsetWidth: 800,
     classList: { contains: (name) => classes.has(name), add: (name) => classes.add(name) },
-    dataset: { windowId: "browser-1", windowChromeMode: mode, ...(maximized ? { maximized: "true" } : {}) },
+    dataset: {
+      windowId: "browser-1",
+      windowChromeMode: mode,
+      ...(maximized ? { maximized: "true" } : {}),
+      ...(browserMaximized ? { browserMaximized: "true" } : {}),
+      ...(snap ? { snap } : {}),
+    },
     style: { left: "100px", top: "50px" },
   };
   const frame = {
@@ -126,9 +152,28 @@ function homeWindow({ mode = "unified-toolbar", maximized = false, hidden = fals
     clamp: (value, min, max) => Math.min(Math.max(value, min), max),
     normalWindowBounds: (windowNode) => ({ x: parseFloat(windowNode.style.left), y: parseFloat(windowNode.style.top) }),
     partialDragBoundsForWindow: () => ({ minX: -1000, maxX: 5000, minY: 0, maxY: 5000 }),
-    hideWindowSnapPreview: () => {},
+    hideWindowSnapPreview: () => previews.push("hidden"),
+    showWindowSnapPreview: (target) => previews.push(target ? target.state : "hidden"),
     beginShellInteraction: () => { interactions.begun += 1; },
     endShellInteraction: () => { interactions.ended += 1; },
+    isPhone: () => phone,
+    WINDOW_SNAP_ACTIVATION_DISTANCE: SNAP_ACTIVATION_DISTANCE,
+    // Restored windows come back 400px wide with the pointer at their middle.
+    restoreWindowForDrag: (windowNode, clientX, clientY) => {
+      restores.push([clientX, clientY]);
+      windowNode.dataset.maximized = "false";
+      windowNode.dataset.browserMaximized = "false";
+      windowNode.dataset.snap = "";
+      const bounds = { x: clientX - 200, y: clientY - 30 - 20 };
+      windowNode.style.left = `${bounds.x}px`;
+      windowNode.style.top = `${bounds.y}px`;
+      return bounds;
+    },
+    snapTargetForPointer: (clientX) => (clientX <= SNAP_EDGE ? { state: "left", bounds: {} } : null),
+    applyWindowSnap: (windowNode, target) => {
+      snaps.push(target.state);
+      windowNode.dataset.snap = target.state;
+    },
   });
   vm.runInContext(
     `${declaration(geometrySource, "safeClamp")}\n${declaration(geometrySource, "attachForwardedWindowDrag")}\nthis.attach = attachForwardedWindowDrag;`,
@@ -157,7 +202,7 @@ function homeWindow({ mode = "unified-toolbar", maximized = false, hidden = fals
       listener({ target });
     }
   };
-  return { node, interactions, send, position, detach, listeners, nodeListeners, loadFrame };
+  return { node, interactions, restores, previews, snaps, send, position, detach, listeners, nodeListeners, loadFrame };
 }
 
 test("Home moves the Browser window with the pointer and saves the place on release", () => {
@@ -170,7 +215,7 @@ test("Home moves the Browser window with the pointer and saves the place on rele
   assert.deepEqual(home.interactions, { begun: 1, ended: 1, saved: 1, focused: ["browser-1"] });
 });
 
-test("Home ignores drag messages from other frames, other chrome modes, maximized and hidden windows", () => {
+test("Home ignores drag messages from other frames, other chrome modes and hidden windows", () => {
   const stranger = homeWindow();
   stranger.send("start", 400, 80, {});
   stranger.send("move", 280, 160, {});
@@ -181,17 +226,80 @@ test("Home ignores drag messages from other frames, other chrome modes, maximize
   standard.send("move", 280, 160);
   assert.deepEqual(standard.position(), [100, 50]);
 
-  const maximized = homeWindow({ maximized: true });
-  maximized.send("start", 400, 80);
-  maximized.send("move", 280, 160);
-  assert.deepEqual(maximized.position(), [100, 50]);
-  assert.equal(maximized.interactions.begun, 0);
-
   const hidden = homeWindow({ hidden: true });
   hidden.send("start", 400, 80);
   hidden.send("move", 280, 160);
   assert.deepEqual(hidden.position(), [100, 50]);
   assert.deepEqual(hidden.interactions, { begun: 0, ended: 0, saved: 0, focused: [] });
+});
+
+test("dragging a maximized or snapped Browser restores it under the pointer and moves it", () => {
+  for (const state of [{ maximized: true }, { browserMaximized: true }, { snap: "left" }, { snap: "ne" }]) {
+    const name = JSON.stringify(state);
+    const home = homeWindow(state);
+    home.send("start", 400, 80);
+    assert.deepEqual(home.restores, [[400, 80]], name);
+    assert.deepEqual(home.position(), [200, 30], name);
+    home.send("move", 280, 160);
+    home.send("end", 280, 160);
+    assert.deepEqual(home.position(), [80, 110], name);
+    assert.deepEqual(home.interactions, { begun: 1, ended: 1, saved: 1, focused: ["browser-1"] }, name);
+    assert.deepEqual(home.snaps, [], name);
+  }
+});
+
+test("dragging the Browser to a screen edge previews and applies the snap on release", () => {
+  const home = homeWindow();
+  home.send("start", 400, 80);
+  home.send("move", 300, 100);
+  home.send("move", 4, 100);
+  assert.equal(home.previews.at(-1), "left");
+  home.send("end", 4, 100);
+  assert.deepEqual(home.snaps, ["left"]);
+  assert.equal(home.node.dataset.snap, "left");
+  assert.deepEqual(home.interactions, { begun: 1, ended: 1, saved: 1, focused: ["browser-1", "browser-1"] });
+});
+
+test("an edge snap needs a real drag and is dropped when the pointer leaves the edge or the drag is cut", () => {
+  const tiny = homeWindow();
+  tiny.send("start", SNAP_EDGE, 100);
+  tiny.send("move", SNAP_EDGE - 1, 100);
+  tiny.send("end", SNAP_EDGE - 1, 100);
+  assert.deepEqual(tiny.snaps, [], "a press that barely moves at the edge does not snap");
+
+  const away = homeWindow();
+  away.send("start", 400, 80);
+  away.send("move", 4, 100);
+  away.send("move", 200, 100);
+  away.send("end", 200, 100);
+  assert.deepEqual(away.snaps, []);
+  assert.equal(away.previews.at(-1), "hidden");
+
+  const reloaded = homeWindow();
+  reloaded.send("start", 400, 80);
+  reloaded.send("move", 4, 100);
+  reloaded.loadFrame();
+  assert.deepEqual(reloaded.snaps, [], "a reload mid-drag never snaps");
+  assert.equal(reloaded.previews.at(-1), "hidden");
+
+  const closed = homeWindow();
+  closed.send("start", 400, 80);
+  closed.send("move", 4, 100);
+  closed.detach();
+  assert.deepEqual(closed.snaps, [], "closing mid-drag never snaps");
+  assert.equal(closed.previews.at(-1), "hidden");
+});
+
+test("on a phone the Browser toolbar focuses the window but never drags, restores or snaps it", () => {
+  const home = homeWindow({ phone: true, maximized: true });
+  home.send("start", 400, 80);
+  home.send("move", 4, 160);
+  home.send("end", 4, 160);
+  assert.deepEqual(home.position(), [100, 50]);
+  assert.deepEqual(home.restores, []);
+  assert.deepEqual(home.snaps, []);
+  assert.equal(home.node.dataset.maximized, "true");
+  assert.deepEqual(home.interactions, { begun: 0, ended: 0, saved: 0, focused: ["browser-1"] });
 });
 
 test("a window that is snapped, maximized or hidden during a drag stops following the pointer", () => {

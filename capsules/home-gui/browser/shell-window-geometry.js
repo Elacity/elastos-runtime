@@ -424,7 +424,9 @@ export const WINDOW_DRAG_MESSAGE_TYPE = "elastos.home.window-drag/v1";
  * and carry the launch token Home gave that frame (`frameHomeToken`), in the
  * exact `elastos.home.window-drag/v1` shape. Anything else is ignored.
  * Positions are frame-relative and are added to the frame's current place,
- * because some engines report screen positions offset or flipped. */
+ * because some engines report screen positions offset or flipped.
+ * Like the title bar, a drag restores a maximized or snapped window and can
+ * snap it to a screen edge on release. */
 export function attachForwardedWindowDrag(
   windowNode,
   focusWindow,
@@ -432,12 +434,19 @@ export function attachForwardedWindowDrag(
   frameHomeToken = null,
 ) {
   let dragging = null;
-  const finish = () => {
+  const finish = (snapOnRelease = false) => {
     if (!dragging) {
       return;
     }
+    const snapTarget = snapOnRelease ? dragging.snapTarget : null;
     dragging = null;
     endShellInteraction();
+    if (snapTarget) {
+      applyWindowSnap(windowNode, snapTarget);
+      focusWindow(windowNode.dataset.windowId);
+    } else {
+      hideWindowSnapPreview();
+    }
     if (typeof onWindowGeometryChange === "function") {
       onWindowGeometryChange();
     }
@@ -468,14 +477,17 @@ export function attachForwardedWindowDrag(
     ) {
       return;
     }
-    // A hidden, maximized or snapped window keeps its place, including when it
-    // changes state in the middle of a drag.
-    const movable =
-      !windowNode.classList.contains("hidden") &&
-      windowNode.dataset.maximized !== "true" &&
-      windowNode.dataset.browserMaximized !== "true" &&
-      !windowNode.dataset.snap;
-    if (data.phase === "end" || !movable) {
+    if (data.phase === "end") {
+      finish(true);
+      return;
+    }
+    // A hidden window keeps its place. A window that is maximized, snapped or
+    // hidden by something else in the middle of a drag stops following.
+    const special =
+      windowNode.dataset.maximized === "true" ||
+      windowNode.dataset.browserMaximized === "true" ||
+      Boolean(windowNode.dataset.snap);
+    if (windowNode.classList.contains("hidden") || (dragging && special)) {
       finish();
       return;
     }
@@ -484,16 +496,30 @@ export function attachForwardedWindowDrag(
     }
     const frameRect = frame.getBoundingClientRect();
     const workspaceRect = desktop.getBoundingClientRect();
-    const pointerX = frameRect.left + data.clientX - workspaceRect.left;
-    const pointerY = frameRect.top + data.clientY - workspaceRect.top;
+    const clientX = frameRect.left + data.clientX;
+    const clientY = frameRect.top + data.clientY;
+    const pointerX = clientX - workspaceRect.left;
+    const pointerY = clientY - workspaceRect.top;
     if (data.phase === "start") {
       hideWindowSnapPreview();
       focusWindow(windowNode.dataset.windowId);
-      const bounds = normalWindowBounds(windowNode);
+      // Phone windows fill the stage, as with the title bar.
+      if (isPhone()) {
+        return;
+      }
+      const bounds = special
+        ? restoreWindowForDrag(windowNode, clientX, clientY)
+        : normalWindowBounds(windowNode);
       if (!dragging) {
         beginShellInteraction();
       }
-      dragging = { offsetX: pointerX - bounds.x, offsetY: pointerY - bounds.y };
+      dragging = {
+        offsetX: pointerX - bounds.x,
+        offsetY: pointerY - bounds.y,
+        startClientX: clientX,
+        startClientY: clientY,
+        snapTarget: null,
+      };
       return;
     }
     if (data.phase !== "move" || !dragging) {
@@ -502,6 +528,11 @@ export function attachForwardedWindowDrag(
     const limits = partialDragBoundsForWindow(windowNode.offsetWidth);
     windowNode.style.left = `${safeClamp(pointerX - dragging.offsetX, limits.minX, limits.maxX)}px`;
     windowNode.style.top = `${safeClamp(pointerY - dragging.offsetY, limits.minY, limits.maxY)}px`;
+    const movedDistance = Math.hypot(clientX - dragging.startClientX, clientY - dragging.startClientY);
+    dragging.snapTarget = movedDistance >= WINDOW_SNAP_ACTIVATION_DISTANCE
+      ? snapTargetForPointer(clientX, clientY)
+      : null;
+    showWindowSnapPreview(dragging.snapTarget);
   };
   // A frame that reloads, navigates or is relaunched mid-drag never sends its
   // end, and its old token no longer matches.

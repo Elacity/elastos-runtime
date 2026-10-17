@@ -187,9 +187,13 @@ unless all of these are true:
   `end`;
 - the window uses `unified-toolbar` chrome and is connected.
 
-On each message the window must also be visible, not maximized, not
-Browser-maximized and not snapped. If not, the drag stops. Home removes the
-listener when it closes the window. The Browser does not send the message when
+The drag behaves like a Home title bar. The window must be visible. A start
+on a maximized, Browser-maximized or snapped window restores it under the
+pointer. If the window is maximized, snapped or hidden by something else
+during a drag, the drag stops. Dragging to a screen edge shows the snap
+preview, and releasing there snaps the window. On a phone the press only
+focuses the window. A reload or close during a drag never snaps. Home removes
+the listener when it closes the window. The Browser does not send the message when
 it has no launch token. Tests: `scripts/browser-toolbar-window-drag.test.mjs`.
 
 ### First-party Clipboard edge
