@@ -5812,6 +5812,143 @@ async fn test_home_background_from_object_requires_library_capability_and_unprot
     }
 }
 
+/// The set-from-object path reads a file from disk on Home's request, so every
+/// way to name a file outside the person's own Library is refused: `..` in
+/// plain, percent-encoded and double-encoded form, backslash separators, NUL
+/// and other control characters, and links that point elsewhere. Trash and
+/// Runtime-private areas are covered by the capability test above.
+#[tokio::test]
+async fn test_home_background_from_object_refuses_traversal_encoding_and_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let _admin_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let _guest_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &guest.principal_id);
+    let picture = test_png_picture(640, 480, b"own-picture");
+    let picture_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/hills.png",
+        &picture,
+    );
+    let guest_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &guest,
+        "Pictures/guest.png",
+        &picture,
+    );
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let root = crate::auth::principal_localhost_root(&admin.principal_id);
+    let guest_root = crate::auth::principal_localhost_root(&guest.principal_id);
+    let guest_tail = guest_root.rsplit('/').next().unwrap().to_string();
+    let set = |uri: String| {
+        let app = app.clone();
+        let home = admin.home_token.clone();
+        let library = library_token.clone();
+        async move { set_background_from_object(&app, home, Some(library), &uri).await }
+    };
+
+    let refused = [
+        // Plain traversal out of the principal root.
+        format!("{root}/../{guest_tail}/Pictures/guest.png"),
+        format!("{root}/Pictures/../../{guest_tail}/Pictures/guest.png"),
+        format!("{root}/Pictures/./hills.png"),
+        "localhost://Users/../../etc/passwd".to_string(),
+        // Percent-encoded and double-encoded dot segments and separators.
+        format!("{root}/Pictures/%2e%2e/%2e%2e/{guest_tail}/Pictures/guest.png"),
+        format!("{root}/Pictures/%2E%2E/hills.png"),
+        format!("{root}/Pictures/%252e%252e/%252e%252e/{guest_tail}/Pictures/guest.png"),
+        format!("{root}/Pictures%2f..%2f..%2f{guest_tail}%2fPictures%2fguest.png"),
+        format!("{root}/Pictures%5c..%5c..%5c{guest_tail}%5cPictures%5cguest.png"),
+        // Windows separators.
+        format!("{root}/Pictures\\..\\..\\{guest_tail}\\Pictures\\guest.png"),
+        format!("{root}\\..\\{guest_tail}\\Pictures\\guest.png"),
+        format!("{root}/Pictures\\hills.png"),
+        // NUL and other control characters, raw and encoded.
+        format!("{root}/Pictures/hills.png\0.txt"),
+        format!("{root}/Pictures/hills%00.png"),
+        format!("{root}/Pictures/hills\n.png"),
+        // Another person's object, named directly.
+        guest_uri.clone(),
+    ];
+    for uri in refused {
+        let (status, text) = set(uri.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri:?}: {text}");
+    }
+
+    // Unicode names are matched exactly as stored (no normalization).
+    let nfc_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/caf\u{e9}.png",
+        &picture,
+    );
+    let (status, text) = set(nfc_uri).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let (status, text) = set(format!("{root}/Pictures/cafe\u{301}.png")).await;
+    if cfg!(target_os = "linux") {
+        // A different byte sequence is a different (missing) name on Linux.
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    } else {
+        // A normalizing file system may resolve it to the same own file.
+        assert!(
+            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
+            "{status}: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let fs_path = |uri: &str| {
+            elastos_common::localhost::rooted_localhost_fs_path(dir.path(), uri).unwrap()
+        };
+        // A plain PNG outside the data directory.
+        let outside_png = outside.path().join("outside.png");
+        std::fs::write(&outside_png, &picture).unwrap();
+        // A link to a file outside Runtime's data directory.
+        symlink(
+            &outside_png,
+            fs_path(&format!("{root}/Pictures/escape.png")),
+        )
+        .unwrap();
+        // A link to the person's own file is still a link.
+        symlink(
+            fs_path(&picture_uri),
+            fs_path(&format!("{root}/Pictures/alias.png")),
+        )
+        .unwrap();
+        // A directory link into another person's Pictures.
+        symlink(
+            fs_path(&format!("{guest_root}/Pictures")),
+            fs_path(&format!("{root}/Pictures/guest-pictures")),
+        )
+        .unwrap();
+        // A directory link at the top of the person's root.
+        symlink(outside.path(), fs_path(&format!("{root}/Outside"))).unwrap();
+        for uri in [
+            format!("{root}/Pictures/escape.png"),
+            format!("{root}/Pictures/alias.png"),
+            format!("{root}/Pictures/guest-pictures/guest.png"),
+            format!("{root}/Outside/outside.png"),
+        ] {
+            let (status, text) = set(uri.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {text}");
+            assert!(text.contains("link"), "{uri}: {text}");
+        }
+    }
+    drop(outside);
+}
+
 #[tokio::test]
 async fn test_home_runtime_ensure_reuses_running_runtime() {
     let dir = tempfile::tempdir().unwrap();
