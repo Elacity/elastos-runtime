@@ -171,7 +171,6 @@ verify:
     ./scripts/vendor-ui-tokens.sh --check
     node scripts/carrier-dependency-generation-check.mjs
     just product-ui-source
-    node scripts/home-clipboard-source-gate.mjs
     node --test scripts/browser-window-close-handshake.test.mjs
     node --test scripts/home-two-runtime-acceptance.test.mjs
     node --test scripts/system-hosted-save.test.mjs

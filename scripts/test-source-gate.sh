@@ -22,6 +22,8 @@ product_ui() {
   node scripts/home-shell-bridge-smoke.mjs
   node scripts/home-agent-shell-smoke.mjs
   node scripts/people-discovery-smoke.mjs
+  node scripts/home-clipboard-source-gate.mjs
+  node --test scripts/home-clipboard-source-gate.test.mjs
 }
 
 release() {
