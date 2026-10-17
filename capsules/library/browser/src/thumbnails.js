@@ -3,16 +3,21 @@
 // Runtime models `thumbnail_uri` on objects but does not fill it yet. Until it
 // does, Library renders a thumbnail from the image bytes it is already allowed
 // to download. Only items on screen are fetched, a few at a time, and object
-// URLs are released when the cache is full.
+// URLs are released when the cache is full. A picture whose header declares a
+// canvas too large to decode, or whose header cannot be read, keeps its icon.
+
+import { isBoundedImage } from "./image-header.js";
 
 const THUMBNAIL_MAX_BYTES = 4 * 1024 * 1024;
 const THUMBNAIL_CACHE_LIMIT = 160;
 const THUMBNAIL_CONCURRENCY = 3;
 const THUMBNAIL_ROOT_MARGIN = "200px";
+// Only formats whose header Library can read; SVG and others keep the icon.
+const THUMBNAIL_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 
 export function isThumbnailCandidate(object) {
   if (!object || object.kind === "directory") return false;
-  if (!String(object.mime || "").startsWith("image/")) return false;
+  if (!THUMBNAIL_MIME_TYPES.has(String(object.mime || ""))) return false;
   return Number(object.size || 0) <= THUMBNAIL_MAX_BYTES;
 }
 
@@ -86,7 +91,12 @@ export function createLibraryThumbnails({ readObjectBlob, root }) {
     const nodes = pending.get(signature) || [];
     let objectUrl = "";
     try {
-      objectUrl = URL.createObjectURL(await readObjectBlob(object.thumbnail_uri || object.uri));
+      const blob = await readObjectBlob(object.thumbnail_uri || object.uri);
+      if (blob.size > THUMBNAIL_MAX_BYTES || !isBoundedImage(new Uint8Array(await blob.arrayBuffer()))) {
+        pending.delete(signature);
+        return;
+      }
+      objectUrl = URL.createObjectURL(blob);
     } catch (_error) {
       // Keep the generic file icon; the object may be unreadable or offline.
       pending.delete(signature);
