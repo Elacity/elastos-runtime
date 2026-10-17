@@ -3130,10 +3130,66 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
             self.assertEqual(record["results"]["finite_memory_boundary"], "failed")
             self.assertNotIn("private Runtime log line", (evidence / "installed-journeys.json").read_text())
 
+    def test_observer_failure_redacts_home_paths_and_tokens_before_the_record_is_saved(self):
+        hexdigest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        did = "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+        private = ["/home/ci-person", "ci-person", "observer root", "Application Support", "/opt/build-cache",
+                   "eyJhbGciOiJFZERTQSJ9.payload-77", "s3cr3t-value", "hunter2pass", hexdigest, did,
+                   "QWxhZGRpbjpvcGVuIHNlc2FtZQ9xYz"]
+
+        def message(home, data):
+            return (f"[Errno 2] No such file or directory: '{data / 'finite-control/request.json'}' "
+                    f"after {home}/model-inputs and /home/ci-person/.config/elastos/keys and "
+                    f"/opt/build-cache/run-41/llama.bin and file:///home/ci-person/x; "
+                    "Authorization: Bearer eyJhbGciOiJFZERTQSJ9.payload-77 token=s3cr3t-value "
+                    f"password: hunter2pass digest {hexdigest} holder did:key:{did} "
+                    "blob QWxhZGRpbjpvcGVuIHNlc2FtZQ9xYz")
+
+        def assert_redacted(text, failure):
+            for value in private:
+                self.assertNotIn(value, text)
+            self.assertIn("No such file or directory: '<path>/request.json'", failure["message"])
+            self.assertIn("did:key:<redacted>", failure["message"])
+            self.assertIn("Bearer <redacted>", failure["message"])
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, {"HOME": "/home/ci-person"}):
+            owner, _ = self.finite_owner(Path(temp) / "observer root")
+            owner.data = owner.home / "Library/Application Support/elastos"
+            owner.started, owner.fds, owner.launch_requested = time.monotonic(), {}, False
+            owner.observe_once = mock.Mock(side_effect=FileNotFoundError(message(owner.home, owner.data)))
+            owner.observe()
+            owner.start = mock.Mock(return_value=owner)
+            case = InstalledJourneyTests()
+            home, data, evidence, _ = case.fixture(Path(temp) / "journey", "linux")
+            (home / "journey-runtime.private.log").write_text("")
+            with self.assertRaisesRegex(AssertionError, "installed Runtime exited before health") as raised:
+                case.execute(home, data, evidence, memory_gib=4, finite=mock.Mock(return_value=owner))
+            saved = (evidence / "installed-journeys.json").read_text()
+            failure = json.loads(saved)["finite_memory"]["observer_failure"]
+            self.assertEqual((failure["phase"], failure["type"], failure["runtime_exited"]),
+                             ("census", "FileNotFoundError", False))
+            assert_redacted(saved, failure)
+            # The CI log line carries the same redacted cause.
+            assert_redacted(str(raised.exception), failure)
+
+            repair = self.journey["RepairRuntime"].__new__(self.journey["RepairRuntime"])
+            repair.home = owner.home
+            repair.data = owner.data
+            repair.control, repair.record = Path(temp) / "repair-control", {"actions": []}
+            repair.control.mkdir(mode=0o700)
+            repair.stop = mock.Mock()
+            repair.stop.wait.return_value = False
+            self.journey["private_json"](repair.control / "request.json", {"id": 1, "action": "engine_running"})
+            repair.engine_running = mock.Mock(side_effect=OSError(message(repair.home, repair.data)))
+            repair.observe()
+            self.assertEqual(repair.record["control_failure"]["phase"], "stage_engine_running")
+            assert_redacted(json.dumps(repair.record), repair.record["control_failure"])
+
     def test_repair_control_failure_reaches_its_record(self):
         owner = self.journey["RepairRuntime"].__new__(self.journey["RepairRuntime"])
         with tempfile.TemporaryDirectory() as temp:
             owner.control, owner.record = Path(temp), {"actions": []}
+            owner.home, owner.data = Path(temp), Path(temp) / "data"
             owner.control.chmod(0o700)
             owner.stop = mock.Mock()
             owner.stop.wait.return_value = False
