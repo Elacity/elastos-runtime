@@ -1614,6 +1614,7 @@ async fn setup_server_infrastructure_impl(
             collaboration_configuration,
             collaboration_carrier_provider,
             provider_registry.clone(),
+            Some(capability_manager.clone()),
         )
         .await?;
     if let (Some(collaboration), Some(carrier)) =

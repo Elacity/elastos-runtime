@@ -30,7 +30,8 @@ from this document after a local history reconstruction.
 8. A direct conversation is authorized between accepted Profile identities.
    Its stable conversation ID is an opaque selector, not authority.
 9. Shared-room attribution comes from verified signed Profiles. Presence is
-   liveness only.
+   liveness only; a member who is online but has not posted is listed under
+   the name in that presence's verified signed Profile, until it expires.
 10. A delivery receipt proves that the named Runtime endpoint accepted the
     exact envelope. It does not claim that a person read the message.
 11. The signed network profile and seed signer provide bootstrap and
