@@ -116,20 +116,26 @@ from `elastos/`. The real Component fixture checks that unrelated async work
 stays responsive, artifact errors are preserved, and stopping a loaded instance
 removes it. The cancellation test queues the compile job behind a held blocking
 worker and checks that the job retains its slot after the caller cancels.
-The heartbeat measurement reports host timing; scheduling assertions are the
-regression gates. This checks loading, while Bus conformance checks Runtime
-dispatch.
+The blocked-worker test checks executor responsiveness. A paused-clock test
+checks that waiting for the compile slot stops after 30 seconds; an admitted
+blocking job retains its slot until it finishes. This checks loading, while Bus
+conformance checks Runtime dispatch.
 
 For request-store changes, run
 `cargo test --locked -p elastos-runtime` from `elastos/`. This covers the pending
 request and capability stores, including concurrent admission limits,
-expired-request recovery and retention of grants for user revocation. Verify
-that concurrent revocation keeps the epoch monotonic and that cleanup retains
-still-valid grants.
+expired-request recovery and retention of grants for user revocation. The
+32-record session share covers outstanding requests and retained live grants;
+one full session must leave room for another while global capacity remains.
+Verify that concurrent revocation keeps the epoch monotonic and that cleanup
+retains still-valid grants.
 
 For capacity reclamation, also run
 `cargo test --locked -p elastos-server --lib api::handlers::capability::tests::test_request_capacity_recovers -- --nocapture`
-from `elastos/`. These regressions invoke the real Rust handlers directly with
+from `elastos/`. Also run
+`cargo test --locked -p elastos-server --lib api::handlers::capability::tests::test_revoke_all_failure_returns_500_and_keeps_live_grants -- --nocapture`
+to check that a failed epoch write returns an error and leaves live grants
+unchanged. These regressions invoke the real Rust handlers directly with
 `State`, `Extension` and `Json`; HTTP routing, middleware and installed acceptance
 need separate evidence. Together these checks exercise Runtime ownership of
 effects as defined in [PRINCIPLES.md](../PRINCIPLES.md); they complement the source
