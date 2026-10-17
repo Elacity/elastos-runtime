@@ -79,6 +79,8 @@ On first launch, Home shows `Set up Home`. Enter a passkey name, choose
 passkey becomes the Home admin. Later launches show `Sign in` / `Use passkey`.
 Use `http://localhost:61180/apps/home/`; do not switch the visible origin to
 `127.0.0.1`, because passkey RP/origin state is bound to the browser origin.
+Port `61180` is the developer source-home lane. The installed Home address is
+in the [launcher contract](LAUNCHER_CONTRACT.md#readiness-and-home-url).
 
 ## Browser VM Artifacts
 

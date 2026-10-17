@@ -55,6 +55,8 @@ Each top-level ledger has one job:
   lifecycle, and child intents
 - [Interactive runtime contract](INTERACTIVE_RUNTIME_CONTRACT.md): interactive
   sessions and return behavior
+- [Launcher contract](LAUNCHER_CONTRACT.md): install, gateway start, `/healthz`,
+  Home URL, data directory, lock, stop, and update
 - [Execution](EXECUTION.md): release execution boundaries
 - [Command runtime matrix](COMMAND_MATRIX.md): Runtime ownership for every
   command

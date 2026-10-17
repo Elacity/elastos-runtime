@@ -429,8 +429,16 @@ pub(super) fn request_host(headers: &HeaderMap) -> anyhow::Result<Option<String>
     Ok(Some(validated_gateway_host(headers)?))
 }
 
-pub(super) async fn healthz() -> &'static str {
-    "OK"
+/// Launcher readiness, `docs/LAUNCHER_CONTRACT.md` ("Readiness and Home URL").
+/// The process that owns the listening socket answers. The body is the two
+/// bytes `OK` only while this process holds the host lock as a gateway; the
+/// JSON record in the lock file is not read.
+pub(super) async fn healthz(State(state): State<GatewayState>) -> Response {
+    if crate::host_lock::holds_gateway_host_lock(&state.data_dir) {
+        (StatusCode::OK, "OK").into_response()
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }
 }
 
 pub(super) async fn serve_release_manifest(

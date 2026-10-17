@@ -221,9 +221,11 @@ async fn test_root_serves_mywebsite_when_staged() {
     assert_eq!(&body[..], b"<html>home site</html>");
 }
 
+/// Launcher readiness. The body is the two bytes `OK` when this process holds the lock.
 #[tokio::test]
 async fn test_healthz_200() {
     let dir = tempfile::tempdir().unwrap();
+    let _gateway_lock = super::hold_gateway_health_lock(dir.path());
     let state = test_state(dir.path());
     let app = gateway_router(state);
 
@@ -238,6 +240,145 @@ async fn test_healthz_200() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"OK");
+    assert_eq!(body.len(), 2);
+}
+
+async fn healthz_status(data_dir: &std::path::Path) -> StatusCode {
+    gateway_router(test_state(data_dir))
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Another process of the same user can rewrite `host-process.lock`. Health
+/// reads ownership from the flock this process holds, never from that record.
+#[tokio::test]
+async fn test_healthz_refuses_a_forged_or_foreign_lock_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("host-process.lock");
+    let pid = std::process::id();
+    let record = |pid: &str, role: &str| {
+        format!("{{\"pid\":{pid},\"role\":\"{role}\",\"addr\":\"localhost:8090\"}}\n")
+    };
+    let forged = record(&pid.to_string(), "gateway");
+
+    // No process holds the lock. A record that names this gateway is a forgery.
+    for (case, bytes) in [
+        ("this pid as gateway", forged.clone()),
+        (
+            "this pid as gateway-public",
+            record(&pid.to_string(), "gateway-public"),
+        ),
+        (
+            "another pid",
+            record(&pid.wrapping_add(1).to_string(), "gateway"),
+        ),
+        ("another role", record(&pid.to_string(), "serve")),
+        (
+            "a pid that is a string",
+            record(&format!("\"{pid}\""), "gateway"),
+        ),
+        ("not JSON", "not-json".to_string()),
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            healthz_status(dir.path()).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unheld lock, {case}"
+        );
+    }
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        healthz_status(dir.path()).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "missing lock"
+    );
+
+    // Another lock holder, here a separate open file in place of another
+    // process, owns the flock while the record names this gateway.
+    std::fs::write(&path, &forged).unwrap();
+    let foreign =
+        crate::host_lock::FileLock::try_exclusive(std::fs::File::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        healthz_status(dir.path()).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "foreign holder"
+    );
+    drop(foreign);
+
+    // This process holds the lock as `serve`. A record rewritten to `gateway` is refused.
+    let serve =
+        crate::host_lock::acquire_host_process_lock(dir.path(), "serve", "127.0.0.1:3000").unwrap();
+    std::fs::write(&path, &forged).unwrap();
+    assert_eq!(
+        healthz_status(dir.path()).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "serve lock"
+    );
+    drop(serve);
+
+    // This process holds the lock as a gateway. The record does not change the answer.
+    let gateway = super::hold_gateway_health_lock(dir.path());
+    assert_eq!(healthz_status(dir.path()).await, StatusCode::OK);
+    for bytes in [
+        record(&pid.wrapping_add(1).to_string(), "gateway"),
+        record(&pid.to_string(), "serve"),
+        "not-json".to_string(),
+    ] {
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(healthz_status(dir.path()).await, StatusCode::OK);
+    }
+
+    // A replaced lock file is not the file this gateway locked.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, &forged).unwrap();
+    assert_eq!(
+        healthz_status(dir.path()).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "replaced file"
+    );
+    drop(gateway);
+
+    // After the gateway releases its lock, the record it left is not readiness.
+    let gateway = super::hold_gateway_health_lock(dir.path());
+    assert_eq!(healthz_status(dir.path()).await, StatusCode::OK);
+    drop(gateway);
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("\"gateway\""));
+    assert_eq!(
+        healthz_status(dir.path()).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "released lock"
+    );
+
+    let contract = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../docs/LAUNCHER_CONTRACT.md"
+    ))
+    .unwrap();
+    assert!(contract.contains("http://localhost:8090/home/"));
+    assert!(contract.contains("two bytes `OK`"));
+    assert!(!contract.contains("three bytes"));
+    assert!(!contract.contains("darwin-x64"));
+    assert!(!contract.contains("127.0.0.1:8090/home/"));
+    // The reply describes the answering process, so the contract states that gap.
+    assert!(!contract.contains("does not treat another"));
+    assert!(contract.contains("The reply does not name the process."));
+    assert!(contract.contains("its `/healthz` returns 503"));
+    // The contract names the flock, not the record, as the proof of ownership.
+    assert!(contract.contains("What proves ownership:"));
+    assert!(!contract.contains("recorded owner"));
 }
 
 #[tokio::test]
@@ -679,6 +820,7 @@ async fn test_concurrent_release_reads_wait_health_works_and_scan_once() {
             .is_err()
     );
     assert!(requests.iter().all(|request| !request.is_finished()));
+    let _gateway_lock = super::hold_gateway_health_lock(&fixture.base);
     let response = app
         .clone()
         .oneshot(

@@ -4609,6 +4609,7 @@ pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
     let text = err.to_string();
     let status = if err.is::<PasskeyRegistrationDenied>()
         || err.is::<crate::auth::OwnerEnrollmentDenied>()
+        || err.is::<crate::auth::PasskeyOriginRefused>()
         || text.contains("missing")
         || text.contains("invalid")
         || text.contains("expired")
@@ -8711,6 +8712,127 @@ mod tests {
         .unwrap()
     }
 
+    fn passkey_sign_in_at(
+        data_dir: &std::path::Path,
+        credential: &StoredCredential,
+        origin: &str,
+    ) -> anyhow::Result<AuthSessionGrantV1> {
+        crate::auth::grant_passkey_session(
+            data_dir,
+            crate::auth::PasskeySessionRequest {
+                credential,
+                origin,
+                user_verified: true,
+                display_name: None,
+                profile_display_name: None,
+                reason: "upgrade sign-in fixture",
+                purpose: crate::auth::PasskeySessionPurpose::SignIn,
+            },
+        )
+    }
+
+    /// Every release takes the relying party id from the page host (`derive_rp`), and
+    /// browsers refuse an IP address as a relying party id. A stored passkey therefore
+    /// names the host it was made at, and the origin check accepts that host on any port.
+    #[test]
+    fn passkey_from_an_earlier_release_signs_in_and_a_foreign_origin_is_refused() {
+        let root = local_profile_fixture_root();
+        let _auth = super::super::gateway::set_test_home_launch_auth_data_dir(root.path());
+        // The owner credential is stored as an earlier release stored it at a custom port.
+        let (owner_credential, owner) = local_profile_owner_grant(root.path());
+        for origin in ["http://localhost:8090", "http://localhost:61180"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("origin", HeaderValue::from_str(origin).unwrap());
+            assert_eq!(
+                super::super::handlers::identity::derive_rp(&headers)
+                    .unwrap()
+                    .id,
+                owner_credential.rp_id
+            );
+        }
+        for origin in [
+            "http://localhost:8090",
+            "http://localhost:61180",
+            "http://LOCALHOST:18090",
+        ] {
+            let grant = passkey_sign_in_at(root.path(), &owner_credential, origin).unwrap();
+            assert_eq!(grant.principal_id, owner.principal_id, "{origin}");
+        }
+        // A public Home credential keeps its own https host.
+        crate::auth::set_guest_registration_enabled(root.path(), true, crate::auth::now_ts())
+            .unwrap();
+        let mut public = test_credential_2();
+        public.rp_id = "home.example.test".to_string();
+        store_test_credential(root.path(), public.clone());
+        let guest = crate::auth::grant_passkey_session(
+            root.path(),
+            crate::auth::PasskeySessionRequest {
+                credential: &public,
+                origin: "https://home.example.test",
+                user_verified: true,
+                display_name: None,
+                profile_display_name: None,
+                reason: "public registration fixture",
+                purpose: crate::auth::PasskeySessionPurpose::GuestRegistration,
+            },
+        )
+        .unwrap();
+        let signed_in =
+            passkey_sign_in_at(root.path(), &public, "https://home.example.test").unwrap();
+        assert_eq!(signed_in.principal_id, guest.principal_id);
+
+        let before = std::fs::read(crate::auth::auth_state_path(root.path()).unwrap()).unwrap();
+        for (credential, origin) in [
+            (&owner_credential, "https://evil.example"),
+            (&owner_credential, "http://localhost.evil.example:8090"),
+            (&owner_credential, "http://evil.localhost:8090"),
+            (&owner_credential, "http://127.0.0.1:8090"),
+            (&owner_credential, "http://[::1]:8090"),
+            (&owner_credential, "not a url"),
+            (&public, "http://localhost:8090"),
+            (&public, "https://evil.home.example.test"),
+        ] {
+            assert!(
+                passkey_sign_in_at(root.path(), credential, origin).is_err(),
+                "{} at {origin}",
+                credential.rp_id
+            );
+        }
+        assert_eq!(
+            std::fs::read(crate::auth::auth_state_path(root.path()).unwrap()).unwrap(),
+            before
+        );
+
+        // The refusal tells the person which address to open, with a 403 reply.
+        let local = "Passkeys work on this computer only at the localhost address. Open http://localhost:8090/home/ and try again.";
+        let refused = passkey_sign_in_at(root.path(), &owner_credential, "http://127.0.0.1:8090")
+            .unwrap_err();
+        assert_eq!(refused.to_string(), local);
+        assert_eq!(auth_error_response(refused).status(), StatusCode::FORBIDDEN);
+        let foreign =
+            passkey_sign_in_at(root.path(), &owner_credential, "https://evil.example").unwrap_err();
+        assert!(foreign
+            .to_string()
+            .starts_with("This passkey works only at the Home address"));
+        let fresh = local_profile_fixture_root();
+        let mut identity = elastos_identity::IdentityManager::new(fresh.path().into()).unwrap();
+        let secret = crate::auth::random_secret_hex();
+        let enrollment = crate::auth::begin_owner_enrollment(
+            fresh.path(),
+            &mut identity,
+            &crate::auth::OwnerAdmission {
+                origin: "http://127.0.0.1:8090",
+                rp_id: "127.0.0.1",
+                claimant: &secret,
+                loopback: true,
+            },
+            "launcher-owner",
+            crate::auth::now_ts(),
+        )
+        .unwrap_err();
+        assert_eq!(enrollment.to_string(), local);
+    }
+
     #[test]
     fn local_profile_setup_resumes_with_current_grant_after_interruption() {
         for fault in ["after-terminal", "after-root", "after-profile"] {
@@ -8881,7 +9003,8 @@ mod tests {
         let (_, owner) = local_profile_owner_grant(root.path());
         crate::auth::set_guest_registration_enabled(root.path(), true, crate::auth::now_ts())
             .unwrap();
-        let guest_credential = test_credential_2();
+        let mut guest_credential = test_credential_2();
+        guest_credential.rp_id = "localhost".to_string();
         store_test_credential(root.path(), guest_credential.clone());
         let guest = crate::auth::grant_passkey_session(
             root.path(),
@@ -8951,7 +9074,8 @@ mod tests {
             .unwrap()
             .is_none()
         );
-        let unrelated_credential = test_credential();
+        let mut unrelated_credential = test_credential();
+        unrelated_credential.rp_id = "localhost".to_string();
         store_test_credential(root.path(), unrelated_credential.clone());
         let unrelated = crate::auth::grant_passkey_session(
             root.path(),
