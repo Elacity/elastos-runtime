@@ -352,7 +352,50 @@ fn retire_host(data: &Path, manifest: &super::ComponentsManifest) -> anyhow::Res
     if browser_installed {
         println!("Browser is not available on this computer yet.");
     }
+    #[cfg(target_os = "linux")]
+    if let Some(notice) = earlier_linux_host_access(Path::new("/"), unsafe { libc::getuid() }) {
+        println!("{notice}");
+    }
     Ok(())
+}
+
+/// The root-owned copy of scripts/browser-vm-linux-network.py that an earlier
+/// release's installer ran with sudo.
+#[cfg(target_os = "linux")]
+const LINUX_HOST_HELPER: &str = "/usr/local/lib/elastos/browser-vm-linux-network.py";
+
+/// An earlier installer could set up root-owned Browser host access for this
+/// account (KVM access, private network devices, a udev rule and a boot
+/// service). Setup runs as the Home user, so it does not remove that access.
+/// It tells the user the exact removal command, and it changes nothing.
+#[cfg(target_os = "linux")]
+fn earlier_linux_host_access(root: &Path, uid: u32) -> Option<String> {
+    let at = |path: &str| root.join(path.trim_start_matches('/'));
+    let state = format!("/var/lib/elastos-browser/{uid}.json");
+    let leftovers: Vec<String> = [
+        format!("/etc/systemd/system/elastos-browser-network-{uid}.service"),
+        format!("/etc/udev/rules.d/70-elastos-browser-kvm-{uid}.rules"),
+        state.clone(),
+    ]
+    .into_iter()
+    .filter(|path| at(path).symlink_metadata().is_ok())
+    .collect();
+    if leftovers.is_empty() {
+        return None;
+    }
+    let helper = at(LINUX_HOST_HELPER)
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.is_file());
+    // The helper's removal needs its saved KVM access record (the state file).
+    if helper && at(&state).symlink_metadata().is_ok() {
+        return Some(format!(
+            "An earlier ElastOS release set up Browser access for your account on this computer: KVM access, private network devices and a boot service. Browser is not available on this computer yet, so this access is not in use. To remove it, run this command and confirm:\n  sudo /usr/bin/python3 -I {LINUX_HOST_HELPER} remove --user \"$(id -un)\""
+        ));
+    }
+    Some(format!(
+        "An earlier ElastOS release left Browser access files for your account on this computer: {}. Browser is not available on this computer yet. An administrator can remove these files.",
+        leftovers.join(", ")
+    ))
 }
 
 /// True when the data directory and every folder from it down to `relative`'s
@@ -933,6 +976,46 @@ mod tests {
             .is_symlink());
         // Paths under real folders are still removed.
         assert!(!data.join("scripts/browser-vm-linux-network.py").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn earlier_linux_host_access_names_its_exact_removal_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let place = |path: &str| {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"root-owned fixture").unwrap();
+        };
+        // A fresh host, or another account's setup, needs no notice.
+        assert_eq!(earlier_linux_host_access(root, 1000), None);
+        place("usr/local/lib/elastos/browser-vm-linux-network.py");
+        place("etc/udev/rules.d/70-elastos-browser-kvm-1001.rules");
+        place("var/lib/elastos-browser/1001.json");
+        assert_eq!(earlier_linux_host_access(root, 1000), None);
+        // This account's setup gets the helper's own removal command.
+        place("etc/systemd/system/elastos-browser-network-1000.service");
+        place("etc/udev/rules.d/70-elastos-browser-kvm-1000.rules");
+        place("var/lib/elastos-browser/1000.json");
+        let notice = earlier_linux_host_access(root, 1000).unwrap();
+        assert!(notice.contains("Browser is not available on this computer yet"));
+        assert!(notice.ends_with(
+            "\n  sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user \"$(id -un)\""
+        ));
+        // The notice only reads; every file stays.
+        assert!(root.join("var/lib/elastos-browser/1000.json").is_file());
+        // Without the root-owned helper or its access record the command would
+        // fail, so the notice names the files instead.
+        fs::remove_file(root.join("var/lib/elastos-browser/1000.json")).unwrap();
+        let notice = earlier_linux_host_access(root, 1000).unwrap();
+        assert!(!notice.contains("sudo"));
+        assert!(notice.contains("/etc/systemd/system/elastos-browser-network-1000.service, /etc/udev/rules.d/70-elastos-browser-kvm-1000.rules"));
+        place("var/lib/elastos-browser/1000.json");
+        fs::remove_file(root.join("usr/local/lib/elastos/browser-vm-linux-network.py")).unwrap();
+        assert!(!earlier_linux_host_access(root, 1000)
+            .unwrap()
+            .contains("sudo"));
     }
 
     #[test]
