@@ -2,7 +2,7 @@
 
 ## Install from the publisher
 
-The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed. See the [Mac runbook](MAC.md) for source-home staging.
+The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Other OS families fail closed. For an Intel Mac, see [Intel Mac](MAC.md#intel-mac). See the [Mac runbook](MAC.md) for source-home staging.
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash

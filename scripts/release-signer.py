@@ -99,11 +99,19 @@ CAPSULE_RECORD_DOMAIN = "elastos.capsule.record.v1"
 CAPSULE_RECORD_SCHEMA = "elastos.capsule.record/v1"
 # A release is one UnixFS chunk; Runtime refuses larger release metadata.
 MAX_RELEASE_METADATA = 256 * 1024
+# The signed release ids. Package keys live in scripts/release-platforms.json.
+# x86_64-darwin is mapped there and is absent from this set.
+SIGNED_RELEASE_PLATFORMS = frozenset({"x86_64-linux", "aarch64-linux", "aarch64-darwin"})
 
 
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def require_signed_release_platforms(platforms):
+    require(type(platforms) is dict and platforms and set(platforms) <= SIGNED_RELEASE_PLATFORMS,
+            "release platforms refused")
 
 
 def sha256(data):
@@ -1041,6 +1049,9 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
     require(sha256(manifest_data) == checked_hash(policy.get("manifest_sha256")), "manifest differs from operator approval")
     manifest = parse_json(manifest_data)
     require(set(manifest) == {"source", "version", "channel", "files", "installer", "release", "head", "provenance"}, "signing input fields refused")
+    # Refuse an unsigned platform before provenance or any signature bytes.
+    if type(manifest.get("release")) is dict and type(manifest["release"].get("platforms")) is dict:
+        require_signed_release_platforms(manifest["release"]["platforms"])
     source = {field: policy[field] for field in ("commit", "tree")}
     require(manifest["source"] == source and manifest["version"] == policy["version"] and manifest["channel"] == policy["channel"], "input source/version/channel differs")
     records = manifest["files"]
@@ -1081,7 +1092,7 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
     if release["prev_release_cid"] is not None:
         cid_info(release["prev_release_cid"])
     platforms = release["platforms"]
-    require(type(platforms) is dict and platforms and set(platforms) <= {"x86_64-linux", "aarch64-linux", "aarch64-darwin"}, "release platforms refused")
+    require_signed_release_platforms(platforms)
     advertised = set()
     approved_refs = {(record["cid"], record["sha256"]) for record in records.values()}
     def admit_ref(cid, digest, size=None, release_path=None):

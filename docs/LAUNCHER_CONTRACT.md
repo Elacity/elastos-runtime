@@ -74,5 +74,5 @@ A supervisor uses these exit codes. It does not parse English sentences from
 stdout. Exit 0 covers more than one successful update outcome. A later issue
 owns a machine-readable update status.
 
-Intel Mac's release id is `x86_64-darwin`. This contract does not publish a
-download for that id.
+This contract publishes no download for an Intel Mac. [Intel Mac](MAC.md#intel-mac)
+records the current state.

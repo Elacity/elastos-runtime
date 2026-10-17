@@ -40,7 +40,7 @@ journeys tested on that device.
 
 ## Install from the publisher
 
-The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed.
+The public installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Other OS families fail closed. For an Intel Mac, see [Intel Mac](docs/MAC.md#intel-mac).
 
 The maintainer release DID is
 `did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
