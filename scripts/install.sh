@@ -47,6 +47,10 @@ MAINTAINER_DID_PLACEHOLDER="__MAINTAINER""_DID__"
 if [[ "$MAINTAINER_DID" == "$MAINTAINER_DID_PLACEHOLDER" ]]; then
     MAINTAINER_DID=""
 fi
+# Publisher stamp. A frozen installer leaves this empty, and an empty stamp
+# stays empty so a fresh install stores no head CID. A non-empty stamp must
+# equal the UnixFS CIDv0 of the verified release-head.json bytes. A stamp that
+# names other bytes is refused.
 HEAD_CID="${ELASTOS_HEAD_CID:-__HEAD_CID__}"
 HEAD_CID_PLACEHOLDER="__HEAD""_CID__"
 if [[ "$HEAD_CID" == "$HEAD_CID_PLACEHOLDER" ]]; then
@@ -106,6 +110,7 @@ show_help() {
     echo ""
     echo -e "${BOLD}ElastOS Installer${NC}"
     echo "  Release lookup: Linux x86_64/aarch64 and macOS Apple silicon."
+    echo "  ${INTEL_MAC_UNSUPPORTED}"
     echo "  The signed release determines which platforms have downloads."
     echo ""
     echo -e "${BOLD}Usage:${NC}"
@@ -150,6 +155,10 @@ fi
 die()  { echo -e "${RED:-}Error:${NC:-} $*" >&2; exit 1; }
 # For messages holding %q-quoted paths: print them byte for byte.
 die_exact() { printf '%bError:%b %s\n' "${RED:-}" "${NC:-}" "$*" >&2; exit 1; }
+# The staged Runtime must stay the file whose SHA-256 was checked.
+RUNTIME_CHANGED="The downloaded Runtime changed on this computer after its check. Nothing was installed. Run the installer again."
+# Every read of a verified envelope must see the SHA-256 its signature check saw.
+RELEASE_CHANGED="The release files changed on this computer after they were checked. Nothing was installed. Run the installer again."
 
 # Colour, the banner and the step layout are for a person at a terminal.
 # Pipes, CI, NO_COLOR and dumb terminals get plain [OK] and [WARN] lines.
@@ -314,6 +323,17 @@ installer_data_dir() {
     esac
 }
 
+# The one Intel Mac stop (docs/MAC.md#intel-mac quotes it).
+INTEL_MAC_UNSUPPORTED="Intel Mac is not supported yet."
+
+# A Terminal under Rosetta on an M1 or later Mac reports uname -m x86_64.
+# The kernel still says the processor is Apple silicon. sysctl -i prints
+# nothing for a key this macOS lacks, which an Intel Mac does for both.
+mac_has_apple_silicon() {
+    [[ "$(sysctl -in sysctl.proc_translated 2>/dev/null)" == 1 ||
+       "$(sysctl -in hw.optional.arm64 2>/dev/null)" == 1 ]]
+}
+
 detect_platform() {
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
     ARCH=$(uname -m)
@@ -328,7 +348,13 @@ detect_platform() {
     case "${OS}" in
         linux)  PLATFORM="${ARCH}-linux" ;;
         darwin)
-            [[ "$ARCH" == aarch64 ]] || die "macOS release lookup requires Apple silicon"
+            # Only the kernel's answer turns x86_64 into Apple silicon. A
+            # missing, failed or unclear sysctl proves nothing, so it stops
+            # here like an Intel Mac, before any download.
+            if [[ "$ARCH" == x86_64 ]] && mac_has_apple_silicon; then
+                ARCH="aarch64"
+            fi
+            [[ "$ARCH" == aarch64 ]] || die "$INTEL_MAC_UNSUPPORTED"
             PLATFORM="aarch64-darwin"
             ;;
         *) die "Unsupported OS: ${OS}" ;;
@@ -372,6 +398,56 @@ sha256_file() {
     else
         die "Neither sha256sum nor shasum found"
     fi
+}
+
+# The staged Runtime is held open on fd 9 (see the install step).
+#   held_runtime hash PATH SHA256  hashes the bytes of the held file; prints its identity
+#   held_runtime check PATH ID     the held file is unchanged and PATH still names it
+# Both refuse (exit 3) unless the held file is a regular file of this user,
+# mode 0500, with one link, and PATH names that same file.
+held_runtime() {
+    python3 - "$@" <<'PY_HELD_RUNTIME'
+import hashlib
+import os
+import stat
+import sys
+
+mode, path, expected = sys.argv[1:4]
+try:
+    held, named = os.fstat(9), os.lstat(path)
+except OSError:
+    sys.exit(3)
+
+
+def identity(info):
+    return ":".join(str(value) for value in (
+        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+
+
+if (not stat.S_ISREG(held.st_mode) or held.st_uid != os.geteuid()
+        or stat.S_IMODE(held.st_mode) != 0o500 or held.st_nlink != 1
+        or identity(named) != identity(held)):
+    sys.exit(3)
+if mode == "hash":
+    digest, offset = hashlib.sha256(), 0
+    while True:
+        chunk = os.pread(9, 1 << 20, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    if digest.hexdigest() != expected or offset != held.st_size or identity(os.fstat(9)) != identity(held):
+        sys.exit(3)
+    print(identity(held))
+elif mode != "check" or identity(held) != expected:
+    sys.exit(3)
+PY_HELD_RUNTIME
+}
+
+# Run the held staged Runtime: the open file itself where HELD_RUNTIME is
+# /proc/self/fd/9, else its path. argv[0] stays the staged path.
+run_held_runtime() {
+    (exec -a "${TMP_INSTALL_BIN}" "${HELD_RUNTIME}" "$@")
 }
 
 installer_runtime_control() {
@@ -656,13 +732,18 @@ fetch_url() {
 # Usage: json_get <file> <python-expression>
 #   json_get release.json 'd["payload"]["schema"]'
 #   json_get release.json 'd["payload"]["platforms"]["aarch64-linux"]["binary"]["cid"]'
+# A third argument is the SHA-256 of the verified bytes: other bytes exit 3.
 json_get() {
     local file="$1"
     local expr="$2"
-    python3 - "$file" "$expr" <<'PY'
-import json, sys
-with open(sys.argv[1], 'r', encoding='utf-8') as f:
-    d = json.load(f)
+    local expected_sha256="${3:-}"
+    python3 - "$file" "$expr" "$expected_sha256" <<'PY'
+import hashlib, json, sys
+with open(sys.argv[1], 'rb') as f:
+    data = f.read()
+if sys.argv[3] and hashlib.sha256(data).hexdigest() != sys.argv[3]:
+    sys.exit(3)
+d = json.loads(data.decode('utf-8'))
 try:
     v = eval(sys.argv[2], {"d": d})
     if v is None:
@@ -675,12 +756,13 @@ PY
 
 # ── Ed25519 verification ─────────────────────────────────────────────
 
+# Sets VERIFIED_SHA256 to the SHA-256 of the exact bytes whose signature passed.
 verify_signature() {
     local json_file="$1"
     local domain="$2"
     local expected_did="$3"
 
-    if ! python3 - "$json_file" "$domain" "$expected_did" <<'PY_ED25519'
+    if ! VERIFIED_SHA256="$(python3 - "$json_file" "$domain" "$expected_did" <<'PY_ED25519'
 # RFC 8032 sections 5.1.3, 5.1.4 and 5.1.7:
 # https://www.rfc-editor.org/rfc/rfc8032.html#section-5.1
 # Verification only: all curve operations below use public data.
@@ -790,8 +872,10 @@ def unique_object(pairs):
 
 
 def verify_envelope(json_file, domain, expected_did):
-    with open(json_file, "r", encoding="utf-8") as source:
-        envelope = json.load(source, object_pairs_hook=unique_object)
+    # One read: the signature, and the SHA-256 returned, cover the same bytes.
+    with open(json_file, "rb") as source:
+        data = source.read()
+    envelope = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
     signer = envelope["signer_did"]
     if not expected_did or signer != expected_did:
         raise ValueError("Envelope signer differs from the pinned maintainer DID")
@@ -809,35 +893,89 @@ def verify_envelope(json_file, domain, expected_did):
                            ensure_ascii=False, allow_nan=False).encode("utf-8")
     digest = hashlib.sha256(domain.encode("utf-8") + b"\0" + canonical).digest()
     verify_ed25519(decode_did_key(signer), digest, bytes.fromhex(signature))
+    return hashlib.sha256(data).hexdigest()
 
 
 if __name__ == "__main__":
     try:
-        verify_envelope(*sys.argv[1:])
+        print(verify_envelope(*sys.argv[1:]))
     except (ValueError, TypeError, KeyError, OSError, AttributeError) as error:
         print("Signature verification failed: " + str(error), file=sys.stderr)
         sys.exit(1)
 PY_ED25519
-    then
+)"; then
         die "Signature verification FAILED"
     fi
+    [[ "$VERIFIED_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "Signature verification FAILED"
     ok "Signature verified"
 }
 
+# Compute the UnixFS CIDv0 of the verified release-head.json bytes, whose
+# SHA-256 is the second argument. An empty stamp stays empty. A non-empty stamp
+# that names those bytes is kept. A stamp that names different bytes is refused.
+bind_verified_head_cid() {
+    local head_path="$1"
+    local expected_sha256="$2"
+    local verified status=0
+    verified="$(python3 - "$head_path" "$expected_sha256" <<'PY_HEAD_CID'
+import hashlib
+import sys
+
+def varint(value):
+    encoded = bytearray()
+    while value >= 128:
+        encoded.append((value & 127) | 128)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+data = open(sys.argv[1], "rb").read()
+if hashlib.sha256(data).hexdigest() != sys.argv[2]:
+    sys.exit(3)
+if not data or len(data) > 256 * 1024:
+    print("release head is outside the single-block UnixFS bound", file=sys.stderr)
+    sys.exit(1)
+unixfs = b"\x08\x02\x12" + varint(len(data)) + data + b"\x18" + varint(len(data))
+node = b"\x0a" + varint(len(unixfs)) + unixfs
+number = int.from_bytes(b"\x12\x20" + hashlib.sha256(node).digest(), "big")
+alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+text = ""
+while number:
+    number, digit = divmod(number, 58)
+    text = alphabet[digit] + text
+print(text)
+PY_HEAD_CID
+)" || status=$?
+    (( status != 3 )) || die "$RELEASE_CHANGED"
+    (( status == 0 )) || die "Verified release head has no single-block CID"
+    if [[ -z "$HEAD_CID" ]]; then
+        return 0
+    fi
+    if [[ "$HEAD_CID" != "$verified" ]]; then
+        die "Stamped head CID differs from the verified release head. Stamp: ${HEAD_CID}. Verified: ${verified}"
+    fi
+}
+
 validate_release_identity() {
-    # Both envelopes are verified before this check, on every transport.
+    # Both envelopes are verified before this check, on every transport; $3 and
+    # $4 are the SHA-256 values of the verified head and release bytes.
     # The signed digest binds exact envelope bytes; the CID stays content identity.
-    if ! python3 - "$1" "$2" <<'PY_RELEASE_IDENTITY'
+    local status=0
+    python3 - "$1" "$2" "$3" "$4" <<'PY_RELEASE_IDENTITY' || status=$?
 import hashlib
 import json
 import re
 import sys
 
 try:
-    with open(sys.argv[1], encoding="utf-8") as source:
-        head = json.load(source)["payload"]
+    with open(sys.argv[1], "rb") as source:
+        head_bytes = source.read()
     with open(sys.argv[2], "rb") as source:
         release_bytes = source.read()
+    if (hashlib.sha256(head_bytes).hexdigest() != sys.argv[3]
+            or hashlib.sha256(release_bytes).hexdigest() != sys.argv[4]):
+        sys.exit(3)
+    head = json.loads(head_bytes.decode("utf-8"))["payload"]
     release = json.loads(release_bytes)["payload"]
     if head.get("schema") != "elastos.release.head/v1" or release.get("schema") != "elastos.release/v1":
         raise ValueError("Unexpected release schema")
@@ -857,7 +995,8 @@ except (ValueError, TypeError, KeyError, OSError, AttributeError) as error:
     print("Release identity check failed: " + str(error), file=sys.stderr)
     sys.exit(1)
 PY_RELEASE_IDENTITY
-    then
+    (( status != 3 )) || die "$RELEASE_CHANGED"
+    if (( status != 0 )); then
         die "Release binding or metadata mismatch; retry after the publisher finishes updating"
     fi
 }
@@ -1284,10 +1423,16 @@ HEAD_SCHEMA=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"]["sch
 
 info "Verifying release head signature..."
 verify_signature "${INSTALL_SCRATCH}/release-head.json" "elastos.release.head.v1" "$MAINTAINER_DID"
+# From here on, each read of this file must find these verified bytes.
+HEAD_SHA256="$VERIFIED_SHA256"
+bind_verified_head_cid "${INSTALL_SCRATCH}/release-head.json" "$HEAD_SHA256"
 
-RELEASE_CID=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"]["latest_release_cid"]')
-RELEASE_VERSION=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"]["version"]')
-RELEASE_CHANNEL=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"].get("channel","stable")')
+RELEASE_CID=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"]["latest_release_cid"]' "$HEAD_SHA256") \
+    || die "$RELEASE_CHANGED"
+RELEASE_VERSION=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"]["version"]' "$HEAD_SHA256") \
+    || die "$RELEASE_CHANGED"
+RELEASE_CHANNEL=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"].get("channel","stable")' "$HEAD_SHA256") \
+    || die "$RELEASE_CHANGED"
 if ! is_allowed_channel "$RELEASE_CHANNEL"; then
     die "Unsupported release channel '${RELEASE_CHANNEL}' in release-head.json. Allowed channels: ${ALLOWED_CHANNELS[*]}"
 fi
@@ -1311,16 +1456,22 @@ RELEASE_SCHEMA=$(json_get "${INSTALL_SCRATCH}/release.json" 'd["payload"]["schem
 
 info "Verifying release signature..."
 verify_signature "${INSTALL_SCRATCH}/release.json" "elastos.release.v1" "$MAINTAINER_DID"
-validate_release_identity "${INSTALL_SCRATCH}/release-head.json" "${INSTALL_SCRATCH}/release.json"
+RELEASE_SHA256="$VERIFIED_SHA256"
+validate_release_identity "${INSTALL_SCRATCH}/release-head.json" "${INSTALL_SCRATCH}/release.json" \
+    "$HEAD_SHA256" "$RELEASE_SHA256"
 
 # ── Extract platform info ────────────────────────────────────────────
 
-BINARY_CID=$(json_get "${INSTALL_SCRATCH}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['cid']")
-BINARY_SHA256=$(json_get "${INSTALL_SCRATCH}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['sha256']")
-BINARY_SIZE=$(json_get "${INSTALL_SCRATCH}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['size']")
+BINARY_CID=$(json_get "${INSTALL_SCRATCH}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['cid']" "$RELEASE_SHA256") \
+    || die "$RELEASE_CHANGED"
+BINARY_SHA256=$(json_get "${INSTALL_SCRATCH}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['sha256']" "$RELEASE_SHA256") \
+    || die "$RELEASE_CHANGED"
+BINARY_SIZE=$(json_get "${INSTALL_SCRATCH}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['size']" "$RELEASE_SHA256") \
+    || die "$RELEASE_CHANGED"
 
 if [[ -z "$BINARY_CID" ]]; then
-    AVAILABLE=$(json_get "${INSTALL_SCRATCH}/release.json" "', '.join(d['payload'].get('platforms',{}).keys())")
+    AVAILABLE=$(json_get "${INSTALL_SCRATCH}/release.json" "', '.join(d['payload'].get('platforms',{}).keys())" "$RELEASE_SHA256") \
+        || die "$RELEASE_CHANGED"
     die "No release available for platform: ${PLATFORM}\n  Available: ${AVAILABLE:-none}"
 fi
 
@@ -1362,16 +1513,32 @@ sha256_check "${INSTALL_SCRATCH}/elastos" "$BINARY_SHA256"
 (umask 077; mkdir -p "$DATA_DIR")
 
 require_install_space "$INSTALL_DIR" "$BINARY_SIZE"
-TMP_INSTALL_BIN="$(mktemp "${INSTALL_DIR}/.elastos.install.XXXXXX")"
-trap 'rm -rf "$INSTALL_SCRATCH" "$TMP_INSTALL_BIN"' EXIT
+# Stage the Runtime in a new folder only this user can open (mktemp -d makes
+# it 0700) inside the checked install directory, read-only and executable.
+STAGE_DIR="$(mktemp -d "${INSTALL_DIR}/.elastos.install.XXXXXX")"
+trap 'rm -rf "$INSTALL_SCRATCH" "$STAGE_DIR"' EXIT
+TMP_INSTALL_BIN="${STAGE_DIR}/elastos"
 cp "${INSTALL_SCRATCH}/elastos" "${TMP_INSTALL_BIN}"
-chmod +x "${TMP_INSTALL_BIN}"
+chmod 0500 "${TMP_INSTALL_BIN}"
+# Open the staged copy once and hold it on fd 9. Its hash is taken from that
+# open file, and every later run of it is checked against that open file. The
+# check above refused a bad download before anything was written.
+exec 9<"${TMP_INSTALL_BIN}"
+HELD_RUNTIME_ID="$(held_runtime hash "${TMP_INSTALL_BIN}" "$BINARY_SHA256")" || die "$RUNTIME_CHANGED"
+# Where the kernel can start an open file (Linux /proc/self/fd), the held file
+# runs, so a path swapped after the last check cannot run. Elsewhere (macOS)
+# the path runs, right after a check that it still names the held file.
+HELD_RUNTIME="${TMP_INSTALL_BIN}"
+if [[ -r /proc/self/fd/9 ]]; then
+    HELD_RUNTIME=/proc/self/fd/9
+fi
 
 # The staged executable must report the exact release version on stdout with
 # empty stderr before it can write this installation.
 STAGED_VERSION_STATUS=0
 STAGED_VERSION_STDERR_PATH="${INSTALL_SCRATCH}/elastos-version.stderr"
-STAGED_VERSION_OUTPUT="$("${TMP_INSTALL_BIN}" --version 2>"${STAGED_VERSION_STDERR_PATH}")" || STAGED_VERSION_STATUS=$?
+held_runtime check "${TMP_INSTALL_BIN}" "$HELD_RUNTIME_ID" || die "$RUNTIME_CHANGED"
+STAGED_VERSION_OUTPUT="$(run_held_runtime --version 2>"${STAGED_VERSION_STDERR_PATH}")" || STAGED_VERSION_STATUS=$?
 STAGED_VERSION_ERROR="$(cat "${STAGED_VERSION_STDERR_PATH}")"
 if [[ "${STAGED_VERSION_STATUS}" -ne 0 ]]; then
     die "Downloaded binary failed its version check (exit ${STAGED_VERSION_STATUS}); the current installation was preserved\n  Output: ${STAGED_VERSION_OUTPUT:-<no output>}\n  Stderr: ${STAGED_VERSION_ERROR:-<no output>}"
@@ -1383,10 +1550,11 @@ ok "Checksum and version match the signed release"
 
 # ── Carrier contact + release metadata for `elastos update` ─────────
 
-SIGNER_DID=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["signer_did"]')
-
 SOURCES_PATH="${INSTALL_SCRATCH}/sources.json"
-PUBLISHER_DID="${SIGNER_DID}" \
+# The publisher pin is the trust root. verify_signature proved that it signed
+# the verified head, so the pin is not read again from release-head.json.
+# A matching stamp is the UnixFS CIDv0 of the verified bytes. An empty stamp stays empty.
+PUBLISHER_DID="${MAINTAINER_DID}" \
 PUBLISHER_GATEWAY="${PUBLISHER_GATEWAY}" \
 INSTALLED_VERSION="${RELEASE_VERSION}" \
 INSTALLED_HEAD_CID="${HEAD_CID}" \
@@ -1442,11 +1610,17 @@ PY
 
 # The writer refuses an older release, another channel, a pending Home
 # update and a concurrent writer before this installer stops Runtime.
-INSTALL_RELEASE=("${TMP_INSTALL_BIN}" install-release --data-dir "$DATA_DIR"
+# It reads each file below once, checks those bytes against the pin, the
+# version, the channel and any head CID stamp in sources.json, and installs
+# those same bytes (update.rs install_release).
+# The writer reads the candidate once and admits it only if those bytes have
+# the signed SHA-256 (installed_release.rs admit_candidate).
+INSTALL_RELEASE=(install-release --data-dir "$DATA_DIR"
     --binary "${INSTALL_DIR}/elastos" --candidate "${TMP_INSTALL_BIN}" "$SOURCES_PATH"
     "${INSTALL_SCRATCH}/release-head.json" "${INSTALL_SCRATCH}/release.json")
 step 4 "Install"
-"${INSTALL_RELEASE[@]}" --check || die "This installation was not changed"
+held_runtime check "${TMP_INSTALL_BIN}" "$HELD_RUNTIME_ID" || die "$RUNTIME_CHANGED"
+run_held_runtime "${INSTALL_RELEASE[@]}" --check || die "This installation was not changed"
 
 info "Stopping verified Runtime processes for this installation so the new version can be installed..."
 installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
@@ -1458,7 +1632,10 @@ fi
 # One journaled transaction replaces the Runtime, trusted sources and the
 # verified release pair; an interrupted run restores the previous set.
 info "Installing binary to $(display_path "${INSTALL_DIR}/elastos")..."
-"${INSTALL_RELEASE[@]}" || die "The previous installation was preserved"
+held_runtime check "${TMP_INSTALL_BIN}" "$HELD_RUNTIME_ID" || die "$RUNTIME_CHANGED"
+run_held_runtime "${INSTALL_RELEASE[@]}" || die "The previous installation was preserved"
+# Later commands run the installed Runtime; they do not need the staged copy.
+exec 9<&-
 ok "Installed ElastOS ${RELEASE_VERSION} to $(display_path "${INSTALL_DIR}/elastos")"
 
 PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"

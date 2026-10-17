@@ -10,13 +10,22 @@ This section is the one record of Intel Mac support. Other documents link
 here instead of repeating it.
 
 The public release id for an Intel Mac is `x86_64-darwin`. `scripts/install.sh`
-stops on that host before a download lookup. The message is
-`macOS release lookup requires Apple silicon`.
+stops on that host before it downloads anything, and exits with code 1. The
+message is `INTEL_MAC_UNSUPPORTED` in that script:
+`Intel Mac is not supported yet.`
 
-A person with an Intel Mac has no signed download. The next step is the signed
-installer on an Apple silicon Mac. The source-home commands later in this
-runbook are a developer build. They are not the installer, and this note does
-not claim that build has passed on Intel.
+There is no signed download and no other install path for an Intel Mac. The
+source-home commands later in this runbook are a developer build for Apple
+silicon. They are not an install path for an Intel Mac, and this note does not
+claim that build works on Intel.
+
+A Terminal that runs under Rosetta on an Apple silicon Mac also reports
+`uname -m` as `x86_64`. The installer then asks the kernel:
+`sysctl -in sysctl.proc_translated` or `sysctl -in hw.optional.arm64` must
+print `1`. If one does, it installs the signed `aarch64-darwin` build. That
+build has only arm64 code, so macOS runs it natively, also when a Rosetta shell
+starts it. If neither prints `1`, or `sysctl` is missing or fails, the
+installer cannot prove Apple silicon and stops with the Intel Mac message.
 
 These files hold the rules:
 

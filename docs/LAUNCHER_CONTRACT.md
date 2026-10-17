@@ -117,7 +117,7 @@ the installed path. On Linux that running path then ends in ` (deleted)`.
 | Code | Meaning |
 | --- | --- |
 | 0 | The command finished. |
-| 1 | The command failed. A second host for the same data directory is one case. |
+| 1 | The command failed. A second host for the same data directory is one case. An installer stamp that differs from the verified release head is another. |
 | 2 | The `elastos` command line is invalid. |
 | 75 | The running gateway's binary watch exited. |
 
