@@ -104,16 +104,22 @@ const canonicalClientImports = Object.freeze({
   "capsules/system/browser/system.js": 'targetId: "system"',
   "capsules/chat-room/browser/chat-room.js": 'targetId: "chat-room"',
 });
+// A capsule can build its client options in a helper (Chat rebuilds its client
+// when Home renews its token), so the gate binds the target, not the call shape:
+// the file names exactly one targetId, and it is the fixed binding.
 for (const [path, targetBinding] of Object.entries(canonicalClientImports)) {
   const source = readFileSync(join(repoRoot, path), "utf8");
+  const bindings = (source.match(/\btargetId\s*:[^,\n}]*/gu) || []).map((binding) => binding.trim());
   assert(
     source.includes(
       'from "/apps/home/home-clipboard-client.js?v=home-20260726a"',
     ) &&
-      source.includes("createHomeClipboardClient({") &&
-      source.includes(targetBinding) &&
+      source.includes("createHomeClipboardClient(") &&
+      bindings.length === 1 &&
+      bindings[0] === targetBinding &&
       source.includes("homeClipboard.start()"),
     `${path} must use the canonical Home Clipboard client and its fixed target binding`,
+    { bindings },
   );
 }
 
