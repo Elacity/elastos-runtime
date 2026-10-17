@@ -8,32 +8,24 @@ artifacts, and `.dmg` packaging work.
 
 The public release id for an Intel Mac is `x86_64-darwin`. The signed installer
 stops on that host before a download lookup. The message is
-`macOS release lookup requires Apple silicon`. This runbook's source-home path
-is the local build. A signed download for that id is a separate release decision.
+`macOS release lookup requires Apple silicon`.
+
+A person with an Intel Mac has no signed download. The next step is the signed
+installer on an Apple silicon Mac. The source-home commands later in this
+runbook are a developer build. They are not the installer.
+
+The signed platform set is `SIGNED_RELEASE_PLATFORMS` in
+`scripts/release-signer.py`. `scripts/release-platforms.json` maps the package
+key `darwin-amd64` to `x86_64-darwin`. That id is outside the signed set.
+`scripts/package-release-binaries.sh --print-platform` prints `darwin-amd64`
+on Darwin x86_64 and writes nothing. The packaging path refuses to write a
+tarball for that key, including when a Rosetta shell reports `x86_64`.
 
 CI job `gateway-smoke-macos-intel` builds the native `elastos` binary on
-`macos-15-intel` and requires `GET /healthz` to return the two bytes `OK` from
-the process that job started. That job is a readiness smoke. It publishes no
-signed release.
-
-A signed Intel release opens only when these gates move together:
-
-- `scripts/release-signer.py` admits `x86_64-linux`, `aarch64-linux`, and
-  `aarch64-darwin`. It refuses `x86_64-darwin`.
-- `scripts/prepare-release-platform.sh` prepares Linux x86_64, Linux ARM64, and
-  macOS ARM64. On Mac it requires the Rust host to be `aarch64-apple-darwin`.
-- `scripts/install.sh` selects `aarch64-darwin` and stops for every other Mac
-  architecture.
-- `components.json` publishes `darwin-arm64` payloads. An Intel install needs
-  its own payload set.
-- The Mac Browser engine host is Apple silicon Virtualization.framework. See
-  [Browser support](BROWSER_SUPPORT.md). This runbook claims no local Intel
-  Browser engine.
-- `scripts/package-release-binaries.sh` prints `darwin-amd64` for Darwin
-  x86_64. The package name is `elastos-runtime-darwin-amd64`. The Intel smoke
-  job checks that printed name. That job uploads no release tarball.
-- `scripts/ci-release-policy-test.py` keeps the release-package matrix on the
-  three signed platforms above.
+`macos-15-intel` and checks the `/healthz` owner response in
+[the launcher contract](LAUNCHER_CONTRACT.md). That job uploads no release
+tarball. This runbook claims no local Intel Browser engine. See
+[Browser support](BROWSER_SUPPORT.md).
 
 ## From Fresh Mac To Home
 

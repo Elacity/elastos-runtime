@@ -19,6 +19,29 @@ import unittest
 from unittest import mock
 
 SOURCE = Path(__file__).with_name("release-signer.py").resolve()
+OPTIMIZED_SIGNER_RUN = r"""
+import os, shutil, subprocess, sys, tempfile
+from pathlib import Path
+source_test = Path(sys.argv[1]).resolve()
+root = Path(tempfile.mkdtemp(prefix="elastos-signer-", dir=Path.home()))
+os.chmod(root, 0o700)
+scripts = root / "scripts"
+scripts.mkdir(mode=0o700)
+for name in ("release-signer.py", "release-signer-test.py"):
+    destination = scripts / name
+    destination.write_bytes((source_test.parent / name).read_bytes())
+    destination.chmod(0o700)
+env = os.environ.copy()
+env["ELASTOS_SIGNER_OPT_CHILD"] = "1"
+try:
+    completed = subprocess.run(
+        [sys.executable, "-O", str(scripts / "release-signer-test.py"),
+         "SignerTests.test_prepare_refuses_x86_64_darwin_without_a_signature"],
+        cwd=root, env=env)
+    raise SystemExit(completed.returncode)
+finally:
+    shutil.rmtree(root)
+"""
 spec = importlib.util.spec_from_file_location("release_signer", SOURCE)
 S = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = S
@@ -537,6 +560,38 @@ class SignerTests(unittest.TestCase):
         self.approve_manifest()
         with self.assertRaisesRegex(ValueError, "release fields refused"):
             self.prepare()
+
+    def test_prepare_refuses_x86_64_darwin_without_a_signature(self):
+        # python -O strips assert statements. This refusal must survive that.
+        # The signer walks parent directories and refuses a world-writable
+        # parent, so the optimized run uses a private directory under $HOME.
+        if os.environ.get("ELASTOS_SIGNER_OPT_CHILD") != "1":
+            self.no_process.stop()
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-O", "-c", OPTIMIZED_SIGNER_RUN, str(Path(__file__).resolve())],
+                    text=True, capture_output=True, timeout=120)
+            finally:
+                self.no_process.start()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("ok", result.stderr.lower())
+            return
+        self.assertGreaterEqual(sys.flags.optimize, 1)
+        self.assertNotIn("x86_64-darwin", S.SIGNED_RELEASE_PLATFORMS)
+        manifest_path = self.root / "signing-input.json"
+        manifest = S.parse_json(manifest_path.read_bytes())
+        manifest["release"]["platforms"]["x86_64-darwin"] = copy.deepcopy(
+            manifest["release"]["platforms"]["x86_64-linux"])
+        data = S.json_bytes(manifest)
+        manifest_path.write_bytes(data)
+        self.policy["manifest_sha256"] = S.sha256(data)
+        signed = self.base / "signed"
+        self.assertFalse(signed.exists())
+        with self.assertRaisesRegex(ValueError, "release platforms refused"):
+            self.prepare()
+        self.assertFalse(signed.exists())
+        self.assertFalse(any(path.name in {"release.json", "release-head.json"}
+                             for path in self.snapshot.rglob("*")))
 
     def test_signer_accepts_all_three_release_platforms(self):
         platform = self.manifest["release"]["platforms"]["x86_64-linux"]

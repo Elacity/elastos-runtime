@@ -13,9 +13,8 @@ platform() {
         Linux-x86_64) printf '%s\n' "linux-amd64" ;;
         Linux-aarch64|Linux-arm64) printf '%s\n' "linux-arm64" ;;
         Darwin-arm64) printf '%s\n' "darwin-arm64" ;;
-        # darwin-amd64 is the package key for release id x86_64-darwin.
-        # scripts/release-platforms.json maps that key to the id. The signer
-        # refuses x86_64-darwin. This name is not a signed download.
+        # The package key for release id x86_64-darwin. Printing the name
+        # does not write a tarball. The packaging path below refuses it.
         Darwin-x86_64) printf '%s\n' "darwin-amd64" ;;
         *)
             echo "Unsupported release platform: $(uname -s)-$(uname -m)" >&2
@@ -24,13 +23,19 @@ platform() {
     esac
 }
 
-# CI on an Intel Mac prints this name. Packaging still requires built binaries.
+# CI on an Intel Mac prints this name. This branch writes nothing.
 if [[ "${1:-}" == --print-platform ]]; then
     platform
     exit 0
 fi
 
 PLATFORM="$(platform)"
+# A Darwin x86_64 shell includes Rosetta, where uname -m is x86_64.
+# Refuse before staging so that shell cannot write a darwin-amd64 tarball.
+if [[ "$PLATFORM" == darwin-amd64 ]]; then
+    echo "darwin-amd64 is not a signed release platform. See docs/MAC.md." >&2
+    exit 1
+fi
 PACKAGE="elastos-runtime-${PLATFORM}"
 STAGE_ROOT="$(mktemp -d)"
 STAGE="${STAGE_ROOT}/${PACKAGE}"
