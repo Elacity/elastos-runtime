@@ -37,6 +37,7 @@ INTEL_MAC_STOP = "Intel Mac is not supported yet."
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # sysctl -in answers for (sysctl.proc_translated, hw.optional.arm64). None
 # means sysctl fails; a missing command is its own case.
+ROSETTA_ON_APPLE_SILICON = [("1", "1"), ("1", ""), ("", "1"), ("0", "1")]
 INTEL_OR_UNPROVEN = [("0", "0"), ("", ""), ("0", ""), ("2", "0"), None, "missing"]
 
 
@@ -617,6 +618,12 @@ if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"
     def respond(self, name, data):
         (self.responses / name).write_bytes(data)
 
+    def mock(self, name, text):
+        """Put one more executable ahead of the system on the installer's PATH."""
+        path = self.root / "mocks" / name
+        path.write_text(text)
+        path.chmod(0o755)
+
     def requests(self):
         return (self.root / "requests").read_text().splitlines()
 
@@ -869,6 +876,29 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(accepted_requests, self.REQUESTS)
             sources = json.loads((sandbox.root / "candidate" / "sources.json").read_text())
             self.assertEqual(sources["sources"][0]["head_cid"], verified)
+
+    def test_rosetta_shell_installs_the_apple_silicon_build_and_intel_downloads_nothing(self):
+        # Terminal under Rosetta on an M1 or later Mac: uname -m says x86_64,
+        # sysctl.proc_translated says 1. The signed aarch64-darwin build is
+        # fetched, checked and installed. A native Intel answer stops first.
+        binary = {"cid": "binary-a", "sha256": hashlib.sha256(RUNTIME_STUB).hexdigest(),
+                  "size": len(RUNTIME_STUB)}
+        did, head, release = installable_fixture(release_extra={"platforms": {"aarch64-darwin": {
+            "binary": binary, "components": {"cid": "components-a", "sha256": "c" * 64, "size": 1}}}})
+        with InstallerSandbox(head, release, did, system="Darwin", machine="x86_64") as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            sandbox.mock("sysctl", sysctl_mock(("0", "0")))
+            intel, intel_requests = sandbox.run("--install-only")
+            self.assertEqual(intel.returncode, 1, intel.stdout + intel.stderr)
+            self.assertEqual(intel.stderr, "Error: " + INTEL_MAC_STOP + "\n")
+            self.assertEqual(intel_requests, [])
+            self.assertFalse(sandbox.binary.exists())
+            sandbox.mock("sysctl", sysctl_mock(("1", "1")))
+            rosetta, requests = sandbox.run("--install-only")
+            self.assertEqual(rosetta.returncode, 0, rosetta.stdout + rosetta.stderr)
+            self.assertIn("(aarch64-darwin)", rosetta.stdout)
+            self.assertEqual(requests, self.REQUESTS[:2] + ["https://test.invalid/artifacts/elastos-aarch64-darwin"])
+            self.assertEqual(sandbox.binary.read_bytes(), RUNTIME_STUB)
 
     def test_installer_prints_the_selected_maintainer_did_before_verification(self):
         did, head, release = installable_fixture()
@@ -1622,6 +1652,24 @@ printf '%s\\n' "$PLATFORM"
         main = SOURCE.split("# ── Main", 1)[1]
         self.assertLess(main.index("detect_platform"), main.index("fetch_url"))
         self.assertLess(main.index("detect_platform"), main.index("release-head.json"))
+
+    def test_rosetta_shell_on_apple_silicon_is_apple_silicon(self):
+        # Terminal under Rosetta reports uname -m x86_64 on an M1 or later Mac.
+        for answers in ROSETTA_ON_APPLE_SILICON:
+            result = shell(sysctl_function(answers) + '''
+uname() { case "$1" in -s) echo Darwin;; -m) echo x86_64;; esac; }
+detect_platform
+printf '%s\\n' "$PLATFORM"
+''')
+            with self.subTest(sysctl=answers):
+                self.assertEqual((result.returncode, result.stdout), (0, "aarch64-darwin\n"), result.stderr)
+        # Linux never asks sysctl, so a Linux x86_64 host stays x86_64.
+        linux = shell(sysctl_function(("1", "1")) + '''
+uname() { case "$1" in -s) echo Linux;; -m) echo x86_64;; esac; }
+detect_platform
+printf '%s\\n' "$PLATFORM"
+''')
+        self.assertEqual(linux.stdout, "x86_64-linux\n", linux.stderr)
 
     def test_intel_mac_full_run_downloads_nothing(self):
         # The whole installer, not only detect_platform: an Intel Mac exits 1

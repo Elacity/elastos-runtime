@@ -322,6 +322,14 @@ installer_data_dir() {
 # The one Intel Mac stop (docs/MAC.md#intel-mac quotes it).
 INTEL_MAC_UNSUPPORTED="Intel Mac is not supported yet."
 
+# A Terminal under Rosetta on an M1 or later Mac reports uname -m x86_64.
+# The kernel still says the processor is Apple silicon. sysctl -i prints
+# nothing for a key this macOS lacks, which an Intel Mac does for both.
+mac_has_apple_silicon() {
+    [[ "$(sysctl -in sysctl.proc_translated 2>/dev/null)" == 1 ||
+       "$(sysctl -in hw.optional.arm64 2>/dev/null)" == 1 ]]
+}
+
 detect_platform() {
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
     ARCH=$(uname -m)
@@ -336,6 +344,12 @@ detect_platform() {
     case "${OS}" in
         linux)  PLATFORM="${ARCH}-linux" ;;
         darwin)
+            # Only the kernel's answer turns x86_64 into Apple silicon. A
+            # missing, failed or unclear sysctl proves nothing, so it stops
+            # here like an Intel Mac, before any download.
+            if [[ "$ARCH" == x86_64 ]] && mac_has_apple_silicon; then
+                ARCH="aarch64"
+            fi
             [[ "$ARCH" == aarch64 ]] || die "$INTEL_MAC_UNSUPPORTED"
             PLATFORM="aarch64-darwin"
             ;;

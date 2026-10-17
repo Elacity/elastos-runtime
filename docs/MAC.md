@@ -19,6 +19,14 @@ source-home commands later in this runbook are a developer build for Apple
 silicon. They are not an install path for an Intel Mac, and this note does not
 claim that build works on Intel.
 
+A Terminal that runs under Rosetta on an Apple silicon Mac also reports
+`uname -m` as `x86_64`. The installer then asks the kernel:
+`sysctl -in sysctl.proc_translated` or `sysctl -in hw.optional.arm64` must
+print `1`. If one does, it installs the signed `aarch64-darwin` build. That
+build has only arm64 code, so macOS runs it natively, also when a Rosetta shell
+starts it. If neither prints `1`, or `sysctl` is missing or fails, the
+installer cannot prove Apple silicon and stops with the Intel Mac message.
+
 These files hold the rules:
 
 - Signing: the release platform allowlist in `scripts/release-signer.py`.
