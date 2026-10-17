@@ -6,33 +6,29 @@ artifacts, and `.dmg` packaging work.
 
 ## Intel Mac
 
-The public release id for an Intel Mac is `x86_64-darwin`. The signed installer
+The public release id for an Intel Mac is `x86_64-darwin`. `scripts/install.sh`
 stops on that host before a download lookup. The message is
-`macOS release lookup requires Apple silicon`. This runbook's source-home path
-is the local build. A signed download for that id is a separate release decision.
+`macOS release lookup requires Apple silicon`.
+
+A person with an Intel Mac has no signed download. The next step is the signed
+installer on an Apple silicon Mac. The source-home commands later in this
+runbook are a developer build. They are not the installer, and this note does
+not claim that build has passed on Intel.
 
 CI job `gateway-smoke-macos-intel` builds the native `elastos` binary on
-`macos-15-intel` and requires `GET /healthz` to return the two bytes `OK` from
-the process that job started. That job is a readiness smoke. It publishes no
-signed release.
+`macos-15-intel`. It requires `GET /healthz` to return HTTP 200 and the two
+bytes `OK` from the process that owns `host-process.lock`. That is the owner
+check in [the launcher contract](LAUNCHER_CONTRACT.md). The job uses an empty
+Home, so a passing probe does not prove providers, capsules, or a signed
+install. `elastos serve` reports operator status at `GET /api/health`.
 
-A signed Intel release opens only when these gates move together:
+The product command is `elastos gateway --addr localhost:8090`. The smoke
+binds one numeric loopback address on a free port. It does not open
+`localhost:8090`. On macOS, `localhost` can resolve to `::1` while that bind
+is `127.0.0.1` or `[::1]`. That name and port gap remains.
 
-- `scripts/release-signer.py` admits `x86_64-linux`, `aarch64-linux`, and
-  `aarch64-darwin`. It refuses `x86_64-darwin`.
-- `scripts/prepare-release-platform.sh` prepares Linux x86_64, Linux ARM64, and
-  macOS ARM64. On Mac it requires the Rust host to be `aarch64-apple-darwin`.
-- `scripts/install.sh` selects `aarch64-darwin` and stops for every other Mac
-  architecture.
-- `components.json` publishes `darwin-arm64` payloads. An Intel install needs
-  its own payload set.
-- The Mac Browser engine host is Apple silicon Virtualization.framework. See
-  [Browser support](BROWSER_SUPPORT.md). This runbook claims no local Intel
-  Browser engine.
-- `scripts/package-release-binaries.sh` accepts `Darwin-arm64` and rejects
-  `Darwin-x86_64`.
-- `scripts/ci-release-policy-test.py` keeps the release-package matrix on the
-  three signed platforms above.
+This runbook claims no local Intel Browser engine. See
+[Browser support](BROWSER_SUPPORT.md). The job uploads no release tarball.
 
 ## From Fresh Mac To Home
 

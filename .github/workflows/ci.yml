@@ -1560,9 +1560,9 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # Native Intel Mac proof of the launcher readiness probe. This job builds
-  # the gateway binary and requires GET /healthz to return OK. It is not a
-  # signed release. docs/MAC.md records the signer and installer gates.
+  # Native Intel Mac proof of the /healthz owner check. This job builds the
+  # gateway binary and requires HTTP 200 and the two bytes OK from that
+  # process. An empty Home can pass. It is not a signed release.
   gateway-smoke-macos-intel:
     name: gateway-smoke-macos-intel
     runs-on: macos-15-intel
