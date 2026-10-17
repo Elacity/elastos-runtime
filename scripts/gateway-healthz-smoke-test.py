@@ -2,10 +2,16 @@
 """The gateway smoke accepts contract readiness and refuses every other case.
 
 Readiness is defined in docs/LAUNCHER_CONTRACT.md "Readiness and Home URL".
-A stub stands in for the elastos binary so each refusal path runs on Linux.
+A stub stands in for the elastos binary so each refusal path runs on Linux and
+macOS. The stub keeps host-process.lock where the real binary does (the dirs
+crate data_dir): $XDG_DATA_HOME/elastos on Linux and
+$HOME/Library/Application Support/elastos on macOS, where XDG_DATA_HOME is not
+read. It asks `uname -s`, as the smoke does, so a test can run the macOS path
+on Linux with a uname shim.
 """
 
 import os
+import shutil
 import signal
 import socket
 import stat
@@ -24,7 +30,7 @@ SMOKE = ROOT / "scripts" / "gateway-healthz-smoke.sh"
 STUB = textwrap.dedent(
     """\
     #!/usr/bin/env python3
-    import json, os, signal, socket, sys, time
+    import json, os, signal, socket, socketserver, subprocess, sys, time
     from http.server import BaseHTTPRequestHandler, HTTPServer
     mode = os.environ.get("SMOKE_STUB", "ok")
     lock_mode = os.environ.get("SMOKE_LOCK", "good")
@@ -58,7 +64,11 @@ STUB = textwrap.dedent(
     addr = args[2]
     host, port = addr.rsplit(":", 1)
     host = host.strip("[]")
-    data = os.path.join(os.environ["XDG_DATA_HOME"], "elastos")
+    system = subprocess.run(["uname", "-s"], capture_output=True, text=True).stdout.strip()
+    if system == "Darwin" and lock_mode != "xdg":
+        data = os.path.join(os.environ["HOME"], "Library", "Application Support", "elastos")
+    else:
+        data = os.path.join(os.environ["XDG_DATA_HOME"], "elastos")
     os.makedirs(data, exist_ok=True)
     record = {"pid": os.getpid(), "role": "gateway", "addr": addr}
     if lock_mode == "other-pid":
@@ -105,6 +115,11 @@ STUB = textwrap.dedent(
         host = os.environ.get("SMOKE_LOCALHOST_BIND", "127.0.0.1")
     class Server(HTTPServer):
         address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        def server_bind(self):
+            # HTTPServer.server_bind also calls socket.getfqdn, a reverse
+            # lookup that can take seconds on macOS. The smoke does not need it.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = host, int(port)
     Server((host, int(port)), Handler).serve_forever()
     """
 )
@@ -270,6 +285,34 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
                 self.assertIn("host-process.lock", result.stderr)
                 self.assertIn(message, result.stderr)
                 self.assertNotIn("ready:", result.stdout)
+
+    # macOS keeps the lock under Library/Application Support. A uname shim runs
+    # that path on Linux too, so Linux CI covers it.
+
+    def darwin_path(self):
+        real_uname = shutil.which("uname")
+        self.assertIsNotNone(real_uname, "this host has no uname")
+        shim = Path(self.tmp.name) / "darwin-bin"
+        shim.mkdir()
+        uname = shim / "uname"
+        uname.write_text('#!/bin/sh\n'
+                         'if [ "$1" = "-s" ]; then echo Darwin; exit 0; fi\n'
+                         f'exec "{real_uname}" "$@"\n')
+        uname.chmod(0o755)
+        return f"{shim}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    def test_macos_lock_is_read_from_application_support(self):
+        result = self.run_smoke("ok", PATH=self.darwin_path())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("host-process.lock names pid", result.stdout)
+
+    def test_macos_lock_under_xdg_is_refused(self):
+        # The real binary does not read XDG_DATA_HOME on macOS, so a lock
+        # there belongs to nothing this smoke started.
+        result = self.run_smoke("ok", SMOKE_LOCK="xdg", PATH=self.darwin_path())
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("host-process.lock is missing or is not JSON", result.stderr)
+        self.assertNotIn("ready:", result.stdout)
 
     def test_ok_from_another_process_on_the_port_is_refused(self):
         self.serve_ok(socket.AF_INET, "127.0.0.1", self.port)
