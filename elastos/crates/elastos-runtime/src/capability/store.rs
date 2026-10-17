@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tokio::sync::RwLock;
 
 use super::token::TokenId;
@@ -21,6 +22,9 @@ use super::token::TokenId;
 pub struct CapabilityStore {
     /// Revocation epoch — all tokens with epoch < this value are rejected.
     epoch: AtomicU64,
+
+    /// Serializes every epoch snapshot, persistent write and memory update.
+    epoch_writer: Mutex<()>,
 
     /// Per-token use counts
     use_counts: RwLock<HashMap<TokenId, u32>>,
@@ -37,6 +41,7 @@ impl CapabilityStore {
     pub fn new() -> Self {
         Self {
             epoch: AtomicU64::new(0),
+            epoch_writer: Mutex::new(()),
             use_counts: RwLock::new(HashMap::new()),
             revoked_tokens: RwLock::new(HashSet::new()),
             storage_path: None,
@@ -52,6 +57,7 @@ impl CapabilityStore {
 
         let store = Self {
             epoch: AtomicU64::new(0),
+            epoch_writer: Mutex::new(()),
             use_counts: RwLock::new(HashMap::new()),
             revoked_tokens: RwLock::new(HashSet::new()),
             storage_path: Some(path.clone()),
@@ -75,36 +81,52 @@ impl CapabilityStore {
     /// if the process dies after persist but before in-memory update,
     /// the next startup loads the higher epoch and tokens stay revoked.
     /// Returns the new epoch value.
-    pub fn advance_epoch(&self) -> u64 {
-        let new_epoch = self.epoch.load(Ordering::SeqCst) + 1;
+    pub fn advance_epoch(&self) -> std::io::Result<u64> {
+        self.epoch_transaction(
+            |current| {
+                current
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("capability epoch exhausted"))
+            },
+            |epoch| self.write_epoch(epoch),
+        )
+    }
 
-        // Persist FIRST — crash-safe ordering
+    /// Load an already-persisted epoch during initialization.
+    ///
+    /// A lower value cannot restore previously revoked authority. The only
+    /// Runtime caller is construction-time loading; use `advance_epoch` for
+    /// revocation, which persists the new value before publishing it.
+    pub fn set_epoch(&self, epoch: u64) {
+        self.epoch_transaction(|current| Ok(current.max(epoch)), |_| Ok(()))
+            .expect("initializing an epoch cannot fail");
+    }
+
+    /// All epoch writers share this synchronous transaction. The update and
+    /// writer run under one lock; memory is published only after writer success.
+    fn epoch_transaction(
+        &self,
+        update: impl FnOnce(u64) -> std::io::Result<u64>,
+        writer: impl FnOnce(u64) -> std::io::Result<()>,
+    ) -> std::io::Result<u64> {
+        let _epoch_writer = self
+            .epoch_writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next = update(self.current_epoch())?;
+        writer(next)?;
+        self.epoch.store(next, Ordering::SeqCst);
+        Ok(next)
+    }
+
+    fn write_epoch(&self, epoch: u64) -> std::io::Result<()> {
         if let Some(path) = &self.storage_path {
             let epoch_path = path.join("epoch");
             let tmp_path = path.join("epoch.tmp");
-            if let Err(e) = fs::write(&tmp_path, new_epoch.to_string())
-                .and_then(|_| fs::rename(&tmp_path, &epoch_path))
-            {
-                tracing::error!(
-                    "CRITICAL: Failed to persist epoch to {}: {}. Epoch advance aborted.",
-                    epoch_path.display(),
-                    e
-                );
-                // Do NOT advance in-memory if persistence failed —
-                // better to fail the revocation than to have in-memory
-                // and on-disk diverge.
-                return self.epoch.load(Ordering::SeqCst);
-            }
+            fs::write(&tmp_path, epoch.to_string())?;
+            fs::rename(&tmp_path, &epoch_path)?;
         }
-
-        // Only update in-memory after successful persistence
-        self.epoch.store(new_epoch, Ordering::SeqCst);
-        new_epoch
-    }
-
-    /// Set the epoch to a specific value (for initialization/loading)
-    pub fn set_epoch(&self, epoch: u64) {
-        self.epoch.store(epoch, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Check if a token's epoch is valid
@@ -179,10 +201,9 @@ impl CapabilityStore {
 
     /// Persist state to disk
     pub async fn persist(&self) -> std::io::Result<()> {
-        if let Some(path) = &self.storage_path {
-            // Persist epoch
-            let epoch_path = path.join("epoch");
-            fs::write(epoch_path, self.current_epoch().to_string())?;
+        if self.storage_path.is_some() {
+            // The synchronous transaction releases its guard before the await.
+            self.epoch_transaction(Ok, |epoch| self.write_epoch(epoch))?;
 
             // Persist revoked tokens
             self.persist_revoked_tokens().await;
@@ -257,13 +278,170 @@ impl Default for CapabilityStore {
 mod tests {
     use super::*;
 
+    fn assert_epoch_writer_held(store: &CapabilityStore) {
+        // This is a deterministic lock-coverage probe, not a timing assertion.
+        let blocked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    matches!(
+                        store.epoch_writer.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    )
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(blocked, "another epoch writer could enter the transaction");
+    }
+
+    #[tokio::test]
+    async fn test_epoch_transaction_serializes_snapshot_write_and_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = CapabilityStore::with_persistence(directory.path())
+            .await
+            .unwrap();
+        for advance in [true, false] {
+            let before = store.current_epoch();
+            let result = store
+                .epoch_transaction(
+                    |current| {
+                        assert_epoch_writer_held(&store);
+                        assert_eq!(current, before);
+                        Ok(if advance { current + 1 } else { current })
+                    },
+                    |next| {
+                        assert_epoch_writer_held(&store);
+                        assert_eq!(store.current_epoch(), before);
+                        store.write_epoch(next)?;
+                        assert_eq!(
+                            fs::read_to_string(directory.path().join("epoch"))?,
+                            next.to_string()
+                        );
+                        assert_eq!(
+                            store.current_epoch(),
+                            before,
+                            "publish only after writer success"
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(store.current_epoch(), result);
+            assert!(store.epoch_writer.try_lock().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_epoch_advance_and_snapshot_preserve_persisted_epoch() {
+        use std::sync::{Arc, Barrier};
+        const WRITERS: usize = 8;
+        const ADVANCES: usize = 8;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            CapabilityStore::with_persistence(directory.path())
+                .await
+                .unwrap(),
+        );
+        let barrier = Arc::new(Barrier::new(WRITERS + 2));
+        let mut handles = Vec::new();
+        for _ in 0..WRITERS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                (0..ADVANCES)
+                    .map(|_| store.advance_epoch().unwrap())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let snapshot_store = Arc::clone(&store);
+        let snapshot_barrier = Arc::clone(&barrier);
+        let snapshots = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            snapshot_barrier.wait();
+            for _ in 0..WRITERS * ADVANCES {
+                runtime.block_on(snapshot_store.persist()).unwrap();
+            }
+        });
+        barrier.wait();
+        let mut epochs = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        snapshots.join().unwrap();
+        epochs.sort_unstable();
+        let final_epoch = (WRITERS * ADVANCES) as u64;
+        assert_eq!(epochs, (1..=final_epoch).collect::<Vec<_>>());
+        assert_eq!(store.current_epoch(), final_epoch);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("epoch")).unwrap(),
+            final_epoch.to_string()
+        );
+        let reloaded = CapabilityStore::with_persistence(directory.path())
+            .await
+            .unwrap();
+        assert_eq!(reloaded.current_epoch(), final_epoch);
+    }
+
+    #[tokio::test]
+    async fn test_epoch_write_and_rename_failures_do_not_publish_memory() {
+        fn assert_send<T: Send>(_: T) {}
+        for blocked_path in ["epoch.tmp", "epoch"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CapabilityStore::with_persistence(directory.path())
+                .await
+                .unwrap();
+            fs::create_dir(directory.path().join(blocked_path)).unwrap();
+            assert!(store.advance_epoch().is_err());
+            assert_eq!(store.current_epoch(), 0);
+            // A synchronous writer guard must not make this async API !Send.
+            assert_send(store.persist());
+            assert!(store.persist().await.is_err());
+            assert_eq!(store.current_epoch(), 0);
+            fs::remove_dir(directory.path().join(blocked_path)).unwrap();
+            assert_eq!(store.advance_epoch().unwrap(), 1);
+            let reloaded = CapabilityStore::with_persistence(directory.path())
+                .await
+                .unwrap();
+            assert_eq!(reloaded.current_epoch(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_epoch_initialization_is_monotonic_and_overflow_stays_unchanged() {
+        let memory = CapabilityStore::new();
+        memory.set_epoch(7);
+        memory.set_epoch(3);
+        assert_eq!(memory.current_epoch(), 7);
+        assert!(!memory.is_epoch_valid(6));
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("epoch"), u64::MAX.to_string()).unwrap();
+        let store = CapabilityStore::with_persistence(directory.path())
+            .await
+            .unwrap();
+        assert!(store.advance_epoch().is_err());
+        assert_eq!(store.current_epoch(), u64::MAX);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("epoch")).unwrap(),
+            u64::MAX.to_string()
+        );
+        store.persist().await.unwrap();
+        let reloaded = CapabilityStore::with_persistence(directory.path())
+            .await
+            .unwrap();
+        assert_eq!(reloaded.current_epoch(), u64::MAX);
+    }
+
     #[test]
     fn test_epoch() {
         let store = CapabilityStore::new();
 
         assert_eq!(store.current_epoch(), 0);
 
-        let new_epoch = store.advance_epoch();
+        let new_epoch = store.advance_epoch().unwrap();
         assert_eq!(new_epoch, 1);
         assert_eq!(store.current_epoch(), 1);
 
@@ -308,8 +486,8 @@ mod tests {
             let store = CapabilityStore::with_persistence(temp_dir.path())
                 .await
                 .unwrap();
-            store.advance_epoch();
-            store.advance_epoch();
+            store.advance_epoch().unwrap();
+            store.advance_epoch().unwrap();
 
             let token_id = TokenId::from_bytes([1u8; 16]);
             store.revoke_token(token_id).await;

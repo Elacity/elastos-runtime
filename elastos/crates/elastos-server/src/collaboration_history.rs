@@ -1063,7 +1063,7 @@ mod tests {
     async fn a_history_request_carries_no_presence_after_an_epoch_bump() {
         let now = now_secs();
         let (a, _b, plane) = reachable_pair("history-epoch", now).await;
-        a.authority.manager().revoke_all("test epoch");
+        a.authority.manager().revoke_all("test epoch").unwrap();
         a.service.fetch_once(now).await.unwrap();
         assert_not_shown_and_nothing_sent(&a, &plane, now);
     }
@@ -1175,7 +1175,10 @@ mod tests {
                 )
                 .unwrap();
             if epoch {
-                a.authority.manager().revoke_all("projection smoke epoch");
+                a.authority
+                    .manager()
+                    .revoke_all("projection smoke epoch")
+                    .unwrap();
             } else {
                 a.decide(PresenceDecision::Hidden, now + 1).await;
             }
@@ -1237,7 +1240,10 @@ mod tests {
                 .await
                 .unwrap();
             } else {
-                self.authority.manager().revoke_all("between history peers");
+                self.authority
+                    .manager()
+                    .revoke_all("between history peers")
+                    .unwrap();
             }
             response
         }

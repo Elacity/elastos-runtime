@@ -4259,7 +4259,7 @@ mod tests {
                 )
                 .await
                 .expect("grant still validates before revoke");
-            manager.revoke_all("test restart revoke");
+            manager.revoke_all("test restart revoke").unwrap();
             token
         };
 

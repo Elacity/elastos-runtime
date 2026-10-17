@@ -345,6 +345,23 @@ impl CapabilityManager {
         token
     }
 
+    /// Whether an issued token is revoked or has no uses remaining.
+    ///
+    /// This is only a bookkeeping query for already-granted tokens: it neither
+    /// validates authority nor consumes a use. Callers must still use `validate`
+    /// before exercising a capability.
+    pub(crate) async fn is_revoked_or_exhausted(&self, token: &CapabilityToken) -> bool {
+        if !self.store.is_epoch_valid(token.constraints.epoch)
+            || self.store.is_token_revoked(&token.id).await
+        {
+            return true;
+        }
+        match token.constraints.max_uses {
+            Some(max_uses) => self.store.has_exceeded_uses(&token.id, max_uses).await,
+            None => false,
+        }
+    }
+
     /// Validate a token for use
     ///
     /// This performs all 12 validation checks as specified in PHASE3.md.
@@ -590,37 +607,65 @@ impl CapabilityManager {
     /// Revoke all tokens by advancing the epoch
     ///
     /// All tokens with epoch < new_epoch will be rejected.
-    /// Returns the new epoch.
-    pub fn revoke_all(&self, reason: &str) -> u64 {
-        let old_epoch = self.store.current_epoch();
-        let new_epoch = self.store.advance_epoch();
-        self.audit_log.epoch_advance(old_epoch, new_epoch, reason);
-        new_epoch
+    /// Returns the persisted epoch, or the write/rename/overflow error.
+    pub fn revoke_all(&self, reason: &str) -> std::io::Result<u64> {
+        let new_epoch = self.store.advance_epoch()?;
+        self.audit_log
+            .epoch_advance(new_epoch - 1, new_epoch, reason);
+        Ok(new_epoch)
     }
 
-    /// Rotate the signing key: generate a new key, advance the epoch, persist.
+    /// Rotate the signing key after epoch advancement succeeds.
     ///
-    /// All previously issued tokens become invalid (epoch revocation).
-    /// Returns the new public key bytes.
-    pub fn rotate_signing_key(&mut self, data_dir: &Path, reason: &str) -> [u8; 32] {
+    /// Epoch failure preserves the disk and memory key. If key publication
+    /// fails after revocation, the epoch stays advanced and the error reports
+    /// that partial result. This is not a multi-file atomic transaction.
+    pub fn rotate_signing_key(
+        &mut self,
+        data_dir: &Path,
+        reason: &str,
+    ) -> std::io::Result<[u8; 32]> {
+        self.rotate_signing_key_with_publish(data_dir, reason, |staged, key_path| {
+            staged
+                .persist(key_path)
+                .map(|_| ())
+                .map_err(|error| error.error)
+        })
+    }
+
+    fn rotate_signing_key_with_publish(
+        &mut self,
+        data_dir: &Path,
+        reason: &str,
+        publish: impl FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
+    ) -> std::io::Result<[u8; 32]> {
+        use std::io::Write as _;
+
         let new_key = SigningKey::generate(&mut rand::thread_rng());
         let new_pub = new_key.verifying_key();
-
-        // Persist new key with restrictive permissions
         let key_path = data_dir.join("signing_key");
-        if let Err(e) = std::fs::write(&key_path, new_key.to_bytes()) {
-            tracing::error!("Failed to persist rotated key: {}", e);
-        } else {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
-            }
+        let mut staged = tempfile::Builder::new()
+            .prefix(".signing-key-rotation-")
+            .tempfile_in(data_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            staged
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
+        staged.write_all(&new_key.to_bytes())?;
+        staged.as_file().sync_all()?;
 
-        // Advance epoch to invalidate all existing tokens
-        let old_epoch = self.store.current_epoch();
-        let new_epoch = self.store.advance_epoch();
+        // Until this succeeds, the live key file and in-memory key stay intact.
+        // NamedTempFile removes the staged key on either error path.
+        let new_epoch = self.revoke_all(reason)?;
+        let old_epoch = new_epoch - 1;
+        publish(staged, &key_path).map_err(|error| {
+            std::io::Error::new(error.kind(), format!(
+                "Capabilities were revoked at epoch {new_epoch}, but signing key publication failed: {error}"
+            ))
+        })?;
 
         self.audit_log.security_warning(
             "signing_key_rotated",
@@ -633,8 +678,7 @@ impl CapabilityManager {
         let pub_bytes = new_pub.to_bytes();
         self.signing_key = new_key;
         self.verifying_key = new_pub;
-
-        pub_bytes
+        Ok(pub_bytes)
     }
 
     /// Get the current revocation epoch
@@ -748,6 +792,221 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_revoke_all_propagates_persistence_failure_without_success_audit() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            CapabilityStore::with_persistence(directory.path())
+                .await
+                .unwrap(),
+        );
+        let audit = Arc::new(AuditLog::new());
+        let manager = CapabilityManager::new(
+            store.clone(),
+            audit.clone(),
+            Arc::new(MetricsManager::new()),
+        );
+        let resource = ResourceId::new("localhost://Users/self/Documents/test");
+        let token = manager.grant(
+            "owner",
+            resource.clone(),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        std::fs::create_dir(directory.path().join("epoch.tmp")).unwrap();
+        assert!(manager.revoke_all("blocked write").is_err());
+        assert_eq!(store.current_epoch(), 0);
+        assert!(audit
+            .recent_events_filtered(100, Some("epoch_advance"))
+            .is_empty());
+        manager
+            .validate(&token, "owner", Action::Read, &resource, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rotation_epoch_failure_preserves_persisted_key_and_authority() {
+        for blocked_path in ["epoch.tmp", "epoch", "overflow"] {
+            let directory = tempfile::tempdir().unwrap();
+            if blocked_path == "overflow" {
+                std::fs::write(directory.path().join("epoch"), u64::MAX.to_string()).unwrap();
+            }
+            let store = Arc::new(
+                CapabilityStore::with_persistence(directory.path())
+                    .await
+                    .unwrap(),
+            );
+            let audit = Arc::new(AuditLog::new());
+            let mut manager = CapabilityManager::load_or_generate(
+                directory.path(),
+                store.clone(),
+                audit.clone(),
+                Arc::new(MetricsManager::new()),
+            );
+            let original_key = manager.public_key_bytes();
+            let original_bytes = std::fs::read(directory.path().join("signing_key")).unwrap();
+            let original_epoch = store.current_epoch();
+            let resource = ResourceId::new("localhost://Users/self/Documents/test");
+            let token = manager.grant(
+                "owner",
+                resource.clone(),
+                Action::Read,
+                TokenConstraints::default(),
+                None,
+            );
+            if blocked_path != "overflow" {
+                std::fs::create_dir(directory.path().join(blocked_path)).unwrap();
+            }
+            let audit_before = audit.recent_events(100).len();
+            assert!(manager
+                .rotate_signing_key(directory.path(), "blocked epoch")
+                .is_err());
+            assert_eq!(manager.public_key_bytes(), original_key);
+            assert_eq!(store.current_epoch(), original_epoch);
+            assert_eq!(
+                std::fs::read(directory.path().join("signing_key")).unwrap(),
+                original_bytes
+            );
+            assert_eq!(audit.recent_events(100).len(), audit_before);
+            assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".signing-key-rotation-")
+            }));
+            if blocked_path != "overflow" {
+                std::fs::remove_dir(directory.path().join(blocked_path)).unwrap();
+            }
+            let reloaded_store = Arc::new(
+                CapabilityStore::with_persistence(directory.path())
+                    .await
+                    .unwrap(),
+            );
+            let reloaded = CapabilityManager::load_or_generate(
+                directory.path(),
+                reloaded_store,
+                Arc::new(AuditLog::new()),
+                Arc::new(MetricsManager::new()),
+            );
+            assert_eq!(reloaded.public_key_bytes(), original_key);
+            assert_eq!(reloaded.current_epoch(), original_epoch);
+            reloaded
+                .validate(&token, "owner", Action::Read, &resource, None)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rotation_publish_failure_keeps_key_and_reports_completed_revocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            CapabilityStore::with_persistence(directory.path())
+                .await
+                .unwrap(),
+        );
+        let audit = Arc::new(AuditLog::new());
+        let mut manager = CapabilityManager::load_or_generate(
+            directory.path(),
+            store.clone(),
+            audit.clone(),
+            Arc::new(MetricsManager::new()),
+        );
+        let original_key = manager.public_key_bytes();
+        let original_bytes = std::fs::read(directory.path().join("signing_key")).unwrap();
+        let resource = ResourceId::new("localhost://Users/self/Documents/test");
+        let token = manager.grant(
+            "owner",
+            resource.clone(),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        let error = manager
+            .rotate_signing_key_with_publish(
+                directory.path(),
+                "blocked rename",
+                |staged, key_path| {
+                    assert_eq!(store.current_epoch(), 1, "revocation precedes publication");
+                    assert_eq!(
+                        std::fs::read_to_string(directory.path().join("epoch")).unwrap(),
+                        "1"
+                    );
+                    assert_eq!(std::fs::read(key_path).unwrap(), original_bytes);
+                    assert_eq!(staged.as_file().metadata().unwrap().len(), 32);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        assert_eq!(
+                            staged.as_file().metadata().unwrap().permissions().mode() & 0o777,
+                            0o600
+                        );
+                    }
+                    Err(std::io::Error::other("injected rename failure"))
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("revoked at epoch 1"));
+        assert!(error.to_string().contains("publication failed"));
+        assert_eq!(manager.public_key_bytes(), original_key);
+        assert_eq!(
+            std::fs::read(directory.path().join("signing_key")).unwrap(),
+            original_bytes
+        );
+        assert_eq!(
+            audit
+                .recent_events_filtered(100, Some("epoch_advance"))
+                .len(),
+            1
+        );
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".signing-key-rotation-")
+        }));
+        let reloaded_store = Arc::new(
+            CapabilityStore::with_persistence(directory.path())
+                .await
+                .unwrap(),
+        );
+        let mut reloaded = CapabilityManager::load_or_generate(
+            directory.path(),
+            reloaded_store,
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        );
+        assert_eq!(reloaded.public_key_bytes(), original_key);
+        assert_eq!(reloaded.current_epoch(), 1);
+        assert!(matches!(
+            reloaded
+                .validate(&token, "owner", Action::Read, &resource, None)
+                .await,
+            Err(ValidationError::TokenRevoked)
+        ));
+        let replacement = reloaded
+            .rotate_signing_key(directory.path(), "retry publication")
+            .unwrap();
+        assert_ne!(replacement, original_key);
+        assert_eq!(reloaded.current_epoch(), 2);
+        let persisted = CapabilityManager::load_or_generate(
+            directory.path(),
+            Arc::new(
+                CapabilityStore::with_persistence(directory.path())
+                    .await
+                    .unwrap(),
+            ),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        );
+        assert_eq!(persisted.public_key_bytes(), replacement);
+        assert_eq!(persisted.current_epoch(), 2);
+    }
+
+    #[tokio::test]
     async fn test_epoch_revocation() {
         let manager = create_test_manager();
 
@@ -760,7 +1019,7 @@ mod tests {
         );
 
         // Advance epoch (mass revocation)
-        manager.revoke_all("test revocation");
+        manager.revoke_all("test revocation").unwrap();
 
         // Token should now be invalid
         let result = manager
@@ -863,7 +1122,7 @@ mod tests {
             .validate_recurring(&fresh, "principal", Action::Message, &resource, None, false)
             .await
             .is_ok());
-        manager.revoke_all("epoch");
+        manager.revoke_all("epoch").unwrap();
         assert!(matches!(
             manager
                 .validate_recurring(&fresh, "principal", Action::Message, &resource, None, false)
@@ -1401,7 +1660,7 @@ mod tests {
         }
 
         // Advance epoch to invalidate all tokens
-        manager.revoke_all("epoch advance test");
+        manager.revoke_all("epoch advance test").unwrap();
 
         let mut successes = 0;
         let mut revoked = 0;

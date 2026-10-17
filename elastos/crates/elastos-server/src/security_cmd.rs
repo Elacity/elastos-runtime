@@ -50,7 +50,7 @@ pub fn run_emergency(cmd: EmergencyCommand) -> anyhow::Result<()> {
                 &data_dir, store, audit_log, metrics,
             );
 
-            let new_pub = mgr.rotate_signing_key(&data_dir, &reason);
+            let new_pub = mgr.rotate_signing_key(&data_dir, &reason)?;
             println!("Signing key rotated.");
             println!("  New public key: {}", hex::encode(new_pub));
             println!("  Epoch advanced: all prior tokens invalidated.");

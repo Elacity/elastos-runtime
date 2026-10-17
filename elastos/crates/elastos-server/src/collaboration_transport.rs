@@ -1510,7 +1510,7 @@ mod tests {
             granted_presence_driver(&a, ac.clone(), FakeCarrier::new()).await;
         queued_presence(&a, &port, "granted-presence").await;
         assert_eq!(driver.retry_outgoing_once(NOW).await.unwrap().attempted, 1);
-        authority.manager().revoke_all("test epoch");
+        authority.manager().revoke_all("test epoch").unwrap();
         tokio::time::advance(SHARED_CUSTODY_RETRY).await;
         assert_eq!(
             driver.retry_outgoing_once(NOW + 5).await.unwrap().attempted,
