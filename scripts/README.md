@@ -112,18 +112,28 @@ cannot dispatch the operation. The command requires exactly one discovered test.
 
 For Component loading, run
 `cargo test --locked -p elastos-compute --lib component_load -- --nocapture`
-from `elastos/`. The real Component fixture must leave unrelated async work
-responsive, keep compilation bounded when a caller cancels, preserve artifact
-errors and clean up its activation. The heartbeat measurement reports host
-timing; the scheduling assertions are the regression gates. This checks loading,
-while Bus conformance checks Runtime dispatch.
+from `elastos/`. The real Component fixture checks that unrelated async work
+stays responsive, artifact errors are preserved, and stopping a loaded instance
+removes it. The cancellation test queues the compile job behind a held blocking
+worker and checks that the job retains its slot after the caller cancels.
+The heartbeat measurement reports host timing; scheduling assertions are the
+regression gates. This checks loading, while Bus conformance checks Runtime
+dispatch.
 
 For request-store changes, run
-`cargo test --locked -p elastos-runtime` from `elastos/`. This includes concurrent
-admission limits, expired-request recovery and retention of grants for user
-revocation. Together these checks exercise Runtime ownership of effects as
-defined in [PRINCIPLES.md](../PRINCIPLES.md); they complement the source gate and
-installed acceptance checks rather than certifying every product journey.
+`cargo test --locked -p elastos-runtime` from `elastos/`. This covers the pending
+request and capability stores, including concurrent admission limits,
+expired-request recovery and retention of grants for user revocation. Verify
+that concurrent revocation keeps the epoch monotonic and that cleanup retains
+still-valid grants.
+
+For capacity reclamation, also run
+`cargo test --locked -p elastos-server --lib api::handlers::capability::tests::test_request_capacity_recovers -- --nocapture`
+from `elastos/`. These regressions invoke the real Rust handlers directly with
+`State`, `Extension` and `Json`; HTTP routing, middleware and installed acceptance
+need separate evidence. Together these checks exercise Runtime ownership of
+effects as defined in [PRINCIPLES.md](../PRINCIPLES.md); they complement the source
+gate and installed acceptance checks rather than certifying every product journey.
 
 ## Library regression checks
 
@@ -199,9 +209,12 @@ cargo clippy --locked --manifest-path elastos/tools/browser-vm-guest-control-bri
 scripts/browser-vm-guest-control-bridge-smoke.sh
 ```
 
-Completed worker handles are reclaimed when another connection is accepted;
-finite runs also join their remaining workers. Test that active requests remain
-independent and that worker failures retain their reporting order. Repeated
+Completed worker handles are reclaimed when another connection is accepted.
+Finite runs join all remaining workers when every request succeeds. On failure,
+they resolve earlier accepted sessions and report the earliest failed session
+without waiting for later workers. Returning a worker error does not roll back
+effects already dispatched. Test that active requests remain independent and
+that worker failures retain their acceptance order. Repeated
 successful requests can measure completed-history retention separately from
 simultaneous active-request capacity. The Unix-socket smoke exercises a real
 bridge process against a local control-service fixture without requiring KVM.
