@@ -615,7 +615,7 @@ impl CapabilityManager {
         Ok(new_epoch)
     }
 
-    /// Rotate the signing key after durable epoch revocation.
+    /// Rotate the signing key after epoch advancement succeeds.
     ///
     /// Epoch failure preserves the disk and memory key. If key publication
     /// fails after revocation, the epoch stays advanced and the error reports

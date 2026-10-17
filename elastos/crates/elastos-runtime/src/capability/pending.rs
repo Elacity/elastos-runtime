@@ -686,23 +686,39 @@ mod tests {
     }
 
     async fn concurrent_admissions(store: Arc<PendingRequestStore>, shared_session: bool) -> usize {
+        use std::future::Future as _;
+        use std::task::{Context, Waker};
+
         const CONTENDERS: usize = 64;
-        let barrier = Arc::new(tokio::sync::Barrier::new(CONTENDERS + 1));
-        let mut tasks = tokio::task::JoinSet::new();
+        let mut contenders = Vec::new();
         for index in 0..CONTENDERS {
             let store = Arc::clone(&store);
-            let barrier = Arc::clone(&barrier);
-            tasks.spawn(async move {
-                barrier.wait().await;
+            contenders.push(Box::pin(tokio::task::unconstrained(async move {
                 let session = if shared_session {
                     "shared-session".to_string()
                 } else {
                     format!("concurrent-{index}")
                 };
                 request_for(&store, &session).await.is_pending()
-            });
+            })));
         }
-        barrier.wait().await;
+
+        // Poll every contender once before any can resume past the injected
+        // decision/insertion yield. Correct code keeps the first writer held,
+        // so the rest wait before checking capacity. If the writer is split at
+        // that boundary, every contender checks the same last slot first.
+        // Exclude Tokio's cooperative-budget yield from this first-poll probe;
+        // the only suspension points are the lock and our explicit boundary.
+        {
+            let mut context = Context::from_waker(Waker::noop());
+            for contender in &mut contenders {
+                assert!(contender.as_mut().poll(&mut context).is_pending());
+            }
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for contender in contenders {
+            tasks.spawn(contender);
+        }
         let mut admitted = 0;
         while let Some(result) = tasks.join_next().await {
             admitted += usize::from(result.unwrap());
@@ -730,7 +746,7 @@ mod tests {
         assert_eq!(store.list_session_pending("shared-session").await.len(), 1);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn test_concurrent_admission_respects_session_limit() {
         let store = Arc::new(create_test_store());
         for _ in 0..MAX_PENDING_PER_SESSION - 1 {
@@ -746,7 +762,7 @@ mod tests {
         assert!(request_for(&store, "other-session").await.is_pending());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn test_concurrent_admission_respects_global_limit() {
         let store = Arc::new(create_test_store());
         for index in 0..MAX_PENDING_REQUESTS - 1 {
