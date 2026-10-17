@@ -2610,6 +2610,10 @@ async function run() {
     await clickMenu(page, "Copy");
     await openItemMenu(page, "Work");
     await clickMenu(page, "Paste Into Folder");
+    await waitForOp(
+      (entry) => entry.op === "copy" && entry.payload.uri === `${documentsUri}/Guide.md` && entry.payload.target_parent_uri === `${documentsUri}/Work`,
+      "Copy/Paste Into Folder must dispatch the intended source and destination",
+    );
     assert(
       ops.some((entry) => entry.op === "copy" && entry.payload.target_parent_uri.endsWith("/Work")),
       "Copy/Paste Into Folder must call copy with the destination folder",
@@ -2636,6 +2640,10 @@ async function run() {
     await page.locator(".item").filter({ hasText: "Upload.txt" }).first().click();
     await dropSelectionOnFolder(page, "Work", { copy: true });
     await page.locator(".item").filter({ hasText: "Upload.txt" }).first().waitFor();
+    await waitForOp(
+      (entry) => entry.op === "copy" && entry.payload.uri === `${documentsUri}/Upload.txt` && entry.payload.target_parent_uri === `${documentsUri}/Work`,
+      "Alt-drag/drop copy must dispatch the intended source and destination",
+    );
     assert(
       ops.some((entry) => entry.op === "copy" && entry.payload.uri.endsWith("/Upload.txt") && entry.payload.target_parent_uri.endsWith("/Work")),
       "Alt-drag/drop copy must call copy with the destination folder",
