@@ -22,6 +22,9 @@ const communitySection = document.querySelector("#community-membership");
 const communityButton = document.querySelector("#community-toggle");
 let communityMembership = null;
 let communityBusy = false;
+const communityPresenceRow = document.querySelector("#community-presence-row");
+const communityPresenceOptions = [...document.querySelectorAll("#community-presence [data-presence-mode]")];
+let communityPresenceBusy = false;
 const themeSegment = document.querySelector("#theme-segment");
 const accentPickerNode = document.querySelector("#accent-picker");
 const accentCustomPopover = document.querySelector("#accent-custom-popover");
@@ -204,6 +207,7 @@ async function boot() {
   configureAppearancePreferences();
   configureGuestAccess();
   configureCommunityMembership();
+  configureCommunityPresence();
   configureAiProvider();
   configurePasskeyAccess();
   configureRecoveryAccess();
@@ -390,6 +394,7 @@ async function refreshSystemSummary() {
     if (runtimeUpdateActive) {
       renderSystemSummary(systemSummary);
       await refreshCommunityMembership();
+      await refreshCommunityPresence();
     }
   })();
   try { await systemSummaryInFlight; }
@@ -772,6 +777,74 @@ async function onGuestRegistrationChange() {
     showGuestRegistrationStatus(String(error.message || error), "error");
   } finally {
     setGuestRegistrationControlState();
+  }
+}
+
+function configureCommunityPresence() {
+  for (const option of communityPresenceOptions) {
+    option.addEventListener("click", () => updateCommunityPresence(option.dataset.presenceMode));
+  }
+}
+
+// Never shows as Hidden; requested, Later or no answer yet shows no choice.
+function communityPresenceMode(state) {
+  return state === "refused" ? "hidden" : state;
+}
+
+function setCommunityPresenceOptions(mode, disabled) {
+  for (const option of communityPresenceOptions) {
+    const current = option.dataset.presenceMode === mode;
+    option.classList.toggle("active", current);
+    option.setAttribute("aria-checked", current ? "true" : "false");
+    option.disabled = disabled;
+  }
+}
+
+// The calling person's own choice; nobody can set it for someone else.
+// Runtime returns the mode only, never the grant behind it.
+function renderCommunityPresence(presence) {
+  if (!presence || presence.schema !== "elastos.community-presence/v1"
+      || typeof presence.configured !== "boolean" || typeof presence.joined !== "boolean") {
+    throw new Error("Community setting is unavailable.");
+  }
+  if (communityPresenceRow) communityPresenceRow.hidden = !presence.configured;
+  setCommunityPresenceOptions(
+    communityPresenceMode(presence.community_presence),
+    communityPresenceBusy || !presence.joined || !hasShellAccess(),
+  );
+}
+
+async function refreshCommunityPresence() {
+  if (communityPresenceBusy || communityPresenceOptions.length === 0) return;
+  try {
+    renderCommunityPresence(await fetchRuntimeUpdateJson({ headers: shellHeaders() }, "/api/apps/system/community/presence"));
+    setHiddenFields("community-presence-status", true);
+  } catch (error) {
+    setCommunityPresenceOptions(null, true);
+    setTextFields("community-presence-status", publicSystemError(error, "Community setting is unavailable."));
+    setHiddenFields("community-presence-status", false);
+  }
+}
+
+async function updateCommunityPresence(mode) {
+  if (communityPresenceBusy || !hasShellAccess()) return;
+  const previous = communityPresenceOptions.find((option) => option.getAttribute("aria-checked") === "true");
+  communityPresenceBusy = true;
+  setCommunityPresenceOptions(mode, true);
+  setHiddenFields("community-presence-status", true);
+  try {
+    const presence = await fetchRuntimeUpdateJson({
+      method: "POST",
+      headers: shellHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ mode }),
+    }, "/api/apps/system/community/presence");
+    communityPresenceBusy = false;
+    renderCommunityPresence(presence);
+  } catch (error) {
+    communityPresenceBusy = false;
+    setCommunityPresenceOptions(previous?.dataset.presenceMode ?? null, !hasShellAccess());
+    setTextFields("community-presence-status", publicSystemError(error, "Community setting could not be changed."));
+    setHiddenFields("community-presence-status", false);
   }
 }
 
@@ -3021,7 +3094,7 @@ async function onRecoveryDownload(options = {}) {
     if (!isActive()) return false;
     const bundle = await exportFullRecoveryBundle(status, isActive);
     if (!isActive()) return false;
-    downloadRecoveryKit(bundle);
+    const fileName = downloadRecoveryKit(bundle);
     if (recoveryPasswordInput) {
       recoveryPasswordInput.value = "";
     }
@@ -3029,14 +3102,14 @@ async function onRecoveryDownload(options = {}) {
     const peopleIdentity = bundle && bundle.included && bundle.included.people_identity;
     showRecoveryNote(
       peopleIdentity
-        ? "Recovery Kit downloaded. Store it offline; it includes your signed People identity."
-        : "Recovery Kit downloaded. Store it offline.",
+        ? `Recovery Kit downloaded as ${fileName}. Store it offline; it includes your signed People identity.`
+        : `Recovery Kit downloaded as ${fileName}. Store it offline.`,
       "success"
     );
     setRecoveryButton("Download Recovery Kit", false);
     notifyHomeSummaryChanged();
     await refreshSystemSummary().catch(() => {
-      showRecoveryNote("Recovery Kit downloaded. Store it offline. Refresh System to update setup status.", "success");
+      showRecoveryNote(`Recovery Kit downloaded as ${fileName}. Store it offline. Refresh System to update setup status.`, "success");
     });
     return true;
   } catch (error) {
@@ -3308,17 +3381,28 @@ function recoveryDownloadPassword() {
   return readText(recoveryPasswordInput && recoveryPasswordInput.value);
 }
 
+// The whole principal goes into the file name (no ellipsis), with characters
+// some file systems refuse replaced; the name is returned so System shows it.
+function recoveryKitFileName(kit) {
+  const principal = readText(kit && kit.principal_id)
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 128) || "principal";
+  return `elastos-recovery-${principal}.json`;
+}
+
 function downloadRecoveryKit(kit) {
-  const principal = shortText(readText(kit && kit.principal_id), 12) || "principal";
+  const fileName = recoveryKitFileName(kit);
   const blob = new Blob([JSON.stringify(kit, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `elastos-recovery-${principal}.json`;
+  anchor.download = fileName;
   document.body.append(anchor);
   anchor.click();
   anchor.remove();
   URL.revokeObjectURL(url);
+  return fileName;
 }
 
 function setRecoveryButton(label, disabled) {
