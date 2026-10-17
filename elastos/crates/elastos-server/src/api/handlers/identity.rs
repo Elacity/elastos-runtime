@@ -482,7 +482,9 @@ fn issue_passkey_session_grant(
 }
 
 fn owner_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    let status = if error.is::<crate::auth::OwnerEnrollmentDenied>() {
+    let status = if error.is::<crate::auth::OwnerEnrollmentDenied>()
+        || error.is::<crate::auth::PasskeyOriginRefused>()
+    {
         StatusCode::FORBIDDEN
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
