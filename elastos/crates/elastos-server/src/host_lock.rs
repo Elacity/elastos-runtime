@@ -79,13 +79,19 @@ impl Drop for FileLock {
 /// Host locks that this process holds now. `docs/LAUNCHER_CONTRACT.md`
 /// ("Readiness and Home URL") states what proves ownership. The JSON record
 /// in the lock file is not proof: any process of the same user can rewrite it.
+///
+/// Each entry keeps a second descriptor of the open file description that
+/// holds the flock. A proof keeps this mutex for its whole check, and a guard
+/// removes its entry under the mutex before it unlocks. So no release or
+/// retake can come between finding an entry and probing its lock.
 static HELD_HOST_LOCKS: std::sync::Mutex<Vec<HeldHostLock>> = std::sync::Mutex::new(Vec::new());
 static NEXT_HELD_HOST_LOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Debug)]
 struct HeldHostLock {
     id: u64,
-    file: LockedFileId,
+    /// The same open file description as the guard's file (a `dup`).
+    file: fs::File,
     role: String,
 }
 
@@ -113,9 +119,10 @@ fn held_host_locks() -> std::sync::MutexGuard<'static, Vec<HeldHostLock>> {
 }
 
 fn remember_held_host_lock(lock: &mut FileLock, role: &str) -> std::io::Result<()> {
-    let Some(file) = locked_file_id(&lock.metadata()?) else {
+    if locked_file_id(&lock.metadata()?).is_none() {
         return Ok(());
-    };
+    }
+    let file = lock.try_clone()?;
     let id = NEXT_HELD_HOST_LOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     held_host_locks().push(HeldHostLock {
         id,
@@ -132,35 +139,85 @@ fn forget_held_host_lock(id: Option<u64>) {
     }
 }
 
+/// Whether the open file description of `held` holds the exclusive flock on
+/// the file that `lock_path` names now.
+///
+/// 1. `lock_path` names the same file (device and inode) as `held`.
+/// 2. A new open of that file cannot take the lock, so some description holds it.
+/// 3. `held` can take it. A description that already holds an exclusive flock
+///    takes it again with no change, and any other holder blocks this step.
+///
+/// If no description holds the lock at step 2, the check stops there and
+/// changes nothing. Step 3 changes the lock only when the holder from step 2
+/// released it in the meantime: then `held` takes it.
+fn description_holds_lock(lock_path: &Path, held: &fs::File) -> bool {
+    let Ok(probe) = fs::File::open(lock_path) else {
+        return false;
+    };
+    let (Ok(probe_metadata), Ok(held_metadata)) = (probe.metadata(), held.metadata()) else {
+        return false;
+    };
+    match (
+        locked_file_id(&probe_metadata),
+        locked_file_id(&held_metadata),
+    ) {
+        (Some(path_file), Some(held_file)) if path_file == held_file => {}
+        _ => return false,
+    }
+    match probe.try_lock() {
+        Err(fs::TryLockError::WouldBlock) => {}
+        Ok(()) => {
+            // The lock was free, so no description holds it.
+            let _ = probe.unlock();
+            return false;
+        }
+        Err(fs::TryLockError::Error(_)) => return false,
+    }
+    held.try_lock().is_ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs inside a proof after it finds a matching entry and before it
+    /// probes the lock: the point a release or retake must not reach.
+    static BEFORE_HELD_HOST_LOCK_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// The entry whose description holds the host lock of `data_dir` now. The
+/// caller keeps the registry locked while it uses the entry.
+fn proven_held_host_lock<'a>(
+    held: &'a [HeldHostLock],
+    data_dir: &Path,
+) -> Option<&'a HeldHostLock> {
+    let lock_path = host_lock_path(data_dir);
+    held.iter().find(|entry| {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_HELD_HOST_LOCK_PROBE.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        description_holds_lock(&lock_path, &entry.file)
+    })
+}
+
+fn is_gateway_role(role: &str) -> bool {
+    matches!(role, "gateway" | "gateway-public")
+}
+
 /// The role under which this process holds the host lock of `data_dir`.
 ///
-/// The proof is the flock itself: this process holds an exclusive lock on an
-/// open file, `{data}/host-process.lock` names that same file now, and a new
-/// open of it cannot take the lock. The JSON record is not read.
+/// The proof is the flock itself: an open file description that this process
+/// keeps holds the exclusive lock on the file `{data}/host-process.lock` names
+/// now. The JSON record is not read. The registry stays locked from the
+/// lookup to the end of the probe, so the lookup and the probe are one step.
 pub fn held_host_role(data_dir: &Path) -> Option<String> {
-    let probe = fs::File::open(host_lock_path(data_dir)).ok()?;
-    let file = locked_file_id(&probe.metadata().ok()?)?;
-    let role = held_host_locks()
-        .iter()
-        .find(|held| held.file == file)
-        .map(|held| held.role.clone())?;
-    match probe.try_lock() {
-        Err(fs::TryLockError::WouldBlock) => Some(role),
-        Ok(()) => {
-            // The lock was free, so this process does not hold it.
-            let _ = probe.unlock();
-            None
-        }
-        Err(fs::TryLockError::Error(_)) => None,
-    }
+    let held = held_host_locks();
+    proven_held_host_lock(&held, data_dir).map(|entry| entry.role.clone())
 }
 
 /// Whether this process holds the host lock of `data_dir` as a gateway.
 pub fn holds_gateway_host_lock(data_dir: &Path) -> bool {
-    matches!(
-        held_host_role(data_dir).as_deref(),
-        Some("gateway" | "gateway-public")
-    )
+    held_host_role(data_dir).is_some_and(|role| is_gateway_role(&role))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -709,6 +766,122 @@ mod tests {
         assert!(!holds_gateway_host_lock(temp.path()));
         serve.release().expect("release");
         assert_eq!(held_host_role(temp.path()), None);
+    }
+
+    /// The proof follows the lock, not the file: a release ends it, and a
+    /// retake proves only the new holder.
+    #[test]
+    fn release_and_retake_prove_only_the_current_holder() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = host_lock_path(temp.path());
+
+        let gateway = acquire_host_process_lock(temp.path(), "gateway", "localhost:8090")
+            .expect("gateway lock");
+        assert_eq!(held_host_role(temp.path()).as_deref(), Some("gateway"));
+        gateway.release().expect("release");
+        assert_eq!(held_host_role(temp.path()), None, "released");
+
+        // This process takes the lock again under another role.
+        let serve =
+            acquire_host_process_lock(temp.path(), "serve", "127.0.0.1:3000").expect("retake");
+        assert_eq!(held_host_role(temp.path()).as_deref(), Some("serve"));
+        assert!(!holds_gateway_host_lock(temp.path()));
+        drop(serve);
+        assert_eq!(held_host_role(temp.path()), None, "dropped");
+
+        // Another holder (a separate open file, as another process would have)
+        // takes it. The record still names this process as a gateway.
+        let foreign = FileLock::try_exclusive(fs::File::open(&path).unwrap()).expect("foreign");
+        assert!(fs::read_to_string(&path).unwrap().contains("\"serve\""));
+        assert_eq!(held_host_role(temp.path()), None, "foreign holder");
+        drop(foreign);
+
+        let gateway = acquire_host_process_lock(temp.path(), "gateway", "localhost:8090")
+            .expect("gateway retakes");
+        assert!(holds_gateway_host_lock(temp.path()));
+        drop(gateway);
+        assert!(!holds_gateway_host_lock(temp.path()));
+    }
+
+    /// A guard whose open file was unlocked behind its back (here by a direct
+    /// unlock; a command that shares the description can do the same) no longer
+    /// holds the lock. When another holder then takes it, the registry entry
+    /// for the same file is not proof: the probe runs on the guard's own
+    /// open file description.
+    #[test]
+    fn an_entry_for_the_same_file_is_not_proof_when_another_holder_has_the_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = host_lock_path(temp.path());
+        let gateway = acquire_host_process_lock(temp.path(), "gateway", "localhost:8090")
+            .expect("gateway lock");
+        gateway.unlock().expect("unlock behind the guard");
+        let foreign = FileLock::try_exclusive(fs::File::open(&path).unwrap()).expect("foreign");
+        assert!(!test_support::lock_is_free(&path));
+        assert_eq!(held_host_role(temp.path()), None);
+        assert!(!holds_gateway_host_lock(temp.path()));
+        drop(foreign);
+        drop(gateway);
+    }
+
+    /// A release that starts after the proof finds its entry waits for the
+    /// probe. So a `Some` answer is never about a lock that another holder
+    /// took in between.
+    #[test]
+    fn a_release_and_retake_cannot_come_between_the_lookup_and_the_probe() {
+        use std::sync::mpsc;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = host_lock_path(temp.path());
+        let gateway = acquire_host_process_lock(temp.path(), "gateway", "localhost:8090")
+            .expect("gateway lock");
+
+        let (retaken_tx, retaken_rx) = mpsc::channel();
+        let retaken_rx = Rc::new(retaken_rx);
+        let (finish_tx, finish_rx) = mpsc::channel::<()>();
+        let releaser = Rc::new(RefCell::new(None));
+        let retaken_before_probe = Rc::new(Cell::new(false));
+        let (hook_releaser, observed, hook_retaken_rx) = (
+            releaser.clone(),
+            retaken_before_probe.clone(),
+            retaken_rx.clone(),
+        );
+        let foreign_path = path.clone();
+        BEFORE_HELD_HOST_LOCK_PROBE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                *hook_releaser.borrow_mut() = Some(std::thread::spawn(move || {
+                    // Release this process's lock, then another holder takes it.
+                    drop(gateway);
+                    let foreign =
+                        FileLock::try_exclusive(fs::File::open(&foreign_path).unwrap()).unwrap();
+                    retaken_tx.send(()).unwrap();
+                    let _ = finish_rx.recv();
+                    drop(foreign);
+                }));
+                observed.set(
+                    hook_retaken_rx
+                        .recv_timeout(Duration::from_millis(300))
+                        .is_ok(),
+                );
+            }) as Box<dyn FnOnce()>);
+        });
+
+        let answer = held_host_role(temp.path());
+        let retaken = retaken_before_probe.get();
+        assert!(
+            !(retaken && answer.is_some()),
+            "a lock another holder took before the probe was reported as held: {answer:?}"
+        );
+        assert_eq!(answer.as_deref(), Some("gateway"));
+        assert!(!retaken, "the release waited for the probe");
+
+        // After the proof, the release and the retake go ahead.
+        let releaser = releaser.borrow_mut().take().expect("hook ran");
+        retaken_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("another holder has the lock");
+        assert!(!test_support::lock_is_free(&path));
+        assert_eq!(held_host_role(temp.path()), None);
+        finish_tx.send(()).unwrap();
+        releaser.join().unwrap();
     }
 
     #[test]
