@@ -892,7 +892,7 @@ fn zip_text_files(bytes: &[u8]) -> std::collections::BTreeMap<String, String> {
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = entry.name().unwrap().into_owned();
         let mut body = String::new();
         entry.read_to_string(&mut body).unwrap();
         files.insert(name, body);
@@ -3868,6 +3868,203 @@ async fn test_library_provider_rejects_unsafe_zip_entries() {
         .as_str()
         .unwrap()
         .contains("relative and safe"));
+}
+
+/// Every path under `root` (files, folders and symlinks, not followed).
+fn walk_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(path.clone());
+            }
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_library_provider_extract_zip_refuses_absolute_dotdot_and_symlink_entries() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let imports_uri = format!("{documents_uri}/Imports");
+
+    let (status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({ "parent_uri": root, "name": "Documents" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({ "parent_uri": documents_uri, "name": "Imports" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    // Each archive holds one hostile entry. The whole-archive extract must
+    // refuse it and write nothing for it, inside or outside the Library.
+    // (archive name, entry kind, entry name, symlink target, expected message)
+    let cases: [(&str, &str, &str, &str, &str); 5] = [
+        (
+            "Absolute.zip",
+            "file",
+            "/absolute-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "DotDot.zip",
+            "file",
+            "../dotdot-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "Inner.zip",
+            "file",
+            "Nested/../inner-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "Backslash.zip",
+            "file",
+            "..\\backslash-escape.txt",
+            "",
+            "invalid library object name",
+        ),
+        (
+            "Symlink.zip",
+            "symlink",
+            "symlink-escape.txt",
+            "/etc/passwd",
+            "non-file",
+        ),
+    ];
+    for (archive_name, kind, entry_name, link_target, expected) in cases {
+        let archive_bytes = {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            if kind == "symlink" {
+                writer
+                    .add_symlink(entry_name, link_target, options)
+                    .unwrap();
+            } else {
+                writer.start_file(entry_name, options).unwrap();
+                writer.write_all(b"escape").unwrap();
+            }
+            writer.finish().unwrap().into_inner()
+        };
+        let zip_uri = format!("{documents_uri}/{archive_name}");
+        let (write_status, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": zip_uri,
+                "mime": "application/zip",
+                "data": base64::engine::general_purpose::STANDARD.encode(archive_bytes),
+            }),
+        )
+        .await;
+        assert_eq!(write_status, StatusCode::OK, "{archive_name}");
+        assert_eq!(write["status"], "ok", "{archive_name}: {write}");
+
+        let (extract_status, extracted) = post_library(
+            app.clone(),
+            &token,
+            "extract_archive",
+            json!({ "uri": zip_uri }),
+        )
+        .await;
+        assert_eq!(extract_status, StatusCode::OK, "{archive_name}");
+        assert_eq!(
+            extracted["status"], "error",
+            "{archive_name}: hostile entry {entry_name:?} was not refused: {extracted}"
+        );
+        assert!(
+            extracted["message"].as_str().unwrap().contains(expected),
+            "{archive_name}: {extracted}"
+        );
+
+        if kind == "symlink" {
+            // The listing marks it blocked and a selected extract refuses it.
+            let (list_status, listed) = post_library(
+                app.clone(),
+                &token,
+                "archive_entries",
+                json!({ "uri": zip_uri }),
+            )
+            .await;
+            assert_eq!(list_status, StatusCode::OK);
+            let rows = listed["data"]["entries"].as_array().unwrap();
+            assert!(
+                rows.iter().any(|entry| entry["path"] == entry_name
+                    && entry["kind"] == "blocked"
+                    && entry["safety"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("non-file")),
+                "{listed}"
+            );
+            let (select_status, selected) = post_library(
+                app.clone(),
+                &token,
+                "archive_extract_entries",
+                json!({
+                    "uri": zip_uri,
+                    "destination_uri": imports_uri,
+                    "entries": [entry_name],
+                }),
+            )
+            .await;
+            assert_eq!(select_status, StatusCode::OK);
+            assert_eq!(selected["status"], "ok", "{selected}");
+            assert_eq!(
+                selected["data"]["receipt"]["progress"]["blocked_entries"],
+                1
+            );
+            assert!(selected["data"]["blocked"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("non-file"));
+        }
+    }
+
+    // Nothing from any hostile entry exists anywhere under the data dir, and
+    // no symlink was created.
+    for path in walk_paths(dir.path()) {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            !name.contains("escape"),
+            "hostile entry was written: {}",
+            path.display()
+        );
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink was created: {}",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]

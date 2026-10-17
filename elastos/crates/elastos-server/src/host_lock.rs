@@ -8,13 +8,24 @@ use serde::{Deserialize, Serialize};
 
 /// An exclusive flock held for this guard's scope.
 #[derive(Debug)]
-pub struct FileLock(Option<fs::File>);
+pub struct FileLock {
+    file: Option<fs::File>,
+    /// Set while this guard is the host lock of a data directory.
+    held_host: Option<u64>,
+}
 
 impl FileLock {
+    fn held(file: fs::File) -> Self {
+        Self {
+            file: Some(file),
+            held_host: None,
+        }
+    }
+
     /// Waits until this open file holds the exclusive lock.
     pub(crate) fn exclusive(file: fs::File) -> std::io::Result<Self> {
         file.lock()?;
-        Ok(Self(Some(file)))
+        Ok(Self::held(file))
     }
 
     /// Takes the exclusive lock now or fails with `WouldBlock`.
@@ -27,7 +38,7 @@ impl FileLock {
         let deadline = Instant::now() + wait;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(Self(Some(file))),
+                Ok(()) => return Ok(Self::held(file)),
                 Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     std::thread::sleep(remaining.min(Duration::from_millis(5)));
@@ -39,7 +50,8 @@ impl FileLock {
 
     /// Unlocks now and reports the result; dropping instead discards it.
     pub(crate) fn release(mut self) -> std::io::Result<()> {
-        self.0.take().map_or(Ok(()), |file| file.unlock())
+        forget_held_host_lock(self.held_host.take());
+        self.file.take().map_or(Ok(()), |file| file.unlock())
     }
 }
 
@@ -47,19 +59,108 @@ impl std::ops::Deref for FileLock {
     type Target = fs::File;
 
     fn deref(&self) -> &fs::File {
-        self.0.as_ref().expect("only release takes the file")
+        self.file.as_ref().expect("only release takes the file")
     }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
+        // This process stops claiming the host lock before it unlocks.
+        forget_held_host_lock(self.held_host.take());
         // A command spawned meanwhile by another thread can retain this
         // description until its CLOEXEC fd closes at exec. The guard's scope
         // owns the lock, so release it before closing our fd.
-        if let Some(file) = &self.0 {
+        if let Some(file) = &self.file {
             let _ = file.unlock();
         }
     }
+}
+
+/// Host locks that this process holds now. `docs/LAUNCHER_CONTRACT.md`
+/// ("Readiness and Home URL") states what proves ownership. The JSON record
+/// in the lock file is not proof: any process of the same user can rewrite it.
+static HELD_HOST_LOCKS: std::sync::Mutex<Vec<HeldHostLock>> = std::sync::Mutex::new(Vec::new());
+static NEXT_HELD_HOST_LOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Debug)]
+struct HeldHostLock {
+    id: u64,
+    file: LockedFileId,
+    role: String,
+}
+
+/// The file a lock is on. While this process keeps the file open, no other
+/// file can have the same device and inode.
+type LockedFileId = (u64, u64);
+
+#[cfg(unix)]
+fn locked_file_id(metadata: &fs::Metadata) -> Option<LockedFileId> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+/// Without a device and inode, this process cannot prove the path names the
+/// file it locked, so it claims no host lock.
+#[cfg(not(unix))]
+fn locked_file_id(_metadata: &fs::Metadata) -> Option<LockedFileId> {
+    None
+}
+
+fn held_host_locks() -> std::sync::MutexGuard<'static, Vec<HeldHostLock>> {
+    HELD_HOST_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn remember_held_host_lock(lock: &mut FileLock, role: &str) -> std::io::Result<()> {
+    let Some(file) = locked_file_id(&lock.metadata()?) else {
+        return Ok(());
+    };
+    let id = NEXT_HELD_HOST_LOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    held_host_locks().push(HeldHostLock {
+        id,
+        file,
+        role: role.to_string(),
+    });
+    lock.held_host = Some(id);
+    Ok(())
+}
+
+fn forget_held_host_lock(id: Option<u64>) {
+    if let Some(id) = id {
+        held_host_locks().retain(|held| held.id != id);
+    }
+}
+
+/// The role under which this process holds the host lock of `data_dir`.
+///
+/// The proof is the flock itself: this process holds an exclusive lock on an
+/// open file, `{data}/host-process.lock` names that same file now, and a new
+/// open of it cannot take the lock. The JSON record is not read.
+pub fn held_host_role(data_dir: &Path) -> Option<String> {
+    let probe = fs::File::open(host_lock_path(data_dir)).ok()?;
+    let file = locked_file_id(&probe.metadata().ok()?)?;
+    let role = held_host_locks()
+        .iter()
+        .find(|held| held.file == file)
+        .map(|held| held.role.clone())?;
+    match probe.try_lock() {
+        Err(fs::TryLockError::WouldBlock) => Some(role),
+        Ok(()) => {
+            // The lock was free, so this process does not hold it.
+            let _ = probe.unlock();
+            None
+        }
+        Err(fs::TryLockError::Error(_)) => None,
+    }
+}
+
+/// Whether this process holds the host lock of `data_dir` as a gateway.
+pub fn holds_gateway_host_lock(data_dir: &Path) -> bool {
+    matches!(
+        held_host_role(data_dir).as_deref(),
+        Some("gateway" | "gateway-public")
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,19 +179,17 @@ struct HostProcessMeta {
     generation: String,
 }
 
-/// The gateway server publishes its pid when this process does not already hold the lock.
-/// `gateway` and `gateway-public` already write that record before the server starts.
+/// The gateway server takes the host lock as `gateway` unless this process
+/// already holds it. `gateway` and `gateway-public` take it before the server
+/// starts. `serve` also holds it when its supervisor starts a gateway in the
+/// same process. That gateway keeps the `serve` lock, so its `/healthz` answers 503.
+/// A record that only names this pid is not a lock this process holds.
 pub fn publish_gateway_lock_if_unowned(
     data_dir: &Path,
     addr: &str,
 ) -> anyhow::Result<Option<FileLock>> {
-    let path = host_lock_path(data_dir);
-    if let Some(meta) = read_lock_metadata(&path) {
-        if meta.pid == std::process::id()
-            && matches!(meta.role.as_str(), "gateway" | "gateway-public")
-        {
-            return Ok(None);
-        }
+    if held_host_role(data_dir).is_some() {
+        return Ok(None);
     }
     acquire_host_process_lock(data_dir, "gateway", addr).map(Some)
 }
@@ -129,7 +228,7 @@ fn acquire_host_process_lock_inner(
         .open(&lock_path)
         .with_context(|| format!("open host lock {}", lock_path.display()))?;
 
-    let lock = match FileLock::try_exclusive(file) {
+    let mut lock = match FileLock::try_exclusive(file) {
         Ok(lock) => lock,
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
             let holder = read_lock_metadata(&lock_path);
@@ -159,6 +258,7 @@ fn acquire_host_process_lock_inner(
     serde_json::to_writer_pretty(&mut file, &meta)?;
     writeln!(file)?;
     file.sync_data()?;
+    remember_held_host_lock(&mut lock, role)?;
 
     Ok(lock)
 }
@@ -625,6 +725,52 @@ mod tests {
                 .contains("another ElastOS host already owns"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A record naming this pid, written by any process of the same user, is
+    /// not a lock this process holds. The gateway still takes the real lock.
+    #[test]
+    fn gateway_takes_the_lock_when_only_a_forged_record_names_this_process() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = host_lock_path(temp.path());
+        fs::write(
+            &path,
+            format!(
+                "{{\"pid\":{},\"role\":\"serve\",\"addr\":\"127.0.0.1:3000\"}}\n",
+                std::process::id()
+            ),
+        )
+        .expect("forged record");
+        assert_eq!(held_host_role(temp.path()), None);
+        let gateway = publish_gateway_lock_if_unowned(temp.path(), "localhost:8090")
+            .expect("gateway start")
+            .expect("the forged record does not stand in for the lock");
+        assert!(!test_support::lock_is_free(&path));
+        assert!(holds_gateway_host_lock(temp.path()));
+        let err = acquire_host_process_lock(temp.path(), "serve", "127.0.0.1:3000")
+            .expect_err("a second host is refused");
+        assert!(err
+            .to_string()
+            .contains("another ElastOS host already owns"));
+        drop(gateway);
+        assert_eq!(held_host_role(temp.path()), None);
+    }
+
+    /// A gateway inside `serve` keeps the `serve` lock that this process holds.
+    #[test]
+    fn gateway_inside_a_held_serve_lock_keeps_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let serve =
+            acquire_host_process_lock(temp.path(), "serve", "127.0.0.1:3000").expect("serve lock");
+        assert!(
+            publish_gateway_lock_if_unowned(temp.path(), "localhost:8090")
+                .expect("gateway inside serve starts")
+                .is_none()
+        );
+        assert_eq!(held_host_role(temp.path()).as_deref(), Some("serve"));
+        assert!(!holds_gateway_host_lock(temp.path()));
+        serve.release().expect("release");
+        assert_eq!(held_host_role(temp.path()), None);
     }
 
     #[test]

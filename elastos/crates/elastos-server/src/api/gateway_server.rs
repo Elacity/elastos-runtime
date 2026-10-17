@@ -1,8 +1,13 @@
 use std::collections::BTreeSet;
-use std::net::{IpAddr, SocketAddr};
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::task::Poll;
 
+use axum::extract::State;
+use axum::response::{IntoResponse, Redirect, Response};
 use elastos_runtime::provider::ProviderRegistry;
 use tokio::net::TcpListener;
 
@@ -94,10 +99,20 @@ async fn start_gateway_server_with_shutdown(
 ) -> anyhow::Result<()> {
     crate::auth::verify_auth_audit_chain_ready(&data_dir)?;
     let _health_lock = crate::host_lock::publish_gateway_lock_if_unowned(&data_dir, addr)?;
-    let listener = TcpListener::bind(addr).await?;
+    let listeners = bind_gateway_listeners(addr).await?;
+    let listen_addrs = listeners
+        .iter()
+        .map(TcpListener::local_addr)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let bound_port = listen_addrs[0].port();
+    let localhost = localhost_port(addr).is_some();
     let local_control_registry = provider_registry.clone();
     let gateway_api_url = if addr.parse::<axum::http::uri::Authority>()?.port_u16() == Some(0) {
-        trusted_gateway_api_url(&listener.local_addr()?.to_string())?
+        if localhost {
+            trusted_gateway_api_url(&format!("localhost:{bound_port}"))?
+        } else {
+            trusted_gateway_api_url(&listen_addrs[0].to_string())?
+        }
     } else {
         trusted_gateway_api_url(addr)?
     };
@@ -117,6 +132,16 @@ async fn start_gateway_server_with_shutdown(
             .map_err(anyhow::Error::msg)?;
     let home_url = format!("{gateway_api_url}/home/");
     let app = gateway_router_with_api_url(state, gateway_api_url);
+    // This gateway owns every localhost address on its port, so a Home page
+    // opened at a loopback IP moves to the one origin where passkeys work.
+    let app = if localhost {
+        app.layer(axum::middleware::from_fn_with_state(
+            bound_port,
+            home_page_on_localhost,
+        ))
+    } else {
+        app
+    };
     // Publish one complete coordinate identity after Home setup, before children
     // capture its owner generation. A later mutation would change their owner hash.
     let gateway_local_control = match local_control_registry {
@@ -149,6 +174,9 @@ async fn start_gateway_server_with_shutdown(
     let advertised = advertised_gateway_urls(addr);
     println!("ElastOS Gateway v{}", GATEWAY_VERSION);
     println!("  Bind:      http://{}", addr);
+    for listen_addr in &listen_addrs {
+        println!("  Listen:    {}", listen_addr);
+    }
     if let Some(primary) = advertised.first() {
         println!("  Open:      {}", primary);
         println!("  Room:      {}apps/chat-room/", primary);
@@ -167,9 +195,17 @@ async fn start_gateway_server_with_shutdown(
         on_ready(&home_url);
     }
     let connections = axum_server::Handle::new();
-    let server = axum_server::Server::<SocketAddr>::from_listener(listener)
-        .handle(connections.clone())
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+    let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+    let server = serve_all(
+        listeners
+            .into_iter()
+            .map(|listener| {
+                axum_server::Server::<SocketAddr>::from_listener(listener)
+                    .handle(connections.clone())
+                    .serve(make_service.clone())
+            })
+            .collect(),
+    );
     tokio::pin!(server);
     let serve_result = tokio::select! {
         result = &mut server => result,
@@ -213,6 +249,198 @@ async fn start_gateway_server_with_shutdown(
     local_control_result?;
     managed_shutdown_result?;
     Ok(())
+}
+
+/// Polls every listener's server with one shared handle. It returns the first
+/// error, or `Ok` after every server has stopped.
+async fn serve_all<F>(servers: Vec<F>) -> std::io::Result<()>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    let mut servers: Vec<Option<Pin<Box<F>>>> = servers
+        .into_iter()
+        .map(|server| Some(Box::pin(server)))
+        .collect();
+    std::future::poll_fn(|cx| {
+        let mut running = false;
+        for slot in &mut servers {
+            let Some(server) = slot else { continue };
+            match server.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => *slot = None,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => running = true,
+            }
+        }
+        if running {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    })
+    .await
+}
+
+/// The port of `addr` when its host is the name `localhost`.
+fn localhost_port(addr: &str) -> Option<u16> {
+    let (host, port) = addr.rsplit_once(':')?;
+    if host.eq_ignore_ascii_case("localhost") {
+        port.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// `localhost` is the one Home origin (`docs/LAUNCHER_CONTRACT.md`). For that
+/// name the gateway listens on every loopback address a client can reach it at.
+/// Any other host binds exactly as given.
+async fn bind_gateway_listeners(addr: &str) -> anyhow::Result<Vec<TcpListener>> {
+    let Some(port) = localhost_port(addr) else {
+        return Ok(vec![TcpListener::bind(addr).await?]);
+    };
+    let resolved = tokio::net::lookup_host(("localhost", port))
+        .await
+        .map_err(|error| {
+            anyhow::Error::new(error).context(
+                "Home cannot start because this computer cannot find the address of localhost.",
+            )
+        })?
+        .collect::<Vec<_>>();
+    bind_localhost_listeners(port, resolved).await
+}
+
+/// The addresses for `localhost`: what this computer resolves, then 127.0.0.1
+/// and ::1, which browsers use for `localhost` whatever the hosts file says.
+fn localhost_bind_addresses(
+    port: u16,
+    resolved: impl IntoIterator<Item = SocketAddr>,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let browser = [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ];
+    let mut addresses = Vec::new();
+    for ip in resolved
+        .into_iter()
+        .map(|address| address.ip())
+        .chain(browser)
+    {
+        anyhow::ensure!(
+            ip.is_loopback(),
+            "Home cannot start because localhost points to {ip}, which is not this computer. \
+             Set localhost to 127.0.0.1 and ::1 in the hosts file, then start Home again."
+        );
+        let address = SocketAddr::new(ip, port);
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    Ok(addresses)
+}
+
+/// Binds each localhost address on one port, or refuses to start. Only an
+/// address family that this computer does not have is left out, because no
+/// other program can listen there either.
+async fn bind_localhost_listeners(
+    port: u16,
+    resolved: Vec<SocketAddr>,
+) -> anyhow::Result<Vec<TcpListener>> {
+    let mut port = port;
+    let mut listeners = Vec::new();
+    for address in localhost_bind_addresses(port, resolved)? {
+        let address = SocketAddr::new(address.ip(), port);
+        match TcpListener::bind(address).await {
+            Ok(listener) => {
+                // Port 0 takes the first free port, and each other address uses it too.
+                port = listener.local_addr()?.port();
+                listeners.push(listener);
+            }
+            Err(error) if address_family_unavailable(&error) => {
+                eprintln!(
+                    "[gateway] {address} does not exist on this computer; Home listens without it"
+                );
+            }
+            Err(error) => {
+                let message = if error.kind() == std::io::ErrorKind::AddrInUse {
+                    format!(
+                        "Home cannot start because another program already uses {address}. \
+                         Stop that program, then start Home again."
+                    )
+                } else {
+                    format!(
+                        "Home cannot start because it cannot listen on {address}. \
+                         Home needs every localhost address on port {port}."
+                    )
+                };
+                return Err(anyhow::Error::new(error).context(message));
+            }
+        }
+    }
+    anyhow::ensure!(
+        !listeners.is_empty(),
+        "Home cannot start because this computer has no localhost address to listen on."
+    );
+    Ok(listeners)
+}
+
+/// This computer has no such address family or address, as for ::1 without IPv6.
+fn address_family_unavailable(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::AddrNotAvailable {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EAFNOSUPPORT)
+    }
+    #[cfg(windows)]
+    {
+        // WSAEAFNOSUPPORT
+        error.raw_os_error() == Some(10047)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+/// The Home page paths. Their API, health, and capsule routes stay on every host.
+const HOME_PAGE_PATHS: [&str; 5] = ["/", "/home", "/home/", "/apps/home", "/apps/home/"];
+
+/// Sends a Home page request for a loopback IP host to the same path at
+/// `localhost` on the port this gateway listens on.
+async fn home_page_on_localhost(
+    State(port): State<u16>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let home_page = matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    ) && HOME_PAGE_PATHS.contains(&request.uri().path())
+        && request
+            .headers()
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_loopback_ip_host);
+    if !home_page {
+        return next.run(request).await;
+    }
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map_or("/", |value| value.as_str());
+    Redirect::permanent(&format!("http://localhost:{port}{path_and_query}")).into_response()
+}
+
+fn is_loopback_ip_host(host: &str) -> bool {
+    let Ok(authority) = host.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    let host = authority.host();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 fn trusted_gateway_api_url(addr: &str) -> anyhow::Result<String> {
@@ -354,9 +582,105 @@ mod trusted_gateway_tests {
         panic!("failed gateway startup must not open Home");
     }
 
+    /// A port that is free on 127.0.0.1 and, when this host has it, on ::1.
     fn unused_localhost_address() -> String {
-        let listener = std::net::TcpListener::bind("localhost:0").unwrap();
-        format!("localhost:{}", listener.local_addr().unwrap().port())
+        format!("localhost:{}", unused_loopback_port())
+    }
+
+    fn unused_loopback_port() -> u16 {
+        loop {
+            let ipv4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = ipv4.local_addr().unwrap().port();
+            match std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
+                Ok(_) => return port,
+                Err(error) if address_family_unavailable(&error) => return port,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// `None` with a loud reason when this host has no IPv6 loopback.
+    fn ipv6_loopback() -> Option<()> {
+        match std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) {
+            Ok(_) => Some(()),
+            Err(error) if address_family_unavailable(&error) => {
+                eprintln!(
+                    "SKIPPED IPv6 PART: this host has no IPv6 loopback (::1): {error}. \
+                     CI hosts have ::1 and run it."
+                );
+                None
+            }
+            Err(error) => panic!("::1 probe failed: {error}"),
+        }
+    }
+
+    /// One HTTP/1.1 GET with an explicit Host. Returns the status and Location.
+    async fn raw_get(connect: SocketAddr, host: &str, path: &str) -> (u16, Option<String>) {
+        let mut stream = tokio::net::TcpStream::connect(connect).await.unwrap();
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let status = text.split(' ').nth(1).unwrap().parse().unwrap();
+        let location = text
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("location")
+                    .then(|| value.trim().to_string())
+            });
+        (status, location)
+    }
+
+    /// Starts a gateway at `addr` and waits until 127.0.0.1 answers `/healthz`.
+    fn start_test_gateway(
+        addr: String,
+        data: PathBuf,
+    ) -> (
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            start_gateway_server_with_shutdown(
+                &addr,
+                None,
+                GatewayCollaborationContext::default(),
+                data.join("cache"),
+                data,
+                None,
+                async {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
+        (stop_tx, server)
+    }
+
+    async fn wait_for_health(
+        server: &tokio::task::JoinHandle<anyhow::Result<()>>,
+        connect: SocketAddr,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::net::TcpStream::connect(connect).await.is_err() {
+            assert!(!server.is_finished(), "the test gateway stopped");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "gateway did not listen"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[cfg(unix)]
@@ -751,6 +1075,58 @@ mod trusted_gateway_tests {
         assert!(!crate::runtime_control::gateway_runtime_coord_path(temp.path()).exists());
     }
 
+    /// `elastos serve` holds the host lock as `serve` and can start a gateway in the
+    /// same process. That gateway starts, and its `/healthz` is not Home readiness.
+    #[tokio::test]
+    async fn gateway_inside_serve_starts_and_answers_health_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().to_path_buf();
+        let addr = unused_localhost_address();
+        let _serve =
+            crate::host_lock::acquire_host_process_lock(&data, "serve", "127.0.0.1:3000").unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let task_addr = addr.clone();
+        let task_data = data.clone();
+        let server = tokio::spawn(async move {
+            start_gateway_server_with_shutdown(
+                &task_addr,
+                None,
+                GatewayCollaborationContext::default(),
+                task_data.join("cache"),
+                task_data,
+                None,
+                async {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if server.is_finished() {
+                panic!("the gateway inside serve stopped: {:?}", server.await);
+            }
+            if let Ok(response) = client.get(format!("http://{addr}/healthz")).send().await {
+                break response.status();
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let _ = stop_tx.send(());
+        server.await.unwrap().unwrap();
+        let lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(data.join("host-process.lock")).unwrap())
+                .unwrap();
+        assert_eq!(lock["role"], "serve");
+        assert_eq!(lock["pid"], std::process::id());
+    }
+
     #[tokio::test]
     async fn browser_home_ready_is_skipped_when_auth_setup_fails() {
         let temp = tempfile::tempdir().unwrap();
@@ -788,5 +1164,259 @@ mod trusted_gateway_tests {
             trusted_gateway_api_url("0.0.0.0:8090").unwrap(),
             "http://localhost:8090"
         );
+    }
+
+    #[test]
+    fn localhost_port_matches_only_the_name_localhost() {
+        assert_eq!(localhost_port("localhost:8090"), Some(8090));
+        assert_eq!(localhost_port("LocalHost:0"), Some(0));
+        assert_eq!(localhost_port("127.0.0.1:8090"), None);
+        assert_eq!(localhost_port("[::1]:8090"), None);
+        assert_eq!(localhost_port("0.0.0.0:8090"), None);
+        assert_eq!(localhost_port("home.localhost:8090"), None);
+        assert_eq!(localhost_port("localhost"), None);
+    }
+
+    #[test]
+    fn localhost_addresses_add_both_browser_loopbacks_once() {
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 8090));
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 8090));
+        // macOS resolves ::1 first; Linux often resolves only 127.0.0.1.
+        assert_eq!(
+            localhost_bind_addresses(8090, [v6, v4, v6]).unwrap(),
+            vec![v6, v4]
+        );
+        assert_eq!(localhost_bind_addresses(8090, [v4]).unwrap(), vec![v4, v6]);
+        assert_eq!(localhost_bind_addresses(8090, []).unwrap(), vec![v4, v6]);
+    }
+
+    #[test]
+    fn localhost_that_points_off_this_computer_is_refused() {
+        let error = localhost_bind_addresses(8090, ["10.0.0.7:8090".parse().unwrap()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("localhost points to 10.0.0.7"), "{error}");
+    }
+
+    #[test]
+    fn only_a_missing_address_family_may_be_left_out() {
+        use std::io::{Error, ErrorKind};
+        assert!(address_family_unavailable(&Error::from(
+            ErrorKind::AddrNotAvailable
+        )));
+        #[cfg(unix)]
+        {
+            assert!(address_family_unavailable(&Error::from_raw_os_error(
+                libc::EAFNOSUPPORT
+            )));
+            assert!(address_family_unavailable(&Error::from_raw_os_error(
+                libc::EADDRNOTAVAIL
+            )));
+            assert!(!address_family_unavailable(&Error::from_raw_os_error(
+                libc::EADDRINUSE
+            )));
+            assert!(!address_family_unavailable(&Error::from_raw_os_error(
+                libc::EACCES
+            )));
+        }
+        assert!(!address_family_unavailable(&Error::from(
+            ErrorKind::AddrInUse
+        )));
+        assert!(!address_family_unavailable(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+    }
+
+    #[tokio::test]
+    async fn localhost_binds_ipv4_and_ipv6_loopback_on_one_port() {
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 0));
+        let listeners = bind_localhost_listeners(0, vec![v4, v6]).await.unwrap();
+        let bound = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect::<Vec<_>>();
+        let port = bound[0].port();
+        assert_ne!(port, 0);
+        if ipv6_loopback().is_none() {
+            // This host can only listen on 127.0.0.1; ::1 is left out, not an error.
+            assert_eq!(bound, vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
+            return;
+        }
+        assert_eq!(
+            bound,
+            vec![
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+            ]
+        );
+        for address in bound {
+            tokio::net::TcpStream::connect(address).await.unwrap();
+        }
+    }
+
+    /// A hostile or stale program that holds one localhost address must not
+    /// receive the Home origin while the gateway listens on the other one.
+    #[tokio::test]
+    async fn localhost_refuses_to_start_when_another_program_holds_ipv4_loopback() {
+        let temp = tempfile::tempdir().unwrap();
+        let port = unused_loopback_port();
+        let _hostile = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let error = start_gateway_server_with_ready(
+            &format!("localhost:{port}"),
+            None,
+            GatewayCollaborationContext::default(),
+            temp.path().join("cache"),
+            temp.path().to_path_buf(),
+            Some(unexpected_ready),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Home cannot start because another program already uses 127.0.0.1:{port}. \
+                 Stop that program, then start Home again."
+            )
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert!(!crate::runtime_control::gateway_runtime_coord_path(temp.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn localhost_refuses_to_start_when_another_program_holds_ipv6_loopback() {
+        if ipv6_loopback().is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let port = unused_loopback_port();
+        let _hostile = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, port)).unwrap();
+        let error = start_gateway_server_with_ready(
+            &format!("localhost:{port}"),
+            None,
+            GatewayCollaborationContext::default(),
+            temp.path().join("cache"),
+            temp.path().to_path_buf(),
+            Some(unexpected_ready),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Home cannot start because another program already uses [::1]:{port}. \
+                 Stop that program, then start Home again."
+            )
+        );
+        assert!(!crate::runtime_control::gateway_runtime_coord_path(temp.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn ip_literal_addr_binds_one_listener_as_before() {
+        let listeners = bind_gateway_listeners("127.0.0.1:0").await.unwrap();
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(
+            listeners[0].local_addr().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        let held = listeners[0].local_addr().unwrap().to_string();
+        let error = bind_gateway_listeners(&held).await.unwrap_err();
+        // The plain io error, with no localhost message added.
+        assert_eq!(error.chain().count(), 1);
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_ip_home_pages_move_to_localhost_and_other_routes_stay() {
+        let temp = tempfile::tempdir().unwrap();
+        let port = unused_loopback_port();
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let (stop, server) =
+            start_test_gateway(format!("localhost:{port}"), temp.path().to_path_buf());
+        wait_for_health(&server, v4).await;
+        let ip_host = format!("127.0.0.1:{port}");
+        for path in [
+            "/",
+            "/home",
+            "/home/",
+            "/apps/home",
+            "/apps/home/",
+            "/home/?pair=1",
+        ] {
+            assert_eq!(
+                raw_get(v4, &ip_host, path).await,
+                (308, Some(format!("http://localhost:{port}{path}"))),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            raw_get(v4, &format!("[::1]:{port}"), "/home/").await,
+            (308, Some(format!("http://localhost:{port}/home/")))
+        );
+        // Health, API, and Home assets answer on the IP host itself. A
+        // launcher probes each address with `Host: localhost:<port>`.
+        assert_eq!(raw_get(v4, &ip_host, "/healthz").await, (200, None));
+        assert_eq!(
+            raw_get(v4, &format!("localhost:{port}"), "/healthz").await,
+            (200, None)
+        );
+        for path in ["/api/auth/passkeys", "/home/index.html", "/apps/chat-room/"] {
+            let (status, location) = raw_get(v4, &ip_host, path).await;
+            assert_ne!(status, 308, "{path}");
+            assert_eq!(location, None, "{path}");
+        }
+        // localhost itself and hosts that are not loopback IPs are served in place.
+        for host in [
+            format!("localhost:{port}"),
+            format!("example.com:{port}"),
+            format!("10.0.0.7:{port}"),
+        ] {
+            let (status, location) = raw_get(v4, &host, "/home/").await;
+            assert_ne!(status, 308, "{host}");
+            assert_eq!(location, None, "{host}");
+        }
+        if ipv6_loopback().is_some() {
+            let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+            assert_eq!(
+                raw_get(v6, &format!("[::1]:{port}"), "/healthz").await,
+                (200, None)
+            );
+            assert_eq!(
+                raw_get(v6, &format!("localhost:{port}"), "/healthz").await,
+                (200, None)
+            );
+            assert_eq!(
+                raw_get(v6, &format!("[::1]:{port}"), "/home/").await,
+                (308, Some(format!("http://localhost:{port}/home/")))
+            );
+        }
+        // The lock records the requested address, as the launcher compares it.
+        let lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("host-process.lock")).unwrap())
+                .unwrap();
+        assert_eq!(lock["addr"], format!("localhost:{port}"));
+        assert_eq!(lock["role"], "gateway");
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn ip_literal_gateway_serves_home_pages_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let port = unused_loopback_port();
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let (stop, server) = start_test_gateway(v4.to_string(), temp.path().to_path_buf());
+        wait_for_health(&server, v4).await;
+        let (status, location) = raw_get(v4, &v4.to_string(), "/home/").await;
+        assert_ne!(status, 308);
+        assert_eq!(location, None);
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
     }
 }
