@@ -502,15 +502,16 @@ pub(crate) enum CommunityLinkStep {
 /// whatever stalled it: first a topic rejoin, then a new gossip actor.
 ///
 /// Only a missing peer counts: a quiet Community is normal (Discovery off
-/// means a Home announces nothing), and frames from a peer prove the link
-/// even before the peer list shows it. While no peer returns it keeps
+/// means a Home announces nothing). Frames that still trickle in do not prove
+/// the link: a Home the hub evicted from its active view lists no neighbour
+/// yet can still get a frame now and then, and it stays cut off until it
+/// rejoins. While no peer returns it keeps
 /// repairing with a doubling wait up to `MAX_COMMUNITY_LINK_RETRY`; two
 /// steps are never closer than one silence, counted from when the last one
 /// finished. After `MAX_COMMUNITY_GOSSIP_REBUILDS` rebuilds it only rejoins.
 pub(crate) struct CommunityLinkWatchdog {
     silence: Duration,
     observed_at: Option<Instant>,
-    received_frames: Option<u64>,
     no_peers_since: Option<Instant>,
     last_step_at: Option<Instant>,
     steps: u32,
@@ -522,7 +523,6 @@ impl CommunityLinkWatchdog {
         Self {
             silence,
             observed_at: None,
-            received_frames: None,
             no_peers_since: None,
             last_step_at: None,
             steps: 0,
@@ -543,21 +543,13 @@ impl CommunityLinkWatchdog {
             .is_some_and(|at| now.duration_since(at) > self.silence / 2)
         {
             *self = Self {
-                received_frames: self.received_frames,
                 last_step_at: self.last_step_at,
                 rebuilds: self.rebuilds,
                 ..Self::new(self.silence)
             };
         }
         self.observed_at = Some(now);
-        let frames_arrived = health.is_some_and(|health| {
-            self.received_frames
-                .is_some_and(|frames| frames != health.received_frames)
-        });
-        if let Some(health) = health {
-            self.received_frames = Some(health.received_frames);
-        }
-        if health.is_some_and(|health| health.peer_count > 0) || frames_arrived {
+        if health.is_some_and(|health| health.peer_count > 0) {
             if self.steps > 0 {
                 tracing::info!(steps = self.steps, "Community link recovered");
             }

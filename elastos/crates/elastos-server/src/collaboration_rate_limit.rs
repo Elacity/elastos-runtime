@@ -12,14 +12,18 @@ use std::collections::{HashMap, VecDeque};
 use elastos_common::collaboration_protocol::MAX_COLLABORATION_ENVELOPE_BYTES;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-/// Payload types the Community limits count. Presence is periodic and bounded
-/// by its own cadence.
+/// Payload types the Community limits count. Presence has its own receive
+/// limit below, so a flood of it never spends a sender's chat budget.
 pub(crate) const COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE: &str = "elastos.chat.message/v1";
 pub(crate) const COMMUNITY_RATE_WINDOW_SECS: u64 = 10;
 pub(crate) const COMMUNITY_SENDS_PER_WINDOW: usize = 5;
 /// Equal to the send limit, as #139 records. Honest messages that network
 /// delay bunches into one window are held and retried by the receiving Home.
 pub(crate) const COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW: usize = 5;
+/// An honest Home sends presence every 15 s, so two per window leaves room for
+/// network bunching. Extra presence is dropped, never held: the next one
+/// supersedes it.
+pub(crate) const PRESENCE_RECEIVES_PER_SENDER_PER_WINDOW: usize = 2;
 /// Only accepted messages open a window, and the core's durable backlog caps
 /// how many land in one window, so honest use stays far below this bound.
 const MAX_TRACKED_PROFILES: usize = 4_096;

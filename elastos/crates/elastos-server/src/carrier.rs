@@ -616,10 +616,36 @@ fn push_gossip_buffer_message(buffer: &mut TopicBuffer, message: GossipMessage) 
     true
 }
 
-fn spawn_carrier_gossip(endpoint: &Endpoint) -> Gossip {
+/// Active neighbours a Community bootstrap node keeps. Homes behind NAT reach
+/// each other only through it, so with iroh-gossip's default of 5 a sixth
+/// Home's join evicts a random Home, which then has no neighbour at all.
+/// Each active neighbour costs the hub one QUIC connection (already held for
+/// the topic) plus a bounded per-peer send queue, so 512 Homes stay cheap.
+const COMMUNITY_HUB_ACTIVE_VIEW_CAPACITY: usize = 512;
+/// Passive view of the hub: contact info only (no connection).
+const COMMUNITY_HUB_PASSIVE_VIEW_CAPACITY: usize = 1024;
+
+/// A Home keeps iroh-gossip's default membership; only a Community bootstrap
+/// node (its endpoint is one of the profile's bootstrap peers) is the hub.
+fn carrier_gossip_membership(community_hub: bool) -> iroh_gossip::proto::HyparviewConfig {
+    let mut membership = iroh_gossip::proto::HyparviewConfig::default();
+    if community_hub {
+        membership.active_view_capacity = COMMUNITY_HUB_ACTIVE_VIEW_CAPACITY;
+        membership.passive_view_capacity = COMMUNITY_HUB_PASSIVE_VIEW_CAPACITY;
+    }
+    membership
+}
+
+fn spawn_carrier_gossip_for(endpoint: &Endpoint, community_hub: bool) -> Gossip {
     Gossip::builder()
         .max_message_size(GOSSIP_WIRE_MESSAGE_MAX_BYTES)
+        .membership_config(carrier_gossip_membership(community_hub))
         .spawn(endpoint.clone())
+}
+
+#[cfg(test)]
+fn spawn_carrier_gossip(endpoint: &Endpoint) -> Gossip {
+    spawn_carrier_gossip_for(endpoint, false)
 }
 
 fn now_secs() -> u64 {
@@ -727,6 +753,8 @@ pub struct GossipState {
     topic_peers: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     did: Option<String>,
     direct_only: bool,
+    /// Set on a Community bootstrap node; every gossip actor it spawns is a hub.
+    community_hub: bool,
     browser_exit_network: Option<crate::collaboration_network::VerifiedCollaborationNetworkProfile>,
     browser_exit_reservations: browser_exit::BrowserExitReservations,
     browser_engine_probe_slots: Arc<tokio::sync::Semaphore>,
@@ -763,6 +791,7 @@ impl GossipState {
             topic_peers: Arc::new(Mutex::new(HashMap::new())),
             did,
             direct_only: false,
+            community_hub: false,
         }
     }
 
@@ -1264,7 +1293,7 @@ async fn rebuild_carrier_gossip(state: &mut GossipState) -> Result<usize> {
     {
         warn!("carrier: gossip actor did not shut down for the rebuild; dropping it");
     }
-    let replacement = spawn_carrier_gossip(&state.endpoint);
+    let replacement = spawn_carrier_gossip_for(&state.endpoint, state.community_hub);
     state.gossip = replacement.clone();
     drop(state.gossip_handler.replace(replacement));
     drop(previous);
@@ -1902,7 +1931,7 @@ pub async fn start_carrier_node_with_registry(
     data_dir: PathBuf,
     provider_registry: Option<Weak<ProviderRegistry>>,
 ) -> Result<CarrierNode> {
-    start_carrier_node_with_registry_bound(signing_key, did, data_dir, provider_registry, None)
+    start_carrier_node_with_registry_bound(signing_key, did, data_dir, provider_registry, None, &[])
         .await
 }
 
@@ -1910,6 +1939,8 @@ pub async fn start_carrier_node_with_registry(
 ///
 /// `bind_addr` of `None` keeps the well-known [`DEFAULT_CARRIER_BIND_ADDR`]
 /// attempt. When supplied, the explicit address must bind successfully.
+/// `community_bootstrap_node_ids` are the verified Community profile's
+/// bootstrap peers; a node whose endpoint is one of them is the Community hub.
 /// Every caller shares this path, so the operator peer-store address
 /// book seeding and provider-invoke dispatch are identical for a runtime host
 /// and a standalone provider host.
@@ -1919,6 +1950,7 @@ pub async fn start_carrier_node_with_registry_bound(
     data_dir: PathBuf,
     provider_registry: Option<Weak<ProviderRegistry>>,
     bind_addr: Option<std::net::SocketAddr>,
+    community_bootstrap_node_ids: &[String],
 ) -> Result<CarrierNode> {
     let network =
         parse_elastos_carrier_network(std::env::var("ELASTOS_CARRIER_NETWORK").ok().as_deref())?;
@@ -1933,6 +1965,7 @@ pub async fn start_carrier_node_with_registry_bound(
         provider_registry,
         network,
         bind_addr,
+        community_bootstrap_node_ids,
     )
     .await
 }
@@ -1951,6 +1984,7 @@ pub(crate) async fn start_isolated_carrier_node_with_registry(
         provider_registry,
         CarrierNodeNetwork::Isolated,
         Some("0.0.0.0:0".parse()?),
+        &[],
     )
     .await
 }
@@ -1962,6 +1996,7 @@ async fn start_carrier_node_with_network(
     provider_registry: Option<Weak<ProviderRegistry>>,
     network: CarrierNodeNetwork,
     bind_addr: Option<std::net::SocketAddr>,
+    community_bootstrap_node_ids: &[String],
 ) -> Result<CarrierNode> {
     let expected_did = crate::crypto::encode_signing_key_did(signing_key);
     let decoded_did =
@@ -2013,9 +2048,18 @@ async fn start_carrier_node_with_network(
     let bootstrap_peers =
         seed_address_book_from_operator_peer_store(&memory_lookup, &data_dir, network);
 
+    // The Community watchdog uses the same rule to tell the seed from a Home.
+    let local_node_id = endpoint.id().to_string();
+    let community_hub = community_bootstrap_node_ids.contains(&local_node_id);
+    if community_hub {
+        info!(
+            active_view = COMMUNITY_HUB_ACTIVE_VIEW_CAPACITY,
+            "carrier: this node is a Community bootstrap node; gossip runs as the hub"
+        );
+    }
     let gossip_state = Arc::new(Mutex::new(GossipState::new(
         endpoint.clone(),
-        spawn_carrier_gossip(&endpoint),
+        spawn_carrier_gossip_for(&endpoint, community_hub),
         memory_lookup.clone(),
         Some(signing_key.clone()),
         Some(did.to_string()),
@@ -2024,6 +2068,7 @@ async fn start_carrier_node_with_network(
         let mut state = gossip_state.lock().await;
         state.bootstrap_peers = bootstrap_peers;
         state.direct_only = network == CarrierNodeNetwork::Isolated;
+        state.community_hub = community_hub;
         state.gossip_handler.clone()
     };
 
@@ -18189,6 +18234,7 @@ pub(crate) mod tests {
             dir.path().to_path_buf(),
             None,
             Some(address),
+            &[],
         )
         .await;
         match result {
@@ -19786,5 +19832,243 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(5), shutdown_test_carrier_node(node))
             .await
             .expect("direct Carrier shutdown deadline");
+    }
+
+    /// iroh-gossip's own membership state machine on a deterministic
+    /// in-memory network: Homes sit behind NAT and reach only the hub (the
+    /// seed's Community node), except Homes on one LAN, which also reach
+    /// each other. A send to an unreachable node fails like a failed dial.
+    mod community_hub_membership {
+        use super::super::carrier_gossip_membership;
+        use gossip_rand::{rngs::StdRng, SeedableRng};
+        use iroh_gossip::proto::{
+            self, topic, Command, InEvent, OutEvent, PeerData, Scope, State, TopicId,
+        };
+        use std::collections::{BTreeMap, BTreeSet, VecDeque};
+        use tokio::time::{Duration, Instant};
+
+        const HUB: u64 = 0;
+        const HOMES: u64 = 8;
+        const MAX_EVENTS: usize = 2_000_000;
+
+        struct Network {
+            hub_membership: bool,
+            lan: Vec<(u64, u64)>,
+            topic: TopicId,
+            nodes: BTreeMap<u64, (u64, State<u64, StdRng>)>,
+            queue: VecDeque<(u64, InEvent<u64>)>,
+            timers: Vec<(Instant, u64, u64, proto::Timer<u64>)>,
+            now: Instant,
+            events: usize,
+            neighbours: BTreeMap<u64, BTreeSet<u64>>,
+            leaving: Option<u64>,
+            /// `(when, home)`: a Home's last neighbour went down.
+            isolated: Vec<(&'static str, u64)>,
+            phase: &'static str,
+            received: BTreeSet<u64>,
+        }
+
+        impl Network {
+            fn new(hub_membership: bool, lan: &[(u64, u64)]) -> Self {
+                Self {
+                    hub_membership,
+                    lan: lan.to_vec(),
+                    topic: TopicId::from_bytes([7; 32]),
+                    nodes: BTreeMap::new(),
+                    queue: VecDeque::new(),
+                    timers: Vec::new(),
+                    now: Instant::now(),
+                    events: 0,
+                    neighbours: BTreeMap::new(),
+                    leaving: None,
+                    isolated: Vec::new(),
+                    phase: "join",
+                    received: BTreeSet::new(),
+                }
+            }
+
+            fn reachable(&self, a: u64, b: u64) -> bool {
+                a == HUB || b == HUB || self.lan.contains(&(a.min(b), a.max(b)))
+            }
+
+            /// Starts (or restarts) `id` and joins the topic through the hub.
+            fn start(&mut self, id: u64) {
+                let generation = self.nodes.get(&id).map_or(0, |(g, _)| g + 1);
+                if self.nodes.contains_key(&id) {
+                    // The old process is gone: its connections close.
+                    for peer in self.neighbours.remove(&id).unwrap_or_default() {
+                        self.queue.push_back((peer, InEvent::PeerDisconnected(id)));
+                    }
+                }
+                let config = proto::Config {
+                    membership: carrier_gossip_membership(id == HUB && self.hub_membership),
+                    ..Default::default()
+                };
+                let rng = StdRng::seed_from_u64(id * 1_000 + generation);
+                let state = State::new(id, PeerData::default(), config, rng);
+                self.nodes.insert(id, (generation, state));
+                let bootstrap = if id == HUB { Vec::new() } else { vec![HUB] };
+                self.queue
+                    .push_back((id, InEvent::Command(self.topic, Command::Join(bootstrap))));
+            }
+
+            /// Carrier's topic rejoin: leave, then join through the hub again.
+            fn rejoin(&mut self, id: u64) {
+                self.leaving = Some(id);
+                self.queue
+                    .push_back((id, InEvent::Command(self.topic, Command::Quit)));
+                self.run_for(Duration::from_secs(1));
+                self.leaving = None;
+                self.neighbours.remove(&id);
+                self.queue
+                    .push_back((id, InEvent::Command(self.topic, Command::Join(vec![HUB]))));
+            }
+
+            fn broadcast_from(&mut self, id: u64) {
+                self.received.clear();
+                self.queue.push_back((
+                    id,
+                    InEvent::Command(
+                        self.topic,
+                        Command::Broadcast(b"community".to_vec().into(), Scope::Swarm),
+                    ),
+                ));
+            }
+
+            fn handle(&mut self, node: u64, event: InEvent<u64>) {
+                self.events += 1;
+                assert!(self.events < MAX_EVENTS, "the membership never settled");
+                let now = self.now;
+                let Some((generation, state)) = self.nodes.get_mut(&node) else {
+                    return;
+                };
+                let generation = *generation;
+                let out: Vec<_> = state.handle(event, now, None).collect();
+                for event in out {
+                    match event {
+                        OutEvent::SendMessage(to, message) => {
+                            if self.reachable(node, to) && self.nodes.contains_key(&to) {
+                                self.queue
+                                    .push_back((to, InEvent::RecvMessage(node, message)));
+                            } else {
+                                self.queue.push_back((node, InEvent::PeerDisconnected(to)));
+                            }
+                        }
+                        OutEvent::EmitEvent(_, topic::Event::NeighborUp(peer)) => {
+                            self.neighbours.entry(node).or_default().insert(peer);
+                        }
+                        OutEvent::EmitEvent(_, topic::Event::NeighborDown(peer)) => {
+                            let left = self.neighbours.entry(node).or_default();
+                            left.remove(&peer);
+                            if left.is_empty() && node != HUB && self.leaving != Some(node) {
+                                self.isolated.push((self.phase, node));
+                            }
+                        }
+                        OutEvent::EmitEvent(_, topic::Event::Received(_)) => {
+                            self.received.insert(node);
+                        }
+                        OutEvent::ScheduleTimer(after, timer) => {
+                            self.timers.push((now + after, node, generation, timer));
+                        }
+                        OutEvent::DisconnectPeer(peer) => {
+                            self.queue
+                                .push_back((peer, InEvent::PeerDisconnected(node)));
+                        }
+                        OutEvent::PeerData(..) => {}
+                    }
+                }
+            }
+
+            fn run_for(&mut self, duration: Duration) {
+                let until = self.now + duration;
+                loop {
+                    while let Some((node, event)) = self.queue.pop_front() {
+                        self.handle(node, event);
+                    }
+                    let next = self
+                        .timers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (at, ..))| *at <= until)
+                        .min_by_key(|(_, (at, ..))| *at)
+                        .map(|(index, _)| index);
+                    let Some(index) = next else { break };
+                    let (at, node, generation, timer) = self.timers.swap_remove(index);
+                    self.now = self.now.max(at);
+                    if self.nodes.get(&node).is_some_and(|(g, _)| *g == generation) {
+                        self.handle(node, InEvent::TimerExpired(timer));
+                    }
+                }
+                self.now = until;
+            }
+        }
+
+        /// A hub and 8 Homes join one after another; then one Home restarts,
+        /// one rejoins, and the hub broadcasts. Returns the network after it.
+        fn community(hub_membership: bool, lan: &[(u64, u64)]) -> Network {
+            let mut network = Network::new(hub_membership, lan);
+            network.start(HUB);
+            network.run_for(Duration::from_secs(1));
+            for home in 1..=HOMES {
+                network.start(home);
+                network.run_for(Duration::from_secs(5));
+            }
+            network.run_for(Duration::from_secs(180));
+            network.phase = "restart";
+            network.start(3);
+            network.run_for(Duration::from_secs(180));
+            network.phase = "rejoin";
+            network.rejoin(5);
+            network.run_for(Duration::from_secs(180));
+            network.broadcast_from(HUB);
+            network.run_for(Duration::from_secs(30));
+            network
+        }
+
+        fn assert_every_home_keeps_the_hub(network: &Network) {
+            assert_eq!(network.isolated, [], "no Home may lose its only neighbour");
+            for home in 1..=HOMES {
+                assert!(
+                    network
+                        .neighbours
+                        .get(&home)
+                        .is_some_and(|n| n.contains(&HUB)),
+                    "Home {home} keeps the hub as a neighbour: {:?}",
+                    network.neighbours.get(&home)
+                );
+            }
+            let homes: BTreeSet<u64> = (1..=HOMES).collect();
+            assert_eq!(
+                network.received, homes,
+                "a hub broadcast reaches all 8 Homes"
+            );
+        }
+
+        #[test]
+        fn default_membership_cuts_homes_off_a_hub_with_more_than_five() {
+            let network = community(false, &[]);
+            // Homes 6..8 already evict earlier ones while joining, and the
+            // restart of Home 3 evicts another.
+            let phases: BTreeSet<&str> = network.isolated.iter().map(|(p, _)| *p).collect();
+            assert!(
+                phases.contains("join") && phases.contains("restart"),
+                "iroh-gossip's default 5 active neighbours evict Homes from the hub: {:?}",
+                network.isolated
+            );
+            assert!(network.neighbours[&HUB].len() <= 5);
+        }
+
+        #[test]
+        fn hub_membership_keeps_every_home_through_joins_restarts_and_rejoins() {
+            let network = community(true, &[]);
+            assert_every_home_keeps_the_hub(&network);
+            assert_eq!(network.neighbours[&HUB].len(), HOMES as usize);
+        }
+
+        #[test]
+        fn homes_on_one_lan_keep_default_membership_and_still_reach_everyone() {
+            let network = community(true, &[(1, 2), (3, 4), (6, 7)]);
+            assert_every_home_keeps_the_hub(&network);
+        }
     }
 }

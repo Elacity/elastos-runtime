@@ -126,6 +126,9 @@ wasm-encoder = "=0.236.1"
 elastos-auth = { path = "../elastos-auth" }
 elastos-protected-content-custody = { path = "../elastos-protected-content-custody" }
 x-wing = { version = "=0.1.0", features = ["hazmat", "zeroize"] }
+# The rand generation iroh-gossip's membership state machine takes; the
+# Community hub test drives that state machine directly.
+gossip-rand = { package = "rand", version = "0.10", default-features = false, features = ["std_rng"] }
 
 [features]
 default = []
