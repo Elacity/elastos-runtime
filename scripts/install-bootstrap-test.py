@@ -562,6 +562,44 @@ class ShellTests(unittest.TestCase):
                         self.assertIn("The release files changed on this computer after they were checked",
                                       result.stderr)
 
+    def test_held_runtime_refuses_any_change_to_the_held_file_or_its_path(self):
+        # The check behind every staged run, alone. fd 9 holds the staged file.
+        with tempfile.TemporaryDirectory() as directory:
+            staged = Path(directory) / "elastos"
+            expected = hashlib.sha256(RUNTIME_STUB).hexdigest()
+            setups = {
+                "unchanged": "",
+                "path renamed over": 'printf x > "$1.new"; chmod 0500 "$1.new"; mv -f "$1.new" "$1"',
+                "path removed": 'rm -f "$1"',
+                "path now a symlink": 'cp "$1" "$1.real"; rm -f "$1"; ln -s "$1.real" "$1"',
+                "written in place": 'chmod u+w "$1"; printf x >> "$1"; chmod 0500 "$1"',
+                "made writable": 'chmod u+w "$1"',
+                "second link": 'ln "$1" "$1.link"',
+            }
+            for name, change in setups.items():
+                for path in Path(directory).iterdir():
+                    path.unlink()
+                staged.write_bytes(RUNTIME_STUB)
+                staged.chmod(0o500)
+                result = shell('''exec 9<"$1"
+id="$(held_runtime hash "$1" "$2")" || exit 10
+held_runtime check "$1" "$id" || exit 11
+''' + change + '''
+held_runtime check "$1" "$id" || exit 12
+''', staged, expected)
+                with self.subTest(change=name):
+                    self.assertEqual(result.returncode, 0 if name == "unchanged" else 12, result.stderr)
+                    self.assertEqual(result.stderr, "")
+            # The hash is of the held file's bytes, and a mode other than 0500 is refused.
+            staged.chmod(0o700)
+            staged.write_bytes(RUNTIME_STUB)
+            staged.chmod(0o500)
+            wrong = shell('exec 9<"$1"; held_runtime hash "$1" "$2"', staged, "0" * 64)
+            self.assertEqual(wrong.returncode, 3)
+            staged.chmod(0o700)
+            loose = shell('exec 9<"$1"; held_runtime hash "$1" "$2"', staged, expected)
+            self.assertEqual(loose.returncode, 3)
+
     def test_verified_head_cid_is_the_hashed_bytes(self):
         vector = b'{"payload":{"version":"0.7.1-rc.2"}}\n'
         expected = "QmZFMnZjkiTqy9VY5FDdKudvpsKtKxifk1poBrV7k4sqp8"
@@ -735,26 +773,54 @@ def run_offline_installer(head, release, did, system="Linux", machine="x86_64"):
         return result, requests
 
 
-# sha256sum FILE and shasum -a 256 FILE: print the real hash, then replace the
-# file curl downloaded (only that one, only once) and log the swap.
-SWAP_HASHER = """import hashlib, pathlib, sys
+# sha256sum FILE and shasum -a 256 FILE print the real hash; "held" only swaps
+# (the real python3 already hashed the held file). Then the first file that
+# matches swap-rule is replaced, once, and the swap is logged:
+#   download inplace   the file curl downloaded, rewritten in place
+#   staged rename      the staged Runtime, replaced by another file at its path
+#   staged inplace     the staged Runtime, rewritten in place, mode put back
+SWAP_HASHER = """import hashlib, os, pathlib, sys
 fixtures, tool, path = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[-1]
-data = pathlib.Path(path).read_bytes()
-print(hashlib.sha256(data).hexdigest() + "  " + path, flush=True)
+digest = lambda: hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+before = digest()
+if tool != "held":
+    print(before + "  " + path, flush=True)
+rule = fixtures / "swap-rule"
+target, how = rule.read_text().split() if rule.exists() else ("download", "inplace")
 downloads = dict(line.split(" ", 1) for line in (fixtures / "downloads").read_text().splitlines())
+hit = path == downloads.get("binary") if target == "download" else "/.elastos.install." in path
 log = fixtures / "swaps"
-if path == downloads.get("binary") and not log.exists():
-    pathlib.Path(path).write_bytes((fixtures / "swap-binary").read_bytes())
-    after = hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
-    log.write_text(" ".join([tool, path, hashlib.sha256(data).hexdigest(), after]) + "\\n")
+if hit and not log.exists():
+    swap = (fixtures / "swap-binary").read_bytes()
+    mode = os.stat(path).st_mode & 0o777
+    if how == "rename":
+        pathlib.Path(path + ".swap").write_bytes(swap)
+        os.chmod(path + ".swap", mode)
+        os.replace(path + ".swap", path)
+    else:
+        os.chmod(path, mode | 0o200)
+        with open(path, "r+b") as handle:
+            handle.write(swap)
+            handle.truncate()
+        os.chmod(path, mode)
+    log.write_text(" ".join([tool, path, before, digest()]) + "\\n")
 """
 
 
-def mock_swapping_hashers(sandbox):
+def mock_swapping_hashers(sandbox, rule=None):
     (sandbox.root / "swap-hasher.py").write_text(SWAP_HASHER)
-    run = f'exec "{sys.executable}" -I "$FIXTURES/swap-hasher.py" "$FIXTURES"'
-    sandbox.mock("sha256sum", f'#!/bin/sh\n[ "$#" = 1 ] || exit 2\n{run} sha256sum "$@"\n')
-    sandbox.mock("shasum", f'#!/bin/sh\n[ "$#" = 3 ] && [ "$1 $2" = "-a 256" ] || exit 2\n{run} shasum "$@"\n')
+    if rule:
+        (sandbox.root / "swap-rule").write_text(rule)
+    run = f'"{sys.executable}" -I "$FIXTURES/swap-hasher.py" "$FIXTURES"'
+    sandbox.mock("sha256sum", f'#!/bin/sh\n[ "$#" = 1 ] || exit 2\nexec {run} sha256sum "$@"\n')
+    sandbox.mock("shasum", f'#!/bin/sh\n[ "$#" = 3 ] && [ "$1 $2" = "-a 256" ] || exit 2\nexec {run} shasum "$@"\n')
+    # install.sh hashes the held staged Runtime with python3 (held_runtime hash).
+    sandbox.mock("python3", f'''#!/bin/sh
+"{sys.executable}" "$@"
+status=$?
+if [ "$status" = 0 ] && [ "$1" = - ] && [ "$2" = hash ]; then {run} held "$3"; fi
+exit "$status"
+''')
 
 
 def mock_apple_mktemp(sandbox):
@@ -1054,6 +1120,86 @@ class InstallationTests(unittest.TestCase):
                 self.assertEqual(list(sandbox.binary.parent.iterdir()), [])
                 self.assertEqual(sandbox.runtime_calls(), [])
 
+    def test_staged_runtime_swapped_between_its_hash_and_its_run_is_refused(self):
+        # Another process of this user replaces the staged Runtime after its
+        # hash passed and before it runs, at its path or in place. The installer
+        # holds the staged file open; each run first checks that the held file
+        # is unchanged and that its path still names it, so nothing runs.
+        swapped = RUNTIME_STUB.replace(b"#!/bin/bash\n", b'#!/bin/bash\necho ran >> "$FIXTURES/swapped-ran"\n', 1)
+        binary = {"cid": "binary-a", "sha256": hashlib.sha256(RUNTIME_STUB).hexdigest(), "size": len(RUNTIME_STUB)}
+        components = {"cid": "components-a", "sha256": hashlib.sha256(COMPONENTS).hexdigest(),
+                      "size": len(COMPONENTS)}
+        did, head, release = installable_fixture(release_extra={"platforms": {
+            platform: {"binary": binary, "components": components}
+            for platform in ("x86_64-linux", "aarch64-darwin")}})
+        for system, machine in (("Linux", "x86_64"), ("Darwin", "arm64")):
+            for how in ("rename", "inplace"):
+                with self.subTest(system=system, swap=how), \
+                        InstallerSandbox(head, release, did, system, machine) as sandbox:
+                    sandbox.respond("binary", RUNTIME_STUB)
+                    (sandbox.root / "swap-binary").write_bytes(swapped)
+                    mock_swapping_hashers(sandbox, "staged " + how)
+                    if system == "Darwin":
+                        sandbox.hide_commands("sha256sum")
+                        mock_apple_mktemp(sandbox)
+                    result, requests = sandbox.run("--install-only")
+                    output = result.stdout + result.stderr
+                    swaps = (sandbox.root / "swaps").read_text().split() if (sandbox.root / "swaps").exists() else []
+                    self.assertEqual(swaps[2:], [hashlib.sha256(RUNTIME_STUB).hexdigest(),
+                                                 hashlib.sha256(swapped).hexdigest()], output)
+                    self.assertFalse((sandbox.root / "swapped-ran").exists(), output)
+                    self.assertRegex(swaps[1], r"/\.elastos\.install\.\w+/elastos$")
+                    self.assertEqual(sandbox.runtime_calls(), [])
+                    self.assertEqual(result.returncode, 1, output)
+                    self.assertTrue(result.stderr.endswith(
+                        "Error: The downloaded Runtime changed on this computer after its check. "
+                        "Nothing was installed. Run the installer again.\n"), result.stderr)
+                    self.assertEqual(len(requests), 3)
+                    self.assertFalse(sandbox.binary.exists())
+                    self.assertEqual(list(sandbox.binary.parent.iterdir()), [])
+
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "the kernel cannot start an open file here (macOS)")
+    def test_staged_runtime_swapped_after_its_last_check_still_runs_the_checked_bytes(self):
+        # The window between the last check and exec: where /proc/self/fd
+        # exists the installer starts the held file, not the path, so the
+        # replaced path never runs. The writer then reads the candidate path,
+        # finds bytes without the signed SHA-256 and refuses, as Runtime's
+        # writer does (installed_release.rs admit_candidate).
+        runtime = RUNTIME_STUB.replace(b"    install-release)\n", b'''    install-release)
+        if [[ "${*: -1}" != --check ]] && [[ "$(python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "${@: -4:1}")" != "$(cat "$FIXTURES/signed-sha256")" ]]; then
+            echo "Error: fixture writer refused a candidate without the signed SHA-256" >&2; exit 1
+        fi
+''', 1)
+        self.assertNotEqual(runtime, RUNTIME_STUB)
+        swapped = runtime.replace(b"#!/bin/bash\n", b'#!/bin/bash\necho ran >> "$FIXTURES/swapped-ran"\n', 1)
+        did, head, release = installable_fixture(runtime=runtime)
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", runtime)
+            (sandbox.root / "signed-sha256").write_text(hashlib.sha256(runtime).hexdigest())
+            (sandbox.root / "swap-binary").write_bytes(swapped)
+            (sandbox.root / "swap-hasher.py").write_text(SWAP_HASHER)
+            (sandbox.root / "swap-rule").write_text("staged rename")
+            # The third check is the one right before the writer installs.
+            sandbox.mock("python3", f'''#!/bin/sh
+"{sys.executable}" "$@"
+status=$?
+if [ "$status" = 0 ] && [ "$1" = - ] && [ "$2" = check ]; then
+    echo check >> "$FIXTURES/checks"
+    if [ "$(wc -l < "$FIXTURES/checks")" -eq 3 ]; then "{sys.executable}" -I "$FIXTURES/swap-hasher.py" "$FIXTURES" held "$3"; fi
+fi
+exit "$status"
+''')
+            result, _ = sandbox.run("--install-only")
+            output = result.stdout + result.stderr
+            self.assertTrue((sandbox.root / "swaps").exists(), output)
+            self.assertFalse((sandbox.root / "swapped-ran").exists(), output)
+            calls = sandbox.runtime_calls()
+            self.assertEqual([call.split()[0] for call in calls], ["--version", "install-release", "install-release"])
+            self.assertEqual(result.returncode, 1, output)
+            self.assertIn("fixture writer refused a candidate without the signed SHA-256", result.stderr)
+            self.assertIn("The previous installation was preserved", result.stderr)
+            self.assertFalse(sandbox.binary.exists())
+
     def test_release_head_swapped_after_its_signature_check_is_refused(self):
         # Another process replaces release-head.json right after its signature
         # passed, with a head signed by its own key. Nothing after the check may
@@ -1342,7 +1488,7 @@ exit "$status"
         self.assertIn("Runtime installed:", result.stdout)
         self.assertNotIn("Setting up Home", result.stdout)
         calls = sandbox.runtime_calls()
-        writer = "^install-release --data-dir %s --binary %s --candidate %s/\\.elastos\\.install\\.\\w+ " \
+        writer = "^install-release --data-dir %s --binary %s --candidate %s/\\.elastos\\.install\\.\\w+/elastos " \
                  "(\\S+)/sources\\.json \\1/release-head\\.json \\1/release\\.json" % (
                      re.escape(str(sandbox.data)), re.escape(str(sandbox.binary)),
                      re.escape(str(sandbox.binary.parent)))
