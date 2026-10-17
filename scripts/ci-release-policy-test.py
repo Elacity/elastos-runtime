@@ -15,6 +15,7 @@ import sys
 import tarfile
 import tempfile
 import textwrap
+import time
 import unittest
 from unittest import mock
 
@@ -2161,14 +2162,15 @@ class InstalledJourneyTests(unittest.TestCase):
             (blocks / key[-3:-1]).mkdir()
             (blocks / key[-3:-1] / f"{key}.data").write_bytes(b"package root")
 
-    def execute(self, home, data, evidence, available=20 * 1024 ** 3, carrier=False, consumer_holds_root=False, memory_gib=0):
+    def execute(self, home, data, evidence, available=20 * 1024 ** 3, carrier=False, consumer_holds_root=False, memory_gib=0,
+                finite=None):
         journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
         child = mock.Mock(pid=12345)
         child.poll.return_value = None
         response = mock.MagicMock()
         response.__enter__.return_value.status = 200
         self.holder = mock.Mock(return_value=(mock.Mock(pid=23456), {"holder_did": "did:key:holder"}))
-        self.finite = mock.Mock()
+        self.finite = finite or mock.Mock()
 
         def node_journey(*args, **kwargs):
             if args[0][1] == "scripts/ci-model-package.mjs":
@@ -2701,7 +2703,7 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
         owner.engine, owner.engine_members = None, set()
         owner.stop = mock.Mock()
         owner.stop.is_set.return_value = False
-        owner.thread, owner.error, owner.launch_requested = None, None, True
+        owner.thread, owner.error, owner.failure, owner.launch_requested = None, None, None, True
         owner.baseline_events = {"oom": 0, "oom_kill": 0}
         owner.show = mock.Mock(return_value=dict(owner.binding))
         owner.command = mock.Mock()
@@ -3071,6 +3073,76 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
                 owner.action({"id": 1, "action": "engine_running"})
             self.assertEqual(owner.actions, [])
             self.assertFalse((owner.control / "response.json").exists())
+
+    def test_finite_observer_failure_names_its_phase_type_message_and_runtime_exit(self):
+        cases = (("census", RuntimeError("finite journey Runtime left its unit"), True),
+                 ("census", RuntimeError("finite journey child escaped its finite unit"), False),
+                 ("stage_engine_running", RuntimeError("finite journey engine stage deadline"), False))
+        for phase, error, exited in cases:
+            with self.subTest(phase=phase, error=str(error)), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                owner.started, owner.fds = time.monotonic(), {100: 1100}
+                owner.observe_once = mock.Mock(side_effect=None if phase.startswith("stage") else error)
+                owner.action = mock.Mock(side_effect=error)
+                if phase.startswith("stage"):
+                    self.journey["private_json"](owner.control / "request.json", {"id": 1, "action": "engine_running"})
+                self.journey["private_json"](owner.control / "runtime-stopped.json", {"reaped": True})
+                with mock.patch.dict(self.globals, {"pidfd_exited": lambda fd: exited and fd == 1100}), \
+                        mock.patch.object(os, "close"):
+                    owner.observe()
+                    expected = {"phase": phase, "type": "RuntimeError", "message": str(error), "runtime_exited": exited}
+                    self.assertEqual(owner.failure, expected)
+                    self.assertEqual(owner.poll(), 1)
+                    # The same cause reaches the CI log line that used to end the job without it.
+                    with self.assertRaisesRegex(AssertionError, re.escape(f"exited before health ({phase}: RuntimeError: {error})")):
+                        self.journey["wait_healthy"](owner, "127.0.0.1:1", "Runtime")
+                    receipt = owner.finish()
+                self.assertEqual(receipt["status"], "failed")
+                self.assertEqual(receipt["observer_failure"], expected)
+                self.assertEqual(receipt.get("runtime_exited_before_cleanup"), True if exited else None)
+
+    def test_observer_failure_text_is_bounded_and_single_line(self):
+        cause = self.journey["observer_failure"]("census", OSError("first line\nsecond " + "x" * 2000))
+        self.assertEqual(cause["type"], "OSError")
+        self.assertNotIn("\n", cause["message"])
+        self.assertTrue(cause["message"].startswith("first line second x"))
+        self.assertLessEqual(len(cause["message"]), 483)
+
+    def test_finite_observer_failure_reaches_the_uploaded_installed_journey_receipt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            owner, _ = self.finite_owner(Path(temp) / "observer")
+            owner.started, owner.fds, owner.launch_requested = time.monotonic(), {}, False
+            owner.observe_once = mock.Mock(side_effect=RuntimeError("finite journey Runtime left its unit"))
+            owner.observe()
+            owner.start = mock.Mock(return_value=owner)
+            case = InstalledJourneyTests()
+            home, data, evidence, _ = case.fixture(Path(temp) / "journey", "linux")
+            # The unit helper creates the private log before start() returns.
+            (home / "journey-runtime.private.log").write_text("private Runtime log line\n")
+            factory = mock.Mock(return_value=owner)
+            with self.assertRaisesRegex(AssertionError, re.escape(
+                    "installed Runtime exited before health (census: RuntimeError: finite journey Runtime left its unit)")):
+                case.execute(home, data, evidence, memory_gib=4, finite=factory)
+            factory.assert_called_once()
+            record = json.loads((evidence / "installed-journeys.json").read_text())
+            self.assertEqual(record["finite_memory"]["observer_failure"]["message"], "finite journey Runtime left its unit")
+            self.assertEqual(record["finite_memory"]["observer_failure"]["phase"], "census")
+            self.assertEqual(record["results"]["finite_memory_boundary"], "failed")
+            self.assertNotIn("private Runtime log line", (evidence / "installed-journeys.json").read_text())
+
+    def test_repair_control_failure_reaches_its_record(self):
+        owner = self.journey["RepairRuntime"].__new__(self.journey["RepairRuntime"])
+        with tempfile.TemporaryDirectory() as temp:
+            owner.control, owner.record = Path(temp), {"actions": []}
+            owner.control.chmod(0o700)
+            owner.stop = mock.Mock()
+            owner.stop.wait.return_value = False
+            self.journey["private_json"](owner.control / "request.json", {"id": 1, "action": "engine_running"})
+            owner.engine_running = mock.Mock(side_effect=RuntimeError("repair journey engine deadline"))
+            owner.observe()
+        self.assertEqual(owner.error, "installed_model_repair_control_failed")
+        self.assertEqual(owner.record["control_failure"], {"phase": "stage_engine_running", "type": "RuntimeError",
+                                                           "message": "repair journey engine deadline"})
 
     def test_finite_start_requires_actual_runtime_and_every_kernel_limit(self):
         for fault in (None, "launcher_pid", "wrong_parent", "unit_max", "swap", "tasks", "tighter_parent",

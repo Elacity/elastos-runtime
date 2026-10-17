@@ -57,6 +57,19 @@ def private_json(path, value=None):
     return json.loads(encoded)
 
 
+def observer_failure(phase, error, limit=480):
+    """Public cause of an observer failure. The harness writes these messages;
+    no observer reads the private Runtime log, so the receipt can carry them."""
+    message = " ".join(str(error).split())
+    if len(message) > limit:
+        message = message[:limit] + "..."
+    return {"phase": phase, "type": type(error).__name__, "message": message}
+
+
+def failure_suffix(failure):
+    return f" ({failure['phase']}: {failure['type']}: {failure['message']})" if failure else ""
+
+
 def linux_process_identity(pid, proc=Path("/proc"), retained=None):
     """Bind a live process by UID, kernel start tick and executable inode."""
     directory = proc / str(pid)
@@ -237,6 +250,7 @@ class FiniteRuntime:
         self.metric_fds = {}
         self.stop = threading.Event()
         self.error = None
+        self.failure = None
         self.thread = None
         self.outside = [os.getpid()]
         self.engine = None
@@ -488,24 +502,39 @@ class FiniteRuntime:
                              "engine_pid": self.engine, "engine_start_ticks": self.known[self.engine]["start_ticks"]})
         private_json(self.control / "response.json", {"id": self.last_action, "status": "passed", "engine_start_ticks": self.known[self.engine]["start_ticks"], "engine_pid": self.engine})
 
+    def runtime_exited(self):
+        try:
+            return self.pid in self.fds and pidfd_exited(self.fds[self.pid])
+        except OSError:
+            return None
+
     def observe(self):
+        phase = "census"
         try:
             while not self.stop.is_set() and time.monotonic() - self.started < 1800:
+                phase = "census"
                 self.observe_once()
                 path = self.control / "request.json"
                 if path.exists():
+                    phase = "stage_request"
                     request = private_json(path)
                     if request.get("id") != self.last_action:
+                        phase = "stage_" + str(request.get("action"))[:32]
                         self.action(request)
                 self.stop.wait(.1)
             if not self.stop.is_set():
+                phase = "deadline"
                 raise RuntimeError("finite journey observer deadline")
-        except BaseException:
+        except BaseException as error:
+            # "census" with "Runtime left its unit" and runtime_exited true means
+            # Runtime itself ended; other census messages name the failed check.
+            self.failure = {**observer_failure(phase, error), "runtime_exited": self.runtime_exited()}
             self.error = "finite_resource_observation_failed"
             private_json(self.control / "response.json", {"id": self.last_action + 1, "status": "failed"})
             private_json(self.control / "stop.json", {"stop": True})
 
     def finish(self):
+        runtime_exited = self.runtime_exited() if self.pid is not None else None
         self.stop.set()
         if self.thread:
             self.thread.join(timeout=3)
@@ -513,6 +542,10 @@ class FiniteRuntime:
                   "status": "failed", "cgroup_empty": False,
                   "observer_complete": self.thread is None or not self.thread.is_alive(),
                   "actions": self.actions, "outside_runtime_unit": True}
+        if self.failure:
+            record["observer_failure"] = self.failure
+        if runtime_exited:
+            record["runtime_exited_before_cleanup"] = True
         phase = "unit_binding"
         try:
             if not self.launch_requested:
@@ -865,7 +898,7 @@ def free_port(kind=socket.SOCK_STREAM):
 def wait_healthy(child, address, label, stop=None):
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not (stop and stop.is_set()):
-        assert child.poll() is None, f"installed {label} exited before health"
+        assert child.poll() is None, f"installed {label} exited before health" + failure_suffix(getattr(child, "failure", None))
         try:
             with urllib.request.urlopen(f"http://{address}/healthz", timeout=1) as response:
                 if response.status == 200:
@@ -943,6 +976,7 @@ class RepairRuntime:
         self.stop = threading.Event()
         self.launch_lock = threading.Lock()
         self.error = None
+        self.failure = None
         try:
             self.launch()
             self.record = {"runtime_episodes": [self.identity()], "actions": []}
@@ -1066,7 +1100,7 @@ class RepairRuntime:
         return {**self.kept, "home_restarted": True}
 
     def observe(self):
-        previous = 0
+        previous, phase = 0, "control_request"
         try:
             while not self.stop.wait(.05):
                 try:
@@ -1080,11 +1114,15 @@ class RepairRuntime:
                 action = request["action"]
                 if action not in ("engine_running", "engine_stopped", "restart_get") or action in self.record["actions"]:
                     raise RuntimeError("repair journey control action differs")
+                phase = "stage_" + action
                 response = getattr(self, action)()
+                phase = "control_request"
                 previous = request["id"]
                 self.record["actions"].append(action)
                 private_json(self.control / "response.json", {"id": previous, "status": "passed", **response})
-        except BaseException:
+        except BaseException as error:
+            self.failure = observer_failure(phase, error)
+            self.record["control_failure"] = self.failure
             self.error = "installed_model_repair_control_failed"
             private_json(self.control / "response.json", {"id": previous + 1, "status": "failed"})
 
@@ -1258,7 +1296,7 @@ def run(home, data, evidence, model=True, carrier=False, memory_gib=0, repair=Fa
                             while browser_owner.poll() is None and time.monotonic() < deadline and not finite.error:
                                 time.sleep(.1)
                             if browser_owner.poll() != 0 or finite.error:
-                                raise RuntimeError("finite installed UI journey failed")
+                                raise RuntimeError("finite installed UI journey failed" + failure_suffix(finite.failure))
                         finally:
                             if browser_owner.poll() is None:
                                 browser_owner.terminate()
