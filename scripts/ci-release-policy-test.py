@@ -20,6 +20,16 @@ from unittest import mock
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+
+
+def native_header(package_key):
+    """A minimal executable header that packaging accepts for this package key."""
+    import struct
+    if package_key.startswith("linux-"):
+        machine = {"linux-amd64": 62, "linux-arm64": 183}[package_key]
+        return (b"\x7fELF\x02\x01\x01" + bytes(9) + struct.pack("<HH", 3, machine)).ljust(64, b"\0")
+    machine = {"darwin-arm64": 0x100000C}[package_key]
+    return (b"\xcf\xfa\xed\xfe" + struct.pack("<III", machine, 0, 2)).ljust(64, b"\0")
 SOURCE = WORKFLOW.read_text()
 # CI source-gate steps run sections of this script; it owns the command list.
 SOURCE_GATE = (WORKFLOW.parents[2] / "scripts/test-source-gate.sh").read_text()
@@ -1145,7 +1155,15 @@ class ReleasePolicyTests(unittest.TestCase):
                 root = Path(directory)
                 script = root / "scripts/package-release-binaries.sh"
                 script.parent.mkdir()
-                script.write_bytes((WORKFLOW.parents[2] / "scripts/package-release-binaries.sh").read_bytes())
+                source_scripts = WORKFLOW.parents[2] / "scripts"
+                script.write_bytes((source_scripts / "package-release-binaries.sh").read_bytes())
+                # Packaging reads the native header rule and the package key map.
+                for name in ("release-platform-input.py", "release-platforms.json", "release-signer.py",
+                             "components-release-integrity-check.py", "browser-host-release.py"):
+                    (script.parent / name).write_bytes((source_scripts / name).read_bytes())
+                package_key = subprocess.run(["bash", str(script), "--print-platform"], capture_output=True,
+                                             text=True, check=True).stdout.strip()
+                header = native_header(package_key)
                 shims = root / "shims"
                 shims.mkdir()
                 cargo = shims / "cargo"
@@ -1175,12 +1193,12 @@ class ReleasePolicyTests(unittest.TestCase):
                 for name in ("elastos", "unused.rlib", "dependency-tool", "browser-local-exit",
                              "browser-engine-supervisor", "browser-native-proxy-engine", "browser-stream-bridge"):
                     path = outputs / name
-                    path.write_bytes(name.encode())
+                    path.write_bytes(header + name.encode())
                     path.chmod(0o755)
                 capsule_outputs = outputs if shared else capsule / "target/release"
                 capsule_outputs.mkdir(parents=True, exist_ok=True)
                 provider = capsule_outputs / "custody-provider"
-                provider.write_bytes(b"custody-provider")
+                provider.write_bytes(header + b"custody-provider")
                 provider.chmod(0o755)
                 if shared:
                     stale = root / "elastos/target/release/stale"
@@ -1194,7 +1212,7 @@ class ReleasePolicyTests(unittest.TestCase):
                 with tarfile.open(package) as archive:
                     binaries = {Path(item.name).name: hashlib.sha256(archive.extractfile(item).read()).hexdigest()
                                 for item in archive if item.isfile()}
-                self.assertEqual(binaries, {name: hashlib.sha256(name.encode()).hexdigest()
+                self.assertEqual(binaries, {name: hashlib.sha256(header + name.encode()).hexdigest()
                                             for name in ("elastos", "custody-provider")})
 
     def test_carrier_binary_paths_use_the_shared_target_or_workspace_default(self):
@@ -1652,6 +1670,8 @@ class ReleasePolicyTests(unittest.TestCase):
                         build.index("cargo build --locked --release"))
         self.assertIn('test -x "$CARGO_TARGET_DIR/release/elastos"', build)
         self.assertIn('scripts/gateway-healthz-smoke.sh "$CARGO_TARGET_DIR/release/elastos"', probe)
+        # The probe keeps the contract address localhost:8090 (the script default).
+        self.assertNotIn("ELASTOS_GATEWAY_ADDR", probe)
 
     def test_github_runners_and_check_names_stay_fixed(self):
         expected = {

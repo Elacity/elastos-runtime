@@ -6,35 +6,57 @@ artifacts, and `.dmg` packaging work.
 
 ## Intel Mac
 
-The public release id for an Intel Mac is `x86_64-darwin`. The signed installer
+This section is the one record of Intel Mac support. Other documents link
+here instead of repeating it.
+
+The public release id for an Intel Mac is `x86_64-darwin`. `scripts/install.sh`
 stops on that host before a download lookup. The message is
 `Intel Mac has no signed release yet. See docs/MAC.md for the source-home path.`
-This runbook is that source-home path. A signed download for that id is a
-separate release decision.
+
+A person with an Intel Mac has no signed download. The next step is the signed
+installer on an Apple silicon Mac. The source-home commands later in this
+runbook are a developer build. They are not the installer, and this note does
+not claim that build has passed on Intel.
+
+These files hold the rules:
+
+- Signing: the release platform allowlist in `scripts/release-signer.py`.
+  `x86_64-darwin` is not in it. `scripts/release-signer-test.py` runs the
+  signer with `python -O` on an `x86_64-darwin` input and requires the
+  refusal.
+- Package name: `scripts/release-platforms.json` maps the package key
+  `darwin-amd64` to `x86_64-darwin`.
+- Packaging: `scripts/package-release-binaries.sh`. `--print-platform` prints
+  `darwin-amd64` only when `sysctl` shows Intel hardware. It stops in a
+  Rosetta shell on Apple silicon and when `sysctl` is missing or unclear.
+  Packaging writes no `darwin-amd64` tarball. For the other keys, it stops
+  on a binary that does not match the key, which includes a universal binary.
+- Install: the platform check in `scripts/install.sh`.
 
 CI job `gateway-smoke-macos-intel` builds the native `elastos` binary on
-`macos-15-intel` and requires `GET /healthz` to return the two bytes `OK` from
-the process that job started. That job is a readiness smoke. It publishes no
-signed release.
+`macos-15-intel`. It runs `scripts/gateway-healthz-smoke.sh`, which starts the
+command in [the launcher contract](LAUNCHER_CONTRACT.md) and requires the
+readiness that contract defines. The probe uses `http://localhost:8090/healthz`
+and passes only when all of these are true:
 
-A signed Intel release opens only when these gates move together:
+- the answer is HTTP 200 with the two bytes `OK`, without a proxy,
+- the address that answered is a listen socket of the gateway process,
+- `host-process.lock` names that process, a gateway role and `localhost:8090`.
 
-- `scripts/release-signer.py` admits `x86_64-linux`, `aarch64-linux`, and
-  `aarch64-darwin`. It refuses `x86_64-darwin`.
-- `scripts/prepare-release-platform.sh` prepares Linux x86_64, Linux ARM64, and
-  macOS ARM64. On Mac it requires the Rust host to be `aarch64-apple-darwin`.
-- `scripts/install.sh` selects `aarch64-darwin` and stops for every other Mac
-  architecture.
-- `components.json` publishes `darwin-arm64` payloads. An Intel install needs
-  its own payload set.
-- The Mac Browser engine host is Apple silicon Virtualization.framework. See
-  [Browser support](BROWSER_SUPPORT.md). This runbook claims no local Intel
-  Browser engine.
-- `scripts/package-release-binaries.sh` prints `darwin-amd64` for Darwin
-  x86_64. The package name is `elastos-runtime-darwin-amd64`. The Intel smoke
-  job checks that printed name. That job uploads no release tarball.
-- `scripts/ci-release-policy-test.py` keeps the release-package matrix on the
-  three signed platforms above.
+The job uses an empty Home. A pass does not prove providers, capsules,
+sign-in, or a signed install. `elastos serve` reports operator status at
+`GET /api/health`.
+
+`--addr localhost:8090` binds one address only: the first address that the
+system lookup gives for `localhost` and that can be bound. When `localhost`
+gives `::1` first, `http://127.0.0.1:8090` does not reach the gateway, and
+another process can hold that address. After the readiness check, the job log
+prints facts, not pass or fail: that lookup order, the address the gateway
+listens on, and what `GET /healthz` returns at `localhost:8090`,
+`127.0.0.1:8090` and `[::1]:8090`.
+
+This runbook claims no local Intel Browser engine. See
+[Browser support](BROWSER_SUPPORT.md). The job uploads no release tarball.
 
 ## From Fresh Mac To Home
 
