@@ -933,6 +933,19 @@ class SignerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             S.render_installer(self.template, {**self.stamps, "HEAD_CID": "circular-head"}, DID)
 
+    def test_rendered_public_installer_keeps_the_did_stamp_free_of_the_environment(self):
+        # #434: render the actual scripts/install.sh. The DID lands in the one
+        # stamp line, which reads no environment, and the split placeholder the
+        # installer compares the stamp with survives, so it knows it is stamped.
+        # install-bootstrap-test.py runs this rendered form against overrides.
+        template = SOURCE.with_name("install.sh").read_bytes()
+        text = S.render_installer(template, self.stamps, DID).decode()
+        self.assertEqual(text.count(f'MAINTAINER_DID_STAMP="{DID}"\n'), 1)
+        self.assertNotIn("__MAINTAINER_DID__", text)
+        self.assertIn('"__MAINTAINER""_DID__"', text)
+        self.assertNotIn("ELASTOS_MAINTAINER_DID:-did:key", text)
+        self.assertEqual(text.count(DID), 1)
+
     def test_unbound_artifact_is_refused(self):
         extra = b"unadvertised"
         (self.root / "extra").write_bytes(extra)

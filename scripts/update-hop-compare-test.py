@@ -960,6 +960,12 @@ class CliFixtureTests(unittest.TestCase):
         installer.write_text(stamped + '\nMAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-substituted}"\n')
         with self.assertRaisesRegex(ValueError, "literal trust default"):
             observer.cli_installer_metadata(installer, {})
+        # A frozen installer from before #434 keeps the environment default form.
+        legacy = stamped.replace(f'MAINTAINER_DID_STAMP="{self.manifest["signer_did"]}"',
+                                 f'MAINTAINER_DID="${{ELASTOS_MAINTAINER_DID:-{self.manifest["signer_did"]}}}"')
+        self.assertNotEqual(legacy, stamped)
+        installer.write_text(legacy)
+        self.assertEqual(observer.cli_installer_metadata(installer, {}), [self.manifest["signer_did"], ""])
 
     def test_cleanup_does_not_signal_recycled_historic_process_groups(self):
         class Exited:
