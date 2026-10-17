@@ -323,6 +323,10 @@ globalThis.window = {
     listeners.push(listener);
     windowEventListeners.set(type, listeners);
   },
+  removeEventListener(type, listener) {
+    const listeners = windowEventListeners.get(type) || [];
+    windowEventListeners.set(type, listeners.filter((candidate) => candidate !== listener));
+  },
   setTimeout,
   clearTimeout,
   clearInterval: () => {},
@@ -970,10 +974,9 @@ assert(
   "People, Chat, or Inbox reintroduced capsule-owned outer window chrome",
 );
 assert(
-  browserStyle.includes("padding: 8px 10px;") &&
-    !browserStyle.includes("--window-chrome-safe-leading") &&
-    !homeGuiStyle.includes("window-chrome-unified-toolbar"),
-  "Browser must sit under the standard draggable Home title bar, without a traffic-light inset",
+  browserStyle.includes("padding: 8px 10px 8px var(--window-chrome-safe-leading, 96px);") &&
+    homeGuiStyle.includes(".window.window-chrome-unified-toolbar .window-head"),
+  "Browser no longer applies the Home-owned toolbar content inset",
 );
 assert(
   !homeGuiScript.includes("(label || toolbarFullscreenButton).textContent"),
@@ -1433,7 +1436,8 @@ const expectedWindowChrome = {
     className: "window-chrome-continuous",
   },
   browser: {
-    mode: "standard",
+    mode: "unified-toolbar",
+    className: "window-chrome-unified-toolbar",
   },
 };
 
@@ -1466,11 +1470,10 @@ const browserEntry = [...shellCore.shellState.windows.values()].find((entry) => 
   browserHead.dispatch("pointermove", { pointerId: 41, clientX: 460, clientY: 180, target: browserHead });
   browserHead.dispatch("pointerup", { pointerId: 41, clientX: 460, clientY: 180, target: browserHead });
   assert(
-    browserEntry.node.dataset.windowChromeMode === "standard" &&
-      !browserEntry.node.classList.contains("window-chrome-unified-toolbar") &&
+    browserEntry.node.dataset.windowChromeMode === "unified-toolbar" &&
       browserEntry.node.style.left === "260px" &&
       browserEntry.node.style.top === "160px",
-    "Browser window title bar must be a standard Home title bar that drags the window",
+    "Browser window-button area must drag the window by the pointer delta",
     { left: [leftBefore, browserEntry.node.style.left], top: [topBefore, browserEntry.node.style.top] },
   );
 }

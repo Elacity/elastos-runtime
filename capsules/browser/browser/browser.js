@@ -65,6 +65,7 @@ const BROWSER_AUTHORITY_RENEWAL_RETRY_DELAYS_MS = Object.freeze([
   30_000,
 ]);
 const HOME_GUI_OPAQUE_ORIGIN = "null";
+const WINDOW_DRAG_MESSAGE_TYPE = "elastos.home.window-drag/v1";
 const params = new URLSearchParams(window.location.search);
 const browserInstanceId = params.get("browser_instance") || "";
 const launchToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
@@ -841,6 +842,58 @@ function postHomeBrowserWindowCloseResult(message, owner, outcome, error = null)
     "*",
   );
 }
+
+/** Home draws only the window dots over this bar, so a press on an empty part
+ * of it moves the window the way a title bar does. */
+function installChromeWindowDrag(chrome) {
+  // Home moves the window only for the launch token it gave this frame.
+  if (!chrome || window.parent === window || !launchToken) {
+    return;
+  }
+  let pointerId = null;
+  const send = (phase, event) => {
+    window.parent.postMessage(
+      {
+        type: WINDOW_DRAG_MESSAGE_TYPE,
+        homeToken: launchToken,
+        phase,
+        clientX: event.clientX,
+        clientY: event.clientY,
+      },
+      "*",
+    );
+  };
+  chrome.addEventListener("pointerdown", (event) => {
+    if (
+      event.button !== 0 ||
+      pointerId !== null ||
+      event.target.closest("button, input, select, textarea, a, label, form, [role='button']")
+    ) {
+      return;
+    }
+    event.preventDefault();
+    pointerId = event.pointerId;
+    chrome.setPointerCapture(pointerId);
+    send("start", event);
+  });
+  chrome.addEventListener("pointermove", (event) => {
+    if (event.pointerId === pointerId) {
+      send("move", event);
+    }
+  });
+  const stop = (event) => {
+    if (event.pointerId !== pointerId) {
+      return;
+    }
+    pointerId = null;
+    send("end", event);
+  };
+  chrome.addEventListener("pointerup", stop);
+  chrome.addEventListener("pointercancel", stop);
+  chrome.addEventListener("lostpointercapture", stop);
+}
+
+installChromeWindowDrag(document.querySelector(".browser-chrome"));
 
 function deliverPendingHomeBrowserWindowClose(owner, outcome) {
   const delivery = pendingHomeWindowCloseDelivery;

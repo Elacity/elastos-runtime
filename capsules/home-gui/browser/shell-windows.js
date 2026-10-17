@@ -31,6 +31,7 @@ import {
   restoreWindowFromSpecialState,
   hideWindowSnapPreview,
   attachWindowDrag,
+  attachForwardedWindowDrag,
   attachWindowResize,
 } from "./shell-window-geometry.js?v=home-20260813a";
 import {
@@ -969,6 +970,7 @@ function tearDownWindowEntry(entry) {
   if (entry.selectionRequest) finishSelectionWindowRequest(entry.selectionRequest, false);
   entry.homeNavigation = null;
   cleanupFrameAutoFit(entry.node);
+  entry.node.detachForwardedWindowDrag?.();
   shellState.windows.delete(entry.id);
   entry.node.remove();
   if (entry.fullscreenStage) {
@@ -1594,6 +1596,12 @@ function createWindow({
     toggleWindowMaximize(id);
   });
   attachWindowDrag(node, handle, focusWindow, persistBrowserSession);
+  node.detachForwardedWindowDrag = attachForwardedWindowDrag(
+    node,
+    focusWindow,
+    persistBrowserSession,
+    () => browserLaunchAuthority(node.querySelector(".window-frame")?.dataset.route || "")?.homeToken || "",
+  );
   attachWindowResize(node, focusWindow, persistBrowserSession);
 
   if (maximizeByDefault && shouldOpenMaximizedByDefault()) {
