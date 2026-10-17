@@ -5011,6 +5011,25 @@ async fn test_home_summary_and_events_include_browser_wallet_approvals() {
         .any(|event| { event["kind"] == "wallet.requests.changed" && event["scope"] == "wallet" }));
 }
 
+/// A PNG whose header declares `width` x `height`, followed by `marker` so a
+/// test can find (or prove it cannot find) the bytes on disk.
+fn test_png_picture(width: u32, height: u32, marker: &[u8]) -> Vec<u8> {
+    let mut bytes = crate::image_bounds::tests::png_header(width, height);
+    bytes.extend_from_slice(marker);
+    bytes
+}
+
+/// A baseline JPEG frame header for `width` x `height`, then `marker`.
+fn test_jpeg_picture(width: u16, height: u16, marker: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08];
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+    bytes.extend_from_slice(marker);
+    bytes.extend_from_slice(&[0xFF, 0xD9]);
+    bytes
+}
+
 #[tokio::test]
 async fn test_system_updates_home_background_image() {
     let dir = tempfile::tempdir().unwrap();
@@ -5021,6 +5040,8 @@ async fn test_system_updates_home_background_image() {
         Some("guest"),
         crate::auth::RuntimePrincipalRole::Guest,
     );
+    let admin_png = test_png_picture(64, 32, b"admin-image");
+    let guest_jpeg = test_jpeg_picture(48, 48, b"guest-image");
     let admin_protection =
         crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
     let guest_protection =
@@ -5034,7 +5055,7 @@ async fn test_system_updates_home_background_image() {
                 .uri("/api/apps/system/appearance/background-image")
                 .header("x-elastos-home-token", admin.system_token.clone())
                 .header(CONTENT_TYPE, "image/png")
-                .body(Body::from("admin-image"))
+                .body(Body::from(admin_png.clone()))
                 .unwrap(),
         )
         .await
@@ -5101,7 +5122,7 @@ async fn test_system_updates_home_background_image() {
     let shell_image_body = axum::body::to_bytes(shell_image.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(shell_image_body.as_ref(), b"admin-image");
+    assert_eq!(shell_image_body.as_ref(), admin_png.as_slice());
 
     // Ordinary app capsules hold no appearance authority.
     let app_token =
@@ -5177,7 +5198,7 @@ async fn test_system_updates_home_background_image() {
                 .uri("/api/apps/system/appearance/background-image")
                 .header("x-elastos-home-token", guest.system_token.clone())
                 .header(CONTENT_TYPE, "image/jpeg")
-                .body(Body::from("guest-image"))
+                .body(Body::from(guest_jpeg.clone()))
                 .unwrap(),
         )
         .await
@@ -5214,7 +5235,7 @@ async fn test_system_updates_home_background_image() {
     let image_body = axum::body::to_bytes(image.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(&image_body[..], b"admin-image");
+    assert_eq!(&image_body[..], admin_png.as_slice());
 
     let guest_image = app
         .clone()
@@ -5245,7 +5266,7 @@ async fn test_system_updates_home_background_image() {
     let guest_image_body = axum::body::to_bytes(guest_image.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(&guest_image_body[..], b"guest-image");
+    assert_eq!(&guest_image_body[..], guest_jpeg.as_slice());
 
     let admin_path = elastos_common::localhost::rooted_localhost_fs_path(
         dir.path(),
@@ -5340,6 +5361,135 @@ async fn test_system_updates_home_background_image() {
     assert_eq!(guest_image_after_admin_reset.status(), StatusCode::OK);
 }
 
+/// A small file can declare a canvas that would take gigabytes to decode.
+/// Runtime refuses it on every write path and will not serve one that is
+/// already stored, so the desktop and System's reset keep working.
+#[tokio::test]
+async fn test_background_image_refuses_a_decompression_bomb() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let bomb = test_png_picture(100_000, 100_000, b"");
+    assert!(bomb.len() < 64, "the bomb is a tiny file");
+
+    let upload = |content_type: &'static str, bytes: Vec<u8>| {
+        let app = app.clone();
+        let token = admin.system_token.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    test_browser_request("localhost:61180", "null")
+                        .method("POST")
+                        .uri("/api/apps/system/appearance/background-image")
+                        .header("x-elastos-home-token", token)
+                        .header(CONTENT_TYPE, content_type)
+                        .body(Body::from(bytes))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+
+    let (status, text) = upload("image/png", bomb.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("too large to show"), "{text}");
+    // Over the pixel limit while each side is under the side limit.
+    let (status, _) = upload("image/png", test_png_picture(16_000, 16_000, b"")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // The label must match the bytes: a JPEG sent as PNG is refused.
+    let (status, text) = upload("image/png", test_jpeg_picture(10, 10, b"")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("readable PNG, JPEG, WebP, or GIF"), "{text}");
+    // A signature alone, with no header, is refused.
+    let (status, _) = upload("image/png", b"\x89PNG\r\n\x1a\nno-header".to_vec()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let stored_path = elastos_common::localhost::rooted_localhost_fs_path(
+        dir.path(),
+        &format!(
+            "{}/.AppData/ElastOS/Home/Appearance/background-image.png",
+            protection.localhost_root
+        ),
+    )
+    .unwrap();
+    assert!(!stored_path.exists(), "a refused picture is never stored");
+
+    // A bomb stored by an older Runtime is not served; the desktop falls back.
+    crate::auth::create_owner_only_dir_all(dir.path(), stored_path.parent().unwrap()).unwrap();
+    crate::auth::write_principal_root_object(
+        dir.path(),
+        &admin.principal_id,
+        &protection.localhost_root,
+        &format!(
+            "{}/.AppData/ElastOS/Home/Appearance/background-image.png",
+            protection.localhost_root
+        ),
+        &stored_path,
+        &bomb,
+    )
+    .unwrap();
+    let overlay = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/system/appearance/background-overlay")
+                .header("x-elastos-home-token", admin.system_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"enabled":false,"opacity":0.55}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(overlay.status(), StatusCode::OK);
+    let summary: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(overlay.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let background_url = summary["background_image_url"]
+        .as_str()
+        .expect("stored picture is listed so System can reset it")
+        .to_string();
+    let shell_token =
+        projection_launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &admin);
+    let served = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(background_url)
+                .header("x-elastos-home-token", shell_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(served.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let reset = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("DELETE")
+                .uri("/api/apps/system/appearance/background-image")
+                .header("x-elastos-home-token", admin.system_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::OK);
+    assert!(!stored_path.exists());
+}
+
 /// Stores `bytes` as a protected object at `<principal root>/<relative>`,
 /// the way Library saves a picture.
 fn write_home_principal_object_bytes_for_authority(
@@ -5364,8 +5514,6 @@ fn write_home_principal_object_bytes_for_authority(
     uri
 }
 
-const PNG_SIGNATURE_BYTES: &[u8] = b"\x89PNG\r\n\x1a\nlibrary-picture";
-
 #[tokio::test]
 async fn test_home_sets_background_image_from_own_object() {
     let dir = tempfile::tempdir().unwrap();
@@ -5380,11 +5528,12 @@ async fn test_home_sets_background_image_from_own_object() {
         crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
     let _guest_protection =
         crate::auth::store_test_principal_root_protection(dir.path(), &guest.principal_id);
+    let picture = test_png_picture(1920, 1080, b"library-picture");
     let picture_uri = write_home_principal_object_bytes_for_authority(
         dir.path(),
         &admin,
         "Pictures/hills.png",
-        PNG_SIGNATURE_BYTES,
+        &picture,
     );
     let text_uri = write_home_principal_object_bytes_for_authority(
         dir.path(),
@@ -5392,11 +5541,17 @@ async fn test_home_sets_background_image_from_own_object() {
         "Documents/notes.txt",
         b"not an image",
     );
+    let bomb_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/bomb.png",
+        &test_png_picture(100_000, 100_000, b""),
+    );
     let guest_picture_uri = write_home_principal_object_bytes_for_authority(
         dir.path(),
         &guest,
         "Pictures/guest.png",
-        PNG_SIGNATURE_BYTES,
+        &picture,
     );
 
     let set_background = |token: String, source_uri: String| {
@@ -5428,6 +5583,8 @@ async fn test_home_sets_background_image_from_own_object() {
     assert_eq!(foreign.status(), StatusCode::BAD_REQUEST);
     let not_image = set_background(admin.home_token.clone(), text_uri).await;
     assert_eq!(not_image.status(), StatusCode::BAD_REQUEST);
+    let bomb = set_background(admin.home_token.clone(), bomb_uri).await;
+    assert_eq!(bomb.status(), StatusCode::BAD_REQUEST);
     let not_localhost = set_background(
         admin.home_token.clone(),
         "elastos://bafy/hills.png".to_string(),
@@ -5483,7 +5640,7 @@ async fn test_home_sets_background_image_from_own_object() {
     let image_body = axum::body::to_bytes(image.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(image_body.as_ref(), PNG_SIGNATURE_BYTES);
+    assert_eq!(image_body.as_ref(), picture.as_slice());
 }
 
 #[tokio::test]

@@ -8037,6 +8037,13 @@ fn parse_background_image_upload(
         _ => anyhow::bail!("background image must be PNG, JPEG, WebP, or GIF"),
     };
     validate_background_image_len(body.len())?;
+    // The declared type must match the bytes, and the declared canvas must be
+    // small enough to decode before anything is stored.
+    if require_bounded_background_image(body)? != file_name {
+        return Err(home_appearance_preference_request_error(
+            BACKGROUND_IMAGE_UNREADABLE,
+        ));
+    }
     Ok((file_name, body.to_vec()))
 }
 
@@ -8055,22 +8062,28 @@ fn validate_background_image_len(len: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A stored object carries no trusted content type, so the format is taken
-/// from the bytes themselves. Same four formats as the byte upload.
-fn background_image_file_name_for_bytes(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Some("background-image.png");
-    }
-    if bytes.starts_with(b"\xFF\xD8\xFF") {
-        return Some("background-image.jpg");
-    }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return Some("background-image.gif");
-    }
-    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        return Some("background-image.webp");
-    }
-    None
+const BACKGROUND_IMAGE_UNREADABLE: &str =
+    "background image must be a readable PNG, JPEG, WebP, or GIF";
+const BACKGROUND_IMAGE_TOO_LARGE: &str =
+    "background image is too large to show; use a picture of at most 16384 pixels per side and 50 million pixels";
+
+/// Reads the format and canvas size from the bytes, never from a caller's
+/// label, and refuses a canvas a browser should not decode. Returns the
+/// stored file name for that format.
+fn require_bounded_background_image(bytes: &[u8]) -> anyhow::Result<&'static str> {
+    use crate::image_bounds::{require_bounded_image, ImageBoundError, ImageFormat};
+    let header = require_bounded_image(bytes).map_err(|err| {
+        home_appearance_preference_request_error(match err {
+            ImageBoundError::Unreadable => BACKGROUND_IMAGE_UNREADABLE,
+            ImageBoundError::TooLarge => BACKGROUND_IMAGE_TOO_LARGE,
+        })
+    })?;
+    Ok(match header.format {
+        ImageFormat::Png => "background-image.png",
+        ImageFormat::Jpeg => "background-image.jpg",
+        ImageFormat::Gif => "background-image.gif",
+        ImageFormat::Webp => "background-image.webp",
+    })
 }
 
 // Protected objects are stored as base64 envelopes, so the on-disk size is
@@ -8122,9 +8135,7 @@ fn home_save_background_image_from_object(
         &path,
     )?;
     validate_background_image_len(bytes.len())?;
-    let file_name = background_image_file_name_for_bytes(&bytes).ok_or_else(|| {
-        home_appearance_preference_request_error("background image must be PNG, JPEG, WebP, or GIF")
-    })?;
+    let file_name = require_bounded_background_image(&bytes)?;
     home_save_background_image(data_dir, context, file_name, bytes)
 }
 
@@ -8292,6 +8303,24 @@ pub(super) async fn home_background_image(
         &entry.path,
     ) {
         Ok(bytes) => {
+            // A picture stored before this check, or written outside these
+            // routes, is not served if its canvas is too large or its bytes
+            // do not match its type. Home then shows the default desktop and
+            // System can still reset it.
+            match crate::image_bounds::require_bounded_image(&bytes) {
+                Ok(header) if header.format.content_type() == entry.content_type => {}
+                Err(crate::image_bounds::ImageBoundError::TooLarge) => {
+                    return (StatusCode::UNPROCESSABLE_ENTITY, BACKGROUND_IMAGE_TOO_LARGE)
+                        .into_response()
+                }
+                _ => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        BACKGROUND_IMAGE_UNREADABLE,
+                    )
+                        .into_response()
+                }
+            }
             let mut response = bytes.into_response();
             let headers = response.headers_mut();
             headers.insert(
