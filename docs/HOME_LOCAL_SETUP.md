@@ -42,10 +42,12 @@ export HOME_URL="http://localhost:61180/apps/home/"
 
 `HOME_URL` is the browser URL you open.
 
-You may choose a different loopback port if it is free. The Mac source-home
-examples in this repository use `localhost:61180`. The agent smoke script
-defaults to `localhost:8090`; that is only a script default, not product
-authority.
+These values are for the developer source-home lane. You may choose a
+different loopback port if it is free. The Mac source-home examples in this
+repository use `localhost:61180`. The installed Home address is
+`http://localhost:8090/home/`; the
+[launcher contract](LAUNCHER_CONTRACT.md#readiness-and-home-url) owns that
+address and the redirect from a loopback IP address to `localhost`.
 
 ## Know the two host lanes
 

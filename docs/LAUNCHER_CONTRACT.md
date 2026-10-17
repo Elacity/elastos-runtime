@@ -12,14 +12,22 @@ elastos gateway --addr localhost:8090
 ```
 
 `--addr` is `host:port`. `elastos home` binds `localhost:8090` and opens the
-Home URL below. The gateway command leaves the system browser closed.
+Home URL below. The gateway command leaves the system browser closed. The
+default `--addr` of the gateway command is `127.0.0.1:8090`, so a launcher
+passes `--addr localhost:8090`.
 
-The gateway listens on one socket. For a host name, it binds the first address
-that the name resolves to and that it can bind. `localhost` can resolve to
-`127.0.0.1` or to `::1` first, so `localhost:8090` listens on one address
-family only. A client that connects to the other family gets no answer from
-this gateway. Listening on every address of `localhost` is a gap in this
-contract.
+For the host name `localhost`, the gateway listens on every loopback address
+that a client can use for that name on the given port: each address that the
+computer resolves for `localhost`, and also `127.0.0.1` and `::1`, which
+browsers use for `localhost`. Each of these listeners serves the same Home.
+When the computer has no IPv6, the gateway listens without `::1`. The gateway
+exits 1 and its error names the address when another program already uses one
+of these addresses, when it cannot listen on one of them for another reason,
+or when `localhost` resolves to an address that is not loopback. For an IP
+address in `--addr`, the gateway listens on that one address.
+
+On Windows, Home runs in WSL2. This repository does not test how Windows
+forwards `localhost` into WSL2; that is a gap in this contract.
 
 `elastos serve` is the operator runtime. Its readiness route is `GET /api/health`.
 A Home supervisor uses `gateway` and `/healthz`.
@@ -50,6 +58,15 @@ The Home origin is:
 http://localhost:8090/home/
 ```
 
+`localhost` is the one Home origin. Other documents cite this section for the
+Home address. When the gateway listens on `localhost`, a `GET` or `HEAD`
+request for a Home page (`/`, `/home`, `/home/`, `/apps/home`, or
+`/apps/home/`) whose `Host` is a loopback IP address, such as `127.0.0.1` or
+`[::1]`, gets HTTP 308. Its `Location` is the same path and query at
+`http://localhost:<port>`. `/healthz`, `/api/` routes, Home assets, and app
+routes answer on every listening address without a redirect. A gateway with an
+IP address in `--addr` serves its Home pages at that address.
+
 The passkey relying party id is `localhost`. Registration and sign-in use that
 origin. An IP-literal origin, including `http://127.0.0.1:8090`, is refused
 with HTTP 403. For a loopback address, the reply tells the person to open
@@ -68,7 +85,8 @@ the same host on any port, and refuses it at every other host.
 | macOS data directory | `~/Library/Application Support/elastos` |
 | Host lock | `{data}/host-process.lock` |
 
-The lock record stores `pid`, `role`, and `addr`. A second live host for the
+The lock record stores `pid`, `role`, and `addr`. `addr` is the `--addr`
+value as given, for example `localhost:8090`. A second live host for the
 same data directory exits 1. Its error contains `another ElastOS host already owns`.
 
 ## Stop
