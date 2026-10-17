@@ -64,6 +64,22 @@ export function hasCapability(object, capability) {
   return !Array.isArray(capabilities) || capabilities.includes(capability);
 }
 
+// Mirrors the Runtime's wallpaper rules so the menu only offers what will save.
+// Runtime decides; this only hides an action that would be refused.
+const DESKTOP_BACKGROUND_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const DESKTOP_BACKGROUND_MAX_BYTES = 5 * 1024 * 1024;
+
+export function isDesktopBackgroundCandidate(object) {
+  if (!object || isDirectory(object) || inTrash(object)) return false;
+  if (!String(object.uri || "").startsWith("localhost://Users/")) return false;
+  if (!hasCapability(object, "read") || object.blocked_reason) return false;
+  // Protected content is never the desktop background.
+  if (object.metadata?.protected_content) return false;
+  if (object.metadata?.visibility?.placement === "runtime_private") return false;
+  if (!DESKTOP_BACKGROUND_MIME_TYPES.has(String(object.mime || ""))) return false;
+  return Number(object.size || 0) <= DESKTOP_BACKGROUND_MAX_BYTES;
+}
+
 export function isWebSpaceUri(uri) {
   const value = String(uri || "").replace(/\/+$/, "");
   return value === "localhost://WebSpaces" || value.startsWith("localhost://WebSpaces/");
@@ -271,4 +287,21 @@ export function base64ToBlob(data, mime) {
     bytes[i] = binary.charCodeAt(i);
   }
   return new Blob([bytes], { type: mime || "application/octet-stream" });
+}
+
+const DESKTOP_BACKGROUND_MESSAGE_MAX_LENGTH = 600;
+
+// Runtime's plain reason for refusing a desktop background, as Home passed
+// it on: one line of text, short, with no control characters. Anything else
+// gives "", and Library shows its own general message.
+export function desktopBackgroundRefusalMessage(result) {
+  const message = typeof result?.message === "string" ? result.message.trim() : "";
+  if (
+    !message ||
+    message.length > DESKTOP_BACKGROUND_MESSAGE_MAX_LENGTH ||
+    /[\u0000-\u001f\u007f]/.test(message)
+  ) {
+    return "";
+  }
+  return message;
 }

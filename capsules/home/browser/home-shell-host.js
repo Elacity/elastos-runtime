@@ -101,6 +101,9 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
   documents: new Set(["chat-room"]),
   library: new Set(["archive-manager", "browser", "chat-room"]),
 });
+// Apps that may ask Home to make one of the person's own objects the wallpaper.
+const SHELL_MESSAGE_DESKTOP_BACKGROUND_SOURCES = new Set(["library"]);
+const DESKTOP_BACKGROUND_SOURCE_URI_MAX_LENGTH = 2048;
 const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
 const launchedAppContexts = new Map();
 const pendingBrowserAuthorityRenewals = new Map();
@@ -1943,6 +1946,10 @@ window.addEventListener("message", (event) => {
     });
     return;
   }
+  if (data.type === "home:set-desktop-background") {
+    handleSetDesktopBackgroundMessage(event, context, data);
+    return;
+  }
   if (data.type === "home:deliver-to-target") {
     const target = typeof data.target === "string" ? data.target.trim() : "";
     if (!target || !canDeliverTargetFromHomeMessage(context, target)) {
@@ -2252,6 +2259,62 @@ function canOpenTargetFromHomeMessage(context, target) {
     return normalizedActiveShellName(target) !== HOME_GUI_SHELL_ID;
   }
   return policy.has(target);
+}
+
+// The app expresses intent; Home performs the change with its own appearance
+// authority, so the app never gains one. Home carries only the single-use
+// ticket the Library frame asked Runtime for (one object, one minute), never
+// Library's launch token, and Runtime reads the object under Library's scope,
+// Trash, and protection rules. Home never reads or decrypts the object itself.
+const DESKTOP_BACKGROUND_TICKET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const DESKTOP_BACKGROUND_MESSAGE_MAX_LENGTH = 600;
+
+function handleSetDesktopBackgroundMessage(event, context, data) {
+  const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+  const uri = typeof data.uri === "string" ? data.uri.trim() : "";
+  const ticket = typeof data.ticket === "string" ? data.ticket : "";
+  if (
+    context.kind !== "app-frame" ||
+    !SHELL_MESSAGE_DESKTOP_BACKGROUND_SOURCES.has(context.targetId) ||
+    !hasExactMessageKeys(data, ["type", "requestId", "homeToken", "uri", "ticket"]) ||
+    !requestId ||
+    requestId.length > 128 ||
+    !uri.startsWith("localhost://Users/") ||
+    uri.length > DESKTOP_BACKGROUND_SOURCE_URI_MAX_LENGTH ||
+    !DESKTOP_BACKGROUND_TICKET_PATTERN.test(ticket)
+  ) {
+    console.warn("home ignored unauthorized set-desktop-background message", context.targetId);
+    replyToShellRequest(event, requestId, null, new Error("Home denied the desktop background change"));
+    return;
+  }
+  fetch("/api/apps/home/appearance/background-image", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ source_uri: uri, library_ticket: ticket }),
+  })
+    .then(async (response) => {
+      if (response.ok) {
+        requestShellSummaryRefresh({ reason: "desktop-background" });
+        replyToShellRequest(event, requestId, { accepted: true });
+        return;
+      }
+      // Runtime answers 400 with a plain sentence that tells the person what
+      // to do next (for example, which protected file to move back). Only
+      // that sentence goes back to Library; Library checks it again.
+      const detail = response.status === 400 ? (await response.text().catch(() => "")).trim() : "";
+      console.warn("home could not set the desktop background", response.status);
+      replyToShellRequest(
+        event,
+        requestId,
+        detail && detail.length <= DESKTOP_BACKGROUND_MESSAGE_MAX_LENGTH
+          ? { accepted: false, message: detail }
+          : { accepted: false },
+      );
+    })
+    .catch((error) => {
+      console.warn("home could not set the desktop background", error);
+      replyToShellRequest(event, requestId, { accepted: false });
+    });
 }
 
 function canDeliverTargetFromHomeMessage(context, target) {

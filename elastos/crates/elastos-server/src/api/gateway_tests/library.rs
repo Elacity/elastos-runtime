@@ -892,7 +892,7 @@ fn zip_text_files(bytes: &[u8]) -> std::collections::BTreeMap<String, String> {
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = entry.name().unwrap().into_owned();
         let mut body = String::new();
         entry.read_to_string(&mut body).unwrap();
         files.insert(name, body);
@@ -3868,6 +3868,203 @@ async fn test_library_provider_rejects_unsafe_zip_entries() {
         .as_str()
         .unwrap()
         .contains("relative and safe"));
+}
+
+/// Every path under `root` (files, folders and symlinks, not followed).
+fn walk_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(path.clone());
+            }
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_library_provider_extract_zip_refuses_absolute_dotdot_and_symlink_entries() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let imports_uri = format!("{documents_uri}/Imports");
+
+    let (status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({ "parent_uri": root, "name": "Documents" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({ "parent_uri": documents_uri, "name": "Imports" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    // Each archive holds one hostile entry. The whole-archive extract must
+    // refuse it and write nothing for it, inside or outside the Library.
+    // (archive name, entry kind, entry name, symlink target, expected message)
+    let cases: [(&str, &str, &str, &str, &str); 5] = [
+        (
+            "Absolute.zip",
+            "file",
+            "/absolute-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "DotDot.zip",
+            "file",
+            "../dotdot-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "Inner.zip",
+            "file",
+            "Nested/../inner-escape.txt",
+            "",
+            "relative and safe",
+        ),
+        (
+            "Backslash.zip",
+            "file",
+            "..\\backslash-escape.txt",
+            "",
+            "invalid library object name",
+        ),
+        (
+            "Symlink.zip",
+            "symlink",
+            "symlink-escape.txt",
+            "/etc/passwd",
+            "non-file",
+        ),
+    ];
+    for (archive_name, kind, entry_name, link_target, expected) in cases {
+        let archive_bytes = {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            if kind == "symlink" {
+                writer
+                    .add_symlink(entry_name, link_target, options)
+                    .unwrap();
+            } else {
+                writer.start_file(entry_name, options).unwrap();
+                writer.write_all(b"escape").unwrap();
+            }
+            writer.finish().unwrap().into_inner()
+        };
+        let zip_uri = format!("{documents_uri}/{archive_name}");
+        let (write_status, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": zip_uri,
+                "mime": "application/zip",
+                "data": base64::engine::general_purpose::STANDARD.encode(archive_bytes),
+            }),
+        )
+        .await;
+        assert_eq!(write_status, StatusCode::OK, "{archive_name}");
+        assert_eq!(write["status"], "ok", "{archive_name}: {write}");
+
+        let (extract_status, extracted) = post_library(
+            app.clone(),
+            &token,
+            "extract_archive",
+            json!({ "uri": zip_uri }),
+        )
+        .await;
+        assert_eq!(extract_status, StatusCode::OK, "{archive_name}");
+        assert_eq!(
+            extracted["status"], "error",
+            "{archive_name}: hostile entry {entry_name:?} was not refused: {extracted}"
+        );
+        assert!(
+            extracted["message"].as_str().unwrap().contains(expected),
+            "{archive_name}: {extracted}"
+        );
+
+        if kind == "symlink" {
+            // The listing marks it blocked and a selected extract refuses it.
+            let (list_status, listed) = post_library(
+                app.clone(),
+                &token,
+                "archive_entries",
+                json!({ "uri": zip_uri }),
+            )
+            .await;
+            assert_eq!(list_status, StatusCode::OK);
+            let rows = listed["data"]["entries"].as_array().unwrap();
+            assert!(
+                rows.iter().any(|entry| entry["path"] == entry_name
+                    && entry["kind"] == "blocked"
+                    && entry["safety"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("non-file")),
+                "{listed}"
+            );
+            let (select_status, selected) = post_library(
+                app.clone(),
+                &token,
+                "archive_extract_entries",
+                json!({
+                    "uri": zip_uri,
+                    "destination_uri": imports_uri,
+                    "entries": [entry_name],
+                }),
+            )
+            .await;
+            assert_eq!(select_status, StatusCode::OK);
+            assert_eq!(selected["status"], "ok", "{selected}");
+            assert_eq!(
+                selected["data"]["receipt"]["progress"]["blocked_entries"],
+                1
+            );
+            assert!(selected["data"]["blocked"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("non-file"));
+        }
+    }
+
+    // Nothing from any hostile entry exists anywhere under the data dir, and
+    // no symlink was created.
+    for path in walk_paths(dir.path()) {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            !name.contains("escape"),
+            "hostile entry was written: {}",
+            path.display()
+        );
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink was created: {}",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]
@@ -10117,4 +10314,172 @@ async fn test_library_provider_unpublish_and_repair_update_status() {
         status["data"]["published"]["availability"]["status"],
         "local_pinned"
     );
+}
+
+/// The record of a protected publish names the bytes custody read and
+/// protected, from that same read. Here the source changes after Library starts
+/// the publish and before custody reads it: the record must name what custody
+/// protected, so a copy of those bytes is refused as the desktop background.
+/// It is still refused after the source file changes again later.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_runtime_custody_publish_records_the_bytes_custody_protected() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
+    crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    reset_mock_content_publish_requests();
+    reset_mock_chain_raw_requests();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    registry
+        .register_sub_provider("content", std::sync::Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "object",
+            std::sync::Arc::new(crate::library::ObjectProvider::new(
+                dir.path().to_path_buf(),
+                std::sync::Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
+    let _process_fixture = crate::protected_content_runtime::tests::register_runtime_custody_process_providers_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
+    crate::protected_content_runtime::tests::register_runtime_custody_mock_media_provider_for_test_registry(
+        dir.path(),
+        &registry,
+    )
+    .await;
+    let creator = passkey_authority_with_profile_role_credential(
+        dir.path(),
+        "creator",
+        crate::auth::RuntimePrincipalRole::Admin,
+        "gateway-test-passkey-creator",
+    );
+    let creator_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &creator);
+    let creator_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal_with_index(&creator.principal_id, 1)
+        .await;
+    set_mock_wallet_transaction_default(
+        &wallet_provider.provider,
+        &creator.principal_id,
+        "eip155:8453",
+        &creator_account_id,
+        10,
+    )
+    .await;
+    let app = gateway_router(state.clone());
+    let root = crate::auth::principal_localhost_root(&creator.principal_id);
+    let uri = format!("{root}/Pictures/protected.png");
+    let protected_bytes = super::home_system::test_png_picture(800, 600, b"custody-protected");
+    let earlier_bytes = super::home_system::test_png_picture(800, 600, b"earlier-version");
+    let later_bytes = super::home_system::test_png_picture(800, 600, b"later-version");
+    write_library_bytes(&app, &creator_token, &uri, &protected_bytes).await;
+    let publish_body = json!({
+        "uri": uri,
+        "protection": {
+            "mode": "runtime_custody",
+            "copies": "0x2",
+            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+        },
+    });
+    // Custody prepares `protected_bytes`, then waits for the Wallet.
+    let (_, pending) =
+        post_library(app.clone(), &creator_token, "publish", publish_body.clone()).await;
+    assert_eq!(
+        pending["message"],
+        "Runtime custody creator mint is pending exact Wallet or Chain settlement",
+        "{pending}"
+    );
+    let _ = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    // The publish starts while the file holds other bytes; they change back
+    // to the prepared bytes before custody reads them.
+    write_library_bytes(&app, &creator_token, &uri, &earlier_bytes).await;
+    {
+        let data_dir = dir.path().to_path_buf();
+        let principal_id = creator.principal_id.clone();
+        let uri = uri.clone();
+        let protected_bytes = protected_bytes.clone();
+        set_mock_creator_mint_source_describe_hook(move || {
+            crate::auth::write_principal_root_object(
+                &data_dir,
+                &principal_id,
+                &crate::auth::principal_localhost_root(&principal_id),
+                &uri,
+                &library_object_path(&data_dir, &uri),
+                &protected_bytes,
+            )
+            .unwrap();
+        });
+    }
+    let (status, published) =
+        post_library(app.clone(), &creator_token, "publish", publish_body).await;
+    let hook_left = mock_creator_mint_source_describe_hook()
+        .lock()
+        .unwrap()
+        .take()
+        .is_some();
+    assert!(!hook_left, "the source change ran inside the publish");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(published["status"], "ok", "{published}");
+
+    // A copy of the bytes custody protected is refused; so is the file
+    // itself. Another picture is allowed.
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &creator);
+    let set = |uri: String| {
+        let app = app.clone();
+        let home = creator.home_token.clone();
+        let library = library_token.clone();
+        async move {
+            super::home_system::set_background_from_object(&app, home, Some(library), &uri).await
+        }
+    };
+    let copy_uri = format!("{root}/Documents/copy.png");
+    write_library_bytes(&app, &creator_token, &copy_uri, &protected_bytes).await;
+    let other_uri = format!("{root}/Pictures/other.png");
+    write_library_bytes(
+        &app,
+        &creator_token,
+        &other_uri,
+        &super::home_system::test_png_picture(800, 600, b"other-picture"),
+    )
+    .await;
+    let (status, text) = set(copy_uri.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "copy: {text}");
+    assert!(text.contains("protected content cannot be"), "copy: {text}");
+    let (status, text) = set(other_uri.clone()).await;
+    assert_eq!(status, StatusCode::OK, "other: {text}");
+
+    // The source changes after the publish. The record still names the bytes
+    // custody protected, so their copy is still refused.
+    crate::auth::write_principal_root_object(
+        dir.path(),
+        &creator.principal_id,
+        &root,
+        &uri,
+        &library_object_path(dir.path(), &uri),
+        &later_bytes,
+    )
+    .unwrap();
+    let (status, text) = set(copy_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "copy after edit: {text}");
+    assert!(
+        text.contains("protected content cannot be"),
+        "copy after edit: {text}"
+    );
+    let (status, text) = set(other_uri).await;
+    assert_eq!(status, StatusCode::OK, "other after edit: {text}");
 }

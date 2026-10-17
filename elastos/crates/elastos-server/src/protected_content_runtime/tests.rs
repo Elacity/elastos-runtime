@@ -9213,11 +9213,16 @@ async fn runtime_custody_library_publish_retries_exactly_when_protect_never_disp
             published.mint_id,
         )
         .unwrap();
-    let (source_replay, source_replay_input) =
+    let (source_replay, source_replay_input, source_replay_digest) =
         publish_runtime_custody_library_source(&data_dir, registry.clone(), source)
             .await
             .expect("consumed media preparation must replay without provider dispatch");
     assert_eq!(source_replay.mint_id, published.mint_id);
+    // The replay names the bytes the journal bound, which are the bytes read.
+    assert_eq!(
+        source_replay_digest,
+        runtime_media_source_digest(b"completed source media")
+    );
     assert!(source_replay_input.clear_init_segment.is_empty());
     assert!(source_replay_input.clear_segments.is_empty());
 

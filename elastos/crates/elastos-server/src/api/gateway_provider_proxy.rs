@@ -3417,27 +3417,33 @@ fn validate_runtime_custody_creator_terminal_bindings(
     Ok(())
 }
 
+/// Returns the publish facts and the SHA-256 of the plaintext source bytes
+/// custody read and protected (see `publish_runtime_custody_library_source`).
 pub(crate) async fn runtime_custody_publish_via_gateway(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
     registry: Arc<ProviderRegistry>,
     input: crate::protected_content_runtime::RuntimeCustodyLibrarySourceInput,
-) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts> {
-    let (facts, prepared_input) =
+) -> anyhow::Result<(
+    crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
+    Digest32,
+)> {
+    let (facts, prepared_input, source_object_digest) =
         crate::protected_content_runtime::publish_runtime_custody_library_source(
             &state.data_dir,
             Arc::clone(&registry),
             input,
         )
         .await?;
-    runtime_custody_publish_creator_tail_from_facts(
+    let facts = runtime_custody_publish_creator_tail_from_facts(
         state,
         authority,
         registry,
         prepared_input,
         facts,
     )
-    .await
+    .await?;
+    Ok((facts, source_object_digest))
 }
 
 pub(crate) async fn runtime_custody_buy_via_gateway(

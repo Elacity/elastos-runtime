@@ -731,6 +731,19 @@
       display: block;
     }
 
+    /* Image files show their own thumbnail in place of the generic icon. */
+    .item--thumbnail .file-icon img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      border-radius: 3px;
+    }
+
+    .content[data-view="grid"] .item--thumbnail .file-icon {
+      overflow: hidden;
+      border-radius: 4px;
+    }
+
     .item-name {
       max-width: 100%;
       overflow: hidden;
@@ -1007,6 +1020,14 @@
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+
+    /* Transient status lives in the footer so it can never push toolbar
+       controls; it takes the spare middle space and truncates first. */
+    .statusbar #status-text {
+      flex: 1 1 auto;
+      text-align: center;
+      color: var(--muted);
     }
 
     .context-menu {

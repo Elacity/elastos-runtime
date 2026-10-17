@@ -5011,6 +5011,25 @@ async fn test_home_summary_and_events_include_browser_wallet_approvals() {
         .any(|event| { event["kind"] == "wallet.requests.changed" && event["scope"] == "wallet" }));
 }
 
+/// A PNG whose header declares `width` x `height`, followed by `marker` so a
+/// test can find (or prove it cannot find) the bytes on disk.
+pub(super) fn test_png_picture(width: u32, height: u32, marker: &[u8]) -> Vec<u8> {
+    let mut bytes = crate::image_bounds::tests::png_header(width, height);
+    bytes.extend_from_slice(marker);
+    bytes
+}
+
+/// A baseline JPEG frame header for `width` x `height`, then `marker`.
+fn test_jpeg_picture(width: u16, height: u16, marker: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08];
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+    bytes.extend_from_slice(marker);
+    bytes.extend_from_slice(&[0xFF, 0xD9]);
+    bytes
+}
+
 #[tokio::test]
 async fn test_system_updates_home_background_image() {
     let dir = tempfile::tempdir().unwrap();
@@ -5021,6 +5040,8 @@ async fn test_system_updates_home_background_image() {
         Some("guest"),
         crate::auth::RuntimePrincipalRole::Guest,
     );
+    let admin_png = test_png_picture(64, 32, b"admin-image");
+    let guest_jpeg = test_jpeg_picture(48, 48, b"guest-image");
     let admin_protection =
         crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
     let guest_protection =
@@ -5034,7 +5055,7 @@ async fn test_system_updates_home_background_image() {
                 .uri("/api/apps/system/appearance/background-image")
                 .header("x-elastos-home-token", admin.system_token.clone())
                 .header(CONTENT_TYPE, "image/png")
-                .body(Body::from("admin-image"))
+                .body(Body::from(admin_png.clone()))
                 .unwrap(),
         )
         .await
@@ -5081,6 +5102,43 @@ async fn test_system_updates_home_background_image() {
         summary_payload["appearance"]["background_overlay_opacity"],
         serde_json::json!(HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT)
     );
+
+    // The active Home GUI shell renders the desktop from an opaque frame and
+    // fetches the wallpaper with its own launch token.
+    let shell_token =
+        projection_launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &admin);
+    let shell_image = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(background_url)
+                .header("x-elastos-home-token", shell_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shell_image.status(), StatusCode::OK);
+    let shell_image_body = axum::body::to_bytes(shell_image.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(shell_image_body.as_ref(), admin_png.as_slice());
+
+    // Ordinary app capsules hold no appearance authority.
+    let app_token =
+        projection_launch_token_for_authority_context(dir.path(), "regular-app", &admin);
+    let app_image = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(background_url)
+                .header("x-elastos-home-token", app_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(app_image.status(), StatusCode::FORBIDDEN);
 
     let overlay = app
         .clone()
@@ -5140,7 +5198,7 @@ async fn test_system_updates_home_background_image() {
                 .uri("/api/apps/system/appearance/background-image")
                 .header("x-elastos-home-token", guest.system_token.clone())
                 .header(CONTENT_TYPE, "image/jpeg")
-                .body(Body::from("guest-image"))
+                .body(Body::from(guest_jpeg.clone()))
                 .unwrap(),
         )
         .await
@@ -5166,10 +5224,18 @@ async fn test_system_updates_home_background_image() {
             .and_then(|value| value.to_str().ok()),
         Some("image/png")
     );
+    // Home GUI loads the wallpaper from an opaque frame under COEP require-corp.
+    assert_eq!(
+        image
+            .headers()
+            .get("cross-origin-resource-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("cross-origin")
+    );
     let image_body = axum::body::to_bytes(image.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(&image_body[..], b"admin-image");
+    assert_eq!(&image_body[..], admin_png.as_slice());
 
     let guest_image = app
         .clone()
@@ -5190,10 +5256,17 @@ async fn test_system_updates_home_background_image() {
             .and_then(|value| value.to_str().ok()),
         Some("image/jpeg")
     );
+    assert_eq!(
+        guest_image
+            .headers()
+            .get("cross-origin-resource-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("cross-origin")
+    );
     let guest_image_body = axum::body::to_bytes(guest_image.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(&guest_image_body[..], b"guest-image");
+    assert_eq!(&guest_image_body[..], guest_jpeg.as_slice());
 
     let admin_path = elastos_common::localhost::rooted_localhost_fs_path(
         dir.path(),
@@ -5286,6 +5359,1172 @@ async fn test_system_updates_home_background_image() {
         .await
         .unwrap();
     assert_eq!(guest_image_after_admin_reset.status(), StatusCode::OK);
+}
+
+/// A small file can declare a canvas that would take gigabytes to decode.
+/// Runtime refuses it on every write path and will not serve one that is
+/// already stored, so the desktop and System's reset keep working.
+#[tokio::test]
+async fn test_background_image_refuses_a_decompression_bomb() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let bomb = test_png_picture(100_000, 100_000, b"");
+    assert!(bomb.len() < 64, "the bomb is a tiny file");
+
+    let upload = |content_type: &'static str, bytes: Vec<u8>| {
+        let app = app.clone();
+        let token = admin.system_token.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    test_browser_request("localhost:61180", "null")
+                        .method("POST")
+                        .uri("/api/apps/system/appearance/background-image")
+                        .header("x-elastos-home-token", token)
+                        .header(CONTENT_TYPE, content_type)
+                        .body(Body::from(bytes))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+
+    let (status, text) = upload("image/png", bomb.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("too large to show"), "{text}");
+    // Over the pixel limit while each side is under the side limit.
+    let (status, _) = upload("image/png", test_png_picture(16_000, 16_000, b"")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // The label must match the bytes: a JPEG sent as PNG is refused.
+    let (status, text) = upload("image/png", test_jpeg_picture(10, 10, b"")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("readable PNG, JPEG, WebP, or GIF"), "{text}");
+    // A signature alone, with no header, is refused.
+    let (status, _) = upload("image/png", b"\x89PNG\r\n\x1a\nno-header".to_vec()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let stored_path = elastos_common::localhost::rooted_localhost_fs_path(
+        dir.path(),
+        &format!(
+            "{}/.AppData/ElastOS/Home/Appearance/background-image.png",
+            protection.localhost_root
+        ),
+    )
+    .unwrap();
+    assert!(!stored_path.exists(), "a refused picture is never stored");
+
+    // A bomb stored by an older Runtime is not served; the desktop falls back.
+    crate::auth::create_owner_only_dir_all(dir.path(), stored_path.parent().unwrap()).unwrap();
+    crate::auth::write_principal_root_object(
+        dir.path(),
+        &admin.principal_id,
+        &protection.localhost_root,
+        &format!(
+            "{}/.AppData/ElastOS/Home/Appearance/background-image.png",
+            protection.localhost_root
+        ),
+        &stored_path,
+        &bomb,
+    )
+    .unwrap();
+    let overlay = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/system/appearance/background-overlay")
+                .header("x-elastos-home-token", admin.system_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"enabled":false,"opacity":0.55}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(overlay.status(), StatusCode::OK);
+    let summary: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(overlay.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let background_url = summary["background_image_url"]
+        .as_str()
+        .expect("stored picture is listed so System can reset it")
+        .to_string();
+    let shell_token =
+        projection_launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &admin);
+    let served = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(background_url)
+                .header("x-elastos-home-token", shell_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(served.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let reset = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("DELETE")
+                .uri("/api/apps/system/appearance/background-image")
+                .header("x-elastos-home-token", admin.system_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::OK);
+    assert!(!stored_path.exists());
+}
+
+/// Stores `bytes` as a protected object at `<principal root>/<relative>`,
+/// the way Library saves a picture.
+fn write_home_principal_object_bytes_for_authority(
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    relative: &str,
+    bytes: &[u8],
+) -> String {
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{localhost_root}/{relative}");
+    let path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &uri).unwrap();
+    crate::auth::create_owner_only_dir_all(data_dir, path.parent().unwrap()).unwrap();
+    crate::auth::write_principal_root_object(
+        data_dir,
+        &authority.principal_id,
+        &localhost_root,
+        &uri,
+        &path,
+        bytes,
+    )
+    .unwrap();
+    uri
+}
+
+#[tokio::test]
+async fn test_home_sets_background_image_from_own_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let _admin_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let _guest_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &guest.principal_id);
+    let picture = test_png_picture(1920, 1080, b"library-picture");
+    let picture_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/hills.png",
+        &picture,
+    );
+    let text_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Documents/notes.txt",
+        b"not an image",
+    );
+    let bomb_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/bomb.png",
+        &test_png_picture(100_000, 100_000, b""),
+    );
+    let guest_picture_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &guest,
+        "Pictures/guest.png",
+        &picture,
+    );
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+
+    // Library only expresses the intent; it never holds appearance authority.
+    let from_library = set_background_from_object(
+        &app,
+        library_token.clone(),
+        Some(library_token.clone()),
+        &picture_uri,
+    )
+    .await;
+    assert_eq!(from_library.0, StatusCode::FORBIDDEN);
+
+    let foreign = set_background_from_object(
+        &app,
+        admin.home_token.clone(),
+        Some(library_token.clone()),
+        &guest_picture_uri,
+    )
+    .await;
+    assert_eq!(foreign.0, StatusCode::BAD_REQUEST, "{}", foreign.1);
+    let not_image = set_background_from_object(
+        &app,
+        admin.home_token.clone(),
+        Some(library_token.clone()),
+        &text_uri,
+    )
+    .await;
+    assert_eq!(not_image.0, StatusCode::BAD_REQUEST);
+    let bomb = set_background_from_object(
+        &app,
+        admin.home_token.clone(),
+        Some(library_token.clone()),
+        &bomb_uri,
+    )
+    .await;
+    assert_eq!(bomb.0, StatusCode::BAD_REQUEST);
+    assert!(bomb.1.contains("too large to show"), "{}", bomb.1);
+    let not_localhost = set_background_from_object(
+        &app,
+        admin.home_token.clone(),
+        Some(library_token.clone()),
+        "elastos://bafy/hills.png",
+    )
+    .await;
+    assert_eq!(not_localhost.0, StatusCode::BAD_REQUEST);
+    let missing = set_background_from_object(
+        &app,
+        admin.home_token.clone(),
+        Some(library_token.clone()),
+        &format!(
+            "{}/Pictures/missing.png",
+            crate::auth::principal_localhost_root(&admin.principal_id)
+        ),
+    )
+    .await;
+    assert_eq!(missing.0, StatusCode::BAD_REQUEST);
+
+    let updated = set_background_from_object(
+        &app,
+        admin.home_token.clone(),
+        Some(library_token.clone()),
+        &picture_uri,
+    )
+    .await;
+    assert_eq!(updated.0, StatusCode::OK, "{}", updated.1);
+    let updated_payload: serde_json::Value = serde_json::from_str(&updated.1).unwrap();
+    let background_url = updated_payload["background_image_url"]
+        .as_str()
+        .expect("background url");
+    assert!(
+        background_url.starts_with("/api/apps/home/appearance/background-image?scope="),
+        "{background_url}"
+    );
+
+    // The wallpaper the shell fetches is the object's bytes with a sniffed type.
+    let shell_token =
+        projection_launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &admin);
+    let image = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(background_url)
+                .header("x-elastos-home-token", shell_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(image.status(), StatusCode::OK);
+    assert_eq!(
+        image
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    let image_body = axum::body::to_bytes(image.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(image_body.as_ref(), picture.as_slice());
+}
+
+/// Asks for a desktop background ticket the way Library does: with Library's
+/// own launch token, for one object. Returns the status and, on success, the
+/// ticket.
+async fn library_desktop_background_ticket_for(
+    app: &axum::Router,
+    library_token: &str,
+    source_uri: &str,
+) -> (StatusCode, Option<String>) {
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/library/desktop-background-ticket")
+                .header("x-elastos-home-token", library_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "source_uri": source_uri }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ticket = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value["ticket"].as_str().map(str::to_string));
+    (status, ticket)
+}
+
+/// POSTs a set-from-object request the way Home does: Home's own authority in
+/// `x-elastos-home-token`, and Library's single-use ticket in the body when
+/// `library_ticket` is set.
+async fn post_background_from_object(
+    app: &axum::Router,
+    home_token: String,
+    library_ticket: Option<String>,
+    source_uri: &str,
+) -> (StatusCode, String) {
+    let mut body = serde_json::json!({ "source_uri": source_uri });
+    if let Some(library_ticket) = library_ticket {
+        body["library_ticket"] = serde_json::Value::String(library_ticket);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/apps/home/appearance/background-image")
+                .header("x-elastos-home-token", home_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The whole flow: Library asks for a ticket with `library_token` (when set),
+/// then Home sends it with its own authority. A refused ticket request returns
+/// that refusal.
+pub(super) async fn set_background_from_object(
+    app: &axum::Router,
+    home_token: String,
+    library_token: Option<String>,
+    source_uri: &str,
+) -> (StatusCode, String) {
+    let ticket = match library_token {
+        Some(library_token) => {
+            match library_desktop_background_ticket_for(app, &library_token, source_uri).await {
+                (StatusCode::OK, Some(ticket)) => Some(ticket),
+                (status, _) => return (status, "Library ticket refused".to_string()),
+            }
+        }
+        None => None,
+    };
+    post_background_from_object(app, home_token, ticket, source_uri).await
+}
+
+/// Library's intent is a single-use ticket for one object, not its 12-hour
+/// launch token. A ticket used once, an expired ticket, a ticket for another
+/// object, and the launch token itself are all refused.
+#[tokio::test]
+async fn test_home_background_from_object_ticket_is_single_use_and_short_lived() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let _protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let picture_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/hills.png",
+        &test_png_picture(800, 600, b"hills"),
+    );
+    let other_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/other.png",
+        &test_png_picture(800, 600, b"other"),
+    );
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let home = || admin.home_token.clone();
+    let ticket = || async {
+        let (status, ticket) =
+            library_desktop_background_ticket_for(&app, &library_token, &picture_uri).await;
+        assert_eq!(status, StatusCode::OK);
+        ticket.expect("ticket")
+    };
+
+    // First use is accepted.
+    let first = ticket().await;
+    assert_eq!(first.len(), 43, "32 random bytes, base64url");
+    let (status, text) =
+        post_background_from_object(&app, home(), Some(first.clone()), &picture_uri).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    // Replaying the same request is refused.
+    let (status, text) = post_background_from_object(&app, home(), Some(first), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "replay: {text}");
+    assert!(text.contains("not valid any more"), "{text}");
+
+    // An expired ticket is refused, and is gone afterwards.
+    let expired = ticket().await;
+    expire_desktop_background_ticket_for_test(&expired);
+    let (status, _) = post_background_from_object(&app, home(), Some(expired), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "expired");
+
+    // A ticket names one object; it cannot set another, and it is used up.
+    let for_picture = ticket().await;
+    let (status, _) =
+        post_background_from_object(&app, home(), Some(for_picture.clone()), &other_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "other object");
+    let (status, _) =
+        post_background_from_object(&app, home(), Some(for_picture), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "used by the refused attempt");
+
+    // A made-up ticket, and Library's launch token in its place, are refused.
+    let (status, _) =
+        post_background_from_object(&app, home(), Some("A".repeat(43)), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) =
+        post_background_from_object(&app, home(), Some(library_token.clone()), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/apps/home/appearance/background-image")
+                .header("x-elastos-home-token", home())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "source_uri": picture_uri, "library_token": library_token })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_client_error(),
+        "the old carried launch token field is not accepted: {}",
+        response.status()
+    );
+
+    // Only Library, opened from Home, can ask for a ticket.
+    let documents_token =
+        projection_launch_token_for_authority_context(dir.path(), DOCUMENTS_CAPSULE_ID, &admin);
+    let (status, ticket) =
+        library_desktop_background_ticket_for(&app, &documents_token, &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(ticket.is_none());
+}
+
+/// Home's appearance authority alone cannot read a Library object: the
+/// Library capability must come with it, for the same person and session.
+/// Inside that capability, Trash, Runtime-private areas and protected content
+/// stay out of reach, and unknown protection counts as protected.
+#[tokio::test]
+async fn test_home_background_from_object_requires_library_capability_and_unprotected_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let _admin_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let _guest_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &guest.principal_id);
+    // Each file holds different bytes: protection follows the bytes, so a
+    // file with the same bytes as a protected one is refused too.
+    let write = |relative: &str| {
+        let picture = test_png_picture(800, 600, relative.as_bytes());
+        write_home_principal_object_bytes_for_authority(dir.path(), &admin, relative, &picture)
+    };
+    let picture_uri = write("Pictures/hills.png");
+    let protected_uri = write("Pictures/protected.png");
+    let unknown_uri = write("Pictures/unknown-protection.png");
+    let key_release_uri = write("Pictures/key-release.png");
+    let broken_record_uri = write("Pictures/broken-record.png");
+    let public_uri = write("Pictures/public.png");
+    let trash_uri = write(".Trash/old.png");
+    let private_uri = write(".AppData/LocalHost/secret.png");
+
+    crate::library::write_test_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &protected_uri,
+        serde_json::json!({ "published_payload": "runtime_custody_encrypted", "key_release_required": true }),
+    );
+    crate::library::write_test_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &unknown_uri,
+        serde_json::json!({ "published_payload": "a_future_protection_format" }),
+    );
+    crate::library::write_test_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &key_release_uri,
+        serde_json::json!({ "published_payload": "plain_content", "key_release_required": true }),
+    );
+    crate::library::write_test_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &public_uri,
+        serde_json::json!({ "published_payload": "plain_content", "key_release_required": false }),
+    );
+
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let guest_library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &guest);
+    let documents_token =
+        projection_launch_token_for_authority_context(dir.path(), DOCUMENTS_CAPSULE_ID, &admin);
+    let home = || admin.home_token.clone();
+
+    // Shell token alone: refused before any read.
+    let (status, text) = set_background_from_object(&app, home(), None, &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+    // The active Home GUI shell token alone is refused too.
+    let shell_token =
+        projection_launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &admin);
+    let (status, _) = set_background_from_object(&app, shell_token, None, &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Another app's capability is not Library's.
+    let (status, _) =
+        set_background_from_object(&app, home(), Some(documents_token), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Another person's Library capability does not combine with this Home.
+    let (status, _) =
+        set_background_from_object(&app, home(), Some(guest_library_token), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A Library capability from another session of the same person does not
+    // combine with this Home session.
+    let other_session_library = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let (status, _) =
+        set_background_from_object(&app, home(), Some(other_session_library), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A forged or truncated capability is refused.
+    let (status, _) = set_background_from_object(
+        &app,
+        home(),
+        Some(library_token[..library_token.len() - 4].to_string()),
+        &picture_uri,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    for (uri, reason) in [
+        (&protected_uri, "protected"),
+        (&unknown_uri, "protected"),
+        (&key_release_uri, "protected"),
+        (&trash_uri, "Trash"),
+        (&private_uri, "own Library files"),
+    ] {
+        let (status, text) =
+            set_background_from_object(&app, home(), Some(library_token.clone()), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {text}");
+        assert!(text.contains(reason), "{uri}: {text}");
+    }
+
+    // Plain published content and an unpublished own picture are allowed.
+    for uri in [&public_uri, &picture_uri] {
+        let (status, text) =
+            set_background_from_object(&app, home(), Some(library_token.clone()), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {text}");
+    }
+
+    // A record that cannot be read leaves its protection unknown. Its object
+    // is refused, and because the bytes it protects are unknown too, so is
+    // every other picture until the record is readable again.
+    crate::library::write_test_broken_publish_record(
+        dir.path(),
+        &admin.principal_id,
+        &broken_record_uri,
+    );
+    for uri in [&broken_record_uri, &picture_uri] {
+        let (status, text) =
+            set_background_from_object(&app, home(), Some(library_token.clone()), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {text}");
+        assert!(text.contains("protected"), "{uri}: {text}");
+    }
+}
+
+/// Runs one Library object operation the way Library's provider does, and
+/// returns the resulting object's URI.
+fn library_object_op(
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    request: serde_json::Value,
+) -> String {
+    let mut request = request;
+    request["principal_id"] = serde_json::Value::String(authority.principal_id.clone());
+    let response = crate::library::handle_object_provider_raw_request(data_dir, &request);
+    assert_eq!(response["status"], "ok", "{response}");
+    response["data"]["object"]["uri"]
+        .as_str()
+        .expect("object uri")
+        .to_string()
+}
+
+/// A copy, rename or move gives protected bytes a new URI with no publish
+/// record of its own. Protection follows the bytes, so each is still refused,
+/// while a different picture is still allowed.
+#[tokio::test]
+async fn test_home_background_from_object_refuses_protected_bytes_after_copy_rename_and_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let _protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let root = crate::auth::principal_localhost_root(&admin.principal_id);
+    let protected_bytes = test_png_picture(800, 600, b"protected-picture");
+    let protected_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/protected.png",
+        &protected_bytes,
+    );
+    let other_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/other.png",
+        &test_png_picture(800, 600, b"other-picture"),
+    );
+    crate::library::write_test_publish_record_with_source(
+        dir.path(),
+        &admin.principal_id,
+        &protected_uri,
+        serde_json::json!({ "published_payload": "runtime_custody_encrypted", "key_release_required": false }),
+        Some(&protected_bytes),
+    );
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let set = |uri: String| {
+        let app = app.clone();
+        let home = admin.home_token.clone();
+        let library = library_token.clone();
+        async move { set_background_from_object(&app, home, Some(library), &uri).await }
+    };
+
+    let copy_uri = library_object_op(
+        dir.path(),
+        &admin,
+        serde_json::json!({ "op": "copy", "uri": protected_uri, "target_parent_uri": format!("{root}/Documents") }),
+    );
+    assert_ne!(copy_uri, protected_uri);
+    let (status, text) = set(copy_uri.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "copy: {text}");
+    assert!(text.contains("protected content cannot be"), "copy: {text}");
+
+    let renamed_uri = library_object_op(
+        dir.path(),
+        &admin,
+        serde_json::json!({ "op": "rename", "uri": protected_uri, "name": "renamed.png" }),
+    );
+    assert_eq!(renamed_uri, format!("{root}/Pictures/renamed.png"));
+    let (status, text) = set(renamed_uri.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "rename: {text}");
+    assert!(
+        text.contains("protected content cannot be"),
+        "rename: {text}"
+    );
+
+    let moved_uri = library_object_op(
+        dir.path(),
+        &admin,
+        serde_json::json!({ "op": "move", "uri": copy_uri, "target_parent_uri": format!("{root}/Desktop") }),
+    );
+    let (status, text) = set(moved_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "move: {text}");
+    assert!(text.contains("protected content cannot be"), "move: {text}");
+
+    // A different picture is not affected.
+    let (status, text) = set(other_uri).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+}
+
+/// Builds a Library with one protected picture whose publish record was
+/// written before records named their digest, plus one ordinary picture.
+struct LegacyProtectedLibrary {
+    _dir: tempfile::TempDir,
+    data_dir: std::path::PathBuf,
+    app: axum::Router,
+    admin: TestPasskeyAuthority,
+    root: String,
+    library_token: String,
+    protected_bytes: Vec<u8>,
+    protected_uri: String,
+    other_uri: String,
+}
+
+impl LegacyProtectedLibrary {
+    fn new(content_security: serde_json::Value) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let app = gateway_router(test_state(&data_dir));
+        let admin = passkey_authority_with_name(&data_dir, Some("admin"));
+        let _protection =
+            crate::auth::store_test_principal_root_protection(&data_dir, &admin.principal_id);
+        let root = crate::auth::principal_localhost_root(&admin.principal_id);
+        let protected_bytes = test_png_picture(800, 600, b"legacy-protected");
+        let protected_uri = write_home_principal_object_bytes_for_authority(
+            &data_dir,
+            &admin,
+            "Pictures/legacy.png",
+            &protected_bytes,
+        );
+        let other_uri = write_home_principal_object_bytes_for_authority(
+            &data_dir,
+            &admin,
+            "Pictures/other.png",
+            &test_png_picture(800, 600, b"other-picture"),
+        );
+        crate::library::write_test_publish_record(
+            &data_dir,
+            &admin.principal_id,
+            &protected_uri,
+            content_security,
+        );
+        let library_token =
+            projection_launch_token_for_authority_context(&data_dir, LIBRARY_CAPSULE_ID, &admin);
+        Self {
+            _dir: dir,
+            data_dir,
+            app,
+            admin,
+            root,
+            library_token,
+            protected_bytes,
+            protected_uri,
+            other_uri,
+        }
+    }
+
+    async fn set(&self, uri: &str) -> (StatusCode, String) {
+        set_background_from_object(
+            &self.app,
+            self.admin.home_token.clone(),
+            Some(self.library_token.clone()),
+            uri,
+        )
+        .await
+    }
+
+    fn op(&self, request: serde_json::Value) -> String {
+        library_object_op(&self.data_dir, &self.admin, request)
+    }
+
+    fn recorded_digest(&self) -> Option<String> {
+        crate::library::test_publish_record_source_sha256(
+            &self.data_dir,
+            &self.admin.principal_id,
+            &self.protected_uri,
+        )
+    }
+}
+
+fn legacy_custody_security() -> serde_json::Value {
+    serde_json::json!({ "published_payload": "runtime_custody_encrypted", "key_release_required": false })
+}
+
+fn sha256_label(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+/// A protected record written before records named their digest: its source
+/// is read once while it is still in place, a copy is refused, and the digest
+/// is kept in the record. After that the source can move and its bytes are
+/// still refused, while other pictures are allowed.
+#[tokio::test]
+async fn test_home_background_from_object_legacy_protected_record_is_checked_once_and_kept() {
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let root = library.root.clone();
+    assert_eq!(library.recorded_digest(), None);
+
+    let copy_uri = library.op(serde_json::json!({
+        "op": "copy", "uri": library.protected_uri, "target_parent_uri": format!("{root}/Documents"),
+    }));
+    let (status, text) = library.set(&copy_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "copy: {text}");
+    assert!(text.contains("protected content cannot be"), "copy: {text}");
+    assert_eq!(
+        library.recorded_digest(),
+        Some(sha256_label(&library.protected_bytes)),
+        "the digest found is kept in the record"
+    );
+
+    let renamed_uri = library.op(serde_json::json!({
+        "op": "rename", "uri": library.protected_uri, "name": "renamed.png",
+    }));
+    let (status, text) = library.set(&renamed_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "renamed: {text}");
+    assert!(
+        text.contains("protected content cannot be"),
+        "renamed: {text}"
+    );
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::OK, "other: {text}");
+}
+
+/// Recovery: a legacy protected record whose file was moved before Runtime
+/// kept its digest. Its bytes are unknown, so every picture is refused, and the
+/// refusal names the file, its folder and the next step. When the person moves
+/// the file back, the check passes, the digest is kept, and the file can then
+/// move again without blocking anything.
+#[tokio::test]
+async fn test_home_background_from_object_legacy_record_not_in_place_names_the_file_and_recovers() {
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let root = library.root.clone();
+    let moved_uri = library.op(serde_json::json!({
+        "op": "move", "uri": library.protected_uri, "target_parent_uri": format!("{root}/Documents"),
+    }));
+
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert_eq!(
+        text,
+        "Library cannot check your protected file \"legacy.png\" because it is not in \"Pictures\". \
+         Move it back to \"Pictures\", then try again. \
+         Or upload the picture in System > Background > Choose image."
+    );
+    let (status, text) = library.set(&moved_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "moved: {text}");
+    assert_eq!(library.recorded_digest(), None, "nothing is guessed");
+
+    // The person follows the message.
+    let back_uri = library.op(serde_json::json!({
+        "op": "move", "uri": moved_uri, "target_parent_uri": format!("{root}/Pictures"),
+    }));
+    assert_eq!(back_uri, library.protected_uri);
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::OK, "after move back: {text}");
+    assert_eq!(
+        library.recorded_digest(),
+        Some(sha256_label(&library.protected_bytes))
+    );
+
+    // Now the file can move again; its bytes stay refused.
+    let moved_again_uri = library.op(serde_json::json!({
+        "op": "move", "uri": library.protected_uri, "target_parent_uri": format!("{root}/Desktop"),
+    }));
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::OK, "after second move: {text}");
+    let (status, text) = library.set(&moved_again_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "moved again: {text}");
+    assert!(
+        text.contains("protected content cannot be"),
+        "moved again: {text}"
+    );
+}
+
+/// The refusal names one file and counts the others that need the same step.
+#[tokio::test]
+async fn test_home_background_from_object_legacy_records_not_in_place_are_counted() {
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    for name in ["second.png", "third.png"] {
+        let uri = write_home_principal_object_bytes_for_authority(
+            &library.data_dir,
+            &library.admin,
+            &format!("Pictures/{name}"),
+            &test_png_picture(800, 600, name.as_bytes()),
+        );
+        crate::library::write_test_publish_record(
+            &library.data_dir,
+            &library.admin.principal_id,
+            &uri,
+            legacy_custody_security(),
+        );
+        library.op(serde_json::json!({ "op": "trash", "uri": uri }));
+    }
+    library.op(serde_json::json!({ "op": "trash", "uri": library.protected_uri }));
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(
+        text.starts_with("Library cannot check your protected file \""),
+        "{text}"
+    );
+    assert!(
+        text.contains("Then do the same for 2 more protected files."),
+        "{text}"
+    );
+}
+
+/// A legacy Runtime custody record needs no file at all: custody's journal
+/// holds the digest of the exact bytes it protected. A file that was moved or
+/// deleted before Runtime kept the digest then blocks nothing, and a copy of
+/// those bytes is still refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_home_background_from_object_legacy_custody_record_uses_custody_journal() {
+    use std::os::unix::fs::PermissionsExt;
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let root = library.root.clone();
+    let protected_content_root = library.data_dir.join("protected-content");
+    std::fs::create_dir_all(&protected_content_root).unwrap();
+    std::fs::set_permissions(
+        &protected_content_root,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    use sha2::Digest as _;
+    let preparation = elastos_protected_content_runtime::RuntimeMediaPreparationRecord::new(
+        &library.admin.principal_id,
+        &library.protected_uri,
+        "protected_principal_root",
+        elastos_protected_content_contracts::Digest32::new(
+            sha2::Sha256::digest(&library.protected_bytes).into(),
+        ),
+        "media",
+        "creator-account",
+        "0x00000000000000000000000000000000000000a1",
+        elastos_protected_content_contracts::Digest32::new([0x71; 32]),
+    )
+    .unwrap();
+    crate::protected_content_runtime::runtime_mint_journal(&library.data_dir)
+        .persist_media_preparation(&preparation)
+        .unwrap();
+    let copy_uri = library.op(serde_json::json!({
+        "op": "copy", "uri": library.protected_uri, "target_parent_uri": format!("{root}/Documents"),
+    }));
+    library.op(serde_json::json!({ "op": "trash", "uri": library.protected_uri }));
+
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::OK, "other: {text}");
+    let (status, text) = library.set(&copy_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "copy: {text}");
+    assert!(text.contains("protected content cannot be"), "copy: {text}");
+    assert_eq!(
+        library.recorded_digest(),
+        Some(sha256_label(&library.protected_bytes))
+    );
+}
+
+/// The legacy check is bounded per request: at most 8 sources hashed, at
+/// most 32 MiB read, and a deadline. Past a limit it fails closed with a plain
+/// message; the digests found so far are kept, so the next try goes on.
+#[tokio::test]
+async fn test_home_background_from_object_legacy_check_is_bounded() {
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    for index in 0..crate::library::PROTECTION_CHECK_LEGACY_SOURCES {
+        let name = format!("Pictures/legacy-{index}.png");
+        let uri = write_home_principal_object_bytes_for_authority(
+            &library.data_dir,
+            &library.admin,
+            &name,
+            &test_png_picture(800, 600, name.as_bytes()),
+        );
+        crate::library::write_test_publish_record(
+            &library.data_dir,
+            &library.admin.principal_id,
+            &uri,
+            legacy_custody_security(),
+        );
+    }
+    // Nine legacy sources: the first request hashes eight, then stops.
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert_eq!(
+        text,
+        "Library did not finish the check of your protected files. Try again."
+    );
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::OK, "second try: {text}");
+
+    // The byte limit and the deadline, on a fresh legacy record.
+    let fresh = LegacyProtectedLibrary::new(legacy_custody_security());
+    let read = |budget: crate::library::ProtectionCheckBudget| {
+        crate::library::read_library_object_for_desktop_background(
+            &fresh.data_dir,
+            &fresh.admin.principal_id,
+            &fresh.other_uri,
+            10 * 1024 * 1024,
+            budget,
+        )
+    };
+    let now = std::time::Instant::now();
+    let full = crate::library::ProtectionCheckBudget::for_request(now);
+    assert_eq!(
+        read(crate::library::ProtectionCheckBudget {
+            legacy_bytes: 16,
+            ..full
+        }),
+        Err(crate::library::DesktopBackgroundSourceRefusal::CheckUnfinished)
+    );
+    assert_eq!(
+        read(crate::library::ProtectionCheckBudget {
+            deadline: now,
+            ..full
+        }),
+        Err(crate::library::DesktopBackgroundSourceRefusal::CheckUnfinished)
+    );
+    assert_eq!(fresh.recorded_digest(), None);
+    assert!(read(full).is_ok());
+    assert_eq!(
+        fresh.recorded_digest(),
+        Some(sha256_label(&fresh.protected_bytes))
+    );
+}
+
+/// The set-from-object path reads a file from disk on Home's request, so every
+/// way to name a file outside the person's own Library is refused: `..` in
+/// plain, percent-encoded and double-encoded form, backslash separators, NUL
+/// and other control characters, and links that point elsewhere. Trash and
+/// Runtime-private areas are covered by the capability test above.
+#[tokio::test]
+async fn test_home_background_from_object_refuses_traversal_encoding_and_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let _admin_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let _guest_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &guest.principal_id);
+    let picture = test_png_picture(640, 480, b"own-picture");
+    let picture_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/hills.png",
+        &picture,
+    );
+    let guest_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &guest,
+        "Pictures/guest.png",
+        &picture,
+    );
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let root = crate::auth::principal_localhost_root(&admin.principal_id);
+    let guest_root = crate::auth::principal_localhost_root(&guest.principal_id);
+    let guest_tail = guest_root.rsplit('/').next().unwrap().to_string();
+    let set = |uri: String| {
+        let app = app.clone();
+        let home = admin.home_token.clone();
+        let library = library_token.clone();
+        async move { set_background_from_object(&app, home, Some(library), &uri).await }
+    };
+
+    let refused = [
+        // Plain traversal out of the principal root.
+        format!("{root}/../{guest_tail}/Pictures/guest.png"),
+        format!("{root}/Pictures/../../{guest_tail}/Pictures/guest.png"),
+        format!("{root}/Pictures/./hills.png"),
+        "localhost://Users/../../etc/passwd".to_string(),
+        // Percent-encoded and double-encoded dot segments and separators.
+        format!("{root}/Pictures/%2e%2e/%2e%2e/{guest_tail}/Pictures/guest.png"),
+        format!("{root}/Pictures/%2E%2E/hills.png"),
+        format!("{root}/Pictures/%252e%252e/%252e%252e/{guest_tail}/Pictures/guest.png"),
+        format!("{root}/Pictures%2f..%2f..%2f{guest_tail}%2fPictures%2fguest.png"),
+        format!("{root}/Pictures%5c..%5c..%5c{guest_tail}%5cPictures%5cguest.png"),
+        // Windows separators.
+        format!("{root}/Pictures\\..\\..\\{guest_tail}\\Pictures\\guest.png"),
+        format!("{root}\\..\\{guest_tail}\\Pictures\\guest.png"),
+        format!("{root}/Pictures\\hills.png"),
+        // NUL and other control characters, raw and encoded.
+        format!("{root}/Pictures/hills.png\0.txt"),
+        format!("{root}/Pictures/hills%00.png"),
+        format!("{root}/Pictures/hills\n.png"),
+        // Another person's object, named directly.
+        guest_uri.clone(),
+    ];
+    for uri in refused {
+        let (status, text) = set(uri.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri:?}: {text}");
+    }
+
+    // Unicode names are matched exactly as stored (no normalization).
+    let nfc_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/caf\u{e9}.png",
+        &picture,
+    );
+    let (status, text) = set(nfc_uri).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let (status, text) = set(format!("{root}/Pictures/cafe\u{301}.png")).await;
+    if cfg!(target_os = "linux") {
+        // A different byte sequence is a different (missing) name on Linux.
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    } else {
+        // A normalizing file system may resolve it to the same own file.
+        assert!(
+            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
+            "{status}: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let fs_path = |uri: &str| {
+            elastos_common::localhost::rooted_localhost_fs_path(dir.path(), uri).unwrap()
+        };
+        // A plain PNG outside the data directory.
+        let outside_png = outside.path().join("outside.png");
+        std::fs::write(&outside_png, &picture).unwrap();
+        // A link to a file outside Runtime's data directory.
+        symlink(
+            &outside_png,
+            fs_path(&format!("{root}/Pictures/escape.png")),
+        )
+        .unwrap();
+        // A link to the person's own file is still a link.
+        symlink(
+            fs_path(&picture_uri),
+            fs_path(&format!("{root}/Pictures/alias.png")),
+        )
+        .unwrap();
+        // A directory link into another person's Pictures.
+        symlink(
+            fs_path(&format!("{guest_root}/Pictures")),
+            fs_path(&format!("{root}/Pictures/guest-pictures")),
+        )
+        .unwrap();
+        // A directory link at the top of the person's root.
+        symlink(outside.path(), fs_path(&format!("{root}/Outside"))).unwrap();
+        for uri in [
+            format!("{root}/Pictures/escape.png"),
+            format!("{root}/Pictures/alias.png"),
+            format!("{root}/Pictures/guest-pictures/guest.png"),
+            format!("{root}/Outside/outside.png"),
+        ] {
+            let (status, text) = set(uri.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {text}");
+            assert!(text.contains("link"), "{uri}: {text}");
+        }
+    }
+    drop(outside);
 }
 
 #[tokio::test]

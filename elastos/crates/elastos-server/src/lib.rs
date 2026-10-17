@@ -47,6 +47,7 @@ pub mod esp_binding;
 pub mod fetcher;
 pub mod gateway_cmd;
 pub mod host_lock;
+pub(crate) mod image_bounds;
 pub mod init;
 pub mod inspect_provider;
 mod install_transaction;

@@ -3394,6 +3394,9 @@ fn verify_protected_content_receipt(
 #[derive(Debug)]
 struct RuntimePreparedLibraryPublish {
     input: RuntimeCustodyLibraryPublishInput,
+    /// SHA-256 of the plaintext source bytes this preparation staged for the
+    /// media provider, as bound into its journal record.
+    source_object_digest: Digest32,
     request_id: Digest32,
     output_receipt_digest: Digest32,
     operation_root: PathBuf,
@@ -4003,6 +4006,7 @@ async fn prepare_runtime_custody_library_source(
                         clear_segments: media.clear_segments,
                         source_storage: source.source_storage.clone(),
                     },
+                    source_object_digest: record.source_object_digest(),
                     request_id: record.request_id(),
                     output_receipt_digest,
                     operation_root,
@@ -4074,6 +4078,7 @@ async fn prepare_runtime_custody_library_source(
                 clear_segments: media.clear_segments,
                 source_storage: source.source_storage.clone(),
             },
+            source_object_digest: record.source_object_digest(),
             request_id: record.request_id(),
             output_receipt_digest,
             operation_root,
@@ -4087,6 +4092,10 @@ async fn runtime_media_provider_is_registered(registry: &ProviderRegistry) -> bo
         .await
 }
 
+/// Publishes one Library source through Runtime custody. Also returns the
+/// SHA-256 of the exact plaintext bytes custody read and staged for the media
+/// provider (`RuntimeMediaPreparationRecord::source_object_digest`), so the
+/// caller records what custody protected, not a second read of the source.
 pub(crate) async fn publish_runtime_custody_library_source(
     data_dir: &Path,
     registry: Arc<ProviderRegistry>,
@@ -4094,9 +4103,11 @@ pub(crate) async fn publish_runtime_custody_library_source(
 ) -> anyhow::Result<(
     RuntimeCustodyLibraryPublishFacts,
     RuntimeCustodyLibraryPublishInput,
+    Digest32,
 )> {
     match prepare_runtime_custody_library_source(data_dir, registry.as_ref(), &source).await? {
         RuntimeLibraryMediaPreparation::Prepared(prepared) => {
+            let source_object_digest = prepared.source_object_digest;
             let input = prepared.input;
             let facts = publish_runtime_custody_library_object(
                 data_dir,
@@ -4113,12 +4124,13 @@ pub(crate) async fn publish_runtime_custody_library_source(
                 .map_err(|_| anyhow::anyhow!(RUNTIME_MEDIA_PREPARATION_RECONCILIATION_MESSAGE))?;
             fs::remove_dir_all(&prepared.operation_root)
                 .map_err(|_| runtime_media_private_state_error(String::new()))?;
-            Ok((facts, input))
+            Ok((facts, input, source_object_digest))
         }
         RuntimeLibraryMediaPreparation::Consumed {
             record,
             operation_root,
         } => {
+            let source_object_digest = record.source_object_digest();
             let mint_id = record.consumed_mint_id().ok_or_else(|| {
                 anyhow::anyhow!("Runtime custody media preparation intent is unavailable")
             })?;
@@ -4151,7 +4163,7 @@ pub(crate) async fn publish_runtime_custody_library_source(
                 fs::remove_dir_all(&operation_root)
                     .map_err(|_| runtime_media_private_state_error(String::new()))?;
             }
-            Ok((facts, input))
+            Ok((facts, input, source_object_digest))
         }
     }
 }
