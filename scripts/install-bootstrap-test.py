@@ -22,6 +22,7 @@ import shlex
 import signal
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -86,6 +87,10 @@ def unixfs_v0_cid(data):
 
 
 _SIGNER_CID = None
+
+
+def sha256_files(paths):
+    return [hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in paths]
 
 
 def binding_fixture():
@@ -491,7 +496,7 @@ class ShellTests(unittest.TestCase):
                                     "release_sha256": hashlib.sha256(paths[1].read_bytes()).hexdigest()}}
                 paths[0].write_text(json.dumps(head))
                 expected = subprocess.run([OPTIONS.bash, str(policy), version], capture_output=True)
-                actual = shell('validate_release_identity "$1" "$2"\n', *paths)
+                actual = shell('validate_release_identity "$1" "$2" "$3" "$4"\n', *paths, *sha256_files(paths))
                 with self.subTest(version=version):
                     self.assertEqual(expected.returncode == 0, version in accepted_versions,
                                      expected.stdout + expected.stderr)
@@ -520,9 +525,41 @@ class ShellTests(unittest.TestCase):
                 first = copy.deepcopy(first)
                 first["payload"]["release_sha256"] = hashlib.sha256(paths[1].read_bytes()).hexdigest()
                 paths[0].write_text(json.dumps(first))
-                result = shell('validate_release_identity "$1" "$2"\n', *paths)
+                result = shell('validate_release_identity "$1" "$2" "$3" "$4"\n', *paths, *sha256_files(paths))
                 with self.subTest(case=index):
                     self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+
+    def test_reads_after_the_signature_check_refuse_other_bytes(self):
+        # Every later read of a verified envelope names the SHA-256 that the
+        # signature check saw. One changed byte must stop each of them.
+        did, head, release = installable_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory, "release-head.json"), Path(directory, "release.json")]
+            paths[0].write_bytes(head)
+            paths[1].write_bytes(release)
+            verified = shell('verify_signature "$1" elastos.release.head.v1 "$2"\nprintf "%s\\n" "$VERIFIED_SHA256"\n',
+                             paths[0], did)
+            self.assertEqual(verified.stdout.splitlines()[-1], hashlib.sha256(head).hexdigest(), verified.stderr)
+            head_sha256, release_sha256 = sha256_files(paths)
+            reads = {
+                "json_get": ('json_get "$1" \'d["payload"]["version"]\' "$3"\n', "0.7.1"),
+                "bind_verified_head_cid": ('HEAD_CID=""\nbind_verified_head_cid "$1" "$3"\n', ""),
+                "validate_release_identity": ('validate_release_identity "$1" "$2" "$3" "$4"\n', ""),
+            }
+            for name, (script, output) in reads.items():
+                with self.subTest(read=name, bytes="verified"):
+                    paths[0].write_bytes(head)
+                    result = shell(script, *paths, head_sha256, release_sha256)
+                    self.assertEqual((result.returncode, result.stdout.strip()), (0, output), result.stderr)
+                with self.subTest(read=name, bytes="changed"):
+                    paths[0].write_bytes(head.replace(b'"updated_at":1', b'"updated_at":2'))
+                    self.assertNotEqual(paths[0].read_bytes(), head)
+                    result = shell(script, *paths, head_sha256, release_sha256)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("0.7.1", result.stdout)
+                    if name != "json_get":
+                        self.assertIn("The release files changed on this computer after they were checked",
+                                      result.stderr)
 
     def test_verified_head_cid_is_the_hashed_bytes(self):
         vector = b'{"payload":{"version":"0.7.1-rc.2"}}\n'
@@ -531,18 +568,19 @@ class ShellTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "release-head.json")
             path.write_bytes(vector)
-            stored = shell('HEAD_CID=""\nbind_verified_head_cid "$1"\nprintf "%s\\n" "$HEAD_CID"\n', path)
+            digest = hashlib.sha256(vector).hexdigest()
+            stored = shell('HEAD_CID=""\nbind_verified_head_cid "$1" "$2"\nprintf "%s\\n" "$HEAD_CID"\n', path, digest)
             self.assertEqual((stored.returncode, stored.stdout.strip()), (0, ""), stored.stderr)
-            same = shell('HEAD_CID="$2"\nbind_verified_head_cid "$1"\nprintf "%s\\n" "$HEAD_CID"\n',
-                         path, expected)
+            same = shell('HEAD_CID="$3"\nbind_verified_head_cid "$1" "$2"\nprintf "%s\\n" "$HEAD_CID"\n',
+                         path, digest, expected)
             self.assertEqual((same.returncode, same.stdout.strip()), (0, expected), same.stderr)
-            mismatch = shell('HEAD_CID="QmStampNamesOtherBytes"\nbind_verified_head_cid "$1"\n', path)
+            mismatch = shell('HEAD_CID="QmStampNamesOtherBytes"\nbind_verified_head_cid "$1" "$2"\n', path, digest)
             self.assertEqual(mismatch.returncode, 1, mismatch.stdout)
             self.assertIn("Stamped head CID differs from the verified release head", mismatch.stderr)
             self.assertIn("Stamp: QmStampNamesOtherBytes", mismatch.stderr)
             self.assertIn("Verified: " + expected, mismatch.stderr)
             path.write_bytes(b"")
-            empty = shell('HEAD_CID=""\nbind_verified_head_cid "$1"\n', path)
+            empty = shell('HEAD_CID=""\nbind_verified_head_cid "$1" "$2"\n', path, hashlib.sha256(b"").hexdigest())
             self.assertEqual(empty.returncode, 1, empty.stdout)
             self.assertIn("no single-block CID", empty.stderr)
 
@@ -777,8 +815,9 @@ class BindingTests(unittest.TestCase):
                 paths[1].write_bytes(candidate)
                 result = shell('''
 verify_signature "$1" elastos.release.head.v1 "$3"
+head_sha256="$VERIFIED_SHA256"
 verify_signature "$2" elastos.release.v1 "$3"
-validate_release_identity "$1" "$2"
+validate_release_identity "$1" "$2" "$head_sha256" "$VERIFIED_SHA256"
 ''', *paths, did)
                 with self.subTest(case=name):
                     self.assertEqual(result.stdout.count("Signature verified"), 2, result.stderr)
@@ -793,7 +832,7 @@ validate_release_identity "$1" "$2"
                 first = json.loads(head)
                 first["payload"]["release_sha256"] = value
                 paths[0].write_text(json.dumps(first))
-                result = shell('validate_release_identity "$1" "$2"\n', *paths)
+                result = shell('validate_release_identity "$1" "$2" "$3" "$4"\n', *paths, *sha256_files(paths))
                 with self.subTest(value=value):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("Release identity check failed", result.stderr)
@@ -899,6 +938,89 @@ class InstallationTests(unittest.TestCase):
             self.assertIn("(aarch64-darwin)", rosetta.stdout)
             self.assertEqual(requests, self.REQUESTS[:2] + ["https://test.invalid/artifacts/elastos-aarch64-darwin"])
             self.assertEqual(sandbox.binary.read_bytes(), RUNTIME_STUB)
+
+    def test_runtime_swapped_after_its_checksum_check_is_not_run_or_installed(self):
+        # Another process changes the download in the temporary folder right
+        # after its SHA-256 passed. The installer runs and installs only bytes
+        # it checked, so the swapped Runtime never runs.
+        did, head, release = installable_fixture()
+        swapped = RUNTIME_STUB.replace(b"#!/bin/bash\n", b'#!/bin/bash\necho ran >> "$FIXTURES/swapped-ran"\n', 1)
+        self.assertNotEqual(swapped, RUNTIME_STUB)
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            (sandbox.root / "swap-binary").write_bytes(swapped)
+            sandbox.mock("sha256sum", f'''#!/bin/sh
+"{sys.executable}" -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest(), sys.argv[1])' "$1" || exit 1
+case "$1" in "$TMPDIR"/*) cp "$FIXTURES/swap-binary" "$1";; esac
+''')
+            result, requests = sandbox.run("--install-only")
+            self.assertFalse((sandbox.root / "swapped-ran").exists(), result.stdout + result.stderr)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("The downloaded Runtime changed on this computer after its check", result.stderr)
+            self.assertEqual(requests, self.REQUESTS)
+            self.assertFalse(sandbox.binary.exists())
+            self.assertEqual(list(sandbox.binary.parent.iterdir()), [])
+            self.assertEqual(sandbox.runtime_calls(), [])
+
+    def test_release_head_swapped_after_its_signature_check_is_refused(self):
+        # Another process replaces release-head.json right after its signature
+        # passed, with a head signed by its own key. Nothing after the check may
+        # read those new bytes, and no other key may become the publisher pin.
+        did, head, release = installable_fixture()
+        payload = json.loads(head)["payload"]
+        seed = bytes([9]) * 32
+        attacker_did = sign_envelope({}, "elastos.release.head.v1", seed=seed)["signer_did"]
+        attacker = sign_envelope(dict(payload, signer_did=attacker_did), "elastos.release.head.v1", seed=seed)
+        self.assertNotEqual(attacker["signer_did"], did)
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            (sandbox.root / "swap-head").write_bytes(encode_envelope(attacker))
+            sandbox.mock("python3", f'''#!/bin/sh
+"{sys.executable}" "$@"
+status=$?
+if [ "$status" = 0 ] && [ "$1" = - ] && [ "$3" = elastos.release.head.v1 ]; then
+    cp "$FIXTURES/swap-head" "$2"
+fi
+exit "$status"
+''')
+            result, requests = sandbox.run("--install-only")
+            candidate = sandbox.root / "candidate" / "sources.json"
+            pinned = json.loads(candidate.read_text())["sources"][0]["publisher_dids"] if candidate.exists() else None
+            self.assertEqual(result.returncode, 1, f"pinned publisher_dids={pinned}\n" + result.stdout + result.stderr)
+            self.assertIn("The release files changed on this computer after they were checked", result.stderr)
+            self.assertEqual(requests, self.REQUESTS[:1])
+            self.assertFalse(sandbox.binary.exists())
+            self.assertIsNone(pinned)
+
+    def test_publisher_pin_is_the_trust_root_not_a_second_read(self):
+        # The head is swapped after the installer's last read of it, so only the
+        # writer reads the new bytes. sources.json must still pin the maintainer
+        # DID; the writer then refuses a head signed by any other key
+        # (update.rs installer_moves_a_canary_home_to_stable_but_never_stable_to_canary).
+        did, head, release = installable_fixture()
+        payload = json.loads(head)["payload"]
+        seed = bytes([9]) * 32
+        attacker_did = sign_envelope({}, "elastos.release.head.v1", seed=seed)["signer_did"]
+        attacker = encode_envelope(sign_envelope(dict(payload, signer_did=attacker_did),
+                                                 "elastos.release.head.v1", seed=seed))
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            (sandbox.root / "swap-head").write_bytes(attacker)
+            # After validate_release_identity, the last check that reads both files.
+            sandbox.mock("python3", f'''#!/bin/sh
+"{sys.executable}" "$@"
+status=$?
+if [ "$status" = 0 ] && [ "$1" = - ] && [ "${{2##*/}}" = release-head.json ] && [ "${{3##*/}}" = release.json ]; then
+    cp "$FIXTURES/swap-head" "$2"
+fi
+exit "$status"
+''')
+            result, requests = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            candidate = sandbox.root / "candidate"
+            self.assertEqual((candidate / "release-head.json").read_bytes(), attacker)
+            sources = json.loads((candidate / "sources.json").read_text())
+            self.assertEqual(sources["sources"][0]["publisher_dids"], [did])
 
     def test_installer_prints_the_selected_maintainer_did_before_verification(self):
         did, head, release = installable_fixture()
