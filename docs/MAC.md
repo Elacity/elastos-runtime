@@ -34,16 +34,26 @@ These files hold the rules:
 - Install: the platform check in `scripts/install.sh`.
 
 CI job `gateway-smoke-macos-intel` builds the native `elastos` binary on
-`macos-15-intel`. It requires `GET /healthz` to return HTTP 200 and the two
-bytes `OK` from the process that owns `host-process.lock`. That is the owner
-check in [the launcher contract](LAUNCHER_CONTRACT.md). The job uses an empty
-Home, so a passing probe does not prove providers, capsules, or a signed
-install. `elastos serve` reports operator status at `GET /api/health`.
+`macos-15-intel`. It runs `scripts/gateway-healthz-smoke.sh`, which starts the
+command in [the launcher contract](LAUNCHER_CONTRACT.md) and requires the
+readiness that contract defines. The probe uses `http://localhost:8090/healthz`
+and passes only when all of these are true:
 
-The product command is `elastos gateway --addr localhost:8090`. The smoke
-binds one numeric loopback address on a free port. It does not open
-`localhost:8090`. On macOS, `localhost` can resolve to `::1` while that bind
-is `127.0.0.1` or `[::1]`. That name and port gap remains.
+- the answer is HTTP 200 with the two bytes `OK`, without a proxy,
+- the address that answered is a listen socket of the gateway process,
+- `host-process.lock` names that process, a gateway role and `localhost:8090`.
+
+The job uses an empty Home. A pass does not prove providers, capsules,
+sign-in, or a signed install. `elastos serve` reports operator status at
+`GET /api/health`.
+
+`--addr localhost:8090` binds one address only: the first address that the
+system lookup gives for `localhost` and that can be bound. When `localhost`
+gives `::1` first, `http://127.0.0.1:8090` does not reach the gateway, and
+another process can hold that address. After the readiness check, the job log
+prints facts, not pass or fail: that lookup order, the address the gateway
+listens on, and what `GET /healthz` returns at `localhost:8090`,
+`127.0.0.1:8090` and `[::1]:8090`.
 
 This runbook claims no local Intel Browser engine. See
 [Browser support](BROWSER_SUPPORT.md). The job uploads no release tarball.
