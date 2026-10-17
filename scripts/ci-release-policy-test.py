@@ -3754,5 +3754,49 @@ class InstalledModelTimingTests(unittest.TestCase):
                 self.assertEqual(list(observe({**rows, 3: (2, guard)}, 1, data)), [])
 
 
+class PinnedModelProofLicenseTests(unittest.TestCase):
+    """The proof copies the vendored license text only after its pin matches; it never downloads it."""
+    def proof(self, root, change=None):
+        tree = root / "tree"
+        (tree / "scripts/fixtures/licenses").mkdir(parents=True)
+        for name in ("pinned-model-consumer-proof.sh", "pinned-smollm2-fixture.json", "fixtures/licenses/Apache-2.0.txt"):
+            shutil.copy2(REPO / "scripts" / name, tree / "scripts" / name)
+        vendored = tree / "scripts/fixtures/licenses/Apache-2.0.txt"
+        if change:
+            vendored.write_bytes(change(vendored.read_bytes()))
+        tools = root / "tools"
+        tools.mkdir()
+        (tools / "curl").write_text("#!/bin/sh\ntouch \"$0.called\"\nexit 22\n")
+        (tools / "curl").chmod(0o700)
+        (root / "model.gguf").write_bytes(b"not the pinned model")
+        environment = {"PATH": f"{tools}:/usr/bin:/bin", "HOME": str(root),
+                       "ELASTOS_PROOF_MODEL_PATH": str(root / "model.gguf")}
+        result = subprocess.run(["bash", str(tree / "scripts/pinned-model-consumer-proof.sh"), str(root / "proof"),
+                                 "--fetch", "--check-inputs"], env=environment, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+        self.assertFalse((tools / "curl.called").exists(), "the license has no network source")
+        return result, root / "proof/inputs/LICENSE"
+
+    def test_vendored_license_matches_its_pin_and_is_copied_before_model_checks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result, copied = self.proof(Path(temp))
+            fixture = json.loads((REPO / "scripts/pinned-smollm2-fixture.json").read_text())["license"]
+            self.assertNotIn("url", fixture)
+            self.assertIn(f"vendored license verified: {fixture['size']} bytes sha256 {fixture['sha256']}", result.stdout)
+            self.assertEqual(hashlib.sha256(copied.read_bytes()).hexdigest(), fixture["sha256"])
+            # The dummy model is refused after the license step; nothing else runs.
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("model size", result.stdout)
+
+    def test_tampered_vendored_license_is_refused_before_copy_or_download(self):
+        for name, change in (("same size", lambda text: text.replace(b"Apache License", b"Apache Licanse", 1)),
+                             ("appended", lambda text: text + b"extra grant\n"), ("empty", lambda text: b"")):
+            with self.subTest(change=name), tempfile.TemporaryDirectory() as temp:
+                result, copied = self.proof(Path(temp), change)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertRegex(result.stdout, r"vendored license (sha256|size) .* differs from pinned")
+                self.assertFalse(copied.exists() or copied.is_symlink())
+
+
 if __name__ == "__main__":
     unittest.main()

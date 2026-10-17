@@ -41,7 +41,8 @@ export const rawCid = bytes => "b" + encode(Buffer.concat([Buffer.from([1, 0x55,
 // PROVENANCE.md is checked against a fixed charset before any download.
 const FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const REPOSITORY = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
-const APACHE_LICENSE_URL = "https://www.apache.org/licenses/LICENSE-2.0.txt";
+// The Apache License 2.0 text is vendored beside the fixtures; it has no network source.
+const APACHE_LICENSE_PATH = "fixtures/licenses/Apache-2.0.txt";
 export function loadFixture(path) {
   const fixture = JSON.parse(readFileSync(path, "utf8"));
   const manifest = fixture.capsule_manifest, model = manifest?.model_content, provenance = model?.provenance;
@@ -57,7 +58,9 @@ export function loadFixture(path) {
   }
   const pinned = `https://huggingface.co/${provenance.quantized_repository}/resolve/${provenance.quantized_revision}/`;
   assert.equal(fixture.model.url, pinned + fixture.model.name, "fixture weights must come from the pinned quantized repository revision");
-  assert([pinned + "LICENSE", APACHE_LICENSE_URL].includes(fixture.license.url), "fixture license must come from the pinned revision or apache.org");
+  assert(fixture.license.url === undefined ? fixture.license.path === APACHE_LICENSE_PATH
+    : fixture.license.path === undefined && fixture.license.url === pinned + "LICENSE",
+  "fixture license must come from the pinned revision or the vendored Apache License text");
   assert(["Q1_0", "Q4_K_M", "Q8_0"].includes(model.quantization), "fixture quantization is unsupported");
   assert(model.license.spdx_id === "Apache-2.0" && provenance.base_license.spdx_id === "Apache-2.0", "fixture licenses must be Apache-2.0");
   assert(/^[a-z0-9][a-z0-9._-]{0,127}$/.test(manifest.name), "fixture capsule name must be a plain identifier");
@@ -291,6 +294,15 @@ export async function download(source, path, get = fetch) {
   }
 }
 
+// A vendored pin is checked in the repository before it is copied, and the
+// copy is checked again. A changed vendored file stops the run.
+export function copyVendored(source, path, base = join(root, "scripts")) {
+  if (existsSync(path)) return fileRecord(path, source.name, source);
+  fileRecord(join(base, source.path), source.name, source);
+  copyFileSync(join(base, source.path), path, constants.COPYFILE_EXCL);
+  return fileRecord(path, source.name, source);
+}
+
 // usage: produce <fixture.json> <output-dir> <publisher-did> <kubo-data>
 // <kubo-data> is a data dir prepared by scripts/seed-kubo-cache.sh (pinned recipe Kubo).
 async function produce(args) {
@@ -302,8 +314,10 @@ async function produce(args) {
   assert.deepEqual(fileRecord(kubo, entrypoint.path), entrypoint, "Kubo binary matches its pinned recipe build");
   const inputs = ownedDirectory(join(ownedDirectory(output), "inputs")), weights = join(inputs, fixture.model.name);
   assert.equal(dirname(weights), inputs, "fixture weights stay inside OUT/inputs");
+  // The local license check runs first, so a changed copy stops before the model download.
+  if (fixture.license.path) copyVendored(fixture.license, join(inputs, "LICENSE"));
+  else await download(fixture.license, join(inputs, "LICENSE"));
   await download(fixture.model, weights);
-  await download(fixture.license, join(inputs, "LICENSE"));
   const repo = mkdtempSync(join(output, ".ipfs-repo-"));
   try {
     const { cid, bytes, packageDir } = producePackage({ inputs, output, publisher, fixture, add: dir => kuboAdd(kubo, repo, dir) });
