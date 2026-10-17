@@ -19,6 +19,7 @@ from pathlib import Path
 import platform
 import re
 import shlex
+import shutil
 import signal
 import ssl
 import subprocess
@@ -613,6 +614,10 @@ class InstallerSandbox:
         self.responses = self.root / "responses"
         for path in (self.home, self.root / "tmp", self.responses, self.root / "mocks"):
             path.mkdir(parents=True)
+        # The installer's TMPDIR is this private folder, never the caller's.
+        (self.root / "tmp").chmod(0o700)
+        self.tmpdir = self.root / "tmp"
+        self.path_tail = None
         (self.root / "requests").write_text("")
         self.respond("release-head.json", head)
         self.respond("release.json", release)
@@ -642,6 +647,8 @@ case "$(cat "$FIXTURES/responses/$response.redirect" 2>/dev/null)" in
   http://*) echo 'curl: (1) Protocol "http" not supported' >&2; exit 1;;
 esac
 [ -f "$FIXTURES/responses/$response" ] || { echo artifact-request-blocked >&2; exit 93; }
+# Each file curl writes, so a test can name the exact download path.
+[ -z "$destination" ] || printf '%s %s\\n' "$response" "$destination" >> "$FIXTURES/downloads"
 if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"; else cat "$FIXTURES/responses/$response"; fi
 ''')
         for path in mocks.iterdir():
@@ -665,18 +672,39 @@ if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"
     def requests(self):
         return (self.root / "requests").read_text().splitlines()
 
+    def downloads(self):
+        path = self.root / "downloads"
+        return dict(line.split(" ", 1) for line in path.read_text().splitlines()) if path.exists() else {}
+
+    def hide_commands(self, *names):
+        """Run with a PATH that has no command by these names, mock or system."""
+        for name in names:
+            (self.root / "mocks" / name).unlink(missing_ok=True)
+        system = self.root / "system-bin"
+        system.mkdir()
+        for directory in os.environ["PATH"].split(os.pathsep):
+            if not os.path.isdir(directory):
+                continue
+            for entry in sorted(os.listdir(directory)):
+                target = os.path.join(directory, entry)
+                if (entry not in names and not (system / entry).exists()
+                        and os.path.isfile(target) and os.access(target, os.X_OK)):
+                    (system / entry).symlink_to(target)
+        self.path_tail = system
+
     def run(self, *options, umask="0022", head_cid=""):
         seen = len(self.requests())
         result = shell('umask "$6"\n' + '''
-export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$1/tmp" FIXTURES="$1" PATH="$1/mocks:$PATH"
+export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$8" FIXTURES="$1" PATH="$1/mocks:${9:-$PATH}"
 # Apple Python otherwise adds bytecode caches to HOME during file-preservation checks.
 export PYTHONDONTWRITEBYTECODE=1
 export ELASTOS_PUBLISHER_GATEWAY="" ELASTOS_HEAD_CID="$7"
 export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID="" ELASTOS_INSTALL_ONLY=""
 export ELASTOS_TEST_CALLS="$1/calls" ELASTOS_TEST_SETUP_MARKER="$1/setup-marker" MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
 # Feed the complete stamped script through stdin, as curl | bash does.
-cat "$3" | "$2" --noprofile --norc -s -- "${@:8}"
+cat "$3" | "$2" --noprofile --norc -s -- "${@:10}"
 ''', self.root, OPTIONS.bash, self.installer, self.system, self.machine, umask, head_cid,
+                       self.tmpdir, self.path_tail or "",
                        "--maintainer-did", self.did, "--publisher-gateway", "https://test.invalid", *options)
         return result, self.requests()[seen:]
 
@@ -705,6 +733,38 @@ def run_offline_installer(head, release, did, system="Linux", machine="x86_64"):
         if sandbox.binary.exists():
             raise AssertionError("Offline fixture reached installation")
         return result, requests
+
+
+# sha256sum FILE and shasum -a 256 FILE: print the real hash, then replace the
+# file curl downloaded (only that one, only once) and log the swap.
+SWAP_HASHER = """import hashlib, pathlib, sys
+fixtures, tool, path = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[-1]
+data = pathlib.Path(path).read_bytes()
+print(hashlib.sha256(data).hexdigest() + "  " + path, flush=True)
+downloads = dict(line.split(" ", 1) for line in (fixtures / "downloads").read_text().splitlines())
+log = fixtures / "swaps"
+if path == downloads.get("binary") and not log.exists():
+    pathlib.Path(path).write_bytes((fixtures / "swap-binary").read_bytes())
+    after = hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+    log.write_text(" ".join([tool, path, hashlib.sha256(data).hexdigest(), after]) + "\\n")
+"""
+
+
+def mock_swapping_hashers(sandbox):
+    (sandbox.root / "swap-hasher.py").write_text(SWAP_HASHER)
+    run = f'exec "{sys.executable}" -I "$FIXTURES/swap-hasher.py" "$FIXTURES"'
+    sandbox.mock("sha256sum", f'#!/bin/sh\n[ "$#" = 1 ] || exit 2\n{run} sha256sum "$@"\n')
+    sandbox.mock("shasum", f'#!/bin/sh\n[ "$#" = 3 ] && [ "$1 $2" = "-a 256" ] || exit 2\n{run} shasum "$@"\n')
+
+
+def mock_apple_mktemp(sandbox):
+    """mktemp as macOS ships it: -d with no template ignores TMPDIR."""
+    (sandbox.root / "darwin-user-temp").mkdir(mode=0o700)
+    real = shutil.which("mktemp")
+    sandbox.mock("mktemp", f'''#!/bin/sh
+if [ "$#" = 1 ] && [ "$1" = -d ]; then exec "{real}" -d "$FIXTURES/darwin-user-temp/tmp.XXXXXXXXXX"; fi
+exec "{real}" "$@"
+''')
 
 
 def changed_paths(before, after):
@@ -940,27 +1000,59 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(sandbox.binary.read_bytes(), RUNTIME_STUB)
 
     def test_runtime_swapped_after_its_checksum_check_is_not_run_or_installed(self):
-        # Another process changes the download in the temporary folder right
-        # after its SHA-256 passed. The installer runs and installs only bytes
-        # it checked, so the swapped Runtime never runs.
-        did, head, release = installable_fixture()
+        # Another process changes the download right after its SHA-256 passed.
+        # The installer runs and installs only bytes it checked, so the swapped
+        # Runtime never runs. The swap targets the exact path curl wrote, so it
+        # does not depend on where mktemp puts the scratch folder: Apple's
+        # mktemp -d ignores TMPDIR and uses the per-user folder from confstr
+        # (shell_cmds mktemp.c, implied -t mode), GNU mktemp -d uses TMPDIR.
         swapped = RUNTIME_STUB.replace(b"#!/bin/bash\n", b'#!/bin/bash\necho ran >> "$FIXTURES/swapped-ran"\n', 1)
         self.assertNotEqual(swapped, RUNTIME_STUB)
-        with InstallerSandbox(head, release, did) as sandbox:
-            sandbox.respond("binary", RUNTIME_STUB)
-            (sandbox.root / "swap-binary").write_bytes(swapped)
-            sandbox.mock("sha256sum", f'''#!/bin/sh
-"{sys.executable}" -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest(), sys.argv[1])' "$1" || exit 1
-case "$1" in "$TMPDIR"/*) cp "$FIXTURES/swap-binary" "$1";; esac
-''')
-            result, requests = sandbox.run("--install-only")
-            self.assertFalse((sandbox.root / "swapped-ran").exists(), result.stdout + result.stderr)
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("The downloaded Runtime changed on this computer after its check", result.stderr)
-            self.assertEqual(requests, self.REQUESTS)
-            self.assertFalse(sandbox.binary.exists())
-            self.assertEqual(list(sandbox.binary.parent.iterdir()), [])
-            self.assertEqual(sandbox.runtime_calls(), [])
+        binary = {"cid": "binary-a", "sha256": hashlib.sha256(RUNTIME_STUB).hexdigest(), "size": len(RUNTIME_STUB)}
+        components = {"cid": "components-a", "sha256": hashlib.sha256(COMPONENTS).hexdigest(),
+                      "size": len(COMPONENTS)}
+        did, head, release = installable_fixture(release_extra={"platforms": {
+            platform: {"binary": binary, "components": components}
+            for platform in ("x86_64-linux", "aarch64-darwin")}})
+        cases = [
+            # (uname -s, uname -m, commands hidden from PATH, Apple mktemp, TMPDIR is a symlink, hasher)
+            ("Linux", "x86_64", (), False, False, "sha256sum"),
+            ("Darwin", "arm64", (), True, True, "sha256sum"),
+            # A Mac without sha256sum: the installer falls back to shasum -a 256.
+            ("Darwin", "arm64", ("sha256sum",), True, True, "shasum"),
+        ]
+        for system, machine, hidden, apple_mktemp, tmp_link, hasher in cases:
+            with self.subTest(system=system, hasher=hasher), \
+                    InstallerSandbox(head, release, did, system, machine) as sandbox:
+                sandbox.respond("binary", RUNTIME_STUB)
+                (sandbox.root / "swap-binary").write_bytes(swapped)
+                mock_swapping_hashers(sandbox)
+                if hidden:
+                    sandbox.hide_commands(*hidden)
+                if apple_mktemp:
+                    mock_apple_mktemp(sandbox)
+                if tmp_link:
+                    # macOS /tmp and /var are symlinks into /private.
+                    (sandbox.root / "tmp-link").symlink_to(sandbox.tmpdir)
+                    sandbox.tmpdir = sandbox.root / "tmp-link"
+                result, requests = sandbox.run("--install-only")
+                output = result.stdout + result.stderr
+                # The swap happened, once, to the download, right after it was hashed.
+                download = sandbox.downloads()["binary"]
+                swaps = (sandbox.root / "swaps").read_text().split() if (sandbox.root / "swaps").exists() else []
+                self.assertEqual(swaps, [hasher, download, hashlib.sha256(RUNTIME_STUB).hexdigest(),
+                                         hashlib.sha256(swapped).hexdigest()], output)
+                scratch = sandbox.root / ("darwin-user-temp" if apple_mktemp else "tmp")
+                self.assertEqual(Path(download).resolve().parent.parent, scratch.resolve())
+                # Then the installer refused it: it never ran, nothing was installed.
+                self.assertFalse((sandbox.root / "swapped-ran").exists(), output)
+                self.assertEqual(result.returncode, 1, output)
+                self.assertIn("The downloaded Runtime changed on this computer after its check", result.stderr)
+                artifact = "elastos-x86_64-linux" if system == "Linux" else "elastos-aarch64-darwin"
+                self.assertEqual(requests, self.REQUESTS[:2] + ["https://test.invalid/artifacts/" + artifact])
+                self.assertFalse(sandbox.binary.exists())
+                self.assertEqual(list(sandbox.binary.parent.iterdir()), [])
+                self.assertEqual(sandbox.runtime_calls(), [])
 
     def test_release_head_swapped_after_its_signature_check_is_refused(self):
         # Another process replaces release-head.json right after its signature
