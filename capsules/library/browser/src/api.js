@@ -286,21 +286,28 @@ export function createLibraryRuntime({ getHomeToken }) {
     }
   }
 
+  // Resolves to { accepted, message }. `message` is Runtime's reason for a
+  // refusal as Home passed it on (the caller checks it before showing it),
+  // or "" when there is none.
   async function setDesktopBackground(uri) {
     const requestId = crypto.randomUUID();
     const token = getHomeToken();
     const ticket = await requestDesktopBackgroundTicket(uri, token);
-    if (!ticket) return false;
+    if (!ticket) return { accepted: false, message: "" };
     return new Promise((resolve) => {
-      const finish = (accepted) => {
+      const finish = (accepted, message = "") => {
         window.clearTimeout(timer);
         window.removeEventListener("message", receive);
-        resolve(accepted);
+        resolve({ accepted, message: accepted ? "" : message });
       };
       const receive = (event) => {
         if (event.source !== window.top || event.origin !== homeParentOrigin ||
             event.data?.type !== "home:shell-response" || event.data.requestId !== requestId) return;
-        finish(getHomeToken() === token && event.data.result?.accepted === true && !event.data.error);
+        const sameSession = getHomeToken() === token;
+        finish(
+          sameSession && event.data.result?.accepted === true && !event.data.error,
+          sameSession && typeof event.data.result?.message === "string" ? event.data.result.message : "",
+        );
       };
       const timer = window.setTimeout(() => finish(false), 20_000);
       window.addEventListener("message", receive);

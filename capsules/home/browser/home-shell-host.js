@@ -2269,6 +2269,7 @@ function canOpenTargetFromHomeMessage(context, target) {
 // Library's launch token, and Runtime reads the object under Library's scope,
 // Trash, and protection rules. Home never reads or decrypts the object itself.
 const DESKTOP_BACKGROUND_TICKET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const DESKTOP_BACKGROUND_MESSAGE_MAX_LENGTH = 600;
 
 function handleSetDesktopBackgroundMessage(event, context, data) {
   const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
@@ -2288,13 +2289,29 @@ function handleSetDesktopBackgroundMessage(event, context, data) {
     replyToShellRequest(event, requestId, null, new Error("Home denied the desktop background change"));
     return;
   }
-  fetchJson("/api/apps/home/appearance/background-image", {
+  fetch("/api/apps/home/appearance/background-image", {
     method: "POST",
+    headers: { "content-type": "application/json" },
     body: JSON.stringify({ source_uri: uri, library_ticket: ticket }),
   })
-    .then(() => {
-      requestShellSummaryRefresh({ reason: "desktop-background" });
-      replyToShellRequest(event, requestId, { accepted: true });
+    .then(async (response) => {
+      if (response.ok) {
+        requestShellSummaryRefresh({ reason: "desktop-background" });
+        replyToShellRequest(event, requestId, { accepted: true });
+        return;
+      }
+      // Runtime answers 400 with a plain sentence that tells the person what
+      // to do next (for example, which protected file to move back). Only
+      // that sentence goes back to Library; Library checks it again.
+      const detail = response.status === 400 ? (await response.text().catch(() => "")).trim() : "";
+      console.warn("home could not set the desktop background", response.status);
+      replyToShellRequest(
+        event,
+        requestId,
+        detail && detail.length <= DESKTOP_BACKGROUND_MESSAGE_MAX_LENGTH
+          ? { accepted: false, message: detail }
+          : { accepted: false },
+      );
     })
     .catch((error) => {
       console.warn("home could not set the desktop background", error);

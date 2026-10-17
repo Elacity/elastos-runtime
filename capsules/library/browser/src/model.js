@@ -288,3 +288,20 @@ export function base64ToBlob(data, mime) {
   }
   return new Blob([bytes], { type: mime || "application/octet-stream" });
 }
+
+const DESKTOP_BACKGROUND_MESSAGE_MAX_LENGTH = 600;
+
+// Runtime's plain reason for refusing a desktop background, as Home passed
+// it on: one line of text, short, with no control characters. Anything else
+// gives "", and Library shows its own general message.
+export function desktopBackgroundRefusalMessage(result) {
+  const message = typeof result?.message === "string" ? result.message.trim() : "";
+  if (
+    !message ||
+    message.length > DESKTOP_BACKGROUND_MESSAGE_MAX_LENGTH ||
+    /[\u0000-\u001f\u007f]/.test(message)
+  ) {
+    return "";
+  }
+  return message;
+}
