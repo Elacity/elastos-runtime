@@ -62,7 +62,27 @@ def private_json(path, value=None):
 KEPT_PATH_SUFFIXES = {"json", "log", "txt", "events", "max", "current", "peak", "stat", "status",
                       "service", "sock", "lock", "pid", "bin", "data", "gguf", "car", "toml", "mjs", "py", "sh"}
 SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|passphrase|api[_-]?key|private[_-]?key|credential|cookie|session|signature|auth)[A-Za-z0-9_.-]*"
-PATH_END = "\\s'\"`,;()\\[\\]{}<>"
+# A path runs until a mark that ends a path in an error message: a quote,
+# a bracket, a comma, a semicolon, a pipe, a line end, or a colon followed by
+# a space or the end ("open /a b/c: denied"). Spaces inside the path stay in
+# it, so a folder name with a space is redacted whole ("/Volumes/Backup Disk").
+# A path that is not quoted or followed by such a mark takes the rest of the
+# text with it: losing words is better than leaking a folder name.
+PATH_STOP = "\\r\\n'\"`,;()\\[\\]{}<>|"
+PATH_TAIL = rf"(?:[^{PATH_STOP}\s:]|:(?!\s|$)|[ \t]+(?=[^{PATH_STOP}\s:]|:(?!\s|$)))*"
+PATH_START = "|".join((
+    r"\bfile:/+",
+    r"(?<!\S)~[A-Za-z0-9._-]*/",
+    # Windows network and device paths: \\server\share, \\?\C:\..., \\.\pipe\...
+    r"(?<![\w\\])\\\\(?=[^\s\\])",
+    # A network path written with slashes (//server/share). A URL's "//" follows a colon.
+    r"(?<![\w.:/\\-])//(?=[^/\s])",
+    # A drive path with either slash (C:\Program Files, C:/Users).
+    r"\b[A-Za-z]:[\\/]",
+    r"(?<![\w.~<>/\\-])/(?![/\s])",
+))
+# The user part of a URL (scheme://user:password@host) is a credential.
+URL_USERINFO = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)[^\s/?#'\"`<>]*@")
 REDACTIONS = (
     # Credentials after an auth scheme or a secret-named key (token=..., password: ...).
     (re.compile(r"\b(Bearer|Basic|Token)\s+[^\s'\",;]+", re.I), r"\1 <redacted>"),
@@ -92,12 +112,11 @@ def redact(text, roots=()):
         known.add(str(Path.home()))
     except (KeyError, RuntimeError):
         pass
+    text = URL_USERINFO.sub(r"\1<redacted>@", text)
     # Known roots first and longest first: a home or data folder may hold a space.
     for root in sorted((root.rstrip("/") for root in known if len(root.rstrip("/")) > 1), key=len, reverse=True):
-        text = re.sub(re.escape(root) + rf"(?![^/{PATH_END}])[^{PATH_END}]*", lambda found: redacted_path(found[0]), text)
-    for pattern in (rf"\bfile:/+[^{PATH_END}]*", rf"(?<!\S)~[A-Za-z0-9._-]*/[^{PATH_END}]*",
-                    rf"\b[A-Za-z]:\\[^{PATH_END}]*", rf"(?<![\w.~<>/-])/(?![/\s])[^{PATH_END}]*"):
-        text = re.sub(pattern, lambda found: redacted_path(found[0]), text)
+        text = re.sub(re.escape(root) + rf"(?![^/\\{PATH_STOP}\s:]){PATH_TAIL}", lambda found: redacted_path(found[0]), text)
+    text = re.sub(rf"(?:{PATH_START}){PATH_TAIL}", lambda found: redacted_path(found[0]), text)
     for pattern, replacement in REDACTIONS:
         text = pattern.sub(replacement, text)
     return text

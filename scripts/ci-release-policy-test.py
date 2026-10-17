@@ -3185,6 +3185,48 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
             self.assertEqual(repair.record["control_failure"]["phase"], "stage_engine_running")
             assert_redacted(json.dumps(repair.record), repair.record["control_failure"])
 
+    def test_observer_failure_redacts_url_user_info_windows_network_paths_and_paths_with_spaces(self):
+        # Each case: the error text, the values that must not survive, and the
+        # cause that is saved. No case is under a known root, so only the
+        # general rules can catch it.
+        cases = (
+            ("GET http://ci-user:hunter9@127.0.0.1:8090/api failed", ("ci-user", "hunter9"),
+             "GET http://<redacted>@127.0.0.1:8090/api failed"),
+            ("proxy https://alice@proxy.corp.example:3128 refused", ("alice",),
+             "proxy https://<redacted>@proxy.corp.example:3128 refused"),
+            ("fetch ftp://bob:pw-77@files.example/x (timeout)", ("bob", "pw-77"),
+             "fetch ftp://<redacted>@files.example/x (timeout)"),
+            ("via socks5h://carol:p@ss@10.0.0.1:1080/", ("carol", "p@ss", "ss@"),
+             "via socks5h://<redacted>@10.0.0.1:1080/"),
+            (r"open \\fileserver\share$\ci person\keys.json: denied", ("fileserver", "share$", "person"),
+             "open <path>/keys.json: denied"),
+            ("open //fileserver/share/ci person/keys failed", ("fileserver", "share", "person"), "open <path>"),
+            (r"\\?\C:\Users\ci person\AppData\x.json missing", ("Users", "person", "AppData"), "<path>"),
+            (r"pipe \\.\pipe\elastos-ci-person busy", ("ci-person",), "pipe <path>"),
+            (r"C:\Program Files\ElastOS Person\bin\elastos.exe: not found", ("Program", "Person"),
+             "<path>: not found"),
+            ("C:/Users/ci person/AppData/Local/elastos/data failed", ("Users", "person"), "<path>"),
+            ("cannot read /srv/ci person/Shared Keys/vault: Permission denied", ("srv", "person", "Shared", "Keys"),
+             "cannot read <path>: Permission denied"),
+            ("No such file or directory: '/var/my folder/secret stuff/key.pem'", ("folder", "secret", "stuff"),
+             "No such file or directory: '<path>'"),
+            ("error at /Volumes/Backup Disk/ci-person (exit 2)", ("Volumes", "Backup", "Disk", "ci-person"),
+             "error at <path> (exit 2)"),
+        )
+        with mock.patch.dict(os.environ, {"HOME": "/home/runner"}):
+            for text, private, saved in cases:
+                with self.subTest(text=text):
+                    failure = self.journey["observer_failure"]("census", OSError(text))
+                    for value in private:
+                        self.assertNotIn(value, failure["message"])
+                    self.assertEqual(failure["message"], saved)
+            # The rules keep what carries no person: a plain URL, a quoted
+            # command's options and a cause with no path.
+            for text in ("GET http://127.0.0.1:8090/api/health returned 503", "Expecting value: line 1 column 1 (char 0)",
+                         "3/4 samples and/or a // b"):
+                with self.subTest(text=text):
+                    self.assertEqual(self.journey["observer_failure"]("census", OSError(text))["message"], text)
+
     def test_repair_control_failure_reaches_its_record(self):
         owner = self.journey["RepairRuntime"].__new__(self.journey["RepairRuntime"])
         with tempfile.TemporaryDirectory() as temp:
