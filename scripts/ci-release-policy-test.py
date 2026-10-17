@@ -1643,6 +1643,37 @@ class ReleasePolicyTests(unittest.TestCase):
             with self.subTest(mutation=name), self.assertRaises(AssertionError):
                 validate_restores_are_verified(changed)
 
+    def test_guest_control_bridge_runs_its_own_workspace_checks(self):
+        def check(source):
+            workflow_jobs = jobs(source)
+            name = "test-browser-guest-control-bridge"
+            job = workflow_jobs[name]
+            self.assertEqual(field(job, "needs"), "source-gate")
+            self.assertEqual(field(job, "working-directory"),
+                             "elastos/tools/browser-vm-guest-control-bridge")
+            job_steps = steps(name, workflow_jobs)
+            checkout, = [step for step in job_steps if "uses: actions/checkout@" in step]
+            self.assertEqual(field(checkout, "ref"),
+                             "${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}")
+            self.assertEqual(field(checkout, "persist-credentials"), "false")
+            toolchain, = [step for step in job_steps if "uses: dtolnay/rust-toolchain@" in step]
+            self.assertEqual(field(toolchain, "components"), "rustfmt, clippy")
+            commands = [field(step, "run") for step in job_steps
+                        if re.search(r"(?m)^\s+run:", step)]
+            self.assertEqual(commands, ["cargo fmt -- --check",
+                                       "cargo clippy --locked --all-targets -- -D warnings",
+                                       "cargo test --locked"])
+            self.assertNotRegex(job, r"(?m)^\s+(?:if|continue-on-error):")
+
+        check(SOURCE)
+        for command in ("cargo fmt -- --check",
+                        "cargo clippy --locked --all-targets -- -D warnings",
+                        "cargo test --locked"):
+            changed = SOURCE.replace(f"        run: {command}\n", "        run: true\n", 1)
+            self.assertNotEqual(changed, SOURCE)
+            with self.subTest(removed=command), self.assertRaises(AssertionError):
+                check(changed)
+
     def test_github_runners_and_check_names_stay_fixed(self):
         expected = {
             "source-gate": ("source-gate", "ubuntu-24.04"),
@@ -1650,6 +1681,7 @@ class ReleasePolicyTests(unittest.TestCase):
             "engine-llama-amd64": ("engine-llama-amd64", "ubuntu-24.04"),
             "lint": ("lint", "ubuntu-24.04"),
             "test-elastos": ("test-elastos", "ubuntu-24.04"),
+            "test-browser-guest-control-bridge": ("test-browser-guest-control-bridge", "ubuntu-24.04"),
             "test-behaviour": ("test-behaviour", "ubuntu-24.04"),
             "test-capsules": ("test-capsules", "ubuntu-24.04"),
             "custody-harness-smoke": ("custody-harness-smoke", "ubuntu-24.04"),
