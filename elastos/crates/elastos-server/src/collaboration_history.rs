@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::collaboration_core::{
     MAX_CONVERSATION_HISTORY_BYTES, MAX_CONVERSATION_HISTORY_MESSAGES,
 };
-use crate::collaboration_presence::CollaborationPresenceProductPort;
+use crate::collaboration_presence::{
+    CollaborationPresenceProductPort, OwnHistoryPresence, UsableOwnPresence,
+};
 use crate::collaboration_product::{CollaborationChatProductPort, CHAT_SERVICE};
 
 pub(crate) const HISTORY_PROVIDER: &str = "collaboration.history";
@@ -29,9 +31,9 @@ pub(crate) const MAX_HISTORY_RESPONSE_BYTES: usize = MAX_CONVERSATION_HISTORY_BY
 pub(crate) const MAX_HISTORY_CARRIER_REPLY_BYTES: usize = MAX_HISTORY_RESPONSE_BYTES + 64;
 const MAX_PEERS_PER_PASS: usize = 4;
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
-// History requests carry this Home's own signed presence, which the Runtime
-// publishes only while Discovery is on.
-const DISCOVERY_OFF_DETAIL: &str = "Turn on Discovery in People to load earlier Community posts.";
+// History requests carry this Home's own signed presence, which exists only
+// for people who granted Community presence.
+const NOT_SHOWN_DETAIL: &str = "Show yourself in Community to load earlier posts.";
 const ALONE_DETAIL: &str = "No other members are online right now.";
 
 #[derive(Clone)]
@@ -109,7 +111,7 @@ impl CollaborationHistoryService {
         Ok(service)
     }
 
-    fn request(&self, presence: String) -> HistoryRequest {
+    fn request(&self, presence: UsableOwnPresence) -> HistoryRequest {
         let (network_id, conversation_id) = self.inner.product.history_scope();
         HistoryRequest {
             schema: REQUEST_SCHEMA.to_string(),
@@ -117,7 +119,7 @@ impl CollaborationHistoryService {
             network_id: network_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sender_service: CHAT_SERVICE.to_string(),
-            presence,
+            presence: presence.into_envelope(),
         }
     }
 
@@ -201,30 +203,42 @@ impl CollaborationHistoryService {
         if !self.inner.product.community_membership().joined() {
             return Ok(());
         }
-        let peers = match self.inner.presence.history_participants(now) {
-            Ok(peers) => peers,
+        let (peers, own) = match async {
+            Ok::<_, anyhow::Error>((
+                self.inner.presence.history_participants(now)?,
+                self.inner.presence.own_history_presence(now).await?,
+            ))
+        }
+        .await
+        {
+            Ok(found) => found,
             Err(error) => {
                 self.inner.product.set_history_status(false);
                 return Err(error);
             }
         };
-        let local_endpoint = self.inner.product.local_device_did();
-        let local = peers
-            .iter()
-            .find(|peer| peer.endpoint_did == local_endpoint);
-        let Some(local) = local else {
-            // Discovery off is a fact only the publisher knows; before its first
-            // pass, or while its presence is still projecting, keep searching.
-            if self.inner.presence.local_publication() == Some(false) {
-                self.inner
-                    .product
-                    .set_history_unavailable(DISCOVERY_OFF_DETAIL);
-            } else {
-                self.inner.product.set_history_searching();
+        // A request carries only the presence of a person whose grant is
+        // valid right now; a record signed before Hidden or an epoch bump is
+        // never sent.
+        match own {
+            OwnHistoryPresence::Usable(_) => {}
+            OwnHistoryPresence::NotUsable => {
+                self.inner.product.set_history_unavailable(NOT_SHOWN_DETAIL);
+                return Ok(());
             }
-            return Ok(());
-        };
-        let request = serde_json::to_value(self.request(local.presence_envelope.clone()))?;
+            OwnHistoryPresence::Absent => {
+                // Nobody chosen is a fact only the publisher knows; before its
+                // first pass, or while its presence is still projecting, keep
+                // searching.
+                if self.inner.presence.local_publication() == Some(false) {
+                    self.inner.product.set_history_unavailable(NOT_SHOWN_DETAIL);
+                } else {
+                    self.inner.product.set_history_searching();
+                }
+                return Ok(());
+            }
+        }
+        let local_endpoint = self.inner.product.local_device_did();
         let mut remote = peers
             .into_iter()
             .filter(|peer| peer.endpoint_did != local_endpoint)
@@ -259,6 +273,18 @@ impl CollaborationHistoryService {
         };
         let mut available = false;
         for peer in remote {
+            // Each peer is a separate disclosure. The previous peer can take
+            // seconds to reply; its authorization never carries to this send.
+            let OwnHistoryPresence::Usable(own) = self
+                .inner
+                .presence
+                .own_history_presence(now_secs().max(now))
+                .await?
+            else {
+                self.inner.product.set_history_unavailable(NOT_SHOWN_DETAIL);
+                return Ok(());
+            };
+            let request = serde_json::to_value(self.request(own))?;
             // History reads have no remote effect. A lost response can be
             // abandoned safely, and the next scheduled pass retries normally.
             let response = tokio::time::timeout(
@@ -267,7 +293,7 @@ impl CollaborationHistoryService {
                     source: HISTORY_PROVIDER.to_string(),
                     target: HISTORY_PROVIDER.to_string(),
                     op: HISTORY_OP.to_string(),
-                    request: request.clone(),
+                    request,
                     transfer: ProviderTransfer::Json,
                     range: None,
                     progress: None,
@@ -387,9 +413,18 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::collaboration_presence::presence_request_binding;
+    use crate::collaboration_presence_grant::{
+        set_presence_grant, test_authority, PresenceAuthority, PresenceDecision,
+    };
     use crate::collaboration_product::{chat_message_request_binding, test_chat_product_port};
     use elastos_runtime::provider::{ProviderCarrierInvoker, ResourceAction};
     use std::collections::BTreeMap;
+
+    const PRINCIPAL: &str = "test-principal";
+
+    fn unchecked(fixture: &Fixture) -> UsableOwnPresence {
+        UsableOwnPresence::test_unchecked(fixture.own_presence.clone())
+    }
 
     struct Fixture {
         root: tempfile::TempDir,
@@ -398,24 +433,92 @@ mod tests {
         registry: Arc<ProviderRegistry>,
         service: CollaborationHistoryService,
         own_presence: String,
+        authority: Arc<PresenceAuthority>,
+        profile_did: String,
     }
 
+    impl Fixture {
+        async fn decide(&self, decision: PresenceDecision, now: u64) {
+            set_presence_grant(
+                &self.authority,
+                self.root.path(),
+                PRINCIPAL,
+                &self.profile_did,
+                &self.presence.presence_scope(),
+                decision,
+                now,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// A Home whose person chose "Always" and whose own presence is live.
     async fn fixture(network: &str, conversation: &str, now: u64) -> Fixture {
         let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        crate::auth::store_test_principal_root_protection(root.path(), PRINCIPAL);
         let product = test_chat_product_port(root.path(), network, conversation);
-        let presence = CollaborationPresenceProductPort::new(product.test_core().clone()).unwrap();
-        let profile = product.test_person_profile("History person", None);
+        let authority = test_authority();
+        let presence = CollaborationPresenceProductPort::new(product.test_core().clone())
+            .unwrap()
+            .with_presence_authority(authority.clone());
+        let (profile_key, _) = elastos_runtime::signature::generate_keypair();
+        let profile = crate::collaboration_profile_authority::signed_profile_document_for_test(
+            &profile_key,
+            "History person",
+            None,
+            1,
+            None,
+            now,
+            vec![product.local_device_did()],
+        )
+        .unwrap();
+        crate::collaboration_presence_grant::store_test_profile(
+            root.path(),
+            PRINCIPAL,
+            &profile_key,
+            &profile,
+        );
+        set_presence_grant(
+            &authority,
+            root.path(),
+            PRINCIPAL,
+            &profile.document().profile_did,
+            &presence.presence_scope(),
+            PresenceDecision::Always,
+            now,
+        )
+        .await
+        .unwrap();
+        let grant = crate::collaboration_presence_grant::presence_grant(
+            &authority,
+            root.path(),
+            PRINCIPAL,
+            &profile.document().profile_did,
+            &presence.presence_scope(),
+            crate::collaboration_presence_grant::PresencePublisher::Runtime,
+            now,
+        )
+        .await
+        .unwrap();
         let prepared = presence
             .prepare_presence(
-                presence_request_binding("history-presence", "test-principal", &profile).unwrap(),
+                presence_request_binding(
+                    &grant.bind_request_id("history-presence"),
+                    PRINCIPAL,
+                    &profile,
+                )
+                .unwrap(),
                 &profile,
                 now,
             )
             .unwrap();
-        presence.project_prepared_presence(&prepared, now).unwrap();
-        let own_presence = presence.history_participants(now).unwrap()[0]
-            .presence_envelope
-            .clone();
+        let own_presence = String::from_utf8(prepared.test_envelope_bytes().to_vec()).unwrap();
         let registry = Arc::new(ProviderRegistry::new());
         let service = CollaborationHistoryService::new(
             product.clone(),
@@ -425,14 +528,23 @@ mod tests {
         )
         .await
         .unwrap();
-        Fixture {
+        let fixture = Fixture {
             root,
             product,
             presence,
             registry,
             service,
             own_presence,
-        }
+            authority,
+            profile_did: profile.document().profile_did.clone(),
+        };
+        fixture.decide(PresenceDecision::Always, now).await;
+        fixture
+            .presence
+            .project_authorized_presence(&prepared, now)
+            .await
+            .unwrap();
+        fixture
     }
 
     fn observe(observer: &Fixture, peer: &Fixture, now: u64) {
@@ -584,7 +696,7 @@ mod tests {
         let a = fixture("history-test", "community", now).await;
         let b = fixture("history-test", "community", now).await;
         let foreign = fixture("foreign-history", "other", now).await;
-        let request = b.service.request(b.own_presence.clone());
+        let request = b.service.request(unchecked(&b));
         assert!(a
             .service
             .receive(request.clone(), &b.product.local_device_did(), now)
@@ -600,7 +712,7 @@ mod tests {
         assert!(a
             .service
             .receive(
-                foreign.service.request(foreign.own_presence.clone()),
+                foreign.service.request(unchecked(&foreign)),
                 &foreign.product.local_device_did(),
                 now
             )
@@ -742,7 +854,7 @@ mod tests {
         let now = now_secs();
         let a = fixture("history-private", "community", now).await;
         let b = fixture("history-private", "community", now).await;
-        let request = serde_json::to_value(b.service.request(b.own_presence.clone())).unwrap();
+        let request = serde_json::to_value(b.service.request(unchecked(&b))).unwrap();
         assert!(a
             .registry
             .send_raw(HISTORY_PROVIDER, &request)
@@ -794,9 +906,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_without_own_presence_asks_for_discovery_only_when_it_is_off() {
-        // Discovery off: this Home publishes no presence of its own, so it has
-        // nothing to sign a history request with, whoever else is online.
+    async fn history_without_own_presence_asks_for_show_me_only_when_nobody_chose_it() {
+        // Nobody here chose Show me: this Home publishes no presence of its
+        // own, so it has nothing to sign a history request with, whoever else
+        // is online. The status never mentions Discovery.
         let now = now_secs();
         let root = tempfile::tempdir().unwrap();
         let product = test_chat_product_port(root.path(), "history-off", "community");
@@ -834,14 +947,14 @@ mod tests {
             detail(),
             (
                 "unavailable".to_string(),
-                "Turn on Discovery in People to load earlier Community posts.".to_string()
+                "Show yourself in Community to load earlier posts.".to_string()
             )
         );
-        // Discovery switched on: presence is published but not yet projected.
+        // Show me chosen: presence is published but not yet projected.
         presence.record_local_publication(Some(true));
         service.fetch_once(now).await.unwrap();
         assert_eq!(detail().0, "searching");
-        // A publisher pass that failed leaves the switch unknown.
+        // A publisher pass that failed leaves the choice unknown.
         presence.record_local_publication(None);
         service.fetch_once(now).await.unwrap();
         assert_eq!(detail().0, "searching");
@@ -903,6 +1016,276 @@ mod tests {
                 .status,
             "available"
         );
+    }
+
+    /// `a` observes `b` and reaches it; returns the calls `a` makes.
+    async fn reachable_pair(network: &str, now: u64) -> (Fixture, Fixture, Arc<Plane>) {
+        let a = fixture(network, "community", now).await;
+        let b = fixture(network, "community", now).await;
+        observe(&a, &b, now);
+        let plane = Arc::new(Plane {
+            source: a.product.local_device_did(),
+            peers: BTreeMap::from([(b.product.local_device_did(), b.registry.clone())]),
+            calls: Mutex::new(Vec::new()),
+            stall: false,
+        });
+        a.registry.set_carrier_invoker(plane.clone()).await;
+        a.service.fetch_once(now).await.unwrap();
+        assert_eq!(plane.calls.lock().unwrap().len(), 1);
+        (a, b, plane)
+    }
+
+    fn assert_not_shown_and_nothing_sent(a: &Fixture, plane: &Plane, now: u64) {
+        let view = a.product.conversation_transport_view().history.unwrap();
+        assert_eq!(view.status, "unavailable");
+        assert_eq!(view.detail, NOT_SHOWN_DETAIL);
+        assert_eq!(plane.calls.lock().unwrap().len(), 1);
+        // Denial retires the own projection and queued announcement as well.
+        assert_eq!(a.presence.history_participants(now).unwrap().len(), 1);
+        assert!(a
+            .product
+            .test_core()
+            .pending_outgoing(now)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_history_request_carries_no_presence_after_hidden() {
+        let now = now_secs();
+        let (a, _b, plane) = reachable_pair("history-hidden", now).await;
+        a.decide(PresenceDecision::Hidden, now).await;
+        a.service.fetch_once(now).await.unwrap();
+        assert_not_shown_and_nothing_sent(&a, &plane, now);
+    }
+
+    #[tokio::test]
+    async fn a_history_request_carries_no_presence_after_an_epoch_bump() {
+        let now = now_secs();
+        let (a, _b, plane) = reachable_pair("history-epoch", now).await;
+        a.authority.manager().revoke_all("test epoch");
+        a.service.fetch_once(now).await.unwrap();
+        assert_not_shown_and_nothing_sent(&a, &plane, now);
+    }
+
+    #[tokio::test]
+    async fn history_revalidates_profile_and_retires_own_projection() {
+        let now = now_secs();
+        let (a, _b, plane) = reachable_pair("history-profile-change", now).await;
+        let (key, _) = elastos_runtime::signature::generate_keypair();
+        let replacement = crate::collaboration_profile_authority::signed_profile_document_for_test(
+            &key,
+            "Replacement",
+            None,
+            1,
+            None,
+            now,
+            vec![a.product.local_device_did()],
+        )
+        .unwrap();
+        crate::collaboration_presence_grant::store_test_profile(
+            a.root.path(),
+            PRINCIPAL,
+            &key,
+            &replacement,
+        );
+        a.service.fetch_once(now).await.unwrap();
+        assert_not_shown_and_nothing_sent(&a, &plane, now);
+        assert_eq!(
+            crate::collaboration_presence_grant::state(
+                a.root.path(),
+                PRINCIPAL,
+                &a.presence.presence_scope()
+            )
+            .unwrap(),
+            None
+        );
+        assert!(a
+            .presence
+            .authorized_snapshot(now)
+            .await
+            .unwrap()
+            .records()
+            .iter()
+            .all(|record| record.sender_profile_did() != a.profile_did));
+    }
+
+    #[tokio::test]
+    async fn history_without_a_manager_fails_closed_after_restart() {
+        let now = now_secs();
+        let (a, _b, plane) = reachable_pair("history-no-manager", now).await;
+        let presence =
+            CollaborationPresenceProductPort::new(a.product.test_core().clone()).unwrap();
+        let registry = Arc::new(ProviderRegistry::new());
+        registry.set_carrier_invoker(plane.clone()).await;
+        let service = CollaborationHistoryService::new(
+            a.product.clone(),
+            presence.clone(),
+            registry,
+            a.root.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        service.fetch_once(now).await.unwrap();
+        assert_eq!(plane.calls.lock().unwrap().len(), 1);
+        assert!(presence
+            .authorized_snapshot(now)
+            .await
+            .unwrap()
+            .records()
+            .iter()
+            .all(|record| record.sender_profile_did() != a.profile_did));
+    }
+
+    #[tokio::test]
+    async fn revoked_presence_cannot_return_through_startup_projection_or_polling() {
+        let now = now_secs();
+        for epoch in [false, true] {
+            let a = fixture("presence-projection-revoke", "community", now).await;
+            let root = crate::auth::principal_localhost_root(PRINCIPAL);
+            let profile = crate::collaboration_profile_authority::load_profile_authority(
+                a.root.path(),
+                PRINCIPAL,
+                &root,
+            )
+            .unwrap()
+            .unwrap();
+            let grant = crate::collaboration_presence_grant::presence_grant(
+                &a.authority,
+                a.root.path(),
+                PRINCIPAL,
+                &profile.document().profile_did,
+                &a.presence.presence_scope(),
+                crate::collaboration_presence_grant::PresencePublisher::Runtime,
+                now,
+            )
+            .await
+            .unwrap();
+            let pending = a
+                .presence
+                .prepare_presence(
+                    presence_request_binding(
+                        &grant.bind_request_id("pending-at-restart"),
+                        PRINCIPAL,
+                        &profile,
+                    )
+                    .unwrap(),
+                    &profile,
+                    now + 1,
+                )
+                .unwrap();
+            if epoch {
+                a.authority.manager().revoke_all("projection smoke epoch");
+            } else {
+                a.decide(PresenceDecision::Hidden, now + 1).await;
+            }
+            a.presence
+                .project_authorized_presence(&pending, now + 1)
+                .await
+                .unwrap();
+            assert!(a
+                .presence
+                .authorized_snapshot(now + 1)
+                .await
+                .unwrap()
+                .records()
+                .is_empty());
+            assert!(a
+                .product
+                .test_core()
+                .pending_outgoing(now + 1)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    struct ChangeAfterFirstRequest {
+        plane: Arc<Plane>,
+        authority: Arc<PresenceAuthority>,
+        root: PathBuf,
+        profile_did: String,
+        scope: crate::collaboration_presence_grant::PresenceScope,
+        hidden: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderCarrierInvoker for ChangeAfterFirstRequest {
+        async fn invoke_carrier_provider(
+            &self,
+            route: &ProviderCarrierRoute,
+            invocation: &ProviderInvocation,
+            request: serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            // Capture the real request at the provider transport boundary.
+            let envelope: serde_json::Value =
+                serde_json::from_str(request["presence"].as_str().unwrap()).unwrap();
+            assert_eq!(envelope["payload"]["sender_profile_did"], self.profile_did);
+            let response = self
+                .plane
+                .invoke_carrier_provider(route, invocation, request)
+                .await;
+            if self.hidden {
+                set_presence_grant(
+                    &self.authority,
+                    &self.root,
+                    PRINCIPAL,
+                    &self.profile_did,
+                    &self.scope,
+                    PresenceDecision::Hidden,
+                    now_secs(),
+                )
+                .await
+                .unwrap();
+            } else {
+                self.authority.manager().revoke_all("between history peers");
+            }
+            response
+        }
+    }
+
+    #[tokio::test]
+    async fn each_history_peer_revalidates_after_hidden_or_epoch() {
+        let now = now_secs();
+        for hidden in [false, true] {
+            let a = fixture("history-between-peers", "community", now).await;
+            let b = fixture("history-between-peers", "community", now).await;
+            let c = fixture("history-between-peers", "community", now).await;
+            observe(&a, &b, now);
+            observe(&a, &c, now);
+            let plane = Arc::new(Plane {
+                source: a.product.local_device_did(),
+                peers: BTreeMap::from([
+                    (b.product.local_device_did(), b.registry.clone()),
+                    (c.product.local_device_did(), c.registry.clone()),
+                ]),
+                calls: Mutex::new(Vec::new()),
+                stall: false,
+            });
+            a.registry
+                .set_carrier_invoker(Arc::new(ChangeAfterFirstRequest {
+                    plane: plane.clone(),
+                    authority: a.authority.clone(),
+                    root: a.root.path().to_path_buf(),
+                    profile_did: a.profile_did.clone(),
+                    scope: a.presence.presence_scope(),
+                    hidden,
+                }))
+                .await;
+            a.service.fetch_once(now).await.unwrap();
+            assert_eq!(
+                plane.calls.lock().unwrap().len(),
+                1,
+                "second peer must receive no request"
+            );
+            assert_eq!(
+                a.product
+                    .conversation_transport_view()
+                    .history
+                    .unwrap()
+                    .detail,
+                NOT_SHOWN_DETAIL
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

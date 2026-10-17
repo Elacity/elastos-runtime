@@ -543,9 +543,15 @@
       } else if (typeof actionId === "string" && actionId.startsWith("hosted-http-approve:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Deny", "hosted-http-deny:" + actionId.slice("hosted-http-approve:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("community-presence-always:")) {
+        const request = actionId.slice("community-presence-always:".length);
+        actions.appendChild(createActionButton("Always while Home is online", actionId, "primary"));
+        actions.appendChild(createActionButton("Only while Community is open", "community-presence-open:" + request));
+        actions.appendChild(createActionButton("Later", "community-presence-later:" + request));
+        actions.appendChild(createActionButton("Never", "community-presence-never:" + request, "danger"));
       }
 
-      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "hosted_route_decision" && entry.kind !== "hosted_route_history" && entry.kind !== "contact_request" && entry.kind !== "service_access_request" && entry.kind !== "service_access_grant") {
+      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request" && entry.kind !== "hosted_route_decision" && entry.kind !== "hosted_route_history" && entry.kind !== "contact_request" && entry.kind !== "service_access_request" && entry.kind !== "service_access_grant" && entry.kind !== "community_presence_request") {
         actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
       }
     }

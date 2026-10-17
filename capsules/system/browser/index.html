@@ -277,12 +277,24 @@
 
           <section class="pc2-section" id="community-membership" aria-labelledby="community-title" hidden>
             <h2 id="community-title" class="pc2-section-title">Community</h2>
-            <div class="pc2-group"><div class="pc2-group-row">
-              <div class="pc2-card-label">This Home</div>
-              <p class="pc2-card-sublabel" data-field="community-detail"></p>
-              <button id="community-toggle" class="pc2-btn pc2-btn-secondary" type="button" disabled>Leave Community</button>
-              <div class="system-status" data-field="community-status" role="status" hidden></div>
-            </div></div>
+            <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-label">This Home</div>
+                <p class="pc2-card-sublabel" data-field="community-detail"></p>
+                <button id="community-toggle" class="pc2-btn pc2-btn-secondary" type="button" disabled>Leave Community</button>
+                <div class="system-status" data-field="community-status" role="status" hidden></div>
+              </div>
+              <div class="pc2-group-row" id="community-presence-row" hidden>
+                <div class="pc2-card-label">Show me in Community</div>
+                <div class="pc2-card-sublabel">Members on this Community see your name, Profile and when your Home is online. Discovery in People is separate.</div>
+                <div id="community-presence" class="system-segment" role="radiogroup" aria-label="Show me in Community">
+                  <button type="button" class="system-segment-option" data-presence-mode="always" role="radio" aria-checked="false" disabled>Always while Home is online</button>
+                  <button type="button" class="system-segment-option" data-presence-mode="while_open" role="radio" aria-checked="false" disabled>Only while Community is open</button>
+                  <button type="button" class="system-segment-option" data-presence-mode="hidden" role="radio" aria-checked="false" disabled>Hidden</button>
+                </div>
+                <div class="pc2-card-value system-status" data-field="community-presence-status" role="status" hidden></div>
+              </div>
+            </div>
           </section>
 
           <section class="pc2-section" aria-labelledby="technical-title">

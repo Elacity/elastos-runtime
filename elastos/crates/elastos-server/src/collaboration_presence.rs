@@ -40,8 +40,17 @@ pub struct CollaborationPresenceProductPort {
     core: Arc<CollaborationCore>,
     read_model: Arc<PresenceReadModel>,
     /// The Runtime publisher's last pass: `Some(true)` it announced someone,
-    /// `Some(false)` it read Discovery off for everyone, `None` unknown.
+    /// `Some(false)` nobody here has a presence grant, `None` unknown.
     local_publication: Arc<std::sync::Mutex<Option<bool>>>,
+    /// Mints and validates Community presence grants with the Runtime's
+    /// capability manager. `None` (standalone gateway, most tests): no grant
+    /// can be made or honoured, so nobody is announced.
+    presence_authority: Option<Arc<crate::collaboration_presence_grant::PresenceAuthority>>,
+    /// Which person on this Home signed each of its own presence records
+    /// (Profile DID → principal), learned when the record is prepared. The
+    /// only way to use an own record off the Home is `own_history_presence`
+    /// or the queued send boundary, and both re-validate that person's grant.
+    own_principals: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 #[derive(Clone)]
@@ -49,6 +58,7 @@ pub struct PreparedCollaborationPresence {
     core: Arc<CollaborationCore>,
     envelope_bytes: Vec<u8>,
     envelope_sha256: String,
+    principal_id: String,
     sender_profile_did: String,
     display_name: String,
     handle: Option<String>,
@@ -89,12 +99,38 @@ pub struct CollaborationPresenceSnapshotRecord {
     expires_at: u64,
 }
 
-/// Internal route evidence. The signed original still owns all Profile and
-/// conversation authority; capsule projections expose neither it nor routes.
+/// Internal route evidence: where a live member can be reached. It carries no
+/// presence record; this Home's own record leaves only as `UsableOwnPresence`.
 #[derive(Clone)]
 pub(crate) struct HistoryParticipant {
     pub(crate) endpoint_did: String,
-    pub(crate) presence_envelope: String,
+}
+
+/// This Home's own signed presence, obtainable only from
+/// `own_history_presence`, after its person's grant validated just now.
+pub(crate) struct UsableOwnPresence {
+    envelope: String,
+}
+
+impl UsableOwnPresence {
+    pub(crate) fn into_envelope(self) -> String {
+        self.envelope
+    }
+
+    /// Receiver tests build requests from arbitrary records.
+    #[cfg(test)]
+    pub(crate) fn test_unchecked(envelope: String) -> Self {
+        Self { envelope }
+    }
+}
+
+pub(crate) enum OwnHistoryPresence {
+    /// A live own record whose person's grant validates now.
+    Usable(UsableOwnPresence),
+    /// Live own records exist, but no person behind them may be shown now.
+    NotUsable,
+    /// No live own record.
+    Absent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +184,307 @@ impl CollaborationPresenceProductPort {
             core,
             read_model,
             local_publication: Arc::new(std::sync::Mutex::new(None)),
+            presence_authority: None,
+            own_principals: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        })
+    }
+
+    pub(crate) fn with_capability_manager(
+        mut self,
+        capability_manager: Option<Arc<elastos_runtime::capability::CapabilityManager>>,
+    ) -> Self {
+        self.presence_authority = capability_manager.map(|manager| {
+            Arc::new(crate::collaboration_presence_grant::PresenceAuthority::new(
+                manager,
+            ))
+        });
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_presence_authority(
+        mut self,
+        authority: Arc<crate::collaboration_presence_grant::PresenceAuthority>,
+    ) -> Self {
+        self.presence_authority = Some(authority);
+        self
+    }
+
+    pub(crate) fn presence_authority(
+        &self,
+    ) -> Option<&Arc<crate::collaboration_presence_grant::PresenceAuthority>> {
+        self.presence_authority.as_ref()
+    }
+
+    /// Leaving Community stops presence for everyone on this Home.
+    pub(crate) fn community_joined(&self) -> bool {
+        self.core.community_membership().joined()
+    }
+
+    /// The scope a presence grant names: this Community conversation.
+    pub(crate) fn presence_scope(&self) -> crate::collaboration_presence_grant::PresenceScope {
+        let (network_id, conversation_id) = self.core.conversation_scope();
+        crate::collaboration_presence_grant::PresenceScope {
+            network_id: network_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+        }
+    }
+
+    /// Drops this person's queued presence announcements.
+    pub(crate) fn retire_outgoing_presence(&self, principal_id: &str) -> anyhow::Result<()> {
+        self.core.retire_outgoing_presence(principal_id)?;
+        Ok(())
+    }
+
+    /// The person left Always/Only while open: their queued announcements and
+    /// this Home's projected record of them are removed at once, so nothing
+    /// signed under the old answer is shown, sent or carried by history.
+    pub(crate) fn retire_own_presence(
+        &self,
+        principal_id: &str,
+        profile_did: &str,
+    ) -> anyhow::Result<()> {
+        self.retire_outgoing_presence(principal_id)?;
+        let profiles = {
+            let mut principals = self
+                .own_principals
+                .lock()
+                .map_err(|_| anyhow::anyhow!("own presence lock is poisoned"))?;
+            let profiles = principals
+                .iter()
+                .filter(|(_, principal)| principal.as_str() == principal_id)
+                .map(|(profile, _)| profile.clone())
+                .collect::<Vec<_>>();
+            principals.retain(|_, principal| principal != principal_id);
+            if principals.is_empty() {
+                self.record_local_publication(Some(false));
+            }
+            profiles
+        };
+        for profile in profiles {
+            self.read_model.remove_sender(&profile, None)?;
+        }
+        self.read_model.remove_sender(profile_did, None)?;
+        Ok(())
+    }
+
+    /// Publisher maintenance retires a person's state after a current denial.
+    /// Effects separately present their immutable operation binding.
+    pub(crate) async fn retire_denied_current_presence(
+        &self,
+        principal_id: &str,
+        profile_did: &str,
+        now: u64,
+    ) -> bool {
+        let allowed = async {
+            let authority = self.presence_authority()?;
+            if !self.community_joined() {
+                return None;
+            }
+            // The grant is bound to the current Profile, not the Profile in
+            // an old envelope. A replacement Profile revokes the old grant.
+            let root = crate::auth::principal_localhost_root(principal_id);
+            let profile = crate::collaboration_profile_authority::load_profile_authority(
+                self.core.data_root(),
+                principal_id,
+                &root,
+            )
+            .ok()??;
+            let granted = crate::collaboration_presence_grant::current_presence_grant_usable(
+                authority,
+                self.core.data_root(),
+                principal_id,
+                &profile.document().profile_did,
+                &self.presence_scope(),
+                now,
+            )
+            .await;
+            // A stale effect may name an old Profile; its caller retires only
+            // that operation when the current Profile still has a valid grant.
+            Some(granted)
+        }
+        .await
+        .unwrap_or(false);
+        if !allowed {
+            // Denial also retires local state; the next publisher can replace
+            // it only after presenting a current grant.
+            if let Err(error) = self.retire_own_presence(principal_id, profile_did) {
+                tracing::warn!(%error, "Community presence retirement failed");
+            }
+        }
+        allowed
+    }
+
+    async fn check_own_operation(
+        &self,
+        operation: &EspRequestBinding,
+        profile_did: &str,
+        now: u64,
+        retire_denied: bool,
+    ) -> bool {
+        async {
+            let authority = self.presence_authority()?;
+            if !self.community_joined() {
+                return None;
+            }
+            let principal = &operation.principal;
+            let root = crate::auth::principal_localhost_root(principal);
+            let profile = crate::collaboration_profile_authority::load_profile_authority(
+                self.core.data_root(),
+                principal,
+                &root,
+            )
+            .ok()??;
+            Some(
+                crate::collaboration_presence_grant::own_presence_operation_authorized(
+                    authority,
+                    self.core.data_root(),
+                    operation,
+                    &profile.document().profile_did,
+                    &self.presence_scope(),
+                    now,
+                    retire_denied,
+                )
+                .await
+                    && profile.document().profile_did == profile_did,
+            )
+        }
+        .await
+        .unwrap_or(false)
+    }
+
+    fn retire_own_operation(&self, profile_did: &str, envelope_hash: &str) -> anyhow::Result<()> {
+        self.core
+            .retire_outgoing_presence_operation(envelope_hash)?;
+        self.read_model
+            .remove_sender(profile_did, Some(envelope_hash))?;
+        Ok(())
+    }
+
+    pub(crate) async fn own_presence_effect_usable(
+        &self,
+        envelope_hash: &str,
+        profile_did: &str,
+        now: u64,
+    ) -> anyhow::Result<bool> {
+        let operations = self.core.own_presence_operations(now)?;
+        let allowed = match operations.get(envelope_hash) {
+            Some(operation) => {
+                self.check_own_operation(operation, profile_did, now, true)
+                    .await
+            }
+            None => false,
+        };
+        if !allowed {
+            if let Some(operation) = operations.get(envelope_hash).cloned() {
+                // A live replacement grant keeps its own prepared work. No
+                // grant at all, including Hidden, retires every announcement
+                // for this person.
+                if self
+                    .retire_denied_current_presence(&operation.principal, profile_did, now)
+                    .await
+                {
+                    self.retire_own_operation(profile_did, envelope_hash)?;
+                }
+            } else {
+                self.retire_own_operation(profile_did, envelope_hash)?;
+            }
+        }
+        Ok(allowed)
+    }
+
+    /// Verify each local record against the live grant at the read boundary.
+    /// Reads filter denied records; history effects also retire them.
+    async fn authorized_records(
+        &self,
+        now: u64,
+        retire_denied: bool,
+    ) -> anyhow::Result<(Vec<(VerifiedPresence, bool)>, bool)> {
+        let local = self.core.local_device_did();
+        let state = self
+            .read_model
+            .load_state()?
+            .unwrap_or_else(|| self.read_model.empty_state());
+        let mut records = Vec::new();
+        let mut own_seen = false;
+        let mut own_operations = None;
+        for record in state.records {
+            let presence = self.read_model.verify_record(&record)?;
+            if presence.expires_at <= now
+                || presence.issued_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+            {
+                continue;
+            }
+            let authorized = self
+                .core
+                .authorize_stored_product_message(record.envelope.as_bytes())?;
+            let principal = self
+                .own_principals
+                .lock()
+                .ok()
+                .and_then(|principals| principals.get(&presence.sender_profile_did).cloned());
+            let own =
+                principal.is_some() || authorized.sender_profile().authorizes_endpoint(&local);
+            if own {
+                own_seen = true;
+                // Recovery reads verified operation bindings once, including
+                // after restart. It never persists core handoff repair.
+                if own_operations.is_none() {
+                    own_operations = Some(self.core.own_presence_operations(now)?);
+                }
+                let allowed = match own_operations
+                    .as_ref()
+                    .unwrap()
+                    .get(&presence.envelope_sha256)
+                {
+                    Some(operation) => {
+                        self.check_own_operation(
+                            operation,
+                            &presence.sender_profile_did,
+                            now,
+                            retire_denied,
+                        )
+                        .await
+                    }
+                    None => false,
+                };
+                if !allowed {
+                    if retire_denied {
+                        self.retire_own_operation(
+                            &presence.sender_profile_did,
+                            &presence.envelope_sha256,
+                        )?;
+                    }
+                    continue;
+                }
+            }
+            records.push((presence, own));
+        }
+        Ok((records, own_seen))
+    }
+
+    /// Each history request consumes a fresh, validated own record. Remote
+    /// participant handles contain routes only and cannot supply this record.
+    pub(crate) async fn own_history_presence(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<OwnHistoryPresence> {
+        if self
+            .core
+            .is_bootstrap_endpoint(&self.core.local_device_did())
+        {
+            return Ok(OwnHistoryPresence::Absent);
+        }
+        let (records, own_seen) = self.authorized_records(now, true).await?;
+        if let Some((record, _)) = records.into_iter().find(|(_, own)| *own) {
+            return Ok(OwnHistoryPresence::Usable(UsableOwnPresence {
+                envelope: String::from_utf8(record.envelope_bytes)?,
+            }));
+        }
+        Ok(if own_seen {
+            OwnHistoryPresence::NotUsable
+        } else {
+            OwnHistoryPresence::Absent
         })
     }
 
@@ -157,7 +494,8 @@ impl CollaborationPresenceProductPort {
         }
     }
 
-    /// `Some(false)`: the Runtime announces nobody here, so Discovery is off.
+    /// `Some(false)`: the Runtime announces nobody here, because nobody on
+    /// this Home has granted Community presence.
     pub(crate) fn local_publication(&self) -> Option<bool> {
         self.local_publication.lock().ok().and_then(|state| *state)
     }
@@ -184,6 +522,7 @@ impl CollaborationPresenceProductPort {
         if operation != expected {
             anyhow::bail!("Chat presence request binding is invalid");
         }
+        let principal_id = operation.principal.clone();
         let prepared = self.core.prepare_profile_outgoing(
             operation,
             profile,
@@ -192,7 +531,12 @@ impl CollaborationPresenceProductPort {
             now,
             PRESENCE_TTL_SECS,
         )?;
-        prepared_presence(self.core.clone(), &prepared)
+        let prepared = prepared_presence(self.core.clone(), &prepared)?;
+        if let Ok(mut principals) = self.own_principals.lock() {
+            principals.retain(|_, principal| principal != &principal_id);
+            principals.insert(prepared.sender_profile_did.clone(), principal_id);
+        }
+        Ok(prepared)
     }
 
     pub(crate) fn pending_outgoing_presences(
@@ -207,7 +551,42 @@ impl CollaborationPresenceProductPort {
             .collect())
     }
 
-    pub fn project_prepared_presence(
+    pub(crate) async fn project_authorized_presence(
+        &self,
+        prepared: &PreparedCollaborationPresence,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        self.require_prepared(prepared)?;
+        if self
+            .own_presence_effect_usable(
+                &prepared.envelope_sha256,
+                &prepared.sender_profile_did,
+                now,
+            )
+            .await?
+        {
+            self.own_principals
+                .lock()
+                .map_err(|_| anyhow::anyhow!("own presence lock is poisoned"))?
+                .insert(
+                    prepared.sender_profile_did.clone(),
+                    prepared.principal_id.clone(),
+                );
+            self.project_prepared_presence_inner(prepared, now)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project_prepared_presence(
+        &self,
+        prepared: &PreparedCollaborationPresence,
+        now: u64,
+    ) -> anyhow::Result<CollaborationPresenceProjectionOutcome> {
+        self.project_prepared_presence_inner(prepared, now)
+    }
+
+    fn project_prepared_presence_inner(
         &self,
         prepared: &PreparedCollaborationPresence,
         now: u64,
@@ -228,7 +607,48 @@ impl CollaborationPresenceProductPort {
             .collect())
     }
 
+    pub(crate) async fn project_authorized_handoff(
+        &self,
+        handoff: &CollaborationPresenceHandoff,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        self.require_handoff(handoff)?;
+        let authorized = self
+            .core
+            .authorize_stored_product_message(&handoff.envelope_bytes)?;
+        if authorized
+            .sender_profile()
+            .authorizes_endpoint(&self.core.local_device_did())
+        {
+            let allowed = self
+                .own_presence_effect_usable(
+                    &handoff.envelope_sha256,
+                    &handoff.sender_profile_did,
+                    now,
+                )
+                .await?;
+            if !allowed {
+                self.read_model
+                    .remove_sender(&handoff.sender_profile_did, Some(&handoff.envelope_sha256))?;
+                self.core
+                    .acknowledge_product_handoff(&handoff.envelope_sha256)?;
+                return Ok(());
+            }
+        }
+        self.project_handoff_inner(handoff, now)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn project_handoff(
+        &self,
+        handoff: &CollaborationPresenceHandoff,
+        now: u64,
+    ) -> anyhow::Result<CollaborationPresenceProjectionOutcome> {
+        self.project_handoff_inner(handoff, now)
+    }
+
+    fn project_handoff_inner(
         &self,
         handoff: &CollaborationPresenceHandoff,
         now: u64,
@@ -240,6 +660,28 @@ impl CollaborationPresenceProductPort {
         Ok(outcome)
     }
 
+    /// Reads filter local records whose live grant fails without writing state.
+    /// Remote records retain their signed TTL and Profile authority.
+    pub(crate) async fn authorized_snapshot(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<CollaborationPresenceSnapshot> {
+        let (records, _) = self.authorized_records(now, false).await?;
+        let mut records = records
+            .into_iter()
+            .map(|(record, _)| CollaborationPresenceSnapshotRecord {
+                sender_profile_did: record.sender_profile_did,
+                display_name: record.display_name,
+                handle: record.handle,
+                last_seen_at: record.issued_at,
+                expires_at: record.expires_at,
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.sender_profile_did.cmp(&right.sender_profile_did));
+        Ok(CollaborationPresenceSnapshot { records })
+    }
+
+    #[cfg(test)]
     pub fn snapshot(&self, now: u64) -> anyhow::Result<CollaborationPresenceSnapshot> {
         self.read_model.snapshot(now)
     }
@@ -266,7 +708,6 @@ impl CollaborationPresenceProductPort {
                 }
                 peers.push(HistoryParticipant {
                     endpoint_did: endpoint.to_string(),
-                    presence_envelope: record.envelope,
                 });
             }
         }
@@ -463,6 +904,7 @@ impl PresenceReadModel {
         }
     }
 
+    #[cfg(test)]
     fn snapshot(&self, now: u64) -> anyhow::Result<CollaborationPresenceSnapshot> {
         let state = self.load_state()?.unwrap_or_else(|| self.empty_state());
         let mut records = state
@@ -556,6 +998,39 @@ impl PresenceReadModel {
             self.write_state(&state)?;
         }
         Ok(outcome)
+    }
+
+    /// An operation denial removes only that operation's current projection.
+    /// A person's explicit answer passes None to remove all their projections.
+    fn remove_sender(
+        &self,
+        profile_did: &str,
+        envelope_hash: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let _in_process = self
+            .mutation_mutex
+            .lock()
+            .map_err(|_| anyhow::anyhow!("presence mutation lock is poisoned"))?;
+        self.ensure_state_directory()?;
+        let _file_lock = lock_owner_only_file(&self.lock_path())?;
+        let Some(mut state) = self.load_state()? else {
+            return Ok(false);
+        };
+        let before = state.records.len();
+        state.records.retain(|record| {
+            self.verify_record(record)
+                .map(|existing| {
+                    existing.sender_profile_did != profile_did
+                        || envelope_hash.is_some_and(|hash| existing.envelope_sha256 != hash)
+                })
+                .unwrap_or(true)
+        });
+        if state.records.len() == before {
+            return Ok(false);
+        }
+        self.validate_state(&state)?;
+        self.write_state(&state)?;
+        Ok(true)
     }
 
     fn verify_envelope(&self, envelope_bytes: &[u8]) -> anyhow::Result<VerifiedPresence> {
@@ -726,8 +1201,14 @@ fn prepared_presence(
 ) -> anyhow::Result<PreparedCollaborationPresence> {
     let authorized = core.authorize_stored_product_message(prepared.envelope_bytes())?;
     let presence = presence_from_authorized(prepared.envelope_bytes(), &authorized)?;
+    let principal_id = prepared
+        .presence_sender()
+        .ok_or_else(|| anyhow::anyhow!("presence has no principal binding"))?
+        .0
+        .to_string();
     Ok(PreparedCollaborationPresence {
         core,
+        principal_id,
         envelope_bytes: presence.envelope_bytes,
         envelope_sha256: presence.envelope_sha256,
         sender_profile_did: presence.sender_profile_did,

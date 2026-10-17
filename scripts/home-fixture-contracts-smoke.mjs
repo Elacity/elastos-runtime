@@ -144,7 +144,7 @@ test("restored-lifecycle summary satisfies the actual Home appearance parser", (
   assert.equal(summary.authority.session_id, "fixture-session");
   for (const field of ["notifications", "desktop_objects", "capsule_catalog", "capsule_interfaces"]) assert(!Array.isArray(summary[field]), field);
   assert.match(lifecycle, /ELASTOS_BROWSER_EXECUTABLE/);
-  assert.match(lifecycle, /elastos.people.discovery\/v1/);
+  assert.doesNotMatch(lifecycle, /collaboration\/presence/, "Home no longer announces Community presence");
 });
 test("bootstrap wait fails before polling after a captured page error", async () => {
   const context = vm.createContext({
@@ -154,25 +154,6 @@ test("bootstrap wait fails before polling after a captured page error", async ()
   });
   vm.runInContext(fn(lifecycle, "waitFor"), context);
   await assert.rejects(context.waitFor(() => false, 15_000, "Home bootstrap"), /fixture bootstrap exception/);
-});
-test("presence fixture retains Home token admission and the Runtime response shape", async () => {
-  const responses = [];
-  const context = vm.createContext({
-    homeAuthorityToken: "fixture-home-token",
-    assert: (condition, message) => assert(condition, message),
-    json: (_res, status, body) => responses.push({ status, body }),
-    readBody: async (req) => req.body,
-  });
-  for (const name of ["requireToken", "handleApi"]) vm.runInContext(fn(lifecycle, name), context);
-  const url = new URL("https://fixture.test/api/apps/home/collaboration/presence");
-  const req = { method: "POST", headers: { "x-elastos-home-token": "fixture-home-token" }, body: {} };
-  assert.equal(await context.handleApi(req, {}, url), true);
-  assert.equal(responses[0].status, 200);
-  assert.equal(responses[0].body.schema, "elastos.people.discovery/v1");
-  assert.equal(responses[0].body.configured, false);
-  await context.handleApi({ ...req, headers: {} }, {}, url);
-  assert.equal(responses[1].status, 401);
-  await assert.rejects(context.handleApi({ ...req, body: { principal_id: "other" } }, {}, url), /empty admitted request/);
 });
 test("System fixture retains four tests and bootstrap assertions without temporary tracing", () => {
   const source = read("scripts/system-window-policy-browser-smoke.mjs");

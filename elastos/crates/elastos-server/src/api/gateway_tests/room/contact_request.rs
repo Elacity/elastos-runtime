@@ -425,3 +425,88 @@ async fn left_home_refuses_new_contact_intent_and_both_inbox_decisions_without_m
     assert_eq!(home.store.snapshot().unwrap().contacts().len(), 1);
     assert_eq!(home.outgoing_requests(), 1);
 }
+
+#[tokio::test]
+async fn community_presence_choice_is_the_callers_own_and_separate_from_discovery() {
+    let mut home = ContactRequestHome::new().await;
+    let chat =
+        crate::collaboration_product::test_chat_product_port(home.dir.path(), NETWORK, "community");
+    let mut state = test_state(home.dir.path());
+    state.collaboration_discovery_service = Some(home.service.clone());
+    state.collaboration_presence_product_port = Some(
+        crate::collaboration_presence::CollaborationPresenceProductPort::new(
+            chat.test_core().clone(),
+        )
+        .unwrap()
+        .with_presence_authority(crate::collaboration_presence_grant::test_authority()),
+    );
+    home.app = gateway_router(state);
+    const CHAT_PATH: &str = "/api/apps/chat-room/community-presence/request";
+    const SYSTEM_PATH: &str = "/api/apps/system/community/presence";
+    let contact_file = elastos_common::localhost::rooted_localhost_fs_path(
+        home.dir.path(),
+        &format!(
+            "{}/.AppData/ElastOS/People/contact-state.json",
+            home.store.localhost_root()
+        ),
+    )
+    .unwrap();
+    let contacts_before = std::fs::read(&contact_file).ok();
+    let discovery_before = home.store.discovery_enabled().unwrap();
+
+    // No token, or a body that names anyone, changes nothing.
+    let (status, _) = home
+        .post(SYSTEM_PATH, None, serde_json::json!({ "mode": "always" }))
+        .await;
+    assert!(status.is_client_error(), "{status}");
+    let (status, _) = home
+        .post(
+            SYSTEM_PATH,
+            Some(&home.authority.system_token),
+            serde_json::json!({ "mode": "always", "principal_id": "someone-else" }),
+        )
+        .await;
+    assert!(status.is_client_error(), "{status}");
+    // Chat's token cannot choose for the person.
+    let (status, _) = home
+        .post(
+            SYSTEM_PATH,
+            Some(&home.chat_token),
+            serde_json::json!({ "mode": "always" }),
+        )
+        .await;
+    assert!(status.is_client_error(), "{status}");
+
+    // Chat only asks; the answer stays the person's.
+    let (status, body) = home
+        .post(CHAT_PATH, Some(&home.chat_token), serde_json::json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["community_presence"], "requested");
+    assert_eq!(body["joined"], true);
+
+    // System's row is the caller's own choice and leaves Discovery and the
+    // contact store exactly as they were.
+    for (mode, expected) in [
+        ("always", "always"),
+        ("while_open", "while_open"),
+        ("hidden", "hidden"),
+    ] {
+        let (status, body) = home
+            .post(
+                SYSTEM_PATH,
+                Some(&home.authority.system_token),
+                serde_json::json!({ "mode": mode }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains(&format!(r#""community_presence":"{expected}""#)),
+            "{body}"
+        );
+        assert!(!body.contains("token"), "{body}");
+    }
+    assert_eq!(home.store.discovery_enabled().unwrap(), discovery_before);
+    assert_eq!(std::fs::read(&contact_file).ok(), contacts_before);
+}
