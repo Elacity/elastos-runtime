@@ -136,6 +136,7 @@ import {
 import {
   bindInboxRail,
   retireInboxRail,
+  hideInboxRail,
   toggleInboxRail,
   showInboxRail,
   inboxRailFrame,
@@ -371,6 +372,11 @@ export function openHomeGuiTarget(target, options = {}) {
       console.error("connector sheet open failed", error);
     });
     return;
+  }
+  if (target !== "inbox") {
+    // An Open from the inbox rail must reveal the target, not leave the
+    // rail covering it (#92).
+    hideInboxRail({ restoreFocus: false });
   }
   openTarget(target, options);
 }

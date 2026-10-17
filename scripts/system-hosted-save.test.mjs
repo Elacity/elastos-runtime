@@ -653,9 +653,10 @@ test("an auth refusal right after a restart reloads once instead of a dead end",
 
 test("Home update summary refreshes share one bounded request", async () => {
   const f = updateFixture();
-  let finish, reads = 0, communityReads = 0;
+  let finish, reads = 0, communityReads = 0, presenceReads = 0;
   f.context.fetchJson = () => { reads++; return new Promise(resolve => { finish = resolve; }); };
   f.context.refreshCommunityMembership = async () => { communityReads++; };
+  f.context.refreshCommunityPresence = async () => { presenceReads++; };
   f.context.renderSystemSummary = value => { f.context.renderRuntimeUpdate(value.runtime_update); };
   const refresh = source.slice(source.indexOf("async function refreshSystemSummary() {"), source.indexOf("async function fetchJson("));
   vm.runInContext(refresh, f.context);
@@ -666,6 +667,7 @@ test("Home update summary refreshes share one bounded request", async () => {
   finish({ runtime_update: f.offer });
   await Promise.all([first, second]);
   assert.equal(communityReads, 1, "one shared summary refresh also reads current Community membership once");
+  assert.equal(presenceReads, 1, "and the person's own Community choice once");
   assert.equal(f.context.systemSummaryInFlight, null);
   assert(![...f.timers.values()].some(timer => timer.delay === 10_000));
   f.context.fetchJson = (_url, init) => new Promise((_resolve, reject) => {
@@ -698,7 +700,7 @@ test("System startup and recovery stay ready while the background Carrier check 
       refreshCapsuleCatalog: async () => calls.push("catalogue"),
     });
     for (const name of ["configureSettingsTabs", "configureSettingsSearch", "activateSettingsTab",
-      "configureAppearanceEditor", "configureAppearancePreferences", "configureGuestAccess", "configureCommunityMembership",
+      "configureAppearanceEditor", "configureAppearancePreferences", "configureGuestAccess", "configureCommunityMembership", "configureCommunityPresence",
       "configureAiProvider", "configurePasskeyAccess", "configureRecoveryAccess", "configureChainAccess",
       "configureActiveShell", "configureCapsuleCatalog", "configureTechnicalDetails", "configureDeviceDidCopy",
       "configureRuntimeUpdate", "configureHomeRecoverySave"]) context[name] = () => {};
@@ -852,4 +854,60 @@ test("Community missing configuration stays hidden and malformed state cannot en
   assert.equal(f.button.disabled, true);
   assert.throws(() => f.context.renderCommunityMembership({ schema: "foreign", configured: true, joined: true }));
   assert.equal(f.button.disabled, true);
+});
+
+test("Show me in Community offers three modes, sets only the caller's own and reverts on refusal", async () => {
+  const row = { hidden: true };
+  const option = mode => {
+    const attrs = new Map([["aria-checked", "false"]]), classes = new Set();
+    return {
+      dataset: { presenceMode: mode }, disabled: true, classes,
+      classList: { toggle: (name, on) => (on ? classes.add(name) : classes.delete(name)) },
+      setAttribute: (key, value) => attrs.set(key, value), getAttribute: key => attrs.get(key),
+    };
+  };
+  const options = ["always", "while_open", "hidden"].map(option);
+  const checked = () => options.filter(o => o.getAttribute("aria-checked") === "true").map(o => o.dataset.presenceMode);
+  const fields = new Map(), hidden = new Map(), requests = [];
+  let reply = { schema: "elastos.community-presence/v1", configured: true, joined: true, community_presence: "requested" };
+  const context = vm.createContext({
+    communityPresenceRow: row, communityPresenceOptions: options, hasShellAccess: () => true,
+    setTextFields: (key, value) => fields.set(key, value),
+    setHiddenFields: (key, value) => hidden.set(key, value),
+    shellHeaders: value => value || {}, publicSystemError: (_, fallback) => fallback,
+    AbortController, runtimeUpdateRequests: new Set(),
+    window: { setTimeout: () => 1, clearTimeout: () => {} },
+    fetchJson: async (path, init) => { requests.push({ path, ...init }); return reply; },
+  });
+  const start = source.indexOf("function configureCommunityPresence(");
+  const end = source.indexOf("function configureAiProvider(", start);
+  const fetchStart = source.indexOf("async function fetchRuntimeUpdateJson(");
+  const fetchEnd = source.indexOf("async function onRuntimeUpdateApply(", fetchStart);
+  vm.runInContext(`let communityPresenceBusy = false; ${source.slice(start, end)} ${source.slice(fetchStart, fetchEnd)}`, context);
+
+  await context.refreshCommunityPresence();
+  assert.equal(row.hidden, false);
+  assert.deepEqual(checked(), [], "an open request shows no choice until the person makes one");
+  assert.ok(options.every(o => !o.disabled));
+
+  reply = { ...reply, community_presence: "while_open" };
+  await context.updateCommunityPresence("while_open");
+  const post = requests.at(-1);
+  assert.equal(post.path, "/api/apps/system/community/presence");
+  assert.deepEqual(JSON.parse(post.body), { mode: "while_open" });
+  assert.deepEqual(checked(), ["while_open"]);
+  assert.ok(options.find(o => o.dataset.presenceMode === "while_open").classes.has("active"));
+
+  context.fetchJson = async () => { throw new Error("request failed: 409"); };
+  await context.updateCommunityPresence("always");
+  assert.deepEqual(checked(), ["while_open"], "a refused change keeps the last accepted choice");
+  assert.equal(hidden.get("community-presence-status"), false);
+
+  context.fetchJson = async () => ({ ...reply, community_presence: "refused" });
+  await context.refreshCommunityPresence();
+  assert.deepEqual(checked(), ["hidden"], "Never in Inbox shows as Hidden");
+
+  context.fetchJson = async () => ({ ...reply, joined: false, community_presence: "always" });
+  await context.refreshCommunityPresence();
+  assert.ok(options.every(o => o.disabled), "a Home that left Community cannot change it until it rejoins");
 });

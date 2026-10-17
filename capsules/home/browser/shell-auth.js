@@ -682,6 +682,23 @@ async function selectRecoveryKit() {
   renderEnrollmentChoice();
 }
 
+// What a full-import response still lacks, as one plain next step, or "" when
+// it completed. Only the Home's own recovery record missing is not a failed
+// recovery: the account, Profile and Wallet are back, and the same kit finishes
+// the record.
+export function recoveryImportIncompleteMessage(response) {
+  const people = response?.people_identity_restore?.status;
+  if (response?.schema === "elastos.full-recovery-bundle.import.response/v2"
+    && response.wallet_restore?.status === "complete"
+    && people === "restored") {
+    return response.runtime_audit?.status === "complete" ? ""
+      : "Your account, Profile and Wallet were recovered. Only this Home's recovery record did not save. Choose the same kit again to finish it.";
+  }
+  return people === "absent"
+    ? "The root was recovered. This kit has no signed Profile or name. Choose a newer kit that includes your Profile."
+    : "The root was recovered. Profile or Wallet recovery still needs completion. Choose the same kit again to retry safely.";
+}
+
 async function completeEnrollmentRecovery() {
   setUnlockStatus("Restoring your account and signed Profile.", "muted");
   const headers = { "x-elastos-home-token": recoverySession.home_token };
@@ -717,14 +734,8 @@ async function completeEnrollmentRecovery() {
     setHomeAuthorityToken(response.home_token);
   }
   recoveryTerminalToken = readText(response.runtime_audit?.retry_token);
-  if (response.schema !== "elastos.full-recovery-bundle.import.response/v2"
-    || response.wallet_restore?.status !== "complete"
-    || response.runtime_audit?.status !== "complete"
-    || response.people_identity_restore?.status !== "restored") {
-    throw new Error(response.people_identity_restore?.status === "absent"
-      ? "The root was recovered. This kit has no signed Profile or name. Choose a newer kit that includes your Profile."
-      : "The root was recovered. Profile, Wallet, or audit recovery still needs completion. Choose the same kit again to retry safely.");
-  }
+  const incomplete = recoveryImportIncompleteMessage(response);
+  if (incomplete) throw new Error(incomplete);
   const refreshed = await refreshHomeSession();
   recoverySession = refreshed;
   const summary = await fetchJson("/api/apps/home/summary", {
