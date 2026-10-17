@@ -20,8 +20,9 @@ Browser contracts. Capsules must not branch on Windows or learn host topology.
 ## First Windows product: WSL2
 
 The first honest Windows product runs the Linux Runtime locally inside WSL2.
-The executed proof for that product is
-[issue #265](https://github.com/Elacity/elastos-runtime/issues/265).
+[Issue #265](https://github.com/Elacity/elastos-runtime/issues/265) owns the
+proof for that product. Until its acceptance items are proven, this section is
+a target, not a result.
 
 - Package the Runtime as a signed or importable ElastOS WSL distribution.
 - A Windows launcher starts, stops, updates, and health-checks the Linux
@@ -58,11 +59,22 @@ Inside a distro, `uname -s` is `Linux`. `detect_platform`
 that is not `Linux` or `Darwin`. A Windows launcher starts the distro and runs
 the Linux installer and binary there.
 
+### Tools in the distro
+
+The installer needs `curl`, `python3`, and `sha256sum` or `shasum` inside the
+distro (`scripts/install.sh:35`). It stops before it downloads anything when
+`curl` or `python3` is missing or `python3` does not run, and when neither
+SHA-256 tool is present (`scripts/install.sh:1177-1191`). `python3` runs the
+release checks: `verify_signature` (`scripts/install.sh:683`) and
+`validate_release_identity` (`scripts/install.sh:830`). A WSL2 distro without
+`python3` cannot install the Runtime. A launcher checks for these tools, or
+installs them, before it runs `install.sh`.
+
 ### Home origin
 
 The [launcher contract](LAUNCHER_CONTRACT.md#readiness-and-home-url) is the
 one source for the Home URL that a launcher opens and for the passkey origin.
-This note does not repeat that value. It records what the Runtime code serves:
+This note does not repeat the URL. It records what the Runtime code serves:
 
 - `elastos home --browser` binds the host name `localhost` at
   `BROWSER_HOME_PORT` (`gateway_entry.rs:17-31`,
@@ -82,21 +94,26 @@ This note does not repeat that value. It records what the Runtime code serves:
   `127.0.0.1` at the same port (`main.rs:438-441`).
 
 `localhost` and `127.0.0.1` are different browser origins. A passkey that is
-registered on one origin does not sign in on the other. The desktop launcher
-and the launcher contract do not use the same host name for the Home origin
-today. That is an open gap. The team decides the canonical origin, and this
-note does not choose one.
+registered on one origin does not sign in on the other. Browsers refuse
+passkeys (WebAuthn) on an IP-address origin such as `http://127.0.0.1:8090`,
+so passkeys work only on `localhost`. The Home origin is decided: `localhost`
+everywhere. The launcher contract states it, and a WSL2 launcher opens and
+probes Home on `localhost`, as on every other computer.
 
 `docs/INSTALL.md` describes `elastos home --browser`. The source-build guides
 `docs/MAC.md` and `docs/HOME_LOCAL_SETUP.md` use a developer gateway on a
 different port. That is a developer lane, not the installed product.
 
-`elastos home --browser` opens a browser itself. `browser_home_ready`
+`elastos home --browser` can open a browser itself. `browser_home_ready`
 (`gateway_entry.rs:33-40`) prints the URL and calls `open_browser`
-(`main.rs:2268-2283`). On Linux, `open_browser` tries `wslview` and then
-`xdg-open`. It skips the open after an update restart
-(`ELASTOS_UPDATE_RESTART=1`). There is no flag that stops this open, so a
-launcher that also opens Home makes a second tab. That is a gap.
+(`main.rs:2268-2283`). On Linux, `open_browser` starts `wslview` and, if that
+cannot start, `xdg-open`. It does not check that a page opened. It skips the
+open after an update restart (`ELASTOS_UPDATE_RESTART=1`). There is no flag
+that stops this open. A launcher that runs `elastos home --browser` and also
+opens Home can thus get a second tab. This is possible, not certain: it
+depends on whether `wslview` or `xdg-open` is in the distro and can reach a
+Windows browser. That is a gap. `elastos gateway` (`gateway_entry.rs:1-15`)
+opens no browser.
 
 ### Release verification
 
