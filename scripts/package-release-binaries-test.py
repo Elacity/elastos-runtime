@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Package names and binary checks for scripts/package-release-binaries.sh."""
 
+import importlib.util
 import json
 import os
 import shutil
@@ -125,6 +126,12 @@ class PackageReleaseNameTest(unittest.TestCase):
     def test_intel_package_key_prints_and_packaging_refuses_the_tarball(self):
         platforms = json.loads((ROOT / "scripts/release-platforms.json").read_text())
         self.assertEqual(platforms["darwin-amd64"], "x86_64-darwin")
+        # The release id behind that key is outside the signer's allowlist.
+        spec = importlib.util.spec_from_file_location(
+            "release_signer_platforms", ROOT / "scripts/release-signer.py")
+        signer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(signer)
+        self.assertNotIn(platforms["darwin-amd64"], signer.RELEASE_PLATFORMS)
         printed = package_name("Darwin", "x86_64")
         self.assertEqual(printed.returncode, 0, printed.stderr)
         self.assertEqual(printed.stdout.strip(), "darwin-amd64")
