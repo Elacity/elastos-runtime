@@ -14,6 +14,7 @@ export function plainTextFromClipboardEvent(event) {
 }
 
 export function bindBrowserInputSurface({
+  captureViewerOwnerGuard,
   copyRemoteClipboardToHost,
   friendlyOpenError,
   getCurrentPage,
@@ -28,13 +29,25 @@ export function bindBrowserInputSurface({
   unlockRemoteAudioFromGesture,
 }) {
   let wheelTimer = 0;
-  let wheelDelta = { x: 0, y: 0 };
+  let wheelBatch = null;
   let touchPanState = null;
   let suppressSyntheticClickUntil = 0;
   const hostModifierState = {
     control: false,
     meta: false,
   };
+
+  function retireTouchPan() {
+    const retired = touchPanState;
+    // Drop ownership before releasing capture: lostpointercapture may run now.
+    touchPanState = null;
+    if (!retired) return null;
+    suppressSyntheticClickUntil = Date.now() + 700;
+    if (renderPanel.hasPointerCapture?.(retired.pointerId)) {
+      renderPanel.releasePointerCapture(retired.pointerId);
+    }
+    return retired;
+  }
 
   function focusKeyboardCapture() {
     const target = keyboardCapture || renderPanel;
@@ -187,7 +200,10 @@ export function bindBrowserInputSurface({
     };
   }
 
-  function sendClickFromEvent(event) {
+  function sendClickFromEvent(event, ownerActive = captureViewerOwnerGuard()) {
+    if (!ownerActive()) {
+      return;
+    }
     unlockRemoteAudioFromGesture();
     const point = browserPointFromEvent(event);
     if (!point) {
@@ -199,7 +215,9 @@ export function bindBrowserInputSurface({
       { type: "click", x: point.x, y: point.y },
       { history: "push" },
     ).catch((error) => {
-      showStatus(friendlyOpenError(error), { sticky: true });
+      if (ownerActive()) {
+        showStatus(friendlyOpenError(error), { sticky: true });
+      }
     });
   }
 
@@ -212,29 +230,60 @@ export function bindBrowserInputSurface({
   }
 
   function queueWheelInput(point, deltaX, deltaY) {
-    wheelDelta.x += deltaX;
-    wheelDelta.y += deltaY;
+    if (wheelBatch && !wheelBatch.ownerActive()) {
+      window.clearTimeout(wheelTimer);
+      wheelBatch = null;
+    }
+    if (!wheelBatch) {
+      const ownerActive = captureViewerOwnerGuard();
+      if (!ownerActive()) {
+        return;
+      }
+      wheelBatch = { ownerActive, x: 0, y: 0, point };
+    }
+    const batch = wheelBatch;
+    batch.x += deltaX;
+    batch.y += deltaY;
+    batch.point = point;
     window.clearTimeout(wheelTimer);
     wheelTimer = window.setTimeout(() => {
-      const delta = wheelDelta;
-      wheelDelta = { x: 0, y: 0 };
+      if (wheelBatch !== batch) {
+        return;
+      }
+      wheelTimer = 0;
+      wheelBatch = null;
+      if (!batch.ownerActive()) {
+        return;
+      }
       sendBrowserInput(
         {
           type: "wheel",
-          x: point?.x,
-          y: point?.y,
-          delta_x: delta.x,
-          delta_y: delta.y,
+          x: batch.point?.x,
+          y: batch.point?.y,
+          delta_x: batch.x,
+          delta_y: batch.y,
         },
         { history: "replace" },
-      ).catch((error) =>
-        showStatus(friendlyOpenError(error), { sticky: true }),
-      );
+      ).catch((error) => {
+        if (batch.ownerActive()) {
+          showStatus(friendlyOpenError(error), { sticky: true });
+        }
+      });
     }, WHEEL_FLUSH_MS);
   }
 
+  function isSyntheticTouchClick(event) {
+    // Touch and pen taps dispatch once from pointerup under the captured
+    // owner. Their later click event cannot capture a replacement owner.
+    if (event.pointerType === "touch" || event.pointerType === "pen" ||
+        event.sourceCapabilities?.firesTouchEvents === true) return true;
+    // Older hosts report compatibility clicks without pointer provenance.
+    // A known mouse remains independent from that short touch fallback.
+    return event.pointerType !== "mouse" && Date.now() < suppressSyntheticClickUntil;
+  }
+
   remoteVideo.addEventListener("click", (event) => {
-    if (Date.now() < suppressSyntheticClickUntil) {
+    if (isSyntheticTouchClick(event)) {
       event.preventDefault();
       return;
     }
@@ -243,7 +292,7 @@ export function bindBrowserInputSurface({
   });
 
   renderPanel.addEventListener("click", (event) => {
-    if (Date.now() < suppressSyntheticClickUntil) {
+    if (isSyntheticTouchClick(event)) {
       event.preventDefault();
       return;
     }
@@ -262,13 +311,24 @@ export function bindBrowserInputSurface({
       if (event.pointerType !== "touch" && event.pointerType !== "pen") {
         return;
       }
+      // An owner that has retired cannot reserve the next page's gesture.
+      if (touchPanState && !touchPanState.ownerActive()) retireTouchPan();
+      // The current owner keeps its first pointer until that gesture ends.
+      if (touchPanState) {
+        return;
+      }
       if (!getCurrentPage()) {
+        return;
+      }
+      const ownerActive = captureViewerOwnerGuard();
+      if (!ownerActive()) {
         return;
       }
       event.preventDefault();
       focusKeyboardCapture();
       touchPanState = {
         pointerId: event.pointerId,
+        ownerActive,
         x: event.clientX,
         y: event.clientY,
         moved: false,
@@ -283,12 +343,15 @@ export function bindBrowserInputSurface({
     (event) => {
       if (
         !touchPanState ||
-        event.pointerId !== touchPanState.pointerId ||
-        !getCurrentPage()
+        event.pointerId !== touchPanState.pointerId
       ) {
         return;
       }
       event.preventDefault();
+      if (!touchPanState.ownerActive() || !getCurrentPage()) {
+        retireTouchPan();
+        return;
+      }
       const dx = touchPanState.x - event.clientX;
       const dy = touchPanState.y - event.clientY;
       if (Math.abs(dx) < 1 && Math.abs(dy) < 1) {
@@ -305,26 +368,28 @@ export function bindBrowserInputSurface({
   renderPanel.addEventListener(
     "pointerup",
     (event) => {
+      // A retired finger can remain down longer than the fallback window.
+      // Renew it at release without taking ownership from a fresh pointer.
+      if (event.pointerType === "touch" || event.pointerType === "pen") {
+        suppressSyntheticClickUntil = Date.now() + 700;
+      }
       if (!touchPanState || event.pointerId !== touchPanState.pointerId) {
         return;
       }
       event.preventDefault();
-      renderPanel.releasePointerCapture?.(event.pointerId);
-      const moved = touchPanState.moved;
-      touchPanState = null;
-      suppressSyntheticClickUntil = Date.now() + 700;
+      const { moved, ownerActive } = retireTouchPan();
       if (!moved) {
-        sendClickFromEvent(event);
+        sendClickFromEvent(event, ownerActive);
       }
     },
     { passive: false },
   );
 
-  renderPanel.addEventListener("pointercancel", (event) => {
-    if (touchPanState?.pointerId === event.pointerId) {
-      touchPanState = null;
-    }
-  });
+  for (const type of ["pointercancel", "lostpointercapture"]) {
+    renderPanel.addEventListener(type, (event) => {
+      if (touchPanState?.pointerId === event.pointerId) retireTouchPan();
+    });
+  }
 
   renderPanel.addEventListener(
     "wheel",
@@ -333,9 +398,12 @@ export function bindBrowserInputSurface({
         return;
       }
       unlockRemoteAudioFromGesture();
+      const point = browserPointFromEvent(event);
+      if (!point) {
+        return;
+      }
       event.preventDefault();
       focusKeyboardCapture();
-      const point = browserPointFromEvent(event);
       queueWheelInput(point, event.deltaX, event.deltaY);
     },
     { passive: false },

@@ -34,4 +34,8 @@ if ! installed "$browser" playwright 1.60.0 || ! installed "$core" playwright-co
 fi
 export NODE_PATH="${browser}/node_modules"
 export BROWSER_OPERATOR_PLAYWRIGHT_CORE="${core}/node_modules/playwright-core"
+export ELASTOS_PLAYWRIGHT_MODULE="${browser}/node_modules/playwright/index.mjs"
+node scripts/browser-window-close-headless-smoke.mjs
+node scripts/home-browser-restored-lifecycle-headless-smoke.mjs
+bash scripts/browser-selkies-control-service-smoke.sh --control-only
 exec node --test --test-force-exit --test-timeout=60000 --test-reporter=spec elastos/esp/projections.test.mjs scripts/*.test.mjs scripts/build/*.test.mjs scripts/lib/*.test.mjs capsules/*/browser/*.test.mjs capsules/*/browser/src/*.test.mjs scripts/home-fixture-contracts-smoke.mjs scripts/documents-save-conflict-smoke.mjs scripts/gba-save-conflict-smoke.mjs scripts/assistant-shell-smoke.mjs scripts/model-preparation-failure-smoke.mjs scripts/model-management-browser-smoke.mjs

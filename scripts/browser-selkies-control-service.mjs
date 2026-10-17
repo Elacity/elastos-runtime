@@ -3156,6 +3156,7 @@ class CdpClient {
   }
 
   async connect(timeoutMs) {
+    this._browserDomainsReady = null;
     await this.ws.connect(timeoutMs);
     this.closed = false;
     this.ws.onText((message) => this.handleMessage(message));
@@ -3273,6 +3274,7 @@ class CdpClient {
   }
 
   close() {
+    this._browserDomainsReady = null;
     this.closed = true;
     this.ws.close();
   }
@@ -4501,8 +4503,7 @@ async function refreshBrowserPageState(browserPage, timeoutMs) {
     return cachedBrowserPageState(browserPage);
   }
   return withBrowserCdp(browserPage, timeoutMs, async (cdp) => {
-    await cdp.request("Page.enable");
-    await cdp.request("Runtime.enable");
+    await ensureBrowserCdpDomains(cdp);
     await ensureBrowserFileChooserInterception(cdp, browserPage);
     return browserPageStateFromCdp(browserPage, cdp, timeoutMs);
   });
@@ -5361,6 +5362,28 @@ async function browserRefInput(page, event, isCurrent) {
   }
 }
 
+// Reuse only domain enablement on this connection; chooser and page state stay separate.
+async function ensureBrowserCdpDomains(cdp) {
+  if (cdp.closed) throw new Error("browser CDP WebSocket closed");
+  if (!cdp._browserDomainsReady) {
+    cdp._browserDomainsReady = (async () => {
+      await cdp.request("Page.enable");
+      await cdp.request("Runtime.enable");
+    })();
+  }
+  const pending = cdp._browserDomainsReady;
+  try {
+    await pending;
+    if (cdp.closed) throw new Error("browser CDP WebSocket closed");
+    if (cdp._browserDomainsReady !== pending) {
+      throw new Error("browser CDP preparation was replaced");
+    }
+  } catch (error) {
+    if (cdp._browserDomainsReady === pending) cdp._browserDomainsReady = null;
+    throw error;
+  }
+}
+
 async function withBrowserCdp(browserPage, timeoutMs, action, { retryAction = true } = {}) {
   if (!browserPage?.debugger_url) {
     throw new Error("browser page debugger URL is unavailable");
@@ -5444,8 +5467,7 @@ function keyEventDefinition(key) {
 async function dispatchBrowserInputEvent(browserPage, event, timeoutMs, suppliedCdp = null) {
   const dispatch = async (cdp) => {
     if (!suppliedCdp) {
-    await cdp.request("Page.enable");
-    await cdp.request("Runtime.enable");
+    await ensureBrowserCdpDomains(cdp);
     await ensureBrowserFileChooserInterception(cdp, browserPage);
     }
     await cdp.request("Input.setIgnoreInputEvents", { ignore: false }).catch(() => {});
@@ -5509,7 +5531,10 @@ async function dispatchBrowserInputEvent(browserPage, event, timeoutMs, supplied
     }
     throw new Error("unsupported browser input event");
   };
-  return suppliedCdp ? dispatch(suppliedCdp) : withBrowserCdp(browserPage, timeoutMs, dispatch);
+  // A lost reply can follow an input effect; reconnecting must not replay it.
+  return suppliedCdp
+    ? dispatch(suppliedCdp)
+    : withBrowserCdp(browserPage, timeoutMs, dispatch, { retryAction: false });
 }
 
 function validateBrowserNavigationUrl(value) {
@@ -6304,9 +6329,10 @@ async function main() {
       const displayStatus = Object.hasOwn(DISPLAY_CONTROL_HTTP_STATUS, error?.code)
         ? DISPLAY_CONTROL_HTTP_STATUS[error.code] : null;
       const inspectionStatus = Object.hasOwn(INSPECTION_HTTP_STATUS, error?.code) ? INSPECTION_HTTP_STATUS[error.code] : null;
-      httpJson(res, inspectionStatus || displayStatus || (error?.code === "invalid_request" ? 400 : 500), {
+      const inputUncertain = error?.code === "operator_outcome_uncertain";
+      httpJson(res, inspectionStatus || displayStatus || (inputUncertain ? 503 : error?.code === "invalid_request" ? 400 : 500), {
         error: error instanceof Error ? error.message : String(error),
-        ...(displayStatus || inspectionStatus ? { code: error.code } : {}),
+        ...(displayStatus || inspectionStatus || inputUncertain ? { code: error.code } : {}),
       });
     }
   });

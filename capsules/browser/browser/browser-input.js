@@ -73,8 +73,8 @@ export function selkiesMessagesForInput(event, currentView = null) {
   }
   if (event.type === "wheel") {
     const magnitude = Math.max(1, Math.min(12, Math.ceil(Math.abs(Number(event.delta_y || 0)) / 80)));
-    const x = Math.round(Number(event.x || (currentView?.width || 1280) / 2));
-    const y = Math.round(Number(event.y || (currentView?.height || 720) / 2));
+    const x = Math.round(Number(event.x === 0 ? 0 : event.x || (currentView?.width || 1280) / 2));
+    const y = Math.round(Number(event.y === 0 ? 0 : event.y || (currentView?.height || 720) / 2));
     if (Number(event.delta_y || 0) < 0) {
       return [`m,${x},${y},16,${magnitude}`, `m,${x},${y},0,0`];
     }

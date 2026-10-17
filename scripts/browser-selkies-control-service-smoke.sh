@@ -264,8 +264,15 @@ server.on("upgrade", (req, socket) => {
             fs.writeFileSync(legacyAnswerPath, "ok");
           }
           sendControl(socket, 0x9, "keepalive");
-          const candidate = JSON.stringify({ ice: { candidate: "candidate:smoke 1 udp 1 127.0.0.1 9 typ host", sdpMid: "0", sdpMLineIndex: 0 } });
-          sendText(socket, legacyRawJson ? candidate : `${peer || "server"} ${candidate}`);
+          const candidates = [
+            "candidate:smoke 1 udp 1 127.0.0.1 9 typ host",
+            "candidate:smoke-srflx 1 udp 1 203.0.113.11 5000 typ srflx",
+            "candidate:smoke-relay 1 udp 1 203.0.113.10 3478 typ relay",
+          ];
+          for (const value of candidates) {
+            const candidate = JSON.stringify({ ice: { candidate: value, sdpMid: "0", sdpMLineIndex: 0 } });
+            sendText(socket, legacyRawJson ? candidate : `${peer || "server"} ${candidate}`);
+          }
         }
       }
     }
@@ -1567,7 +1574,11 @@ JSON
 const response = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 if (response.schema !== "elastos.browser.webrtc-signal-ack/v1") throw new Error("wrong legacy candidate ack schema");
 if (response.type !== "candidate" || response.accepted !== true) throw new Error("legacy candidate was not accepted");
-if (response.candidates?.[0]?.candidate !== "candidate:smoke 1 udp 1 127.0.0.1 9 typ host") throw new Error("legacy raw JSON candidate was not returned in candidate ack");
+require("node:assert/strict").deepEqual(response.candidates, [{
+  candidate: "candidate:smoke-relay 1 udp 1 203.0.113.10 3478 typ relay",
+  sdpMid: "0",
+  sdpMLineIndex: 0,
+}], "legacy candidate ack must return only relay ICE");
 ' "$legacy_candidate_response"
 curl --silent --show-error --fail \
   --unix-socket "$control_socket" \
@@ -1933,7 +1944,11 @@ JSON
 const response = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 if (response.schema !== "elastos.browser.webrtc-signal-ack/v1") throw new Error("wrong candidate ack schema");
 if (response.type !== "candidate" || response.accepted !== true) throw new Error("candidate was not accepted");
-if (response.candidates?.[0]?.candidate !== "candidate:smoke 1 udp 1 127.0.0.1 9 typ host") throw new Error("queued Selkies candidate was not returned in candidate ack");
+require("node:assert/strict").deepEqual(response.candidates, [{
+  candidate: "candidate:smoke-relay 1 udp 1 203.0.113.10 3478 typ relay",
+  sdpMid: "0",
+  sdpMLineIndex: 0,
+}], "queued candidate ack must return only relay ICE");
 ' "$candidate_response"
 
 reattach_answer_response="$tmp_dir/reattach-answer-response.json"
@@ -1954,7 +1969,11 @@ JSON
 const response = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 if (response.schema !== "elastos.browser.webrtc-signal-ack/v1") throw new Error("wrong reattach answer ack schema");
 if (response.type !== "answer" || response.accepted !== true) throw new Error("reattach answer was not accepted");
-if (response.candidates?.[0]?.candidate !== "candidate:smoke 1 udp 1 127.0.0.1 9 typ host") throw new Error("reattached Browser answer did not receive Selkies candidate history");
+require("node:assert/strict").deepEqual(response.candidates, [{
+  candidate: "candidate:smoke-relay 1 udp 1 203.0.113.10 3478 typ relay",
+  sdpMid: "0",
+  sdpMLineIndex: 0,
+}], "reattached answer must return only relay ICE");
 ' "$reattach_answer_response"
 
 status_response="$tmp_dir/status-response.json"

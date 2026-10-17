@@ -625,10 +625,39 @@ generic Browser capsules still speak the Runtime Browser ABI, not raw host input
 APIs. Browser commands such as address navigation, back, forward, and reload
 remain Runtime/provider input calls; the Selkies control service applies them
 over private CDP and returns the current page state with `direct_network=false`.
+
+Ordinary CDP input and page-state refresh reuse successful Page and Runtime
+domain enablement on the same connection. A failed preparation remains an
+error and may be retried by a later call. A replacement connection prepares its
+own domains. Each input still enables input delivery, and each refresh reads
+current page metadata and navigation history. File chooser setup remains
+separate from domain preparation.
+
+Ordinary CDP click, wheel, and key dispatch reports the connection failure
+without automatically replaying input whose outcome may be uncertain. The
+viewer queue then stops dependent input. A fresh connection, or replacement of
+a cache already known to be closed, can be established before the first input
+attempt. Observation calls keep their existing reconnection behavior.
+
 The product raster is fixed at 1920x1080 with DPR 1. Home resizes only the
 viewer using `object-fit: contain`, and maps input through decoded-video
 coordinates. Home CSS dimensions never resize the guest compositor or page
 raster.
+Wheel coordinates at zero retain the decoded video's left or top edge through
+Selkies encoding; omitted or null coordinates retain the existing center fallback.
+The viewer ignores wheel events outside the decoded image or while the video
+is hidden or has zero size. These events leave any valid pending wheel batch
+and keyboard focus unchanged, and keep the outer UI's default wheel behavior.
+Deferred wheel batches and touch gestures belong to the Runtime page owner
+present when they begin, including its cleanup handle and page generation.
+The Browser viewer discards that input when the owner retires or starts closing;
+a replacement page accepts a fresh gesture. The viewer tracks one touch or pen
+pointer until release or cancellation. Ordinary page metadata refreshes
+and display reattachment under the same owner preserve the gesture. Late errors
+from these wheel and pointer sends stay with their original owner. This rule
+preserves the existing wheel batching and encoding; the full movement and latency
+requirements remain in
+[B05](BROWSER_ACCEPTANCE.md#b05-input-and-navigation-feel-like-a-browser).
 Browser status polling consumes that page state, including `can_go_back` and
 `can_go_forward`, so visible navigation follows Chromium's actual history
 instead of a UI-side shadow model. Address-bar submits in an active hosted
