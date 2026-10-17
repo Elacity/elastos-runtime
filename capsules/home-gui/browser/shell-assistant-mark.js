@@ -86,6 +86,7 @@ export function bindAssistantMark(button, options) {
   const shouldAnimate = options.animate ?? (() => true);
   const reducedMotion = options.reducedMotion ?? prefersReducedMotion;
   let running = false;
+  let bound = true;
 
   async function handleClick(event) {
     event.preventDefault();
@@ -102,9 +103,18 @@ export function bindAssistantMark(button, options) {
     await playContact(art);
     delete button.dataset.animating;
     running = false;
+    /* The contact announced an opening. If the face opened (or started to
+       move) by another path meanwhile, or the mark was unbound, that opening
+       is stale: activating now would toggle the face shut instead. */
+    if (!bound || !shouldAnimate()) {
+      return;
+    }
     options.onActivate();
   }
 
   button.addEventListener("click", handleClick);
-  return () => button.removeEventListener("click", handleClick);
+  return () => {
+    bound = false;
+    button.removeEventListener("click", handleClick);
+  };
 }

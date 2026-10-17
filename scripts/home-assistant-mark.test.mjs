@@ -150,3 +150,52 @@ test("a toggle without the mark still opens; unbind removes the handler; null is
   assert.equal(bare.hasClickListener(), false);
   assert.equal(typeof bindAssistantMark(null, { onActivate() {} }), "function");
 });
+
+test("an opening that another path made during the contact is not toggled shut", async () => {
+  /* Click while the face is closed: the contact plays. Meanwhile the face
+     opens by another path (Agent space, a launch). Activating at the end
+     would toggle the open face shut, the opposite of what the click asked. */
+  const log = [];
+  const button = fakeButton(log);
+  let faceOpen = false;
+  let toggles = 0;
+  bindAssistantMark(button, {
+    onActivate: () => { toggles += 1; faceOpen = !faceOpen; },
+    animate: () => !faceOpen,
+    reducedMotion: () => false,
+  });
+
+  const sequence = button.click();
+  assert.equal(log.length, 2, "the contact started for an opening");
+  faceOpen = true;
+  await settleAll(log);
+  await settleAll(log);
+  await sequence;
+  assert.equal(toggles, 0, "the stale opening did not toggle the face");
+  assert.equal(faceOpen, true, "the face the person asked for stays open");
+  assert.equal(button.dataset.animating, undefined);
+
+  faceOpen = false;
+  const next = button.click();
+  await settleAll(log);
+  await settleAll(log);
+  await next;
+  assert.equal(toggles, 1, "the next real opening still opens");
+  assert.equal(faceOpen, true);
+});
+
+test("unbinding during the contact drops the activation", async () => {
+  const log = [];
+  const button = fakeButton(log);
+  let activations = 0;
+  const unbind = bindAssistantMark(button, {
+    onActivate: () => { activations += 1; },
+    reducedMotion: () => false,
+  });
+  const sequence = button.click();
+  unbind();
+  await settleAll(log);
+  await settleAll(log);
+  await sequence;
+  assert.equal(activations, 0, "a torn-down mark opens nothing");
+});
