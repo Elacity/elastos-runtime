@@ -778,13 +778,42 @@ async fn start_home_terminal_session(
     if let Some(gateway_api_url) = gateway_api_url {
         command.env(HOME_CLI_GATEWAY_API_URL_ENV, gateway_api_url);
     }
+    // The terminal proves that this gateway holds the host lock from this
+    // descriptor of the locked file, never from the lock file's JSON record
+    // (`runtime_control::parent_gateway_lock_proven`).
+    let host_lock = crate::host_lock::gateway_host_lock_for_child(data_dir);
+    let inherited_lock_fd = host_lock.as_ref().map(|file| file.as_raw_fd());
+    match inherited_lock_fd {
+        Some(fd) => {
+            command
+                .env(
+                    crate::runtime_control::GATEWAY_HOST_PID_ENV,
+                    std::process::id().to_string(),
+                )
+                .env(
+                    crate::runtime_control::GATEWAY_HOST_LOCK_FD_ENV,
+                    fd.to_string(),
+                );
+        }
+        None => {
+            command
+                .env_remove(crate::runtime_control::GATEWAY_HOST_PID_ENV)
+                .env_remove(crate::runtime_control::GATEWAY_HOST_LOCK_FD_ENV);
+        }
+    }
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
             if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(io::Error::last_os_error());
+            }
+            // Only this child keeps the lock descriptor across exec.
+            if let Some(fd) = inherited_lock_fd {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             Ok(())
         });
@@ -798,6 +827,7 @@ async fn start_home_terminal_session(
     let child = command
         .spawn()
         .with_context(|| format!("failed to start terminal process {}", command_spec.label))?;
+    drop(host_lock);
     let child_pid = child.id();
     let (events, _receiver) = broadcast::channel(256);
     let session = Arc::new(HomeTerminalSession {
