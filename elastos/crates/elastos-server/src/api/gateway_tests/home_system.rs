@@ -156,12 +156,12 @@ pub(super) fn configured_discovery_network_profile_for_test(
     }
 }
 
-struct TestCollaborationMessageScope<'a> {
-    network_id: &'a str,
-    conversation_id: &'a str,
+pub(super) struct TestCollaborationMessageScope<'a> {
+    pub(super) network_id: &'a str,
+    pub(super) conversation_id: &'a str,
 }
 
-fn signed_discovery_message_for_test(
+pub(super) fn signed_discovery_message_for_test(
     signing_key: &SigningKey,
     sender_profile_did: &str,
     scope: TestCollaborationMessageScope<'_>,
@@ -405,18 +405,26 @@ async fn test_home_entry_serves_browser_surface() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HOST, "localhost:61180")
                 .uri("/api/apps/home/summary")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(unsigned_summary.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(unsigned_summary.into_body(), usize::MAX)
+    assert_eq!(unsigned_summary.status(), StatusCode::FORBIDDEN);
+
+    let sign_in = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri("/api/auth/passkey/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["authority"]["signed_in"], false);
+    assert_eq!(sign_in.status(), StatusCode::OK);
 
     let cookie_name = home_session_cookie_name(
         test_browser_request("localhost:61180", "http://localhost:61180")
@@ -452,6 +460,7 @@ async fn test_home_entry_serves_browser_surface() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HOST, "localhost:61180")
                 .uri("/home/home-shell-host.js")
                 .body(Body::empty())
                 .unwrap(),
@@ -513,6 +522,11 @@ async fn test_home_entry_redirects_preserve_bookmarks_and_capsule_roots() {
 #[tokio::test]
 async fn test_home_entry_preserves_capsule_bytes_and_security_headers() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"gateway_allowed_hosts = ["localhost:8090", "elastos.elacitylabs.com"]"#,
+    )
+    .unwrap();
     let app = gateway_router(test_state(dir.path()));
     std::fs::write(
         dir.path()
@@ -568,8 +582,13 @@ async fn test_home_entry_preserves_capsule_bytes_and_security_headers() {
             assert_eq!(home.headers()["x-content-type-options"], "nosniff");
             if home_path.ends_with('/') || home_path.ends_with(".html") {
                 let csp = home.headers()["content-security-policy"].to_str().unwrap();
+                assert!(csp.contains("default-src 'self'"));
+                assert!(csp.contains("script-src 'self'"));
+                assert!(csp.contains("style-src 'self'"));
                 assert!(csp.contains("connect-src 'self'"));
                 assert!(csp.contains("frame-ancestors 'none'"));
+                assert!(!csp.contains("sandbox"));
+                assert!(!csp.contains("'unsafe-inline'"));
             }
             let home_body = axum::body::to_bytes(home.into_body(), usize::MAX)
                 .await
@@ -637,8 +656,263 @@ async fn test_home_entry_rejects_path_traversal() {
 
 #[tokio::test]
 #[cfg(unix)]
-async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
+async fn test_home_cli_terminal_delayed_body_policy_switch_refuses_spawn() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
+    let fixture = tempfile::tempdir().unwrap();
+    let marker = fixture.path().join("terminal-started");
+    let _program = EnvRestore::set("ELASTOS_HOME_CLI_TERMINAL_PROGRAM", "/bin/sh".to_string());
+    let _args = EnvRestore::set(
+        "ELASTOS_HOME_CLI_TERMINAL_ARGS_JSON",
+        serde_json::json!([
+            "-c",
+            "printf started > \"$1\"; exec sleep 30",
+            "terminal-policy-fixture",
+            marker.to_str().unwrap()
+        ])
+        .to_string(),
+    );
+    for enable_registration in [false, true] {
+        for route in [
+            "sessions",
+            "sessions/missing/resize",
+            "sessions/missing/intent",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let owner = passkey_authority(dir.path());
+            std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
+            let app = gateway_router(test_state(dir.path()));
+            let token = app_token_for_authority(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &owner);
+            let (reading_tx, reading_rx) = tokio::sync::oneshot::channel();
+            let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+            let body = Body::from_stream(futures_lite::stream::unfold(
+                Some((reading_tx, body_rx)),
+                |state| async move {
+                    let (reading_tx, body_rx) = state?;
+                    reading_tx.send(()).unwrap();
+                    let body = body_rx.await.unwrap();
+                    Some((Ok::<Bytes, Infallible>(body), None))
+                },
+            ));
+            let pending = tokio::spawn(
+                app.oneshot(
+                    test_browser_request("localhost:61180", "null")
+                        .method("POST")
+                        .uri(format!("/api/apps/home-cli/terminal/{route}"))
+                        .header("x-elastos-home-token", &token)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .unwrap(),
+                ),
+            );
+            // Body polling proves the request passed the outer policy middleware.
+            reading_rx.await.unwrap();
+            if enable_registration {
+                crate::auth::set_guest_registration_enabled(
+                    dir.path(),
+                    true,
+                    crate::auth::now_ts(),
+                )
+                .unwrap();
+            } else {
+                std::fs::write(dir.path().join("config.toml"), "developer_mode = false\n").unwrap();
+            }
+            body_tx.send(Bytes::from_static(b"{}")).unwrap();
+            let response = pending.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !marker.exists(),
+                "a delayed refused request started a process"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_home_cli_terminal_developer_mode_policy_matrix() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
+    let fixture = tempfile::tempdir().unwrap();
+    let marker = fixture.path().join("terminal-started");
+    let _program = EnvRestore::set("ELASTOS_HOME_CLI_TERMINAL_PROGRAM", "/bin/sh".to_string());
+    let _args = EnvRestore::set(
+        "ELASTOS_HOME_CLI_TERMINAL_ARGS_JSON",
+        serde_json::json!([
+            "-c",
+            "printf started > \"$1\"; exec sleep 30",
+            "terminal-policy-fixture",
+            marker.to_str().unwrap()
+        ])
+        .to_string(),
+    );
+
+    for developer_mode in [false, true] {
+        for registration_enabled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let owner = passkey_authority(dir.path());
+            let guest = passkey_authority_with_name_role(
+                dir.path(),
+                Some("terminal policy guest"),
+                crate::auth::RuntimePrincipalRole::Guest,
+            );
+            std::fs::write(
+                dir.path().join("config.toml"),
+                format!("developer_mode = {developer_mode}\n"),
+            )
+            .unwrap();
+            crate::auth::set_guest_registration_enabled(
+                dir.path(),
+                registration_enabled,
+                crate::auth::now_ts(),
+            )
+            .unwrap();
+            let app = gateway_router(test_state(dir.path()));
+            for authority in [&owner, &guest] {
+                let token =
+                    app_token_for_authority(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, authority);
+                if developer_mode && !registration_enabled {
+                    let contract = app
+                        .clone()
+                        .oneshot(
+                            test_browser_request("localhost:61180", "null")
+                                .uri("/api/apps/home-cli/terminal/contract")
+                                .header("x-elastos-home-token", &token)
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(contract.status(), StatusCode::OK);
+                    continue;
+                }
+                assert_terminal_routes_refused(&app, &token).await;
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!marker.exists(), "a refused request started a host process");
+
+    // The same command fixture must start when the policy permits the owner.
+    // Then each policy switch must close the existing process as well.
+    for enable_registration in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = passkey_authority(dir.path());
+        std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
+        let app = gateway_router(test_state(dir.path()));
+        let token = app_token_for_authority(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &owner);
+        let started = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/home-cli/terminal/sessions")
+                    .header("x-elastos-home-token", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(started.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id = started["session_id"].as_str().unwrap();
+        let pid = gateway_home_terminal::home_terminal_process_id(session_id)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if enable_registration {
+            crate::auth::set_guest_registration_enabled(dir.path(), true, crate::auth::now_ts())
+                .unwrap();
+        } else {
+            std::fs::write(dir.path().join("config.toml"), "developer_mode = false\n").unwrap();
+        }
+        assert_terminal_routes_refused(&app, &token).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if gateway_home_terminal::home_terminal_process_id(session_id)
+                    .await
+                    .is_none()
+                    && unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("policy switch must retire the owned terminal process");
+        std::fs::remove_file(&marker).unwrap();
+    }
+}
+
+async fn assert_terminal_routes_refused(app: &axum::Router, token: &str) {
+    for (method, route) in [
+        ("GET", "contract"),
+        ("POST", "sessions"),
+        ("GET", "sessions/missing/events?ticket=fixture"),
+        ("GET", "sessions/missing/input?ticket=fixture"),
+        ("POST", "sessions/missing/resize"),
+        ("POST", "sessions/missing/intent"),
+        ("POST", "sessions/missing/close"),
+        ("OPTIONS", "sessions"),
+    ] {
+        for body in ["{}", "invalid JSON"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    test_browser_request("localhost:61180", "null")
+                        .method(method)
+                        .uri(format!("/api/apps/home-cli/terminal/{route}"))
+                        .header("x-elastos-home-token", token)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("access-control-request-method", "POST")
+                        .header("access-control-request-headers", "x-elastos-home-token")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {route}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_home_cli_terminal_defaults_off_and_malformed_settings_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
+    let owner = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &owner);
+    let app = gateway_router(test_state(dir.path()));
+    assert_terminal_routes_refused(&app, &token).await;
+    for contents in [
+        "dev_mode = true\n",
+        "developer_mode = false\n",
+        "developer_mode = 'true'\n",
+        "developer_mode = 1\n",
+        "developer_mode = true\nbroken = [",
+    ] {
+        std::fs::write(dir.path().join("config.toml"), contents).unwrap();
+        assert_terminal_routes_refused(&app, &token).await;
+    }
+    std::fs::remove_file(dir.path().join("config.toml")).unwrap();
+    std::fs::create_dir(dir.path().join("config.toml")).unwrap();
+    assert_terminal_routes_refused(&app, &token).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
+    let _guard = HOME_GATEWAY_TEST_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
     let _program = EnvRestore::set("ELASTOS_HOME_CLI_TERMINAL_PROGRAM", "/bin/sh".to_string());
     let _args = EnvRestore::set(
         "ELASTOS_HOME_CLI_TERMINAL_ARGS_JSON",
@@ -656,8 +930,9 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
     let contract = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/home-cli/terminal/contract")
+                .header("x-elastos-home-token", cli_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -785,10 +1060,11 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
     let bad_events = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!(
                     "/api/apps/home-cli/terminal/sessions/{session_id}/events?ticket=wrong"
                 ))
+                .header("x-elastos-home-token", cli_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -799,8 +1075,9 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
     let non_websocket_input = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(input_socket_url)
+                .header("x-elastos-home-token", cli_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1142,15 +1419,22 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     let public = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(public.status(), StatusCode::OK);
-    let public_body = axum::body::to_bytes(public.into_body(), usize::MAX)
+    assert_eq!(public.status(), StatusCode::FORBIDDEN);
+    // The signed-out read model stays private and keeps empty account facts.
+    let signed_out_model = gateway_home_system::home_summary(
+        State(library_test_state(dir.path()).await),
+        HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(signed_out_model.status(), StatusCode::OK);
+    let public_body = axum::body::to_bytes(signed_out_model.into_body(), usize::MAX)
         .await
         .unwrap();
     let public_payload: serde_json::Value = serde_json::from_slice(&public_body).unwrap();
@@ -1361,16 +1645,21 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert_eq!(wallet["route"], "/apps/wallet/");
     assert_eq!(wallet["attach_kind"], "iframe");
     assert_eq!(wallet["target_kind"], "app");
-    let browser = targets
-        .iter()
-        .find(|target| target["target"] == "browser")
-        .expect("browser target");
-    assert_eq!(browser["role"], "app");
-    assert_eq!(browser["title"], "Browser");
-    assert_eq!(browser["description"], "Browse websites from this device.");
-    assert_eq!(browser["route"], "/apps/browser/");
-    assert_eq!(browser["attach_kind"], "iframe");
-    assert_eq!(browser["target_kind"], "app");
+    let browser = targets.iter().find(|target| target["target"] == "browser");
+    if crate::setup::browser_available(&crate::setup::detect_platform()) {
+        let browser = browser.expect("browser target");
+        assert_eq!(browser["role"], "app");
+        assert_eq!(browser["title"], "Browser");
+        assert_eq!(browser["description"], "Browse websites from this device.");
+        assert_eq!(browser["route"], "/apps/browser/");
+        assert_eq!(browser["attach_kind"], "iframe");
+        assert_eq!(browser["target_kind"], "app");
+    } else {
+        assert!(
+            browser.is_none(),
+            "Browser is hidden on hosts without a local Engine"
+        );
+    }
     assert!(targets
         .iter()
         .all(|target| target["target"] != "wallet-metamask"));
@@ -3838,6 +4127,18 @@ fn assert_recovery_readiness_projection(payload: &Value, status: &str, path: &st
     );
 }
 
+fn assert_recovery_setup_required_projection(payload: &Value, reason: &str, path: &str) {
+    assert_eq!(
+        payload["identity"]["recovery_readiness"],
+        json!({
+            "schema": "elastos.recovery.readiness/v1",
+            "status": "setup_required",
+            "reason": reason,
+        }),
+        "{path}"
+    );
+}
+
 #[tokio::test]
 async fn existing_profile_setup_protects_root_without_claiming_recovery() {
     let dir = tempfile::tempdir().unwrap();
@@ -3972,7 +4273,11 @@ async fn existing_profile_setup_protects_root_without_claiming_recovery() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["identity"]["profile_readiness"]["status"], "ready");
-    assert_recovery_readiness_projection(&payload, "setup_required", "profile without backup");
+    assert_recovery_setup_required_projection(
+        &payload,
+        "recovery_kit_missing",
+        "profile without backup",
+    );
     assert_eq!(
         payload["discovery"]["status"], "unconfigured",
         "Profile creation does not opt into discovery"
@@ -4001,7 +4306,7 @@ async fn test_recovery_readiness_does_not_claim_profile_coverage() {
     ] {
         let (status, payload) = home_test_get_json(&app, path, token, origin).await;
         assert_eq!(status, StatusCode::OK, "{path}");
-        assert_recovery_readiness_projection(&payload, "setup_required", path);
+        assert_recovery_setup_required_projection(&payload, "recovery_kit_missing", path);
     }
     assert_eq!(file_snapshot(dir.path()), before_summary);
 
@@ -4037,6 +4342,24 @@ async fn test_recovery_readiness_does_not_claim_profile_coverage() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["profile"]["display_name"], "Owner");
     assert_eq!(payload["profile_readiness"]["status"], "ready");
+
+    // A verified kit that predates the Profile is outdated, not missing.
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_recovery_setup_required_projection(&payload, "recovery_kit_outdated", path);
+    }
 }
 
 #[tokio::test]
@@ -4091,7 +4414,12 @@ async fn test_recovery_readiness_projects_unavailable_and_first_profile_fails_cl
         .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
-    assert_eq!(file_snapshot(dir.path()), before);
+    let mut after = file_snapshot(dir.path());
+    assert_eq!(
+        after.remove("ElastOS/System/Auth/principal-root-lifecycle.lock"),
+        Some(Vec::new())
+    );
+    assert_eq!(after, before);
     assert!(
         crate::collaboration_profile_authority::load_profile_authority(
             dir.path(),
@@ -5205,6 +5533,109 @@ async fn test_system_guest_registration_requires_admin_passkey() {
         .starts_with("localhost://Users/"));
 }
 
+#[tokio::test]
+async fn system_community_membership_is_home_wide_and_requires_current_owner_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let port = crate::collaboration_product::test_chat_product_port(
+        dir.path(),
+        "membership-network",
+        "community",
+    );
+    let mut state = test_state(dir.path());
+    state.collaboration_chat_product_port = Some(port.clone());
+    let app = gateway_router(state);
+    let marker = dir
+        .path()
+        .join("collaboration-community-membership-v1.json");
+    let mut denied_tokens = vec![
+        system_app_token(dir.path()),
+        projection_launch_token_for_authority_context(dir.path(), PEOPLE_CAPSULE_ID, &authority),
+    ];
+    for index in 0..3 {
+        let guest = passkey_authority_with_profile_role_credential(
+            dir.path(),
+            &format!("Guest {index}"),
+            crate::auth::RuntimePrincipalRole::Guest,
+            &format!("membership-guest-{index}"),
+        );
+        denied_tokens.push(guest.system_token);
+    }
+    for token in denied_tokens {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/system/community")
+                    .header("x-elastos-home-token", token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"joined":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(port.community_membership().joined());
+        assert!(!marker.exists());
+    }
+    for joined in [false, true] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/apps/system/community")
+                    .header("x-elastos-home-token", &authority.system_token)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"joined": joined}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["joined"], joined);
+        assert_eq!(port.community_membership().joined(), joined);
+    }
+    let before = std::fs::read(&marker).unwrap();
+    let mut principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    principal.role = crate::auth::RuntimePrincipalRole::Guest;
+    let mut auth = crate::auth::load_auth_state(dir.path()).unwrap();
+    let current = auth
+        .principals
+        .iter_mut()
+        .find(|entry| entry.principal_id == principal.principal_id)
+        .unwrap();
+    *current = principal;
+    crate::auth::save_auth_state(dir.path(), &auth).unwrap();
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/system/community")
+                .header("x-elastos-home-token", authority.system_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"joined":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an earlier owner token cannot retain a removed admin role"
+    );
+    assert_eq!(std::fs::read(marker).unwrap(), before);
+}
+
 #[test]
 fn system_runtime_activity_filters_attach_noise() {
     use elastos_runtime::primitives::audit::AuditEvent;
@@ -5260,17 +5691,33 @@ fn system_runtime_activity_filters_attach_noise() {
 async fn test_removed_system_identity_mutations_cannot_succeed_or_mutate_state() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority(dir.path());
+    let before = file_snapshot(dir.path());
 
     for uri in [
         "/api/apps/system/identity/handle",
         "/api/apps/system/identity/profile-card",
     ] {
+        let unsigned = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"display_name":"owner"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), StatusCode::FORBIDDEN, "{uri}");
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri(uri)
+                    .header("x-elastos-home-token", &authority.system_token)
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"display_name":"owner"}"#))
                     .unwrap(),
@@ -5287,11 +5734,12 @@ async fn test_removed_system_identity_mutations_cannot_succeed_or_mutate_state()
             response.status()
         );
     }
+    assert_eq!(file_snapshot(dir.path()), before);
     assert!(
         crate::collaboration_profile_authority::load_profile_authority(
             dir.path(),
-            "person:local:missing",
-            &crate::auth::principal_localhost_root("person:local:missing"),
+            &authority.principal_id,
+            &crate::auth::principal_localhost_root(&authority.principal_id),
         )
         .unwrap()
         .is_none()
@@ -6065,6 +6513,7 @@ async fn test_home_launch_validates_shell_targets() {
     let projection_manifest_path = dir.path().join("capsules/projection-app/capsule.json");
     let mut projection_manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&projection_manifest_path).unwrap()).unwrap();
+    projection_manifest["type"] = serde_json::json!("web-projection");
     projection_manifest["runtime_abi"] = serde_json::json!("elastos.runtime-projection/v1");
     projection_manifest["bus_contract"] = serde_json::json!("elastos.runtime-projection/v1");
     projection_manifest["execution"] = serde_json::json!("web-projection");
@@ -6383,6 +6832,7 @@ async fn test_window_policy_survives_discovery_catalog_and_home_launch() {
             let path = dir.path().join("capsules").join(name).join("capsule.json");
             let mut manifest: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            manifest["type"] = json!("web-projection");
             manifest["runtime_abi"] = json!("elastos.runtime-projection/v1");
             manifest["bus_contract"] = json!("elastos.runtime-projection/v1");
             manifest["execution"] = json!("web-projection");
@@ -6484,8 +6934,70 @@ async fn test_window_policy_survives_discovery_catalog_and_home_launch() {
 }
 
 #[tokio::test]
+async fn test_home_active_shell_without_developer_mode_resets_terminal_to_desktop() {
+    let dir = tempfile::tempdir().unwrap();
+    write_test_browser_capsule(
+        dir.path(),
+        "home-cli",
+        "shell",
+        "Home CLI",
+        Some("<!doctype html><title>Home CLI</title>"),
+    );
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let state_uri = format!("{localhost_root}/.AppData/ElastOS/Home/active-shell.json");
+    let state_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &state_uri).unwrap();
+    write_home_principal_object_json_for_authority(
+        dir.path(),
+        &authority,
+        "active-shell.json",
+        json!({
+            "schema": "elastos.home.active-shell/v1",
+            "principal_id": authority.principal_id.clone(),
+            "localhost_root": localhost_root.clone(),
+            "active": "home-cli"
+        }),
+    );
+
+    let (status, payload) = home_test_get_json(
+        &app,
+        "/api/apps/home/summary",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["active_shell"]["active"], HOME_GUI_SHELL_ID);
+    assert!(!payload["active_shell"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate["name"] == "home-cli"));
+    let saved = std::fs::read_to_string(&state_path).unwrap();
+    assert!(saved.contains(r#""active": "home-gui""#), "{saved}");
+
+    let selected = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/apps/home/active-shell")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"active":"home-cli"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
     write_test_browser_capsule(
         dir.path(),
         "home-cli",
@@ -6681,15 +7193,18 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         authority.principal_id
     );
 
-    let (status, wrong_origin_shell_summary) = home_test_get_json(
-        &app,
-        "/api/apps/home/summary",
-        &home_cli_token,
-        "http://localhost:61180",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(wrong_origin_shell_summary["authority"]["signed_in"], false);
+    let wrong_origin_shell_summary = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri("/api/apps/home/summary")
+                .header("x-elastos-home-token", &home_cli_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_origin_shell_summary.status(), StatusCode::FORBIDDEN);
 
     let catalog = app
         .clone()
@@ -6720,9 +7235,10 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let esp_initialize = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/esp/initialize")
+                .header("x-elastos-home-token", &home_cli_token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"esp_version":"0","accepts":["elastos.capsules.catalog/v1"]}"#,
@@ -6761,10 +7277,20 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let regular_token = launch_token_from_route(payload["route"].as_str().unwrap()).unwrap();
-    let (status, native_regular_summary) =
-        home_test_get_json_without_origin(&app, "/api/apps/home/summary", &regular_token).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(native_regular_summary["authority"]["signed_in"], false);
+    let native_regular_summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/home/summary")
+                .header(HOST, "localhost:61180")
+                .header("x-elastos-home-token", &regular_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(native_regular_summary.status(), StatusCode::FORBIDDEN);
+
     let catalog_rejected = app
         .clone()
         .oneshot(
@@ -6994,6 +7520,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
 #[tokio::test]
 async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launch_failure() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "developer_mode = true\n").unwrap();
     let state = test_state(dir.path());
     std::fs::remove_file(dir.path().join("capsules/home-cli").join("home-cli.wasm")).unwrap();
     let app = gateway_router(state);
@@ -7570,6 +8097,8 @@ async fn test_home_browser_state_drops_unknown_targets() {
             "obsolete-wallet": "Old Wallet"
         },
         "taskbar": ["system", "people", "obsolete-wallet"],
+        "homeDock": ["obsolete-wallet", "people", "people"],
+        "homePages": [["system", "obsolete-wallet"], ["obsolete-wallet"], ["people", "system"], "system"],
         "desktopIconsVisible": true
     });
     {
@@ -7629,6 +8158,8 @@ async fn test_home_browser_state_drops_unknown_targets() {
     assert!(json["layout"]["desktopLabels"].get("people").is_some());
     assert_eq!(json["layout"]["desktopHidden"], json!(["system", "people"]));
     assert_eq!(json["layout"]["taskbar"], json!(["system", "people"]));
+    assert_eq!(json["layout"]["homeDock"], json!(["people"]));
+    assert_eq!(json["layout"]["homePages"], json!([["system"], ["people"]]));
     assert_eq!(json["session"]["windows"].as_array().unwrap().len(), 2);
     assert_eq!(json["session"]["windows"][0]["target"], "people");
     assert_eq!(json["session"]["windows"][1]["target"], "system");
@@ -8438,8 +8969,12 @@ async fn test_home_appearance_preferences_fail_closed_and_signed_out_defaults_st
         )
         .await
         .unwrap();
-    assert_eq!(unsigned.status(), StatusCode::OK);
-    let unsigned_body = axum::body::to_bytes(unsigned.into_body(), usize::MAX)
+    assert_eq!(unsigned.status(), StatusCode::FORBIDDEN);
+    // Unit-test the fixed signed-out projection independently of API admission.
+    let signed_out_model =
+        gateway_home_system::home_summary(State(test_state(dir.path())), HeaderMap::new()).await;
+    assert_eq!(signed_out_model.status(), StatusCode::OK);
+    let unsigned_body = axum::body::to_bytes(signed_out_model.into_body(), usize::MAX)
         .await
         .unwrap();
     let unsigned_payload: serde_json::Value = serde_json::from_slice(&unsigned_body).unwrap();
@@ -8680,6 +9215,160 @@ fn services_engine_offer(fixture: &ServicesContactFixture) -> String {
         "offer:{}:browser-engine",
         home_people_contact_id(&fixture.profile.document().profile_did)
     )
+}
+
+#[tokio::test]
+async fn test_private_engine_request_requires_share_before_inbox_approval() {
+    for model_shared in [false, true] {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+        let (trusted_key, _) = generate_keypair();
+        let network =
+            configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+        let alice =
+            services_contact_fixture(left.path(), "Alice", bus.clone(), network.clone()).await;
+        let bob = services_contact_fixture(right.path(), "Bob", bus, network).await;
+        accept_services_contact_pair(&alice, &bob);
+        std::fs::create_dir_all(right.path().join("config")).unwrap();
+        std::fs::write(
+            right.path().join("config/browser-engine-adapter.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::create_dir_all(right.path().join("bin")).unwrap();
+        std::fs::write(right.path().join("bin/model-provider"), b"").unwrap();
+        let services_token =
+            app_token_for_authority(right.path(), SERVICES_CAPSULE_ID, &bob.authority);
+        if model_shared {
+            let (status, _) = services_contact_post(
+                &bob.app,
+                &services_token,
+                "/api/apps/services/offers",
+                json!({"offer_id":MODEL_LOCAL_OFFER,"section":"mine","selected":true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let alice_token =
+            app_token_for_authority(left.path(), SERVICES_CAPSULE_ID, &alice.authority);
+        let (status, _) = services_contact_post(
+            &alice.app,
+            &alice_token,
+            "/api/apps/services/offers",
+            json!({"offer_id":services_engine_offer(&bob),"section":"others","selected":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = home_test_post_json(
+            &bob.app,
+            "/api/apps/home/launch",
+            &bob.authority.home_token,
+            "http://localhost:61180",
+            json!({"target":INBOX_CAPSULE_ID}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let inbox_token = app_token_for_authority(right.path(), INBOX_CAPSULE_ID, &bob.authority);
+        let (_, inbox) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        let request = inbox["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == "service_access_request")
+            .unwrap();
+        assert!(request["body"].as_str().unwrap().contains(
+            "Your Browser Engine is private. Share it in Services before approving this request."
+        ));
+        let action = request["action_ref"]["action_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, message) = services_contact_post(
+            &bob.app,
+            &inbox_token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert!(!status.is_success());
+        assert!(
+            message.contains("Your Browser Engine is private. Share it in Services"),
+            "{message}"
+        );
+        let (_, still_pending) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        assert!(still_pending["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["action_ref"]["action_id"] == action));
+
+        let (status, _) = services_contact_post(
+            &bob.app,
+            &services_token,
+            "/api/apps/services/offers",
+            json!({"offer_id":"local:provider:browser-engine","section":"mine","selected":true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, services) = home_test_get_json(
+            &bob.app,
+            "/api/apps/services/summary",
+            &services_token,
+            "null",
+        )
+        .await;
+        assert!(services["local_offers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|offer| offer["offer_id"] == "local:provider:browser-engine"));
+        assert_eq!(
+            services["local_offers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|offer| offer["offer_id"] == MODEL_LOCAL_OFFER),
+            model_shared
+        );
+        let (_, ready_inbox) =
+            home_test_get_json(&bob.app, "/api/apps/inbox/summary", &inbox_token, "null").await;
+        assert!(!ready_inbox["notifications"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["action_ref"]["action_id"] == action)
+            .unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .contains("is private"));
+        let (status, message) = services_contact_post(
+            &bob.app,
+            &inbox_token,
+            "/api/apps/inbox/actions",
+            json!({"action_id":action}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{message}");
+        let (_, services) = home_test_get_json(
+            &bob.app,
+            "/api/apps/services/summary",
+            &services_token,
+            "null",
+        )
+        .await;
+        assert_eq!(
+            services["local_offers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|offer| offer["offer_id"] == MODEL_LOCAL_OFFER),
+            model_shared
+        );
+    }
 }
 
 #[tokio::test]
@@ -9105,6 +9794,7 @@ async fn test_services_remote_engine_signed_approval_retains_scoped_execution_gr
     assert!(!left.path().join("config/exit-provider.json").exists());
     assert!(alice.exit_provider.requests.lock().await.is_empty());
     let grant = grant.clone();
+    super::remote_engine::config(right.path());
     let status = crate::carrier::probe_browser_engine(&consumer_registry, &grant, "status", None)
         .await
         .unwrap();
@@ -10122,13 +10812,15 @@ async fn test_services_runtime_mailbox_requires_current_sharing_contact_and_sign
     std::fs::write(right.path().join("config/exit-provider.json"), "{}").unwrap();
     let service = bob.discovery_service.clone();
     service.sync_services_mailboxes_once(right.path(), 0).await;
-    assert!(bob
-        .peer_provider
-        .state
-        .provider_requests
-        .lock()
-        .await
-        .is_empty());
+    let initial_peer_calls = bob.peer_provider.state.provider_requests.lock().await;
+    assert!(
+        initial_peer_calls.iter().all(|call| matches!(
+            call["op"].as_str(),
+            Some("get_ticket" | "gossip_join" | "gossip_join_peers" | "gossip_recv")
+        )),
+        "an empty mailbox may poll but must not send: {initial_peer_calls:?}"
+    );
+    drop(initial_peer_calls);
     assert!(
         services_mailbox_saved_state(right.path(), &bob.authority, "services-requests.json")
             ["requests"]
@@ -11206,4 +11898,216 @@ async fn test_system_ai_provider_migrates_legacy_openrouter_secret() {
     assert_eq!(connection(&payload, "openrouter")["id"], "model:openrouter");
     assert_eq!(connection(&payload, "openrouter")["connected"], true);
     assert_ai_provider_http_omits_secrets(&body);
+}
+
+async fn home_external_link_raw(
+    app: &axum::Router,
+    origin: &'static str,
+    home_token: &str,
+    body: serde_json::Value,
+) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", origin)
+                .method("POST")
+                .uri("/api/apps/home/external-link")
+                .header("x-elastos-home-token", home_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn home_external_link_names_the_launched_app_and_the_exact_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let context = local_home_launch_token_context(dir.path()).unwrap();
+    let home_token =
+        issue_home_launch_token_with_context(dir.path(), HOME_CAPSULE_ID, &context).unwrap();
+    let launched = |target: &str| {
+        issue_home_projection_launch_token_with_context(dir.path(), target, target, &context)
+            .unwrap()
+    };
+    let request = |app_token: &str, url: &str| {
+        json!({
+            "schema": "elastos.home.external-link.request/v1",
+            "app_token": app_token,
+            "url": url,
+        })
+    };
+
+    let browser_token = launched(BROWSER_CAPSULE_ID);
+    for (app_token, app_id, app_title) in [
+        (browser_token.clone(), BROWSER_CAPSULE_ID, "Browser"),
+        (
+            launched(HOME_CLI_CAPSULE_ID_FOR_TEST),
+            "home-cli",
+            "Home CLI",
+        ),
+    ] {
+        let (status, body) = home_external_link_raw(
+            &app,
+            "http://localhost:61180",
+            &home_token,
+            request(&app_token, "https://Example.com/a b?q=1#part"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            json!({
+                "schema": "elastos.home.external-link.result/v1",
+                "app_id": app_id,
+                "app_title": app_title,
+                "url": "https://example.com/a%20b?q=1#part",
+            })
+        );
+    }
+
+    let other_session = local_home_launch_token_context(dir.path()).unwrap();
+    let refused_authority = [
+        (
+            "foreign origin",
+            "https://evil.example",
+            home_token.clone(),
+            browser_token.clone(),
+        ),
+        (
+            "an app frame calling directly",
+            "null",
+            home_token.clone(),
+            browser_token.clone(),
+        ),
+        (
+            "app token from another Home session",
+            "http://localhost:61180",
+            home_token.clone(),
+            issue_home_projection_launch_token_with_context(
+                dir.path(),
+                BROWSER_CAPSULE_ID,
+                BROWSER_CAPSULE_ID,
+                &other_session,
+            )
+            .unwrap(),
+        ),
+        (
+            "Home token from another session",
+            "http://localhost:61180",
+            issue_home_launch_token_with_context(dir.path(), HOME_CAPSULE_ID, &other_session)
+                .unwrap(),
+            browser_token.clone(),
+        ),
+        (
+            "app token Home did not mint",
+            "http://localhost:61180",
+            home_token.clone(),
+            issue_home_launch_token_with_context(dir.path(), BROWSER_CAPSULE_ID, &context).unwrap(),
+        ),
+        (
+            "Home GUI is not a link sender",
+            "http://localhost:61180",
+            home_token.clone(),
+            launched(HOME_GUI_SHELL_ID),
+        ),
+        (
+            "Home's own token",
+            "http://localhost:61180",
+            home_token.clone(),
+            home_token.clone(),
+        ),
+        (
+            "an app that is not installed",
+            "http://localhost:61180",
+            home_token.clone(),
+            launched("not-installed"),
+        ),
+        (
+            "a projection onto another app",
+            "http://localhost:61180",
+            home_token.clone(),
+            issue_home_projection_launch_token_with_context(
+                dir.path(),
+                "assistant",
+                BROWSER_CAPSULE_ID,
+                &context,
+            )
+            .unwrap(),
+        ),
+        (
+            "a forged token",
+            "http://localhost:61180",
+            home_token.clone(),
+            "not-a-launch-token".to_string(),
+        ),
+    ];
+    for (label, origin, home, app_token) in refused_authority {
+        let (status, body) = home_external_link_raw(
+            &app,
+            origin,
+            &home,
+            request(&app_token, "https://example.com/"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+    }
+
+    let expired =
+        issue_expired_home_launch_token_with_context(dir.path(), BROWSER_CAPSULE_ID, &context)
+            .unwrap();
+    let (status, body) = home_external_link_raw(
+        &app,
+        "http://localhost:61180",
+        &home_token,
+        request(&expired, "https://example.com/"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("expired"), "{body}");
+
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,x",
+        "file:///etc/passwd",
+        "elastos://doc",
+        "https://user:pass@example.com/",
+        "https://example.com/\u{7}",
+        // Home's own pages (the request's Host) open inside Home.
+        "http://localhost:61180/apps/home/",
+        "http://localhost:61180/api/apps/home/summary",
+    ] {
+        let (status, body) = home_external_link_raw(
+            &app,
+            "http://localhost:61180",
+            &home_token,
+            request(&browser_token, url),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{url:?}: {body}");
+    }
+    let (status, _) = home_external_link_raw(
+        &app,
+        "http://localhost:61180",
+        &home_token,
+        json!({
+            "schema": "elastos.home.external-link.request/v2",
+            "app_token": browser_token,
+            "url": "https://example.com/",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mut extra = request(&browser_token, "https://example.com/");
+    extra["app_id"] = json!("wallet");
+    let (status, _) =
+        home_external_link_raw(&app, "http://localhost:61180", &home_token, extra).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }

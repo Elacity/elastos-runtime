@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const browserRoot = join(repoRoot, "capsules/archive-manager/browser");
+const homeNavigationClientPath = join(repoRoot, "capsules/home/browser/home-navigation-client.js");
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
@@ -183,6 +184,16 @@ function startServer() {
         const appSrc = url.searchParams.get("app_src") || "";
         const body = Buffer.from(buildShellDocument(appSrc));
         response.writeHead(200, { "content-length": body.length, "content-type": "text/html; charset=utf-8" });
+        response.end(body);
+        return;
+      }
+      if (url.pathname === "/apps/home/home-navigation-client.js") {
+        const body = await readFile(homeNavigationClientPath);
+        response.writeHead(200, {
+          "access-control-allow-origin": "null",
+          "content-length": body.length,
+          "content-type": "text/javascript",
+        });
         response.end(body);
         return;
       }

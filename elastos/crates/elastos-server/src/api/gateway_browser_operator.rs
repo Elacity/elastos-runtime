@@ -168,6 +168,16 @@ async fn operator_session(
         .await
         .ok_or_else(|| failure(StatusCode::UNAUTHORIZED, "operator_session_expired"))
 }
+
+/// Reuse the existing Runtime session gate before gateway body extraction.
+/// Browser callers retain their separate signed launch authority.
+pub(in crate::api::gateway) async fn admit_runtime_session(
+    state: &GatewayState,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let service = service(state).map_err(|response| *response)?;
+    operator_session(&service, headers).await.map(|_| ())
+}
 fn resource(page: &str, id: &str) -> ResourceId {
     ResourceId::new(format!("elastos://browser/pages/{page}/operator/{id}"))
 }

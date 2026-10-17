@@ -64,18 +64,23 @@ Object.assign(context, {
   clearRecoveryPending: () => {}, setRecoveryButton: () => {},
   showRecoveryStatus: (text, kind) => outcomes.push({ text, kind }),
   showRecoveryNote: (text, kind) => outcomes.push({ text, kind }),
-  downloadRecoveryKit: () => outcomes.push("download"), recoveryPasswordInput: null,
+  downloadRecoveryKit: (kit) => { outcomes.push("download"); return context.recoveryKitFileName(kit); }, recoveryPasswordInput: null,
   notifyHomeSummaryChanged: () => outcomes.push("refresh-home"),
   refreshSystemSummary: async () => { throw new Error("summary failed"); },
 });
 vm.runInContext(functionSource(system, "onRecoveryDownload"), context);
-context.exportFullRecoveryBundle = async () => ({ included: { people_identity: true } });
+vm.runInContext(functionSource(system, "recoveryKitFileName"), context);
+const longPrincipal = "did:elastos:iqTKjH4ZKXbM4hnZtYV8M2pnf6Ag7Lqb9zW";
+assert.equal(context.recoveryKitFileName({ principal_id: longPrincipal }),
+  "elastos-recovery-did-elastos-iqTKjH4ZKXbM4hnZtYV8M2pnf6Ag7Lqb9zW.json");
+assert.equal(context.recoveryKitFileName({}), "elastos-recovery-principal.json");
+context.exportFullRecoveryBundle = async () => ({ principal_id: longPrincipal, included: { people_identity: true } });
 context.fetchJson = async () => status;
 await context.onRecoveryDownload();
 assert(outcomes.includes("download"));
 assert(outcomes.includes("refresh-home"));
 assert(!outcomes.some((outcome) => outcome.kind === "error"));
-assert(outcomes.some((outcome) => outcome.text?.includes("Recovery Kit downloaded")));
+assert(outcomes.some((outcome) => outcome.text?.includes("Recovery Kit downloaded as elastos-recovery-did-elastos-iqTKjH4ZKXbM4hnZtYV8M2pnf6Ag7Lqb9zW.json")));
 let releaseExport;
 let exportCount = 0;
 vm.runInContext(functionSource(system, "setRecoveryButton"), context);
@@ -134,6 +139,14 @@ const summary = { authority: { signed_in: true }, identity: {
   recovery_readiness: { schema: "elastos.recovery.readiness/v1", status: "setup_required" },
 } };
 assert.equal(home.homeSetupNeedsAct(summary), true, "existing Profile still needs an exported kit covering it");
+vm.runInContext(functionSource(setup, "homeRecoveryKitOutdated"), home);
+assert.equal(home.homeRecoveryKitOutdated(summary), false, "a kit without a stated reason reads as a first kit");
+summary.identity.recovery_readiness.reason = "recovery_kit_missing";
+assert.equal(home.homeRecoveryKitOutdated(summary), false, "a new account is greeted with a first-kit message");
+summary.identity.recovery_readiness.reason = "recovery_kit_outdated";
+assert.equal(home.homeRecoveryKitOutdated(summary), true, "a kit that predates the Profile reads as outdated");
+delete summary.identity.recovery_readiness.reason;
+assert(setup.includes("Save a Recovery Kit so you can get back into your account."), "new accounts get first-kit copy");
 let shown = 0;
 Object.assign(home, { SETUP_HOLD_TARGETS: new Set(["chat-room"]), shellState: { currentSummary: summary }, showSetupSheet: () => { shown += 1; } });
 vm.runInContext(functionSource(setup, "holdHomeSetupAct"), home);
@@ -204,7 +217,7 @@ const later = vm.createContext({
   SETUP_REMINDER_ID: "setup",
   shellState: { currentSummary: laterSummary, shellLayoutState: {} },
   sheet: { hidden: false, inert: false, setAttribute() {} },
-  finishedHideTimer: null, dismissedThisSession: false, drag: null,
+  dismissedThisSession: false, drag: null,
   restoreSetupSheetOverlay() {},
   showSetupSheet: () => { reopenedSheets += 1; },
   rememberChromeNotification: (item) => reminders.push(item),

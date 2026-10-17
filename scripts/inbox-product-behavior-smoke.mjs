@@ -159,9 +159,8 @@ async function settle() {
 }
 
 function extractInboxScript(html) {
-  const match = html.match(/<script>([\s\S]*)<\/script>\s*<\/body>/);
-  assert(match, "Inbox inline script not found");
-  return match[1];
+  assert(html.includes('<script src="./inbox.js"></script>'), "Inbox script reference not found");
+  return fs.readFileSync(new URL("../capsules/inbox/browser/inbox.js", import.meta.url), "utf8");
 }
 
 async function runInboxHomeChromeSmoke() {
@@ -264,7 +263,7 @@ async function runInboxHomeChromeSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 
@@ -308,6 +307,24 @@ async function runInboxHomeChromeSmoke() {
     const end = actions.children.find(node => node.dataset.actionId === "model-egress-end:model-egress-fixture");
     assert.equal(Boolean(end), status === "pending" || status === "approved");
     if (end) assert.equal(end.type, "button");
+  }
+  // Community presence: four answers, no Dismiss; the Runtime keeps the card
+  // until the person decides.
+  {
+    const actions = new FakeElement("div");
+    context.fillEntryActions(actions, {
+      id: "community-presence-request:42", kind: "community_presence_request",
+      source_app: "chat-room", title: "Show yourself in Community?", body: "",
+      action_ref: { app: "inbox", action_id: "community-presence-always:42" },
+    });
+    const decisions = actions.children.filter(node => node.dataset.actionId).map(node => [node.textContent, node.dataset.actionId]);
+    assert.deepEqual(decisions, [
+      ["Always while Home is online", "community-presence-always:42"],
+      ["Only while Community is open", "community-presence-open:42"],
+      ["Later", "community-presence-later:42"],
+      ["Never", "community-presence-never:42"],
+    ]);
+    assert(!actions.children.some(node => String(node.dataset.actionId || "").startsWith("notification-dismiss:")));
   }
   context.setStatus("unauthorized provider");
   assert.equal(nodes.get("status-text").textContent, "Inbox action could not be completed.");
@@ -644,7 +661,7 @@ async function runInboxLaunchSelectionSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 
@@ -728,7 +745,7 @@ async function runInboxMissingLaunchSelectionSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 
@@ -827,7 +844,7 @@ async function runInboxRemovedLaunchSelectionSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
   await nodes.get("refresh").listeners.get("click")[0]();
@@ -927,7 +944,7 @@ async function runInboxRequestedSelectionAppearsLaterSmoke() {
   };
 
   vm.runInNewContext(inboxScript, context, {
-    filename: "capsules/inbox/browser/index.html:inline",
+    filename: "capsules/inbox/browser/inbox.js",
   });
   await settle();
 

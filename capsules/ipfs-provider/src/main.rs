@@ -10,6 +10,7 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Only Runtime's typed local Registry methods dispatch the private operations.
@@ -18,17 +19,195 @@ mod directory_hash;
 
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const KUBO_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const KUBO_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+// Tests shorten the idle stop so it can be observed.
+#[cfg(not(test))]
 const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
+#[cfg(test)]
+const IDLE_TIMEOUT_SECS: u64 = 2;
+#[cfg(not(test))]
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 const LOCKFILE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const LOCKFILE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const LARGE_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 const CAT_TO_PATH_CHUNK: usize = 64 * 1024;
+const ADD_PATH_CHUNK: usize = 1024 * 1024;
 const BOUNDED_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const BOUNDED_READ_KUBO_TIMEOUT: &str = "100ms";
 const MAX_BOUNDED_READ_BYTES: u64 = 64 * 1024;
 const MAX_CAPACITY_REQUIRED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+// The upload reads one opened file. A short read or changed file cannot
+// silently replace missing payload bytes with the multipart footer.
+struct AddPathReader {
+    file: fs::File,
+    length: u64,
+    remaining: u64,
+    modified: SystemTime,
+}
+
+impl AddPathReader {
+    fn new(file: fs::File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Upload source must be a regular file",
+            ));
+        }
+        Ok(Self {
+            file,
+            length: metadata.len(),
+            remaining: metadata.len(),
+            modified: metadata.modified()?,
+        })
+    }
+
+    fn unchanged(&self) -> io::Result<()> {
+        let metadata = self.file.metadata()?;
+        if metadata.len() != self.length || metadata.modified()? != self.modified {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Upload source changed during read",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Read for AddPathReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            self.unchanged()?;
+            return Ok(0);
+        }
+        let limit = buffer
+            .len()
+            .min(ADD_PATH_CHUNK)
+            .min(self.remaining.min(usize::MAX as u64) as usize);
+        let count = self.file.read(&mut buffer[..limit])?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Upload source ended before its recorded length",
+            ));
+        }
+        self.remaining -= count as u64;
+        if self.remaining == 0 {
+            self.unchanged()?;
+        }
+        Ok(count)
+    }
+}
+
+/// Opens a local object root below this provider's own data root. Every
+/// component below the data root is opened O_NOFOLLOW|O_DIRECTORY, so no link
+/// can lead the import outside it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_local_object_root(data_root: &Path, root: &Path) -> io::Result<fs::File> {
+    let outside = || {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Local object is outside the data root",
+        )
+    };
+    let relative = root.strip_prefix(data_root).map_err(|_| outside())?;
+    let mut dir = fs::File::open(data_root)?;
+    if !dir.metadata()?.is_dir() {
+        return Err(outside());
+    }
+    for part in relative.components() {
+        let std::path::Component::Normal(name) = part else {
+            return Err(outside());
+        };
+        dir = directory_hash::open_at(&dir, name.to_str().ok_or_else(outside)?, true)?;
+    }
+    Ok(dir)
+}
+
+/// Opens one declared file below an object root fd, following no link: it must
+/// be a regular file of the recorded size owned by this user.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_local_object_file(root: &fs::File, path: &str, size: u64) -> io::Result<fs::File> {
+    use std::os::unix::fs::MetadataExt;
+
+    let (parents, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let mut dir = root.try_clone()?;
+    for part in parents.split('/').filter(|part| !part.is_empty()) {
+        dir = directory_hash::open_at(&dir, part, true)?;
+    }
+    let file = directory_hash::open_at(&dir, name, false)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.len() != size
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Local object file is not the recorded regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Multipart body of one local object directory for Kubo `add`. Files open one
+/// at a time when their part starts and stream through `AddPathReader`, so the
+/// provider holds one bounded chunk whatever the object's size.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct LocalObjectBody<'a> {
+    root: fs::File,
+    files: std::slice::Iter<'a, StagedFile>,
+    boundary: String,
+    pending: io::Cursor<Vec<u8>>,
+    current: Option<AddPathReader>,
+    finished: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Read for LocalObjectBody<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let count = self.pending.read(buffer)?;
+            if count != 0 {
+                return Ok(count);
+            }
+            if let Some(reader) = self.current.as_mut() {
+                let count = reader.read(buffer)?;
+                if count != 0 {
+                    return Ok(count);
+                }
+                self.current = None;
+                self.pending = io::Cursor::new(b"\r\n".to_vec());
+                continue;
+            }
+            if let Some(file) = self.files.next() {
+                let source = open_local_object_file(&self.root, &file.path, file.size)?;
+                self.current = Some(AddPathReader::new(source)?);
+                self.pending = io::Cursor::new(directory_part_header(&self.boundary, &file.path));
+            } else if !self.finished {
+                self.finished = true;
+                self.pending = io::Cursor::new(format!("--{}--\r\n", self.boundary).into_bytes());
+            } else {
+                return Ok(0);
+            }
+        }
+    }
+}
+
+fn directory_part_header(boundary: &str, path: &str) -> Vec<u8> {
+    format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{path}\"\r\nContent-Type: {}\r\n\r\n",
+        guess_mime(path)
+    )
+    .into_bytes()
+}
 
 fn deserialize_metadata_max<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -36,10 +215,7 @@ fn deserialize_metadata_max<'de, D: serde::Deserializer<'de>>(
     u64::deserialize(deserializer).map(Some)
 }
 
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── Protocol types ──────────────────────────────────────────────────
 
@@ -52,6 +228,9 @@ enum Request {
     },
     RuntimeHashStagedDirectory {
         directory: StagedDirectory,
+    },
+    RuntimeAddLocalObject {
+        object: LocalObject,
     },
     Init {
         #[serde(default)]
@@ -143,16 +322,19 @@ struct StagedDirectory {
     total_bytes: u64,
 }
 
+fn valid_root(root: &Path) -> bool {
+    root.to_str().is_some_and(|root| {
+        root.starts_with('/')
+            && root.len() <= 4096
+            && !root.contains('\0')
+            && root[1..].split('/').count() <= 64
+            && !root[1..].split('/').any(|p| matches!(p, "" | "." | ".."))
+    })
+}
+
 impl StagedDirectory {
     fn valid_shape(&self) -> bool {
-        let Some(root) = self.root.to_str() else {
-            return false;
-        };
-        if !root.starts_with('/')
-            || root.len() > 4096
-            || root.contains('\0')
-            || root[1..].split('/').count() > 64
-            || root[1..].split('/').any(|p| matches!(p, "" | "." | ".."))
+        if !valid_root(&self.root)
             || self.files.is_empty()
             || self.files.len() > 33
             || self.total_bytes == 0
@@ -197,6 +379,41 @@ impl StagedDirectory {
     }
 }
 
+const MAX_LOCAL_OBJECT_FILES: usize = 4096;
+
+/// Runtime's descriptor of one complete local Content object directory: the
+/// manifest's files plus `_elastos_object.json`, with their recorded sizes.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalObject {
+    root: PathBuf,
+    files: Vec<StagedFile>,
+}
+
+impl LocalObject {
+    fn valid_shape(&self) -> bool {
+        let mut paths = std::collections::BTreeSet::new();
+        // Paths become multipart filenames; quotes and controls cannot pass.
+        valid_root(&self.root)
+            && (1..=MAX_LOCAL_OBJECT_FILES).contains(&self.files.len())
+            && self.files.iter().all(|file| {
+                file.path.len() <= 4096
+                    && !file.path.split('/').any(|p| matches!(p, "" | "." | ".."))
+                    && !file
+                        .path
+                        .chars()
+                        .any(|c| c.is_control() || c == '"' || c == '\\')
+                    && paths.insert(file.path.as_str())
+            })
+            && paths.contains("_elastos_object.json")
+            && !self.files.iter().any(|f| {
+                f.path
+                    .match_indices('/')
+                    .any(|(i, _)| paths.contains(&f.path[..i]))
+            })
+    }
+}
+
 fn private_preparation_error() -> Response {
     Response::error(
         "preparation_unavailable",
@@ -217,6 +434,7 @@ fn parse_request(line: &str) -> Result<Request, Response> {
                         "runtime_prepare_backend"
                             | "runtime_hash_staged_directory"
                             | "runtime_check_capacity"
+                            | "runtime_add_local_object"
                     )
                 })
             })
@@ -278,6 +496,37 @@ enum KuboState {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HostRole {
+    #[default]
+    User,
+    Gateway,
+}
+
+impl HostRole {
+    fn from_init(config: &serde_json::Value) -> Result<Self, ()> {
+        // The role belongs to Runtime's private Init envelope, not arbitrary
+        // top-level provider options or the process environment.
+        if config.get("runtime_host_role").is_some() {
+            return Err(());
+        }
+        match config
+            .get("extra")
+            .and_then(|extra| extra.get("runtime_host_role"))
+        {
+            None => Ok(Self::User),
+            Some(serde_json::Value::String(role)) if role == "user" => Ok(Self::User),
+            Some(serde_json::Value::String(role)) if role == "gateway" => Ok(Self::Gateway),
+            Some(_) => Err(()),
+        }
+    }
+
+    fn idle_stop_due(self, last_used: u64, now: u64) -> bool {
+        self == Self::User && now.saturating_sub(last_used) > IDLE_TIMEOUT_SECS
+    }
+}
+
 // ── Coord file ──────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -292,6 +541,8 @@ struct CoordFile {
 // ── Provider ────────────────────────────────────────────────────────
 
 struct IpfsProvider {
+    host_role: HostRole,
+    initialized: bool,
     state: KuboState,
     api_port: u16,
     gateway_port: u16,
@@ -306,6 +557,8 @@ impl IpfsProvider {
         let data_dir = data_dir();
         let repo_dir = data_dir.join("ipfs-repo");
         Self {
+            host_role: HostRole::User,
+            initialized: false,
             state: KuboState::Cold,
             api_port: 0,
             gateway_port: 0,
@@ -373,7 +626,7 @@ impl IpfsProvider {
     fn fetch_bytes(&mut self, arg: &str) -> Result<Vec<u8>, String> {
         let mut failures = Vec::new();
 
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             match self.kubo_cat_bytes(arg, LARGE_HTTP_TIMEOUT) {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => failures.push(err),
@@ -401,7 +654,7 @@ impl IpfsProvider {
     fn fetch_to_path(&mut self, arg: &str, dest: &Path) -> Result<u64, String> {
         // Dest copies borrow a local repo hit, then Content fails over to
         // Carrier. Pin/add and gateway fallback search the public swarm.
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             self.kubo_cat_to_path(arg, dest, LARGE_HTTP_TIMEOUT)
         } else {
             Err("local dest cat backend is not ready".into())
@@ -454,7 +707,11 @@ impl IpfsProvider {
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 {
                     match directory_hash::check_capacity(self, required_bytes) {
-                        Ok(observation) => Response::ok(serde_json::json!(observation)),
+                        Ok(observation) => {
+                            // A model download reaches Kubo only through these checks.
+                            update_coord_last_used(&self.data_dir);
+                            Response::ok(serde_json::json!(observation))
+                        }
                         Err(error) => {
                             eprintln!(
                                 "ipfs-provider: private capacity observation failed: {error}"
@@ -475,9 +732,35 @@ impl IpfsProvider {
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 {
                     match directory_hash::hash_directory(self, &directory) {
-                        Ok(cid) => Response::ok(serde_json::json!({"cid":cid})),
+                        Ok(cid) => {
+                            update_coord_last_used(&self.data_dir);
+                            Response::ok(serde_json::json!({"cid":cid}))
+                        }
                         Err(error) => {
                             eprintln!("ipfs-provider: private directory hash failed: {error}");
+                            private_preparation_error()
+                        }
+                    }
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    private_preparation_error()
+                }
+            }
+            Request::RuntimeAddLocalObject { object } => {
+                if !object.valid_shape() {
+                    return private_preparation_error();
+                }
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    if let Err(error) = self.ensure_kubo() {
+                        eprintln!("ipfs-provider: local object backend unavailable: {error}");
+                        return private_preparation_error();
+                    }
+                    match self.kubo_add_local_object(&object) {
+                        Ok(cid) => Response::ok(serde_json::json!({"cid":cid})),
+                        Err(error) => {
+                            eprintln!("ipfs-provider: local object import failed: {error}");
                             private_preparation_error()
                         }
                     }
@@ -533,9 +816,11 @@ impl IpfsProvider {
     // ── Init ────────────────────────────────────────────────────────
 
     fn init(&mut self, config: serde_json::Value) -> Response {
+        let Ok(host_role) = HostRole::from_init(&config) else {
+            return Response::error("invalid_config", "Invalid Runtime IPFS host role");
+        };
         let extra = config.get("extra").unwrap_or(&config);
-
-        if let Some(base_path) = config
+        let selected_root = if let Some(base_path) = config
             .get("base_path")
             .and_then(serde_json::Value::as_str)
             .or_else(|| extra.get("data_dir").and_then(serde_json::Value::as_str))
@@ -549,11 +834,27 @@ impl IpfsProvider {
                     "ipfs-provider data_dir must be absolute",
                 );
             }
-            self.data_dir = path;
-            self.repo_dir = self.data_dir.join("ipfs-repo");
+            path
+        } else {
+            self.data_dir.clone()
+        };
+        if self.initialized && (self.host_role != host_role || self.data_dir != selected_root) {
+            return Response::error(
+                "invalid_config",
+                "Runtime IPFS role and data root are fixed at Init",
+            );
         }
+        if self.initialized {
+            return Response::ok(
+                serde_json::json!({"provider":"ipfs-provider", "state":self.state,
+                "runtime_host_role":self.host_role}),
+            );
+        }
+        self.host_role = host_role;
+        self.data_dir = selected_root;
+        self.repo_dir = self.data_dir.join("ipfs-repo");
 
-        if extra.get("gateways").is_some() || std::env::var("ELASTOS_IPFS_GATEWAYS").is_ok() {
+        if extra.get("gateways").is_some() {
             eprintln!("ipfs-provider: ignoring gateway override; provider is local-IPFS only");
         }
 
@@ -588,19 +889,40 @@ impl IpfsProvider {
             }
         }
 
+        self.initialized = true;
+        eprintln!(
+            "ipfs-provider: Runtime host role {:?}; idle stop {}",
+            self.host_role,
+            if self.host_role == HostRole::Gateway {
+                "disabled"
+            } else {
+                "600s"
+            }
+        );
         Response::ok(serde_json::json!({
             "provider": "ipfs-provider",
             "state": self.state,
+            "runtime_host_role": self.host_role,
         }))
     }
 
     // ── Ensure Kubo is running ──────────────────────────────────────
 
     fn ensure_kubo(&mut self) -> Result<(), String> {
+        // Reap an owned daemon after the idle watcher or a crash stops it.
+        if self
+            .kubo_child
+            .as_mut()
+            .is_some_and(|child| child.try_wait().ok().flatten().is_some())
+        {
+            self.kubo_child = None;
+        }
         if self.state == KuboState::Ready {
             // Verify still alive
             if let Some(coord) = read_coord_file(&self.data_dir) {
                 if is_pid_alive(coord.kubo_pid) {
+                    self.api_port = coord.api_port;
+                    self.gateway_port = coord.gateway_port;
                     update_coord_last_used(&self.data_dir);
                     return Ok(());
                 }
@@ -678,6 +1000,7 @@ impl IpfsProvider {
     }
 
     fn start_kubo(&mut self) -> Result<(), String> {
+        self.reap_previous_kubo()?;
         let binary = self.kubo_binary.as_ref().ok_or("Kubo binary not found")?;
         self.state = KuboState::Starting;
 
@@ -811,6 +1134,35 @@ impl IpfsProvider {
         Ok(())
     }
 
+    fn reap_previous_kubo(&mut self) -> Result<(), String> {
+        let Some(child) = self.kubo_child.as_mut() else {
+            return Ok(());
+        };
+        let mut deadline = Instant::now() + KUBO_STOP_TIMEOUT;
+        let mut forced = false;
+        loop {
+            if child
+                .try_wait()
+                .map_err(|error| format!("Previous Kubo exit check failed: {error}"))?
+                .is_some()
+            {
+                self.kubo_child = None;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                if forced {
+                    return Err("Previous Kubo did not exit; replacement refused".into());
+                }
+                // Keep ownership until the stopped daemon releases its repo lock.
+                // A concurrent exit can make kill fail; the next poll still reaps it.
+                let _ = child.kill();
+                forced = true;
+                deadline = Instant::now() + KUBO_STOP_TIMEOUT;
+            }
+            std::thread::sleep(LOCKFILE_POLL_INTERVAL);
+        }
+    }
+
     // ── Write ops ───────────────────────────────────────────────────
 
     fn add_bytes(&mut self, data_b64: &str, filename: &str, pin: bool) -> Response {
@@ -865,7 +1217,7 @@ impl IpfsProvider {
     // ── Read ops ────────────────────────────────────────────────────
 
     fn cat_bounded(
-        &self,
+        &mut self,
         cid: &str,
         path: Option<&str>,
         invocation: Option<&serde_json::Value>,
@@ -943,6 +1295,14 @@ impl IpfsProvider {
             if self.state != KuboState::Ready || self.api_port == 0 {
                 return Err("bounded read backend is not ready".into());
             }
+            let coord =
+                read_coord_file(&self.data_dir).filter(|coord| is_pid_alive(coord.kubo_pid));
+            let Some(coord) = coord else {
+                self.state = KuboState::Cold;
+                return Err("bounded read backend is not ready".into());
+            };
+            self.api_port = coord.api_port;
+            self.gateway_port = coord.gateway_port;
             let arg = if path.is_empty() {
                 cid.to_string()
             } else {
@@ -1066,7 +1426,7 @@ impl IpfsProvider {
 
     fn ls(&mut self, cid: &str) -> Response {
         // Try Kubo first
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
@@ -1136,7 +1496,7 @@ impl IpfsProvider {
 
             let arg = format!("{}/{}", cid, file_path);
 
-            let bytes = if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+            let bytes = if self.ensure_kubo().is_ok() {
                 let url = format!("{}/api/v0/cat?arg={}", self.api_url(), arg);
                 match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
                     Ok(resp) if resp.status() == 200 => {
@@ -1301,9 +1661,52 @@ impl IpfsProvider {
     }
 
     fn kubo_add_path(&self, path: &Path, pin: bool) -> Result<String, String> {
-        let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
+        if !fs::metadata(path)
+            .map_err(|e| format!("Failed to read file: {}", e))?
+            .is_file()
+        {
+            return Err("Upload source must be a regular file".into());
+        }
+        let file = fs::File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+        let reader = file
+            .try_clone()
+            .and_then(AddPathReader::new)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        let length = reader.length;
+        let modified = reader.modified;
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-        self.kubo_add_bytes(&bytes, filename, pin)
+        let boundary = format!("----elastos{}", now_unix_secs());
+        let prefix = format!("--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n", boundary, filename).into_bytes();
+        let footer = format!("\r\n--{}--\r\n", boundary).into_bytes();
+        let content_length = length
+            .checked_add(prefix.len() as u64)
+            .and_then(|n| n.checked_add(footer.len() as u64))
+            .ok_or("Upload content length exceeds its bound")?;
+        let body = io::Cursor::new(prefix)
+            .chain(reader)
+            .chain(io::Cursor::new(footer));
+        let resp = ureq::post(&format!("{}/api/v0/add?pin={}", self.api_url(), pin))
+            .set(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={}", boundary),
+            )
+            .set("Content-Length", &content_length.to_string())
+            .timeout(LARGE_HTTP_TIMEOUT)
+            .send(body)
+            .map_err(|e| format!("IPFS add failed: {}", e))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        if metadata.len() != length || metadata.modified().map_err(|e| e.to_string())? != modified {
+            return Err("Upload source changed during read".into());
+        }
+        if resp.status() != 200 {
+            return Err(format!("IPFS add failed: HTTP {}", resp.status()));
+        }
+        let body_str = resp
+            .into_string()
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+        parse_add_response(&body_str)
     }
 
     fn kubo_add_directory(&self, files: Vec<DirFile>, pin: bool) -> Result<String, String> {
@@ -1314,30 +1717,13 @@ impl IpfsProvider {
             let bytes = BASE64
                 .decode(&file.data)
                 .map_err(|e| format!("Invalid base64 for {}: {}", file.path, e))?;
-
-            write!(body, "--{}\r\n", boundary).unwrap();
-            write!(
-                body,
-                "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
-                file.path
-            )
-            .unwrap();
-
-            // Guess MIME type
-            let mime = guess_mime(&file.path);
-            write!(body, "Content-Type: {}\r\n\r\n", mime).unwrap();
+            body.extend_from_slice(&directory_part_header(&boundary, &file.path));
             body.extend_from_slice(&bytes);
             write!(body, "\r\n").unwrap();
         }
         write!(body, "--{}--\r\n", boundary).unwrap();
 
-        let url = format!(
-            "{}/api/v0/add?wrap-with-directory=true&pin={}&cid-version=1&hash=sha2-256&raw-leaves=true&chunker=size-262144&trickle=false&max-file-links=174&max-directory-links=0&max-hamt-fanout=256&inline=false&inline-limit=32&nocopy=false&fscache=false&preserve-mode=false&preserve-mtime=false&empty-dirs=false&progress=false&fast-provide-root=false&fast-provide-wait=false",
-            self.api_url(),
-            pin
-        );
-
-        let resp = ureq::post(&url)
+        let resp = ureq::post(&self.add_directory_url(pin))
             .set(
                 "Content-Type",
                 &format!("multipart/form-data; boundary={}", boundary),
@@ -1345,30 +1731,53 @@ impl IpfsProvider {
             .timeout(LARGE_HTTP_TIMEOUT)
             .send_bytes(&body)
             .map_err(|e| format!("IPFS add directory failed: {}", e))?;
+        directory_root(resp)
+    }
 
-        if resp.status() != 200 {
-            return Err(format!("IPFS add directory failed: HTTP {}", resp.status()));
+    /// Adds one complete local object directory to Kubo unpinned, with the same
+    /// parts and add options as `add_directory`, so its CID equals the original
+    /// import; Runtime pins it only after comparing that CID. Files stream from
+    /// disk through fds opened below the data root without following links.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn kubo_add_local_object(&self, object: &LocalObject) -> Result<String, String> {
+        let root = open_local_object_root(&self.data_dir, &object.root)
+            .map_err(|e| format!("Local object root refused: {}", e))?;
+        let boundary = format!("----elastos{}", now_unix_secs());
+        let mut length = format!("--{boundary}--\r\n").len() as u64;
+        for file in &object.files {
+            open_local_object_file(&root, &file.path, file.size)
+                .map_err(|e| format!("Local object file refused: {}", e))?;
+            length = length
+                .checked_add(directory_part_header(&boundary, &file.path).len() as u64 + 2)
+                .and_then(|n| n.checked_add(file.size))
+                .ok_or("Local object length exceeds its bound")?;
         }
+        let body = LocalObjectBody {
+            root,
+            files: object.files.iter(),
+            boundary: boundary.clone(),
+            pending: io::Cursor::new(Vec::new()),
+            current: None,
+            finished: false,
+        };
+        let resp = ureq::post(&self.add_directory_url(false))
+            .set(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={}", boundary),
+            )
+            .set("Content-Length", &length.to_string())
+            .timeout(LARGE_HTTP_TIMEOUT)
+            .send(body)
+            .map_err(|e| format!("IPFS add local object failed: {}", e))?;
+        directory_root(resp)
+    }
 
-        // Parse NDJSON — the entry with empty Name is the root directory CID
-        let body_str = resp
-            .into_string()
-            .map_err(|e| format!("Failed to read response: {}", e))?;
-        let mut root_cid = None;
-        for line in body_str.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
-                let name = entry["Name"].as_str().unwrap_or("");
-                let hash = entry["Hash"].as_str().unwrap_or("");
-                if name.is_empty() && !hash.is_empty() {
-                    root_cid = Some(hash.to_string());
-                }
-            }
-        }
-
-        root_cid.ok_or_else(|| "No root CID in IPFS response".to_string())
+    fn add_directory_url(&self, pin: bool) -> String {
+        format!(
+            "{}/api/v0/add?wrap-with-directory=true&pin={}&cid-version=1&hash=sha2-256&raw-leaves=true&chunker=size-262144&trickle=false&max-file-links=174&max-directory-links=0&max-hamt-fanout=256&inline=false&inline-limit=32&nocopy=false&fscache=false&preserve-mode=false&preserve-mtime=false&empty-dirs=false&progress=false&fast-provide-root=false&fast-provide-wait=false",
+            self.api_url(),
+            pin
+        )
     }
 
     // ── Internal: local IPFS gateway only ──────────────────────────
@@ -1448,7 +1857,7 @@ impl IpfsProvider {
 
     fn list_dir_files(&mut self, cid: &str) -> Result<Vec<String>, String> {
         // Try Kubo API first
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
@@ -1552,6 +1961,23 @@ fn guess_mime(path: &str) -> &'static str {
         Some("svg") => "image/svg+xml",
         _ => "application/octet-stream",
     }
+}
+
+/// Root CID of a wrapped directory add: the NDJSON entry with an empty Name.
+fn directory_root(resp: ureq::Response) -> Result<String, String> {
+    if resp.status() != 200 {
+        return Err(format!("IPFS add directory failed: HTTP {}", resp.status()));
+    }
+    let body = resp
+        .into_string()
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+    body.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry["Name"].as_str().unwrap_or("").is_empty())
+        .filter_map(|entry| entry["Hash"].as_str().map(str::to_owned))
+        .filter(|hash| !hash.is_empty())
+        .next_back()
+        .ok_or_else(|| "No root CID in IPFS response".to_string())
 }
 
 fn parse_add_response(body: &str) -> Result<String, String> {
@@ -1850,7 +2276,7 @@ fn collect_ls_entries(json: &serde_json::Value, prefix: &str, out: &mut Vec<serd
 }
 
 fn collect_ls_files_recursive(
-    provider: &IpfsProvider,
+    provider: &mut IpfsProvider,
     json: &serde_json::Value,
     prefix: &str,
     out: &mut Vec<String>,
@@ -1873,6 +2299,9 @@ fn collect_ls_files_recursive(
                     match link_type {
                         1 if !hash.is_empty() => {
                             // Directory — recurse
+                            if provider.ensure_kubo().is_err() {
+                                continue;
+                            }
                             let url = format!("{}/api/v0/ls?arg={}", provider.api_url(), hash);
                             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                                 if resp.status() == 200 {
@@ -1899,13 +2328,15 @@ fn collect_ls_files_recursive(
 
 // ── Idle timeout (background thread) ────────────────────────────────
 
-fn spawn_idle_watcher(data_dir: PathBuf) {
+fn spawn_idle_watcher(data_dir: PathBuf, activity: Arc<Mutex<()>>, role: HostRole) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(IDLE_CHECK_INTERVAL);
+            // The provider keeps startup and active reads ahead of an idle stop.
+            let _activity = activity.lock().unwrap();
             if let Some(coord) = read_coord_file(&data_dir) {
                 let idle_secs = now_unix_secs().saturating_sub(coord.last_used);
-                if idle_secs > IDLE_TIMEOUT_SECS {
+                if role.idle_stop_due(coord.last_used, now_unix_secs()) {
                     eprintln!(
                         "ipfs-provider: Kubo idle for {}s (threshold {}s), stopping",
                         idle_secs, IDLE_TIMEOUT_SECS
@@ -1923,11 +2354,7 @@ fn spawn_idle_watcher(data_dir: PathBuf) {
                             .output();
                     }
                     remove_coord_file(&data_dir);
-                    break;
                 }
-            } else {
-                // No coord file — Kubo not running, exit watcher
-                break;
             }
         }
     });
@@ -1940,8 +2367,8 @@ fn main() {
 
     let mut provider = IpfsProvider::new();
 
-    // Start idle watcher thread
-    spawn_idle_watcher(provider.data_dir.clone());
+    let activity = Arc::new(Mutex::new(()));
+    let mut idle_watcher_started = false;
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -1968,7 +2395,20 @@ fn main() {
         };
 
         let is_shutdown = matches!(request, Request::Shutdown);
+        let _activity = activity.lock().unwrap();
         let response = provider.handle(request);
+        if !idle_watcher_started
+            && provider.state == KuboState::Ready
+            && provider.host_role == HostRole::User
+        {
+            // Init has selected the data root before this daemon becomes ready.
+            spawn_idle_watcher(
+                provider.data_dir.clone(),
+                Arc::clone(&activity),
+                provider.host_role,
+            );
+            idle_watcher_started = true;
+        }
 
         let json = serde_json::to_string(&response).unwrap();
         writeln!(stdout, "{}", json).unwrap();
@@ -1987,6 +2427,315 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ADD_PATH_RESPONSE: &[u8] =
+        b"{\"Name\":\"release.tar.gz\",\"Hash\":\"QmStreamedFixture\",\"Size\":\"17\"}\n";
+
+    fn add_http_fixture(
+        status: u16,
+        response: &'static [u8],
+    ) -> (u16, std::thread::JoinHandle<(String, Vec<u8>)>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut socket = accept_bounded_fixture(&listener);
+            let headers = read_bounded_fixture_headers(&mut socket);
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            assert!(length < 4 * ADD_PATH_CHUNK);
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            write!(
+                socket,
+                "HTTP/1.1 {} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                status,
+                response.len()
+            )
+            .unwrap();
+            socket.write_all(response).unwrap();
+            (headers, body)
+        });
+        (port, server)
+    }
+
+    #[test]
+    fn add_path_streams_exact_multipart_and_keeps_single_file_pin_options() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("release.tar.gz");
+        let payload: Vec<u8> = (0..2 * ADD_PATH_CHUNK + 17)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        fs::write(&path, &payload).unwrap();
+        for pin in [true, false] {
+            let (port, server) = add_http_fixture(200, ADD_PATH_RESPONSE);
+            let provider = bounded_cat_fixture_provider(root.path(), port);
+            assert_eq!(
+                provider.kubo_add_path(&path, pin).unwrap(),
+                "QmStreamedFixture"
+            );
+            let (headers, body) = server.join().unwrap();
+            assert!(headers.starts_with(&format!("POST /api/v0/add?pin={} HTTP/1.1\r\n", pin)));
+            assert!(!headers.to_ascii_lowercase().contains("transfer-encoding:"));
+            let content_type = headers
+                .lines()
+                .find(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+                .unwrap();
+            let boundary = content_type.split("boundary=").nth(1).unwrap();
+            assert!(content_type.contains("multipart/form-data; boundary=----elastos"));
+            let prefix = format!("--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"release.tar.gz\"\r\nContent-Type: application/octet-stream\r\n\r\n", boundary).into_bytes();
+            let footer = format!("\r\n--{}--\r\n", boundary).into_bytes();
+            assert!(body.starts_with(&prefix) && body.ends_with(&footer));
+            assert_eq!(body.len(), prefix.len() + payload.len() + footer.len());
+            assert_eq!(
+                &body[prefix.len()..body.len() - footer.len()],
+                payload.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn add_path_stream_reader_bounds_reads_and_refuses_short_or_changed_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("payload");
+        let payload = vec![b'x'; 2 * ADD_PATH_CHUNK + 17];
+        fs::write(&path, &payload).unwrap();
+        let mut reader = AddPathReader::new(fs::File::open(&path).unwrap()).unwrap();
+        let mut buffer = vec![0; 3 * ADD_PATH_CHUNK];
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        let mut total = 0;
+        loop {
+            let count = reader.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            assert!(count <= ADD_PATH_CHUNK);
+            assert_eq!(&buffer[..count], &payload[total..total + count]);
+            total += count;
+        }
+        assert_eq!(total, payload.len());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(payload.len() as u64 + 1)
+            .unwrap();
+        assert_eq!(
+            reader.read(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::write(&path, &payload).unwrap();
+        let mut reader = AddPathReader::new(fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(reader.read(&mut buffer).unwrap(), ADD_PATH_CHUNK);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        assert_eq!(
+            reader.read(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn add_path_stream_request_failure_and_nonregular_source_are_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("release.tar.gz");
+        fs::write(&path, b"fixture payload").unwrap();
+        let (port, server) = add_http_fixture(500, ADD_PATH_RESPONSE);
+        let provider = bounded_cat_fixture_provider(root.path(), port);
+        let error = provider.kubo_add_path(&path, true).unwrap_err();
+        assert!(error.contains("IPFS add failed") && error.contains("500"));
+        let (_, body) = server.join().unwrap();
+        assert!(body
+            .windows(b"fixture payload".len())
+            .any(|part| part == b"fixture payload"));
+        assert!(provider
+            .kubo_add_path(root.path(), true)
+            .unwrap_err()
+            .contains("regular file"));
+    }
+
+    const DIRECTORY_ROOT_RESPONSE: &[u8] =
+        b"{\"Name\":\"assets/data.bin\",\"Hash\":\"bafkfile\"}\n{\"Name\":\"\",\"Hash\":\"bafyroot\"}\n";
+
+    fn multipart_boundary(headers: &str) -> String {
+        headers
+            .lines()
+            .find_map(|line| line.split("boundary=").nth(1))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    fn without_boundary(body: &[u8], boundary: &str) -> Vec<u8> {
+        let mut kept = Vec::with_capacity(body.len());
+        let mut rest = body;
+        while let Some((&byte, tail)) = rest.split_first() {
+            if rest.starts_with(boundary.as_bytes()) {
+                rest = &rest[boundary.len()..];
+            } else {
+                kept.push(byte);
+                rest = tail;
+            }
+        }
+        kept
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn local_object_add_streams_the_parts_and_options_of_directory_add() {
+        let root = tempfile::tempdir().unwrap();
+        let object = root.path().join("object");
+        fs::create_dir_all(object.join("assets")).unwrap();
+        let files: [(&str, Vec<u8>); 3] = [
+            ("index.html", b"<p>held</p>".to_vec()),
+            (
+                "assets/data.bin",
+                (0..2 * ADD_PATH_CHUNK + 17)
+                    .map(|n| (n % 251) as u8)
+                    .collect(),
+            ),
+            ("_elastos_object.json", b"{\"files\":[]}".to_vec()),
+        ];
+        for (path, bytes) in &files {
+            fs::write(object.join(path), bytes).unwrap();
+        }
+        let (port, server) = add_http_fixture(200, DIRECTORY_ROOT_RESPONSE);
+        let provider = bounded_cat_fixture_provider(root.path(), port);
+        let encoded = files
+            .iter()
+            .map(|(path, bytes)| DirFile {
+                path: path.to_string(),
+                data: BASE64.encode(bytes),
+            })
+            .collect();
+        assert_eq!(
+            provider.kubo_add_directory(encoded, false).unwrap(),
+            "bafyroot"
+        );
+        let (json_headers, json_body) = server.join().unwrap();
+
+        let (port, server) = add_http_fixture(200, DIRECTORY_ROOT_RESPONSE);
+        let provider = bounded_cat_fixture_provider(root.path(), port);
+        let local = LocalObject {
+            root: object,
+            files: files
+                .iter()
+                .map(|(path, bytes)| StagedFile {
+                    path: path.to_string(),
+                    size: bytes.len() as u64,
+                })
+                .collect(),
+        };
+        assert!(local.valid_shape());
+        assert_eq!(provider.kubo_add_local_object(&local).unwrap(), "bafyroot");
+        let (headers, body) = server.join().unwrap();
+        // The same add options and parts, apart from the random boundary, give
+        // Kubo the same directory, so the CID equals the original JSON import.
+        // Runtime pins only after comparing it.
+        assert_eq!(headers.lines().next(), json_headers.lines().next());
+        assert!(headers.lines().next().unwrap().contains("&pin=false&"));
+        assert!(!headers.to_ascii_lowercase().contains("transfer-encoding:"));
+        assert_eq!(
+            without_boundary(&body, &multipart_boundary(&headers)),
+            without_boundary(&json_body, &multipart_boundary(&json_headers))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn local_object_add_refuses_unsafe_descriptors_links_and_changed_files() {
+        let root = tempfile::tempdir().unwrap();
+        let object = root.path().join("object");
+        fs::create_dir(&object).unwrap();
+        fs::write(object.join("a.txt"), b"abc").unwrap();
+        fs::write(object.join("_elastos_object.json"), b"{}").unwrap();
+        let mut provider = bounded_cat_fixture_provider(root.path(), 0);
+        let refused = serde_json::to_value(private_preparation_error()).unwrap();
+        let manifest = serde_json::json!({"path":"_elastos_object.json","size":2});
+        let request = |root: serde_json::Value, files: serde_json::Value| serde_json::json!({"op":"runtime_add_local_object","object":{"root":root,"files":files}});
+        let mut requests: Vec<_> = [
+            serde_json::json!([]),
+            serde_json::json!([{"path":"a.txt","size":3}]),
+            serde_json::json!([{"path":"../a.txt","size":3}, manifest]),
+            serde_json::json!([{"path":"a\"b","size":3}, manifest]),
+            serde_json::json!([{"path":"a\r\nb","size":3}, manifest]),
+            serde_json::json!([{"path":"a.txt","size":3}, {"path":"a.txt/b","size":1}, manifest]),
+            serde_json::json!([manifest, manifest]),
+        ]
+        .into_iter()
+        .map(|files| request(serde_json::json!(object), files))
+        .collect();
+        requests.push(request(
+            serde_json::json!("object"),
+            serde_json::json!([manifest]),
+        ));
+        let mut extra = request(serde_json::json!(object), serde_json::json!([manifest]));
+        extra["pin"] = serde_json::json!(false);
+        requests.push(extra);
+        for request in requests {
+            let response = match parse_request(&request.to_string()) {
+                Ok(parsed) => provider.handle(parsed),
+                Err(response) => response,
+            };
+            assert_eq!(
+                serde_json::to_value(response).unwrap(),
+                refused,
+                "{request}"
+            );
+        }
+        // Roots and files the import cannot trust are refused before anything
+        // reaches Kubo: this fixture has no backend, so a sent request would
+        // fail differently.
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret"), b"abc").unwrap();
+        fs::write(outside.path().join("_elastos_object.json"), b"{}").unwrap();
+        fs::create_dir(outside.path().join("dir")).unwrap();
+        fs::write(outside.path().join("dir/a.txt"), b"abc").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), object.join("linked.txt"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("dir"), object.join("linked")).unwrap();
+        let linked_root = root.path().join("linked-root");
+        std::os::unix::fs::symlink(outside.path(), &linked_root).unwrap();
+        for (object_root, path, size, refusal) in [
+            (&object, "a.txt", 4, "Local object file refused"),
+            (&object, "linked.txt", 3, "Local object file refused"),
+            (&object, "linked/a.txt", 3, "Local object file refused"),
+            (
+                &outside.path().to_path_buf(),
+                "secret",
+                3,
+                "Local object root refused",
+            ),
+            (&linked_root, "secret", 3, "Local object root refused"),
+        ] {
+            let candidate = LocalObject {
+                root: object_root.clone(),
+                files: vec![
+                    StagedFile {
+                        path: path.into(),
+                        size,
+                    },
+                    StagedFile {
+                        path: "_elastos_object.json".into(),
+                        size: 2,
+                    },
+                ],
+            };
+            assert!(candidate.valid_shape());
+            let error = provider.kubo_add_local_object(&candidate).unwrap_err();
+            assert!(error.starts_with(refusal), "{path}: {error}");
+        }
+    }
 
     fn private_hash_fixture_request() -> serde_json::Value {
         serde_json::json!({"op":"runtime_hash_staged_directory","directory":{
@@ -2061,6 +2810,8 @@ mod tests {
         );
         let root = tempfile::tempdir().unwrap();
         let mut provider = IpfsProvider {
+            host_role: crate::HostRole::User,
+            initialized: true,
             state: KuboState::Cold,
             api_port: 0,
             gateway_port: 0,
@@ -2215,6 +2966,8 @@ mod tests {
             },
         );
         IpfsProvider {
+            host_role: HostRole::User,
+            initialized: true,
             state: KuboState::Ready,
             api_port: port,
             gateway_port: port,
@@ -2223,6 +2976,167 @@ mod tests {
             data_dir: root.to_path_buf(),
             repo_dir: root.join("unused-repo"),
         }
+    }
+
+    #[test]
+    fn bounded_read_after_idle_stop_refuses_within_deadline_without_startup() {
+        for missing_coord in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut provider =
+                bounded_cat_fixture_provider(root.path(), listener.local_addr().unwrap().port());
+            provider.kubo_binary = Some(root.path().join("must-not-execute"));
+            if missing_coord {
+                remove_coord_file(root.path());
+            } else {
+                let mut coord = read_coord_file(root.path()).unwrap();
+                coord.kubo_pid = 999999;
+                assert!(!is_pid_alive(coord.kubo_pid));
+                write_coord_file(root.path(), &coord);
+            }
+            let started = Instant::now();
+            let response =
+                provider.handle(serde_json::from_value(bounded_cat_fixture_request()).unwrap());
+            assert!(started.elapsed() < BOUNDED_READ_TIMEOUT);
+            assert!(
+                matches!(response, Response::Error { code, .. } if code == "bounded_read_failed")
+            );
+            assert_eq!(provider.state, KuboState::Cold);
+            assert!(provider.kubo_child.is_none());
+            assert!(!provider.repo_dir.exists());
+            assert!(matches!(listener.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+        }
+    }
+
+    #[test]
+    fn unbounded_read_refreshes_ready_backend_ports_from_coord() {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut provider =
+            bounded_cat_fixture_provider(root.path(), listener.local_addr().unwrap().port());
+        provider.api_port = 0;
+        provider.gateway_port = 0;
+        let backend = std::thread::spawn(move || {
+            let mut socket = accept_bounded_fixture(&listener);
+            let headers = read_bounded_fixture_headers(&mut socket);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n89ab")
+                .unwrap();
+            headers
+        });
+        assert_eq!(provider.fetch_bytes("release-cid").unwrap(), b"89ab");
+        assert!(backend
+            .join()
+            .unwrap()
+            .starts_with("POST /api/v0/cat?arg=release-cid"));
+        assert_eq!(provider.state, KuboState::Ready);
+        assert!(provider.kubo_child.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn immediate_recovery_read_reaps_delayed_previous_daemon_before_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut previous = Command::new("sh")
+            .args(["-c", "trap 'sleep 1; exit 0' TERM; printf ready; read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0; 5];
+        previous
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+        let previous_pid = previous.id();
+        let mut provider = bounded_cat_fixture_provider(root.path(), 0);
+        provider.kubo_child = Some(previous);
+        remove_coord_file(root.path());
+
+        // The replacement fixture exposes only the startup health and cat calls.
+        let kubo = root.path().join("kubo-fixture");
+        fs::write(&kubo, "#!/bin/sh\ncase \"$1\" in\ndaemon) printf '%s' \"$3\" > \"$IPFS_PATH.started\"; exec sleep 60;;\n*) exit 0;;\nesac\n").unwrap();
+        fs::set_permissions(&kubo, fs::Permissions::from_mode(0o700)).unwrap();
+        provider.kubo_binary = Some(kubo);
+        let started_path = provider.repo_dir.with_extension("started");
+        let backend = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let port = loop {
+                if let Ok(address) = fs::read_to_string(&started_path) {
+                    if let Some(port) = address
+                        .rsplit('/')
+                        .next()
+                        .and_then(|value| value.parse::<u16>().ok())
+                    {
+                        break port;
+                    }
+                }
+                assert!(Instant::now() < deadline, "replacement was not started");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut health = accept_bounded_fixture(&listener);
+            let health_headers = read_bounded_fixture_headers(&mut health);
+            health
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+            drop(health);
+            let mut cat = accept_bounded_fixture(&listener);
+            let cat_headers = read_bounded_fixture_headers(&mut cat);
+            cat.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n89ab")
+                .unwrap();
+            (health_headers, cat_headers)
+        });
+
+        assert_eq!(unsafe { libc::kill(previous_pid as i32, libc::SIGTERM) }, 0);
+        let started = Instant::now();
+        let result = provider.fetch_bytes("release-cid");
+        let elapsed = started.elapsed();
+        let previous_reaped = !is_pid_alive(previous_pid);
+        if let Some(mut replacement) = provider.kubo_child.take() {
+            let _ = replacement.kill();
+            replacement.wait().unwrap();
+        }
+        // Settle the previous fixture even when a regression loses its Child handle.
+        unsafe { libc::waitpid(previous_pid as i32, std::ptr::null_mut(), 0) };
+        let (health_headers, cat_headers) = backend.join().unwrap();
+        assert_eq!(result.unwrap(), b"89ab");
+        assert!(elapsed >= Duration::from_secs(1));
+        assert!(
+            previous_reaped,
+            "previous Child was replaced before it was reaped"
+        );
+        assert!(health_headers.starts_with("POST /api/v0/id"));
+        assert!(cat_headers.starts_with("POST /api/v0/cat?arg=release-cid"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn previous_daemon_is_force_stopped_and_reaped_within_stop_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = Command::new("sleep").arg("60").spawn().unwrap();
+        let previous_pid = previous.id();
+        let mut provider = bounded_cat_fixture_provider(root.path(), 0);
+        provider.kubo_child = Some(previous);
+        let started = Instant::now();
+        let result = provider.reap_previous_kubo();
+        let elapsed = started.elapsed();
+        if let Some(mut remaining) = provider.kubo_child.take() {
+            let _ = remaining.kill();
+            remaining.wait().unwrap();
+        }
+        result.unwrap();
+        assert!(elapsed >= KUBO_STOP_TIMEOUT);
+        assert!(elapsed < KUBO_STOP_TIMEOUT * 2 + LOCKFILE_POLL_INTERVAL);
+        assert!(!is_pid_alive(previous_pid));
     }
 
     fn complete_metadata_request(max: u64) -> serde_json::Value {
@@ -2825,6 +3739,155 @@ mod tests {
         assert_eq!(provider.data_dir, tmp.path());
         assert_eq!(provider.repo_dir, tmp.path().join("ipfs-repo"));
         assert_eq!(provider.kubo_binary, Some(tmp.path().join("bin/kubo")));
+    }
+
+    #[test]
+    fn runtime_role_init_preserves_native_environment_roots() {
+        // Child test processes isolate native environment selection from other
+        // tests. Init must preserve that selected root for both Runtime roles.
+        if let Some(expected) = std::env::var_os("ISSUE89_INIT_EXPECTED_ROOT") {
+            let expected = PathBuf::from(expected);
+            for role in ["user", "gateway"] {
+                let mut provider = IpfsProvider::new();
+                assert_eq!(provider.data_dir, expected);
+                let request: Request = serde_json::from_value(serde_json::json!({
+                    "op":"init", "config":{"base_path":"", "allowed_paths":[],
+                    "read_only":false, "encryption_key":"",
+                    "extra":{"runtime_host_role":role}}
+                }))
+                .unwrap();
+                assert!(matches!(provider.handle(request), Response::Ok { .. }));
+                assert_eq!(provider.data_dir, expected);
+                assert_eq!(provider.repo_dir, expected.join("ipfs-repo"));
+                assert_eq!(provider.kubo_binary, Some(expected.join("bin/kubo")));
+                assert_eq!(
+                    provider.host_role,
+                    if role == "user" {
+                        HostRole::User
+                    } else {
+                        HostRole::Gateway
+                    }
+                );
+                assert!(provider.initialized);
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let explicit = root.path().join("explicit");
+        let xdg = root.path().join("child-xdg");
+        let home = root.path().join("child-home");
+        for selected in [&parent, &explicit, &xdg.join("elastos")] {
+            fs::create_dir_all(selected.join("bin")).unwrap();
+            fs::create_dir_all(selected.join("ipfs-repo")).unwrap();
+            fs::write(
+                selected.join("bin/kubo"),
+                b"fixture; Init does not execute Kubo",
+            )
+            .unwrap();
+            fs::write(selected.join("ipfs-repo/config"), b"{}\n").unwrap();
+        }
+        for (case, expected, managed_parent) in [
+            ("managed-parent", parent.clone(), parent.clone()),
+            ("explicit", explicit.clone(), parent.clone()),
+            (
+                "xdg",
+                xdg.join("elastos"),
+                root.path().join("absent-parent"),
+            ),
+        ] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tests::runtime_role_init_preserves_native_environment_roots",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", &xdg)
+                .env("ELASTOS_HOME_LAUNCH_TRUSTED_AUTH_DATA_DIR", &managed_parent)
+                .env("ISSUE89_INIT_EXPECTED_ROOT", &expected);
+            if case == "explicit" {
+                child.env("ELASTOS_DATA_DIR", &explicit);
+            }
+            let result = child.output().unwrap();
+            assert!(
+                result.status.success()
+                    && String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed"),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_host_role_defaults_to_user_and_only_gateway_keeps_kubo() {
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"extra":null}),
+            serde_json::json!({"extra":{"runtime_host_role":"user", "keep_alive":true}}),
+        ] {
+            assert_eq!(HostRole::from_init(&config), Ok(HostRole::User));
+        }
+        assert_eq!(
+            HostRole::from_init(&serde_json::json!({"extra":{"runtime_host_role":"gateway"}})),
+            Ok(HostRole::Gateway)
+        );
+        let limit = IDLE_TIMEOUT_SECS;
+        assert!(!HostRole::User.idle_stop_due(100, 100 + limit));
+        assert!(HostRole::User.idle_stop_due(100, 101 + limit));
+        assert!(!HostRole::User.idle_stop_due(100 + limit, 100));
+        assert!(!HostRole::Gateway.idle_stop_due(0, u64::MAX));
+        for role in [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(600),
+            serde_json::json!("Gateway"),
+            serde_json::json!("publisher"),
+            serde_json::json!("gateway "),
+        ] {
+            assert!(
+                HostRole::from_init(&serde_json::json!({"extra":{"runtime_host_role":role}}))
+                    .is_err()
+            );
+        }
+        assert!(HostRole::from_init(&serde_json::json!({"runtime_host_role":"gateway"})).is_err());
+    }
+
+    #[test]
+    fn runtime_init_refuses_role_or_root_changes_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        for role in ["user", "gateway"] {
+            let mut provider = IpfsProvider::new();
+            let config =
+                serde_json::json!({"base_path":root.path(), "extra":{"runtime_host_role":role}});
+            assert!(matches!(provider.init(config.clone()), Response::Ok { .. }));
+            assert!(matches!(provider.init(config.clone()), Response::Ok { .. }));
+            let bound_role = provider.host_role;
+            for change in [
+                serde_json::json!({"base_path":other.path(), "extra":{"runtime_host_role":role}}),
+                serde_json::json!({"base_path":root.path(), "extra":{"runtime_host_role":if role=="user" {"gateway"} else {"user"}}}),
+            ] {
+                assert!(matches!(provider.init(change), Response::Error { .. }));
+                assert_eq!(provider.host_role, bound_role);
+                assert_eq!(provider.data_dir, root.path());
+                assert_eq!(provider.repo_dir, root.path().join("ipfs-repo"));
+                assert_eq!(provider.state, KuboState::Cold);
+            }
+        }
+        let mut provider = IpfsProvider::new();
+        let previous = provider.data_dir.clone();
+        assert!(matches!(
+            provider.init(serde_json::json!({"base_path":root.path(),
+            "extra":{"runtime_host_role":true}})),
+            Response::Error { .. }
+        ));
+        assert_eq!(provider.data_dir, previous);
+        assert!(!provider.initialized);
+        assert_eq!(provider.host_role, HostRole::User);
     }
 
     #[test]

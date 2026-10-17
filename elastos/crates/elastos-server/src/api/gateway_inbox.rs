@@ -24,12 +24,22 @@ pub(super) async fn inbox_summary(
         };
     if let Err(err) = super::gateway_home_system::apply_contact_request_notification_projection(
         &state.data_dir,
-        contact_authority.as_ref().map(|authority| &authority.store),
+        contact_authority.as_ref(),
+        state.collaboration_chat_product_port.as_ref(),
         &mut notifications,
     ) {
         return inbox_error_response(err);
     }
     append_home_service_access_notifications(&state.data_dir, &context, &mut notifications);
+    if let Some(card) =
+        super::gateway_collaboration_presence::community_presence_request_notification(
+            &state, &context,
+        )
+    {
+        notifications.unread_count += 1;
+        notifications.attention_count += 1;
+        notifications.entries.push(card);
+    }
     let wallet_approvals = system_wallet_approvals_summary(&state, &authority, false).await;
     append_wallet_approval_notifications(&mut notifications, wallet_approvals.approval_requests);
     if let Ok(capability_requests) = runtime_capability_pending_requests(&state.data_dir).await {
@@ -221,6 +231,16 @@ pub(super) async fn inbox_action(
         Ok(req) => req,
         Err(err) => return inbox_error_response(err),
     };
+    if action.action_id.starts_with("room-approve-request:")
+        || action.action_id.starts_with("room-deny-request:")
+    {
+        if state.collaboration_chat_product_port.is_some() {
+            return super::gateway_room::configured_legacy_room_control_unsupported_response();
+        }
+        if let Err(error) = ensure_admin_context(&state.data_dir, &context) {
+            return inbox_error_response(error);
+        }
+    }
     match dispatch_inbox_action(&state, &launch, &context, &authority, &action).await {
         Ok(message) => {
             let result = inspect_action_request_id_from_action(&action.action_id)
@@ -274,9 +294,13 @@ async fn dispatch_inbox_action(
 ) -> anyhow::Result<String> {
     let action_id = action.action_id.as_str();
     let data_dir = &state.data_dir;
+    // Entries one account owns, such as its direct messages, change only for
+    // that account.
+    let viewer = super::gateway_home_system::load_profile_authority_for_context(data_dir, context)?
+        .map(|profile| profile.document().profile_did.clone());
     if let Some(notification_id) = action_id.strip_prefix("notification-read:") {
         return Ok(
-            match crate::notifications::mark_read(data_dir, notification_id)? {
+            match crate::notifications::mark_read(data_dir, viewer.as_deref(), notification_id)? {
                 true => "Marked inbox entry read.".to_string(),
                 false => "That inbox entry was already read or is no longer present.".to_string(),
             },
@@ -284,11 +308,18 @@ async fn dispatch_inbox_action(
     }
     if let Some(notification_id) = action_id.strip_prefix("notification-dismiss:") {
         return Ok(
-            match crate::notifications::dismiss(data_dir, notification_id)? {
+            match crate::notifications::dismiss(data_dir, viewer.as_deref(), notification_id)? {
                 true => "Dismissed inbox entry.".to_string(),
                 false => "That inbox entry is already gone.".to_string(),
             },
         );
+    }
+    if let Some(answer) = super::gateway_collaboration_presence::answer_community_presence_request(
+        state, context, action_id,
+    )
+    .await
+    {
+        return answer;
     }
     if let Some(request_hash) = action_id.strip_prefix("contact-accept-request:") {
         return decide_contact_request(
@@ -318,7 +349,7 @@ async fn dispatch_inbox_action(
         };
         let summary = crate::room_service::load_summary(data_dir)?;
         let _ = crate::notifications::sync_room_notifications(data_dir, &summary);
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(message);
     }
     if let Some(request_id) = action_id.strip_prefix("room-deny-request:") {
@@ -332,7 +363,7 @@ async fn dispatch_inbox_action(
             };
         let summary = crate::room_service::load_summary(data_dir)?;
         let _ = crate::notifications::sync_room_notifications(data_dir, &summary);
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-approve-request:") {
@@ -364,7 +395,7 @@ async fn dispatch_inbox_action(
             INBOX_CAPSULE_ID,
         )
         .await?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(outcome.message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-reject-request:") {
@@ -439,7 +470,7 @@ async fn dispatch_inbox_action(
         ensure_admin_context(data_dir, context)?;
         let approved_at = now_ts();
         store_wallet_price_http_policy(data_dir, &context.principal_id, approved_at)?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         append_wallet_price_policy_audit(
             data_dir,
             &context.principal_id,
@@ -488,7 +519,7 @@ async fn dispatch_inbox_action(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("admin passkey required"))?;
         crate::api::model_provider_egress_decision::approve(data_dir, request_id, proof)?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok(
             "Approved this hosted access. End it in Inbox when it is no longer needed.".to_string(),
         );
@@ -511,7 +542,7 @@ async fn dispatch_inbox_action(
     {
         ensure_admin_context(data_dir, context)?;
         crate::jev_approval_lens::record_human_decision(data_dir, request_id, "approve")?;
-        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, None, action_id);
         return Ok("Approved this hosted connection. Send again from Assistant.".to_string());
     }
     if let Some(request_id) =

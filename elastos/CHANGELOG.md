@@ -1,8 +1,1370 @@
 # Changelog
 
-All notable changes to the public ElastOS Runtime repository.
+All notable changes to the public ElastOS Runtime repository. System shows a
+release's Added, Changed, Fixed, Removed and Security bullets before you update;
+"Developer detail" is for developers and is not shown.
 
 ## [Unreleased]
+
+### Developer detail
+
+- `elastos serve --capsule` starts its initial MicroVM capsule with a VM-bound
+  Capsule session instead of a Shell session, because the guest can read its
+  boot token; capability approval stays with the shell (#387).
+- Community presence is a capability grant, not Discovery (#410). The
+  Runtime mints a token for the person's principal (action `message`,
+  resource `elastos://chat/presence/<network>/<conversation>/always` or
+  `/while-open`, no expiry) only when they answer the Inbox card
+  (`community-presence-always|open|later|never:<issued_at>`) or System
+  (`/api/apps/system/community/presence`, `{mode}`); it lives in their
+  owner-only `.AppData/ElastOS/Home/community-presence.json` and no route
+  returns it. Every Runtime tick (`/always`) and Chat heartbeat
+  (`POST /api/apps/chat-room/presence`, `/while-open`) runs all twelve checks
+  through the new `CapabilityManager::validate_recurring`, which audits every
+  failure and one success per token per hour. Hidden, mode and Profile changes
+  revoke; an epoch bump silences every grant. The Home-shell heartbeat route
+  is removed. Community's People list adds members with unexpired presence,
+  one row per Profile DID. Undo: after Undo, Community presence follows the
+  Discovery switch in People again. If you chose Hidden or Only while open in
+  alpha.23 and Discovery is on, you will be announced; turn Discovery off in
+  People to stay hidden.
+- A Community bootstrap node (its Carrier endpoint is one of the verified
+  profile's bootstrap peers, the seed's Community node) runs iroh-gossip as the
+  hub: 512 active and 1024 passive neighbours instead of the default 5 and 30,
+  so a sixth Home joining or restarting no longer evicts a Home that reaches
+  the Community only through the hub. Homes keep the default. The Community
+  link watchdog now counts only listed peers; frames that trickle in without
+  a peer no longer mark the link healthy.
+- Runtime's Community link watchdog (`CommunityLinkWatchdog`) repairs a joined
+  Home that has had no Community peer for 60 seconds, whatever stalled it: it
+  rejoins the topic, then replaces Carrier's gossip actor a minute later, and
+  keeps repairing while no peer returns, waiting twice as long each time up to
+  five minutes. It replaces the actor at most six times per process
+  (`MAX_COMMUNITY_GOSSIP_REBUILDS`; each replacement leaves an iroh address
+  lookup behind), then only rejoins. A quiet Community with a peer listed and
+  a bootstrap node never get a step. Carrier's Runtime-only
+  `gossip_topic_health`, `gossip_rejoin` and `gossip_rebuild` operations carry
+  it, and Carrier shutdown no longer waits forever on a stalled gossip actor.
+- `scripts/release-publish.sh` publishes a final version `X.Y.Z` on `stable`
+  from its tag `vX.Y.Z` on `main` (#335). See docs/VERSIONING.md.
+- A signed components manifest whose schema this Runtime does not know, or
+  whose known components pass every check but which also names a component
+  kind (`strategy`) this Runtime does not know, is `InstallerRequired`; a
+  malformed manifest of the known schema and every other admission refusal stay
+  `ReleaseRefused`. System's status and
+  `elastos update` print `curl -fsSL '<publisher gateway>/install.sh' | bash`,
+  the URL built with URL operations (no query, fragment or credentials) and
+  single-quoted as one shell word.
+- `scripts/update-hop-oldest-release.json` pins 0.8.0-alpha.15, the oldest
+  release that still updates in System (alpha.13 and alpha.14 Homes run
+  install.sh once). `update-hop-compare.py check-oldest-start`, run by its test
+  in the source gate, refuses a `components.json` that release's updater cannot
+  read or install; while both pins name one release the update journey covers
+  that start in full. `scripts/release-publish.sh prepare` refuses a source
+  without the pin.
+- A release names the Community network only when the approved source pins it
+  and `scripts/release-publish.sh prepare` gets `RELEASE_COMMUNITY_DIR`, the
+  custodian's `community-profile` output for exactly that pin; the package's
+  own Runtime verifies the file before signing, and prepare refuses a source
+  pin without that output. The release signer refuses a Community pin whose
+  network ID or signer set differ from its file.
+- `scripts/release-publish.sh seed` and `seed-upgrade` require `RELEASE_SEED_DATA`
+  to end in `/elastos` and export `XDG_DATA_HOME` as its parent, because the
+  Runtime reads `$XDG_DATA_HOME/elastos`; the seed script checks the saved
+  publish state against the signed head's `prev_head_cid` before downloading
+  (a first publication may have none). `seed` refuses a signed head whose
+  `signer_did` or `prev_head_cid` is not plain data, and its printed commands
+  carry every value as one shell word.
+- CI's update journey starts from the release users run now (the pin in
+  `scripts/update-hop-previous-release.json`).
+  Before alpha.15 it started from 0.8.0-alpha.8 and never ran the alpha.14 to
+  alpha.15 hop, which Apple Silicon and Linux ARM64 refused for the new
+  `browser-vm-image` strategy.
+  `scripts/release-publish.sh prepare` refuses, before any download, a source
+  whose `scripts/update-hop-previous-release.json` does not name the public
+  release head; N+1 of a pair passes once the public head is the N this Mac
+  signed from the same run.
+- Only the Runtime binary (`elastos`) compiles in the release version. Home
+  CLI, the shell and the Browser VZ supervisor no longer do, so their bytes
+  stay the same across releases when their code does not change (#194). The
+  terminal Home shows the Runtime version it reads from the Runtime.
+- CI's `release-upstream-assets` job runs the release's upstream asset build
+  (`scripts/release-upstream-assets.py`, including the Browser helper source
+  builds) for Linux ARM64 and Apple Silicon on every pull request that changes
+  its scripts, recipes, packaged files or `ci.yml`, and on merge groups and
+  manual runs. It requires the build's stdout to be one JSON document, as
+  release preparation does. Before, these builds ran only in a release (#319).
+- `scripts/release-host-prerequisites.sh` is the one list of release host
+  packages; `release-package.yml` and that job both install it, and
+  `ci-release-policy-test.py` checks they use the same runner, Rust toolchain
+  and targets, and that the job's path filter covers every file the build
+  calls, loads or packages.
+- The Browser VM's web egress bridge allows 128 sessions and its media/TURN
+  bridge 16; the `ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS` setting is removed
+  (a value saved in `browser-engine-adapter.json` is ignored). The Runtime
+  raises its soft open-file limit to the hard limit, at most 10240, when it
+  starts, and the Browser local exit keeps accepting after an accept error.
+
+## [0.8.0] - 2026-10-16
+
+### Security
+
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in 0.8.1). Web pages and shared files open in a separate sandbox; the web Terminal is off by default; Home checks allowed hosts and rejects requests whose Origin header names another website; sandboxed apps need valid tokens to reach private data; releases are signed with a new key kept off the public server.
+- Isolation status, not done yet: Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls (S1 and S2 of #173). Importing a Recovery Kit does not yet ask for your passkey again (#403), and on Linux with KVM the Browser network helper is installed with sudo without a hash check (#406). All are planned for 0.8.1.
+- Security updates for the TLS library (rustls 0.23.46, four reported weaknesses, RUSTSEC-2026-0346 to 0349, #380) and the WebAssembly runtime (wasmtime 36.0.18, RUSTSEC-2026-0363).
+
+### Added
+
+- An owner (admin) can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey. You confirm with your current passkey first, and the new passkey opens the same account as an admin (#338).
+
+- Home has a touch layout for phone-sized screens, 640 px wide or less: a Dock and pages of apps, one app at a time full screen, swipe down on its title bar for the app switcher, long-press menus, sheets with drag handles, and the screen kept above the keyboard. Desktop and tablet keep the desktop shell. Opening your Home from a phone needs an HTTPS address for your Home, which 0.8.0 does not set up yet (#116, #92).
+
+### Changed
+
+- When an update cannot be applied from this version (the release uses a
+  newer format or a kind of component this version does not know), System and
+  `elastos update` say that the install command is needed once and show it,
+  instead of saying the publisher's release is not valid. Your current version
+  stays unchanged.
+- Homes on the test channel also accept the final release, so they update to
+  0.8.0 in System. Running the install command again moves them to the stable
+  channel (#335).
+- Make admin and Make guest in System → Accounts change every passkey of that account together (#338).
+- Spam limits for Chat: 5 Community messages per Profile every 10 seconds (Chat
+  shows "Slow down"), 5 per sender on receiving Homes without holding up other
+  senders, and Discovery relay caps of 4 listings per Home, 8 contact requests
+  per sender and 16 per Home. The relay admits only the signing Home's own
+  submissions.
+- Known issues: Browser runs only on Apple Silicon Macs, takes about 5 seconds to close, and has no Chinese, Japanese or Korean fonts. On the Jetson, getting Qwen takes about 43 minutes; its first reply takes about 22 seconds and the next about 3.6 seconds. On a Mac under memory pressure, a model can refuse to start for lack of free memory; close other apps and try again.
+- Known issue: Updating to this version in System from a test version older than 0.8.0-alpha.18 on a slow device such as a Jetson can still fail, because that older version runs the update. If Home is then stuck, follow "Recover an interrupted update" in `docs/INSTALL.md`.
+- Community posts reach members again without turning on Discovery, also across networks: they travel through the seed's Community node. Posts are signed, but that node can read them in transit until the relay arrives in 0.8.1. Direct messages across networks need that relay. Contact requests across networks still need Discovery on.
+- Upgrading from 0.7.1 or earlier: run the install command once. System update cannot move these Homes to 0.8.0, because releases are now signed with a new key (#186). Your Home keeps its data. If your 0.7.1 passkey is not offered, choose "Use a security key or another device" and type your account name.
+- A Browser session now lasts until you close it, until Home stops answering for 5 minutes, until Runtime stops, or 12 hours (it used to close after 10 minutes).
+- Browser Settings no longer shows Agent access, which no agent can use yet (#290), and hides the engine choice when there is only one engine. The default engine is called Automatic.
+- If a model download is interrupted, Home now resumes it by itself a few times before asking you to Retry.
+- A model's memory check now says: "This device has enough memory for this model. Replies also need some of it free when the model runs."
+- Community: a post whose delivery could not be confirmed says "Delivery unconfirmed". Inbox asks you once whether members see you online: Always, Only while Community is open, Later or Never; shown, earlier posts load without Discovery. Change it in System → Community. After Undo to an earlier test version, Community presence follows the Discovery switch in People again; turn Discovery off there to stay hidden.
+
+### Fixed
+
+- When sign-in fails, the lock screen now says why in one line and what to do next, instead of showing nothing (#338).
+- The publisher's Carrier ticket lists only its public addresses when it has
+  one (no container bridge, LAN or loopback addresses), and a Runtime on a
+  fixed Carrier port also listens on that port over IPv6, so its ticket stays
+  the same across restarts (#336).
+- Browser shows "Starting Browser…" while it starts, no longer shows white bars around the page, and has a standard title bar, so you can drag its window.
+- Browser opens on a new install. Setup now records the Browser helpers it installs, so opening Browser no longer downloads them again and fails with "another writer owns the installation lock". Browser also no longer fails to open when another program uses one of the local ports it picked.
+- Browser shows images and fonts on busy news sites such as BBC and the Guardian. Before, Browser allowed only 16 connections at a time, so many pictures and fonts timed out.
+- Home no longer uses about a third of the CPU while Browser is open: it now checks Browser's status once a second and ignores changes to its timers.
+- Chat: the message box returns to one line after you send, People → Message reuses the open Chat window, and Open Inbox in People works. Web links in Chat messages and in Home CLI open in your browser after Home shows the exact address and you choose Open link.
+- In the Assistant, Edit on a message you just sent opens the editor, and Delete asks in the message itself, then removes it. A reply that just finished, or that you stopped, offers Delete and Regenerate right away. Before, Edit did nothing until the chat was reopened, and Delete did nothing.
+- In the Assistant, the end of each reply and its buttons stay above the message box, so you no longer scroll down to read the last lines.
+- First-run setup: the welcome sheet no longer disappears. Opening a step shrinks it to a small card that you click to continue, and it comes back after you save the Recovery Kit.
+- From this version on, every Home start gives its newly started Runtime up to 2 minutes to become ready: a System update, `elastos home --browser`, and `elastos home` without `--browser` (which gave up after 30 seconds). So Home no longer fails to start, or is left stopped by an update, on a slower device such as a Jetson. If the previous version was put back but could not start, `elastos home --browser` starts it again. The update log keeps the output of every update start.
+- During an update, System says that Home is restarting and how long it usually takes, and reloads by itself when the update is done.
+- Community posts are no longer held up by an overloaded Community node: Homes resend unanswered posts and presence less often, and the node only forwards them. Homes stay connected when other Homes join or restart, a Home that shows Community unreachable reconnects by itself, and presence from other Homes can no longer fill Community and stop new posts arriving.
+- Restoring the same Recovery Kit again on a Home now completes instead of showing an error, and the Kit's file name is shown in full. Inbox Open closes the inbox and shows the app. After `elastos update` or Undo in a terminal, it says Home is stopped and prints the command that starts it.
+
+## [0.8.0-alpha.23] - 2026-10-16
+
+Release candidate for 0.8.0 on the test channel, with the same notes.
+
+### Security
+
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in 0.8.1). Web pages and shared files open in a separate sandbox; the web Terminal is off by default; Home checks allowed hosts and rejects requests whose Origin header names another website; sandboxed apps need valid tokens to reach private data; releases are signed with a new key kept off the public server.
+- Isolation status, not done yet: Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls (S1 and S2 of #173). Importing a Recovery Kit does not yet ask for your passkey again (#403), and on Linux with KVM the Browser network helper is installed with sudo without a hash check (#406). All are planned for 0.8.1.
+- Security updates for the TLS library (rustls 0.23.46, four reported weaknesses, RUSTSEC-2026-0346 to 0349, #380) and the WebAssembly runtime (wasmtime 36.0.18, RUSTSEC-2026-0363).
+
+### Added
+
+- An owner (admin) can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey. You confirm with your current passkey first, and the new passkey opens the same account as an admin (#338).
+
+- Home has a touch layout for phone-sized screens, 640 px wide or less: a Dock and pages of apps, one app at a time full screen, swipe down on its title bar for the app switcher, long-press menus, sheets with drag handles, and the screen kept above the keyboard. Desktop and tablet keep the desktop shell. Opening your Home from a phone needs an HTTPS address for your Home, which 0.8.0 does not set up yet (#116, #92).
+
+### Changed
+
+- When an update cannot be applied from this version (the release uses a
+  newer format or a kind of component this version does not know), System and
+  `elastos update` say that the install command is needed once and show it,
+  instead of saying the publisher's release is not valid. Your current version
+  stays unchanged.
+- Homes on the test channel also accept the final release, so they update to
+  0.8.0 in System. Running the install command again moves them to the stable
+  channel (#335).
+- Make admin and Make guest in System → Accounts change every passkey of that account together (#338).
+- Spam limits for Chat: 5 Community messages per Profile every 10 seconds (Chat
+  shows "Slow down"), 5 per sender on receiving Homes without holding up other
+  senders, and Discovery relay caps of 4 listings per Home, 8 contact requests
+  per sender and 16 per Home. The relay admits only the signing Home's own
+  submissions.
+- Known issues: Browser runs only on Apple Silicon Macs, takes about 5 seconds to close, and has no Chinese, Japanese or Korean fonts. On the Jetson, getting Qwen takes about 43 minutes; its first reply takes about 22 seconds and the next about 3.6 seconds. On a Mac under memory pressure, a model can refuse to start for lack of free memory; close other apps and try again.
+- Known issue: Updating to this version in System from a test version older than 0.8.0-alpha.18 on a slow device such as a Jetson can still fail, because that older version runs the update. If Home is then stuck, follow "Recover an interrupted update" in `docs/INSTALL.md`.
+- Community posts reach members again without turning on Discovery, also across networks: they travel through the seed's Community node. Posts are signed, but that node can read them in transit until the relay arrives in 0.8.1. Direct messages across networks need that relay. Contact requests across networks still need Discovery on.
+- Upgrading from 0.7.1 or earlier: run the install command once. System update cannot move these Homes to 0.8.0, because releases are now signed with a new key (#186). Your Home keeps its data. If your 0.7.1 passkey is not offered, choose "Use a security key or another device" and type your account name.
+- A Browser session now lasts until you close it, until Home stops answering for 5 minutes, until Runtime stops, or 12 hours (it used to close after 10 minutes).
+- Browser Settings no longer shows Agent access, which no agent can use yet (#290), and hides the engine choice when there is only one engine. The default engine is called Automatic.
+- If a model download is interrupted, Home now resumes it by itself a few times before asking you to Retry.
+- A model's memory check now says: "This device has enough memory for this model. Replies also need some of it free when the model runs."
+- Community: a post whose delivery could not be confirmed says "Delivery unconfirmed". Inbox asks you once whether members see you online: Always, Only while Community is open, Later or Never; shown, earlier posts load without Discovery. Change it in System → Community. After Undo to an earlier test version, Community presence follows the Discovery switch in People again; turn Discovery off there to stay hidden.
+
+### Fixed
+
+- When sign-in fails, the lock screen now says why in one line and what to do next, instead of showing nothing (#338).
+- The publisher's Carrier ticket lists only its public addresses when it has
+  one (no container bridge, LAN or loopback addresses), and a Runtime on a
+  fixed Carrier port also listens on that port over IPv6, so its ticket stays
+  the same across restarts (#336).
+- Browser shows "Starting Browser…" while it starts, no longer shows white bars around the page, and has a standard title bar, so you can drag its window.
+- Browser opens on a new install. Setup now records the Browser helpers it installs, so opening Browser no longer downloads them again and fails with "another writer owns the installation lock". Browser also no longer fails to open when another program uses one of the local ports it picked.
+- Browser shows images and fonts on busy news sites such as BBC and the Guardian. Before, Browser allowed only 16 connections at a time, so many pictures and fonts timed out.
+- Home no longer uses about a third of the CPU while Browser is open: it now checks Browser's status once a second and ignores changes to its timers.
+- Chat: the message box returns to one line after you send, People → Message reuses the open Chat window, and Open Inbox in People works. Web links in Chat messages and in Home CLI open in your browser after Home shows the exact address and you choose Open link.
+- In the Assistant, Edit on a message you just sent opens the editor, and Delete asks in the message itself, then removes it. A reply that just finished, or that you stopped, offers Delete and Regenerate right away. Before, Edit did nothing until the chat was reopened, and Delete did nothing.
+- In the Assistant, the end of each reply and its buttons stay above the message box, so you no longer scroll down to read the last lines.
+- First-run setup: the welcome sheet no longer disappears. Opening a step shrinks it to a small card that you click to continue, and it comes back after you save the Recovery Kit.
+- From this version on, every Home start gives its newly started Runtime up to 2 minutes to become ready: a System update, `elastos home --browser`, and `elastos home` without `--browser` (which gave up after 30 seconds). So Home no longer fails to start, or is left stopped by an update, on a slower device such as a Jetson. If the previous version was put back but could not start, `elastos home --browser` starts it again. The update log keeps the output of every update start.
+- During an update, System says that Home is restarting and how long it usually takes, and reloads by itself when the update is done.
+- Community posts are no longer held up by an overloaded Community node: Homes resend unanswered posts and presence less often, and the node only forwards them. Homes stay connected when other Homes join or restart, a Home that shows Community unreachable reconnects by itself, and presence from other Homes can no longer fill Community and stop new posts arriving.
+- Restoring the same Recovery Kit again on a Home now completes instead of showing an error, and the Kit's file name is shown in full. Inbox Open closes the inbox and shows the app. After `elastos update` or Undo in a terminal, it says Home is stopped and prints the command that starts it.
+
+## [0.8.0-alpha.22] - 2026-10-16
+
+Release candidate for 0.8.0 on the test channel, with the same notes.
+
+### Security
+
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in 0.8.1). Web pages and shared files open in a separate sandbox; the web Terminal is off by default; Home checks allowed hosts and rejects requests whose Origin header names another website; sandboxed apps need valid tokens to reach private data; releases are signed with a new key kept off the public server.
+- Isolation status, not done yet: Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls. These stages (S1 and S2 of #173) are planned for 0.8.1.
+- Security updates for the TLS library (rustls 0.23.46, four reported weaknesses, RUSTSEC-2026-0346 to 0349, #380) and the WebAssembly runtime (wasmtime 36.0.18, RUSTSEC-2026-0363).
+
+### Added
+
+- An owner (admin) can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey. You confirm with your current passkey first, and the new passkey opens the same account as an admin (#338).
+
+- Home has a touch layout for phone-sized screens, 640 px wide or less: a Dock and pages of apps, one app at a time full screen, swipe down on its title bar for the app switcher, long-press menus, sheets with drag handles, and the screen kept above the keyboard. Desktop and tablet keep the desktop shell. Opening your Home from a phone needs an HTTPS address for your Home, which 0.8.0 does not set up yet (#116, #92).
+
+### Changed
+
+- When an update cannot be applied from this version (the release uses a
+  newer format or a kind of component this version does not know), System and
+  `elastos update` say that the install command is needed once and show it,
+  instead of saying the publisher's release is not valid. Your current version
+  stays unchanged.
+- Homes on the test channel also accept the final release, so they update to
+  0.8.0 in System. Running the install command again moves them to the stable
+  channel (#335).
+- Make admin and Make guest in System → Accounts change every passkey of that account together (#338).
+- Spam limits for Chat: 5 Community messages per Profile every 10 seconds (Chat
+  shows "Slow down"), 5 per sender on receiving Homes without holding up other
+  senders, and Discovery relay caps of 4 listings per Home, 8 contact requests
+  per sender and 16 per Home. The relay admits only the signing Home's own
+  submissions.
+- Known issues: Browser runs only on Apple Silicon Macs, takes about 5 seconds to close, and has no Chinese, Japanese or Korean fonts. On the Jetson, getting Qwen takes about 43 minutes; its first reply takes about 22 seconds and the next about 3.6 seconds.
+- Known issue: Updating to this version in System from a test version older than 0.8.0-alpha.18 on a slow device such as a Jetson can still fail, because that older version runs the update. If Home is then stuck, follow "Recover an interrupted update" in `docs/INSTALL.md`.
+- Known issues: on a Mac under memory pressure, a model can refuse to start for lack of free memory; close other apps and try again. Restoring a Recovery Kit a second time on the same Home shows an error, although the Profile is restored. After `elastos update` or Undo in a terminal, run `~/.local/bin/elastos home --browser` to start Home and reconnect Community.
+- Community posts reach members again without turning on Discovery, also across networks: they travel through the seed's Community node. Posts are signed, but that node can read them in transit until the relay arrives in 0.8.1. Direct messages across networks need that relay. Contact requests across networks, and showing as online in People, still need Discovery on.
+- Upgrading from 0.7.1 or earlier: run the install command once. System update cannot move these Homes to 0.8.0, because releases are now signed with a new key (#186). Your Home keeps its data.
+- A Browser session now lasts until you close it, until Home stops answering for 5 minutes, until Runtime stops, or 12 hours (it used to close after 10 minutes).
+- Browser Settings no longer shows Agent access, which no agent can use yet (#290), and hides the engine choice when there is only one engine. The default engine is called Automatic.
+- If a model download is interrupted, Home now resumes it by itself a few times before asking you to Retry.
+- A model's memory check now says: "This device has enough memory for this model. Replies also need some of it free when the model runs."
+- Community: a post whose delivery could not be confirmed now says "Delivery unconfirmed" instead of "Expired". When no other member is online, Community says "No other members are online right now.", and with Discovery off it says "Turn on Discovery in People to load earlier Community posts."
+
+### Fixed
+
+- When sign-in fails, the lock screen now says why in one line and what to do next, instead of showing nothing (#338).
+- The publisher's Carrier ticket lists only its public addresses when it has
+  one (no container bridge, LAN or loopback addresses), and a Runtime on a
+  fixed Carrier port also listens on that port over IPv6, so its ticket stays
+  the same across restarts (#336).
+- Browser shows "Starting Browser…" while it starts, no longer shows white bars around the page, and has a standard title bar, so you can drag its window.
+- Browser opens on a new install. Setup now records the Browser helpers it installs, so opening Browser no longer downloads them again and fails with "another writer owns the installation lock". Browser also no longer fails to open when another program uses one of the local ports it picked.
+- Browser shows images and fonts on busy news sites such as BBC and the Guardian. Before, Browser allowed only 16 connections at a time, so many pictures and fonts timed out.
+- Home no longer uses about a third of the CPU while Browser is open: it now checks Browser's status once a second and ignores changes to its timers.
+- Chat: the message box returns to one line after you send, People → Message reuses the open Chat window, and Open Inbox in People works.
+- In the Assistant, Edit on a message you just sent opens the editor, and Delete asks in the message itself, then removes it. A reply that just finished, or that you stopped, offers Delete and Regenerate right away. Before, Edit did nothing until the chat was reopened, and Delete did nothing.
+- In the Assistant, the end of each reply and its buttons stay above the message box, so you no longer scroll down to read the last lines.
+- First-run setup: the welcome sheet no longer disappears. Opening a step shrinks it to a small card that you click to continue, and it comes back after you save the Recovery Kit.
+- From this version on, every Home start gives its newly started Runtime up to 2 minutes to become ready: a System update, `elastos home --browser`, and `elastos home` without `--browser` (which gave up after 30 seconds). So Home no longer fails to start, or is left stopped by an update, on a slower device such as a Jetson. If the previous version was put back but could not start, `elastos home --browser` starts it again. The update log keeps the output of every update start.
+- During an update, System says that Home is restarting and how long it usually takes, and reloads by itself when the update is done.
+- Community posts are no longer held up by an overloaded Community node: Homes resend unanswered posts and presence less often, and the node only forwards them. Homes stay connected when other Homes join or restart, a Home that shows Community unreachable reconnects by itself, and presence from other Homes can no longer fill Community and stop new posts arriving.
+
+## [0.8.0-alpha.21] - 2026-10-16
+
+Release candidate for 0.8.0 on the test channel, with the same notes.
+
+### Security
+
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in 0.8.1). Web pages and shared files open in a separate sandbox; the web Terminal is off by default; Home checks allowed hosts and rejects requests whose Origin header names another website; sandboxed apps need valid tokens to reach private data; releases are signed with a new key kept off the public server.
+- Isolation status, not done yet: Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls. These stages (S1 and S2 of #173) are planned for 0.8.1.
+- Security updates for the TLS library (rustls 0.23.46, four reported weaknesses, RUSTSEC-2026-0346 to 0349, #380) and the WebAssembly runtime (wasmtime 36.0.18, RUSTSEC-2026-0363).
+
+### Added
+
+- An owner (admin) can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey. You confirm with your current passkey first, and the new passkey opens the same account as an admin (#338).
+
+- Home on a phone (or a phone turned sideways) gets a touch layout: a Dock and pages of apps, one app at a time full screen, swipe down on its title bar for the app switcher, long-press menus, sheets with drag handles, and the screen kept above the keyboard. On Android, Back closes the top sheet or menu first, then sends the open app home; on iPhone the on-screen buttons do this. Desktop and tablet keep the desktop shell (#116, #92).
+
+### Changed
+
+- When an update cannot be applied from this version (the release uses a
+  newer format or a kind of component this version does not know), System and
+  `elastos update` say that the install command is needed once and show it,
+  instead of saying the publisher's release is not valid. Your current version
+  stays unchanged.
+- Homes on the test channel also accept the final release, so they update to
+  0.8.0 in System. Running the install command again moves them to the stable
+  channel (#335).
+- Make admin and Make guest in System → Accounts change every passkey of that account together (#338).
+- Spam limits for Chat: 5 Community messages per Profile every 10 seconds (Chat
+  shows "Slow down"), 5 per sender on receiving Homes without holding up other
+  senders, and Discovery relay caps of 4 listings per Home, 8 contact requests
+  per sender and 16 per Home. The relay admits only the signing Home's own
+  submissions.
+- Known issue: on the Jetson, getting a model is slow (Qwen takes about 43 minutes). The first Qwen reply takes about 22 seconds and the second about 3.6 seconds.
+- Known issue: Browser runs only on Apple Silicon Macs.
+- Known issue: Updating to this version in System from a test version older than 0.8.0-alpha.18 on a slow device such as a Jetson can still fail, because that older version runs the update. If Home is then stuck, follow "Recover an interrupted update" in `docs/INSTALL.md`.
+- Community posts reach members again without turning on Discovery, also across networks: they travel through the seed's Community node. Posts are signed, but that node can read them in transit until the relay arrives in 0.8.1. Direct messages across networks need that relay. Contact requests across networks, and showing as online in People, still need Discovery on.
+- Upgrading from 0.7.1 or earlier: run the install command once. System update cannot move these Homes to 0.8.0, because releases are now signed with a new key (#186). Your Home keeps its data.
+- A Browser session now lasts until you close it, until Home stops answering for 5 minutes, until Runtime stops, or 12 hours (it used to close after 10 minutes).
+- Browser Settings no longer shows Agent access, which no agent can use yet (#290), and hides the engine choice when there is only one engine. The default engine is called Automatic.
+- If a model download is interrupted, Home now resumes it by itself a few times before asking you to Retry.
+- A model's memory check now says: "This device has enough memory for this model. Replies also need some of it free when the model runs."
+- Community: a post whose delivery could not be confirmed now says "Delivery unconfirmed" instead of "Expired". When no other member is online, Community says "No other members are online right now.", and with Discovery off it says "Turn on Discovery in People to load earlier Community posts."
+
+### Fixed
+
+- When sign-in fails, the lock screen now says why in one line and what to do next, instead of showing nothing (#338).
+- The publisher's Carrier ticket lists only its public addresses when it has
+  one (no container bridge, LAN or loopback addresses), and a Runtime on a
+  fixed Carrier port also listens on that port over IPv6, so its ticket stays
+  the same across restarts (#336).
+- Browser shows "Starting Browser…" while it starts, no longer shows white bars around the page, and has a standard title bar, so you can drag its window.
+- Browser opens on a new install. Setup now records the Browser helpers it installs, so opening Browser no longer downloads them again and fails with "another writer owns the installation lock". Browser also no longer fails to open when another program uses one of the local ports it picked.
+- Browser shows images and fonts on busy news sites such as BBC and the Guardian. Before, Browser allowed only 16 connections at a time, so many pictures and fonts timed out.
+- Home no longer uses about a third of the CPU while Browser is open: it now checks Browser's status once a second and ignores changes to its timers.
+- Chat: the message box returns to one line after you send, People → Message reuses the open Chat window, and Open Inbox in People works.
+- In the Assistant, Edit on a message you just sent opens the editor, and Delete asks in the message itself, then removes it. A reply that just finished, or that you stopped, offers Delete and Regenerate right away. Before, Edit did nothing until the chat was reopened, and Delete did nothing.
+- In the Assistant, the end of each reply and its buttons stay above the message box, so you no longer scroll down to read the last lines.
+- First-run setup: the welcome sheet no longer disappears. Opening a step shrinks it to a small card that you click to continue, and it comes back after you save the Recovery Kit.
+- From this version on, every Home start gives its newly started Runtime up to 2 minutes to become ready: a System update, `elastos home --browser`, and `elastos home` without `--browser` (which gave up after 30 seconds). So Home no longer fails to start, or is left stopped by an update, on a slower device such as a Jetson. If the previous version was put back but could not start, `elastos home --browser` starts it again. The update log keeps the output of every update start.
+- During an update, System says that Home is restarting and how long it usually takes, and reloads by itself when the update is done.
+- Community posts are no longer held up by an overloaded Community node: Homes resend unanswered posts and presence less often, and the node only forwards them. A Home that shows Community unreachable now reconnects by itself instead of staying unreachable until Home restarts.
+
+## [0.8.0-alpha.20] - 2026-10-15
+
+Release candidate for 0.8.0 on the test channel, with the same notes.
+
+### Security
+
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in 0.8.1). Web pages and shared files open in a separate sandbox; the web Terminal is off by default; Home checks allowed hosts and rejects requests whose Origin header names another website; sandboxed apps need valid tokens to reach private data; releases are signed with a new key kept off the public server.
+- Isolation status, not done yet: Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls. These stages (S1 and S2 of #173) are planned for 0.8.1.
+- Security updates for the TLS library (rustls 0.23.46, four reported weaknesses, RUSTSEC-2026-0346 to 0349, #380) and the WebAssembly runtime (wasmtime 36.0.18, RUSTSEC-2026-0363).
+
+### Added
+
+- An owner (admin) can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey. You confirm with your current passkey first, and the new passkey opens the same account as an admin (#338).
+
+- Home on a phone (or a phone turned sideways) gets a touch layout: a Dock and pages of apps, one app at a time full screen, swipe down on its title bar for the app switcher, long-press menus, sheets with drag handles, and the screen kept above the keyboard. On Android, Back closes the top sheet or menu first, then sends the open app home; on iPhone the on-screen buttons do this. Desktop and tablet keep the desktop shell (#116, #92).
+
+### Changed
+
+- When an update cannot be applied from this version (the release uses a
+  newer format or a kind of component this version does not know), System and
+  `elastos update` say that the install command is needed once and show it,
+  instead of saying the publisher's release is not valid. Your current version
+  stays unchanged.
+- Homes on the test channel also accept the final release, so they update to
+  0.8.0 in System. Running the install command again moves them to the stable
+  channel (#335).
+- Make admin and Make guest in System → Accounts change every passkey of that account together (#338).
+- Spam limits for Chat: 5 Community messages per Profile every 10 seconds (Chat
+  shows "Slow down"), 5 per sender on receiving Homes without holding up other
+  senders, and Discovery relay caps of 4 listings per Home, 8 contact requests
+  per sender and 16 per Home. The relay admits only the signing Home's own
+  submissions.
+- Known issue: on the Jetson, getting a model is slow (Qwen takes about 43 minutes). The first Qwen reply takes about 22 seconds and the second about 3.6 seconds.
+- Known issue: Browser runs only on Apple Silicon Macs.
+- Known issue: Updating to this version in System from a test version older than 0.8.0-alpha.18 on a slow device such as a Jetson can still fail, because that older version runs the update. If Home is then stuck, follow "Recover an interrupted update" in `docs/INSTALL.md`.
+- Community posts reach members again without turning on Discovery, also across networks: they travel through the seed's Community node. Posts are signed, but that node can read them in transit until the relay arrives in 0.8.1. Direct messages across networks need that relay. Contact requests across networks, and showing as online in People, still need Discovery on.
+- Upgrading from 0.7.1 or earlier: run the install command once. System update cannot move these Homes to 0.8.0, because releases are now signed with a new key (#186). Your Home keeps its data.
+- A Browser session now lasts until you close it, until Home stops answering for 5 minutes, until Runtime stops, or 12 hours (it used to close after 10 minutes).
+- Browser Settings no longer shows Agent access, which no agent can use yet (#290), and hides the engine choice when there is only one engine. The default engine is called Automatic.
+- If a model download is interrupted, Home now resumes it by itself a few times before asking you to Retry.
+- A model's memory check now says: "This device has enough memory for this model. Replies also need some of it free when the model runs."
+- Community: a post whose delivery could not be confirmed now says "Delivery unconfirmed" instead of "Expired". When no other member is online, Community says "No other members are online right now.", and with Discovery off it says "Turn on Discovery in People to load earlier Community posts."
+
+### Fixed
+
+- When sign-in fails, the lock screen now says why in one line and what to do next, instead of showing nothing (#338).
+- The publisher's Carrier ticket lists only its public addresses when it has
+  one (no container bridge, LAN or loopback addresses), and a Runtime on a
+  fixed Carrier port also listens on that port over IPv6, so its ticket stays
+  the same across restarts (#336).
+- Browser shows "Starting Browser…" while it starts, no longer shows white bars around the page, and has a standard title bar, so you can drag its window.
+- Browser opens on a new install. Setup now records the Browser helpers it installs, so opening Browser no longer downloads them again and fails with "another writer owns the installation lock". Browser also no longer fails to open when another program uses one of the local ports it picked.
+- Browser shows images and fonts on busy news sites such as BBC and the Guardian. Before, Browser allowed only 16 connections at a time, so many pictures and fonts timed out.
+- Home no longer uses about a third of the CPU while Browser is open: it now checks Browser's status once a second and ignores changes to its timers.
+- Chat: the message box returns to one line after you send, People → Message reuses the open Chat window, and Open Inbox in People works.
+- In the Assistant, Edit on a message you just sent opens the editor, and Delete asks in the message itself, then removes it. A reply that just finished, or that you stopped, offers Delete and Regenerate right away. Before, Edit did nothing until the chat was reopened, and Delete did nothing.
+- In the Assistant, the end of each reply and its buttons stay above the message box, so you no longer scroll down to read the last lines.
+- First-run setup: the welcome sheet no longer disappears. Opening a step shrinks it to a small card that you click to continue, and it comes back after you save the Recovery Kit.
+- From this version on, every Home start gives its newly started Runtime up to 2 minutes to become ready: a System update, `elastos home --browser`, and `elastos home` without `--browser` (which gave up after 30 seconds). So Home no longer fails to start, or is left stopped by an update, on a slower device such as a Jetson. If the previous version was put back but could not start, `elastos home --browser` starts it again. The update log keeps the output of every update start.
+- During an update, System says that Home is restarting and how long it usually takes, and reloads by itself when the update is done.
+- Community posts are no longer held up by an overloaded Community node: Homes resend unanswered posts and presence less often, and the node only forwards them.
+
+## [0.8.0-alpha.19] - 2026-10-15
+
+Release candidate for 0.8.0 on the test channel, with the same notes.
+
+### Security
+
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in 0.8.1). Web pages and shared files open in a separate sandbox; the web Terminal is off by default; Home checks allowed hosts and rejects requests whose Origin header names another website; sandboxed apps need valid tokens to reach private data; releases are signed with a new key kept off the public server.
+- Isolation status, not done yet: Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls. These stages (S1 and S2 of #173) are planned for 0.8.1.
+- Security updates for the TLS library (rustls 0.23.46, four reported weaknesses, RUSTSEC-2026-0346 to 0349, #380) and the WebAssembly runtime (wasmtime 36.0.18, RUSTSEC-2026-0363).
+
+### Added
+
+- An owner (admin) can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey. You confirm with your current passkey first, and the new passkey opens the same account as an admin (#338).
+
+- Home on a phone (or a phone turned sideways) gets a touch layout: a Dock and pages of apps, one app at a time full screen, swipe down on its title bar for the app switcher, long-press menus, sheets with drag handles, and the screen kept above the keyboard. On Android, Back closes the top sheet or menu first, then sends the open app home; on iPhone the on-screen buttons do this. Desktop and tablet keep the desktop shell (#116, #92).
+
+### Changed
+
+- When an update cannot be applied from this version (the release uses a
+  newer format or a kind of component this version does not know), System and
+  `elastos update` say that the install command is needed once and show it,
+  instead of saying the publisher's release is not valid. Your current version
+  stays unchanged.
+- Homes on the test channel also accept the final release, so they update to
+  0.8.0 in System. Running the install command again moves them to the stable
+  channel (#335).
+- Make admin and Make guest in System → Accounts change every passkey of that account together (#338).
+- Spam limits for Chat: 5 Community messages per Profile every 10 seconds (Chat
+  shows "Slow down"), 5 per sender on receiving Homes without holding up other
+  senders, and Discovery relay caps of 4 listings per Home, 8 contact requests
+  per sender and 16 per Home. The relay admits only the signing Home's own
+  submissions.
+- Known issue: on the Jetson, getting a model is slow (Qwen takes about 43 minutes). The first Qwen reply takes about 22 seconds and the second about 3.6 seconds.
+- Known issue: Browser runs only on Apple Silicon Macs.
+- Known issue: Updating to this version in System from a test version older than 0.8.0-alpha.18 on a slow device such as a Jetson can still fail, because that older version runs the update. If Home is then stuck, follow "Recover an interrupted update" in `docs/INSTALL.md`.
+- Community posts reach members again without turning on Discovery, also across networks: they travel through the seed's Community node. Posts are signed, but that node can read them in transit until the relay arrives in 0.8.1. Direct messages across networks need that relay. Contact requests across networks, and showing as online in People, still need Discovery on.
+- Upgrading from 0.7.1 or earlier: run the install command once. System update cannot move these Homes to 0.8.0, because releases are now signed with a new key (#186). Your Home keeps its data.
+- A Browser session now lasts until you close it, until Home stops answering for 5 minutes, until Runtime stops, or 12 hours (it used to close after 10 minutes).
+- Browser Settings no longer shows Agent access, which no agent can use yet (#290), and hides the engine choice when there is only one engine. The default engine is called Automatic.
+- If a model download is interrupted, Home now resumes it by itself a few times before asking you to Retry.
+- A model's memory check now says: "This device has enough memory for this model. Replies also need some of it free when the model runs."
+- Community: a post whose delivery could not be confirmed now says "Delivery unconfirmed" instead of "Expired". When no other member is online, Community says "No other members are online right now.", and with Discovery off it says "Turn on Discovery in People to load earlier Community posts."
+
+### Fixed
+
+- When sign-in fails, the lock screen now says why in one line and what to do next, instead of showing nothing (#338).
+- The publisher's Carrier ticket lists only its public addresses when it has
+  one (no container bridge, LAN or loopback addresses), and a Runtime on a
+  fixed Carrier port also listens on that port over IPv6, so its ticket stays
+  the same across restarts (#336).
+- Browser shows "Starting Browser…" while it starts, no longer shows white bars around the page, and has a standard title bar, so you can drag its window.
+- Browser opens on a new install. Setup now records the Browser helpers it installs, so opening Browser no longer downloads them again and fails with "another writer owns the installation lock". Browser also no longer fails to open when another program uses one of the local ports it picked.
+- Browser shows images and fonts on busy news sites such as BBC and the Guardian. Before, Browser allowed only 16 connections at a time, so many pictures and fonts timed out.
+- Home no longer uses about a third of the CPU while Browser is open: it now checks Browser's status once a second and ignores changes to its timers.
+- Chat: the message box returns to one line after you send, People → Message reuses the open Chat window, and Open Inbox in People works.
+- In the Assistant, Edit on a message you just sent opens the editor, and Delete asks in the message itself, then removes it. A reply that just finished, or that you stopped, offers Delete and Regenerate right away. Before, Edit did nothing until the chat was reopened, and Delete did nothing.
+- In the Assistant, the end of each reply and its buttons stay above the message box, so you no longer scroll down to read the last lines.
+- First-run setup: the welcome sheet no longer disappears. Opening a step shrinks it to a small card that you click to continue, and it comes back after you save the Recovery Kit.
+- From this version on, every Home start gives its newly started Runtime up to 2 minutes to become ready: a System update, `elastos home --browser`, and `elastos home` without `--browser` (which gave up after 30 seconds). So Home no longer fails to start, or is left stopped by an update, on a slower device such as a Jetson. If the previous version was put back but could not start, `elastos home --browser` starts it again. The update log keeps the output of every update start.
+- During an update, System says that Home is restarting and how long it usually takes, and reloads by itself when the update is done.
+- Community posts are no longer held up by an overloaded Community node: Homes resend unanswered posts and presence less often, and the node only forwards them.
+
+## [0.8.0-alpha.18] - 2026-10-15
+
+Release candidate for 0.8.0 on the test channel, with the same notes.
+
+### Security
+
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in 0.8.1). Web pages and shared files open in a separate sandbox; the web Terminal is off by default; Home checks allowed hosts and rejects requests whose Origin header names another website; sandboxed apps need valid tokens to reach private data; releases are signed with a new key kept off the public server.
+- Isolation status, not done yet: Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls. These stages (S1 and S2 of #173) are planned for 0.8.1.
+- Security updates for the TLS library (rustls 0.23.46, four reported weaknesses, RUSTSEC-2026-0346 to 0349, #380) and the WebAssembly runtime (wasmtime 36.0.18, RUSTSEC-2026-0363).
+
+### Added
+
+- An owner (admin) can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey. You confirm with your current passkey first, and the new passkey opens the same account as an admin (#338).
+
+### Changed
+
+- When an update cannot be applied from this version (the release uses a
+  newer format or a kind of component this version does not know), System and
+  `elastos update` say that the install command is needed once and show it,
+  instead of saying the publisher's release is not valid. Your current version
+  stays unchanged.
+- Homes on the test channel also accept the final release, so they update to
+  0.8.0 in System. Running the install command again moves them to the stable
+  channel (#335).
+- Make admin and Make guest in System → Accounts change every passkey of that account together (#338).
+- Spam limits for Chat: 5 Community messages per Profile every 10 seconds (Chat
+  shows "Slow down"), 5 per sender on receiving Homes without holding up other
+  senders, and Discovery relay caps of 4 listings per Home, 8 contact requests
+  per sender and 16 per Home. The relay admits only the signing Home's own
+  submissions.
+- Known issue: on the Jetson, getting a model is slow (Qwen takes about 43 minutes). The first Qwen reply takes about 22 seconds and the second about 3.6 seconds.
+- Known issue: Browser runs only on Apple Silicon Macs.
+- Known issue: Updating to this version in System from an earlier test version on a slow device such as a Jetson can still fail, because the earlier version runs the update; use the install command there.
+- Community posts reach members again without turning on Discovery, also across networks: they travel through the seed's Community node. Posts are signed, but that node can read them in transit until the relay arrives in 0.8.1. Direct messages across networks need that relay. Contact requests across networks, and showing as online in People, still need Discovery on.
+- Upgrading from 0.7.1 or earlier: run the install command once. System update cannot move these Homes to 0.8.0, because releases are now signed with a new key (#186). Your Home keeps its data.
+- A Browser session now lasts until you close it, until Home stops answering for 5 minutes, until Runtime stops, or 12 hours (it used to close after 10 minutes).
+- Browser Settings no longer shows Agent access, which no agent can use yet (#290), and hides the engine choice when there is only one engine. The default engine is called Automatic.
+- If a model download is interrupted, Home now resumes it by itself a few times before asking you to Retry.
+- A model's memory check now says: "This device has enough memory for this model. Replies also need some of it free when the model runs."
+
+### Fixed
+
+- When sign-in fails, the lock screen now says why in one line and what to do next, instead of showing nothing (#338).
+- The publisher's Carrier ticket lists only its public addresses when it has
+  one (no container bridge, LAN or loopback addresses), and a Runtime on a
+  fixed Carrier port also listens on that port over IPv6, so its ticket stays
+  the same across restarts (#336).
+- Browser shows "Starting Browser…" while it starts, and no longer shows white bars around the page.
+- Chat: the message box returns to one line after you send, People → Message reuses the open Chat window, and Open Inbox in People works.
+- In the Assistant, Edit on a message you just sent opens the editor, and Delete asks in the message itself, then removes it. Before, Edit did nothing until the chat was reopened, and Delete did nothing.
+- In the Assistant, the end of each reply and its buttons stay above the message box, so you no longer scroll down to read the last lines.
+- First-run setup: the welcome sheet no longer disappears. Opening a step shrinks it to a small card that you click to continue, and it comes back after you save the Recovery Kit.
+- From this version on, a System update gives Home up to 2 minutes to start, so it no longer fails, or leaves Home stopped, on a slower device such as a Jetson. If the previous version was put back but could not start, `elastos home --browser` starts it again. The update log keeps the output of every start.
+- During an update, System says that Home is restarting and how long it usually takes, and reloads by itself when the update is done.
+- Community posts are no longer held up by an overloaded Community node: Homes resend unanswered posts and presence less often, and the node only forwards them.
+
+## [0.8.0-alpha.17] - 2026-10-14
+
+Release candidate for 0.8.0 on the test channel, with the same notes.
+
+### Security
+
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in 0.8.1). Web pages and shared files open in a separate sandbox; the web Terminal is off by default; Home checks allowed hosts and rejects requests whose Origin header names another website; sandboxed apps need valid tokens to reach private data; releases are signed with a new key kept off the public server.
+- Isolation status, not done yet: Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls. These stages (S1 and S2 of #173) are planned for 0.8.1.
+- Security updates for the TLS library (rustls 0.23.46, four reported weaknesses, RUSTSEC-2026-0346 to 0349, #380) and the WebAssembly runtime (wasmtime 36.0.18, RUSTSEC-2026-0363).
+
+### Added
+
+- An owner (admin) can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey. You confirm with your current passkey first, and the new passkey opens the same account as an admin (#338).
+
+### Changed
+
+- When an update cannot be applied from this version (the release uses a
+  newer format or a kind of component this version does not know), System and
+  `elastos update` say that the install command is needed once and show it,
+  instead of saying the publisher's release is not valid. Your current version
+  stays unchanged.
+- Homes on the test channel also accept the final release, so they update to
+  0.8.0 in System. Running the install command again moves them to the stable
+  channel (#335).
+- Make admin and Make guest in System → Accounts change every passkey of that account together (#338).
+- Spam limits for Chat: 5 Community messages per Profile every 10 seconds (Chat
+  shows "Slow down"), 5 per sender on receiving Homes without holding up other
+  senders, and Discovery relay caps of 4 listings per Home, 8 contact requests
+  per sender and 16 per Home. The relay admits only the signing Home's own
+  submissions.
+- Known issue: on the Jetson, getting a model is slow (Qwen takes about 43 minutes). The first Qwen reply takes about 22 seconds and the second about 3.6 seconds.
+- Known issue: Browser runs only on Apple Silicon Macs.
+- Community posts reach members again without turning on Discovery, also across networks: they travel through the seed's Community node. Posts are signed, but that node can read them in transit until the relay arrives in 0.8.1. Direct messages across networks need that relay.
+- Upgrading from 0.7.1 or earlier: run the install command once. System update cannot move these Homes to 0.8.0, because releases are now signed with a new key (#186). Your Home keeps its data.
+- A Browser session now lasts until you close it, until Home stops answering for 5 minutes, until Runtime stops, or 12 hours (it used to close after 10 minutes).
+- Browser Settings no longer shows Agent access, which no agent can use yet (#290), and hides the engine choice when there is only one engine. The default engine is called Automatic.
+- If a model download is interrupted, Home now resumes it by itself a few times before asking you to Retry.
+- A model's memory check now says: "This device has enough memory for this model. Replies also need some of it free when the model runs."
+
+### Fixed
+
+- When sign-in fails, the lock screen now says why in one line and what to do next, instead of showing nothing (#338).
+- The publisher's Carrier ticket lists only its public addresses when it has
+  one (no container bridge, LAN or loopback addresses), and a Runtime on a
+  fixed Carrier port also listens on that port over IPv6, so its ticket stays
+  the same across restarts (#336).
+- Browser shows "Starting Browser…" while it starts, and no longer shows white bars around the page.
+- Chat: the message box returns to one line after you send, People → Message reuses the open Chat window, and Open Inbox in People works.
+- In the Assistant, Edit on a message you just sent opens the editor, and Delete asks in the message itself, then removes it. Before, Edit did nothing until the chat was reopened, and Delete did nothing.
+- In the Assistant, the end of each reply and its buttons stay above the message box, so you no longer scroll down to read the last lines.
+- First-run setup: the welcome sheet no longer disappears. Opening a step shrinks it to a small card that you click to continue, and it comes back after you save the Recovery Kit.
+
+## [0.8.0-alpha.16] - 2026-10-13
+
+Release candidate for 0.8.0 on the test channel, with the same notes.
+
+### Security
+
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in 0.8.1). Web pages and shared files open in a separate sandbox; the web Terminal is off by default; Home checks allowed hosts and rejects requests whose Origin header names another website; sandboxed apps need valid tokens to reach private data; releases are signed with a new key kept off the public server.
+- Isolation status, not done yet: Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls. These stages (S1 and S2 of #173) are planned for 0.8.1.
+
+### Added
+
+- An owner (admin) can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey. You confirm with your current passkey first, and the new passkey opens the same account as an admin (#338).
+
+### Changed
+
+- When an update cannot be applied from this version (the release uses a
+  newer format or a kind of component this version does not know), System and
+  `elastos update` say that the install command is needed once and show it,
+  instead of saying the publisher's release is not valid. Your current version
+  stays unchanged.
+- Homes on the test channel also accept the final release, so they update to
+  0.8.0 in System. Running the install command again moves them to the stable
+  channel (#335).
+- Make admin and Make guest in System → Accounts change every passkey of that account together (#338).
+- Spam limits for Chat: 5 Community messages per Profile every 10 seconds (Chat
+  shows "Slow down"), 5 per sender on receiving Homes without holding up other
+  senders, and Discovery relay caps of 4 listings per Home, 8 contact requests
+  per sender and 16 per Home. The relay admits only the signing Home's own
+  submissions.
+- Known issue: on the Jetson, getting a model is slow (Qwen takes about 43 minutes) and replies run on the CPU (about 25 seconds each).
+- Known issue: on a Mac with a slow connection, getting a model can stop with "Model content could not be read".
+- Known issue: Browser runs only on Apple Silicon Macs.
+
+### Fixed
+
+- When sign-in fails, the lock screen now says why in one line and what to do next, instead of showing nothing (#338).
+- The publisher's Carrier ticket lists only its public addresses when it has
+  one (no container bridge, LAN or loopback addresses), and a Runtime on a
+  fixed Carrier port also listens on that port over IPv6, so its ticket stays
+  the same across restarts (#336).
+
+## [0.8.0-alpha.15]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- You can remove ElastOS with `curl -fsSL https://elastos.elacitylabs.com/install.sh | bash -s -- --uninstall`. It keeps your identity and files, so installing again continues where you were; add `--remove-data` to delete them too (keep your Recovery Kit first).
+- An owner who lost every passkey can recover their Home with their Recovery Kit: choose "Recover this Home with your Recovery Kit" on the sign-in screen, run the command it shows on the computer that runs Home, and enter the code it prints.
+- Browser runs on Apple Silicon Macs. On Linux, including the Jetson, it stays hidden until a later release.
+
+### Changed
+
+- Setup installs one Home, and `elastos --help` lists only everyday commands; commands for servers and publishers still work and have their own `--help`.
+- The terminal Home no longer offers the old native Chat. People "Message" opens Chat on the Desktop, or says "Open Chat on the Desktop to message <name>." in a native terminal.
+
+### Fixed
+
+- On Linux, Carrier sends one UDP datagram at a time. Some Wi-Fi drivers, such as the Jetson's, dropped batched datagrams, which stalled connections, Chat and downloads.
+- The terminal Home no longer quits with "403 Forbidden" after the first action, and Inbox and Apps items that only work on the Desktop say "Open … on the Desktop".
+- Publishing a document (Documents Publish and `elastos share`) works again (#128).
+- Importing your Recovery Kit with a new passkey keeps your admin role; before, the Home could be left with no admin.
+- Home no longer runs out of memory when it starts with Qwen2.5 1.5B, and on Linux a reply right after Get no longer fails with "Not enough free memory" when the memory in use is mostly cached files.
+- `elastos setup` on a Home that imported media tools before 0.8.0-alpha.9 no longer stops with "supplied media tools differ"; it fetches and verifies the release's media tools again.
+- Model downloads and setup show "Checking status…" and "Finishing setup…" instead of stopping at an error, Assistant shows progress such as "SmolLM2 is downloading (42%)", and Retry continues a stopped download from where it stopped.
+- Right after Get, Assistant lists the model by its name, such as "Qwen2.5 1.5B Instruct", without Refresh models.
+- If there is not enough disk space for a model, Apps says how much space it needs instead of "Model action could not be confirmed".
+- With no model yet, Assistant says "Get a model to start. Models run on this Home." with a Get a model button; Stop shows "Stopped."
+- Terminal views appear only in developer mode, and Home opens the Desktop if a chosen Terminal can no longer start.
+- A new Home no longer asks for market-price access before you open Wallet, Assistant no longer shows a microphone button that cannot work, and the welcome sheet and lock screen read correctly.
+- Apps that ask for the ElastOS version get the same version as `elastos --version` and System.
+- `elastos update` explains a damaged version record even offline, and System explains an update already running or an approval that was replaced, instead of saying the release was refused.
+- The installer: an interrupted download changes nothing; it uses HTTPS only; it keeps your temporary folder; running it while Home is open works; a Mac without Apple's Command Line Tools is told to run `xcode-select --install` first.
+- When setup or an update cannot reach the trusted source, ElastOS says it needs outgoing UDP to port 4433 and to check the firewall or network.
+
+### Removed
+
+- The sign-in screen no longer shows "Use an older security key"; to replace a passkey, restore your Recovery Kit and create a new one.
+- Protected content is not part of 0.8.0: Elacity Player, "Protect and List…" and the Marketplace Media tab return in a later release.
+- `elastos agent`, `elastos upgrade` (use `elastos update`), `--no-confirm`, `elastos update --gateway` and `--no-p2p`, and the installer's IPFS-gateway options. Updates come only from your trusted source over Carrier.
+- ElastOS no longer attaches downloads to GitHub Releases; `install.sh` and System fetch the signed release over Carrier.
+
+### Security
+
+- An installed Home runs a local capsule only when it comes from the signed release or is signed by the release publisher. Homes built from source keep running unsigned capsules.
+- Recovery Kit import accepts only a Kit made on this Home for that account, and refuses any import that would leave the Home without an admin passkey.
+- Requests and replies from other computers now have limits and deadlines: at most two whole-object fetch replies at once and one per peer, and a relayed connection closes after five idle minutes.
+
+### Developer detail
+
+- The local pre-push gate now runs the CI behaviour suite and the CI
+  source-gate checks before Cargo work. CI, `just test-behaviour` and the gate
+  share `scripts/test-behaviour.sh`; CI source-gate, `just verify` and the gate
+  share `scripts/test-source-gate.sh`. A failing check stops the push locally
+  and names the test. Run `just test-behaviour-inputs` once to install the
+  pinned Playwright inputs.
+- Removed `elastos identity passkey-hint` and the private credential-hint
+  sign-in path. Anonymous sign-in options still never list an account's
+  credentials.
+- The capsule catalogue marks `home-cli` not launchable unless the host
+  terminal policy allows it (`developer_mode = true` and closed guest
+  registration), so Home view candidates, System and Marketplace follow the same
+  rule; the active-shell summary already repairs a saved shell that is no longer
+  a candidate. Home host also resets a non-launchable saved shell to `home-gui`
+  through `POST /api/apps/home/active-shell`
+  (`scripts/home-shell-unavailable-shell-fallback-smoke.mjs`).
+- `protected_content = true` in the host `config.toml` (`elastos config set
+  protected_content true`; default off) is the one switch for protected content:
+  off, the catalogue drops `elacity-player` and reports
+  `policy.protected_content: false` (Marketplace hides Media), Library objects
+  lack the `protect` capability that "Protect and List…" requires, and
+  `object/publish` with `protection` is refused.
+- `GET /api/wallet/prices` raises the CoinGecko Inbox request only with
+  `request_access=true`, and not within 24 hours of a dismissal or rejection
+  (new `dismissed_at` on Inbox entries). Wallet sends it unless it was preloaded
+  by the rail (`preload=1`); opening the rail sends `elastos:wallet-refresh`,
+  which asks.
+- `model-management.js` adds the `finishing` phase (admitted, activation
+  pending, no dispatch-unavailable reason), which turns back into the
+  unavailable phase with Retry after 120 s. `model-selection.js` adds
+  `downloadPercent` and `downloadingModel`.
+- `components.json` keeps only the `home` profile and the `browser-host`
+  helper set that setup installs automatically; `demo`, `operator`,
+  `blockchain`, `agent-local-ai`, `public-gateway`, `minimal` and `full` are
+  removed. Developer components (GBA, site, tunnel, cloudflared, availability
+  and the DRM, rights, key, decrypt and custody providers) still publish with
+  each release and install with `elastos setup --with <name>`.
+- `--profile`, `--with` and `--without` are hidden from `elastos setup --help`
+  but still accepted; the help no longer names a nonexistent `chat` profile.
+- MyWebSite and Shared leave the home-cli for 0.8.0; `elastos site`, `share`
+  and `shares` stay operator commands. The Rust `demo` publish profile is gone;
+  `scripts/home-demo-local.sh` runs plain `setup`, and the operator smoke and
+  pinned-model proof use `--with`.
+- `elastos update` and System Update stage this profile change normally; only
+  the standalone frozen offline path refuses a `profiles` difference.
+- Home consumes `intent.json` by overwriting it with empty content instead of
+  deleting it; the session holds only read and write capabilities. A
+  regression test runs two intents against a provider that refuses delete.
+- The `chat` core action and `ManagedChat` launch are removed from Home.
+  `elastos chat` is hidden from help and kept only for the native chat smoke
+  scripts. `people-message:` emits a `switch-shell-open-target` host intent for
+  `chat-room` with `{conversation_id}` (the query People sends); the gateway
+  accepts only that bounded query for People hand-offs. Home and home-cli key
+  messaging on the contact's `conversation_id` (the People summary never had
+  `route`), and `run_chat_from_home` is removed.
+- `elastos agent`, `agent_cmd.rs` and the shell's `agent` command request are
+  removed. The `capsule` help, the serve banner, the first-run welcome and the
+  microVM publish hint (no `serve --forward` flag) name commands that exist.
+  `docs/COMMAND_MATRIX.md` drops `chat`, `agent` and seven nonexistent `room`
+  subcommands; GETTING_STARTED no longer suggests `elastos chat`.
+- Share bundles copy the viewer from its manifest `entrypoint`
+  (`browser/index.html` plus its assets) to the bundle root. The entrypoint
+  must be a relative path inside the viewer. Every path component is opened
+  with `openat(O_NOFOLLOW)` from the viewer directory's descriptor, so a
+  symlink anywhere in the copied tree, even one swapped in after listing, is
+  refused; the copy is capped at 256 files and 16 MiB. The Documents
+  publish test installs the real `capsules/documents` layout and checks the
+  published file list.
+- Startup restore and repair of complete local Content objects skip
+  Runtime-private `model-preparation`. Admitted models are verified at
+  admission, and this Home's Kubo does not hold them in 0.8.0; serving them to
+  peers is the holder role (#324). Before this, restore read each admitted
+  model file whole, then base64-encoded it and copied it through the provider
+  bridge, using about 8 times the file size.
+- Restore and repair now stream every local object from disk into Kubo,
+  unpinned, through a new Runtime-private ipfs-provider operation
+  (`runtime_add_local_object`). It uses the same parts and add options as
+  `add_directory`, so the CID matches the original import. The provider opens
+  the object below its data root and each file without following links
+  (regular files owned by this user only). Content pins only a matching CID:
+  repair pins the requested CID, and restore pins a CID with a Content receipt
+  that was not withdrawn by unpublish. Runtime hashes the files with a streamed
+  reader and sends only their paths and sizes, so memory stays the same
+  whatever the object's size.
+- model-provider's cgroup v2 memory check subtracts reclaimable file cache
+  (`active_file + inactive_file - file_dirty - file_writeback` in
+  `memory.stat`, never below zero) from `memory.current`.
+- `elastos update` checks the installed version before connecting to Carrier
+  (#156). Runtime admission and the release integrity checker now read one
+  platform table, `scripts/release-platforms.json` (`darwin-arm64` =
+  `aarch64-darwin`, `darwin-amd64` = `x86_64-darwin`). The checker no longer
+  uses `macos-arm64`, so it no longer skips the Mac entries Runtime admits.
+- Capsule admission (`Runtime::configure_capsule_admission`): a Home with an
+  installed signed release verifies each capsule against the signed release:
+  it trusts the default trusted source's publisher DID keys plus
+  `trusted_keys`, and admits a capsule without a publisher signature only from
+  its release install path when `components.json` matches the signed release
+  and the capsule's `.elastos-cid` and archive receipts match its entry.
+  Source and CI Homes keep developer mode explicitly (`setup-source-home.sh`,
+  `ci-installed-journeys.py`). The new Runtime applies this on its first start
+  and leaves `config.toml` unchanged.
+- `commit_recovered_root_reassignment` sets the importer's role inside the
+  same auth-state mutation: Admin if the importer or any replaced record of the
+  recovered principal or root was Admin, otherwise Guest. The commit fails, with
+  auth state unchanged, if no active admin passkey would remain. (#88)
+  Reassignment also requires that, when this Home already knows the recovered
+  principal or root, a stored `principal_root_protections` entry for that exact
+  principal/root has the Kit's `data_key_id` (the Kit unwraps the same data
+  key). The import route checks this before deriving keys, activating
+  protection or creating the recovery archive key, so a refusal writes only
+  the denial audit event. The Kit's archive is sealed inside the commit's auth
+  lock; if this commit created the recovery archive key and the auth file on
+  disk does not reference the new archive after a failure, the key is removed.
+- New `elastos identity arm-owner-recovery --origin --rp-id [--expires-in ≤900]`
+  stores the digest of a one-time code (`AuthState.owner_recovery`); the Home
+  must already have an admin. `POST /api/auth/owner-recovery/begin` and
+  `/complete` (header `x-elastos-owner-recovery`) register a passkey only when,
+  in one auth write, the code matches (constant-time), has not expired, and the
+  presented Kit belongs to an existing Admin record whose stored root protection
+  has the Kit's `data_key_id`. That write replaces the admin's records, revokes
+  their sessions, binds the new passkey as Admin, consumes the code and audits
+  `auth.owner.recovered`. Both routes share the passkey-registration rate
+  limit, and each checks the code (armed, unexpired, constant-time match)
+  before any password derivation or Kit work; an unarmed or expired Home
+  refuses without writing, and the fifth wrong code burns the armed code. A Kit
+  refusal leaves auth state and the credential store unchanged. The credential
+  is written just before the auth write; a crash between them leaves an orphan
+  credential that a retry with the same passkey reconciles. (#88)
+- Assistant empty state: `showEmptyState()` builds its lines with DOM nodes;
+  `paintEmptyModelHint()` shows the no-model line and a `data-agent-get-model`
+  button (`openModelsFromAgent()`, Marketplace `category: models`) only after a
+  successful offers read returned none (`endpointState: "no-model-offers"`) and
+  no model is downloading. A failed read or an unavailable chosen model beside
+  others keeps the usual hero and model menu. The harness refreshes it on
+  `assistant:live-models` via `refreshEmptyModelHint()`. `syncAgentSendButton`
+  titles a disabled Send "Get a model to start".
+- `streamChatViaContract` results carry `stopRequested`. A user Stop that the
+  engine settles as `settlement_unknown` shows `STOPPED_STATUS`; the turn
+  manifest keeps `settlement_unknown`.
+- Preparation `use` refused by `require_space` now reports the model's whole
+  unwritten size (`NotEnoughFreeSpace { needed: unwritten }`), not the zero-byte
+  probe. The capsule invoke gateway maps it to HTTP 507
+  `not_enough_free_space` with a plain message; `_shared/model-management.js`
+  shows that message, leaves Get available and skips reconcile. The
+  `capacity_pending` phase text is built by `capacityText()` with the remaining
+  bytes.
+- `Commands` in `main.rs` marks `serve`, `publish-release`, `content`,
+  `collaboration-config`, `protected-content-config`, `node`, `gateway`,
+  `sign-payload`, `keys`, `tls` and `emergency` with `hide = true`;
+  `docs/COMMAND_MATRIX.md` lists them. Removed the `Upgrade` variant, the
+  `no-confirm` alias, and the retired hidden `publish-release --key` /
+  `--allow-no-bootstrap` flags with their `PublishReleaseOptions` fields. The
+  `just publish*` recipes, which always failed on the retired `--key`, are gone.
+- `get_runtime_info` in `resource_bridge.rs` (both the local and the attached
+  bridge) returns `ELASTOS_VERSION` from `build.rs` instead of
+  `CARGO_PKG_VERSION`.
+- `carrier.rs` reads peer lines through `read_peer_line` (`take(max + 1)`
+  under a timeout). Caps come from the protocol limits: `handle_file_stream`
+  takes the I/O bridge line limit or one `GOSSIP_WIRE_MESSAGE_MAX_BYTES`
+  message plus 64 KiB of envelope, within 10 s; `gossip_pull` replies take
+  `GOSSIP_TOPIC_BUFFER_MAX_BYTES` plus envelope; open-ended provider replies
+  take one `MAX_CARRIER_OBJECT_IMPORT_BYTES` object as base64 within an hour
+  and share a 256 MiB in-flight budget (`CARRIER_REPLY_BUDGET`; refused past
+  it); whole-object content fetch replies keep no size cap (the object is one
+  JSON line) but run two at once and one per peer;
+  bounded reads keep 128 KiB and now also get the route deadline on peer-DID
+  routes. `operator_control.rs` reads requests (before signature checks) at
+  64 KiB / 10 s and replies at 1 MiB / 1 h. Relays in `carrier.rs`,
+  `carrier_engine_media.rs` and `carrier_engine_binding.rs` close after 5 min
+  with no bytes either way (`RelayActivity`), and stream acks have deadlines.
+- Model preparation keeps its stage after any `MetadataRead`, `WeightsRead` or
+  `Capacity` failure, not only after a read typed as in transit (`Io`). A part
+  that a holder refuses or answers malformed is rejected before it is written,
+  so the staged prefix stays valid; the next Use re-hashes it and continues
+  after the last whole part. Integrity, local storage, authority, policy and
+  Cancel still remove the stage. Seen on a Jetson running alpha.14: a read that
+  ended as a `Provider` error at 78.7% sent the next Retry back to 0%.
+- Assistant lists a Runtime-admitted model offer (`model:<sha256>`) only through
+  its catalogue row (title and CID); `liveMenuOffers()` leaves it out of the raw
+  offer rows, which could not be chosen anyway. While Assistant is open
+  (`watchLiveModels`), `agent-live.js` reads the catalogue again every 3 s when
+  such an offer is listed but its catalogue row is not yet bound to it
+  (`dispatch_ready: false`, for example the first read after activation), at
+  most 10 times, and while a model downloads with nothing selectable. One timer
+  serves both, it skips while a read is in flight, and closing Assistant stops
+  it. Every probe result is published as `assistant:live-models`; the harness
+  updates the chip and an open menu from it, keeping keyboard focus on a row or
+  menu action. Before, an open menu kept the earlier read while the chip changed.
+- Owner update refusals caused by another owner action are typed. The System
+  update route answers `update_controller::UpdateInProgress` (owner-action lock
+  held, `WouldBlock` only, or a different request queued or active) with 423,
+  and `ApprovalReplaced` (a later approval replaced the receipt and nothing is
+  queued or active) with 410; `system.js` shows the plain messages above. Other
+  lock I/O failures and refusals keep 409. Covered by
+  `system_update_refuses_a_concurrent_tab_and_a_replaced_approval`.
+- `scripts/install.sh` runs every action inside `main`, called on its last
+  line, so bash parses the whole script before acting. `install-bootstrap-test.py`
+  feeds the installer truncated at each step and after the Runtime stop, and
+  asserts no request, output, Runtime call or HOME change.
+- `install.sh` keeps its scratch directory in `INSTALL_SCRATCH` and never
+  assigns `TMPDIR`, so `elastos setup`, Home and the update controller's saved
+  launch environment see the caller's `TMPDIR`. Tests: a policy check, and the
+  fixture's `setup` stub records the `TMPDIR` it receives.
+- `install.sh` fetches through `fetch_url`, which runs curl with
+  `--proto '=https' --proto-redir '=https' --tlsv1.2`. Only an exact
+  `http://127.0.0.1`, `http://[::1]` or `http://localhost` origin (optional
+  port, no userinfo) may use HTTP, and such a fetch follows no redirect
+  (`--max-redirs 0`). curl's exit 1 (protocol refused) names the URL. The
+  bootstrap fixture's curl stand-in requires these flags on every request;
+  real-curl tests cover userinfo tricks and HTTP and HTTPS redirects to plain HTTP.
+- Removed the web transport override from the Runtime update flow (gateway
+  head discovery, `/ipfs/<cid>` fetches, the gateway release-manifest path and
+  the third-party IPFS host list) and the installer's CID-gateway bootstrap
+  (`ipfs_fetch`, `ELASTOS_IPFS_GATEWAYS`) with its docs and fixture transport.
+  Dead installer values (`PUBLISHER_HASH`, `LAST_SUCCESS_GATEWAY`) are gone.
+- The installer's identity-checked stop recognises this installation's Home:
+  `<bin> home …` is a Runtime command, and when its parent is this data
+  root's `update-controller/runtime __update-controller --receipt …`, the
+  controller is stopped first so it does not restart Home. Real-process fixture
+  test: `test_open_home_stops_through_its_update_controller`.
+- `install.sh` still needs python3 to check the Ed25519 signature: stock macOS
+  `openssl` (LibreSSL 3.3.6) has no Ed25519. Its preflight now runs
+  `python3 -c ''` and, if the macOS stub (or any broken python3) cannot run,
+  stops with one next step before the first request. Test:
+  `test_python3_that_cannot_run_stops_before_any_download_with_one_next_step`.
+- `install.sh` discards `principal-root-upgrade`'s stdout receipt (written to
+  the backup directory when objects move) and prints one line. The command's
+  JSON output is unchanged for the source-restart scripts that parse it.
+- Setup, Home capsule launch, update refresh and the supervisor install every
+  component only over Carrier by its signed `release_path`; the HTTP
+  `{gateway}/ipfs/<cid>` content path (`download_streaming`,
+  `build_gateway_list`, `ElastosFetchPath`, the update HTTP download helpers)
+  is removed. Admission refuses a component without a non-blank `release_path`
+  (`component_without_signed_release_path_is_refused_before_fetch`). sources.json
+  `gateways` now serves only Carrier ticket refresh.
+- `CarrierClient::connect_trusted_source` wraps a failed connection in that
+  plain message; the per-route ticket and fallback errors stay in the cause
+  chain (`{:#}`). Test: `unreachable_trusted_source_names_the_network_fix`.
+- `install.sh --uninstall [--remove-data]` (#315) first refuses, before
+  stopping anything, a data directory that is a link, belongs to another user,
+  is not named `elastos` or is `$HOME` or one of its parents (compared by device
+  and inode, so aliases and case variants count), and a release entry that is a
+  link. It then stops the installation with the installer's identity-checked
+  `installer_runtime_control`, takes the Runtime writer's
+  `.elastos.install.lock` and refuses while it is held or an update journal
+  exists. It removes the binary and the release-owned data entries (`bin`,
+  `capsules`, `libexec`, `tools`, `model-catalog.json`, `components.json`,
+  `sources.json`, `installation`, `update-controller`); with `--remove-data` it
+  removes the whole data directory instead, without following links. It
+  downloads nothing and needs no trust anchors. `docs/INSTALL.md` now lists the
+  macOS and Linux paths and documents removal.
+- `docs/VERSIONING.md` "Withdraw a bad release" (#321): publish N+2 from the
+  last good source, announce on #93, point affected Homes to Undo; the seed
+  keeps N pinned. Decision: no withdrawn-versions list in the signed head for
+  0.8.0; revisit with #157 and #213.
+- The local pre-push gate refuses what CI refuses: its Cargo calls use
+  `RUSTFLAGS=-D warnings` and drop `CARGO_ENCODED_RUSTFLAGS`, clippy covers
+  the touched packages and their reverse dependencies in each workspace, and a
+  change to `scripts/release-*`, `scripts/install.sh` or
+  `scripts/publish-release.sh` runs `release-platform-input-test.py` and
+  `ci-release-policy-test.py`. Documentation-only changes keep fmt and git
+  checks without rebuilding unrelated workspaces (#319). The installed Home
+  journey waits the model-preparation window for the first engine refusal.
+- The `custody-harness-smoke` path filter and the Linux holder canary's paths
+  now include every input their jobs build or call (setup and restart scripts,
+  `chain-provider`, `elastos-runtime`, the workspace manifest and lock,
+  `rust-toolchain.toml`, the Cargo configuration it reads, `components.json`,
+  the workflow, the canary's `localhost-provider` capsule, hop observer and
+  Kubo seed scripts, and the crates each capsule names by path).
+  `ci-release-policy-test.py` follows each job's shell scripts, Dockerfiles,
+  Cargo configuration, `-p` capsule packages and path dependencies, and fails
+  when a called input is outside the filter (#317).
+- `ci.yml` no longer publishes a GitHub Release or uploads `elastos-runtime-*`
+  packages on tags, `main` or dispatch: those unsigned assets were a second
+  channel beside the signed Carrier release. CI still packages ARM64 for the
+  Jetson compatibility gate. The nine required checks are unchanged.
+- New `update-hop-linux` CI job proves install and update on
+  Linux x86-64 as `source-home-macos` does on Mac: the pinned published release
+  (0.8.0-alpha.8, which carries x86_64-linux artifacts) installs with its own
+  `install.sh`, its System installs this source and Home reconnects, this
+  source's System refuses a tampered offer and applies the next release, the
+  CLI refusals (wrong signers, platform, version, tampered binary) leave Homes
+  unchanged, and `update --rollback-to` undoes the hop. `update-hop-compare.py`
+  runs CLI fixtures natively on Linux (`HOME/.local/share/elastos`, ELF
+  admission, `xdg-open` fixture opener, Runtime's platform aliases). The seed's
+  HTTP route does not serve every Linux artifact, so its new
+  `install-previous-release` installs a disposable Home with the published
+  `install.sh`, rolls it back over Carrier to the pinned head (`head_cid`, new
+  in `update-hop-previous-release.json`) and copies the release out under its
+  signed hashes, rebuilding capsule archives as releases build them. On Linux
+  and Mac, the `check-result` verdict in the job summary also requires and
+  names the next release, the refused tampered offer and each CLI refusal (#320).
+- Linux Browser's prepared rootfs pool names each copy by the admitted rootfs
+  hash from the image manifest. Launch boots only copies of the current image
+  and removes the rest, so an image update or Undo never boots the previous
+  rootfs with the new kernel; a refill that sees the image change discards its
+  copy (#307).
+- Linux Browser support (per-Home TURN credential in the owner-only
+  `runtime-turn/turn-credentials.env`, crosvm launcher, network setup) stays in
+  the code, but setup selects Browser only on `darwin-arm64`. Elsewhere the
+  capsule catalog omits Browser, Runtime starts no Browser helpers, and setup
+  resets the Engine selection to empty and removes the release-owned Browser
+  host files and image an earlier release installed (profiles under `Users/`
+  stay), so the installer's later Linux host step never asks for sudo (#307).
+- Browser TURN relays only to its own relay address on both hosts: coturn
+  denies loopback, private ranges and every other peer. On Mac, a loopback relay
+  keeps loopback peers, and the media bridge closes any guest TURN stream that
+  addresses a peer outside the session relay ports or asks for a TCP relay
+  (#307).
+- Linux Browser network setup adds a per-slot output rule: UDP from the TURN
+  relay ports reaches only the slot's TURN ports. coturn's RFC 6062 TCP
+  relays are off on both hosts. `check` refuses a setup receipt without the
+  rule, so Browser asks to re-run the root setup once (#307).
+
+## [0.8.0-alpha.14]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- Marketplace offers a second local model, Qwen2.5 1.5B Instruct (1.1 GB,
+  Apache-2.0), for noticeably better answers than SmolLM2. It needs about 3 GB
+  of free memory.
+
+### Changed
+
+- This release updates the model list. If SmolLM2 is already on this device,
+  press Use once; it keeps the downloaded files.
+- If this Home is on 0.8.0-alpha.12 or older, Update here stops with "The update
+  could not start" and keeps your current release. Run the installer again
+  instead (`curl -fsSL https://elastos.elacitylabs.com/install.sh | bash`); it
+  keeps your identity and data.
+
+### Developer detail
+
+- Signed model catalogue 3 is pinned in `components.json` (head
+  `bafkreid5lc25ap4v3qw576uw3z3zdsbsfhqnnt5uwfdkawju4ejrtin7z4`): SmolLM2-135M
+  unchanged plus Qwen2.5-1.5B-Instruct Q4_K_M (package
+  `bafybeievyi6xp5b62qkuh65ywkd72medhx6uxrmik2fhnr3aameeqnxvwe`, reproducible,
+  pinned on the seed). alpha.13's updaters install the new catalogue; alpha.12
+  and older System updaters cannot (#84, #113).
+
+## [0.8.0-alpha.13]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+If your Home is on 0.8.0-alpha.10 or older, update it once from Terminal with
+`elastos update`; the System page in those releases cannot install this one.
+
+### Changed
+
+- A model download that stops because the network failed, or because Home
+  restarted, now continues from where it stopped the next time you press Use,
+  instead of starting over. Cancel on the stopped download discards the part
+  already downloaded; Home also discards it after 7 days, or when the model is no
+  longer offered.
+- A local model now starts only when the device has enough free memory for it.
+  Otherwise you see "Not enough free memory for this model. Close other apps or
+  choose a smaller model." instead of a model failure.
+- A local model stops after a minute without use to give its memory back, and
+  starts again on your next message. Only one local model runs at a time.
+- When the model list is updated, a model already on this device says "Model
+  list updated. Press Use to keep using this model." Use keeps the files; nothing
+  downloads again.
+- Marketplace shows a model's own description from the signed model list.
+
+### Fixed
+
+- An update made by an older version could leave out the release's signed model
+  list, after which Home, Undo and later updates stopped with "Installed release
+  inputs require repair". Home, Update and Undo now fetch the release's own
+  signed model list from your trusted source and continue. Without a connection,
+  Home still starts and Local AI says the list could not be fetched; Update and
+  Undo say so and change nothing.
+- Update and Undo now carry the signed model list with the release's other
+  files, in Terminal and in System, so a release with a new model list installs
+  cleanly and Undo puts back the previous list.
+- An Undo that stopped halfway could leave one component from the other release,
+  after which Update, Undo and `elastos setup` refused to continue. Home, Update
+  and Undo now put back this release's signed copy, and `elastos update` does so
+  even when no newer release exists. Replacing a component folder no longer
+  removes the old one first.
+- `elastos setup` fetched the newest release's components by name, so setting up
+  an older release failed. It now fetches that release's own files by their
+  signed IDs.
+- A brief network stall no longer stops a model download. Home tries a part
+  that timed out up to three more times before it stops.
+- After about 64 model downloads, retries or cancels, Home could no longer get
+  any model. Old finished attempts no longer use up that limit.
+- Setting up Home on an ARM64 device without the CPU features local AI needs no
+  longer fails. Home installs without the local model engine, and Marketplace
+  shows "Local AI is not supported on this device."
+
+### Developer detail
+
+- Home start, `elastos update`, System update and Undo first repair the installed
+  release from its signed components: a missing or wrong-head pinned model
+  catalogue is fetched by CID over Carrier and checked for CID and publisher
+  signature; a component with the wrong bytes is re-fetched by CID. Both update
+  paths install the target's catalogue as journaled support. Setup fetches
+  components and the catalogue by the release's signed CID instead of by name.
+  The catalogue pin stays at alpha.11's head
+  (`bafkreihmcsvldwwa5ttbgw5yfrs62kiv3natqhfj3tkg3yzemsd73runr4`) so alpha.11 and
+  alpha.12 updaters, which do not install catalogues, can update to this release
+  (#113).
+- `model-provider` admits a local engine right before spawn when free memory
+  covers GGUF weights once, the f16 KV cache at the configured context, batch
+  scratch and headroom of max(10% RAM, 1 GiB). Free memory is Linux
+  `MemAvailable` capped by every cgroup v2 ancestor's `memory.max -
+  memory.current` (cgroup v1: `MemAvailable` only), or macOS free (minus
+  speculative) + purgeable + file-backed pages. When that estimate is short,
+  macOS still admits if `kern.memorystatus_vm_pressure_level` is normal and the
+  need is at most 40% of RAM. Refusal is `model_memory_unavailable` (#98).
+- Local runs share one execution slot; an engine idle for 60 s is stopped and
+  opening another model closes the previous engine. llama-server gets
+  `--batch-size 128 --ubatch-size 128 --cache-ram 0`. `elastos setup` drops
+  `llama-server` on an `UnsupportedHost` instead of aborting.
+- A model part read that every holder failed only in transit (answer deadline,
+  connect failure, lost stream; `carrier_fetch_in_transit`, mapped to
+  `ProviderError::Io`) is repeated up to 3 times after 0.5, 1 and 2 s in the same
+  in-flight slot, after the same per-part checks as a first read. Refusals,
+  malformed or oversized answers and integrity, authority or capacity failures
+  are never repeated. The seed's `ipfs-provider` bridge serializes requests, so
+  one slow read there runs every queued read's 5 s budget out together.
+- Download resume: `settle_failure` keeps the stage (`kept_stage`) after an
+  in-transit read failure, a stopping Home, a passed deadline or restart
+  reconciliation, and removes it on cancel and on any refusal, integrity,
+  authority, policy or storage failure. The next Use adopts it only if its
+  `_elastos_object.json` equals the signed `object_manifest`, re-hashes complete
+  files, truncates a partial file to a 64 KiB boundary and fetches only the
+  remaining parts; per-file SHA-256 and package CID checks are unchanged. A kept
+  stage stays charged against the cache budget until adopted, cancelled, or
+  removed at startup after 7 days or when no longer offered.
+- The 64-record preparation cap bounds live work only: `reserve_at` prunes
+  ownerless Failed, Expired or Cancelled records settled at least an hour ago
+  (`settled_at`) before refusing; expiry is saved before any refusal.
+- `ci-model-package.mjs produce FIXTURE OUT DID KUBO_DATA` builds one package from
+  a pinned, validated fixture; `catalog CAT DID ENTRY...` writes an unsigned
+  payload only after `release-signer.py`'s own catalogue check accepts it.
+- The model projection reports `dispatch_unavailable_reason: "catalog_updated"`
+  only for an admission bound to an earlier head whose package the current
+  trusted catalogue still offers under a current local-use grant.
+
+## [0.8.0-alpha.12]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Changed
+
+- Models download several times faster: Home now fetches up to eight parts at
+  once instead of one after another.
+
+### Fixed
+
+- Getting a model on a slower connection no longer stops after about ten minutes
+  with "Storage capacity is unavailable". Home was shutting down its storage
+  service as idle while the model was still downloading.
+
+### Developer detail
+
+- Model preparation keeps up to 8 part reads in flight across the package; each
+  part's authority and capacity checks run in package order just before its read,
+  results arriving after a revocation are discarded, and per-file SHA-256 and the
+  package CID check are unchanged. Real installs spent ~200-600 ms per part on
+  round trips while the seed's own read takes ~2.5 ms (#84).
+- `ipfs-provider` counts a successful private capacity check (run once per MiB of
+  model download) and staged-directory hash as Kubo use, refreshing
+  `ipfs-coords.json` `last_used` like bounded reads do, so the 600 s idle stop no
+  longer ends Kubo during a long model download (#97).
+
+## [0.8.0-alpha.11]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- Marketplace offers a local AI model, SmolLM2 135M (145 MB, Apache-2.0). Press
+  Get and Assistant can answer with it on this device; the AI engine downloads
+  the first time a model needs it. Answers from this small model are basic; larger
+  models follow.
+
+### Changed
+
+- Models download several times faster: after the first piece, a Home reads the
+  rest straight from the Homes that hold it.
+
+### Developer detail
+
+- The first production model catalogue is signed offline with the maintainer key
+  (`release-signer.py --model-catalog`, policy field `model_catalog_sha256`) and
+  pinned in `components.json` (`model_catalog`, head
+  `bafkreihmcsvldwwa5ttbgw5yfrs62kiv3natqhfj3tkg3yzemsd73runr4`); the package
+  `bafybeiew3vuq32fvuz2kmps7lmgl4rxpvwsvklxykx4covogbrkhgy5qky` is built by
+  `ci-model-package.mjs produce` and pinned on the seed (#84).
+- CI proves Marketplace Get and an Assistant reply on Mac, Linux x86-64 and
+  ARM64; on x86-64 the package lives only on a separate holder Home, so Get
+  crosses Carrier (#150).
+- Model preparation tries the local store only until its first miss, then reads
+  remaining parts from Carrier holders with unchanged per-file SHA-256 and
+  package CID checks (145 MB: 332 s to 42 s locally).
+- CI retries apt with backoff and cancels a pull-request run at its first failed
+  job (#194).
+- `publish-release` no longer sends a release gossip announcement that no Home
+  received. Seeds on an older Runtime still print the old announcement error after
+  the commit (#174). INSTALL.md describes how updates reach a Home, and
+  VERSIONING.md describes the seed's role.
+
+## [0.8.0-alpha.10]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Fixed
+
+- Installs and updates now finish on slow connections. A download stops only
+  when no data arrives for a while, not because a large file takes long.
+- On Ubuntu and Jetson, ElastOS no longer creates files that a later update
+  refuses as unsafe. If an existing file is unsafe, the update names the
+  command that fixes it.
+
+### Developer detail
+
+- Carrier `fetch_file` and `fetch_content` bound each step (30 s to open, send
+  and read an error reply, 60 s for the source's header, then 30 s without
+  body bytes) and have no total cap. HTTP release downloads read in chunks with
+  a byte ceiling (signed size, else 200 MiB) and a 30 s idle timeout. install.sh
+  drops its 30-minute binary cap and keeps curl's minimum-speed rule (1 KiB/s
+  over 60 s) (#113).
+- Release packaging extracts capsule trees from a file instead of a pipe, so
+  macOS bsdtar can no longer stop `git archive` with SIGPIPE (#194).
+- The Runtime drops group and world write from its umask before it starts any
+  thread (keeping stricter bits such as 077), so Ubuntu's 0002 no longer makes
+  group-writable files; an unsafe release file's refusal names `chmod go-w`
+  (#279). Installs made by alpha.8 under umask 0002 need `chmod -R go-w` on the
+  data folder once, because the installed binary performs the update.
+
+## [0.8.0-alpha.9]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Changed
+
+- Chat is its own signed capsule. A new install downloads it over Carrier, and an
+  update from System or Terminal adds it if it is missing.
+- Media tools are downloaded again only when they actually change.
+
+### Fixed
+
+- Undo to an earlier release works again. Before, it received the newest
+  release's parts and was refused.
+- On Ubuntu and Jetson, install.sh no longer refuses the folder it just created.
+  If an existing folder is unsafe, it says how to fix it before downloading
+  anything.
+- Home status no longer shows Content Exchange as "stale install" right after a
+  fresh install.
+
+### Developer detail
+
+- Components are fetched by their signed CID, like the Runtime binary and
+  components.json; the release name is used only when a descriptor has no CID
+  (#287).
+- Media tools build with fixed prefixes; the archive is byte-identical across
+  build directories (#194).
+- `elastos update` in Terminal adds missing Home components only on a Home;
+  Terminal and System updates share one support plan.
+- Artifact receipts have one format: the bare sha256 hex digest. Receipts that
+  earlier releases wrote with the `sha256:` prefix are still read.
+- Archive components are verified by their receipt and the recorded hash of
+  the extracted executable, and `elastos home status` reports them that way.
+  Content Exchange status is correct again (#280).
+- One `FileLock` guard unlocks its lock when dropped; `release()` unlocks and
+  reports an unlock failure where callers need it.
+- install.sh creates its directories 0755 under any umask. Before any download it
+  checks the data folder's existing parents with the Runtime's rule (owned by you
+  or root, not group- or other-writable). The installer and the media-tools check
+  name the unsafe folder and the exact repair command (#279).
+- Test fixtures that are executed are written from a child process, so a test
+  no longer fails with ETXTBSY.
+- Process-group scans skip processes that exit during the scan.
+- Runtime and validators accept legacy execution labels and the honest
+  `web-projection`, `native-provider` and `native-host` values. Shipped first-party
+  manifests retain the legacy values so older Runtimes can complete an update.
+  Switch shipped manifests to the honest values in the next release, once every
+  supported Runtime accepts them. Runtime audits and Home display actual
+  execution boundaries during this transition. Third-party executable admission
+  remains gated by publisher, package approval and revocation checks.
+
+### Isolation status
+
+- Apps use opaque browser frames and Runtime capability checks. Home retains
+  cross-app capability authority. Providers run as native processes; only the
+  model provider is partly confined. Stored keys and full backups remain
+  accessible to the host operator. A stolen device or profile key requires a
+  new identity. The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+  sets the remaining installed acceptance gates.
+
+## [0.8.0-alpha.8]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+### Added
+
+- Chat is part of Home. New installs have it, and updating from System adds it.
+- This is the first release published for Linux (x86-64) and NVIDIA Jetson. They
+  install with the same install.sh command as on Mac.
+
+### Changed
+
+- From alpha.7 on, you update through System, also when a release changes its
+  support files. On 0.8.0-alpha.6, System cannot install this update: run
+  `elastos update` in Terminal once.
+- Updates and installs keep 2 GB of free space on top of what they write. This
+  one rule replaces the old percentage checks.
+- The installer shows numbered steps. When its output goes to a file or another
+  program, it prints plain text.
+- Providers no longer carry the release number, so from the next release an
+  update downloads only the parts that changed.
+- To be able to undo an update, run `elastos source show` first and keep the
+  Head CID. `elastos update --rollback-to <that CID>` goes back to it.
+- MicroVM capsules are not available in this release.
+
+### Fixed
+
+- Opening Chat again works offline and no longer downloads it again.
+- An owner action no longer fails with "Another Home owner action is in
+  progress" after Home started another process.
+- If an install into another folder is refused, nothing is left behind in that
+  folder.
+
+### Developer detail
+
+- Providers no longer embed the release version (`ELASTOS_RELEASE_VERSION`). They
+  report their own crate version in startup logs and status, so a new release
+  version is no longer a reason for provider bytes and checksums to change;
+  dependencies and the toolchain still can change them (#194).
+- `crosvm` and the guest kernel are published for no platform, so microVM
+  capsules are not available; setup skips them and the supervisor says so. Their
+  pinned bytes were unavailable and could not be signed. Release preparation now
+  refuses a checksummed component CID without a release file, before signing.
+- Disk-space checks no longer demand a fixed share (10% or 15%) of the volume.
+  Each step requires that its own bytes fit in the free space. Update staging,
+  the installer, model and content downloads and Browser image preparation also
+  keep one shared 2 GiB reserve and refuse with "not enough free space: this
+  needs N GB plus 2 GB kept free". An update that does not fit keeps the previous
+  release. Source-home setup keeps its 16 GiB minimum and the media tools build
+  its 4 GiB minimum.
+
+## [0.8.0-alpha.7]
+
+Test-channel release. Signed releases show these notes in System before you update.
+
+**On 0.8.0-alpha.6, System cannot install this update.** Run `elastos update`
+in Terminal once. Later updates work from System again.
+
+### Changed
+
+- Home keeps running while an update downloads and checks the whole new version.
+  Home restarts only once, at the end.
+- If an update cannot be used, your current version stays and System says why.
+- ElastOS now installs on Linux (x86-64) and NVIDIA Jetson with the same
+  install.sh command as on Mac.
+
+### Fixed
+
+- After an update, protected media could stop opening. It opens again.
+
+### Removed
+
+- Local AI models are no longer part of the release, so Home shows no models for
+  now. They will return as a separate signed download.
+
+### Developer detail
+
+- Releases no longer pin or carry a model catalogue; with no pin, Home shows no
+  published models. The model CAR retention and import path,
+  `model-package-handoff.py`, `fetch-model.sh` and their tests are removed from
+  release preparation, signing and publication.
+- Setup reads a pinned model catalogue over Carrier with its 128 KiB bound and
+  refuses a larger declared size before reading the body.
+- Setup accepts passive content capsules from signed releases and checks provider
+  roles and icons. It refuses URL-only downloads and blank release paths,
+  including entries with a CID. Explicit CID-only operator gateways verify
+  checksums before replacing installed bytes.
+- Fresh setup admits the private signed release pair and binary under the
+  installation writer, then fetches components and the model catalogue over
+  Carrier and verifies both before writing metadata or components. Signed
+  manifest bytes stay unchanged.
+- CLI updates check the candidate executable before installation with a bounded
+  version probe. Failed launches, timeouts, excess output and unexpected version
+  output preserve the previous installation.
+- An offline update foundation stages and verifies release files with unchanged
+  support assets, an installation lock and journal, and restoration after failed
+  or interrupted activation.
 
 ## [0.7.1] - 2026-09-30
 

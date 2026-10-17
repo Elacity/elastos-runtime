@@ -21,12 +21,14 @@ const menuListener = guiSource.match(/  desktopContextMenu\?\.addEventListener\(
 // Use Home's actual menu, dispatch and focus functions. Only unrelated shell
 // services and fixture creation/close are substitutes; pointer hit testing is real.
 const program = `
+document.body.dataset.homeStatus = "ready";
 const shellState = { windows: new Map(), zIndexCounter: 10, currentSummary: {}, contextMenuTarget: { kind: "target", source: "taskbar", targetId: "browser" } };
 const desktopContextMenu = document.querySelector("#desktop-context-menu");
 const evidence = window.evidence = { actions: [], closes: [], contextClicks: [] };
 const rememberRecentTarget = () => {}, fitLaunchedWindow = () => {}, refreshWindowUi = () => {}, persistBrowserSession = () => {};
 const supportsMenuNewWindow = () => true, browserWindowDisplayTitle = entry => entry.id;
 const taskbarPinMenuItem = () => ({ action: "pin-taskbar", label: "Keep in Shelf" }), appendTargetGroupManagementItems = () => {};
+const targetTitle = (summary, targetId) => targetId, isPhone = () => false;
 const contextMenuItems = target => targetContextMenuItems(target);
 const hideDesktopContextMenu = () => { desktopContextMenu.hidden = true; };
 ${["browserWindowEntries", "browserWindowEntriesForTarget", "sortWindowEntriesByZOrder", "focusWindow", "focusWindowControl"].map(name => declaration(windows, name)).join("\n")}
@@ -81,7 +83,7 @@ test("real Home menu focuses captured Browser through overlap; launcher binds fo
       args: ["--disable-background-networking", "--disable-component-update", "--no-first-run"] });
     const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
     const errors = []; page.on("pageerror", error => errors.push(error.message));
-    const globals = { URL, URLSearchParams, Date, HOME_URL: `${origin}/apps/home/`,
+    const globals = { URL, URLSearchParams, Date, CHECK_BROWSER_CONTROLLED_JOURNEY: false, HOME_URL: `${origin}/apps/home/`,
       delay: ms => new Promise(resolve => setTimeout(resolve, ms)), assert: (value, message) => assert.ok(value, message) };
     for (const name of ["launchTokenFromRoute", "assertIsolatedLaunchRoute", "assertBrowserWindowIdentity", "captureBrowserWindowIdentity",
       "focusCapturedBrowserWindow", "clickBrowserWindowClose", "waitForBrowserWindowDetached"]) {

@@ -7,9 +7,12 @@ import {
 } from "./wallet-format.js?v=wallet-20260819f";
 
 export function createWalletStateLoader({ fetchJson, shellHeaders }) {
-  async function loadPrices() {
+  // requestAccess asks Runtime to raise the market-price approval in Inbox
+  // when prices are not approved yet; only a Wallet the user is viewing asks.
+  async function loadPrices({ requestAccess = false } = {}) {
     try {
-      const payload = await fetchJson("/api/wallet/prices", { headers: shellHeaders() });
+      const path = requestAccess ? "/api/wallet/prices?request_access=true" : "/api/wallet/prices";
+      const payload = await fetchJson(path, { headers: shellHeaders() });
       return {
         stale: Boolean(payload.stale),
         prices: payload.prices || {},

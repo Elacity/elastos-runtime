@@ -17,6 +17,20 @@ use crate::store::{IdentityStore, StoredCredential};
 
 /// Challenge expiry duration
 const CHALLENGE_EXPIRY: Duration = Duration::from_secs(300);
+const MAX_REGISTRATION_CHALLENGES: usize = 8;
+const MAX_GUIDED_REGISTRATION_CHALLENGES: usize = 8;
+const MAX_AUTHENTICATION_CHALLENGES: usize = 64;
+
+#[derive(Debug)]
+pub struct CeremonyCapacityExceeded;
+
+impl std::fmt::Display for CeremonyCapacityExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Passkey sign-in is busy. Try again shortly.")
+    }
+}
+
+impl std::error::Error for CeremonyCapacityExceeded {}
 const FLAG_USER_PRESENT: u8 = 0x01;
 const FLAG_USER_VERIFIED: u8 = 0x04;
 const FLAG_ATTESTED_CREDENTIAL_DATA: u8 = 0x40;
@@ -31,7 +45,40 @@ struct PendingChallenge {
     challenge: Vec<u8>,
     registration_binding: Option<[u8; 32]>,
     challenge_type: ChallengeType,
+    /// Set only for a named sign-in: the assertion must use one of these IDs.
+    named: Option<NamedSignInAccount>,
     created: Instant,
+}
+
+/// Longest account name a named sign-in accepts, as for principal and
+/// Profile display names.
+const MAX_NAMED_SIGN_IN_NAME_BYTES: usize = 64;
+
+/// The account a named sign-in is for: the Runtime principals whose account
+/// name matched, and their stored credential IDs. Identity has no principal
+/// model; the principal IDs are opaque and come back in the outcome so the
+/// caller can bind the session to the named account.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamedSignInAccount {
+    pub principal_ids: Vec<String>,
+    pub credential_ids: Vec<String>,
+}
+
+/// The comparison key for an account name: whitespace collapsed and case
+/// folded, so "Alice  Smith" and "alice smith" name the same account. `None`
+/// for an empty, over-long or control-character name.
+pub fn named_sign_in_account_key(name: &str) -> Option<String> {
+    if name.len() > 4 * MAX_NAMED_SIGN_IN_NAME_BYTES {
+        return None;
+    }
+    let collapsed = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty()
+        || collapsed.len() > MAX_NAMED_SIGN_IN_NAME_BYTES
+        || collapsed.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(collapsed.to_lowercase())
 }
 
 /// Identity status returned to clients
@@ -66,6 +113,9 @@ pub struct AuthenticationOutcome {
     pub credential: StoredCredential,
     pub origin: String,
     pub user_verified: bool,
+    /// For a named sign-in, the principals the name matched at begin. The
+    /// caller must bind the session to one of them; empty means decoys.
+    pub named_principal_ids: Option<Vec<String>>,
 }
 
 // === WebAuthn Protocol Types ===
@@ -280,20 +330,14 @@ impl IdentityManager {
         origin: &str,
         binding: [u8; 32],
     ) -> anyhow::Result<CreationOptions> {
-        self.cleanup_expired();
-        if ceremony.len() > 128
-            || rp_id.len() > 253
-            || origin.len() > 512
-            || self.challenges.len() >= 16
-        {
-            anyhow::bail!("guided registration limit exceeded");
-        }
-        let options = self.begin_principal_registration(ceremony, rp_id, origin)?;
-        self.challenges
-            .get_mut(ceremony)
-            .expect("created challenge")
-            .registration_binding = Some(binding);
-        Ok(options)
+        self.begin_registration_inner(
+            ceremony,
+            rp_id,
+            origin,
+            "ElastOS Passkey",
+            false,
+            Some(binding),
+        )
     }
 
     pub fn verify_bound_registration(
@@ -350,7 +394,7 @@ impl IdentityManager {
         rp_id: &str,
         rp_origin: &str,
     ) -> anyhow::Result<CreationOptions> {
-        self.begin_registration_inner(session_token, rp_id, rp_origin, "ElastOS User", true)
+        self.begin_registration_inner(session_token, rp_id, rp_origin, "ElastOS User", true, None)
     }
 
     /// Begin registration for a separate runtime principal.
@@ -364,7 +408,14 @@ impl IdentityManager {
         rp_id: &str,
         rp_origin: &str,
     ) -> anyhow::Result<CreationOptions> {
-        self.begin_registration_inner(session_token, rp_id, rp_origin, "ElastOS Passkey", false)
+        self.begin_registration_inner(
+            session_token,
+            rp_id,
+            rp_origin,
+            "ElastOS Passkey",
+            false,
+            None,
+        )
     }
 
     fn begin_registration_inner(
@@ -374,8 +425,26 @@ impl IdentityManager {
         rp_origin: &str,
         display_name: &str,
         exclude_existing: bool,
+        registration_binding: Option<[u8; 32]>,
     ) -> anyhow::Result<CreationOptions> {
-        self.cleanup_expired();
+        self.admit_challenge(session_token, rp_id, Some(rp_origin))?;
+        let guided = registration_binding.is_some();
+        let pending = self
+            .challenges
+            .values()
+            .filter(|pending| {
+                matches!(pending.challenge_type, ChallengeType::Registration { .. })
+                    && pending.registration_binding.is_some() == guided
+            })
+            .count();
+        let capacity = if guided {
+            MAX_GUIDED_REGISTRATION_CHALLENGES
+        } else {
+            MAX_REGISTRATION_CHALLENGES
+        };
+        if pending >= capacity {
+            return Err(CeremonyCapacityExceeded.into());
+        }
 
         let challenge = generate_challenge();
         let challenge_b64 = URL_SAFE_NO_PAD.encode(&challenge);
@@ -421,8 +490,8 @@ impl IdentityManager {
                 timeout: 300000,
                 authenticator_selection: AuthenticatorSelection {
                     authenticator_attachment: None, // platform or cross-platform
-                    resident_key: "preferred".to_string(),
-                    require_resident_key: false,
+                    resident_key: "required".to_string(),
+                    require_resident_key: true,
                     user_verification: "required".to_string(),
                 },
                 attestation: "none".to_string(),
@@ -434,11 +503,12 @@ impl IdentityManager {
             session_token.to_string(),
             PendingChallenge {
                 challenge,
-                registration_binding: None,
+                registration_binding,
                 challenge_type: ChallengeType::Registration {
                     rp_id: rp_id.to_string(),
                     rp_origin: rp_origin.to_string(),
                 },
+                named: None,
                 created: Instant::now(),
             },
         );
@@ -606,13 +676,75 @@ impl IdentityManager {
         })
     }
 
-    /// Begin authentication flow
+    /// Begin the anonymous sign-in: an empty allow-list, so the response never
+    /// names a credential and the browser offers only discoverable passkeys.
     pub fn begin_authentication(
         &mut self,
         session_token: &str,
         rp_id: &str,
     ) -> anyhow::Result<RequestOptions> {
-        self.cleanup_expired();
+        self.begin_authentication_scoped(session_token, rp_id, None)
+    }
+
+    /// Begin a sign-in for one named account, for passkeys the browser cannot
+    /// discover (0.7.1 registered them with `residentKey: "preferred"`).
+    ///
+    /// The allow-list is every stored credential of `account` for this RP,
+    /// because discoverability is unknown. When the name has no eligible
+    /// credential the allow-list is this Home's stable decoys for the name,
+    /// sorted the same way and with common credential ID lengths.
+    ///
+    /// Disclosure: a caller who guesses an account name learns whether it has
+    /// passkeys and receives their credential IDs (as every caller did in
+    /// 0.7.1); decoys only stop casual enumeration of unknown names.
+    pub fn begin_named_authentication(
+        &mut self,
+        session_token: &str,
+        rp_id: &str,
+        account_key: &str,
+        account: NamedSignInAccount,
+    ) -> anyhow::Result<RequestOptions> {
+        // Both branches do the same work: the decoys are always derived.
+        let decoys = self.store.named_sign_in_decoy_ids(account_key);
+        let stored = self.store.get_credentials();
+        let mut credential_ids = account.credential_ids;
+        credential_ids.retain(|id| {
+            stored
+                .iter()
+                .any(|credential| &credential.credential_id == id && credential.rp_id == rp_id)
+        });
+        credential_ids.sort_unstable();
+        credential_ids.dedup();
+        let scope = if credential_ids.is_empty() {
+            NamedSignInAccount {
+                principal_ids: Vec::new(),
+                credential_ids: decoys,
+            }
+        } else {
+            NamedSignInAccount {
+                principal_ids: account.principal_ids,
+                credential_ids,
+            }
+        };
+        self.begin_authentication_scoped(session_token, rp_id, Some(scope))
+    }
+
+    fn begin_authentication_scoped(
+        &mut self,
+        session_token: &str,
+        rp_id: &str,
+        named: Option<NamedSignInAccount>,
+    ) -> anyhow::Result<RequestOptions> {
+        self.admit_challenge(session_token, rp_id, None)?;
+        if self
+            .challenges
+            .values()
+            .filter(|pending| matches!(pending.challenge_type, ChallengeType::Authentication))
+            .count()
+            >= MAX_AUTHENTICATION_CHALLENGES
+        {
+            return Err(CeremonyCapacityExceeded.into());
+        }
 
         let credentials = self.store.get_credentials();
         if credentials.is_empty() {
@@ -622,20 +754,19 @@ impl IdentityManager {
         let challenge = generate_challenge();
         let challenge_b64 = URL_SAFE_NO_PAD.encode(&challenge);
 
-        let allow = credentials
-            .iter()
-            .map(|c| CredentialDescriptor {
-                type_: "public-key".to_string(),
-                id: c.credential_id.clone(),
-            })
-            .collect();
-
         let options = RequestOptions {
             public_key: PublicKeyCredentialRequestOptions {
                 challenge: challenge_b64,
                 timeout: 300000,
                 rp_id: rp_id.to_string(),
-                allow_credentials: allow,
+                allow_credentials: named
+                    .iter()
+                    .flat_map(|named| &named.credential_ids)
+                    .map(|id| CredentialDescriptor {
+                        type_: "public-key".to_string(),
+                        id: id.clone(),
+                    })
+                    .collect(),
                 user_verification: "required".to_string(),
             },
         };
@@ -646,6 +777,7 @@ impl IdentityManager {
                 challenge,
                 challenge_type: ChallengeType::Authentication,
                 registration_binding: None,
+                named,
                 created: Instant::now(),
             },
         );
@@ -678,8 +810,16 @@ impl IdentityManager {
             anyhow::bail!("Authentication challenge expired");
         }
 
-        // Find the matching credential
+        // Find the matching credential. A named sign-in accepts only the
+        // credentials listed for the named account at begin.
         let credential_id = &response.raw_id;
+        if pending
+            .named
+            .as_ref()
+            .is_some_and(|named| !named.credential_ids.contains(credential_id))
+        {
+            anyhow::bail!("Unknown credential");
+        }
         let stored = self
             .store
             .get_credentials()
@@ -776,7 +916,29 @@ impl IdentityManager {
             credential,
             origin: client_data.origin,
             user_verified: true,
+            named_principal_ids: pending.named.map(|named| named.principal_ids),
         })
+    }
+
+    fn admit_challenge(
+        &mut self,
+        ceremony: &str,
+        rp_id: &str,
+        origin: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.cleanup_expired();
+        if ceremony.is_empty()
+            || ceremony.len() > 128
+            || rp_id.is_empty()
+            || rp_id.len() > 253
+            || origin.is_some_and(|origin| origin.is_empty() || origin.len() > 512)
+        {
+            anyhow::bail!("invalid WebAuthn ceremony input");
+        }
+        if self.challenges.contains_key(ceremony) {
+            anyhow::bail!("WebAuthn ceremony is already pending");
+        }
+        Ok(())
     }
 
     fn cleanup_expired(&mut self) {
@@ -1042,6 +1204,15 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     fn registration_response(challenge: &str, rp_id: &str, origin: &str) -> RegistrationResponse {
+        registration_response_with_id(challenge, rp_id, origin, b"ceremony-credential")
+    }
+
+    fn registration_response_with_id(
+        challenge: &str,
+        rp_id: &str,
+        origin: &str,
+        credential_id: &[u8],
+    ) -> RegistrationResponse {
         use ciborium::Value;
         let signing_key = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
         let point = signing_key.verifying_key().to_encoded_point(false);
@@ -1058,7 +1229,6 @@ mod tests {
                 Value::Bytes(point.y().unwrap().to_vec()),
             ),
         ]);
-        let credential_id = b"ceremony-credential";
         let mut auth_data = Sha256::digest(rp_id.as_bytes()).to_vec();
         auth_data.push(FLAG_USER_PRESENT | FLAG_USER_VERIFIED | FLAG_ATTESTED_CREDENTIAL_DATA);
         auth_data.extend_from_slice(&0u32.to_be_bytes());
@@ -1245,7 +1415,7 @@ mod tests {
         assert!(manager
             .verify_bound_registration("first", &response, rp, origin, [1; 32])
             .is_ok());
-        for n in 1..16 {
+        for n in 1..MAX_GUIDED_REGISTRATION_CHALLENGES {
             manager
                 .begin_bound_principal_registration(&format!("pending-{n}"), rp, origin, [1; 32])
                 .unwrap();
@@ -1447,6 +1617,446 @@ mod tests {
             .unwrap();
 
         assert_eq!(options.public_key.user_verification, "required");
+    }
+
+    #[test]
+    fn anonymous_authentication_options_keep_all_credential_ids_private() {
+        let mut manager = manager_with_credential(0);
+        manager.store.add_credential(StoredCredential {
+            credential_id: "other-account-credential".into(),
+            public_key: "other-public-key".into(),
+            sign_count: 0,
+            rp_id: "localhost".into(),
+        });
+        let options = manager.begin_authentication("guest", "localhost").unwrap();
+        assert!(options.public_key.allow_credentials.is_empty());
+        let encoded = serde_json::to_string(&options).unwrap();
+        for credential in manager.credentials() {
+            assert!(!encoded.contains(&credential.credential_id));
+        }
+        let registration = manager
+            .begin_principal_registration("new-guest", "localhost", "http://localhost")
+            .unwrap();
+        assert_eq!(
+            registration.public_key.authenticator_selection.resident_key,
+            "required"
+        );
+        assert!(
+            registration
+                .public_key
+                .authenticator_selection
+                .require_resident_key
+        );
+        assert!(registration.public_key.exclude_credentials.is_empty());
+    }
+
+    fn signed_assertion(challenge: &str, credential_id: &str) -> AuthenticationResponse {
+        use p256::ecdsa::signature::Signer;
+        let mut assertion = assertion_response(
+            challenge,
+            "http://localhost",
+            "localhost",
+            FLAG_USER_PRESENT | FLAG_USER_VERIFIED,
+            1,
+        );
+        assertion.raw_id = credential_id.to_string();
+        assertion._id = credential_id.to_string();
+        let mut signed = URL_SAFE_NO_PAD
+            .decode(&assertion.response.authenticator_data)
+            .unwrap();
+        signed.extend_from_slice(&Sha256::digest(
+            URL_SAFE_NO_PAD
+                .decode(&assertion.response.client_data_json)
+                .unwrap(),
+        ));
+        let signature: p256::ecdsa::Signature = p256::ecdsa::SigningKey::from_slice(&[7u8; 32])
+            .unwrap()
+            .sign(&signed);
+        assertion.response.signature = URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes());
+        assertion
+    }
+
+    /// Two accounts on one Home, each with one real (signable) credential, and
+    /// a third credential registered on another RP.
+    fn manager_with_two_accounts() -> (tempfile::TempDir, IdentityManager, String, String) {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(root.path().into()).unwrap();
+        let mut ids = Vec::new();
+        for (ceremony, raw) in [
+            ("a", b"account-a-credential"),
+            ("b", b"account-b-credential"),
+        ] {
+            let options = manager
+                .begin_principal_registration(ceremony, "localhost", "http://localhost")
+                .unwrap();
+            let response = registration_response_with_id(
+                &options.public_key.challenge,
+                "localhost",
+                "http://localhost",
+                raw,
+            );
+            ids.push(
+                manager
+                    .complete_registration(ceremony, &response, "localhost", "http://localhost")
+                    .unwrap()
+                    .credential
+                    .credential_id,
+            );
+        }
+        manager.store.add_credential(StoredCredential {
+            credential_id: "account-a-other-rp".into(),
+            public_key: "other-public-key".into(),
+            sign_count: 0,
+            rp_id: "home.example".into(),
+        });
+        let b = ids.pop().unwrap();
+        let a = ids.pop().unwrap();
+        (root, manager, a, b)
+    }
+
+    fn allow_list(options: &RequestOptions) -> Vec<String> {
+        options
+            .public_key
+            .allow_credentials
+            .iter()
+            .map(|descriptor| {
+                assert_eq!(descriptor.type_, "public-key");
+                descriptor.id.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn named_sign_in_lists_exactly_the_named_accounts_credentials() {
+        let (_root, mut manager, a, b) = manager_with_two_accounts();
+        let account_a = NamedSignInAccount {
+            principal_ids: vec!["principal-a".into()],
+            // The other-RP credential and an ID the store does not hold are
+            // never listed; every stored credential for this RP is.
+            credential_ids: vec![a.clone(), "account-a-other-rp".into(), "gone".into()],
+        };
+        let options = manager
+            .begin_named_authentication("named-a", "localhost", "alice", account_a.clone())
+            .unwrap();
+        assert_eq!(allow_list(&options), vec![a.clone()]);
+        assert!(!serde_json::to_string(&options).unwrap().contains(&b));
+        assert_eq!(options.public_key.user_verification, "required");
+
+        let outcome = manager
+            .complete_authentication(
+                "named-a",
+                &signed_assertion(&options.public_key.challenge, &a),
+                "localhost",
+                "http://localhost",
+            )
+            .unwrap();
+        assert_eq!(outcome.credential.credential_id, a);
+        assert_eq!(
+            outcome.named_principal_ids,
+            Some(vec!["principal-a".to_string()])
+        );
+
+        // The anonymous begin stays empty after named sign-ins exist.
+        let anonymous = manager
+            .begin_authentication("anonymous", "localhost")
+            .unwrap();
+        assert!(anonymous.public_key.allow_credentials.is_empty());
+        let outcome = manager
+            .complete_authentication(
+                "anonymous",
+                &signed_assertion(&anonymous.public_key.challenge, &b),
+                "localhost",
+                "http://localhost",
+            )
+            .unwrap();
+        assert_eq!(outcome.named_principal_ids, None);
+    }
+
+    #[test]
+    fn named_sign_in_refuses_another_accounts_credential() {
+        let (_root, mut manager, a, b) = manager_with_two_accounts();
+        let options = manager
+            .begin_named_authentication(
+                "named-b",
+                "localhost",
+                "bob",
+                NamedSignInAccount {
+                    principal_ids: vec!["principal-b".into()],
+                    credential_ids: vec![b.clone()],
+                },
+            )
+            .unwrap();
+        let error = manager
+            .complete_authentication(
+                "named-b",
+                &signed_assertion(&options.public_key.challenge, &a),
+                "localhost",
+                "http://localhost",
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Unknown credential");
+        // The challenge is consumed: the right credential cannot replay it.
+        assert!(manager
+            .complete_authentication(
+                "named-b",
+                &signed_assertion(&options.public_key.challenge, &b),
+                "localhost",
+                "http://localhost",
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn named_sign_in_for_an_unknown_name_lists_stable_decoys() {
+        let (_root, mut manager, a, b) = manager_with_two_accounts();
+        let begin = |manager: &mut IdentityManager, ceremony: &str, key: &str| {
+            manager
+                .begin_named_authentication(
+                    ceremony,
+                    "localhost",
+                    key,
+                    NamedSignInAccount::default(),
+                )
+                .unwrap()
+        };
+        let first = begin(&mut manager, "unknown-1", "mallory");
+        let decoys = allow_list(&first);
+        assert!(!decoys.is_empty());
+        assert_eq!(decoys, manager.store.named_sign_in_decoy_ids("mallory"));
+        assert_eq!(
+            allow_list(&begin(&mut manager, "unknown-2", "mallory")),
+            decoys
+        );
+        assert_ne!(
+            allow_list(&begin(&mut manager, "unknown-3", "trent")),
+            decoys
+        );
+        for id in &decoys {
+            assert!(id != &a && id != &b);
+        }
+        // A known name whose credentials are all on another RP or gone is
+        // ineligible and gets its decoys too, not an empty list.
+        let ineligible = manager
+            .begin_named_authentication(
+                "ineligible",
+                "localhost",
+                "carol",
+                NamedSignInAccount {
+                    principal_ids: vec!["principal-c".into()],
+                    credential_ids: vec!["account-a-other-rp".into()],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            allow_list(&ineligible),
+            manager.store.named_sign_in_decoy_ids("carol")
+        );
+        // Same option shape as a real account.
+        let encoded = serde_json::to_value(&first).unwrap();
+        let keys: Vec<_> = encoded["publicKey"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let known = manager
+            .begin_named_authentication(
+                "known",
+                "localhost",
+                "alice",
+                NamedSignInAccount {
+                    principal_ids: vec!["principal-a".into()],
+                    credential_ids: vec![a],
+                },
+            )
+            .unwrap();
+        let known = serde_json::to_value(&known).unwrap();
+        assert_eq!(
+            known["publicKey"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            keys
+        );
+        // A decoy challenge cannot complete, and names no account.
+        let error = manager
+            .complete_authentication(
+                "unknown-1",
+                &signed_assertion(&first.public_key.challenge, &b),
+                "localhost",
+                "http://localhost",
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Unknown credential");
+    }
+
+    #[test]
+    fn named_sign_in_account_key_folds_case_and_space() {
+        assert_eq!(
+            named_sign_in_account_key("  Alice \t Smith ").as_deref(),
+            Some("alice smith")
+        );
+        assert_eq!(
+            named_sign_in_account_key("ALICE SMITH"),
+            named_sign_in_account_key("alice smith")
+        );
+        for invalid in ["", "   ", "a\u{7}b", &"x".repeat(65), &"x".repeat(257)] {
+            assert_eq!(named_sign_in_account_key(invalid), None, "{invalid:?}");
+        }
+        assert!(named_sign_in_account_key(&"x".repeat(64)).is_some());
+    }
+
+    #[test]
+    fn challenge_flood_keeps_reserved_pools_and_valid_completions() {
+        use p256::ecdsa::signature::Signer;
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(root.path().into()).unwrap();
+        let rp = "localhost";
+        let origin = "http://localhost";
+        let bootstrap = manager.begin_registration("bootstrap", rp, origin).unwrap();
+        let response = registration_response(&bootstrap.public_key.challenge, rp, origin);
+        let credential = manager
+            .complete_registration("bootstrap", &response, rp, origin)
+            .unwrap()
+            .credential;
+        let login = manager.begin_authentication("guest-login", rp).unwrap();
+        let normal = manager
+            .begin_principal_registration("normal", rp, origin)
+            .unwrap();
+        let guided = manager
+            .begin_bound_principal_registration("guided", rp, origin, [1; 32])
+            .unwrap();
+
+        for index in 1..MAX_AUTHENTICATION_CHALLENGES {
+            manager
+                .begin_authentication(&format!("login-{index}"), rp)
+                .unwrap();
+        }
+        assert!(manager
+            .begin_authentication("login-overflow", rp)
+            .unwrap_err()
+            .is::<CeremonyCapacityExceeded>());
+        // Ordinary registration has its own pool, and guided guest registration
+        // remains available after both other pools reach capacity.
+        for index in 1..MAX_REGISTRATION_CHALLENGES {
+            manager
+                .begin_registration(&format!("registration-{index}"), rp, origin)
+                .unwrap();
+        }
+        assert!(manager
+            .begin_registration("registration-overflow", rp, origin)
+            .unwrap_err()
+            .is::<CeremonyCapacityExceeded>());
+        for index in 1..MAX_GUIDED_REGISTRATION_CHALLENGES {
+            manager
+                .begin_bound_principal_registration(&format!("guided-{index}"), rp, origin, [1; 32])
+                .unwrap();
+        }
+        assert!(manager
+            .begin_bound_principal_registration("guided-overflow", rp, origin, [1; 32])
+            .unwrap_err()
+            .is::<CeremonyCapacityExceeded>());
+        assert_eq!(
+            manager.challenges.len(),
+            MAX_AUTHENTICATION_CHALLENGES
+                + MAX_REGISTRATION_CHALLENGES
+                + MAX_GUIDED_REGISTRATION_CHALLENGES
+        );
+        let challenge_before = manager.challenges["guest-login"].challenge.clone();
+        assert!(manager.begin_authentication("guest-login", rp).is_err());
+        assert_eq!(
+            manager.challenges["guest-login"].challenge,
+            challenge_before
+        );
+
+        let guided_response = registration_response(&guided.public_key.challenge, rp, origin);
+        assert!(manager
+            .verify_bound_registration("guided", &guided_response, rp, origin, [1; 32])
+            .is_ok());
+        let mut assertion = assertion_response(
+            &login.public_key.challenge,
+            origin,
+            rp,
+            FLAG_USER_PRESENT | FLAG_USER_VERIFIED,
+            1,
+        );
+        assertion.raw_id = credential.credential_id.clone();
+        assertion._id = credential.credential_id;
+        let mut signed = URL_SAFE_NO_PAD
+            .decode(&assertion.response.authenticator_data)
+            .unwrap();
+        signed.extend_from_slice(&Sha256::digest(
+            URL_SAFE_NO_PAD
+                .decode(&assertion.response.client_data_json)
+                .unwrap(),
+        ));
+        let signature: p256::ecdsa::Signature = p256::ecdsa::SigningKey::from_slice(&[7u8; 32])
+            .unwrap()
+            .sign(&signed);
+        assertion.response.signature = URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes());
+        assert!(manager
+            .complete_authentication("guest-login", &assertion, rp, origin)
+            .is_ok());
+        let normal_response = registration_response_with_id(
+            &normal.public_key.challenge,
+            rp,
+            origin,
+            b"normal-credential",
+        );
+        assert!(manager
+            .complete_registration("normal", &normal_response, rp, origin)
+            .is_ok());
+        assert!(manager.begin_authentication("next-login", rp).is_ok());
+        assert!(manager
+            .begin_principal_registration("next-registration", rp, origin)
+            .is_ok());
+    }
+
+    #[test]
+    fn challenge_bounds_apply_to_every_begin_and_expired_slots_recover() {
+        let mut manager = manager_with_credential(0);
+        for index in 0..MAX_AUTHENTICATION_CHALLENGES {
+            manager
+                .begin_authentication(&format!("login-{index}"), "localhost")
+                .unwrap();
+        }
+        manager.expire_challenge_for_test("login-0");
+        assert!(manager
+            .begin_authentication("replacement", "localhost")
+            .is_ok());
+        assert_eq!(manager.challenges.len(), MAX_AUTHENTICATION_CHALLENGES);
+        for ceremony in [String::new(), "x".repeat(129)] {
+            assert!(manager
+                .begin_authentication(&ceremony, "localhost")
+                .is_err());
+            assert!(manager
+                .begin_registration(&ceremony, "localhost", "http://localhost")
+                .is_err());
+            assert!(manager
+                .begin_bound_principal_registration(
+                    &ceremony,
+                    "localhost",
+                    "http://localhost",
+                    [1; 32]
+                )
+                .is_err());
+        }
+        assert!(manager
+            .begin_authentication("invalid-rp", &"x".repeat(254))
+            .is_err());
+        assert!(manager
+            .begin_registration("invalid-origin", "localhost", &"x".repeat(513))
+            .is_err());
+        assert!(manager
+            .begin_bound_principal_registration(
+                "invalid-guided-origin",
+                "localhost",
+                &"x".repeat(513),
+                [1; 32]
+            )
+            .is_err());
     }
 
     #[test]

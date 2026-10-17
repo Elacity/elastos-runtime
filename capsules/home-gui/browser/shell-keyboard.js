@@ -32,8 +32,10 @@ import {
 import {
   closeOtherShellPopovers,
   handleShellEscape,
+  LAYER_STATE,
   registerEscapeHandler,
   registerShellPopover,
+  registerStageLayer,
   setOverlayOpen,
 } from "./shell-popovers.js?v=home-20260813a";
 import {
@@ -259,6 +261,12 @@ export function bindShellKeyboard() {
     isActive: () => Boolean(shortcutsOverlay && !shortcutsOverlay.hidden),
     dismiss: () => hideShortcutsOverlay(),
   });
+  registerStageLayer("window-switcher", {
+    selector: "#window-switcher",
+    state: () => (switcherState.open === true ? LAYER_STATE.open : LAYER_STATE.closed),
+    close: () => closeSwitcher(),
+  });
+  registerStageLayer("shortcuts", { selector: "#shortcuts-overlay", close: () => hideShortcutsOverlay() });
   registerEscapeHandler("window-switcher", {
     priority: 85,
     isActive: () => switcherState.open === true,
@@ -297,7 +305,8 @@ export function bindShellKeyboard() {
       if (!homeGuiOwnsKeys()) {
         return;
       }
-      if (event.key === "Escape") {
+      // Escape from the Home welcome sheet or its card is the sheet's own Close.
+      if (event.key === "Escape" && !event.target?.closest?.("#setup-sheet")) {
         if (handleShellEscape()) {
           event.preventDefault();
           event.stopPropagation();

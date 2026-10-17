@@ -296,7 +296,8 @@ fn dashboard_tui_loop(
                 needs_render = true;
             }
             UiKey::Enter => {
-                state.notice = None;
+                state.notice = state.desktop_only_notice(&snapshot);
+                needs_render = true;
                 if let Some(action_id) = state.activate(&snapshot) {
                     write_intent(write_token, intent_path, &action_id)?;
                     return Ok(());
@@ -414,20 +415,6 @@ fn dashboard_line_loop(
             Err(error) => {
                 println!();
                 println!("people: {}", error);
-                wait_for_enter()?;
-                continue;
-            }
-        }
-
-        match mywebsite_line_action(trimmed) {
-            Ok(Some(action_id)) => {
-                write_intent(write_token, intent_path, &action_id)?;
-                return Ok(());
-            }
-            Ok(None) => {}
-            Err(error) => {
-                println!();
-                println!("mywebsite: {}", error);
                 wait_for_enter()?;
                 continue;
             }

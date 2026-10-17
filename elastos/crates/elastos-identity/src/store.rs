@@ -11,7 +11,9 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use zeroize::Zeroizing;
 
 #[path = "store_files.rs"]
@@ -82,6 +84,21 @@ const DID_KEY_PREFIX: &str = "did:key:z";
 const DID_KEY_ED25519_PREFIX: &str = "did:key:z6Mk";
 const DID_KEY_ED25519_LEN: usize = 56;
 const DID_KEY_DECODED_BYTES: usize = 34;
+const CANONICAL_KEY_CACHE_CAPACITY: usize = 64;
+static CANONICAL_KEYS: OnceLock<Mutex<VecDeque<ed25519_dalek::VerifyingKey>>> = OnceLock::new();
+
+fn remember_canonical_key(
+    keys: &mut VecDeque<ed25519_dalek::VerifyingKey>,
+    key: ed25519_dalek::VerifyingKey,
+) {
+    if keys.iter().any(|known| known == &key) {
+        return;
+    }
+    if keys.len() == CANONICAL_KEY_CACHE_CAPACITY {
+        keys.pop_front();
+    }
+    keys.push_back(key);
+}
 
 fn encode_canonical_did_key_bytes(key_bytes: [u8; 32]) -> String {
     let mut encoded = Vec::with_capacity(34);
@@ -106,6 +123,15 @@ pub fn encode_did_key(verifying_key: &ed25519_dalek::VerifyingKey) -> anyhow::Re
 pub fn validate_canonical_ed25519_verifying_key_bytes(
     bytes: [u8; 32],
 ) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
+    // Only deterministic public-key mathematics is reused. Callers still own
+    // current signatures, grants, expiry, revocation and Profile authority.
+    let keys = CANONICAL_KEYS
+        .get_or_init(|| Mutex::new(VecDeque::with_capacity(CANONICAL_KEY_CACHE_CAPACITY)));
+    if let Ok(known) = keys.lock() {
+        if let Some(key) = known.iter().find(|key| key.as_bytes() == &bytes) {
+            return Ok(*key);
+        }
+    }
     let compressed = CompressedEdwardsY(bytes);
     let point = compressed
         .decompress()
@@ -119,8 +145,12 @@ pub fn validate_canonical_ed25519_verifying_key_bytes(
     if !point.is_torsion_free() {
         anyhow::bail!("Ed25519 key must be torsion free");
     }
-    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
-        .map_err(|error| anyhow::anyhow!("invalid Ed25519 verifying key: {error}"))
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+        .map_err(|error| anyhow::anyhow!("invalid Ed25519 verifying key: {error}"))?;
+    if let Ok(mut known) = keys.lock() {
+        remember_canonical_key(&mut known, key);
+    }
+    Ok(key)
 }
 
 /// Decode the one canonical Ed25519 `did:key` representation.
@@ -365,6 +395,48 @@ fn derive_storage_key(device_key: &[u8; 32]) -> [u8; 32] {
     okm
 }
 
+/// Salt that separates the named sign-in decoy key from every other key this
+/// Home derives from `device.key`.
+const NAMED_SIGN_IN_DECOY_SALT: &[u8] = b"elastos-named-sign-in-decoy/v1";
+/// Credential ID lengths in bytes that authenticators return in practice:
+/// platform passkeys and password managers (16, 20, 32), Android
+/// non-discoverable credentials (65), and security-key key handles that wrap
+/// the private key (48 to 256). Real IDs can be 1 to 1024 bytes; this set only
+/// keeps a decoy from standing out by length among common authenticators.
+const DECOY_CREDENTIAL_ID_LENGTHS: [usize; 14] =
+    [16, 20, 32, 48, 64, 65, 70, 72, 80, 96, 128, 160, 192, 256];
+const MAX_DECOY_CREDENTIAL_ID_BYTES: usize = 256;
+const MAX_DECOY_CREDENTIALS: usize = 2;
+
+/// Deterministic decoy credential IDs for one named sign-in account key,
+/// sorted as the real allow-list is.
+///
+/// The PRF is HKDF-SHA256 (HMAC-SHA256) keyed by `HKDF-Extract(salt,
+/// device.key)`, with the account key as `info`. `device.key` is this Home's
+/// existing protected secret (0600, the root of the encrypted credential
+/// store), so the decoys need no new state, survive restarts, differ per Home
+/// and per name, and cannot be computed by a caller.
+fn named_sign_in_decoys(device_key: &[u8; 32], account_key: &str) -> Vec<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    const SLOT: usize = 1 + MAX_DECOY_CREDENTIAL_ID_BYTES;
+    let hk = Hkdf::<Sha256>::new(Some(NAMED_SIGN_IN_DECOY_SALT), device_key);
+    // One count byte, then per decoy one length byte and the longest ID.
+    let mut okm = Zeroizing::new([0u8; 1 + MAX_DECOY_CREDENTIALS * SLOT]);
+    hk.expand(account_key.as_bytes(), okm.as_mut())
+        .expect("HKDF output length is within bounds");
+    let count = 1 + usize::from(okm[0]) % MAX_DECOY_CREDENTIALS;
+    let mut decoys: Vec<String> = (0..count)
+        .map(|index| {
+            let start = 1 + index * SLOT;
+            let length = DECOY_CREDENTIAL_ID_LENGTHS
+                [usize::from(okm[start]) % DECOY_CREDENTIAL_ID_LENGTHS.len()];
+            URL_SAFE_NO_PAD.encode(&okm[start + 1..start + 1 + length])
+        })
+        .collect();
+    decoys.sort_unstable();
+    decoys
+}
+
 fn nickname_path(data_dir: &Path) -> PathBuf {
     data_dir.join("did").join("nickname.enc")
 }
@@ -567,6 +639,13 @@ impl IdentityStore {
         hex::encode(self.device_key.as_ref())
     }
 
+    /// Stable decoy credential IDs a named sign-in lists when the name has no
+    /// eligible account. They only stop casual enumeration of unknown names;
+    /// they do not hide whether a guessed name has passkeys.
+    pub fn named_sign_in_decoy_ids(&self, account_key: &str) -> Vec<String> {
+        named_sign_in_decoys(&self.device_key, account_key)
+    }
+
     /// Access the underlying identity data (if loaded).
     pub fn data(&self) -> Option<&IdentityData> {
         self.data.as_ref()
@@ -724,6 +803,46 @@ mod tests {
         assert!(store2.is_registered());
         assert_eq!(store2.user_id(), Some(user_id.as_str()));
         assert_eq!(store2.get_credentials().len(), 1);
+    }
+
+    #[test]
+    fn named_sign_in_decoys_are_stable_per_home_and_name() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let dir = tempfile::tempdir().unwrap();
+        let store = IdentityStore::new(dir.path()).unwrap();
+        let first = store.named_sign_in_decoy_ids("alice");
+        assert!((1..=MAX_DECOY_CREDENTIALS).contains(&first.len()));
+        for id in &first {
+            let bytes = URL_SAFE_NO_PAD.decode(id).unwrap();
+            assert!(DECOY_CREDENTIAL_ID_LENGTHS.contains(&bytes.len()));
+        }
+        // Stable across calls and across a reopened store (the key is device.key).
+        assert_eq!(store.named_sign_in_decoy_ids("alice"), first);
+        let reopened = IdentityStore::new(dir.path()).unwrap();
+        assert_eq!(reopened.named_sign_in_decoy_ids("alice"), first);
+        // Different per name and per Home.
+        assert_ne!(store.named_sign_in_decoy_ids("bob"), first);
+        let other_home = tempfile::tempdir().unwrap();
+        let other = IdentityStore::new(other_home.path()).unwrap();
+        assert_ne!(other.named_sign_in_decoy_ids("alice"), first);
+        // Over many names both decoy counts and several lengths occur, so the
+        // shape does not single out decoys.
+        let mut counts = std::collections::BTreeSet::new();
+        let mut lengths = std::collections::BTreeSet::new();
+        for index in 0..64 {
+            let ids = store.named_sign_in_decoy_ids(&format!("name {index}"));
+            counts.insert(ids.len());
+            for id in ids {
+                lengths.insert(URL_SAFE_NO_PAD.decode(id).unwrap().len());
+            }
+        }
+        assert_eq!(counts.len(), MAX_DECOY_CREDENTIALS);
+        assert!(lengths.len() > 4);
+        assert!(lengths.iter().any(|length| *length >= 96), "{lengths:?}");
+        for index in 0..64 {
+            let ids = store.named_sign_in_decoy_ids(&format!("name {index}"));
+            assert!(ids.windows(2).all(|pair| pair[0] <= pair[1]), "{ids:?}");
+        }
     }
 
     fn persistence_credential(id: &str, sign_count: u32) -> StoredCredential {
@@ -1223,6 +1342,88 @@ mod tests {
         assert!(
             validate_canonical_ed25519_verifying_key_bytes(non_torsion_free_public_key_bytes())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_key_cache_keeps_only_a_bounded_set_of_validated_public_keys() {
+        let mut keys = VecDeque::new();
+        let first = ed25519_dalek::SigningKey::from_bytes(&[0; 32]).verifying_key();
+        for seed in 0..=CANONICAL_KEY_CACHE_CAPACITY {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[seed as u8; 32]).verifying_key();
+            let validated = validate_canonical_ed25519_verifying_key_bytes(key.to_bytes()).unwrap();
+            remember_canonical_key(&mut keys, validated);
+            remember_canonical_key(&mut keys, validated);
+            assert!(keys.len() <= CANONICAL_KEY_CACHE_CAPACITY);
+        }
+        assert_eq!(keys.len(), CANONICAL_KEY_CACHE_CAPACITY);
+        assert!(!keys.contains(&first));
+        // Eviction only repeats the canonical checks; it changes no authority.
+        assert_eq!(
+            validate_canonical_ed25519_verifying_key_bytes(first.to_bytes()).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn warm_canonical_key_cache_still_rejects_invalid_keys_and_did_aliases() {
+        let generated = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+        for _ in 0..3 {
+            assert_eq!(
+                validate_canonical_ed25519_verifying_key_bytes(generated.to_bytes()).unwrap(),
+                generated
+            );
+            assert!(decode_did_key(
+                &(encode_signing_key_did(&ed25519_dalek::SigningKey::from_bytes(&[7; 32])) + "x")
+            )
+            .is_err());
+            let (canonical_alias, noncanonical_alias) = alias_pair();
+            for invalid in [
+                canonical_alias,
+                noncanonical_alias,
+                weak_public_key_bytes(),
+                non_torsion_free_public_key_bytes(),
+            ] {
+                assert!(validate_canonical_ed25519_verifying_key_bytes(invalid).is_err());
+                assert!(!CANONICAL_KEYS
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|key| key.as_bytes() == &invalid));
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_public_key_validation_remains_correct_during_concurrent_eviction() {
+        let workers: Vec<_> = (0..4)
+            .map(|offset| {
+                std::thread::spawn(move || {
+                    for index in 0..72 {
+                        let mut seed = [index; 32];
+                        seed[0] = offset;
+                        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+                        let expected = signing_key.verifying_key();
+                        assert_eq!(
+                            validate_canonical_ed25519_verifying_key_bytes(expected.to_bytes())
+                                .unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            decode_did_key(&encode_signing_key_did(&signing_key)).unwrap(),
+                            expected
+                        );
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(
+            CANONICAL_KEYS.get().unwrap().lock().unwrap().len() <= CANONICAL_KEY_CACHE_CAPACITY
         );
     }
 

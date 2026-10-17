@@ -176,8 +176,8 @@ def main():
         return
     output.parent.mkdir(parents=True, exist_ok=True)
     disk = shutil.disk_usage(output.parent)
-    if disk.free * 10 < disk.total or disk.free < 4 * 1024**3:
-        raise ValueError("Media build needs 4 GiB free and at least 10% free volume space")
+    if disk.free < 4 * 1024**3:
+        raise ValueError("Media build needs 4 GiB free volume space")
     with tempfile.TemporaryDirectory(prefix=".media-tools-build-", dir=output.parent) as temporary:
         work = Path(temporary)
         package = work / "media-tools"
@@ -191,16 +191,18 @@ def main():
             dest = work / name.split("-")[0]
             dest.mkdir()
             roots[name.split("-")[0]] = unpack(archive, dest)
-        prefix = work / "prefix"
+        # Fixed prefixes keep the random build directory out of the binaries; DESTDIR stages installs.
+        stage = work / "stage"
         x264 = roots["x264"]
-        run(["./configure", f"--prefix={prefix}", "--enable-static", "--disable-cli", "--disable-opencl",
+        run(["./configure", "--prefix=/elastos/x264", "--enable-static", "--disable-cli", "--disable-opencl",
              "--disable-avs", "--disable-lavf", "--disable-ffms", "--disable-gpac", "--disable-lsmash",
              "--disable-swscale"], x264, env)
         run(["make", f"-j{jobs}"], x264, env)
-        run(["make", "install"], x264, env)
-        env["PKG_CONFIG_LIBDIR"] = str(prefix / "lib/pkgconfig")
+        run(["make", "install", f"DESTDIR={stage}"], x264, env)
+        env["PKG_CONFIG_LIBDIR"] = str(stage / "elastos/x264/lib/pkgconfig")
+        env["PKG_CONFIG_SYSROOT_DIR"] = str(stage)
         ffmpeg = roots["ffmpeg"]
-        flags = ["./configure", f"--prefix={work / 'install'}", f"--cc={compiler}",
+        flags = ["./configure", "--prefix=/elastos/media-tools", f"--cc={compiler}",
                  "--disable-autodetect", "--disable-network", "--disable-shared", "--enable-static",
                  "--enable-gpl", "--enable-libx264", "--disable-ffplay", "--disable-doc",
                  "--disable-debug", "--pkg-config-flags=--static"]

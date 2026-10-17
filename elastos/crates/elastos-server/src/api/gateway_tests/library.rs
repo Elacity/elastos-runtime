@@ -575,6 +575,10 @@ async fn create_runtime_custody_publish_directory(
     (init, segments)
 }
 
+fn enable_protected_content(data_dir: &std::path::Path) {
+    std::fs::write(data_dir.join("config.toml"), "protected_content = true\n").unwrap();
+}
+
 async fn publish_runtime_custody(
     app: &axum::Router,
     token: &str,
@@ -6020,6 +6024,7 @@ async fn test_library_provider_rejects_key_release_policy_until_provider_exists(
 #[tokio::test]
 async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_protection_fields() {
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
@@ -6100,6 +6105,7 @@ async fn test_library_provider_runtime_custody_publish_fails_closed_without_comp
 ) {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
     let protected_content_root = dir.path().join("protected-content");
     std::fs::create_dir_all(&protected_content_root).unwrap();
@@ -8480,6 +8486,7 @@ async fn test_runtime_custody_import_rejects_manifest_and_package_mismatch() {
 async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
     let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
     let registry = state.provider_registry.as_ref().unwrap().clone();
@@ -8961,6 +8968,7 @@ async fn test_runtime_custody_two_runtime_portable_listing_gateway_journey() {
 
     let shared_content = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     let runtime_a = tempfile::tempdir().unwrap();
+    enable_protected_content(runtime_a.path());
     crate::protected_content_runtime::tests::write_device_key(runtime_a.path(), 0x5a);
     let content_a = TwoRuntimeContentProvider::new(0x5a, shared_content.clone());
     let (state_a, wallet_a) = wallet_chain_test_state_with_observer(runtime_a.path()).await;
@@ -9117,6 +9125,7 @@ async fn test_runtime_custody_two_runtime_portable_listing_gateway_journey() {
     assert_eq!(publish_requests[2]["links"].as_array().unwrap().len(), 2);
 
     let runtime_b = tempfile::tempdir().unwrap();
+    enable_protected_content(runtime_b.path());
     crate::protected_content_runtime::tests::write_device_key(runtime_b.path(), 0x5b);
     let content_b = TwoRuntimeContentProvider::new(0x5b, shared_content);
     assert_ne!(content_a.signer_did(), content_b.signer_did());
@@ -9656,8 +9665,31 @@ async fn test_library_provider_runtime_custody_viewer_ops_require_player_launch_
 }
 
 #[tokio::test]
+async fn test_library_provider_refuses_protected_publish_until_protected_content_is_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/protection-not-released");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &uri, 0x40).await;
+
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &uri,
+        "protected content is not available in this release",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_layouts() {
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
@@ -9948,6 +9980,7 @@ async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_lay
 async fn test_library_provider_runtime_custody_publish_passes_one_file_to_runtime_media_boundary() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     // The creator wallet/chain binding gate runs ahead of the media gate, so
     // the state must carry wallet + chain providers plus a seeded managed
     // default account for this test to reach the media preparation boundary

@@ -41,6 +41,12 @@ const CHECK_APP_MATRIX = process.env.HOME_VIRTUAL_AUTH_APP_MATRIX === "1";
 const CHECK_RECOVERY_EXPORT = process.env.HOME_VIRTUAL_AUTH_RECOVERY_EXPORT === "1";
 const CHECK_SHELL_SWITCH = process.env.HOME_VIRTUAL_AUTH_SHELL_SWITCH !== "0";
 const CHECK_SYSTEM = process.env.HOME_VIRTUAL_AUTH_SYSTEM !== "0";
+// The installed-release CI journey (scripts/update-hop-compare.py): the published release's
+// System installs a release whose support changed and Home reconnects; on the new release
+// System refuses a tampered offer and applies the next one; the runner undoes it.
+const SYSTEM_UPDATE_DIR = process.env.HOME_VIRTUAL_AUTH_UPDATE_DIR || "";
+const [SYSTEM_UPDATE_CURRENT = "", SYSTEM_UPDATE_NEW = "", SYSTEM_UPDATE_NEXT = ""] =
+  (process.env.HOME_VIRTUAL_AUTH_UPDATE_VERSIONS || "").split(" ");
 const CHECK_BROWSER_SUMMARY =
   process.env.HOME_VIRTUAL_AUTH_BROWSER_SUMMARY === "1" ||
   process.env.HOME_VIRTUAL_AUTH_BROWSER_OPEN === "1";
@@ -654,12 +660,17 @@ function isLocalhostWebAuthnUrl(value) {
   return new URL(value).hostname === "localhost";
 }
 
-async function waitForHomeReady(page, timeoutMs = 30_000) {
-  await page.waitForFunction(
-    () => document.body?.dataset?.homeStatus === "ready",
-    null,
-    { timeout: timeoutMs },
-  );
+async function waitForHomeEntry(page, timeoutMs = 30_000) {
+  await page.waitForFunction(() => {
+    if (document.body?.dataset?.homeStatus === "ready") return true;
+    if (document.body?.dataset?.homeStatus !== "locked") return false;
+    const unlock = document.querySelector("#home-unlock");
+    if (!unlock || unlock.hidden) return false;
+    return ["#home-unlock-primary", "#home-unlock-person"].some(selector => {
+      const control = document.querySelector(selector);
+      return control && !control.disabled && control.getClientRects().length > 0;
+    });
+  }, null, { timeout: timeoutMs });
 }
 
 function launchTokenFromRoute(route) {
@@ -3206,13 +3217,13 @@ async function runControlledBrowserJourney(page, appFrame, windowIdentity, token
     await appFrame.locator("#browser-url").waitFor({ state: "visible", timeout: 15_000 });
     await appFrame.waitForFunction(() => document.querySelector("#browser-url")?.disabled === false,
       null, { timeout: BROWSER_UI_PAGE_ID_TIMEOUT_MS });
-    if (fixture.engineId) {
+    if (engineChoice?.engineId) {
       await appFrame.locator("#browser-settings").click();
       const selectedEngine = await appFrame.locator("#browser-engine").inputValue();
-      if (selectedEngine !== fixture.engineId) {
-        await appFrame.locator("#browser-engine").selectOption(fixture.engineId);
+      if (selectedEngine !== engineChoice.engineId) {
+        await appFrame.locator("#browser-engine").selectOption(engineChoice.engineId);
       }
-      assert(await appFrame.locator("#browser-engine").inputValue() === fixture.engineId,
+      assert(await appFrame.locator("#browser-engine").inputValue() === engineChoice.engineId,
         "Requested Browser Engine UI selection failed");
       await appFrame.locator("#browser-settings-close").click();
     }
@@ -3965,7 +3976,7 @@ async function createPasskeyFromCurrentUnlock(page, mode, onCreated) {
 }
 
 async function ensureSignedWithVirtualPasskey(page, onCreated) {
-  await waitForHomeReady(page);
+  await waitForHomeEntry(page);
   let state = await homeState(page);
   if (state.authority === "signed") {
     if (REUSE_SIGNED_HOME) {
@@ -4003,7 +4014,7 @@ async function ensureSignedWithVirtualPasskey(page, onCreated) {
       return { created: false, mode: "existing-passkey", homeToken };
     } catch {
       await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
-      await waitForHomeReady(page);
+      await waitForHomeEntry(page);
     }
   }
 
@@ -4014,9 +4025,11 @@ async function ensureSignedWithVirtualPasskey(page, onCreated) {
     throw skip;
   }
 
-  const secondary = page.locator("#home-unlock-secondary");
-  await secondary.waitFor({ state: "visible", timeout: 15_000 });
-  await secondary.click();
+  // The lock face offers "Create account" directly; the card's secondary
+  // action covers the neutral surface.
+  const createEntry = page.locator("#home-unlock-create:visible, #home-unlock-secondary:visible").first();
+  await createEntry.waitFor({ state: "visible", timeout: 15_000 });
+  await createEntry.click();
   state = await homeState(page);
   assert(
     state.unlockTitle === "Create guest account" && state.unlockNameVisible,
@@ -4108,7 +4121,7 @@ async function signOut(page, homeToken = "") {
 async function signBackIn(page) {
   const tokenPromise = captureNextPasskeyToken(page, 20_000).catch(() => null);
   await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
-  await waitForHomeReady(page);
+  await waitForHomeEntry(page);
   let signed = false;
   try {
     await waitForSignedHome(page, 8_000);
@@ -4370,7 +4383,137 @@ async function launchSystem(page, homeToken, passkey) {
   const recoveryExport = CHECK_RECOVERY_EXPORT
     ? await checkSystemRecoveryExport(page, systemFrame, passkey)
     : null;
-  return { ...system, recoveryExport };
+  const systemUpdate = SYSTEM_UPDATE_DIR ? await checkSystemUpdate(page, passkey) : null;
+  return { ...system, recoveryExport, systemUpdate };
+}
+
+async function checkSystemUpdate(page, passkey) {
+  assert(SYSTEM_UPDATE_CURRENT && SYSTEM_UPDATE_NEW && SYSTEM_UPDATE_NEXT,
+    "System update check needs the published, new and next version");
+  let shownFrame = null;
+  // Home may remount System after a restart; always read the live System window.
+  const read = async () => {
+    const frame = capsuleFrameForTarget(page, "system");
+    if (!frame) return { frame: false };
+    try {
+      if (frame !== shownFrame) {
+        // Show the update row for the screenshots; the checks read the DOM either way.
+        await frame.locator('button[data-settings="about"]').evaluate((button) => button.click());
+        shownFrame = frame;
+      }
+      return await frame.evaluate(() => {
+        const field = (name) => document.querySelector(`[data-field="${name}"]`);
+        const text = (node) => node?.textContent?.trim() || "";
+        const apply = document.querySelector("#runtime-update-apply");
+        return {
+          frame: true,
+          shown: document.querySelector("#runtime-update")?.hidden === false,
+          status: text(document.querySelector("#runtime-update-status")),
+          offer: field("update-offer")?.hidden === false,
+          can_apply: Boolean(apply && !apply.hidden && !apply.disabled),
+          current_version: text(field("update-current-version")),
+          new_version: text(field("update-new-version")),
+          changes: field("update-changes")?.hidden === false ? text(field("update-changes")) : "",
+          installed_version: text(field("source-installed-version")),
+          // Set before an approval: true while the same System window stays open.
+          same_window: window.__elastosUpdateWindowMarker === true,
+        };
+      });
+    } catch (error) {
+      return { frame: false, error: String(error.message || error).slice(0, 200) };
+    }
+  };
+  const record = (name, value) =>
+    writeFileSync(join(SYSTEM_UPDATE_DIR, `${name}.json`), `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  // System polls every 5 s, Runtime caches a Carrier check for 30 s, and an
+  // approved update restarts Home.
+  const reach = async (name, predicate, message, seconds = 150) => {
+    const deadline = Date.now() + seconds * 1_000;
+    let state = await read();
+    while (!predicate(state) && Date.now() < deadline) {
+      await delay(1_000);
+      state = await read();
+    }
+    await page.screenshot({ path: join(SYSTEM_UPDATE_DIR, `${name}.png`) }).catch(() => {});
+    assert(predicate(state), `${message}: ${JSON.stringify(state)}`, state);
+    // The fixture runner takes its next step when it sees this file.
+    record(name, state);
+    return state;
+  };
+  // The fixture signs each release with the change note "Fixture <publication>",
+  // so System can tell the offers apart.
+  const offered = (publication, current, next) => (state) => state.shown && state.offer && state.can_apply
+    && state.current_version === current && state.new_version === next
+    && state.changes === `Fixture ${publication}`;
+  const upToDate = (version) => (state) => state.shown && !state.offer
+    && state.status === "Home is up to date." && state.installed_version === version;
+  const approve = async () => {
+    const frame = capsuleFrameForTarget(page, "system");
+    await frame.evaluate(() => { window.__elastosUpdateWindowMarker = true; });
+    // Home asks the virtual authenticator for the owner's step-up proof.
+    await frame.locator("#runtime-update-apply").evaluate((button) => button.click());
+  };
+  const sameAccount = async (message) => {
+    const refreshed = await refreshCurrentHomeToken(page);
+    assert(refreshed.ok && refreshed.homeToken, message, { status: refreshed.status });
+    const current = await currentPasskey(page, refreshed.homeToken);
+    assert(current?.proof_binding_id === passkey.proof_binding_id, "Home changed account: " + message);
+    return refreshed.homeToken;
+  };
+  // The runner stopped Home, changed the installed release and started Home again:
+  // open Home again, as a person does, and find the same account.
+  const reopen = async (name, message) => {
+    const deadline = Date.now() + 600_000;
+    while (!existsSync(join(SYSTEM_UPDATE_DIR, `restart-${name}.json`)) && Date.now() < deadline) await delay(1_000);
+    assert(existsSync(join(SYSTEM_UPDATE_DIR, `restart-${name}.json`)), `the runner did not restart Home after ${name}`);
+    let signed = false;
+    while (!signed && Date.now() < deadline) {
+      signed = await page.reload({ waitUntil: "domcontentloaded" })
+        .then(() => waitForSignedHome(page, 15_000)).then(() => true, () => false);
+    }
+    assert(signed, message);
+    return sameAccount(message);
+  };
+  const upToDateCurrent = await reach("up-to-date", upToDate(SYSTEM_UPDATE_CURRENT), "System did not report Home up to date");
+  // The published release's System installs this release although its support changed: it
+  // prepares the update while Home runs, restarts Home once and reconnects the same account.
+  await reach("new-offer", offered("new", SYSTEM_UPDATE_CURRENT, SYSTEM_UPDATE_NEW),
+    "System did not offer the new release");
+  await approve();
+  const updated = await reach("updated", upToDate(SYSTEM_UPDATE_NEW),
+    "System did not reconnect on the new release", 300);
+  await waitForSignedHome(page, 60_000);
+  await sameAccount("Home session did not survive the System update to the new release");
+  const tampered = await reach("tampered-offer", offered("tampered-binary", SYSTEM_UPDATE_NEW, SYSTEM_UPDATE_NEXT),
+    "System did not offer the tampered fixture");
+  await approve();
+  // What the person sees after a refusal: the same System window, the current version, a
+  // new message, and Update usable again. update-hop-compare.py checks that the
+  // controller recorded the failure and that the same Home process kept running.
+  const refused = await reach("refused", (state) => state.shown && state.same_window
+    && state.installed_version === SYSTEM_UPDATE_NEW && state.can_apply
+    && state.status !== "" && state.status !== tampered.status,
+  "System did not show the refusal on the current version in the same window");
+  const nextOffer = await reach("next-offer", offered("next", SYSTEM_UPDATE_NEW, SYSTEM_UPDATE_NEXT),
+    "System did not offer the next signed version");
+  await approve();
+  const nextUpdated = await reach("next-updated", upToDate(SYSTEM_UPDATE_NEXT), "System did not reconnect on the next version");
+  // Home reconnected by itself: no navigation, and the same account is signed in.
+  await waitForSignedHome(page, 60_000);
+  const token = await sameAccount("Home session did not survive the System update");
+  const stored = await browserApi(page, token, "/api/apps/home/appearance/preferences",
+    { method: "POST", body: { theme: "light" } });
+  assert(stored.ok && stored.body?.theme === "light", "Home did not store the account preference", stored);
+  record("post-update-item", { theme: stored.body.theme, revision: stored.body.revision });
+  // The runner undoes the update with `elastos update --rollback-to` and starts Home on the
+  // published release; the account and the preference stored after the update remain.
+  const after = await browserApi(page, await reopen("undo", "Home did not sign in again on the published release"),
+    "/api/apps/home/summary");
+  assert(after.ok && after.body?.appearance?.theme === "light", "Undo lost the account preference", after);
+  const undone = { theme: after.body.appearance.theme, revision: after.body.appearance.revision, same_account: true };
+  record("undone", undone);
+  return { up_to_date: upToDateCurrent, updated, tampered, refused, next_offer: nextOffer, next_updated: nextUpdated,
+    undone, same_account: true };
 }
 
 async function readRecoveryExportDownload(download, expected) {
@@ -4737,52 +4880,23 @@ async function checkShellSwitchJourney(page, homeToken) {
     switchedToCli = true;
     await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
     await waitForSignedHome(page);
-    const chatCliFrame = await waitForCapsuleFrame(page, "home-cli");
-    await chatCliFrame.waitForFunction(() => (
+    const directCliFrame = await waitForCapsuleFrame(page, "home-cli");
+    await directCliFrame.waitForFunction(() => (
       document.body?.dataset?.runtimeTerminal === "attached" &&
       document.querySelector("#xterm-terminal")?.hidden === false
     ), null, { timeout: 20_000 });
 
-    markStage("shell-switch:cli-open-chat");
-    await pressHomeCliKey(chatCliFrame, "1");
-    await chatCliFrame.waitForFunction(() => (
-      (document.querySelector("#xterm-terminal")?.textContent || "").includes("Type /home to return Home")
-    ), null, { timeout: 30_000 });
-    const chatHost = await page.evaluate(() => ({
-      body: { ...document.body.dataset },
-      frame_src: document.querySelector("#active-shell-frame")?.getAttribute("src") || "",
-      host_gui_dom_present: Boolean(document.querySelector(
-        "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
-      )),
+    markStage("shell-switch:cli-home-tabs");
+    await directCliFrame.waitForFunction(() => (
+      /Home\s+Inbox\s+People\s+Apps\s+System/.test(document.querySelector("#xterm-terminal")?.textContent || "")
+    ), null, { timeout: 20_000 });
+    const cliHome = await directCliFrame.evaluate(() => ({
+      offers_native_chat: (document.querySelector("#xterm-terminal")?.textContent || "").includes("Chat [ready]"),
     }));
-    const chatTerminal = await chatCliFrame.evaluate(() => {
-      const terminalText = document.querySelector("#xterm-terminal")?.textContent || "";
-      return {
-        terminal_has_chat_prompt: terminalText.includes("Type /home to return Home"),
-        terminal_has_chat_identity: terminalText.includes("Chat #general as "),
-      };
-    });
-    const chatNative = { host: chatHost, terminal: chatTerminal };
-    assert(chatHost.frame_src.includes("/apps/home-cli/"), "CLI Chat replaced the root shell", chatNative);
-    assert(!chatHost.host_gui_dom_present, "CLI Chat instantiated Home GUI DOM", chatNative);
-    assert(!capsuleFrameForTarget(page, "home-gui"), "CLI Chat loaded Home GUI", {
-      frames: page.frames().map((frame) => frame.url()),
-    });
-    assert(chatTerminal.terminal_has_chat_prompt, "Home CLI did not enter CLI Chat", chatNative);
-    assert(chatTerminal.terminal_has_chat_identity, "Home CLI Chat did not show its identity", chatNative);
-
-    markStage("shell-switch:cli-chat-return-home");
-    const cliTextarea = await homeCliXtermTextarea(chatCliFrame);
-    await cliTextarea.pressSequentially("/home");
-    await cliTextarea.press("Enter");
-    await chatCliFrame.waitForFunction(() => {
-      const terminalText = document.querySelector("#xterm-terminal")?.textContent || "";
-      return /Home\s+Inbox\s+People\s+Apps\s+System/.test(terminalText) &&
-        terminalText.includes("Chat [ready]");
-    }, null, { timeout: 20_000 });
+    assert(!cliHome.offers_native_chat, "Home CLI still offers the native #general Chat", cliHome);
 
     markStage("shell-switch:cli-browser-boundary");
-    await pressHomeCliKey(chatCliFrame, "b");
+    await pressHomeCliKey(directCliFrame, "b");
     await page.waitForTimeout(500);
     const browserBoundary = {
       host: await page.evaluate(() => ({
@@ -4792,7 +4906,7 @@ async function checkShellSwitchJourney(page, homeToken) {
           "#desktop, .desktop-backdrop, .toolbar, .desktop-workspace, .taskbar, #launcher, #window-template",
         )),
       })),
-      cli: await chatCliFrame.evaluate(() => ({
+      cli: await directCliFrame.evaluate(() => ({
         runtime_terminal: document.body?.dataset?.runtimeTerminal || "",
         terminal_text_tail: (document.querySelector("#xterm-terminal")?.textContent || "").slice(-2000),
       })),
@@ -4806,7 +4920,7 @@ async function checkShellSwitchJourney(page, homeToken) {
       shell_options: shellOptions,
       cli_root: { fills_viewport: true, origin: cliState.origin, terminal_ready: true },
       restored,
-      chat_cli: chatNative,
+      cli_home: cliHome,
       browser_boundary: browserBoundary,
     };
   } finally {
@@ -5464,6 +5578,7 @@ async function revokeCurrentPasskey(page, proofBindingId, homeToken) {
 }
 
 async function main() {
+  assert(!SYSTEM_UPDATE_DIR || CHECK_SYSTEM, "The System update check requires the System check");
   assert(!BROWSER_CONTROLLED_TURN_TEST_HOME || CHECK_BROWSER_CONTROLLED_RECOVERY,
     "The task TURN interruption requires controlled Browser recovery");
   assert(!BROWSER_CONTROLLED_TURN_CONTROL_SOCKET || BROWSER_CONTROLLED_TURN_TEST_HOME,
@@ -5625,6 +5740,7 @@ async function main() {
       recovery_export_checked: Boolean(system?.recoveryExport),
       recovery_export: system?.recoveryExport ?? null,
       system_fields: system?.fields || null,
+      system_update: system?.systemUpdate ?? null,
       home_public_copy: homePublicCopy,
       shell_switch: shellSwitch,
       browser_launch_checked: Boolean(browserLaunch),

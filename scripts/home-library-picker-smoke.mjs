@@ -181,7 +181,7 @@ test("fresh Runtime picker launch binds only the live opener request", async () 
 });
 
 function archiveFixture() {
-  const source = readFileSync(new URL("../capsules/archive-manager/browser/index.html", import.meta.url), "utf8");
+  const source = readFileSync(new URL("../capsules/archive-manager/browser/archive-manager.js", import.meta.url), "utf8");
   const messages = [];
   const opens = [];
   const menus = [];

@@ -9,11 +9,12 @@ const repoRoot = resolve(new URL("..", import.meta.url).pathname);
 const chatIndexPath = resolve(repoRoot, "capsules/chat-room/browser/index.html");
 const source = readFileSync(chatIndexPath, "utf8");
 
-function extractInlineScript(needle) {
-  const blocks = [...source.matchAll(/<script>([\s\S]*?)<\/script>/g)];
-  const match = blocks.find((entry) => entry[1].includes(needle));
-  assert(match, `missing inline script for ${needle}`);
-  return match[1];
+function extractScript(needle) {
+  const scripts = [...source.matchAll(/<script src="\.\/([^"?]+)(?:\?[^"]*)?"><\/script>/g)]
+    .map((entry) => readFileSync(resolve(repoRoot, "capsules/chat-room/browser", entry[1]), "utf8"));
+  const script = scripts.find((entry) => entry.includes(needle));
+  assert(script, `missing script for ${needle}`);
+  return script;
 }
 
 class FakeElement {
@@ -72,6 +73,7 @@ function createEnvironment() {
   const parentMessages = [];
   const windowListeners = new Map();
   const observers = [];
+  const dispatchedEvents = [];
   const participantToggle = new FakeElement("participant-toggle");
   const roomAccessToggle = new FakeElement("room-access-toggle");
   roomAccessToggle.hidden = true;
@@ -80,8 +82,6 @@ function createEnvironment() {
     { dataset: { conversationChoice: "shared" } },
     { dataset: { conversationChoice: "direct:sha256:fixture-conversation" } },
   ];
-  const conversationJoinSection = new FakeElement("conversation-join-section");
-  conversationJoinSection.hidden = true;
   const composerForm = new FakeElement("composer-form");
   const composerField = new FakeElement("composer-field");
   const messageInput = new FakeTextAreaElement("message-input");
@@ -111,7 +111,6 @@ function createEnvironment() {
     ["participant-toggle", participantToggle],
     ["room-access-toggle", roomAccessToggle],
     ["conversation-selector", conversationSelector],
-    ["conversation-join-section", conversationJoinSection],
     ["composer-form", composerForm],
     ["message-input", messageInput],
   ]);
@@ -145,6 +144,16 @@ function createEnvironment() {
       addEventListener(type, callback) {
         windowListeners.set(type, callback);
       },
+      dispatchEvent(event) {
+        dispatchedEvents.push(event);
+        return true;
+      },
+    },
+    CustomEvent: class {
+      constructor(type, init = {}) {
+        this.type = type;
+        this.detail = init.detail;
+      }
     },
     globalThis: null,
     getComputedStyle(node) {
@@ -161,8 +170,8 @@ function createEnvironment() {
     body,
     composerField,
     context,
-    conversationJoinSection,
     conversationSelector,
+    dispatchedEvents,
     messageInput,
     notify(target) {
       for (const observer of observers) {
@@ -189,9 +198,61 @@ function plainJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function checkChatStartup() {
+  const startup = readFileSync(resolve(repoRoot, "capsules/chat-room/browser/chat-room.js"), "utf8")
+    .replace(/^[ \t]*import\b[\s\S]*?;/gm, "")
+    .replaceAll("import.meta.url", JSON.stringify("http://home.example/apps/chat-room/chat-room.js"));
+  // The cache version changes with every rebuilt bundle; both asset URLs must
+  // carry the same one.
+  const startupSource = readFileSync(resolve(repoRoot, "capsules/chat-room/browser/chat-room.js"), "utf8");
+  const assetVersions = [...startupSource.matchAll(/\?v=(chat-room-ui-[0-9a-z]+)/g)].map(match => match[1]);
+  assert.equal(assetVersions.length, 2, "Chat startup must version both browser assets");
+  assert.equal(assetVersions[0], assetVersions[1], "Chat startup assets must share one cache version");
+  const assetVersion = assetVersions[0];
+  for (const token of ["", "chat-test-token"]) {
+    const env = createEnvironment();
+    const calls = [];
+    env.context.window.location.hash = token ? `#home_token=${token}` : "";
+    Object.assign(env.context, {
+      URL,
+      createHomeNavigationClient(options) {
+        calls.push({ type: "navigation", options });
+        return { setQuery(query) { calls.push({ type: "query", query }); } };
+      },
+      createHomeClipboardClient(options) {
+        calls.push({ type: "clipboard", options });
+        return {
+          start() { calls.push({ type: "clipboard-start" }); },
+          writeText(text, options) { calls.push({ type: "copy", text, options }); },
+        };
+      },
+      init(options) { calls.push({ type: "wasm", url: options.module_or_path.href }); },
+    });
+    vm.runInContext(startup, env.context);
+    if (!token) {
+      assert.deepEqual(calls, [], "Unsigned Chat must keep bridge and WASM startup inactive");
+      continue;
+    }
+    assert.deepEqual(calls.map(call => call.type), ["navigation", "clipboard", "clipboard-start", "wasm"]);
+    assert.equal(calls[0].options.homeToken, token);
+    assert.equal(calls[1].options.homeToken, token);
+    assert.equal(calls[1].options.targetId, "chat-room");
+    assert.equal(calls[3].url, `http://home.example/apps/chat-room/chat_room_ui_bg.wasm?v=${assetVersion}`);
+    env.context.elastosChatNavigation({ conversation_id: "fixture" });
+    env.context.elastosChatCopyInvite("fixture-invite");
+    assert.deepEqual(plainJson(calls.slice(4)), [
+      { type: "query", query: { conversation_id: "fixture" } },
+      { type: "copy", text: "fixture-invite", options: { purpose: "conversation.invite" } },
+    ]);
+  }
+  assert.match(source, /id="chat-open-home" href="\/home\/" target="_self"/);
+  assert(!source.includes('id="browser-access-form"'), "Direct Chat must replace its unavailable guest form with Home recovery");
+}
+
 function main() {
-  const accessModeScript = extractInlineScript("data-room-access-mode");
-  const behaviorScript = extractInlineScript("function announceHomeChrome()");
+  checkChatStartup();
+  const accessModeScript = extractScript("data-room-access-mode");
+  const behaviorScript = extractScript("function announceHomeChrome()");
   const env = createEnvironment();
 
   vm.runInContext(accessModeScript, env.context);
@@ -246,6 +307,25 @@ function main() {
     data: { type: "elastos:menu-command", cmd: "view-access-settings" },
   });
   assert.equal(env.participantToggle.clickCount, 1, "People must route through the existing toggle button");
+
+  // Home shows a requested conversation in the open Chat window.
+  const navigate = (overrides = {}, query = { conversation_id: "direct:sha256:fixture" }) => ({
+    origin: "null",
+    source: env.parentFrame,
+    data: { type: "elastos.chat.navigate/v1", homeToken: "chat-test-token", query, ...overrides },
+  });
+  onMessage({ ...navigate(), source: env.topFrame });
+  onMessage(navigate({ homeToken: "other-token" }));
+  onMessage(navigate({ extra: true }));
+  onMessage(navigate({}, { conversation_id: "direct:sha256:fixture", extra: "x" }));
+  onMessage(navigate({}, { conversation_id: "" }));
+  assert.equal(env.dispatchedEvents.length, 0, "Chat must ignore a navigate request from the wrong source, token or shape");
+  onMessage(navigate());
+  assert.deepEqual(
+    env.dispatchedEvents.map((event) => [event.type, event.detail]),
+    [["elastos-chat-open-conversation", "direct:sha256:fixture"]],
+    "Chat must open the conversation Home requests",
+  );
   assert.equal(env.roomAccessToggle.clickCount, 1, "Access Settings must route through the existing toggle button");
 
   env.roomAccessToggle.disabled = true;
@@ -266,10 +346,7 @@ function main() {
   assert.equal(env.body.dataset.roomCompactRail, "visible", "Two conversations must keep the compact rail available");
   env.conversationSelector.children = [{ dataset: { conversationChoice: "shared" } }];
   env.notify(env.conversationSelector);
-  assert.equal(env.body.dataset.roomCompactRail, "hidden", "One conversation may hide the compact rail when no required join control is visible");
-  env.conversationJoinSection.hidden = false;
-  env.notify(env.conversationJoinSection);
-  assert.equal(env.body.dataset.roomCompactRail, "visible", "Visible join controls must keep the compact rail available");
+  assert.equal(env.body.dataset.roomCompactRail, "hidden", "One conversation may hide the compact rail");
 
   env.messageInput.value = "line one\nline two\nline three";
   env.messageInput.dispatchEvent({ type: "input" });
@@ -279,13 +356,20 @@ function main() {
   env.messageInput.dispatchEvent({ type: "input" });
   assert.equal(env.messageInput.style.height, "34px", "Chat must shrink the current textarea after multiline input clears");
   assert.equal(env.composerField.dataset.multiline, "false", "Chat must clear multiline presentation state after input shrinks");
+  // Chat clears a sent message from code, which raises no input event.
+  env.messageInput.value = "line one\nline two";
+  env.messageInput.dispatchEvent({ type: "input" });
+  env.messageInput.value = "";
+  env.context.elastosChatSyncComposer();
+  assert.equal(env.messageInput.style.height, "34px", "Chat must shrink the textarea when it clears a sent message");
+  assert.equal(env.composerField.dataset.multiline, "false", "Chat must leave multiline presentation when it clears a sent message");
 
   const accessSectionIndex = source.indexOf('id="room-access-section"');
   const inviteIndex = source.indexOf('id="conversation-invite-create"');
   const accessSectionClose = source.indexOf("</section>", accessSectionIndex);
   assert(accessSectionIndex >= 0 && inviteIndex > accessSectionIndex && inviteIndex < accessSectionClose, "Invite creation must stay inside the current access section");
 
-  console.log("PASS chat Home menu, compact rail, and multiline composer behavior");
+  console.log("PASS Chat Home recovery, signed startup, Home menu, compact rail, and multiline composer behavior");
 }
 
 main();

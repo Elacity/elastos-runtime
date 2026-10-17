@@ -772,7 +772,7 @@ direct IPFS. Protected content composes Runtime coordination, typed rights
 evidence, signed recipient authorization, immutable custody epochs,
 recipient-encrypted node contributions, threshold reconstruction, node-local
 claims and exact encrypted result replay. [Protected content](PROTECTED_CONTENT.md)
-owns that contract; [state.md](../state.md) owns source and installed proof.
+owns that contract; [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own source and installed proof.
 Provisional DRM, rights, key and decrypt capsules remain a separate retirement
 surface. The content provider validates
 `sealed` object publishes against the sealed descriptor, required graph links,

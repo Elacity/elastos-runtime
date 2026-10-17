@@ -4,43 +4,33 @@
 #
 # Usage:
 #   curl -fsSL https://<publisher-origin>/install.sh | bash
-#
-#   ELASTOS_HEAD_CID=QmXyz ELASTOS_MAINTAINER_DID=did:key:z6Mk... \
-#     curl -fsSL https://<explicit-gateway>/ipfs/<installer-cid>/install.sh | bash
-#
-#   ./scripts/install.sh --head-cid QmXyz...
-#   ./scripts/install.sh --head-cid QmXyz... --maintainer-did did:key:z6Mk...
-#   ./scripts/install.sh --head-cid QmXyz... --allow-unsigned
+#   ./scripts/install.sh --publisher-gateway https://<publisher-origin> --maintainer-did did:key:z6Mk...
 #   ./scripts/install.sh --help
 #
-# Required (one of):
-#   ELASTOS_HEAD_CID env var   or   --head-cid <CID>
+# Required (stamped into published installers):
+#   ELASTOS_PUBLISHER_GATEWAY env var   or   --publisher-gateway <url>
 #   ELASTOS_MAINTAINER_DID env var   or   --maintainer-did <did:key:...>
-#   (or --allow-unsigned to skip sig check)
 #
 # Trust anchors can be provided via env vars or CLI flags. In the canonical
 # bootstrap flow, they should already be stamped into install.sh.
 #
-# Downloads the signed Runtime, components.json, and the pinned model catalog:
-#   1. elastos binary → ~/.local/bin/elastos
-#   2. components.json → the platform's ElastOS application-data directory
-#   3. model-catalog.json → the same data directory, when components.json pins one
+# Downloads the signed release head, release envelope, and Runtime binary.
+# Runtime setup fetches component metadata over Carrier.
 #
 # After bootstrap, setup installs the Home profile and opens browser Home.
-# Use --install-only for automated provisioning or other profiles.
+# Use --install-only for automated provisioning.
 #
 # Trust model:
-#   1. Bootstrap over the stamped publisher URL (or explicit operator/debug CID gateway)
+#   1. Bootstrap over the stamped publisher URL
 #   2. Verify Ed25519 signature against pinned MAINTAINER_DID
 #   3. Follow latest_release_cid to release.json
 #   4. Verify release signature
-#   5. Download binary + components.json, verify SHA-256
-#   6. Download the pinned model catalog when components.json names one, verify its head
-#   7. Install to ~/.local/bin/elastos + the platform's ElastOS data directory
-#   8. Save trusted-source Carrier metadata for later `setup` and `update`
+#   5. Download the Runtime binary and verify SHA-256
+#   6. Runtime's installation writer admits and installs the Runtime, the verified
+#      envelopes and the stamped Carrier source in one journaled transaction
+#   7. Runtime setup fetches signed metadata and installs Home over Carrier
 #
-# Fails closed if trust anchors or signature verification fail, unless the
-# operator explicitly selects --allow-unsigned.
+# Fails closed if trust anchors or signature verification fail.
 #
 # Dependencies: curl, python3 (stdlib only), sha256sum|shasum
 #
@@ -91,18 +81,12 @@ if [[ "$IPNS_NAME" == "$IPNS_NAME_PLACEHOLDER" ]]; then
     IPNS_NAME=""
 fi
 
-# Explicit IPFS gateways for operator/debug bootstrap only.
-# Override with:
-#   1) --gateway <url> (repeatable, takes highest priority)
-#   2) ELASTOS_IPFS_GATEWAYS="https://a,https://b"
-GATEWAYS=()
-CLI_GATEWAYS=()
-LAST_SUCCESS_GATEWAY=""
 ALLOWED_CHANNELS=("stable" "canary" "jetson-test")
-BINARY_DOWNLOAD_MAX_TIME="${ELASTOS_BINARY_DOWNLOAD_MAX_TIME:-1800}"
 BINARY_DOWNLOAD_RETRY_COUNT="${ELASTOS_BINARY_DOWNLOAD_RETRY_COUNT:-10}"
 BINARY_DOWNLOAD_RETRY_DELAY="${ELASTOS_BINARY_DOWNLOAD_RETRY_DELAY:-2}"
 BINARY_DOWNLOAD_CONNECT_TIMEOUT="${ELASTOS_BINARY_DOWNLOAD_CONNECT_TIMEOUT:-15}"
+# curl has no pure idle timeout, so a download fails only when it stays below
+# 1 KiB/s for 60 s (the closest rule); there is no total cap.
 BINARY_DOWNLOAD_SPEED_LIMIT="${ELASTOS_BINARY_DOWNLOAD_SPEED_LIMIT:-1024}"
 BINARY_DOWNLOAD_SPEED_TIME="${ELASTOS_BINARY_DOWNLOAD_SPEED_TIME:-60}"
 
@@ -113,6 +97,7 @@ DIM='\033[2m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 RED='\033[0;31m'
+ACCENT='\033[38;5;208m'
 NC='\033[0m'
 
 # ── Help ──────────────────────────────────────────────────────────────
@@ -125,28 +110,25 @@ show_help() {
     echo ""
     echo -e "${BOLD}Usage:${NC}"
     echo "  curl -fsSL https://<publisher-origin>/install.sh | bash"
-    echo "  curl -fsSL https://<explicit-gateway>/ipfs/<installer-cid>/install.sh | bash   # operator/debug only"
     echo "  ./scripts/install.sh [options]"
     echo ""
     echo -e "${BOLD}Options:${NC}"
-    echo "  --head-cid CID       Override bootstrap head CID"
     echo "  --maintainer-did DID Override maintainer DID trust anchor"
-    echo "  --gateway URL        IPFS gateway base URL (repeatable, operator/debug bootstrap)"
     echo "  --publisher-gateway URL  Bootstrap publisher URL (stamped for normal installs)"
-    echo "  --publisher-node-id ID   Publisher P2P node ID (for durable Carrier link)"
-    echo "  --allow-unsigned      Skip signature verification (NOT recommended)"
     echo "  --install-dir PATH    Binary install directory (default: ~/.local/bin)"
     echo "  --install-only        Install Runtime without setup or opening Home"
+    echo "  --isolated            Keep this Home out of the shared Community room"
+    echo "  --uninstall           Remove the Runtime and its components; keep your data"
+    echo "  --remove-data         With --uninstall, also delete the data directory"
     echo "  --help                Show this help"
     echo ""
     echo -e "${BOLD}What gets installed:${NC}"
     echo "  ~/.local/bin/elastos                     Runtime binary"
-    echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/components.json   Capsule registry"
-    echo "  \${XDG_DATA_HOME:-~/.local/share}/elastos/model-catalog.json  Signed model catalog, when pinned"
-    echo "  macOS registry: ~/Library/Application Support/elastos/components.json"
+    echo "  Verified release metadata and the trusted Carrier source in the Runtime data directory"
     echo ""
     echo -e "${BOLD}After installation:${NC}"
-    echo "  Setup installs the Home profile, then opens Home in your browser."
+    echo "  Runtime setup fetches signed metadata and Home components over Carrier."
+    echo "  Setup then opens Home in your browser."
     echo "  Keep the terminal open while using Home; Ctrl+C stops it."
     echo "  Without an interactive terminal, the installer prints the launch command."
     echo ""
@@ -166,8 +148,154 @@ fi
 # ── Helpers ───────────────────────────────────────────────────────────
 
 die()  { echo -e "${RED:-}Error:${NC:-} $*" >&2; exit 1; }
-info() { echo -e "  ${GREEN:-}▶${NC:-} $*"; }
-warn() { echo -e "  ${YELLOW:-}!${NC:-} $*"; }
+# For messages holding %q-quoted paths: print them byte for byte.
+die_exact() { printf '%bError:%b %s\n' "${RED:-}" "${NC:-}" "$*" >&2; exit 1; }
+
+# Colour, the banner and the step layout are for a person at a terminal.
+# Pipes, CI, NO_COLOR and dumb terminals get plain [OK] and [WARN] lines.
+installer_rich_output() {
+    [[ -t 1 && -z "${NO_COLOR:-}" && -z "${CI:-}" && "${TERM:-dumb}" != dumb ]]
+}
+
+installer_select_output() {
+    if installer_rich_output; then
+        INSTALLER_RICH=true
+    else
+        INSTALLER_RICH=false
+        BOLD='' DIM='' GREEN='' YELLOW='' RED='' NC='' ACCENT=''
+    fi
+}
+
+INSTALLER_STEPS=5
+
+show_banner() {
+    if [[ "${INSTALLER_RICH:-false}" != true ]]; then
+        echo "ElastOS Installer"
+        return 0
+    fi
+    local line
+    echo ""
+    # shellcheck disable=SC1003  # the art's trailing backslashes are literal
+    for line in \
+        '    _____ _           _    ___  ____' \
+        '   | ____| | __ _ ___| |_ / _ \/ ___|' \
+        '   |  _| | |/ _` / __| __| | | \___ \' \
+        '   | |___| | (_| \__ \ |_| |_| |___) |' \
+        '   |_____|_|\__,_|___/\__|\___/|____/'; do
+        printf '%b%s%b\n' "${ACCENT:-}" "$line" "${NC:-}"
+    done
+    echo ""
+    echo -e "   ${BOLD:-}ElastOS Installer${NC:-}  ${DIM:-}signed release · verified before anything changes${NC:-}"
+}
+
+step() {
+    if [[ "${INSTALLER_RICH:-false}" == true ]]; then
+        echo ""
+        echo -e "  ${ACCENT:-}[$1/${INSTALLER_STEPS}]${NC:-} ${BOLD:-}$2${NC:-}"
+    else
+        echo "[$1/${INSTALLER_STEPS}] $2"
+    fi
+}
+
+info() {
+    if [[ "${INSTALLER_RICH:-false}" == true ]]; then
+        echo -e "        ${DIM:-}$*${NC:-}"
+    else
+        echo -e "  ... $*"
+    fi
+}
+
+ok() {
+    if [[ "${INSTALLER_RICH:-false}" == true ]]; then
+        echo -e "        ${GREEN:-}✓${NC:-} $*"
+    else
+        echo -e "  [OK] $*"
+    fi
+}
+
+warn() {
+    if [[ "${INSTALLER_RICH:-false}" == true ]]; then
+        echo -e "        ${YELLOW:-}!${NC:-} $*"
+    else
+        echo -e "  [WARN] $*"
+    fi
+}
+
+format_elapsed() {
+    local seconds="$1"
+    if (( seconds < 60 )); then
+        printf '%s s\n' "$seconds"
+    else
+        printf '%s min %s s\n' "$((seconds / 60))" "$((seconds % 60))"
+    fi
+}
+
+# Free space, in MB, on the volume that holds a path's nearest existing parent.
+free_space_mb() {
+    local path="$1"
+    while [[ ! -e "$path" && "$path" != / ]]; do
+        path="$(dirname "$path")"
+    done
+    df -Pk "$path" 2>/dev/null | awk 'NR == 2 { print int($4 / 1024) }'
+}
+
+platform_label() {
+    case "$1" in
+        aarch64-darwin)
+            local version
+            version="$(sw_vers -productVersion 2>/dev/null || true)"
+            printf 'macOS%s on Apple silicon\n' "${version:+ $version}"
+            ;;
+        x86_64-linux) printf 'Linux on x86-64\n' ;;
+        aarch64-linux) printf 'Linux on ARM64\n' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+# Reads the installed version from the trusted source record without running
+# the installed binary. Empty when this computer has no ElastOS installation.
+installed_version() {
+    local sources="$1/sources.json" version
+    [[ -f "$sources" ]] || return 0
+    version="$(json_get "$sources" \
+        '(lambda v: v if isinstance(v, str) else None)(d["sources"][0]["installed_version"])' \
+        2>/dev/null || true)"
+    if [[ "$version" =~ ^[0-9A-Za-z.+-]{1,64}$ ]]; then
+        printf '%s\n' "$version"
+    fi
+}
+
+short_did() {
+    local did="$1"
+    if (( ${#did} > 24 )); then
+        printf '%s…%s\n' "${did:0:14}" "${did: -6}"
+    else
+        printf '%s\n' "$did"
+    fi
+}
+
+# User-facing writes keep this much free on top of their own bytes, so a disk is
+# never filled to zero. A Runtime test keeps it equal to FREE_SPACE_RESERVE_BYTES.
+FREE_SPACE_RESERVE_BYTES=2147483648
+
+require_install_space() {
+    local dir="$1"
+    # A release that omits the size still keeps the reserve; the Runtime's
+    # installation writer checks the exact bytes again before writing.
+    local bytes="${2:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || die "Release states an invalid binary size"
+    local available_kib
+    available_kib="$(df -Pk "$dir" | awk 'NR == 2 { print $4 }')"
+    [[ "$available_kib" =~ ^[0-9]+$ ]] || die "Cannot read free space for ${dir}"
+    if (( available_kib * 1024 < bytes + FREE_SPACE_RESERVE_BYTES )); then
+        # Same wording and rounding (up to a tenth of a GB) as the Runtime.
+        local gib=1073741824 tenths needed
+        tenths=$(( (bytes * 10 + gib - 1) / gib ))
+        needed="$(( tenths / 10 ))"
+        (( tenths % 10 == 0 )) || needed="${needed}.$(( tenths % 10 ))"
+        die "not enough free space: this needs ${needed} GB plus $(( FREE_SPACE_RESERVE_BYTES / gib )) GB kept free"
+    fi
+}
 
 installer_data_dir() {
     local home_dir="$1"
@@ -211,53 +339,6 @@ validate_explicit_source_bootstrap_pair() {
     if [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" == true && "$PUBLISHER_NODE_ID_EXPLICIT" != true ]] ||
        [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" != true && "$PUBLISHER_NODE_ID_EXPLICIT" == true ]]; then
         die "trusted-source Carrier bootstrap overrides are atomic; set both ELASTOS_SOURCE_CONNECT_TICKET and ELASTOS_PUBLISHER_NODE_ID, or neither"
-    fi
-}
-
-refresh_source_bootstrap_from_publisher() {
-    [[ -n "$PUBLISHER_GATEWAY" ]] || return 0
-    if [[ "$SOURCE_CONNECT_TICKET_EXPLICIT" == true && "$PUBLISHER_NODE_ID_EXPLICIT" == true ]]; then
-        return 0
-    fi
-
-    local bootstrap_url parsed
-    bootstrap_url="${PUBLISHER_GATEWAY%/}/.well-known/elastos/carrier-bootstrap.json?role=publisher"
-    if ! parsed=$(curl -fsSL --max-time 10 "$bootstrap_url" | python3 -c '
-import json
-import sys
-
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    raise SystemExit(1)
-
-if data.get("schema") != "elastos.carrier.bootstrap/v1":
-    raise SystemExit(1)
-if data.get("role") != "publisher":
-    raise SystemExit(1)
-ticket = (data.get("ticket") or "").strip()
-node_id = (data.get("node_id") or "").strip()
-if not ticket or not node_id:
-    raise SystemExit(1)
-print(ticket)
-print(node_id)
-'); then
-        warn "Could not refresh trusted-source Carrier bootstrap from ${bootstrap_url}; using stamped source route"
-        return 0
-    fi
-
-    local refreshed=() line
-    while IFS= read -r line; do
-        refreshed+=("$line")
-    done <<<"$parsed"
-    if [[ "${SOURCE_CONNECT_TICKET_EXPLICIT}" != true ]]; then
-        SOURCE_CONNECT_TICKET="${refreshed[0]:-}"
-    fi
-    if [[ "${PUBLISHER_NODE_ID_EXPLICIT}" != true ]]; then
-        PUBLISHER_NODE_ID="${refreshed[1]:-}"
-    fi
-    if [[ -n "$SOURCE_CONNECT_TICKET" && -n "$PUBLISHER_NODE_ID" ]]; then
-        info "Refreshed trusted-source Carrier bootstrap from publisher gateway"
     fi
 }
 
@@ -306,7 +387,7 @@ import subprocess
 import sys
 import time
 
-PREFIXES = ("serve", "gateway", "room open")
+PREFIXES = ("serve", "gateway", "room open", "home")
 
 
 def process_snapshot(pid):
@@ -345,6 +426,26 @@ def matches_command(snapshot, binary, prefixes=PREFIXES):
         if snapshot[1] == command or snapshot[1].startswith(command + " "):
             return True
     return False
+
+
+def home_controller(pid, data_dir):
+    """The update controller that owns this installation's Home host, if any."""
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "ppid="],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, LC_ALL="C"), text=True, check=False,
+    )
+    parent = result.stdout.strip()
+    if result.returncode or not parent.isdigit() or int(parent) <= 1:
+        return None
+    directory = os.path.join(os.path.realpath(data_dir), "update-controller")
+    command = (os.path.join(directory, "runtime"),
+               ("__update-controller --receipt " + os.path.join(directory, "receipt.json"),))
+    snapshot = process_snapshot(int(parent))
+    if snapshot is None or not matches_command(snapshot, *command):
+        return None
+    return int(parent), snapshot, command
+
 
 
 def stop_owned_process(pid, expected, binary, prefixes=PREFIXES):
@@ -502,7 +603,17 @@ def stop_installation(data_dir, binary, scan_binary):
                 raise ValueError("A process using this binary has no ownership record in the selected data directory; close it and retry")
             if selected[pid] != snapshot:
                 raise ValueError("Runtime process identity changed during inspection")
-    children = descendant_processes(selected)
+    # Home runs under its update controller; stopping the controller first
+    # stops Home without the controller restarting it.
+    controllers = {}
+    for pid, snapshot in selected.items():
+        if matches_command(snapshot, binary, ("home",)):
+            controller = home_controller(pid, data_dir)
+            if controller is not None:
+                controllers[controller[0]] = controller[1:]
+    children = descendant_processes([*selected, *controllers])
+    for pid, (snapshot, command) in controllers.items():
+        stop_owned_process(pid, snapshot, *command)
     for pid, snapshot in selected.items():
         stop_owned_process(pid, snapshot, binary)
     wait_for_descendants(children)
@@ -523,19 +634,22 @@ if __name__ == "__main__":
 PY_RUNTIME_CONTROL
 }
 
-# Fetch a CID from IPFS gateways (tries each in order)
-ipfs_fetch() {
-    local cid="$1"
-    local output="$2"
-    local url
-    for gw in ${GATEWAYS[@]+"${GATEWAYS[@]}"}; do
-        url="${gw}/ipfs/${cid}"
-        if curl -fsSL --max-time 30 -o "$output" "$url" 2>/dev/null; then
-            LAST_SUCCESS_GATEWAY="$gw"
-            return 0
-        fi
-    done
-    die "Failed to fetch CID ${cid} from any gateway"
+# curl for release data: HTTPS only, redirects included. Plain HTTP is
+# accepted only for an exact loopback origin, which test fixtures use, and
+# never follows a redirect. The URL is the last argument.
+FETCH_LOOPBACK_URL='^http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?(/[^@\\]*)?$'
+fetch_url() {
+    local url="${!#}" status=0
+    if [[ "$url" =~ $FETCH_LOOPBACK_URL ]]; then
+        curl --proto '=http' --max-redirs 0 "$@" || status=$?
+    else
+        curl --proto '=https' --proto-redir '=https' --tlsv1.2 "$@" || status=$?
+    fi
+    # curl exits 1 only for a refused protocol.
+    if (( status == 1 )); then
+        echo -e "${RED:-}Error:${NC:-} ${url} or a redirect from it is not HTTPS; release data is fetched over HTTPS only" >&2
+    fi
+    return "$status"
 }
 
 # Extract a value from a JSON file using python3 (replaces jq dependency).
@@ -565,11 +679,6 @@ verify_signature() {
     local json_file="$1"
     local domain="$2"
     local expected_did="$3"
-
-    if [[ "$ALLOW_UNSIGNED" = true ]]; then
-        warn "Skipping signature verification (--allow-unsigned)"
-        return 0
-    fi
 
     if ! python3 - "$json_file" "$domain" "$expected_did" <<'PY_ED25519'
 # RFC 8032 sections 5.1.3, 5.1.4 and 5.1.7:
@@ -712,7 +821,7 @@ PY_ED25519
     then
         die "Signature verification FAILED"
     fi
-    info "Signature verified"
+    ok "Signature verified"
 }
 
 validate_release_identity() {
@@ -737,6 +846,9 @@ try:
         raise ValueError("Release head requires a lowercase SHA-256 envelope binding; ask the publisher to update its metadata")
     if hashlib.sha256(release_bytes).hexdigest() != expected:
         raise ValueError("Release envelope differs from the signed head")
+    core = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    if not re.fullmatch(core + r"(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?", str(head.get("version", ""))):
+        raise ValueError("Invalid signed release version; expected X.Y.Z or X.Y.Z-{alpha|beta|rc}.N")
     for field in ("version", "channel"):
         value = head.get(field)
         if not isinstance(value, str) or not value or release.get(field) != value:
@@ -750,16 +862,100 @@ PY_RELEASE_IDENTITY
     fi
 }
 
+# A path a person can paste into a shell: ~/... under HOME, quoted elsewhere.
+display_path() {
+    local path="$1" quoted
+    quoted="$(printf '%q' "$path")"
+    if [[ "$quoted" == "$path" && -n "${HOME:-}" && "$path" == "${HOME%/}"/* ]]; then
+        printf '%s/%s' '~' "${path#"${HOME%/}"/}"
+    else
+        printf '%s' "$quoted"
+    fi
+}
+
+runtime_command() {
+    local runtime_bin="$1"
+    if [[ "$(command -v elastos 2>/dev/null || true)" == "$runtime_bin" ]]; then
+        printf 'elastos'
+    else
+        display_path "$runtime_bin"
+    fi
+}
+
+show_ready() {
+    local runtime_bin="$1" command elapsed
+    command="$(runtime_command "$runtime_bin")"
+    elapsed="$(format_elapsed $((SECONDS - ${INSTALL_STARTED_AT:-0})))"
+    echo ""
+    echo -e "  ${GREEN}${BOLD}ElastOS ${RELEASE_VERSION:-} is ready${NC} ${DIM}(took ${elapsed})${NC}"
+    printf '    %b%-12s%b %s\n' "$DIM" "Open Home" "$NC" "${command} home --browser"
+    printf '    %b%-12s%b %s\n' "$DIM" "Update" "$NC" "${command} update"
+    if [[ "$command" != elastos ]]; then
+        local quoted path_entry
+        quoted="$(printf '%q' "$INSTALL_DIR")"
+        if [[ "$quoted" == "$INSTALL_DIR" && -n "${HOME:-}" && "$INSTALL_DIR" == "${HOME%/}"/* ]]; then
+            path_entry="\"\$HOME/${INSTALL_DIR#"${HOME%/}"/}:\$PATH\""
+        else
+            path_entry="${quoted}:\"\$PATH\""
+        fi
+        printf '    %b%-12s%b %s\n' "$DIM" "Add to PATH" "$NC" "export PATH=${path_entry}"
+    fi
+    echo ""
+}
+
 # Setup leaves the curl pipe unread. Browser Home runs in the controlling
 # terminal; non-interactive provisioning prints the command for a later launch.
+prepare_browser_linux_host() {
+    BROWSER_LINUX_HOST_READY=false
+    [[ "$(uname -s)" == Linux ]] || return 0
+    local helper="${DATA_DIR}/scripts/browser-vm-linux-network.py" user
+    # sudo runs only a root-owned copy, never the user-writable helper.
+    local root_helper=/usr/local/lib/elastos/browser-vm-linux-network.py
+    [[ -f "$helper" ]] || return 0
+    if [[ ! -e /dev/kvm ]]; then
+        info "Browser virtualization is unavailable: this host has no /dev/kvm device."
+        return 0
+    fi
+    user="$(id -un)"
+    if /usr/bin/python3 -I "$helper" check >/dev/null 2>&1; then
+        info "Browser KVM and network access are ready."
+    elif ( : </dev/tty ) 2>/dev/null && command -v sudo >/dev/null 2>&1; then
+        info "Browser needs one-time administrator setup for KVM access and its private network devices."
+        info "The setup shows its changes and asks for confirmation. Runtime then runs as your user."
+        sudo install -D -o root -g root -m 755 "$helper" "$root_helper" </dev/tty || return $?
+        sudo /usr/bin/python3 -I "$root_helper" setup --user "$user" </dev/tty || return $?
+        /usr/bin/python3 -I "$helper" check >/dev/null 2>&1 || return $?
+    else
+        info "Browser needs one-time administrator setup. Run from a terminal:"
+        printf '  sudo install -D -o root -g root -m 755 %q %q\n' "$helper" "$root_helper"
+        printf '  sudo /usr/bin/python3 -I %q setup --user %q\n' "$root_helper" "$user"
+        return 0
+    fi
+    BROWSER_LINUX_HOST_READY=true
+    info "To remove Browser host access after closing Browser:"
+    printf '  sudo /usr/bin/python3 -I %q remove --user %q\n' "$root_helper" "$user"
+}
+
 finish_install() {
     local runtime_bin="${INSTALL_DIR}/elastos"
     if [[ "$INSTALL_ONLY" == true || "$INSTALL_ONLY" == 1 ]]; then
         info "Runtime installed: ${runtime_bin}"
         return 0
     fi
+    step 5 "Set up Home"
     info "Setting up Home..."
-    "$runtime_bin" setup </dev/null || return $?
+    local setup_args=(setup)
+    if [[ "${ISOLATED:-false}" == true ]]; then
+        setup_args+=(--isolated)
+    fi
+    "$runtime_bin" "${setup_args[@]}" </dev/null || return $?
+    if ! prepare_browser_linux_host; then
+        warn "Browser host preparation is incomplete. Home is ready. Run the installer from a terminal to complete Browser host access, then run elastos setup."
+    elif [[ "${BROWSER_LINUX_HOST_READY:-false}" == true ]]; then
+        # Resume image preparation with the same Community choice.
+        "$runtime_bin" "${setup_args[@]}" </dev/null || warn "Home is ready. Browser preparation needs repair with elastos setup."
+    fi
+    show_ready "$runtime_bin"
     if ( : </dev/tty ) 2>/dev/null && [[ -t 1 ]]; then
         info "Opening Home..."
         "$runtime_bin" home --browser </dev/tty || return $?
@@ -769,40 +965,174 @@ finish_install() {
     fi
 }
 
-# ── Parse args ────────────────────────────────────────────────────────
+# ── Uninstall ─────────────────────────────────────────────────────────
 
-# Repo smoke/publisher helpers source these definitions inside a subshell.
-# The downloaded installer remains one self-contained script.
-if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]]; then
-    return 0
-fi
+# Checks, then removes, the Runtime binary and every file a release installs.
+# Refuses a data directory that is a link, belongs to someone else or holds
+# HOME, and a release entry that is a link, so nothing outside is touched.
+uninstall_files() {
+    python3 - "$HOME" "$@" <<'PY_UNINSTALL'
+import fcntl
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
 
-ALLOW_UNSIGNED=false
+# What a release installs in the data directory: the Runtime writer's
+# destinations, its support roots, the release scripts, the Browser image set
+# and the Home update controller. Browser profiles live under Users/ and stay.
+RELEASE_FILES = ("bin", "capsules", "libexec", "tools", "scripts", "browser-vm/image-set",
+                 "model-catalog.json", "components.json", "sources.json", "installation",
+                 "update-controller")
+
+
+def lstat(path):
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
+def data_root(home, data_dir):
+    metadata = lstat(data_dir)
+    if metadata is None:
+        return False
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise OSError(f"{data_dir} is a link or a file, not the data directory; remove it by hand")
+    if metadata.st_uid != os.geteuid():
+        raise OSError(f"{data_dir} belongs to another user")
+    if os.path.basename(os.path.realpath(data_dir)) != "elastos":
+        raise OSError(f"{data_dir} is not an ElastOS data directory")
+    # Compare device and inode, not path text: aliases and case-insensitive
+    # volumes can name HOME or one of its parents differently.
+    identity = (metadata.st_dev, metadata.st_ino)
+    home, real_home = Path(home), Path(os.path.realpath(home))
+    for path in (home, *home.parents, real_home, *real_home.parents):
+        found = os.stat(path)
+        if (found.st_dev, found.st_ino) == identity:
+            raise OSError(f"{data_dir} is or contains your home directory")
+    return True
+
+
+def release_entries(data_dir):
+    entries = []
+    for name in RELEASE_FILES:
+        # Check every component, so a linked parent is never followed.
+        path, metadata = data_dir, None
+        for part in Path(name).parts:
+            path = path / part
+            metadata = lstat(path)
+            if metadata is None:
+                break
+            if stat.S_ISLNK(metadata.st_mode):
+                raise OSError(f"{path} is a link; remove it by hand")
+        if metadata is None:
+            continue
+        entries.append((data_dir / name, stat.S_ISDIR(metadata.st_mode)))
+    return entries
+
+
+def uninstall(home, mode, install_dir, data_dir, remove_data):
+    binary = install_dir / "elastos"
+    metadata = lstat(binary)
+    if metadata is not None and stat.S_ISDIR(metadata.st_mode):
+        raise OSError(f"{binary} is a directory, not the Runtime")
+    has_data = data_root(home, data_dir)
+    entries = release_entries(data_dir) if has_data else []
+    if mode == "check":
+        return
+    lock = install_dir / ".elastos.install.lock"
+    if install_dir.is_dir():
+        # The same lock as the Runtime's installation writer.
+        descriptor = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise OSError("an install or update is running; retry after it finishes")
+        if lstat(install_dir / ".elastos.update-journal.json") is not None:
+            raise OSError("an install or update was interrupted; run install.sh again to restore it")
+    binary.unlink(missing_ok=True)
+    # rmtree removes links inside a tree without following them.
+    if has_data and remove_data:
+        shutil.rmtree(data_dir)
+        entries = []
+    for path, is_dir in entries:
+        if is_dir:
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    lock.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    try:
+        uninstall(sys.argv[1], sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]), sys.argv[5] == "true")
+    except OSError as error:
+        print("Uninstall stopped: " + str(error), file=sys.stderr)
+        sys.exit(1)
+PY_UNINSTALL
+}
+
+# The data directory (identity, wallets, recovery material, user files) stays
+# unless removal is requested, so a later install continues with the same identity.
+uninstall_installation() {
+    local install_dir="$1" remove_data="$2" data_dir binary
+    [[ "$install_dir" == /* ]] || install_dir="${PWD}/${install_dir}"
+    data_dir="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
+    binary="${install_dir}/elastos"
+    if [[ ! -e "$binary" && ! -L "$binary" && ! -e "$data_dir" && ! -L "$data_dir" ]]; then
+        ok "No ElastOS installation found"
+        return 0
+    fi
+    command -v python3 &>/dev/null || die "Required tool not found: python3"
+    uninstall_files check "$install_dir" "$data_dir" "$remove_data" \
+        || die "Nothing was stopped or removed"
+    info "Stopping this installation's verified Runtime processes..."
+    installer_runtime_control "$data_dir" "$binary" true \
+        || die "Close this installation's Runtime and retry; nothing was removed"
+    if [[ "$remove_data" == true ]]; then
+        warn "Deleting $(display_path "$data_dir"): your identity, wallets, recovery material and files"
+        warn "Only your Recovery Kit can restore this identity afterwards"
+    fi
+    uninstall_files remove "$install_dir" "$data_dir" "$remove_data" \
+        || die "Uninstall did not finish; run it again after fixing the reason above"
+    ok "Removed the Runtime and its components"
+    if [[ "$remove_data" == true ]]; then
+        ok "Deleted the data directory"
+    else
+        ok "Kept your data in $(display_path "$data_dir")"
+        info "Installing again continues with the same identity. To delete the data too, run the uninstall again with --remove-data."
+    fi
+}
+
+# ── Main ──────────────────────────────────────────────────────────────
+
+# Every action runs inside main, called on the last line, so `curl | bash`
+# acts only after bash has read the whole script. Repo smoke/publisher
+# helpers source this file for its definitions only.
+main() {
+ISOLATED=false
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_ONLY="${ELASTOS_INSTALL_ONLY:-false}"
+UNINSTALL=false
+REMOVE_DATA=false
+INSTALL_STARTED_AT=$SECONDS
+installer_select_output
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) show_help ;;
-        --head-cid)
-            [[ -z "${2:-}" ]] && die "Usage: --head-cid CID"
-            HEAD_CID="$2"; shift 2 ;;
         --maintainer-did)
             [[ -z "${2:-}" ]] && die "Usage: --maintainer-did did:key:z6Mk..."
             MAINTAINER_DID="$2"; shift 2 ;;
-        --gateway)
-            [[ -z "${2:-}" ]] && die "Usage: --gateway https://<gateway>"
-            gw="${2%/}"
-            gw="${gw%/ipfs}"
-            CLI_GATEWAYS+=("$gw"); shift 2 ;;
         --publisher-gateway)
             [[ -z "${2:-}" ]] && die "Usage: --publisher-gateway https://<url>"
             PUBLISHER_GATEWAY="${2%/}"; shift 2 ;;
-        --publisher-node-id)
-            [[ -z "${2:-}" ]] && die "Usage: --publisher-node-id <node-id>"
-            PUBLISHER_NODE_ID="$2"; PUBLISHER_NODE_ID_EXPLICIT=true; shift 2 ;;
         --install-only) INSTALL_ONLY=true; shift ;;
-        --allow-unsigned) ALLOW_UNSIGNED=true; shift ;;
+        --isolated) ISOLATED=true; shift ;;
+        --uninstall) UNINSTALL=true; shift ;;
+        --remove-data) REMOVE_DATA=true; shift ;;
         --install-dir)
             [[ -z "${2:-}" ]] && die "Usage: --install-dir PATH"
             INSTALL_DIR="$2"; shift 2 ;;
@@ -810,45 +1140,36 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$REMOVE_DATA" == true && "$UNINSTALL" != true ]]; then
+    die "--remove-data deletes your data and works only with --uninstall"
+fi
+if [[ "$UNINSTALL" == true ]]; then
+    uninstall_installation "$INSTALL_DIR" "$REMOVE_DATA"
+    exit 0
+fi
+
+if [[ "$INSTALL_ONLY" == true || "$INSTALL_ONLY" == 1 ]]; then
+    INSTALLER_STEPS=4
+fi
+
+show_banner
+step 1 "Check this computer"
 detect_platform
-info "Platform: ${PLATFORM}"
+ok "Platform: $(platform_label "$PLATFORM") (${PLATFORM})"
 
 validate_explicit_source_bootstrap_pair
 
-if [[ ${#CLI_GATEWAYS[@]} -gt 0 ]]; then
-    GATEWAYS=("${CLI_GATEWAYS[@]}")
-elif [[ -n "${ELASTOS_IPFS_GATEWAYS:-}" ]]; then
-    GATEWAYS=()
-    IFS=', ' read -r -a ENV_GATEWAYS <<< "${ELASTOS_IPFS_GATEWAYS}"
-    for gw in ${ENV_GATEWAYS[@]+"${ENV_GATEWAYS[@]}"}; do
-        [[ -z "$gw" ]] && continue
-        gw="${gw%/}"
-        gw="${gw%/ipfs}"
-        GATEWAYS+=("$gw")
-    done
+if [[ -z "$PUBLISHER_GATEWAY" ]]; then
+    die "No bootstrap publisher URL configured. Use the canonical publisher install URL."
 fi
+PG="${PUBLISHER_GATEWAY%/}"
 
-# Prepend bootstrap publisher URL if available (it also serves /ipfs/<cid>/)
-if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-    if [[ ${#GATEWAYS[@]} -gt 0 ]]; then
-        GATEWAYS=("${PUBLISHER_GATEWAY%/}" "${GATEWAYS[@]}")
-    else
-        GATEWAYS=("${PUBLISHER_GATEWAY%/}")
-    fi
+if [[ -z "$MAINTAINER_DID" ]]; then
+    die "MAINTAINER_DID not set. Either:\n  1. Set ELASTOS_MAINTAINER_DID env var, or\n  2. Pass --maintainer-did <did:key:...>."
 fi
-
-if [[ -z "$PUBLISHER_GATEWAY" && ${#GATEWAYS[@]} -eq 0 ]]; then
-    die "No bootstrap publisher URL configured and no explicit IPFS gateways provided.\n  Use the canonical publisher install URL, or pass --gateway <url> for operator/debug bootstrap."
-fi
-
-# ── Validate trust anchors ────────────────────────────────────────────
-
-if [[ -z "$HEAD_CID" && -z "$PUBLISHER_GATEWAY" ]]; then
-    die "No bootstrap publisher URL and no HEAD_CID. Either:\n  1. Set ELASTOS_PUBLISHER_GATEWAY env var, or\n  2. Set ELASTOS_HEAD_CID env var, or\n  3. Pass --head-cid <CID>."
-fi
-
-if [[ "$ALLOW_UNSIGNED" != true && -z "$MAINTAINER_DID" ]]; then
-    die "MAINTAINER_DID not set. Either:\n  1. Set ELASTOS_MAINTAINER_DID env var, or\n  2. Pass --maintainer-did <did:key:...>.\n  For unsigned install: pass --allow-unsigned"
+# The DID reaches the terminal before its signature check, so only base58 did:key text passes.
+if [[ ! "$MAINTAINER_DID" =~ ^did:key:z[1-9A-HJ-NP-Za-km-z]{1,128}$ ]]; then
+    die "MAINTAINER_DID must be a did:key value (did:key:z6Mk...)."
 fi
 
 # ── Preflight ─────────────────────────────────────────────────────────
@@ -856,240 +1177,215 @@ fi
 for cmd in curl python3; do
     command -v "$cmd" &>/dev/null || die "Required tool not found: $cmd"
 done
+# A Mac without Command Line Tools has only a python3 stub that cannot run.
+if ! python3 -c '' </dev/null &>/dev/null; then
+    if [[ "$PLATFORM" == *-darwin ]]; then
+        die "This Mac needs Apple's Command Line Tools for python3. Run: xcode-select --install, then run the installer again."
+    fi
+    die "python3 is installed but does not run. Repair python3, then run the installer again."
+fi
 
 if ! command -v sha256sum &>/dev/null && ! command -v shasum &>/dev/null; then
     die "Neither sha256sum nor shasum found"
 fi
+ok "Tools: curl, python3 and SHA-256 are available"
 
-echo ""
-echo -e "${BOLD}ElastOS Installer${NC}"
-echo ""
+DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
+PREVIOUS_VERSION="$(installed_version "$DATA_DIR")"
+EXISTING_INSTALL=false
+if [[ -n "$PREVIOUS_VERSION" ]]; then
+    EXISTING_INSTALL=true
+    ok "Existing installation: ElastOS ${PREVIOUS_VERSION}"
+elif [[ -e "${INSTALL_DIR}/elastos" || -e "${DATA_DIR}/sources.json" ]]; then
+    EXISTING_INSTALL=true
+    ok "Existing installation found"
+else
+    ok "Fresh install: no ElastOS installation found"
+fi
+
+FREE_MB="$(free_space_mb "$DATA_DIR" || true)"
+if [[ "$FREE_MB" =~ ^[0-9]+$ ]]; then
+    if (( FREE_MB < 1024 )); then
+        ok "Disk: ${FREE_MB} MB free"
+    else
+        ok "Disk: $((FREE_MB / 1024)) GB free"
+    fi
+fi
+
+# ── Admit the installation directories before any download or write ──
+
+[[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="${PWD}/${INSTALL_DIR}"
+
+# The installation writer refuses directories others can write. Check the real
+# directory, as the writer does after resolving symlinks; say how to fix it and
+# leave it unchanged.
+require_safe_existing_dir() {
+    local dir="$1" real
+    [[ -e "$dir" || -L "$dir" ]] || return 0
+    [[ -d "$dir" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$dir") is not a directory"
+    real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve installation directory: $(printf '%q' "$dir")"
+    [[ -O "$real" ]] || die_exact "Unsafe installation directory: $(printf '%q' "$real") is not owned by you; fix with: sudo chown \"\$(id -u)\" $(printf '%q' "$real")"
+    if [[ -n "$(find "$real" -maxdepth 0 \( -perm -g+w -o -perm -o+w \))" ]]; then
+        die_exact "Unsafe installation directory: $(printf '%q' "$real") is group- or world-writable; fix with: chmod go-w $(printf '%q' "$real")"
+    fi
+}
+# The runtime also refuses media tools under a parent others can write, such
+# as a group-writable ~/.local. Apply that rule to every existing ancestor of
+# the data directory now, before any download: owned by you or root, and not
+# group- or world-writable.
+dir_owner_mode() {
+    # GNU stat -f reports the filesystem, so pick the syntax by what works.
+    if stat -c '%u %a' / >/dev/null 2>&1; then
+        stat -c '%u %a' -- "$1"
+    else
+        stat -f '%u %Lp' -- "$1"
+    fi
+}
+require_safe_parent_chain() {
+    local dir="$1" real owner mode quoted
+    while [[ ! -e "$dir" && "$dir" != "/" ]]; do dir="$(dirname -- "$dir")"; done
+    real="$(cd -P -- "$dir" && pwd -P)" || die_exact "Cannot resolve directory: $(printf '%q' "$dir")"
+    while :; do
+        read -r owner mode < <(dir_owner_mode "$real") || die_exact "Cannot inspect directory: $(printf '%q' "$real")"
+        quoted="$(printf '%q' "$real")"
+        if [[ "$owner" != 0 && "$owner" != "$(id -u)" ]]; then
+            die_exact "Unsafe parent directory: $quoted is not owned by you; fix with: sudo chown \"\$(id -u)\" $quoted"
+        fi
+        if (( 8#$mode & 8#022 )); then
+            if [[ "$owner" == 0 && "$(id -u)" != 0 ]]; then
+                die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: sudo chmod go-w $quoted"
+            fi
+            die_exact "Unsafe parent directory: $quoted is group- or world-writable; fix with: chmod go-w $quoted"
+        fi
+        [[ "$real" != "/" ]] || break
+        real="$(dirname -- "$real")"
+    done
+}
+require_safe_existing_dir "$INSTALL_DIR"
+require_safe_existing_dir "$DATA_DIR"
+require_safe_parent_chain "$DATA_DIR"
 
 # ── Fetch + verify release head ──────────────────────────────────────
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+step 2 "Verify the release"
+info "Maintainer DID: ${MAINTAINER_DID}"
 
-# Publisher gateway is the source of truth. No fallback.
-if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-    PG="${PUBLISHER_GATEWAY%/}"
-    info "Fetching release head from ${PG}"
-    curl -fsSL --max-time 30 -o "${TMPDIR}/release-head.json" "${PG}/release-head.json" \
-        || die "Publisher gateway unreachable: ${PG}/release-head.json"
-else
-    # No bootstrap publisher URL — use CID-based fetch (operator/debug bootstrap only)
-    [[ -z "$HEAD_CID" ]] && die "No bootstrap publisher URL and no HEAD_CID configured"
-    info "Fetching release head by CID: ${HEAD_CID} (bootstrap mode)"
-    ipfs_fetch "$HEAD_CID" "${TMPDIR}/release-head.json"
-fi
+INSTALL_SCRATCH=$(mktemp -d)
+trap 'rm -rf "$INSTALL_SCRATCH"' EXIT
 
-HEAD_SCHEMA=$(json_get "${TMPDIR}/release-head.json" 'd["payload"]["schema"]') \
+info "Fetching release head from ${PG}"
+fetch_url -fsSL --max-time 30 -o "${INSTALL_SCRATCH}/release-head.json" "${PG}/release-head.json" \
+    || die "Publisher gateway unreachable: ${PG}/release-head.json"
+
+HEAD_SCHEMA=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"]["schema"]') \
     || die "Invalid release-head.json format"
 [[ "$HEAD_SCHEMA" != "elastos.release.head/v1" ]] && \
     die "Unexpected head schema: ${HEAD_SCHEMA}"
 
 info "Verifying release head signature..."
-verify_signature "${TMPDIR}/release-head.json" "elastos.release.head.v1" "$MAINTAINER_DID"
+verify_signature "${INSTALL_SCRATCH}/release-head.json" "elastos.release.head.v1" "$MAINTAINER_DID"
 
-RELEASE_CID=$(json_get "${TMPDIR}/release-head.json" 'd["payload"]["latest_release_cid"]')
-RELEASE_VERSION=$(json_get "${TMPDIR}/release-head.json" 'd["payload"]["version"]')
-RELEASE_CHANNEL=$(json_get "${TMPDIR}/release-head.json" 'd["payload"].get("channel","stable")')
+RELEASE_CID=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"]["latest_release_cid"]')
+RELEASE_VERSION=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"]["version"]')
+RELEASE_CHANNEL=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["payload"].get("channel","stable")')
 if ! is_allowed_channel "$RELEASE_CHANNEL"; then
     die "Unsupported release channel '${RELEASE_CHANNEL}' in release-head.json. Allowed channels: ${ALLOWED_CHANNELS[*]}"
 fi
-info "Version: ${RELEASE_VERSION}"
+ok "Release: ElastOS ${RELEASE_VERSION} (${RELEASE_CHANNEL}), signed by $(short_did "$MAINTAINER_DID")"
+if [[ "$PREVIOUS_VERSION" == "$RELEASE_VERSION" ]]; then
+    info "Reinstalling the installed version"
+elif [[ -n "$PREVIOUS_VERSION" ]]; then
+    info "Update: ${PREVIOUS_VERSION} → ${RELEASE_VERSION}"
+fi
 
 # ── Fetch + verify release.json ──────────────────────────────────────
 
-if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-    info "Fetching release bootstrap metadata from publisher URL"
-    curl -fsSL --max-time 30 -o "${TMPDIR}/release.json" "${PG}/release.json" \
-        || die "Publisher gateway unreachable: ${PG}/release.json"
-else
-    info "Fetching release by CID: ${RELEASE_CID} (bootstrap mode)"
-    ipfs_fetch "$RELEASE_CID" "${TMPDIR}/release.json"
-fi
+info "Fetching release bootstrap metadata from publisher URL"
+fetch_url -fsSL --max-time 30 -o "${INSTALL_SCRATCH}/release.json" "${PG}/release.json" \
+    || die "Publisher gateway unreachable: ${PG}/release.json"
 
-RELEASE_SCHEMA=$(json_get "${TMPDIR}/release.json" 'd["payload"]["schema"]') \
+RELEASE_SCHEMA=$(json_get "${INSTALL_SCRATCH}/release.json" 'd["payload"]["schema"]') \
     || die "Invalid release.json format"
 [[ "$RELEASE_SCHEMA" != "elastos.release/v1" ]] && \
     die "Unexpected release schema: ${RELEASE_SCHEMA}"
 
 info "Verifying release signature..."
-verify_signature "${TMPDIR}/release.json" "elastos.release.v1" "$MAINTAINER_DID"
-validate_release_identity "${TMPDIR}/release-head.json" "${TMPDIR}/release.json"
+verify_signature "${INSTALL_SCRATCH}/release.json" "elastos.release.v1" "$MAINTAINER_DID"
+validate_release_identity "${INSTALL_SCRATCH}/release-head.json" "${INSTALL_SCRATCH}/release.json"
 
 # ── Extract platform info ────────────────────────────────────────────
 
-BINARY_CID=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['cid']")
-BINARY_SHA256=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['sha256']")
-COMPONENTS_CID=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['components']['cid']")
-COMPONENTS_SHA256=$(json_get "${TMPDIR}/release.json" "d['payload']['platforms']['${PLATFORM}']['components']['sha256']")
+BINARY_CID=$(json_get "${INSTALL_SCRATCH}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['cid']")
+BINARY_SHA256=$(json_get "${INSTALL_SCRATCH}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['sha256']")
+BINARY_SIZE=$(json_get "${INSTALL_SCRATCH}/release.json" "d['payload']['platforms']['${PLATFORM}']['binary']['size']")
 
 if [[ -z "$BINARY_CID" ]]; then
-    AVAILABLE=$(json_get "${TMPDIR}/release.json" "', '.join(d['payload'].get('platforms',{}).keys())")
+    AVAILABLE=$(json_get "${INSTALL_SCRATCH}/release.json" "', '.join(d['payload'].get('platforms',{}).keys())")
     die "No release available for platform: ${PLATFORM}\n  Available: ${AVAILABLE:-none}"
 fi
 
 # ── Download + verify binary ─────────────────────────────────────────
 
-if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-    info "Downloading binary from bootstrap publisher URL"
-    CURL_BINARY_FLAGS=(-fL)
-    if [[ -t 2 ]]; then
-        CURL_BINARY_FLAGS+=(--progress-bar)
-    else
-        CURL_BINARY_FLAGS+=(-sS)
-    fi
-    curl "${CURL_BINARY_FLAGS[@]}" \
-        --retry "${BINARY_DOWNLOAD_RETRY_COUNT}" \
-        --retry-all-errors \
-        --retry-delay "${BINARY_DOWNLOAD_RETRY_DELAY}" \
-        --connect-timeout "${BINARY_DOWNLOAD_CONNECT_TIMEOUT}" \
-        --speed-limit "${BINARY_DOWNLOAD_SPEED_LIMIT}" \
-        --speed-time "${BINARY_DOWNLOAD_SPEED_TIME}" \
-        --max-time "${BINARY_DOWNLOAD_MAX_TIME}" \
-        -o "${TMPDIR}/elastos" "${PG}/artifacts/elastos-${PLATFORM}" \
-        || die "Failed to download binary from ${PG}/artifacts/elastos-${PLATFORM}"
-else
-    info "Downloading binary by CID: ${BINARY_CID} (bootstrap mode)"
-    ipfs_fetch "$BINARY_CID" "${TMPDIR}/elastos"
+step 3 "Download ElastOS Runtime"
+require_install_space "$INSTALL_SCRATCH" "$BINARY_SIZE"
+BINARY_SIZE_LABEL=""
+if [[ "$BINARY_SIZE" =~ ^[0-9]+$ ]] && (( BINARY_SIZE >= 1048576 )); then
+    BINARY_SIZE_LABEL=" ($((BINARY_SIZE / 1048576)) MB)"
 fi
+
+info "Downloading binary${BINARY_SIZE_LABEL} from ${PG}"
+CURL_BINARY_FLAGS=(-fL)
+if [[ -t 2 ]]; then
+    CURL_BINARY_FLAGS+=(--progress-bar)
+else
+    CURL_BINARY_FLAGS+=(-sS)
+fi
+fetch_url "${CURL_BINARY_FLAGS[@]}" \
+    --retry "${BINARY_DOWNLOAD_RETRY_COUNT}" \
+    --retry-all-errors \
+    --retry-delay "${BINARY_DOWNLOAD_RETRY_DELAY}" \
+    --connect-timeout "${BINARY_DOWNLOAD_CONNECT_TIMEOUT}" \
+    --speed-limit "${BINARY_DOWNLOAD_SPEED_LIMIT}" \
+    --speed-time "${BINARY_DOWNLOAD_SPEED_TIME}" \
+    -o "${INSTALL_SCRATCH}/elastos" "${PG}/artifacts/elastos-${PLATFORM}" \
+    || die "Failed to download binary from ${PG}/artifacts/elastos-${PLATFORM}"
 
 info "Verifying binary SHA-256..."
-sha256_check "${TMPDIR}/elastos" "$BINARY_SHA256"
+sha256_check "${INSTALL_SCRATCH}/elastos" "$BINARY_SHA256"
 
-# ── Download + verify components.json ────────────────────────────────
+# ── Admit the verified release with the shared installation writer ──
 
-if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-    info "Downloading components.json from bootstrap publisher URL"
-    curl -fsSL --max-time 30 -o "${TMPDIR}/components.json" "${PG}/artifacts/components-${PLATFORM}.json" \
-        || die "Failed to download components from ${PG}/artifacts/components-${PLATFORM}.json"
-else
-    info "Downloading components.json by CID: ${COMPONENTS_CID} (bootstrap mode)"
-    ipfs_fetch "$COMPONENTS_CID" "${TMPDIR}/components.json"
-fi
-
-info "Verifying components.json SHA-256..."
-sha256_check "${TMPDIR}/components.json" "$COMPONENTS_SHA256"
-
-# ── Download + verify the pinned model catalog ───────────────────────
-# The verified components.json names the catalog head. Every advertised file
-# is staged and verified here; nothing running or installed changes before.
-
-CATALOG_HEAD=$(json_get "${TMPDIR}/components.json" '(d.get("model_catalog") or {}).get("head_cid")')
-if [[ -n "$CATALOG_HEAD" ]]; then
-    if [[ -n "$PUBLISHER_GATEWAY" ]]; then
-        info "Downloading model catalog from bootstrap publisher URL"
-        curl -fsSL --max-time 30 -o "${TMPDIR}/model-catalog.json" "${PG}/artifacts/model-catalog.json" \
-            || die "Failed to download model catalog from ${PG}/artifacts/model-catalog.json; the current installation was preserved"
-    else
-        info "Downloading model catalog by CID: ${CATALOG_HEAD} (bootstrap mode)"
-        ipfs_fetch "$CATALOG_HEAD" "${TMPDIR}/model-catalog.json"
-    fi
-    info "Verifying model catalog head ${CATALOG_HEAD}..."
-    CATALOG_HEAD="$CATALOG_HEAD" python3 - "${TMPDIR}/model-catalog.json" <<'PY' \
-        || die "Downloaded model catalog does not match the pin in components.json; the current installation was preserved"
-import base64
-import hashlib
-import os
-import pathlib
-import sys
-
-data = pathlib.Path(sys.argv[1]).read_bytes()
-expected = os.environ["CATALOG_HEAD"]
-head = "b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest()).decode("ascii").lower().rstrip("=")
-if head != expected:
-    raise SystemExit(f"model catalog head {head} does not match pin {expected}")
-PY
-fi
-
-# ── Install (2 files) ────────────────────────────────────────────────
-
-DATA_DIR="$(installer_data_dir "$HOME" "${XDG_DATA_HOME:-}")"
-info "Stopping verified Runtime processes for this installation before its protected-root check..."
-installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
-    || die "Close this installation's Runtime and retry; its existing files were preserved"
-info "Open Home again after installation to reconnect."
-
-info "Installing binary to ${INSTALL_DIR}/elastos..."
-mkdir -p "$INSTALL_DIR"
-TMP_INSTALL_BIN="${INSTALL_DIR}/.elastos.install.tmp"
-cp "${TMPDIR}/elastos" "${TMP_INSTALL_BIN}"
-chmod +x "${TMP_INSTALL_BIN}"
-
-# The staged executable must run and report the release version before it
-# replaces the current binary. A refusal removes only this staged copy.
-STAGED_VERSION_STATUS=0
-STAGED_VERSION_OUTPUT="$("${TMP_INSTALL_BIN}" --version 2>&1)" || STAGED_VERSION_STATUS=$?
-if [[ "${STAGED_VERSION_STATUS}" -ne 0 ]]; then
-    rm -f "${TMP_INSTALL_BIN}"
-    die "Downloaded binary failed its version check (exit ${STAGED_VERSION_STATUS}); the current installation was preserved\n  Output: ${STAGED_VERSION_OUTPUT:-<no output>}"
-fi
-if ! printf '%s' "${STAGED_VERSION_OUTPUT}" | grep -Fq "${RELEASE_VERSION}"; then
-    rm -f "${TMP_INSTALL_BIN}"
-    die "Downloaded binary version mismatch; the current installation was preserved\n  Expected: ${RELEASE_VERSION}\n  Got:      ${STAGED_VERSION_OUTPUT:-<no output>}"
-fi
-mv -f "${TMP_INSTALL_BIN}" "${INSTALL_DIR}/elastos"
+# Directories created here are 0755 whatever the caller's umask.
+(umask 022; mkdir -p "$INSTALL_DIR")
 
 # New Runtime data is private; preserve the mode of an existing installation.
 (umask 077; mkdir -p "$DATA_DIR")
 
-# Evict stale cached capsules when components.json changes (CID mismatch).
-# This forces the supervisor to re-download updated capsule binaries on demand.
-OLD_COMPONENTS="${DATA_DIR}/components.json"
-if [[ -f "$OLD_COMPONENTS" ]]; then
-    CHANGED_CAPSULES=$(python3 - "$OLD_COMPONENTS" "${TMPDIR}/components.json" <<'PY'
-import json, sys
-try:
-    old = json.load(open(sys.argv[1]))
-    new = json.load(open(sys.argv[2]))
-    for name, entry in new.get("capsules", {}).items():
-        old_entry = old.get("capsules", {}).get(name, {})
-        if old_entry.get("cid") != entry.get("cid"):
-            print(name)
-except Exception:
-    pass
-PY
-    )
-    CAPSULE_CACHE="${DATA_DIR}/capsules"
-    for cname in $CHANGED_CAPSULES; do
-        if [[ -d "${CAPSULE_CACHE}/${cname}" ]]; then
-            info "Evicting stale capsule cache: ${cname}"
-            rm -rf "${CAPSULE_CACHE}/${cname}"
-        fi
-    done
+require_install_space "$INSTALL_DIR" "$BINARY_SIZE"
+TMP_INSTALL_BIN="$(mktemp "${INSTALL_DIR}/.elastos.install.XXXXXX")"
+trap 'rm -rf "$INSTALL_SCRATCH" "$TMP_INSTALL_BIN"' EXIT
+cp "${INSTALL_SCRATCH}/elastos" "${TMP_INSTALL_BIN}"
+chmod +x "${TMP_INSTALL_BIN}"
+
+# The staged executable must report the exact release version on stdout with
+# empty stderr before it can write this installation.
+STAGED_VERSION_STATUS=0
+STAGED_VERSION_STDERR_PATH="${INSTALL_SCRATCH}/elastos-version.stderr"
+STAGED_VERSION_OUTPUT="$("${TMP_INSTALL_BIN}" --version 2>"${STAGED_VERSION_STDERR_PATH}")" || STAGED_VERSION_STATUS=$?
+STAGED_VERSION_ERROR="$(cat "${STAGED_VERSION_STDERR_PATH}")"
+if [[ "${STAGED_VERSION_STATUS}" -ne 0 ]]; then
+    die "Downloaded binary failed its version check (exit ${STAGED_VERSION_STATUS}); the current installation was preserved\n  Output: ${STAGED_VERSION_OUTPUT:-<no output>}\n  Stderr: ${STAGED_VERSION_ERROR:-<no output>}"
 fi
-
-info "Installing components.json to ${DATA_DIR}/..."
-cp "${TMPDIR}/components.json" "${DATA_DIR}/components.json"
-
-if [[ -n "$CATALOG_HEAD" ]]; then
-    info "Installing signed model catalog ${CATALOG_HEAD} to ${DATA_DIR}/..."
-    (umask 077; cp "${TMPDIR}/model-catalog.json" "${DATA_DIR}/model-catalog.json")
-    chmod 600 "${DATA_DIR}/model-catalog.json"
+if [[ "${STAGED_VERSION_OUTPUT}" != "elastos ${RELEASE_VERSION}" || -s "${STAGED_VERSION_STDERR_PATH}" ]]; then
+    die "Downloaded binary version mismatch; the current installation was preserved\n  Expected: ${RELEASE_VERSION}\n  Got:      ${STAGED_VERSION_OUTPUT:-<no output>}\n  Stderr: ${STAGED_VERSION_ERROR:-<no output>}"
 fi
+ok "Checksum and version match the signed release"
 
-PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
-info "Verifying and upgrading configured protected roots while Runtime is stopped..."
-"${INSTALL_DIR}/elastos" principal-root-upgrade \
-    --data-dir "${DATA_DIR}" \
-    --backup-dir "${PRINCIPAL_ROOT_BACKUP_DIR}"
+# ── Carrier contact + release metadata for `elastos update` ─────────
 
-# ── Save Carrier contact + release metadata for `elastos upgrade` ────
+SIGNER_DID=$(json_get "${INSTALL_SCRATCH}/release-head.json" 'd["signer_did"]')
 
-refresh_source_bootstrap_from_publisher
-
-SIGNER_DID=$(json_get "${TMPDIR}/release-head.json" 'd["signer_did"]')
-
-SOURCES_PATH="${DATA_DIR}/sources.json"
-PUBLISHER_HASH=$(SIGNER_DID="${SIGNER_DID}" python3 - <<'PY'
-import hashlib
-import os
-publisher = os.environ["SIGNER_DID"]
-print(hashlib.sha256(publisher.encode("utf-8")).hexdigest()[:32])
-PY
-)
+SOURCES_PATH="${INSTALL_SCRATCH}/sources.json"
 PUBLISHER_DID="${SIGNER_DID}" \
 PUBLISHER_GATEWAY="${PUBLISHER_GATEWAY}" \
 INSTALLED_VERSION="${RELEASE_VERSION}" \
@@ -1143,14 +1439,41 @@ with open(os.environ["SOURCES_PATH"], "w", encoding="utf-8") as f:
     json.dump(sources, f, indent=2)
     f.write("\n")
 PY
-info "Saved trusted source config to ${DATA_DIR}/sources.json"
 
-PUBLISHER_ROOT="${DATA_DIR}/ElastOS/SystemServices/Publisher"
-mkdir -p "${PUBLISHER_ROOT}"
-cp "${TMPDIR}/release-head.json" "${PUBLISHER_ROOT}/release-head.json"
-cp "${TMPDIR}/release.json" "${PUBLISHER_ROOT}/release.json"
-info "Saved publisher metadata for future upgrades"
+# The writer refuses an older release, another channel, a pending Home
+# update and a concurrent writer before this installer stops Runtime.
+INSTALL_RELEASE=("${TMP_INSTALL_BIN}" install-release --data-dir "$DATA_DIR"
+    --binary "${INSTALL_DIR}/elastos" --candidate "${TMP_INSTALL_BIN}" "$SOURCES_PATH"
+    "${INSTALL_SCRATCH}/release-head.json" "${INSTALL_SCRATCH}/release.json")
+step 4 "Install"
+"${INSTALL_RELEASE[@]}" --check || die "This installation was not changed"
+
+info "Stopping verified Runtime processes for this installation so the new version can be installed..."
+installer_runtime_control "$DATA_DIR" "${INSTALL_DIR}/elastos" true \
+    || die "Close this installation's Runtime and retry; its existing files were preserved"
+if [[ "${EXISTING_INSTALL:-true}" == true ]]; then
+    info "Open Home again after installation to reconnect."
+fi
+
+# One journaled transaction replaces the Runtime, trusted sources and the
+# verified release pair; an interrupted run restores the previous set.
+info "Installing binary to $(display_path "${INSTALL_DIR}/elastos")..."
+"${INSTALL_RELEASE[@]}" || die "The previous installation was preserved"
+ok "Installed ElastOS ${RELEASE_VERSION} to $(display_path "${INSTALL_DIR}/elastos")"
+
+PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
+info "Verifying and upgrading configured protected roots while Runtime is stopped..."
+# The receipt stays in the backup directory; the terminal gets one line.
+"${INSTALL_DIR}/elastos" principal-root-upgrade \
+    --data-dir "${DATA_DIR}" \
+    --backup-dir "${PRINCIPAL_ROOT_BACKUP_DIR}" >/dev/null
+ok "Protected roots are ready"
+ok "Saved trusted source config to $(display_path "${DATA_DIR}/sources.json")"
+ok "Saved verified release inputs for Runtime setup and updates"
 
 # ── Complete installation ─────────────────────────────────────────────
 
 finish_install
+}
+
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then main "$@"; fi

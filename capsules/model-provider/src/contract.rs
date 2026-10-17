@@ -321,6 +321,14 @@ pub struct ProviderFault {
 }
 
 impl ProviderFault {
+    pub fn request_expired() -> Self {
+        Self {
+            code: elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE,
+            message: elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE,
+            detail: None,
+        }
+    }
+
     pub fn invalid_request(message: &'static str) -> Self {
         Self {
             code: "invalid_request",

@@ -337,6 +337,19 @@ fn model_provider_journal_dir(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join("journal")
 }
 
+/// Declare the installed component's engine read boundary for macOS startup.
+/// Activation still verifies its full receipt and payload closure before Init.
+#[cfg(target_os = "macos")]
+pub fn model_provider_engine_bundle(data_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let bytes = super::capsule_inventory::read_model_catalog_file(
+        data_dir,
+        "components.json",
+        4 * 1024 * 1024,
+    )?;
+    let manifest = serde_json::from_slice(&bytes)?;
+    crate::setup::local_model_engine_confinement_bundle(data_dir, &manifest)
+}
+
 pub fn model_provider_bridge_config(
     data_dir: &Path,
 ) -> anyhow::Result<provider::BridgeProviderConfig> {
@@ -375,7 +388,10 @@ pub fn model_provider_bridge_config(
 pub async fn model_provider_config(
     data_dir: &Path,
     registry: &provider::ProviderRegistry,
-) -> anyhow::Result<(provider::BridgeProviderConfig, Option<fs::File>)> {
+) -> anyhow::Result<(
+    provider::BridgeProviderConfig,
+    Option<crate::host_lock::FileLock>,
+)> {
     let config = model_provider_bridge_config(data_dir)?;
     #[cfg(unix)]
     {
@@ -1214,8 +1230,8 @@ pub(super) fn archive_hosted_egress_decision(
         );
         let volume = unsafe { volume.assume_init() };
         anyhow::ensure!(
-            u128::from(volume.f_bavail) * 10 >= u128::from(volume.f_blocks),
-            "hosted egress history disk reserve reached"
+            u128::from(volume.f_bavail) * u128::from(volume.f_frsize) >= bytes.len() as u128,
+            "not enough free space for the hosted egress history entry"
         );
     }
     let stage = directory.join(format!(
@@ -1434,6 +1450,12 @@ fn materialize_provider_offer(
         // a named offer and requests each external effect through Runtime.
         adapter.remove("api_key");
         adapter.remove("bearer_token");
+        if let Some(hosted) = adapter
+            .get_mut("hosted")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            hosted.remove("egress_contract");
+        }
     }
     apply_fixture_chat_url(fixtures, &mut offer);
     offer
@@ -1833,11 +1855,35 @@ fn read_model_provider_private_file(
 #[cfg(test)]
 mod hosted_hint_tests {
     use super::{
-        hosted_hint_from_offers, hosted_model_share_cards, hosted_offer, named_jev_hosted_offer,
+        hosted_hint_from_offers, hosted_model_share_cards, hosted_offer,
+        materialize_provider_offer, named_jev_hosted_offer,
         seed_model_provider_operator_offers_for_test, set_hosted_offer_share, status_from_offers,
         HostedAiProvider,
     };
     use serde_json::json;
+
+    #[test]
+    fn provider_init_omits_runtime_egress_contract() {
+        let offer = hosted_offer(
+            HostedAiProvider::OpenRouter,
+            "model:hosted-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Fixture",
+            "fixture/model",
+            None,
+        );
+        assert_eq!(
+            offer.pointer("/adapter/hosted/egress_contract"),
+            Some(&json!("connection-v1"))
+        );
+        let projected = materialize_provider_offer(offer.clone(), None);
+        assert!(projected
+            .pointer("/adapter/hosted/egress_contract")
+            .is_none());
+        assert_eq!(
+            offer.pointer("/adapter/hosted/egress_contract"),
+            Some(&json!("connection-v1"))
+        );
+    }
 
     #[test]
     fn hosted_hint_omits_urls_and_keys() {

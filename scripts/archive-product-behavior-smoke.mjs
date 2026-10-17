@@ -9,7 +9,8 @@ function assert(condition, message) {
   }
 }
 
-const source = readFileSync(resolve("capsules/archive-manager/browser/index.html"), "utf8");
+const source = readFileSync(resolve("capsules/archive-manager/browser/index.html"), "utf8") +
+  readFileSync(resolve("capsules/archive-manager/browser/archive-manager.js"), "utf8");
 const letterSpacingValues = [...source.matchAll(/letter-spacing:\s*([^;]+);/g)].map((match) => match[1].trim());
 
 assert(

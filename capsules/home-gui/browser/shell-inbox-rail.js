@@ -7,6 +7,7 @@ import {
 import {
   closeOtherShellPopovers,
   registerShellPopover,
+  registerStageLayer,
 } from "./shell-popovers.js?v=home-20260813a";
 import {
   iframeAllowForLaunch,
@@ -58,6 +59,7 @@ export function bindInboxRail() {
   }
   if (!registered) {
     registerShellPopover("inbox-rail", () => hideInboxRail({ restoreFocus: false }));
+    registerStageLayer("inbox-rail", { selector: "#inbox-rail", close: () => hideInboxRail({ restoreFocus: false }) });
     registered = true;
   }
   refreshButton?.addEventListener("click", () => {

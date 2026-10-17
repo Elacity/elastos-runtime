@@ -5,8 +5,10 @@
   "description": "Internal example service contract",
   "author": "example-publisher",
   "role": "provider",
-  "type": "microvm",
-  "entrypoint": "rootfs.ext4",
+  "type": "native-provider",
+  "runtime_abi": "elastos.provider-stdio/v1",
+  "execution": "native-provider",
+  "entrypoint": "example-provider",
   "provides": "elastos://example/*",
   "authority": {
     "reason": "Owns the narrow example service implementation behind Runtime policy.",

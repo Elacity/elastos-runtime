@@ -5,11 +5,12 @@ use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{ensure, Context as _};
 
 use super::PreparationInventory;
+use crate::host_lock::FileLock;
 
 const DIRECTORY: &CStr = c"model-preparation";
 const LOCK: &CStr = c"lock";
@@ -90,13 +91,56 @@ fn unlink_at(dir: &File, name: &CStr) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reads and validates state.json as last published. Publication renames a
+/// complete synced file over it, so an opened state file never changes.
+fn read_state(dir: &File) -> anyhow::Result<(PreparationInventory, Option<Stamp>)> {
+    let (state, original) = match optional_file(dir, STATE)? {
+        Some(mut file) => {
+            let before = stamp(&file.metadata()?);
+            let mut bytes = Vec::new();
+            (&mut file)
+                .take(MAX_STATE_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() as u64 <= MAX_STATE_BYTES && stamp(&file.metadata()?) == before,
+                "preparation state changed during read"
+            );
+            (
+                serde_json::from_slice::<PreparationInventory>(&bytes)?,
+                Some(before),
+            )
+        }
+        None => (PreparationInventory::default(), None),
+    };
+    state.validate()?;
+    Ok((state, original))
+}
+
+/// The last durably saved inventory, read without the inventory lock.
+/// Status reads use it so a download's progress saves never make them wait
+/// or fail. Any change still takes the lock and reloads.
+pub(super) fn saved_inventory(data_path: &Path) -> anyhow::Result<PreparationInventory> {
+    let data = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(data_path)?;
+    check_directory(&data.metadata()?, false)?;
+    let dir = open_at(&data, DIRECTORY, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    check_directory(&dir.metadata()?, true)?;
+    // Refuse the same unsafe lock and temporary shapes a locked read refuses.
+    check_file(&open_at(&dir, LOCK, libc::O_RDONLY)?.metadata()?, 0)?;
+    let state = read_state(&dir)?.0;
+    let _ = optional_file(&dir, NEXT)?;
+    Ok(state)
+}
+
 // This lock protects exactly one bounded inventory snapshot. Separate opens
-// contend across both processes and threads; dropping the fd releases flock.
+// contend across both processes and threads; dropping the guard releases flock.
 pub(super) struct Inventory {
     data_path: PathBuf,
     data: File,
     dir: File,
-    lock: File,
+    lock: FileLock,
     loaded: RefCell<Option<Option<Stamp>>>,
 }
 
@@ -130,19 +174,12 @@ impl Inventory {
             libc::O_RDWR | if create { libc::O_CREAT } else { 0 },
         )?;
         check_file(&lock.metadata()?, 0)?;
-        // Snapshot readers and progress writers share this short transaction
-        // lock. Ordinary contention must not terminate the preparation worker.
-        // Keep the wait bounded; the separate worker lock still rejects a
-        // competing preparation immediately.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if error.kind() != std::io::ErrorKind::WouldBlock || remaining.is_zero() {
-                return Err(error).context("preparation inventory busy");
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(5)));
-        }
+        // Writers and checked snapshots share this short transaction lock.
+        // Ordinary contention must not terminate the preparation worker. Keep
+        // the wait bounded; the separate worker lock still rejects a competing
+        // preparation immediately. Status reads use `saved_inventory` instead.
+        let lock = FileLock::exclusive_within(lock, Duration::from_secs(1))
+            .context("preparation inventory busy")?;
         let result = Self {
             data_path: data_path.into(),
             data,
@@ -194,30 +231,12 @@ impl Inventory {
 
     pub(super) fn snapshot(&self) -> anyhow::Result<PreparationInventory> {
         self.revalidate()?;
-        let file = optional_file(&self.dir, STATE)?;
-        let (state, original) = if let Some(mut file) = file {
-            let before = stamp(&file.metadata()?);
-            let mut bytes = Vec::new();
-            (&mut file)
-                .take(MAX_STATE_BYTES + 1)
-                .read_to_end(&mut bytes)?;
-            ensure!(
-                bytes.len() as u64 <= MAX_STATE_BYTES && stamp(&file.metadata()?) == before,
-                "preparation state changed during read"
-            );
-            (
-                serde_json::from_slice::<PreparationInventory>(&bytes)?,
-                Some(before),
-            )
-        } else {
-            (PreparationInventory::default(), None)
-        };
-        state.validate()?;
+        let (state, original) = read_state(&self.dir)?;
         for entry in std::fs::read_dir(self.data_path.join("model-preparation"))? {
             let name = entry?.file_name();
             if name == "stage" {
                 ensure!(
-                    state.records.iter().any(|r| r.active()),
+                    state.records.iter().any(|r| r.active()) || state.kept_stage.is_some(),
                     "unowned preparation stage"
                 );
             } else if let Some(id) = name.to_str().and_then(|n| n.strip_prefix("admitted-")) {
@@ -270,6 +289,23 @@ impl Inventory {
     }
 
     pub(super) fn save(&self, state: &PreparationInventory) -> anyhow::Result<()> {
+        self.save_checked(state, false)
+    }
+
+    /// The activation composer verifies the current signed engine and complete
+    /// admitted package before replacing only the owner's engine binding.
+    pub(super) fn save_engine_replacements(
+        &self,
+        state: &PreparationInventory,
+    ) -> anyhow::Result<()> {
+        self.save_checked(state, true)
+    }
+
+    fn save_checked(
+        &self,
+        state: &PreparationInventory,
+        engine_replacements: bool,
+    ) -> anyhow::Result<()> {
         state.validate()?;
         let bytes = serde_json::to_vec(state)?;
         ensure!(
@@ -278,13 +314,36 @@ impl Inventory {
         );
         self.check_loaded()?;
         let previous = self.snapshot()?;
+        ensure!(
+            state.pruned_issued_floor_ms >= previous.pruned_issued_floor_ms,
+            "preparation replay floor moved backwards"
+        );
         for owner in previous.records.iter().filter(|r| r.activation.is_some()) {
+            let next = state
+                .records
+                .iter()
+                .find(|r| r.operation_id == owner.operation_id)
+                .context("original activation owner missing")?;
+            let replacement = if engine_replacements
+                && owner.state == super::PreparationState::Admitted
+                && next.state == super::PreparationState::Admitted
+                && owner.package_cid == next.package_cid
+                && owner.admission_id == next.admission_id
+                && next.activation_pending
+            {
+                match (&owner.activation, &next.activation) {
+                    (Some(old), Some(new)) => {
+                        old.check_root(&self.data_path, owner)?;
+                        new.check_root(&self.data_path, next)?;
+                        new.engine_successor_of(old)
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
             ensure!(
-                state
-                    .records
-                    .iter()
-                    .any(|r| r.operation_id == owner.operation_id
-                        && r.activation == owner.activation),
+                next.activation == owner.activation || replacement,
                 "original activation binding changed"
             );
         }
@@ -378,7 +437,7 @@ impl Inventory {
 
     pub(super) fn space_fits(&self, reserved_bytes: u64) -> anyhow::Result<bool> {
         let (capacity, available, required) = space_observation(&self.dir, reserved_bytes)?;
-        space_floor_fits(capacity, available, required)
+        reservation_fits(capacity, available, required)
     }
 
     pub(super) fn volume(&self) -> anyhow::Result<u64> {
@@ -387,13 +446,10 @@ impl Inventory {
 
     // This same-inventory lock outlives short snapshot transactions. Status
     // and cancellation remain available while a worker awaits provider drain.
-    pub(super) fn worker_lock(&self) -> anyhow::Result<File> {
+    pub(super) fn worker_lock(&self) -> anyhow::Result<FileLock> {
         let file = open_at(&self.dir, c"worker", libc::O_RDWR | libc::O_CREAT)?;
         check_file(&file.metadata()?, 0)?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("preparation worker busy");
-        }
-        Ok(file)
+        FileLock::try_exclusive(file).context("preparation worker busy")
     }
 
     pub(super) fn stage(&self, create: bool) -> anyhow::Result<Stage> {
@@ -405,6 +461,15 @@ impl Inventory {
             self.dir.sync_all()?;
         }
         self.directory(c"stage")
+    }
+
+    /// Bytes held by the stage, zero when there is none.
+    pub(super) fn stage_bytes(&self) -> anyhow::Result<u64> {
+        match self.stage(false) {
+            Ok(stage) => stage.tree_bytes(&mut 300),
+            Err(err) if missing(&err) => Ok(0),
+            Err(err) => Err(err),
+        }
     }
 
     fn directory(&self, name: &CStr) -> anyhow::Result<Stage> {
@@ -570,6 +635,25 @@ impl Stage {
         Ok(file)
     }
 
+    /// Reopen a file an earlier preparation left in this stage, for reading
+    /// and appending. `None` when it was never created. The same ownership,
+    /// mode and link checks as a new file apply, and a symlink is refused.
+    pub(super) fn open_partial(&self, path: &str) -> anyhow::Result<Option<File>> {
+        let (dir, name) = match self.parent(path, false) {
+            Ok(parent) => parent,
+            Err(err) if missing(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let file = match open_at(&dir, &name, libc::O_RDWR | libc::O_APPEND) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        check_file(&file.metadata()?, super::MAX_PACKAGE_BYTES)?;
+        self.check()?;
+        Ok(Some(file))
+    }
+
     pub(super) fn read_index(&self) -> anyhow::Result<Vec<u8>> {
         self.check()?;
         let mut file = open_at(&self.dir, c"_elastos_object.json", libc::O_RDONLY)?;
@@ -680,6 +764,21 @@ impl Stage {
         Ok(())
     }
 
+    fn tree_bytes(&self, budget: &mut usize) -> anyhow::Result<u64> {
+        let mut total = 0u64;
+        for (name, meta) in self.children()? {
+            *budget = budget.checked_sub(1).context("stage tree bound exceeded")?;
+            let bytes = if meta.is_dir() {
+                self.child(&name)?.tree_bytes(budget)?
+            } else {
+                check_file(&meta, super::MAX_PACKAGE_BYTES)?;
+                meta.len()
+            };
+            total = total.checked_add(bytes).context("stage size overflow")?;
+        }
+        Ok(total)
+    }
+
     fn remove_contents(&self) -> anyhow::Result<()> {
         for (name, meta) in self.children()? {
             if meta.is_dir() {
@@ -704,7 +803,7 @@ impl Stage {
 
 fn require_available_space(dir: &File, reserved_bytes: u64) -> anyhow::Result<()> {
     let (capacity, available, required) = space_observation(dir, reserved_bytes)?;
-    require_space_floor(capacity, available, required)
+    require_reservation_fits(capacity, available, required)
 }
 
 fn space_observation(dir: &File, reserved_bytes: u64) -> anyhow::Result<(u128, u128, u128)> {
@@ -727,31 +826,55 @@ fn space_observation(dir: &File, reserved_bytes: u64) -> anyhow::Result<(u128, u
     Ok((capacity, available, required))
 }
 
-pub(super) fn space_floor_fits(
+pub(super) fn reservation_fits(
     capacity: u128,
     available: u128,
     reserved: u128,
 ) -> anyhow::Result<bool> {
-    ensure!(
-        capacity > 0 && available <= capacity,
-        "invalid preparation disk capacity"
-    );
-    let Some(remaining) = available.checked_sub(reserved) else {
-        return Ok(false);
-    };
-    Ok(remaining.checked_mul(10).context("disk floor overflow")? >= capacity)
+    match require_reservation_fits(capacity, available, reserved) {
+        Ok(()) => Ok(true),
+        Err(error) if error.is::<elastos_common::NotEnoughFreeSpace>() => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
-pub(super) fn require_space_floor(
+/// Model and content preparation keep the shared free-space reserve.
+pub(super) fn require_reservation_fits(
     capacity: u128,
     available: u128,
     reserved: u128,
 ) -> anyhow::Result<()> {
-    let fits = space_floor_fits(capacity, available, reserved)?;
-    ensure!(available >= reserved, "insufficient preparation space");
     ensure!(
-        fits,
-        "preparation requires ten percent free space after reservation"
+        capacity > 0 && available <= capacity,
+        "invalid preparation disk capacity"
     );
-    Ok(())
+    Ok(elastos_common::require_free_space(available, reserved)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_lock::test_support::SpawnedWhileOpen;
+
+    #[test]
+    fn ended_inventory_is_free_while_a_command_spawned_under_it_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let inventory = Inventory::open(root.path(), true).unwrap();
+        let _command = SpawnedWhileOpen::new(&root.path().join("model-preparation/lock"));
+        drop(inventory);
+        Inventory::open(root.path(), false)
+            .expect("the next snapshot must not wait for a command spawned under the last");
+    }
+
+    #[test]
+    fn ended_worker_lock_is_free_while_a_command_spawned_under_it_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let inventory = Inventory::open(root.path(), true).unwrap();
+        let worker = inventory.worker_lock().unwrap();
+        let _command = SpawnedWhileOpen::new(&root.path().join("model-preparation/worker"));
+        drop(worker);
+        inventory
+            .worker_lock()
+            .expect("the next worker must not wait for a command spawned under the last");
+    }
 }

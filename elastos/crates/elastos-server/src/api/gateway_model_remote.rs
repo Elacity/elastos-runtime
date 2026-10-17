@@ -264,7 +264,7 @@ pub(crate) fn consumer_grants(
 #[derive(Debug)]
 pub(crate) enum RemoteRouteError {
     /// Authenticated destination proof for this invocation only.
-    PreDispatchRefused { binding: Value, reason: String },
+    InvocationRefused { binding: Value, reason: String },
     /// The granting Runtime answered with a bounded class such as `denied`.
     Rejected { code: String },
     /// Carrier could not complete the call; the run state is unknown here.
@@ -276,7 +276,16 @@ pub(crate) enum RemoteRouteError {
 impl std::fmt::Display for RemoteRouteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PreDispatchRefused { .. } => {
+            Self::InvocationRefused { reason, .. }
+                if reason == elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE =>
+            {
+                write!(
+                    f,
+                    "{}",
+                    elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE
+                )
+            }
+            Self::InvocationRefused { .. } => {
                 write!(f, "this invocation was refused before provider dispatch")
             }
             Self::Rejected { code } => {
@@ -350,13 +359,23 @@ async fn call_grant(
         .map_err(|err| classify_carrier_error(&err.to_string()))?;
     if response["code"] == "remote_model_invocation_refused" {
         let reason = response["reason"].as_str().unwrap_or_default();
+        let mut expected_refusal = expected_refusal;
+        let valid_phase = if reason == elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE {
+            if let Some(binding) = expected_refusal.as_mut() {
+                binding["dispatch"] = json!("provider_refused");
+            }
+            response["refusal"]["dispatch"] == "provider_refused"
+        } else {
+            matches!(reason, "denied" | "offer_unavailable" | "rate_limited")
+                && response["refusal"]["dispatch"] == "not_started"
+        };
         if response["status"] == "error"
-            && matches!(reason, "denied" | "offer_unavailable" | "rate_limited")
+            && valid_phase
             && expected_refusal
                 .as_ref()
                 .is_some_and(|binding| response["refusal"] == *binding)
         {
-            return Err(RemoteRouteError::PreDispatchRefused {
+            return Err(RemoteRouteError::InvocationRefused {
                 binding: response["refusal"].clone(),
                 reason: reason.to_string(),
             });
@@ -566,7 +585,7 @@ pub(crate) async fn append_remote_offers(
             Err(RemoteRouteError::Invalid(message)) => services.push(
                 json!({ "grant_id": grant.grant_id, "status": "invalid", "message": message }),
             ),
-            Err(RemoteRouteError::PreDispatchRefused { .. }) => {
+            Err(RemoteRouteError::InvocationRefused { .. }) => {
                 services.push(json!({ "grant_id": grant.grant_id, "status": "invalid" }))
             }
         }
@@ -633,7 +652,7 @@ pub(crate) async fn route_run_operation(
                     if held_slot {
                         release_route_slot(data_dir, now, &key);
                     }
-                    if let RemoteRouteError::PreDispatchRefused { binding, .. } = &mut err {
+                    if let RemoteRouteError::InvocationRefused { binding, .. } = &mut err {
                         binding["offer_id"] = json!(offer_id);
                     }
                     return Err(err);
