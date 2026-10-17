@@ -37,6 +37,18 @@ export function bindBrowserInputSurface({
     meta: false,
   };
 
+  function retireTouchPan() {
+    const retired = touchPanState;
+    // Drop ownership before releasing capture: lostpointercapture may run now.
+    touchPanState = null;
+    if (!retired) return null;
+    suppressSyntheticClickUntil = Date.now() + 700;
+    if (renderPanel.hasPointerCapture?.(retired.pointerId)) {
+      renderPanel.releasePointerCapture(retired.pointerId);
+    }
+    return retired;
+  }
+
   function focusKeyboardCapture() {
     const target = keyboardCapture || renderPanel;
     target.focus({ preventScroll: true });
@@ -260,8 +272,18 @@ export function bindBrowserInputSurface({
     }, WHEEL_FLUSH_MS);
   }
 
+  function isSyntheticTouchClick(event) {
+    // Touch and pen taps dispatch once from pointerup under the captured
+    // owner. Their later click event cannot capture a replacement owner.
+    if (event.pointerType === "touch" || event.pointerType === "pen" ||
+        event.sourceCapabilities?.firesTouchEvents === true) return true;
+    // Older hosts report compatibility clicks without pointer provenance.
+    // A known mouse remains independent from that short touch fallback.
+    return event.pointerType !== "mouse" && Date.now() < suppressSyntheticClickUntil;
+  }
+
   remoteVideo.addEventListener("click", (event) => {
-    if (Date.now() < suppressSyntheticClickUntil) {
+    if (isSyntheticTouchClick(event)) {
       event.preventDefault();
       return;
     }
@@ -270,7 +292,7 @@ export function bindBrowserInputSurface({
   });
 
   renderPanel.addEventListener("click", (event) => {
-    if (Date.now() < suppressSyntheticClickUntil) {
+    if (isSyntheticTouchClick(event)) {
       event.preventDefault();
       return;
     }
@@ -289,7 +311,9 @@ export function bindBrowserInputSurface({
       if (event.pointerType !== "touch" && event.pointerType !== "pen") {
         return;
       }
-      // Keep the first pointer's owner and release guard until it ends.
+      // An owner that has retired cannot reserve the next page's gesture.
+      if (touchPanState && !touchPanState.ownerActive()) retireTouchPan();
+      // The current owner keeps its first pointer until that gesture ends.
       if (touchPanState) {
         return;
       }
@@ -319,13 +343,13 @@ export function bindBrowserInputSurface({
     (event) => {
       if (
         !touchPanState ||
-        event.pointerId !== touchPanState.pointerId ||
-        !getCurrentPage()
+        event.pointerId !== touchPanState.pointerId
       ) {
         return;
       }
       event.preventDefault();
-      if (!touchPanState.ownerActive()) {
+      if (!touchPanState.ownerActive() || !getCurrentPage()) {
+        retireTouchPan();
         return;
       }
       const dx = touchPanState.x - event.clientX;
@@ -344,14 +368,16 @@ export function bindBrowserInputSurface({
   renderPanel.addEventListener(
     "pointerup",
     (event) => {
+      // A retired finger can remain down longer than the fallback window.
+      // Renew it at release without taking ownership from a fresh pointer.
+      if (event.pointerType === "touch" || event.pointerType === "pen") {
+        suppressSyntheticClickUntil = Date.now() + 700;
+      }
       if (!touchPanState || event.pointerId !== touchPanState.pointerId) {
         return;
       }
       event.preventDefault();
-      renderPanel.releasePointerCapture?.(event.pointerId);
-      const { moved, ownerActive } = touchPanState;
-      touchPanState = null;
-      suppressSyntheticClickUntil = Date.now() + 700;
+      const { moved, ownerActive } = retireTouchPan();
       if (!moved) {
         sendClickFromEvent(event, ownerActive);
       }
@@ -359,11 +385,11 @@ export function bindBrowserInputSurface({
     { passive: false },
   );
 
-  renderPanel.addEventListener("pointercancel", (event) => {
-    if (touchPanState?.pointerId === event.pointerId) {
-      touchPanState = null;
-    }
-  });
+  for (const type of ["pointercancel", "lostpointercapture"]) {
+    renderPanel.addEventListener(type, (event) => {
+      if (touchPanState?.pointerId === event.pointerId) retireTouchPan();
+    });
+  }
 
   renderPanel.addEventListener(
     "wheel",
