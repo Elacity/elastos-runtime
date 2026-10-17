@@ -25,7 +25,7 @@ journeys tested on that device.
 
 ## Install from the publisher
 
-The installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Intel Mac and other OS families fail closed. The signed release determines which binaries exist for a given platform.
+The installer looks up signed releases for Linux x86_64/aarch64 and macOS Apple silicon. Other OS families fail closed. For an Intel Mac, see [Intel Mac](MAC.md#intel-mac). The signed release determines which binaries exist for a given platform.
 
 This checkout's installer combines installation, Home setup, and launch into one
 command:

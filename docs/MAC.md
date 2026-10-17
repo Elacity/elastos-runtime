@@ -6,6 +6,9 @@ artifacts, and `.dmg` packaging work.
 
 ## Intel Mac
 
+This section is the one record of Intel Mac support. Other documents link
+here instead of repeating it.
+
 The public release id for an Intel Mac is `x86_64-darwin`. `scripts/install.sh`
 stops on that host before a download lookup. The message is
 `macOS release lookup requires Apple silicon`.
@@ -15,12 +18,20 @@ installer on an Apple silicon Mac. The source-home commands later in this
 runbook are a developer build. They are not the installer, and this note does
 not claim that build has passed on Intel.
 
-The signed platform set is `SIGNED_RELEASE_PLATFORMS` in
-`scripts/release-signer.py`. `scripts/release-platforms.json` maps the package
-key `darwin-amd64` to `x86_64-darwin`. That id is outside the signed set.
-`scripts/package-release-binaries.sh --print-platform` prints `darwin-amd64`
-on Darwin x86_64 and writes nothing. The packaging path refuses to write a
-tarball for that key, including when a Rosetta shell reports `x86_64`.
+These files hold the rules:
+
+- Signing: the release platform allowlist in `scripts/release-signer.py`.
+  `x86_64-darwin` is not in it. `scripts/release-signer-test.py` runs the
+  signer with `python -O` on an `x86_64-darwin` input and requires the
+  refusal.
+- Package name: `scripts/release-platforms.json` maps the package key
+  `darwin-amd64` to `x86_64-darwin`.
+- Packaging: `scripts/package-release-binaries.sh`. `--print-platform` prints
+  `darwin-amd64` only when `sysctl` shows Intel hardware. It stops in a
+  Rosetta shell on Apple silicon and when `sysctl` is missing or unclear.
+  Packaging writes no `darwin-amd64` tarball. For the other keys, it stops
+  on a binary that does not match the key, which includes a universal binary.
+- Install: the platform check in `scripts/install.sh`.
 
 CI job `gateway-smoke-macos-intel` builds the native `elastos` binary on
 `macos-15-intel`. It requires `GET /healthz` to return HTTP 200 and the two
