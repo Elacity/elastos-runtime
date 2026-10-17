@@ -81,6 +81,9 @@ function createHarness() {
     objectsByUri: new Map(objects.map((object) => [object.uri, object])),
   };
   const openCalls = [];
+  const renameCalls = [];
+  const trashCalls = [];
+  const menuCalls = [];
   let renameCount = 0;
   let deleteCount = 0;
   let trashCount = 0;
@@ -91,6 +94,8 @@ function createHarness() {
 
   const previousWindow = globalThis.window;
   const previousDocument = globalThis.document;
+  const previousCss = globalThis.CSS;
+  globalThis.CSS = { escape: (value) => value };
   globalThis.window = {
     addEventListener(type, listener) {
       windowListeners.set(type, listener);
@@ -181,15 +186,19 @@ function createHarness() {
     showError(error) {
       throw error;
     },
-    showMenuForObject() {},
+    showMenuForObject(object) {
+      menuCalls.push(object.uri);
+    },
     showPlaceMenu() {},
-    startRename() {
+    startRename(object) {
       renameCount += 1;
+      renameCalls.push(object.uri);
     },
     state,
     stopLibraryEventStream() {},
     trashSelectedObjects: async () => {
       trashCount += 1;
+      trashCalls.push(selection.selectedObjects().map((object) => object.uri));
     },
     uploadFiles: async () => {},
   });
@@ -198,6 +207,8 @@ function createHarness() {
     cleanup() {
       globalThis.window = previousWindow;
       globalThis.document = previousDocument;
+      if (previousCss === undefined) delete globalThis.CSS;
+      else globalThis.CSS = previousCss;
     },
     deleteCount: () => deleteCount,
     elements,
@@ -206,7 +217,15 @@ function createHarness() {
     state,
     animationFrames,
     pointerDown() { windowListeners.get("pointerdown")?.(); },
+    clickItem(index, extras = {}) {
+      elements.content.listeners.get("click").forEach((listener) => listener({
+        target: items[index], ctrlKey: false, metaKey: false, shiftKey: false, ...extras,
+      }));
+    },
     openCalls,
+    renameCalls,
+    trashCalls,
+    menuCalls,
     renameCount: () => renameCount,
     selectAllCount: () => selectAllCount,
     trashCount: () => trashCount,
@@ -299,18 +318,19 @@ test("Library file shortcuts pause while the context menu is open", () => {
   }
 });
 
-test("Library opens the focused item and preserves a selection that includes it", async () => {
+test("Library Enter opens the selected items when focus is outside the selection", async () => {
   const harness = createHarness();
   try {
     const onKeydown = harness.windowKeydown();
     assert.equal(dispatchWindowKey(onKeydown, "Enter", harness.items[1]), true);
     await Promise.resolve();
-    assert.deepEqual(harness.openCalls, ["second.md"]);
-    assert.deepEqual([...harness.state.selectedUris], [harness.items[1].dataset.uri]);
+    assert.deepEqual(harness.openCalls, ["fixture.md"]);
+    assert.deepEqual([...harness.state.selectedUris], [harness.items[0].dataset.uri]);
     harness.selection.toggleSelected(harness.items[2].dataset.uri);
-    dispatchWindowKey(onKeydown, "Enter", harness.items[2]);
+    dispatchWindowKey(onKeydown, "Enter", harness.items[1]);
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.deepEqual(harness.openCalls, ["second.md", "second.md", "third.md"]);
+    assert.deepEqual(harness.openCalls, ["fixture.md", "fixture.md", "third.md"]);
+    assert.deepEqual([...harness.state.selectedUris], [harness.items[0].dataset.uri, harness.items[2].dataset.uri]);
   } finally {
     harness.cleanup();
   }
@@ -374,20 +394,65 @@ test("Library grid arrows follow columns and stay within the first and last rows
   }
 });
 
-test("Library rename and delete use the focused item when it is outside the selection", () => {
+test("Library rename, delete and keyboard menus use the selection when focus is elsewhere", () => {
   const harness = createHarness();
   try {
     const onKeydown = harness.windowKeydown();
     dispatchWindowKey(onKeydown, "F2", harness.items[1]);
-    assert.equal(harness.renameCount(), 1);
-    assert.deepEqual([...harness.state.selectedUris], [harness.items[1].dataset.uri]);
+    assert.deepEqual(harness.renameCalls, [harness.items[0].dataset.uri]);
     dispatchWindowKey(onKeydown, "Delete", harness.items[2]);
-    assert.equal(harness.trashCount(), 1);
-    assert.deepEqual([...harness.state.selectedUris], [harness.items[2].dataset.uri]);
+    assert.deepEqual(harness.trashCalls, [[harness.items[0].dataset.uri]]);
+    dispatchWindowKey(onKeydown, "ContextMenu", harness.items[1]);
+    dispatchWindowKey(onKeydown, "F10", harness.items[2], { shiftKey: true });
+    assert.deepEqual(harness.menuCalls, [harness.items[0].dataset.uri, harness.items[0].dataset.uri]);
+    assert.deepEqual([...harness.state.selectedUris], [harness.items[0].dataset.uri]);
+
+    harness.selection.toggleSelected(harness.items[2].dataset.uri);
+    dispatchWindowKey(onKeydown, "F2", harness.items[1]);
+    assert.equal(harness.renameCount(), 1, "F2 must leave a multiple selection unchanged");
+    dispatchWindowKey(onKeydown, "Delete", harness.items[1]);
+    assert.deepEqual(harness.trashCalls.at(-1), [harness.items[0].dataset.uri, harness.items[2].dataset.uri]);
   } finally {
     harness.cleanup();
   }
 });
+
+test("Library item shortcuts use the focused row when the selection is empty", async () => {
+  const harness = createHarness();
+  try {
+    const onKeydown = harness.windowKeydown();
+    for (const [key, extras] of [["Enter", {}], ["F2", {}], ["Delete", {}], ["ContextMenu", {}], ["F10", { shiftKey: true }]]) {
+      harness.selection.clearSelection();
+      assert.equal(dispatchWindowKey(onKeydown, key, harness.items[1], extras), true);
+      assert.deepEqual([...harness.state.selectedUris], [harness.items[1].dataset.uri], key);
+    }
+    await Promise.resolve();
+    assert.deepEqual(harness.openCalls, ["second.md"]);
+    assert.deepEqual(harness.renameCalls, [harness.items[1].dataset.uri]);
+    assert.deepEqual(harness.trashCalls, [[harness.items[1].dataset.uri]]);
+    assert.deepEqual(harness.menuCalls, [harness.items[1].dataset.uri, harness.items[1].dataset.uri]);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+for (const modifier of ["ctrlKey", "metaKey"]) {
+  test(`Library ${modifier}-click deselect then Delete trashes only the remaining selection`, () => {
+    const harness = createHarness();
+    try {
+      harness.clickItem(1, { [modifier]: true });
+      assert.deepEqual([...harness.state.selectedUris], [harness.items[0].dataset.uri, harness.items[1].dataset.uri]);
+      harness.clickItem(1, { [modifier]: true });
+      assert.equal(document.activeElement, harness.items[1]);
+      assert.deepEqual([...harness.state.selectedUris], [harness.items[0].dataset.uri]);
+      dispatchWindowKey(harness.windowKeydown(), "Delete", document.activeElement);
+      assert.deepEqual(harness.trashCalls, [[harness.items[0].dataset.uri]]);
+      assert.equal(harness.state.selectedUris.has(harness.items[1].dataset.uri), false);
+    } finally {
+      harness.cleanup();
+    }
+  });
+}
 
 test("Library navigation keys leave editing, toolbar, dialog, and menu input native", () => {
   const harness = createHarness();

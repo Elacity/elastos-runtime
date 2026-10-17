@@ -307,7 +307,7 @@ export function bindLibraryEvents({
     }
     const itemAction = ["Enter", "F2", "Delete", "ContextMenu"].includes(event.key)
       || (event.shiftKey && event.key === "F10");
-    if (itemAction && focusedItem && !state.selectedUris.has(focusedItem.dataset.uri)) {
+    if (itemAction && focusedItem && state.selectedUris.size === 0) {
       selectOnly(focusedItem.dataset.uri);
     }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a" && shortcutSurfaceReady) {

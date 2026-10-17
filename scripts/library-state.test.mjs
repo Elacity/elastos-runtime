@@ -49,6 +49,35 @@ test("name sorting preserves the default locale, case/accent equivalence and sou
   assert.deepEqual(names(ties), ["Éclair", "eclair", "éclair"]);
 });
 
+test("name sorting reuses one locale collator across comparisons and folder refreshes", async (t) => {
+  const NativeCollator = Intl.Collator;
+  let constructions = 0;
+  let comparisons = 0;
+  t.mock.method(Intl, "Collator", function (...args) {
+    constructions += 1;
+    const collator = new NativeCollator(...args);
+    return {
+      compare(left, right) {
+        comparisons += 1;
+        return collator.compare(left, right);
+      },
+    };
+  });
+  const subject = await import("../capsules/library/browser/src/state.js?collator-reuse");
+  const state = makeState();
+  for (const objects of [[item("Zulu"), item("alpha")], [item("delta"), item("Bravo"), item("charlie")]]) {
+    subject.setLibraryObjects(state, objects);
+    const before = comparisons;
+    const ascending = subject.visibleObjectsForState(state).map((object) => object.name);
+    assert.ok(comparisons > before, "name comparisons must use the shared collator");
+    assert.deepEqual(ascending, objects.map((object) => object.name).sort(new NativeCollator(undefined, { sensitivity: "base" }).compare));
+    state.sortOrder = "desc";
+    assert.deepEqual(subject.visibleObjectsForState(state).map((object) => object.name), ascending.toReversed());
+    state.sortOrder = "asc";
+    assert.equal(constructions, 1, "new listings and sort directions must reuse locale setup");
+  }
+});
+
 test("directories stay first in both name sort directions", () => {
   const state = makeState([
     item("beta.txt"), item("Z folder", { kind: "directory" }),

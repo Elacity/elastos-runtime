@@ -1851,32 +1851,39 @@ async function assertKeyboardJourney(page) {
   await published.focus();
   const readsBefore = ops.filter((entry) => entry.op === "read").length;
   await page.keyboard.press("Enter");
-  await page.locator(".dialog-card").filter({ hasText: "Published.md" }).first().waitFor();
+  await page.locator(".dialog-card").filter({ hasText: "Readme.md" }).first().waitFor();
   assert(ops.filter((entry) => entry.op === "read").length === readsBefore + 1
-    && ops.filter((entry) => entry.op === "read").at(-1).payload.uri === `${documentsUri}/Published.md`,
-    "Enter must open the focused item when a different item was selected");
+    && ops.filter((entry) => entry.op === "read").at(-1).payload.uri === `${documentsUri}/Readme.md`,
+    "Enter must open the selected item when a different item has focus");
   await page.keyboard.press("Escape");
+  await published.click();
   await readme.focus();
   await page.keyboard.press("F2");
   const editor = page.locator(".rename-input");
   await editor.waitFor();
-  assert(await editor.inputValue() === "Readme.md", "F2 must rename the focused item");
+  assert(await editor.inputValue() === "Published.md", "F2 must rename the selected item when a different item has focus");
   await page.keyboard.press(`${multiSelectModifier}+a`);
   assert(await selected.count() === 1, "Select all inside the name editor must keep item selection unchanged");
   await page.keyboard.press("ArrowLeft");
   assert(await editor.evaluate((input) => document.activeElement === input), "Arrow keys must remain in the name editor");
   await page.keyboard.press("Escape");
-  assert(await focusedUri() === `${documentsUri}/Readme.md`, "Cancel rename must return focus to its item");
+  assert(await focusedUri() === `${documentsUri}/Published.md`, "Cancel rename must return focus to its item");
+  await readme.click();
+  await published.focus();
   await page.keyboard.press("Shift+F10");
   assert(await page.evaluate(() => document.activeElement?.matches("#context-menu .menu-item")),
     "The keyboard context menu must focus its first action");
+  assert(await selected.count() === 1 && await selected.first().getAttribute("data-uri") === `${documentsUri}/Readme.md`,
+    "The keyboard context menu must preserve the selected item when another item has focus");
   await page.keyboard.press("Escape");
-  assert(await focusedUri() === `${documentsUri}/Readme.md`, "Escape from a keyboard menu must return focus to its item");
+  assert(await focusedUri() === `${documentsUri}/Published.md`, "Escape from a keyboard menu must return focus to its owner");
+  await readme.click();
+  await published.focus();
   await page.keyboard.press("Shift+F10");
   await page.keyboard.press("Enter");
   await page.locator(".dialog-card").filter({ hasText: "Readme.md" }).first().waitFor();
   await page.keyboard.press("Escape");
-  assert(await focusedUri() === `${documentsUri}/Readme.md`, "Keyboard menu Open must preserve an item focus target");
+  assert(await focusedUri() === `${documentsUri}/Published.md`, "Keyboard menu Open must preserve the menu owner's focus target");
 
   await page.locator("#grid-button").click();
   await rows.first().focus();
@@ -1895,7 +1902,7 @@ async function assertKeyboardJourney(page) {
   assert(await focusedUri() === await rowUri(0), "ArrowLeft must focus the previous icon");
   await page.locator("#list-button").click();
   const projects = rows.filter({ hasText: "Projects" }).first();
-  await projects.focus();
+  await projects.click();
   await page.keyboard.press("Enter");
   await page.locator(".crumb-current").filter({ hasText: "Projects" }).first().waitFor();
   await page.locator("#back-button").focus();
@@ -1907,6 +1914,46 @@ async function assertKeyboardJourney(page) {
   await page.keyboard.press("Tab");
   assert(await focusedUri() === "", "One Tab must leave the item collection");
   await page.keyboard.press("Escape");
+}
+
+async function assertDeselectDeleteJourney(context, port) {
+  const selectedName = "Keyboard selected.md";
+  const deselectedName = "Keyboard deselected.md";
+  const selectedUri = `${documentsUri}/${selectedName}`;
+  const deselectedUri = `${documentsUri}/${deselectedName}`;
+  putObject(documentsUri, createFileObject(selectedUri, selectedName));
+  putObject(documentsUri, createFileObject(deselectedUri, deselectedName));
+  const page = await context.newPage();
+  try {
+    await page.goto(`http://127.0.0.1:${port}/apps/library/#home_token=${encodeURIComponent(token)}`);
+    const selected = page.locator(`#content .item[data-uri="${selectedUri}"]`);
+    const deselected = page.locator(`#content .item[data-uri="${deselectedUri}"]`);
+    await selected.click();
+    await deselected.click({ modifiers: [multiSelectModifier] });
+    assert(await page.locator('#content .item[aria-selected="true"]').count() === 2,
+      "Modified click must add the second item to the selection");
+    await deselected.click({ modifiers: [multiSelectModifier] });
+    assert(await deselected.evaluate((item) => document.activeElement === item),
+      "The deselected item must retain focus for this regression");
+    assert(await selected.getAttribute("aria-selected") === "true" && await deselected.getAttribute("aria-selected") === "false",
+      "Modified click must remove only the focused item from the selection");
+    const before = ops.length;
+    await page.keyboard.press("Delete");
+    await waitForOp((entry) => entry.op === "trash" && entry.payload.uri === selectedUri,
+      "Delete after deselection must trash the remaining selected item");
+    await selected.waitFor({ state: "detached" });
+    const trashed = ops.slice(before).filter((entry) => entry.op === "trash").map((entry) => entry.payload.uri);
+    assert(trashed.length === 1 && trashed[0] === selectedUri,
+      "Delete must dispatch exactly the selected item to Trash");
+    assert(await deselected.count() === 1 && findObject(deselectedUri)?.uri === deselectedUri,
+      "Delete must preserve the focused item that the user deselected");
+  } finally {
+    await page.close();
+    for (const name of [selectedName, deselectedName]) {
+      removeObject(`${documentsUri}/${name}`);
+      removeObject(`${principalRoot}/.Trash/${name}`);
+    }
+  }
 }
 
 async function assertEmptyWebspaceReadiness(context, port) {
@@ -2032,6 +2079,7 @@ async function run() {
     }
 
     await assertEmptyWebspaceReadiness(context, port);
+    await assertDeselectDeleteJourney(context, port);
     await assertKeyboardJourney(page);
 
     for (const label of ["Home", "Desktop", "Documents", "Pictures", "Videos", "Downloads", "Public", "Trash", "Spaces"]) {
