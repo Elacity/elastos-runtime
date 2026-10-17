@@ -372,15 +372,22 @@ struct SystemBackgroundOverlayRequest {
 }
 
 /// Sets the wallpaper from one of the caller's own Library files. Runtime reads
-/// it through Library's capability (forwarded by Home), so the bytes never
-/// traverse a capsule and Library's scope and protection rules apply.
+/// it under Library's scope and protection rules, so the bytes never traverse
+/// a capsule.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HomeBackgroundImageSourceRequest {
     source_uri: String,
-    /// The launch token of the Library frame that asked, carried by Home.
+    /// The single-use ticket Library asked for, carried by Home.
     #[serde(default)]
-    library_token: Option<String>,
+    library_ticket: Option<String>,
+}
+
+/// Library asks for a single-use desktop background ticket for one object.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryDesktopBackgroundTicketRequest {
+    source_uri: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

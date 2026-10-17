@@ -265,11 +265,32 @@ export function createLibraryRuntime({ getHomeToken }) {
     });
   }
 
-  // Library only expresses the intent; Home holds the appearance authority
-  // and reads the object itself. Resolves once Home has answered.
-  function setDesktopBackground(uri) {
+  // Library only expresses the intent; Home holds the appearance authority.
+  // Library first asks Runtime, with its own launch token, for a single-use
+  // ticket for this one object, and gives Home only that ticket, never its
+  // launch token. Resolves once Home has answered.
+  async function requestDesktopBackgroundTicket(uri, token) {
+    try {
+      const response = await fetch("/api/apps/library/desktop-background-ticket", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-elastos-home-token": token,
+        },
+        body: JSON.stringify({ source_uri: uri }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      return response.ok && typeof payload.ticket === "string" ? payload.ticket : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  async function setDesktopBackground(uri) {
     const requestId = crypto.randomUUID();
     const token = getHomeToken();
+    const ticket = await requestDesktopBackgroundTicket(uri, token);
+    if (!ticket) return false;
     return new Promise((resolve) => {
       const finish = (accepted) => {
         window.clearTimeout(timer);
@@ -283,7 +304,7 @@ export function createLibraryRuntime({ getHomeToken }) {
       };
       const timer = window.setTimeout(() => finish(false), 20_000);
       window.addEventListener("message", receive);
-      if (!shellMessage({ type: "home:set-desktop-background", uri, requestId })) finish(false);
+      if (!shellMessage({ type: "home:set-desktop-background", uri, requestId, ticket })) finish(false);
     });
   }
 

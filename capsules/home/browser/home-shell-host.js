@@ -2264,22 +2264,25 @@ function canOpenTargetFromHomeMessage(context, target) {
 }
 
 // The app expresses intent; Home performs the change with its own appearance
-// authority, so the app never gains one. Home carries the launched Library
-// frame's own capability (the token this message was bound to), and Runtime
-// reads the object only through that Library capability: the same scope,
-// Trash, and protection rules Library's read applies. Home never reads or
-// decrypts the object itself.
+// authority, so the app never gains one. Home carries only the single-use
+// ticket the Library frame asked Runtime for (one object, one minute), never
+// Library's launch token, and Runtime reads the object under Library's scope,
+// Trash, and protection rules. Home never reads or decrypts the object itself.
+const DESKTOP_BACKGROUND_TICKET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
 function handleSetDesktopBackgroundMessage(event, context, data) {
   const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
   const uri = typeof data.uri === "string" ? data.uri.trim() : "";
+  const ticket = typeof data.ticket === "string" ? data.ticket : "";
   if (
     context.kind !== "app-frame" ||
     !SHELL_MESSAGE_DESKTOP_BACKGROUND_SOURCES.has(context.targetId) ||
-    !hasExactMessageKeys(data, ["type", "requestId", "homeToken", "uri"]) ||
+    !hasExactMessageKeys(data, ["type", "requestId", "homeToken", "uri", "ticket"]) ||
     !requestId ||
     requestId.length > 128 ||
     !uri.startsWith("localhost://Users/") ||
-    uri.length > DESKTOP_BACKGROUND_SOURCE_URI_MAX_LENGTH
+    uri.length > DESKTOP_BACKGROUND_SOURCE_URI_MAX_LENGTH ||
+    !DESKTOP_BACKGROUND_TICKET_PATTERN.test(ticket)
   ) {
     console.warn("home ignored unauthorized set-desktop-background message", context.targetId);
     replyToShellRequest(event, requestId, null, new Error("Home denied the desktop background change"));
@@ -2287,7 +2290,7 @@ function handleSetDesktopBackgroundMessage(event, context, data) {
   }
   fetchJson("/api/apps/home/appearance/background-image", {
     method: "POST",
-    body: JSON.stringify({ source_uri: uri, library_token: context.homeToken }),
+    body: JSON.stringify({ source_uri: uri, library_ticket: ticket }),
   })
     .then(() => {
       requestShellSummaryRefresh({ reason: "desktop-background" });

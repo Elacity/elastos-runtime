@@ -1038,6 +1038,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/apps/home/appearance/background-image",
             get(home_background_image).post(home_background_image_set_from_object),
         )
+        .route(
+            "/api/apps/library/desktop-background-ticket",
+            post(library_desktop_background_ticket),
+        )
         .route("/api/apps/home/runtime/ensure", post(home_runtime_ensure))
         .route("/api/apps/home/launch", post(home_launch))
         .route(

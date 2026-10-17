@@ -5656,18 +5656,51 @@ async fn test_home_sets_background_image_from_own_object() {
     assert_eq!(image_body.as_ref(), picture.as_slice());
 }
 
+/// Asks for a desktop background ticket the way Library does: with Library's
+/// own launch token, for one object. Returns the status and, on success, the
+/// ticket.
+async fn library_desktop_background_ticket_for(
+    app: &axum::Router,
+    library_token: &str,
+    source_uri: &str,
+) -> (StatusCode, Option<String>) {
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/library/desktop-background-ticket")
+                .header("x-elastos-home-token", library_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "source_uri": source_uri }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ticket = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value["ticket"].as_str().map(str::to_string));
+    (status, ticket)
+}
+
 /// POSTs a set-from-object request the way Home does: Home's own authority in
-/// `x-elastos-home-token`, and the launched Library frame's capability carried
-/// in the body when `library_token` is set.
-async fn set_background_from_object(
+/// `x-elastos-home-token`, and Library's single-use ticket in the body when
+/// `library_ticket` is set.
+async fn post_background_from_object(
     app: &axum::Router,
     home_token: String,
-    library_token: Option<String>,
+    library_ticket: Option<String>,
     source_uri: &str,
 ) -> (StatusCode, String) {
     let mut body = serde_json::json!({ "source_uri": source_uri });
-    if let Some(library_token) = library_token {
-        body["library_token"] = serde_json::Value::String(library_token);
+    if let Some(library_ticket) = library_ticket {
+        body["library_ticket"] = serde_json::Value::String(library_ticket);
     }
     let response = app
         .clone()
@@ -5687,6 +5720,123 @@ async fn set_background_from_object(
         .await
         .unwrap();
     (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The whole flow: Library asks for a ticket with `library_token` (when set),
+/// then Home sends it with its own authority. A refused ticket request returns
+/// that refusal.
+async fn set_background_from_object(
+    app: &axum::Router,
+    home_token: String,
+    library_token: Option<String>,
+    source_uri: &str,
+) -> (StatusCode, String) {
+    let ticket = match library_token {
+        Some(library_token) => {
+            match library_desktop_background_ticket_for(app, &library_token, source_uri).await {
+                (StatusCode::OK, Some(ticket)) => Some(ticket),
+                (status, _) => return (status, "Library ticket refused".to_string()),
+            }
+        }
+        None => None,
+    };
+    post_background_from_object(app, home_token, ticket, source_uri).await
+}
+
+/// Library's intent is a single-use ticket for one object, not its 12-hour
+/// launch token. A ticket used once, an expired ticket, a ticket for another
+/// object, and the launch token itself are all refused.
+#[tokio::test]
+async fn test_home_background_from_object_ticket_is_single_use_and_short_lived() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let _protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let picture_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/hills.png",
+        &test_png_picture(800, 600, b"hills"),
+    );
+    let other_uri = write_home_principal_object_bytes_for_authority(
+        dir.path(),
+        &admin,
+        "Pictures/other.png",
+        &test_png_picture(800, 600, b"other"),
+    );
+    let library_token =
+        projection_launch_token_for_authority_context(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let home = || admin.home_token.clone();
+    let ticket = || async {
+        let (status, ticket) =
+            library_desktop_background_ticket_for(&app, &library_token, &picture_uri).await;
+        assert_eq!(status, StatusCode::OK);
+        ticket.expect("ticket")
+    };
+
+    // First use is accepted.
+    let first = ticket().await;
+    assert_eq!(first.len(), 43, "32 random bytes, base64url");
+    let (status, text) =
+        post_background_from_object(&app, home(), Some(first.clone()), &picture_uri).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    // Replaying the same request is refused.
+    let (status, text) = post_background_from_object(&app, home(), Some(first), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "replay: {text}");
+    assert!(text.contains("not valid any more"), "{text}");
+
+    // An expired ticket is refused, and is gone afterwards.
+    let expired = ticket().await;
+    expire_desktop_background_ticket_for_test(&expired);
+    let (status, _) = post_background_from_object(&app, home(), Some(expired), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "expired");
+
+    // A ticket names one object; it cannot set another, and it is used up.
+    let for_picture = ticket().await;
+    let (status, _) =
+        post_background_from_object(&app, home(), Some(for_picture.clone()), &other_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "other object");
+    let (status, _) =
+        post_background_from_object(&app, home(), Some(for_picture), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "used by the refused attempt");
+
+    // A made-up ticket, and Library's launch token in its place, are refused.
+    let (status, _) =
+        post_background_from_object(&app, home(), Some("A".repeat(43)), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) =
+        post_background_from_object(&app, home(), Some(library_token.clone()), &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/apps/home/appearance/background-image")
+                .header("x-elastos-home-token", home())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "source_uri": picture_uri, "library_token": library_token })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_client_error(),
+        "the old carried launch token field is not accepted: {}",
+        response.status()
+    );
+
+    // Only Library, opened from Home, can ask for a ticket.
+    let documents_token =
+        projection_launch_token_for_authority_context(dir.path(), DOCUMENTS_CAPSULE_ID, &admin);
+    let (status, ticket) =
+        library_desktop_background_ticket_for(&app, &documents_token, &picture_uri).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(ticket.is_none());
 }
 
 /// Home's appearance authority alone cannot read a Library object: the

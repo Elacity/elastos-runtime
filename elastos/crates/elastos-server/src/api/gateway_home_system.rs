@@ -8232,14 +8232,163 @@ pub(super) async fn system_background_overlay_update(
     }
 }
 
+/// One "set as desktop background" intent from Library. Library asks for it
+/// with its own launch token just before it messages Home, and Home carries
+/// only this ticket, never Library's launch token. A ticket is used once,
+/// lives [`DESKTOP_BACKGROUND_TICKET_TTL_SECS`], and names one object, person
+/// and session, so a captured request cannot be replayed and Home never holds
+/// a Library capability it could use again for another object.
+struct DesktopBackgroundTicket {
+    principal_id: String,
+    session_id: String,
+    source_uri: String,
+    expires_at: u64,
+}
+
+/// Library asks for the ticket and Home sends it on at once, so one minute is
+/// ample, and short enough that a ticket seen in transit is soon useless.
+pub(super) const DESKTOP_BACKGROUND_TICKET_TTL_SECS: u64 = 60;
+const DESKTOP_BACKGROUND_TICKETS_PER_SESSION: usize = 8;
+const DESKTOP_BACKGROUND_TICKETS_MAX: usize = 1024;
+const DESKTOP_BACKGROUND_TICKET_REFUSED: &str =
+    "this desktop background request is not valid any more; choose Set as Desktop Background in Library again";
+
+/// Pending tickets by the SHA-256 of the ticket, so the store never holds a
+/// usable ticket value. Held in memory only: a Runtime restart drops them,
+/// and the person chooses the action again.
+fn desktop_background_tickets() -> &'static Mutex<BTreeMap<String, DesktopBackgroundTicket>> {
+    static TICKETS: OnceLock<Mutex<BTreeMap<String, DesktopBackgroundTicket>>> = OnceLock::new();
+    TICKETS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn desktop_background_ticket_key(ticket: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(ticket.as_bytes()))
+}
+
+fn issue_desktop_background_ticket(
+    principal_id: &str,
+    session_id: &str,
+    source_uri: &str,
+    now: u64,
+) -> anyhow::Result<String> {
+    use base64::Engine as _;
+    use rand::RngCore as _;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let mut tickets = desktop_background_tickets()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("desktop background tickets are unavailable"))?;
+    tickets.retain(|_, pending| pending.expires_at > now);
+    let pending_for_session = tickets
+        .values()
+        .filter(|pending| pending.principal_id == principal_id && pending.session_id == session_id)
+        .count();
+    if pending_for_session >= DESKTOP_BACKGROUND_TICKETS_PER_SESSION
+        || tickets.len() >= DESKTOP_BACKGROUND_TICKETS_MAX
+    {
+        anyhow::bail!("too many desktop background requests are waiting; try again in a minute");
+    }
+    tickets.insert(
+        desktop_background_ticket_key(&ticket),
+        DesktopBackgroundTicket {
+            principal_id: principal_id.to_string(),
+            session_id: session_id.to_string(),
+            source_uri: source_uri.to_string(),
+            expires_at: now.saturating_add(DESKTOP_BACKGROUND_TICKET_TTL_SECS),
+        },
+    );
+    Ok(ticket)
+}
+
+/// Removes the ticket whatever the outcome, so it is used at most once, then
+/// accepts it only if it is in time and names this person, session and object.
+fn consume_desktop_background_ticket(
+    ticket: &str,
+    principal_id: &str,
+    session_id: &str,
+    source_uri: &str,
+    now: u64,
+) -> bool {
+    let Ok(mut tickets) = desktop_background_tickets().lock() else {
+        return false;
+    };
+    let Some(pending) = tickets.remove(&desktop_background_ticket_key(ticket)) else {
+        return false;
+    };
+    pending.expires_at > now
+        && pending.principal_id == principal_id
+        && pending.session_id == session_id
+        && pending.source_uri == source_uri
+}
+
+/// Test hook: moves a pending ticket's expiry into the past.
+#[cfg(test)]
+pub(super) fn expire_desktop_background_ticket_for_test(ticket: &str) {
+    if let Some(pending) = desktop_background_tickets()
+        .lock()
+        .unwrap()
+        .get_mut(&desktop_background_ticket_key(ticket))
+    {
+        pending.expires_at = 0;
+    }
+}
+
+/// Library asks for a desktop background ticket with its own launch token.
+/// The token must be Library's, launched by Home; the ticket is bound to that
+/// token's person and session and to the one object Library names.
+pub(super) async fn library_desktop_background_ticket(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<LibraryDesktopBackgroundTicketRequest>,
+) -> Response {
+    let library =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[LIBRARY_CAPSULE_ID]) {
+            Ok(library) => library,
+            Err(err) => return home_error_response(err),
+        };
+    if library.launch_context.executable_actor != LIBRARY_CAPSULE_ID
+        || library.launch_context.authority_actor != HOME_CAPSULE_ID
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "only Library opened from Home can ask for a desktop background",
+        )
+            .into_response();
+    }
+    let source_uri = req.source_uri.trim();
+    if source_uri.is_empty()
+        || source_uri.len() > 2048
+        || !source_uri.starts_with("localhost://Users/")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "background image source must be one of your own Library files",
+        )
+            .into_response();
+    }
+    match issue_desktop_background_ticket(
+        &library.context.principal_id,
+        &library.context.session_id,
+        source_uri,
+        now_ts(),
+    ) {
+        Ok(ticket) => Json(serde_json::json!({
+            "ticket": ticket,
+            "expires_in": DESKTOP_BACKGROUND_TICKET_TTL_SECS,
+        }))
+        .into_response(),
+        Err(err) => (StatusCode::TOO_MANY_REQUESTS, err.to_string()).into_response(),
+    }
+}
+
 /// Home arbitrates "set as desktop background" intents from Library. Two
 /// authorities must both be present, for the same person and session:
-/// Home's appearance authority (the caller), and Library's read capability
-/// (carried by Home from the Library frame that asked). Home alone cannot
-/// read a Library object, and Library alone cannot change the desktop. The
-/// carried token follows the same rule as the Home wallet connector and the
-/// passkey step-up: verified on its own, launched by Home, and bound to the
-/// caller's person and session.
+/// Home's appearance authority (the caller), and Library's intent for this
+/// one object (a single-use ticket Library asked for with its own launch
+/// token, carried by Home). Home alone cannot read a Library object, and
+/// Library alone cannot change the desktop.
 pub(super) async fn home_background_image_set_from_object(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -8249,32 +8398,22 @@ pub(super) async fn home_background_image_set_from_object(
         Ok(context) => context,
         Err(err) => return home_error_response(err),
     };
-    let library_token = req.library_token.as_deref().map(str::trim).unwrap_or("");
-    if library_token.is_empty() {
+    let ticket = req.library_ticket.as_deref().map(str::trim).unwrap_or("");
+    if ticket.is_empty() {
         return (
             StatusCode::FORBIDDEN,
-            "missing Library launch token; use Set as Desktop Background in Library",
+            "missing Library request; use Set as Desktop Background in Library",
         )
             .into_response();
     }
-    let library = match require_carried_home_launch_token(
-        &state.data_dir,
-        library_token,
-        &[LIBRARY_CAPSULE_ID],
+    if !consume_desktop_background_ticket(
+        ticket,
+        &context.principal_id,
+        &context.session_id,
+        req.source_uri.trim(),
+        now_ts(),
     ) {
-        Ok(library) => library,
-        Err(err) => return home_error_response(err),
-    };
-    if library.launch_context.executable_actor != LIBRARY_CAPSULE_ID
-        || library.launch_context.authority_actor != HOME_CAPSULE_ID
-        || library.context.principal_id != context.principal_id
-        || library.context.session_id != context.session_id
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            "the Library home launch token belongs to another person, session or launcher",
-        )
-            .into_response();
+        return (StatusCode::FORBIDDEN, DESKTOP_BACKGROUND_TICKET_REFUSED).into_response();
     }
     let request_id = format!("object:desktop-background:{}", now_ts());
     let audit = |event_type: &'static str, result: &'static str, reason: &'static str| {
