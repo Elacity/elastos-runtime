@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
 use wasmtime::component::{bindgen, Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
@@ -27,6 +28,7 @@ bindgen!({
 
 const COMPONENT_FUEL: u64 = 100_000_000;
 const COMPONENT_MEMORY_SIZE: usize = 128 * 1024 * 1024;
+const COMPONENT_COMPILE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct ComponentActivation {
     engine: Engine,
@@ -160,12 +162,15 @@ impl ComputeProvider for ComponentProvider {
         let component_path = path.join(&manifest.entrypoint);
         // File reads and Wasmtime compilation can take substantial time. Keep
         // unrelated Runtime work responsive while preparing the activation.
-        let compile_permit = self
-            .compile_slot
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ElastosError::Compute("Component compiler is unavailable".into()))?;
+        // Bound the wait for capacity; an admitted blocking job keeps its slot
+        // until the actual compile finishes, even if its caller is cancelled.
+        let compile_permit = tokio::time::timeout(
+            COMPONENT_COMPILE_WAIT_TIMEOUT,
+            self.compile_slot.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| ElastosError::Compute("Timed out waiting for the component compiler".into()))?
+        .map_err(|_| ElastosError::Compute("Component compiler is unavailable".into()))?;
         let (engine, component) =
             tokio::task::spawn_blocking(move || -> Result<(Engine, Component)> {
                 // A cancelled caller can leave blocking work in progress. The
@@ -442,9 +447,7 @@ impl elastos::bus::providers::Host for ComponentState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
 
     fn component_fixture() -> (std::path::PathBuf, CapsuleManifest) {
         let path =
@@ -500,41 +503,34 @@ mod tests {
         });
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn component_load_reports_heartbeat_delay() {
-        let provider = ComponentProvider::new();
+    #[tokio::test(start_paused = true)]
+    async fn component_load_times_out_waiting_for_compile_slot() {
+        let provider = Arc::new(ComponentProvider::new());
+        let held_permit = provider.compile_slot.clone().acquire_owned().await.unwrap();
         let (path, manifest) = component_fixture();
-        let completed = AtomicBool::new(false);
-        let started = Instant::now();
-        let loading = async {
-            let result = provider.load(&path, manifest).await;
-            completed.store(true, Ordering::Relaxed);
-            result
-        };
-        let heartbeat = async {
-            let mut previous = started;
-            let mut max_delay = Duration::ZERO;
-            let mut ticks = 0;
-            loop {
-                let now = Instant::now();
-                max_delay = max_delay.max(now.duration_since(previous));
-                if completed.load(Ordering::Relaxed) {
-                    break;
-                }
-                ticks += 1;
-                previous = now;
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            (ticks, max_delay)
-        };
-        let (handle, (ticks, max_delay)) = tokio::join!(biased; loading, heartbeat);
-        println!(
-            "component load: elapsed={:?}, heartbeat_ticks={}, max_heartbeat_delay={:?}",
-            started.elapsed(),
-            ticks,
-            max_delay
+        let loading_provider = provider.clone();
+        let mut loading = tokio::spawn(async move { loading_provider.load(&path, manifest).await });
+
+        // The outer deadline makes a missing queue limit fail instead of hang.
+        // Paused Tokio time avoids relying on compilation or host speed.
+        let result = tokio::time::timeout(
+            COMPONENT_COMPILE_WAIT_TIMEOUT + Duration::from_secs(1),
+            &mut loading,
+        )
+        .await;
+        if result.is_err() {
+            loading.abort();
+            let _ = loading.await;
+        }
+        drop(held_permit);
+
+        assert!(
+            matches!(result, Ok(Ok(Err(ElastosError::Compute(message))))
+                if message == "Timed out waiting for the component compiler"),
+            "a queued component load must return its own timeout before the outer deadline"
         );
-        provider.stop(&handle.unwrap()).await.unwrap();
+        assert!(provider.instances.read().await.is_empty());
+        assert_eq!(provider.compile_slot.available_permits(), 1);
     }
 
     #[test]
