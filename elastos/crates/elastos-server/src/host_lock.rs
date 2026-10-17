@@ -78,19 +78,17 @@ struct HostProcessMeta {
     generation: String,
 }
 
-/// The gateway server publishes its pid when this process does not already hold the lock.
-/// `gateway` and `gateway-public` already write that record before the server starts.
+/// The gateway server publishes its pid when no host in this process holds the lock.
+/// `gateway` and `gateway-public` write that record before the server starts.
+/// `serve` also holds it when its supervisor starts a gateway in the same process.
+/// That gateway keeps the `serve` record, so its `/healthz` answers 503.
 pub fn publish_gateway_lock_if_unowned(
     data_dir: &Path,
     addr: &str,
 ) -> anyhow::Result<Option<FileLock>> {
     let path = host_lock_path(data_dir);
-    if let Some(meta) = read_lock_metadata(&path) {
-        if meta.pid == std::process::id()
-            && matches!(meta.role.as_str(), "gateway" | "gateway-public")
-        {
-            return Ok(None);
-        }
+    if read_lock_metadata(&path).is_some_and(|meta| meta.pid == std::process::id()) {
+        return Ok(None);
     }
     acquire_host_process_lock(data_dir, "gateway", addr).map(Some)
 }

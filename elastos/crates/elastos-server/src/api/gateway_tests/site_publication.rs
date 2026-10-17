@@ -263,18 +263,43 @@ async fn test_healthz_refuses_another_pid_and_a_tampered_lock() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    std::fs::write(dir.path().join("host-process.lock"), b"not-json").unwrap();
-    let app = gateway_router(test_state(dir.path()));
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/healthz")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let pid = std::process::id();
+    for lock in [
+        Some(b"not-json".to_vec()),
+        None,
+        Some(
+            format!("{{\"pid\":{pid},\"role\":\"serve\",\"addr\":\"localhost:8090\"}}")
+                .into_bytes(),
+        ),
+        Some(
+            format!("{{\"pid\":\"{pid}\",\"role\":\"gateway\",\"addr\":\"localhost:8090\"}}")
+                .into_bytes(),
+        ),
+    ] {
+        let path = dir.path().join("host-process.lock");
+        match &lock {
+            Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        let app = gateway_router(test_state(dir.path()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{:?}",
+            lock.map(String::from_utf8)
+        );
+    }
     let contract = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../../docs/LAUNCHER_CONTRACT.md"
@@ -285,6 +310,10 @@ async fn test_healthz_refuses_another_pid_and_a_tampered_lock() {
     assert!(!contract.contains("three bytes"));
     assert!(!contract.contains("darwin-x64"));
     assert!(!contract.contains("127.0.0.1:8090/home/"));
+    // The reply describes the answering process, so the contract states that gap.
+    assert!(!contract.contains("does not treat another"));
+    assert!(contract.contains("The reply does not name the process."));
+    assert!(contract.contains("its `/healthz` returns 503"));
 }
 
 #[tokio::test]
