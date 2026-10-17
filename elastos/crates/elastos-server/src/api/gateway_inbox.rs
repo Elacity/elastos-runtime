@@ -31,6 +31,15 @@ pub(super) async fn inbox_summary(
         return inbox_error_response(err);
     }
     append_home_service_access_notifications(&state.data_dir, &context, &mut notifications);
+    if let Some(card) =
+        super::gateway_collaboration_presence::community_presence_request_notification(
+            &state, &context,
+        )
+    {
+        notifications.unread_count += 1;
+        notifications.attention_count += 1;
+        notifications.entries.push(card);
+    }
     let wallet_approvals = system_wallet_approvals_summary(&state, &authority, false).await;
     append_wallet_approval_notifications(&mut notifications, wallet_approvals.approval_requests);
     if let Ok(capability_requests) = runtime_capability_pending_requests(&state.data_dir).await {
@@ -304,6 +313,13 @@ async fn dispatch_inbox_action(
                 false => "That inbox entry is already gone.".to_string(),
             },
         );
+    }
+    if let Some(answer) = super::gateway_collaboration_presence::answer_community_presence_request(
+        state, context, action_id,
+    )
+    .await
+    {
+        return answer;
     }
     if let Some(request_hash) = action_id.strip_prefix("contact-accept-request:") {
         return decide_contact_request(

@@ -6414,14 +6414,14 @@ pub fn verify_signed_full_recovery_outcome_audit_event(
     verify_audit_event_signature(event, &runtime_did)
 }
 
-pub fn load_signed_full_recovery_outcome_audit_event(
+pub fn find_signed_full_recovery_outcome_audit_event(
     data_dir: &Path,
-    event_id: &str,
+    matches: impl Fn(&RuntimeAuditEventV1) -> bool,
 ) -> anyhow::Result<Option<RuntimeAuditEventV1>> {
     let event = load_auth_state(data_dir)?
         .audit
         .iter()
-        .find(|event| event.event_id == event_id)
+        .find(|event| matches(event))
         .cloned();
     if let Some(event) = event.as_ref() {
         verify_signed_full_recovery_outcome_audit_event(data_dir, event)?;

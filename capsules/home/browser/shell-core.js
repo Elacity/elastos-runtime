@@ -28,8 +28,6 @@ export const shellState = {
   homeEventsSource: null,
   homeEventsStreamFailed: false,
   sessionRefreshTimer: null,
-  presenceHeartbeatTimer: null,
-  presenceHeartbeatInFlight: null,
   currentSummary: null,
   requestSummaryRefresh: null,
   activeShellRootTarget: "",
@@ -56,8 +54,7 @@ export function hasHomeAuthorityToken() {
 
 export async function fetchJson(url, init) {
   const requiresHomeAuthority = url === "/api/apps/home/launch"
-    || url === "/api/apps/home/active-shell"
-    || url === "/api/apps/home/collaboration/presence";
+    || url === "/api/apps/home/active-shell";
   const authorityHeaders = requiresHomeAuthority && homeAuthorityToken
     ? { "x-elastos-home-token": homeAuthorityToken }
     : {};
