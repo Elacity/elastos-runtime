@@ -411,12 +411,19 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
         install = (ROOT / "scripts/install.sh").read_text()
         # This smoke is no Intel download. install.sh stops an Intel Mac in
         # detect_platform before release lookup, and MAC.md quotes that stop.
-        message = "Intel Mac has no signed release yet. See docs/MAC.md for the source-home path."
+        message = ("This Mac has an Intel processor. ElastOS supports Macs with "
+                   "Apple silicon (M1 or later). Intel Mac is not supported yet.")
         self.assertIn(f'[[ "$ARCH" == aarch64 ]] || die "{message}"', install)
         main = install.split("# ── Main", 1)[1]
+        self.assertLess(main.index("detect_platform"), main.index("fetch_url"))
         self.assertLess(main.index("detect_platform"), main.index("release-head.json"))
         self.assertIn(f"`{message}`", mac)
-        self.assertNotIn("macOS release lookup requires Apple silicon", install + mac)
+        # The stop names no developer build as a way to install.
+        self.assertNotIn("source-home", message)
+        for retired in ["macOS release lookup requires Apple silicon",
+                        "Intel Mac has no signed release yet",
+                        "Use the source-home path in docs/MAC.md"]:
+            self.assertNotIn(retired, install + mac)
 
 
 if __name__ == "__main__":
