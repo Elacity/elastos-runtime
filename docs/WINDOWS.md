@@ -25,11 +25,12 @@ The executed proof for that product is
 
 - Package the Runtime as a signed or importable ElastOS WSL distribution.
 - A Windows launcher starts, stops, updates, and health-checks the Linux
-  Runtime, and opens one Home origin. [Home origin](#home-origin) gives that
-  URL and its code.
+  Runtime, and opens one Home origin. The
+  [launcher contract](LAUNCHER_CONTRACT.md#readiness-and-home-url) owns that
+  URL.
 - The launcher keeps Runtime state on the distro filesystem.
 - The launcher enforces explicit storage budgets and cleanup.
-- The launcher keeps the localhost passkey origin stable.
+- The launcher keeps the passkey origin stable.
 - The launcher reports Browser availability honestly. Edge is a shell surface
   for Home. It is not proof of a local isolated Browser capsule.
 
@@ -59,36 +60,36 @@ the Linux installer and binary there.
 
 ### Home origin
 
-The Home origin is `http://localhost:8090/home/`. A Windows launcher opens
-only this URL. Other text in this note refers to it as "the Home origin".
+The [launcher contract](LAUNCHER_CONTRACT.md#readiness-and-home-url) is the
+one source for the Home URL that a launcher opens and for the passkey origin.
+This note does not repeat that value. It records what the Runtime code serves:
 
-- `elastos home --browser` binds `localhost:` plus `BROWSER_HOME_PORT`
-  (`gateway_entry.rs:17-31`). `BROWSER_HOME_PORT` is `8090`
-  (`update_controller.rs:2288-2289`).
-- The gateway keeps the host name `localhost` in its URL
+- `elastos home --browser` binds the host name `localhost` at
+  `BROWSER_HOME_PORT` (`gateway_entry.rs:17-31`,
+  `update_controller.rs:2288-2289`).
+- The gateway keeps the host name that it was given in its URL
   (`api/gateway_server.rs:96-101`) and adds `/home/`
   (`api/gateway_server.rs:117`). `HOME_ROUTE` is `/home/`
   (`api/gateway.rs:440`).
 - `/home`, `/apps/home`, and `/apps/home/` redirect permanently to `/home/`
   (`api/gateway.rs:1222-1235`, `redirect_home_root` in
   `api/browser_capsules.rs:58-64`).
-- After an update restart, Runtime prints the same URL
-  (`update_controller.rs:1049`). The update controller accepts a ready Home
-  only at port `8090` and path `/home/` (`approved_home_url`,
-  `update_controller.rs:2291-2299`).
+- After an update restart, Runtime prints the Home URL with the host name
+  `localhost` (`update_controller.rs:1049`). The update controller accepts a
+  ready Home at `BROWSER_HOME_PORT` and `/home/` on `localhost`, `127.0.0.1`,
+  or `[::1]` (`approved_home_url`, `update_controller.rs:2291-2299`).
 - `elastos gateway` is a hidden operator command. Without `--addr` it binds
-  `127.0.0.1:8090` (`main.rs:438-441`). A launcher does not use it to open
-  Home. `127.0.0.1` is a different origin from `localhost`, and a passkey made
-  on one origin does not sign in on the other.
+  `127.0.0.1` at the same port (`main.rs:438-441`).
 
-The passkey relying party id for the Home origin is `localhost`. WebAuthn
-scopes that id by host, so any port on `localhost` can request an assertion
-for it.
+`localhost` and `127.0.0.1` are different browser origins. A passkey that is
+registered on one origin does not sign in on the other. The desktop launcher
+and the launcher contract do not use the same host name for the Home origin
+today. That is an open gap. The team decides the canonical origin, and this
+note does not choose one.
 
-`docs/INSTALL.md` gives the same Home origin. The source-build guides
-`docs/MAC.md` and `docs/HOME_LOCAL_SETUP.md` use a developer gateway at
-`http://localhost:61180/apps/home/`. That is a developer lane, not the
-installed product.
+`docs/INSTALL.md` describes `elastos home --browser`. The source-build guides
+`docs/MAC.md` and `docs/HOME_LOCAL_SETUP.md` use a developer gateway on a
+different port. That is a developer lane, not the installed product.
 
 `elastos home --browser` opens a browser itself. `browser_home_ready`
 (`gateway_entry.rs:33-40`) prints the URL and calls `open_browser`
@@ -239,6 +240,6 @@ Before Windows support is called product-ready, prove:
 - same-device and cross-device Carrier behavior where applicable
 - bounded disk usage and explicit cleanup
 - no orphan processes after stop
-- stable localhost and passkey origin
+- stable Home and passkey origin
 - honest Browser availability
 - installed artifact receipt and source receipt
