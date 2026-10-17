@@ -4,18 +4,27 @@ import { createServer } from "node:http";
 import { existsSync, readFileSync } from "node:fs";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { DEFAULT_URL } from "../capsules/browser/browser/browser-runtime-api.js";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const browserInstance = "browser:0123456789abcdef0123456789abcdef";
 const browserToken = "browser-window-close-headless-token";
+const browserEngineId = "close-proof-engine";
+const remoteExitId = "close-proof-exit";
 const state = {
+  authorityErrors: [],
   closeCalls: [],
+  closeOwnershipBrowserInstance: browserInstance,
+  freshStartAllowed: true,
   openCalls: 0,
   openRequests: 0,
+  openRequestBodies: [],
   openStatusRequests: 0,
+  pages: {},
   resetCalls: [],
   releaseInitialOpen: null,
   serverErrors: [],
+  statusCalls: [],
   requests: [],
   unknownOpenResult: null,
 };
@@ -92,6 +101,8 @@ function topDocument(origin) {
 function browserRoute(homeOrigin, includeUrl = true) {
   const query = new URLSearchParams({
     browser_instance: browserInstance,
+    browser_engine_id: browserEngineId,
+    remote_exit_id: remoteExitId,
     display_mode: "webrtc_remote_display",
     guarantee_level: "mechanism_microvm",
     home_origin: homeOrigin,
@@ -160,17 +171,23 @@ function attackerDocument() {
 </html>`;
 }
 
-function openResult() {
+function openResult(url) {
   state.openCalls += 1;
   const ordinal = state.openCalls;
   const pageId = `page-${ordinal}`;
+  state.pages[pageId] = url;
   return {
     schema: "elastos.browser.open-result/v1",
+    stream_session: {
+      schema: "elastos.net.stream-session/v1",
+      backend: remoteExitId,
+      direct_network: false,
+    },
     engine_page: {
       schema: "elastos.browser.engine.page/v1",
       page_id: pageId,
-      url: "https://example.com/close-proof",
-      actual_url: "https://example.com/close-proof",
+      url,
+      actual_url: url,
       title: "Close proof",
       display_session: {
         schema: "elastos.browser.display-session/v1",
@@ -202,55 +219,78 @@ async function handleApi(req, res, url) {
     res.end();
     return true;
   }
+  if (url.pathname.startsWith("/api/") && req.headers["x-elastos-home-token"] !== browserToken) {
+    state.authorityErrors.push(`${req.method} ${url.pathname}: wrong Browser token`);
+    json(res, 403, { error: "invalid fixture Browser authority" });
+    return true;
+  }
   if (url.pathname === "/api/apps/browser/summary" && req.method === "GET") {
     json(res, 200, {
       schema: "elastos.browser.runtime/v1",
       sessions: {
         schema: "elastos.browser.session-capacity/v1",
         status: "configured",
-        fresh_start_allowed: true,
+        fresh_start_allowed: state.freshStartAllowed,
         recoverable_page: null,
         window_close_ownership: {
           schema: "elastos.browser.window-close-ownership/v1",
-          browser_instance: browserInstance,
+          browser_instance: state.closeOwnershipBrowserInstance,
           state: "absent",
         },
       },
-      browser_engines: [],
-      remote_carrier_exits: [],
+      engine_adapter: {
+        adapters: [{
+          id: browserEngineId,
+          backing_substrate: "local_microvm",
+          direct_network: false,
+          wallet_injection: false,
+        }],
+      },
+      net: { exit_provider: { remote_carrier_exits: [{ id: remoteExitId }] } },
     });
     return true;
   }
   if (url.pathname === "/api/apps/browser/profile/reset" && req.method === "POST") {
-    state.resetCalls.push({ token: req.headers["x-elastos-home-token"] });
+    state.resetCalls.push({
+      token: req.headers["x-elastos-home-token"],
+      closeCallsAtReset: state.closeCalls.length,
+      openRequestsAtReset: state.openRequests,
+    });
     json(res, 200, { schema: "elastos.browser.profile-reset/v1", status: "ok", removed_profile_disk: true });
     return true;
   }
   if (url.pathname === "/api/apps/browser/open" && req.method === "POST") {
     const body = await readBody(req);
     if (
-      req.headers["x-elastos-home-token"] !== browserToken ||
-      body?.browser_instance !== browserInstance
+      body?.browser_instance !== browserInstance ||
+      body?.adapter_id !== browserEngineId ||
+      body?.remote_exit_id !== remoteExitId
     ) {
+      state.authorityErrors.push("open changed the Browser instance, Engine, or Exit selection");
       json(res, 403, { error: "invalid fixture Browser owner" });
       return true;
     }
     state.openRequests += 1;
+    state.openRequestBodies.push(body);
     if (state.openRequests === 1) {
       await new Promise((resolveOpen) => {
         state.releaseInitialOpen = resolveOpen;
       });
-      json(res, 200, openResult());
+      json(res, 200, openResult(body.url));
       return true;
     }
     if (state.openRequests === 2) {
-      state.unknownOpenResult = openResult();
+      state.unknownOpenResult = openResult(body.url);
       json(res, 202, {
         schema: "elastos.browser.open-accepted/v1",
         status: "pending",
         open_id: "open-unknown-owner",
         status_url: "/api/apps/browser/open/open-unknown-owner",
       });
+      return true;
+    }
+    if (state.openRequests === 3) {
+      json(res, 200, openResult(body.url));
       return true;
     }
     json(res, 409, { error: "unexpected Browser open" });
@@ -283,7 +323,18 @@ async function handleApi(req, res, url) {
   }
   const signal = url.pathname.match(/^\/api\/apps\/browser\/pages\/([^/]+)\/signal$/);
   if (signal && req.method === "POST") {
-    await readBody(req);
+    const body = await readBody(req);
+    if (body?.type === "candidate" || body?.type === "end_of_candidates") {
+      json(res, 200, {
+        schema: "elastos.browser.webrtc-signal-ack/v1",
+        type: body.type,
+        accepted: true,
+        candidates: [],
+        end_of_candidates: true,
+      });
+      return true;
+    }
+    assert(body?.type === "offer", "fixture received an unexpected display signal", body);
     json(res, 200, {
       schema: "elastos.browser.webrtc-answer/v1",
       type: "answer",
@@ -297,7 +348,17 @@ async function handleApi(req, res, url) {
   if (close && req.method === "POST") {
     const pageId = decodeURIComponent(close[1]);
     const body = await readBody(req);
-    state.closeCalls.push({ pageId, body });
+    if (
+      body?.schema !== "elastos.browser.close-request/v2" ||
+      body?.browser_instance !== browserInstance ||
+      body?.cleanup_id !== pageId.replace("page-", "cleanup-") ||
+      !Object.hasOwn(state.pages, pageId)
+    ) {
+      state.authorityErrors.push(`close changed the exact Runtime owner for ${pageId}`);
+      json(res, 403, { error: "invalid fixture Browser cleanup authority" });
+      return true;
+    }
+    state.closeCalls.push({ pageId, body, token: req.headers["x-elastos-home-token"] });
     const alreadyReaped = pageId === "page-2";
     json(res, 200, {
       schema: "elastos.browser.close-result/v1",
@@ -308,11 +369,16 @@ async function handleApi(req, res, url) {
     });
     return true;
   }
-  if (/^\/api\/apps\/browser\/pages\/[^/]+\/status$/.test(url.pathname)) {
+  const status = url.pathname.match(/^\/api\/apps\/browser\/pages\/([^/]+)\/status$/);
+  if (status && req.method === "GET") {
+    const pageId = decodeURIComponent(status[1]);
+    state.statusCalls.push(pageId);
     json(res, 200, {
       schema: "elastos.browser.page-status/v1",
-      actual_url: "https://example.com/close-proof",
-      title: "Close proof",
+      page_id: pageId,
+      direct_network: false,
+      actual_url: state.pages[pageId],
+      title: `Observed ${pageId}`,
       audio: false,
       video: false,
     });
@@ -515,7 +581,7 @@ try {
   try {
     await browserFrame.waitForFunction(
       () =>
-        document.body.dataset.loading === "false" &&
+        document.body?.dataset.loading === "false" &&
         !window.__elastosBrowserCurrentPageId,
       null,
       { timeout: 10_000 },
@@ -523,7 +589,7 @@ try {
   } catch (error) {
     const browserState = await browserFrame.evaluate(() => ({
       currentPageId: window.__elastosBrowserCurrentPageId,
-      loading: document.body.dataset.loading,
+      loading: document.body?.dataset.loading ?? null,
       status: document.querySelector("#browser-status")?.textContent || "",
     })).catch(() => null);
     throw new Error(`unknown-owner Browser did not settle after the lost poll: ${JSON.stringify({
@@ -639,51 +705,144 @@ try {
     (frame) => frame.url().includes("/apps/browser/") && !new URL(frame.url()).searchParams.has("url"),
     "fresh Browser capsule",
   );
-  await browserFrame.waitForFunction(() => document.body.dataset.loading === "false");
+  await browserFrame.waitForFunction(() => document.body?.dataset.loading === "false");
+  assert(
+    state.openRequests === 3 &&
+      state.openRequestBodies[2].url === DEFAULT_URL &&
+      state.openRequestBodies[2].adapter_id === browserEngineId &&
+      state.openRequestBodies[2].remote_exit_id === remoteExitId &&
+      (await browserFrame.evaluate(() => window.__elastosBrowserCurrentPageId)) === "page-3",
+    "a fresh Browser must open its default URL with the selected Engine and Exit",
+    state.openRequestBodies,
+  );
+  await browserFrame.waitForFunction(
+    () => document.title === "Observed page-3 - ElastOS Browser" &&
+      window.__elastosBrowserCurrentPageId === "page-3",
+    null,
+    { timeout: 10_000 },
+  );
+  assert(state.statusCalls.includes("page-3"), "the fresh page did not complete a status observation", state.statusCalls);
+  const opensBeforeReset = state.openRequests;
+  const closesBeforeReset = state.closeCalls.length;
+  async function assertResetUnchanged(action) {
+    assert(
+      state.resetCalls.length === 0 &&
+        state.closeCalls.length === closesBeforeReset &&
+        state.openRequests === opensBeforeReset &&
+        (await browserFrame.evaluate(() => window.__elastosBrowserCurrentPageId)) === "page-3",
+      `${action} changed the Browser profile or page`,
+      state,
+    );
+  }
   await browserFrame.locator("#browser-settings").click();
   const confirmation = browserFrame.locator("#browser-profile-reset-confirmation");
   await browserFrame.locator("#browser-profile-reset").click();
   await confirmation.waitFor({ state: "visible" });
   await browserFrame.locator("#browser-profile-reset-cancel").click();
   await confirmation.waitFor({ state: "hidden" });
-  assert(state.resetCalls.length === 0, "Cancel changed the Browser profile", state.resetCalls);
+  await assertResetUnchanged("Cancel");
   await browserFrame.locator("#browser-profile-reset").click();
   await browserFrame.locator("#browser-profile-reset-cancel").press("Escape");
   await confirmation.waitFor({ state: "hidden" });
   await browserFrame.locator("#browser-settings").click();
-  assert(state.resetCalls.length === 0, "Escape changed the Browser profile", state.resetCalls);
+  await assertResetUnchanged("Escape");
   await browserFrame.locator("#browser-profile-reset").click();
   await browserFrame.locator("#browser-settings-close").click();
   await browserFrame.locator("#browser-settings").click();
   await confirmation.waitFor({ state: "hidden" });
-  assert(state.resetCalls.length === 0, "Closing Settings changed the Browser profile", state.resetCalls);
+  await assertResetUnchanged("Closing Settings");
   await browserFrame.locator("#browser-profile-reset").click();
   await browserFrame.locator("#browser-profile-reset-commit").click();
   await browserFrame.locator("#browser-status").getByText("Browser profile reset. Open the address again.", { exact: true }).waitFor();
-  assert(state.resetCalls.length === 1 && state.resetCalls[0].token === browserToken && state.openRequests === 2,
-    "Confirmed reset must use the exact window authority once without opening an Engine", state.resetCalls);
+  assert(
+    state.resetCalls.length === 1 &&
+      state.resetCalls[0].token === browserToken &&
+      state.resetCalls[0].closeCallsAtReset === closesBeforeReset + 1 &&
+      state.resetCalls[0].openRequestsAtReset === opensBeforeReset &&
+      state.closeCalls.length === closesBeforeReset + 1 &&
+      state.closeCalls.at(-1).pageId === "page-3" &&
+      state.closeCalls.at(-1).body.cleanup_id === "cleanup-3" &&
+      state.openRequests === opensBeforeReset &&
+      !(await browserFrame.evaluate(() => window.__elastosBrowserCurrentPageId)),
+    "Confirmed reset must close the exact page before using window authority once, without a replacement open",
+    { resetCalls: state.resetCalls, closeCalls: state.closeCalls, openRequests: state.openRequests },
+  );
   await shellFrame.evaluate(
     (message) => window.__browserCloseProof.send(message),
     { ...request, requestId: "headless-close-exact-absence" },
   );
   await shellFrame.waitForFunction(() => window.__browserCloseProof.resultCount() === 5);
+  const resetResult = await shellFrame.evaluate(() => window.__browserCloseProof.results().at(-1));
+  assert(
+    state.openRequests === opensBeforeReset && state.closeCalls.length === closesBeforeReset + 1 &&
+      resetResult.state === "terminal" &&
+      resetResult.terminalKind === "no_page" &&
+      resetResult.pageId === "" &&
+      resetResult.cleanupId === "",
+    "Browser did not retain terminal page absence after profile reset",
+    { resetResult, closeCalls: state.closeCalls },
+  );
+
+  // An independent window never starts a page. Only Runtime's exact ownership
+  // receipt may make its close terminal, even when fresh starts are unavailable.
+  state.freshStartAllowed = false;
+  state.closeOwnershipBrowserInstance = "browser:another-window";
+  await shellFrame.evaluate(() => window.__browserCloseProof.navigateAway());
+  await waitForFrame(page, (frame) => frame.url().includes("/blank"), "reset Browser navigation");
+  await shellFrame.evaluate(() => window.__browserCloseProof.openFresh());
+  browserFrame = await waitForFrame(
+    page,
+    (frame) => frame.url().includes("/apps/browser/") && !new URL(frame.url()).searchParams.has("url"),
+    "Browser without a page",
+  );
+  await browserFrame.waitForFunction(() => document.body?.dataset.loading === "false");
+  assert(
+    state.openRequests === opensBeforeReset &&
+      !(await browserFrame.evaluate(() => window.__elastosBrowserCurrentPageId)),
+    "Browser opened a page while Runtime withheld fresh-start permission",
+    state,
+  );
+  await shellFrame.evaluate(
+    (message) => window.__browserCloseProof.send(message),
+    { ...request, requestId: "headless-close-other-window-absence" },
+  );
+  await shellFrame.waitForFunction(() => window.__browserCloseProof.resultCount() === 6);
+  const unrelatedAbsence = await shellFrame.evaluate(() => window.__browserCloseProof.results().at(-1));
+  assert(
+    unrelatedAbsence.state === "pending" &&
+      unrelatedAbsence.terminalKind === "" &&
+      unrelatedAbsence.reason === "runtime_ownership_unproven",
+    "Browser accepted another window's absence as its own terminal close",
+    unrelatedAbsence,
+  );
+  state.closeOwnershipBrowserInstance = browserInstance;
+  const freshRequest = { ...request, requestId: "headless-close-fresh-exact-absence" };
+  await shellFrame.evaluate((message) => window.__browserCloseProof.send(message), freshRequest);
+  await shellFrame.waitForFunction(() => window.__browserCloseProof.resultCount() === 7);
   const freshResult = await shellFrame.evaluate(() => window.__browserCloseProof.results().at(-1));
   assert(
-    state.openRequests === 2 && state.closeCalls.length === 1 &&
+    state.openRequests === opensBeforeReset && state.closeCalls.length === closesBeforeReset + 1 &&
+      freshResult.requestId === freshRequest.requestId &&
+      freshResult.homeToken === browserToken &&
+      freshResult.browserInstance === browserInstance &&
       freshResult.state === "terminal" &&
       freshResult.terminalKind === "no_page" &&
       freshResult.pageId === "" &&
       freshResult.cleanupId === "",
-    "fresh Browser did not accept Runtime's exact absence without closing another page",
+    "Browser without a page did not accept Runtime's exact absence without closing another page",
     { freshResult, closeCalls: state.closeCalls },
   );
+  assert(state.authorityErrors.length === 0, "Browser changed fixture authority", state.authorityErrors);
   assert(pageErrors.length === 0, "Browser close fixture raised page errors", pageErrors);
   assert(state.serverErrors.length === 0, "Browser close fixture server failed", state.serverErrors);
   console.log(JSON.stringify({
     schema: "elastos.browser.window-close-headless-smoke/v1",
     ok: true,
     close_calls: state.closeCalls.length,
+    default_startup: state.openRequestBodies[2].url,
+    fresh_page_status_observed: state.statusCalls.includes("page-3"),
     fresh_close: freshResult.terminalKind,
+    unrelated_absence: unrelatedAbsence.state,
     unload_close_calls: 0,
     reset_calls: state.resetCalls.length,
   }));
