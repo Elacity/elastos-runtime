@@ -1057,6 +1057,10 @@ struct GatewayRoomPollView {
     transport: crate::room_service::RoomTransportView,
     #[serde(default)]
     own_delivery: Vec<crate::room_service::CommunityDeliveryView>,
+    /// The polling person's Community presence choice: `unchosen`, `shown`
+    /// or `hidden`. Absent outside a joined Community.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    community_presence: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1117,7 +1121,7 @@ struct GatewayParticipantCard {
     #[serde(skip_serializing_if = "Option::is_none")]
     conversation_id: Option<String>,
     can_add_contact: bool,
-    /// The person shares presence (Discovery on) and it has not expired.
+    /// The person's Home announced Community presence that has not expired.
     active_now: bool,
 }
 
@@ -1132,8 +1136,16 @@ pub(super) struct ParticipantCardDirectory {
     /// Profile DIDs visible in Discovery right now, so a request can bind to
     /// their signed advertisement.
     pub(super) discoverable: std::collections::HashSet<String>,
-    /// Profile DIDs with unexpired shared presence.
-    pub(super) present: std::collections::HashSet<String>,
+    /// Unexpired Community presence by Profile DID: the signed Profile's
+    /// display name and when the Home last announced it.
+    pub(super) present: std::collections::HashMap<String, PresentMember>,
+}
+
+/// A Community member whose Home is online now, from verified presence.
+#[derive(Debug, Clone)]
+pub(super) struct PresentMember {
+    pub(super) display_name: String,
+    pub(super) last_seen_at: u64,
 }
 
 impl ParticipantCardDirectory {
@@ -1158,15 +1170,55 @@ impl ParticipantCardDirectory {
             relationship,
             conversation_id,
             can_add_contact: relationship == "none" && self.discoverable.contains(member_did),
-            active_now: self.present.contains(member_did),
+            active_now: self.present.contains_key(member_did),
         }
     }
 }
 
 impl GatewayRoomPollView {
-    /// Attaches a profile card to every verified participant and an opaque
-    /// sender reference to every verified message.
+    /// Lists members whose Home is online now beside members who posted,
+    /// one row per Profile DID, then attaches a profile card to every
+    /// verified participant and an opaque sender reference to every verified
+    /// message. Online rows come only from unexpired presence, so they leave
+    /// the list when it expires.
     pub(super) fn apply_participant_cards(&mut self, directory: &ParticipantCardDirectory) {
+        let listed = self
+            .participants
+            .iter()
+            .filter_map(|participant| participant.member_did.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut online = directory
+            .present
+            .iter()
+            .filter(|(member_did, _)| !listed.contains(*member_did))
+            .map(|(member_did, member)| GatewayParticipantView {
+                member_did: Some(member_did.clone()),
+                card: None,
+                display_name: member.display_name.clone(),
+                profile_verified: Some(true),
+                device_label: String::new(),
+                last_seen_at: member.last_seen_at,
+                role: None,
+                local_session_count: 0,
+                is_current_session: directory.local_profile_did.as_deref()
+                    == Some(member_did.as_str()),
+            })
+            .collect::<Vec<_>>();
+        if !online.is_empty() {
+            self.participants.append(&mut online);
+            self.participants.sort_by(|left, right| {
+                right
+                    .is_current_session
+                    .cmp(&left.is_current_session)
+                    .then_with(|| right.local_session_count.cmp(&left.local_session_count))
+                    .then_with(|| {
+                        left.display_name
+                            .to_lowercase()
+                            .cmp(&right.display_name.to_lowercase())
+                    })
+                    .then_with(|| right.last_seen_at.cmp(&left.last_seen_at))
+            });
+        }
         for participant in &mut self.participants {
             if participant.profile_verified != Some(true) {
                 continue;
@@ -1291,6 +1343,7 @@ impl From<crate::room_service::RoomPollView> for GatewayRoomPollView {
                 .collect(),
             transport: view.transport,
             own_delivery: view.own_delivery,
+            community_presence: None,
         }
     }
 }

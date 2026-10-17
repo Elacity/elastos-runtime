@@ -1274,7 +1274,7 @@ async function runScenario(scenario) {
         const card = document.querySelector("#participant-card");
         const action = document.querySelector("#participant-card-action");
         return card?.hidden === false && card.dataset.participantRef === "participant:fixture-friend"
-          && document.querySelector("#participant-card-state")?.textContent === "Contact · Active now"
+          && document.querySelector("#participant-card-state")?.textContent === "Contact · Home online"
           && action?.hidden === false && !action.disabled && action.dataset.cardAction === "message"
           && action.textContent === "Message"
           && !!document.querySelector('[data-conversation-choice="direct:sha256:fixture-conversation"]');
@@ -1291,7 +1291,7 @@ async function runScenario(scenario) {
           window.fixtureCardObserver = new MutationObserver(() => {
             const action = document.querySelector("#participant-card-action");
             window.fixtureCardRegressed ||= card.hidden
-              || document.querySelector("#participant-card-state")?.textContent !== "Contact · Active now"
+              || document.querySelector("#participant-card-state")?.textContent !== "Contact · Home online"
               || action?.hidden !== false || action.disabled || action.dataset.cardAction !== "message";
           });
           window.fixtureCardObserver.observe(card, { subtree: true, childList: true, characterData: true, attributes: true });
@@ -1308,7 +1308,7 @@ async function runScenario(scenario) {
           return window.fixtureCardRegressed;
         });
         assert(!regressed, "a held request response briefly reverted accepted contact state");
-        assert(await frame.locator("#participant-card-state").innerText() === "Contact · Active now"
+        assert(await frame.locator("#participant-card-state").innerText() === "Contact · Home online"
           && await frame.locator("#participant-card-action").isVisible()
           && await frame.locator("#participant-card-action").innerText() === "Message",
         "a held request response reverted accepted contact state");
