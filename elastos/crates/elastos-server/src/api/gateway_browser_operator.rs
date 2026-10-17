@@ -332,13 +332,10 @@ pub(in crate::api::gateway) async fn request_admission(
         return failure(StatusCode::TOO_MANY_REQUESTS, "operator_requests_busy");
     }
     service.pending.cleanup_old(60).await;
-    service
-        .pending
-        .cleanup_retired_grants_at_capacity(&service.capabilities)
-        .await;
     let pending = service
         .pending
-        .create_request_with_reason(
+        .admit_request(
+            &service.capabilities,
             session.id.clone(),
             ResourceId::new(format!("elastos://browser/pages/{page_id}/input")),
             Action::Write,

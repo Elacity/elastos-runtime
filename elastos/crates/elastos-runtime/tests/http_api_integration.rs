@@ -110,17 +110,19 @@ async fn test_invalidate_session() {
 
 #[tokio::test]
 async fn test_create_capability_request() {
-    let (session_registry, _, pending_store) = create_test_infra();
+    let (session_registry, capability_manager, pending_store) = create_test_infra();
 
     let session = session_registry
         .create_session(SessionType::Capsule, None)
         .await;
 
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
@@ -135,7 +137,7 @@ async fn test_create_capability_request() {
 
 #[tokio::test]
 async fn test_list_pending_requests() {
-    let (session_registry, _, pending_store) = create_test_infra();
+    let (session_registry, capability_manager, pending_store) = create_test_infra();
 
     // Create two sessions with requests
     let session1 = session_registry
@@ -146,18 +148,22 @@ async fn test_list_pending_requests() {
         .await;
 
     pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session1.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
     pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session2.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/documents/*"),
             Action::Write,
+            String::new(),
         )
         .await;
 
@@ -174,10 +180,12 @@ async fn test_grant_capability_request() {
         .await;
 
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
@@ -217,17 +225,19 @@ async fn test_grant_capability_request() {
 
 #[tokio::test]
 async fn test_deny_capability_request() {
-    let (session_registry, _, pending_store) = create_test_infra();
+    let (session_registry, capability_manager, pending_store) = create_test_infra();
 
     let session = session_registry
         .create_session(SessionType::Capsule, None)
         .await;
 
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/sensitive/*"),
             Action::Delete,
+            String::new(),
         )
         .await;
 
@@ -290,10 +300,12 @@ async fn test_cannot_grant_already_granted_request() {
         .await;
 
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
@@ -324,17 +336,19 @@ async fn test_cannot_grant_already_granted_request() {
 
 #[tokio::test]
 async fn test_cannot_deny_already_denied_request() {
-    let (session_registry, _, pending_store) = create_test_infra();
+    let (session_registry, capability_manager, pending_store) = create_test_infra();
 
     let session = session_registry
         .create_session(SessionType::Capsule, None)
         .await;
 
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
@@ -362,10 +376,12 @@ async fn test_grant_once_duration() {
         .await;
 
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
@@ -398,17 +414,19 @@ async fn test_grant_once_duration() {
 
 #[tokio::test]
 async fn test_request_expiry_detection() {
-    let (session_registry, _, pending_store) = create_test_infra();
+    let (session_registry, capability_manager, pending_store) = create_test_infra();
 
     let session = session_registry
         .create_session(SessionType::Capsule, None)
         .await;
 
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
@@ -420,7 +438,7 @@ async fn test_request_expiry_detection() {
 
 #[tokio::test]
 async fn test_all_action_types() {
-    let (session_registry, _, pending_store) = create_test_infra();
+    let (session_registry, capability_manager, pending_store) = create_test_infra();
 
     let session = session_registry
         .create_session(SessionType::Capsule, None)
@@ -437,10 +455,12 @@ async fn test_all_action_types() {
 
     for action in actions {
         let request = pending_store
-            .create_request(
+            .admit_request(
+                &capability_manager,
                 session.id.clone(),
                 ResourceId::new("localhost://Users/self/Documents/test/*"),
                 action,
+                String::new(),
             )
             .await;
 
@@ -519,7 +539,7 @@ async fn test_cleanup_dead_vm_sessions() {
 
 #[tokio::test]
 async fn test_multiple_requests_same_session() {
-    let (session_registry, _, pending_store) = create_test_infra();
+    let (session_registry, capability_manager, pending_store) = create_test_infra();
 
     let session = session_registry
         .create_session(SessionType::Capsule, None)
@@ -527,18 +547,22 @@ async fn test_multiple_requests_same_session() {
 
     // Create multiple requests from same session
     let request1 = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
     let request2 = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/documents/*"),
             Action::Write,
+            String::new(),
         )
         .await;
 
@@ -568,10 +592,12 @@ async fn test_full_capability_flow() {
 
     // 3. Capsule requests capability
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             capsule.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
@@ -908,10 +934,12 @@ async fn test_session_info_capabilities_count() {
 
     // Create and grant first capability
     let req1 = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
@@ -937,10 +965,12 @@ async fn test_session_info_capabilities_count() {
 
     // Create and grant second capability
     let req2 = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/docs/*"),
             Action::Write,
+            String::new(),
         )
         .await;
 
@@ -966,10 +996,12 @@ async fn test_session_info_capabilities_count() {
 
     // Pending request should NOT be counted
     pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             session.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/music/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
@@ -985,10 +1017,12 @@ async fn test_session_info_capabilities_count() {
         .create_session(SessionType::Capsule, None)
         .await;
     let other_req = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             other.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/other/*"),
             Action::Read,
+            String::new(),
         )
         .await;
     let other_token = capability_manager.grant(
@@ -1060,10 +1094,12 @@ async fn test_shadow_divergence_visible_in_audit_log() {
         .await;
 
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             capsule.id.clone(),
             ResourceId::new("localhost://Users/self/Documents/sensitive/*"),
             Action::Delete,
+            String::new(),
         )
         .await;
 
@@ -1129,10 +1165,12 @@ async fn test_no_shadow_no_divergence_events() {
     let evaluator = PolicyEvaluator::new(Box::new(ShellPassthroughVerifier), audit_log.clone());
 
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             elastos_runtime::session::SessionId::from_string("test-session"),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
@@ -1177,10 +1215,12 @@ async fn test_shadow_agreement_no_divergence() {
     );
 
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             elastos_runtime::session::SessionId::from_string("test-session"),
             ResourceId::new("localhost://Users/self/Documents/photos/*"),
             Action::Read,
+            String::new(),
         )
         .await;
 
@@ -1211,10 +1251,12 @@ async fn test_rules_shadow_diverges_on_blocked_resource() {
 
     // Request targets a blocklisted resource segment ("admin")
     let request = pending_store
-        .create_request(
+        .admit_request(
+            &capability_manager,
             elastos_runtime::session::SessionId::from_string("test-session"),
             ResourceId::new("localhost://Users/self/Documents/admin/secrets"),
             Action::Read,
+            String::new(),
         )
         .await;
 

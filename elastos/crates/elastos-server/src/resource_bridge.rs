@@ -840,12 +840,10 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                 let resource_id = elastos_runtime::capability::ResourceId::new(resource);
 
                 // Create a pending request — the shell decides whether to grant.
-                ctx.pending_store
-                    .cleanup_retired_grants_at_capacity(&ctx.capability_manager)
-                    .await;
                 let pending = ctx
                     .pending_store
-                    .create_request_with_reason(
+                    .admit_request(
+                        &ctx.capability_manager,
                         elastos_runtime::session::SessionId(ctx.capsule_id.clone()),
                         resource_id.clone(),
                         action,

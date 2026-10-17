@@ -118,23 +118,24 @@ pub async fn request_capability(
 
     // For now, all requests go to pending (no auto-grant policy yet)
     // Future: check if session already has this capability, or if policy allows auto-grant
-
-    state
-        .pending_store
-        .cleanup_retired_grants_at_capacity(&state.capability_manager)
-        .await;
     let request = state
         .pending_store
-        .create_request_with_reason(session.id.clone(), resource, action, input.reason)
+        .admit_request(
+            &state.capability_manager,
+            session.id.clone(),
+            resource,
+            action,
+            input.reason,
+        )
         .await;
 
     // If pre-denied (e.g. rate limit), surface the denial immediately
-    if request.is_denied() {
+    if let elastos_runtime::capability::RequestStatus::Denied { reason } = &request.status {
         return Ok(Json(RequestCapabilityOutput {
             status: "denied".to_string(),
             request_id: Some(request.id.to_string()),
             token: None,
-            reason: Some("Too many pending requests".to_string()),
+            reason: Some(reason.clone()),
         }));
     }
 
@@ -542,17 +543,26 @@ pub async fn revoke_all_capabilities(
     State(state): State<CapabilityState>,
     Extension(_session): Extension<Session>, // Shell check done by middleware
     Json(input): Json<RevokeAllInput>,
-) -> Json<RevokeAllOutput> {
-    let new_epoch = state.capability_manager.revoke_all(&input.reason);
+) -> Result<Json<RevokeAllOutput>, (StatusCode, String)> {
+    let new_epoch = state
+        .capability_manager
+        .revoke_all(&input.reason)
+        .map_err(|error| {
+            tracing::error!("Failed to persist capability revocation: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to persist capability revocation".to_string(),
+            )
+        })?;
 
     // Mark all granted requests as revoked
     state.pending_store.revoke_all_granted().await;
 
-    Json(RevokeAllOutput {
+    Ok(Json(RevokeAllOutput {
         success: true,
         new_epoch,
         reason: input.reason,
-    })
+    }))
 }
 
 // === Session Info ===
@@ -781,6 +791,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_revoke_all_failure_returns_500_and_keeps_live_grants() {
+        use elastos_runtime::capability::{CapabilityStore, RequestStatus};
+        use elastos_runtime::primitives::{audit::AuditEvent, metrics::MetricsManager};
+
+        for blocked_path in ["epoch.tmp", "epoch", "overflow"] {
+            let directory = tempfile::tempdir().unwrap();
+            if blocked_path == "overflow" {
+                std::fs::write(directory.path().join("epoch"), u64::MAX.to_string()).unwrap();
+            }
+            let authority = Arc::new(
+                CapabilityStore::with_persistence(directory.path())
+                    .await
+                    .unwrap(),
+            );
+            let mut state = test_state();
+            let audit = state.pending_store.audit_log();
+            state.capability_manager = Arc::new(CapabilityManager::new(
+                authority.clone(),
+                audit.clone(),
+                Arc::new(MetricsManager::new()),
+            ));
+            let session = Session::new_capsule("revocation-failure".to_string());
+            let request = state
+                .pending_store
+                .admit_request(
+                    &state.capability_manager,
+                    session.id.clone(),
+                    ResourceId::new("localhost://Users/self/Documents/test"),
+                    Action::Read,
+                    String::new(),
+                )
+                .await;
+            let token = state.capability_manager.grant(
+                session.id.as_str(),
+                request.resource.clone(),
+                request.action,
+                TokenConstraints::default(),
+                None,
+            );
+            state
+                .pending_store
+                .grant_request(request.id.as_str(), token.clone(), GrantDuration::Session)
+                .await
+                .unwrap();
+            if blocked_path != "overflow" {
+                std::fs::create_dir(directory.path().join(blocked_path)).unwrap();
+            }
+            let epoch = authority.current_epoch();
+            let result = revoke_all_capabilities(
+                State(state.clone()),
+                Extension(Session::new_shell("test-shell".to_string())),
+                Json(RevokeAllInput {
+                    reason: "persistence failure".to_string(),
+                }),
+            )
+            .await;
+            let (status, message) = match result {
+                Err(error) => error,
+                Ok(_) => panic!("failed persistence must not report successful revocation"),
+            };
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(message, "Failed to persist capability revocation");
+            assert_eq!(authority.current_epoch(), epoch);
+            assert!(matches!(
+                state
+                    .pending_store
+                    .get_request(request.id.as_str())
+                    .await
+                    .unwrap()
+                    .status,
+                RequestStatus::Granted { .. }
+            ));
+            assert!(audit
+                .recent_events(100)
+                .iter()
+                .all(|event| !matches!(event, AuditEvent::EpochAdvance { .. })));
+            state
+                .capability_manager
+                .validate(
+                    &token,
+                    session.id.as_str(),
+                    request.action,
+                    &request.resource,
+                    None,
+                )
+                .await
+                .unwrap();
+            if blocked_path != "overflow" {
+                std::fs::remove_dir(directory.path().join(blocked_path)).unwrap();
+                let recovered = revoke_all_capabilities(
+                    State(state.clone()),
+                    Extension(Session::new_shell("test-shell".to_string())),
+                    Json(RevokeAllInput {
+                        reason: "retry after repair".to_string(),
+                    }),
+                )
+                .await
+                .unwrap()
+                .0;
+                assert!(recovered.success);
+                assert_eq!(recovered.new_epoch, epoch + 1);
+                assert!(state
+                    .pending_store
+                    .get_request(request.id.as_str())
+                    .await
+                    .unwrap()
+                    .is_denied());
+                assert!(state
+                    .capability_manager
+                    .validate(
+                        &token,
+                        session.id.as_str(),
+                        request.action,
+                        &request.resource,
+                        None
+                    )
+                    .await
+                    .is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_request_capacity_recovers_consumed_once_grants_without_losing_live_grants() {
         use elastos_runtime::capability::{
             manager::ValidationError, pending::MAX_PENDING_REQUESTS, CapabilityToken,
@@ -839,10 +972,12 @@ mod tests {
         for index in 0..MAX_PENDING_REQUESTS - 3 {
             let pending = state
                 .pending_store
-                .create_request(
+                .admit_request(
+                    &state.capability_manager,
                     SessionId::from_string(format!("prefill-{index}")),
                     spent.resource().clone(),
                     Action::Read,
+                    String::new(),
                 )
                 .await;
             assert!(pending.is_pending());
@@ -957,7 +1092,13 @@ mod tests {
         let resource = ResourceId::new("localhost://Users/self/Documents/test");
         let stale_request = state
             .pending_store
-            .create_request(stale_session.id.clone(), resource.clone(), Action::Read)
+            .admit_request(
+                &state.capability_manager,
+                stale_session.id.clone(),
+                resource.clone(),
+                Action::Read,
+                String::new(),
+            )
             .await;
         // Reproduce the grant handler's mint/register split without timing sleeps.
         let stale_token = state.capability_manager.grant(
@@ -975,6 +1116,7 @@ mod tests {
             }),
         )
         .await
+        .unwrap()
         .0;
         assert!(state
             .pending_store
@@ -1007,7 +1149,13 @@ mod tests {
 
         let live_request = state
             .pending_store
-            .create_request(live_session.id.clone(), resource.clone(), Action::Read)
+            .admit_request(
+                &state.capability_manager,
+                live_session.id.clone(),
+                resource.clone(),
+                Action::Read,
+                String::new(),
+            )
             .await;
         let live_grant = grant_request(
             State(state.clone()),
@@ -1028,10 +1176,12 @@ mod tests {
         for index in 0..MAX_PENDING_REQUESTS - 2 {
             assert!(state
                 .pending_store
-                .create_request(
+                .admit_request(
+                    &state.capability_manager,
                     SessionId::from_string(format!("prefill-{index}")),
                     resource.clone(),
-                    Action::Read
+                    Action::Read,
+                    String::new()
                 )
                 .await
                 .is_pending());
@@ -1064,10 +1214,12 @@ mod tests {
         );
         assert!(state
             .pending_store
-            .create_request(
+            .admit_request(
+                &state.capability_manager,
                 SessionId::from_string("overflow"),
                 resource.clone(),
-                Action::Read
+                Action::Read,
+                String::new()
             )
             .await
             .is_denied());

@@ -81,21 +81,15 @@ impl CapabilityStore {
     /// if the process dies after persist but before in-memory update,
     /// the next startup loads the higher epoch and tokens stay revoked.
     /// Returns the new epoch value.
-    pub fn advance_epoch(&self) -> u64 {
-        match self.epoch_transaction(
+    pub fn advance_epoch(&self) -> std::io::Result<u64> {
+        self.epoch_transaction(
             |current| {
                 current
                     .checked_add(1)
                     .ok_or_else(|| std::io::Error::other("capability epoch exhausted"))
             },
             |epoch| self.write_epoch(epoch),
-        ) {
-            Ok(epoch) => epoch,
-            Err(error) => {
-                tracing::error!("CRITICAL: Capability epoch advance aborted: {}", error);
-                self.current_epoch()
-            }
-        }
+        )
     }
 
     /// Load an already-persisted epoch during initialization.
@@ -356,7 +350,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
                 (0..ADVANCES)
-                    .map(|_| store.advance_epoch())
+                    .map(|_| store.advance_epoch().unwrap())
                     .collect::<Vec<_>>()
             }));
         }
@@ -400,14 +394,14 @@ mod tests {
                 .await
                 .unwrap();
             fs::create_dir(directory.path().join(blocked_path)).unwrap();
-            assert_eq!(store.advance_epoch(), 0);
+            assert!(store.advance_epoch().is_err());
             assert_eq!(store.current_epoch(), 0);
             // A synchronous writer guard must not make this async API !Send.
             assert_send(store.persist());
             assert!(store.persist().await.is_err());
             assert_eq!(store.current_epoch(), 0);
             fs::remove_dir(directory.path().join(blocked_path)).unwrap();
-            assert_eq!(store.advance_epoch(), 1);
+            assert_eq!(store.advance_epoch().unwrap(), 1);
             let reloaded = CapabilityStore::with_persistence(directory.path())
                 .await
                 .unwrap();
@@ -428,7 +422,7 @@ mod tests {
         let store = CapabilityStore::with_persistence(directory.path())
             .await
             .unwrap();
-        assert_eq!(store.advance_epoch(), u64::MAX);
+        assert!(store.advance_epoch().is_err());
         assert_eq!(store.current_epoch(), u64::MAX);
         assert_eq!(
             fs::read_to_string(directory.path().join("epoch")).unwrap(),
@@ -447,7 +441,7 @@ mod tests {
 
         assert_eq!(store.current_epoch(), 0);
 
-        let new_epoch = store.advance_epoch();
+        let new_epoch = store.advance_epoch().unwrap();
         assert_eq!(new_epoch, 1);
         assert_eq!(store.current_epoch(), 1);
 
@@ -492,8 +486,8 @@ mod tests {
             let store = CapabilityStore::with_persistence(temp_dir.path())
                 .await
                 .unwrap();
-            store.advance_epoch();
-            store.advance_epoch();
+            store.advance_epoch().unwrap();
+            store.advance_epoch().unwrap();
 
             let token_id = TokenId::from_bytes([1u8; 16]);
             store.revoke_token(token_id).await;

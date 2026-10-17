@@ -20,8 +20,8 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Maximum number of pending requests before rejecting new ones
 pub const MAX_PENDING_REQUESTS: usize = 1024;
 
-/// Maximum number of pending requests per session before rejecting new ones.
-/// Prevents a single session from starving other sessions.
+/// Maximum outstanding requests and retained live grants per session.
+/// A session keeps its live grant records within its own bounded share.
 pub const MAX_PENDING_PER_SESSION: usize = 32;
 
 /// Unique identifier for a pending request
@@ -202,6 +202,22 @@ struct PendingRequestState {
 }
 
 impl PendingRequestState {
+    fn session_admission_count(&self, session_id: &str, now: &SecureTimestamp) -> usize {
+        self.session_requests.get(session_id).map_or(0, |ids| {
+            ids.iter()
+                .filter(|id| {
+                    self.requests
+                        .get(*id)
+                        .is_some_and(|request| match &request.status {
+                            RequestStatus::Pending => !request.expires_at.is_before(now),
+                            RequestStatus::Granted { .. } => true,
+                            RequestStatus::Denied { .. } | RequestStatus::Expired => false,
+                        })
+                })
+                .count()
+        })
+    }
+
     fn cleanup_expired(&mut self, now: &SecureTimestamp) -> usize {
         let mut expired = 0;
         for request in self.requests.values_mut() {
@@ -284,12 +300,27 @@ impl PendingRequestStore {
         }
     }
 
-    /// Create a new pending request
+    /// Admit a request through Runtime-owned pressure reconciliation.
     ///
-    /// If the store is at capacity (MAX_PENDING_REQUESTS), expired requests are
-    /// cleaned up first. If still at capacity, the returned request is immediately
-    /// denied (not stored) to prevent request-flood DoS.
-    pub async fn create_request(
+    /// The manager must be the Runtime owner that issued this store's grants.
+    /// Reconciliation never consumes or grants authority. The final capacity
+    /// decision and insertion share one write lock after reconciliation.
+    pub async fn admit_request(
+        &self,
+        capability_manager: &CapabilityManager,
+        session_id: SessionId,
+        resource: ResourceId,
+        action: Action,
+        reason: String,
+    ) -> PendingCapabilityRequest {
+        self.cleanup_retired_grants_at_capacity(capability_manager, Some(session_id.as_str()))
+            .await;
+        self.create_request_with_reason(session_id, resource, action, reason)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn create_request(
         &self,
         session_id: SessionId,
         resource: ResourceId,
@@ -299,7 +330,7 @@ impl PendingRequestStore {
             .await
     }
 
-    pub async fn create_request_with_reason(
+    async fn create_request_with_reason(
         &self,
         session_id: SessionId,
         resource: ResourceId,
@@ -309,7 +340,9 @@ impl PendingRequestStore {
         // Admission, cleanup, and both index updates are one state transition.
         let mut state = self.state.write().await;
         let now = SecureTimestamp::now();
-        if state.requests.len() >= MAX_PENDING_REQUESTS {
+        if state.requests.len() >= MAX_PENDING_REQUESTS
+            || state.session_admission_count(session_id.as_str(), &now) >= MAX_PENDING_PER_SESSION
+        {
             state.cleanup_expired(&now);
             state.cleanup_old(&now, 0);
         }
@@ -317,18 +350,8 @@ impl PendingRequestStore {
         let denial = if state.requests.len() >= MAX_PENDING_REQUESTS {
             Some("Too many pending requests")
         } else {
-            let pending_count = state.session_requests.get(&session_id.0).map_or(0, |ids| {
-                ids.iter()
-                    .filter(|id| {
-                        state.requests.get(*id).is_some_and(|request| {
-                            matches!(request.status, RequestStatus::Pending)
-                                && !request.expires_at.is_before(&now)
-                        })
-                    })
-                    .count()
-            });
-            (pending_count >= MAX_PENDING_PER_SESSION)
-                .then_some("Too many pending requests for this session")
+            (state.session_admission_count(session_id.as_str(), &now) >= MAX_PENDING_PER_SESSION)
+                .then_some("Too many outstanding requests or grants for this session")
         };
 
         let mut request = PendingCapabilityRequest::new_with_reason(
@@ -345,6 +368,10 @@ impl PendingRequestStore {
             return request;
         }
 
+        // Exercise the decision/insertion boundary in race tests. The writer
+        // remains held across this yield, so contenders cannot share a slot.
+        #[cfg(test)]
+        tokio::task::yield_now().await;
         state.requests.insert(request.id.0.clone(), request.clone());
         state
             .session_requests
@@ -479,42 +506,79 @@ impl PendingRequestStore {
         state.cleanup_old(&SecureTimestamp::now(), retention_secs)
     }
 
-    /// Reclaim authoritatively revoked or exhausted grants when the store is full.
-    ///
-    /// The Runtime owner must supply the manager that issued and validates this
-    /// store's grants. Revocation and remaining uses come from that manager's
-    /// authoritative state, never the requested duration or session visibility.
-    /// This does not consume, revoke or authorize a use.
-    /// Admission still rechecks both limits under the same state lock afterward.
-    pub async fn cleanup_retired_grants_at_capacity(
+    /// Reclaim retired grants under global or requesting-session pressure.
+    async fn cleanup_retired_grants_at_capacity(
         &self,
         capability_manager: &CapabilityManager,
+        session_id: Option<&str>,
     ) -> usize {
-        if self.state.read().await.requests.len() < MAX_PENDING_REQUESTS {
-            return 0;
-        }
-        let mut state = self.state.write().await;
-        if state.requests.len() < MAX_PENDING_REQUESTS {
-            return 0;
-        }
+        self.reclaim_retired_grants_with(session_id, |token| async move {
+            capability_manager.is_revoked_or_exhausted(&token).await
+        })
+        .await
+    }
 
+    async fn reclaim_retired_grants_with<F, Fut>(
+        &self,
+        session_id: Option<&str>,
+        mut is_retired: F,
+    ) -> usize
+    where
+        F: FnMut(CapabilityToken) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let candidates = {
+            let state = self.state.read().await;
+            let global_pressure = state.requests.len() >= MAX_PENDING_REQUESTS;
+            let session_pressure = session_id.is_some_and(|session_id| {
+                state.session_admission_count(session_id, &SecureTimestamp::now())
+                    >= MAX_PENDING_PER_SESSION
+            });
+            if !global_pressure && !session_pressure {
+                return 0;
+            }
+            state
+                .requests
+                .iter()
+                .filter(|(_, request)| {
+                    global_pressure || Some(request.session_id.as_str()) == session_id
+                })
+                .filter_map(|(id, request)| match &request.status {
+                    RequestStatus::Granted { token, duration } => {
+                        Some((id.clone(), token.as_ref().clone(), *duration))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Manager queries can await without holding any pending-state guard.
         let mut retired = Vec::new();
-        for (id, request) in &state.requests {
-            if let RequestStatus::Granted { token, .. } = &request.status {
-                // The query reads only the manager's epoch/revocation/use state.
-                // Those guards are released before callers access pending state.
-                if capability_manager.is_revoked_or_exhausted(token).await {
-                    retired.push(id.clone());
-                }
+        for (id, token, duration) in candidates {
+            let token_id = *token.id();
+            if is_retired(token).await {
+                retired.push((id, token_id, duration));
             }
         }
-        for id in &retired {
-            state.requests.remove(id);
+
+        let mut state = self.state.write().await;
+        let mut removed = 0;
+        for (id, token_id, duration) in retired {
+            // A granted record's fields are immutable until its status changes.
+            // Recheck status, token identity and duration before removing it.
+            let unchanged = state.requests.get(&id).is_some_and(|request| {
+                matches!(&request.status, RequestStatus::Granted { token, duration: current_duration }
+                    if *token.id() == token_id && *current_duration == duration)
+            });
+            if unchanged {
+                state.requests.remove(&id);
+                removed += 1;
+            }
         }
-        if !retired.is_empty() {
+        if removed != 0 {
             state.prune_session_index();
         }
-        retired.len()
+        removed
     }
 
     /// Get the number of pending requests
@@ -802,9 +866,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_live_grants_fill_capacity_until_explicit_revocation() {
+    async fn test_retained_live_grants_fill_only_the_owning_session_share() {
         let store = create_test_store();
-        for _ in 0..MAX_PENDING_REQUESTS {
+        for _ in 0..MAX_PENDING_PER_SESSION {
             let request = request_for(&store, "grant-session").await;
             assert!(request.is_pending());
             store
@@ -816,17 +880,192 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(request_for(&store, "new-session").await.is_denied());
+        assert!(request_for(&store, "grant-session").await.is_denied());
+        assert!(request_for(&store, "new-session").await.is_pending());
         assert_eq!(
             store.list_session_granted("grant-session").await.len(),
-            MAX_PENDING_REQUESTS
+            MAX_PENDING_PER_SESSION
         );
         assert_eq!(store.cleanup_old(0).await, 0);
 
         store.revoke_all_granted().await;
-        assert!(request_for(&store, "new-session").await.is_pending());
+        assert!(request_for(&store, "grant-session").await.is_pending());
         assert!(store.list_session_granted("grant-session").await.is_empty());
-        assert_eq!(store.state.read().await.requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_admission_reclaims_session_share_without_spending_live_grants() {
+        use crate::capability::{CapabilityStore, TokenConstraints};
+        use crate::primitives::metrics::MetricsManager;
+
+        for revoke in [false, true] {
+            let audit = Arc::new(AuditLog::new());
+            let authority = Arc::new(CapabilityStore::new());
+            let manager = CapabilityManager::new(
+                authority.clone(),
+                audit.clone(),
+                Arc::new(MetricsManager::new()),
+            );
+            let store = PendingRequestStore::new(audit);
+            let mut grants = Vec::new();
+            for _ in 0..MAX_PENDING_PER_SESSION {
+                let request = store
+                    .admit_request(
+                        &manager,
+                        SessionId::from_string("owner"),
+                        ResourceId::new("localhost://Users/self/Documents/test"),
+                        Action::Read,
+                        "bounded share".to_string(),
+                    )
+                    .await;
+                assert!(request.is_pending());
+                let token = manager.grant(
+                    "owner",
+                    request.resource.clone(),
+                    request.action,
+                    TokenConstraints::new(0, false, None, Some(1)),
+                    None,
+                );
+                store
+                    .grant_request(request.id.as_str(), token.clone(), GrantDuration::Once)
+                    .await
+                    .unwrap();
+                grants.push((request, token));
+            }
+            let admit = |session| {
+                store.admit_request(
+                    &manager,
+                    SessionId::from_string(session),
+                    ResourceId::new("localhost://Users/self/Documents/test"),
+                    Action::Read,
+                    String::new(),
+                )
+            };
+            assert!(admit("owner").await.is_denied());
+            assert!(admit("another-session").await.is_pending());
+            assert_eq!(
+                store.list_session_granted("owner").await.len(),
+                MAX_PENDING_PER_SESSION
+            );
+            let (retired, token) = &grants[0];
+            if revoke {
+                manager.revoke(*token.id(), "share recovery").await;
+            } else {
+                manager
+                    .validate(token, "owner", Action::Read, &retired.resource, None)
+                    .await
+                    .unwrap();
+            }
+            assert!(admit("owner").await.is_pending());
+            assert!(store.get_request(retired.id.as_str()).await.is_none());
+            assert_eq!(
+                store.list_session_granted("owner").await.len(),
+                MAX_PENDING_PER_SESSION - 1
+            );
+            assert_eq!(
+                authority.get_use_count(token.id()).await,
+                u32::from(!revoke)
+            );
+            for (request, live_token) in &grants[1..] {
+                assert!(store
+                    .get_request(request.id.as_str())
+                    .await
+                    .unwrap()
+                    .is_granted());
+                assert_eq!(authority.get_use_count(live_token.id()).await, 0);
+            }
+            assert_eq!(
+                store.state.read().await.requests.len(),
+                MAX_PENDING_PER_SESSION + 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reclaim_queries_without_pending_lock_and_preserves_changed_records() {
+        let store = create_test_store();
+        let mut granted = Vec::new();
+        for _ in 0..4 {
+            let request = request_for(&store, "owner").await;
+            let token = token_for(&request);
+            store
+                .grant_request(request.id.as_str(), token.clone(), GrantDuration::Session)
+                .await
+                .unwrap();
+            granted.push((request, token));
+        }
+        for _ in 4..MAX_PENDING_PER_SESSION {
+            assert!(request_for(&store, "owner").await.is_pending());
+        }
+        let removed = store
+            .reclaim_retired_grants_with(Some("owner"), |token| {
+                let store = &store;
+                let granted = &granted;
+                async move {
+                    // This fails immediately if either a read or write guard escaped
+                    // the snapshot scope. It does not rely on a timeout or scheduler.
+                    let mut state = store
+                        .state
+                        .try_write()
+                        .expect("manager query holds pending lock");
+                    let index = granted
+                        .iter()
+                        .position(|(_, old)| old.id() == token.id())
+                        .unwrap();
+                    let request = state
+                        .requests
+                        .get_mut(granted[index].0.id.as_str())
+                        .unwrap();
+                    match index {
+                        0 => {}
+                        1 => {
+                            request.status = RequestStatus::Denied {
+                                reason: "changed during query".into(),
+                            }
+                        }
+                        2 => {
+                            request.status = RequestStatus::Granted {
+                                token: Box::new(token_for(request)),
+                                duration: GrantDuration::Session,
+                            }
+                        }
+                        3 => {
+                            request.status = RequestStatus::Granted {
+                                token: Box::new(token),
+                                duration: GrantDuration::Once,
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    drop(state);
+                    tokio::task::yield_now().await;
+                    true
+                }
+            })
+            .await;
+        assert_eq!(removed, 1);
+        assert!(store.get_request(granted[0].0.id.as_str()).await.is_none());
+        assert!(store
+            .get_request(granted[1].0.id.as_str())
+            .await
+            .unwrap()
+            .is_denied());
+        let replacement = store.get_request(granted[2].0.id.as_str()).await.unwrap();
+        assert_ne!(replacement.granted_token().unwrap().id(), granted[2].1.id());
+        assert!(matches!(
+            store
+                .get_request(granted[3].0.id.as_str())
+                .await
+                .unwrap()
+                .status,
+            RequestStatus::Granted {
+                duration: GrantDuration::Once,
+                ..
+            }
+        ));
+        let state = store.state.read().await;
+        assert_eq!(state.requests.len(), MAX_PENDING_PER_SESSION - 1);
+        assert_eq!(state.session_requests["owner"].len(), state.requests.len());
     }
 
     #[tokio::test]
@@ -870,14 +1109,24 @@ mod tests {
             }
             grants.push((request, token, used));
         }
-        assert_eq!(store.cleanup_retired_grants_at_capacity(&manager).await, 0);
+        assert_eq!(
+            store
+                .cleanup_retired_grants_at_capacity(&manager, None)
+                .await,
+            0
+        );
         for index in 0..MAX_PENDING_REQUESTS - grants.len() {
             assert!(request_for(&store, &format!("prefill-{index}"))
                 .await
                 .is_pending());
         }
 
-        assert_eq!(store.cleanup_retired_grants_at_capacity(&manager).await, 2);
+        assert_eq!(
+            store
+                .cleanup_retired_grants_at_capacity(&manager, None)
+                .await,
+            2
+        );
         for (index, (request, token, used)) in grants.iter().enumerate() {
             assert_eq!(
                 store.get_request(request.id.as_str()).await.is_some(),
@@ -897,7 +1146,12 @@ mod tests {
 
         assert!(request_for(&store, "recovered").await.is_pending());
         assert!(request_for(&store, "recovered").await.is_pending());
-        assert_eq!(store.cleanup_retired_grants_at_capacity(&manager).await, 0);
+        assert_eq!(
+            store
+                .cleanup_retired_grants_at_capacity(&manager, None)
+                .await,
+            0
+        );
         assert!(request_for(&store, "overflow").await.is_denied());
     }
 
@@ -922,7 +1176,7 @@ mod tests {
             TokenConstraints::default(),
             None,
         );
-        let epoch = manager.revoke_all("retire old epoch");
+        let epoch = manager.revoke_all("retire old epoch").unwrap();
         store.revoke_all_granted().await;
         // A grant minted before revocation can finish registering afterward.
         store
@@ -983,7 +1237,12 @@ mod tests {
         }
         let revoked_before = authority.get_revoked_tokens().await;
 
-        assert_eq!(store.cleanup_retired_grants_at_capacity(&manager).await, 2);
+        assert_eq!(
+            store
+                .cleanup_retired_grants_at_capacity(&manager, None)
+                .await,
+            2
+        );
         assert_eq!(authority.current_epoch(), epoch);
         assert_eq!(authority.get_revoked_tokens().await, revoked_before);
         assert!(authority.is_token_revoked(revoked_token.id()).await);
@@ -1020,7 +1279,12 @@ mod tests {
 
         assert!(request_for(&store, "recovered").await.is_pending());
         assert!(request_for(&store, "recovered").await.is_pending());
-        assert_eq!(store.cleanup_retired_grants_at_capacity(&manager).await, 0);
+        assert_eq!(
+            store
+                .cleanup_retired_grants_at_capacity(&manager, None)
+                .await,
+            0
+        );
         assert!(request_for(&store, "overflow").await.is_denied());
     }
 
