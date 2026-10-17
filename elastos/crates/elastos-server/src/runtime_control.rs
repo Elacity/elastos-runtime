@@ -62,7 +62,7 @@ fn managed_runtime_start_lock_path(data_dir: &Path) -> PathBuf {
 }
 
 fn acquire_managed_runtime_start_lock(data_dir: &Path) -> anyhow::Result<ManagedRuntimeStart> {
-    std::fs::create_dir_all(data_dir)?;
+    crate::setup::create_data_directory_with_safe_modes(data_dir)?;
     let path = managed_runtime_start_lock_path(data_dir);
     match create_managed_runtime_start_marker(&path) {
         Ok(file) => Ok(ManagedRuntimeStart::Owner(ManagedRuntimeStartGuard {
