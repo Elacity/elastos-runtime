@@ -1909,6 +1909,64 @@ async function assertKeyboardJourney(page) {
   await page.keyboard.press("Escape");
 }
 
+async function assertEmptyWebspaceReadiness(context, port) {
+  for (const readonly of [false, true]) {
+    const page = await context.newPage();
+    let releaseList;
+    const held = new Promise((resolve) => { releaseList = resolve; });
+    const folderObject = {
+      ...webspaceMutable,
+      capabilities: readonly ? ["open", "list", "properties"] : webspaceMutable.capabilities,
+      metadata: { ...webspaceMutable.metadata, readonly, access_policy: readonly ? "read-only" : "owner-writable" },
+    };
+    try {
+      await page.route("**/api/provider/object/list", async (route) => {
+        if (route.request().postDataJSON()?.uri !== webspaceMutableUri) {
+          return route.continue();
+        }
+        await held;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: ok({ objects: [], object: folderObject }),
+        });
+      });
+      await page.goto(`http://127.0.0.1:${port}/apps/library/#home_token=${encodeURIComponent(token)}`);
+      await page.locator(".item").filter({ hasText: "Readme.md" }).first().waitFor();
+      await page.locator(".place").filter({ hasText: "Spaces" }).first().click();
+      await Promise.all([
+        page.waitForRequest((request) =>
+          new URL(request.url()).pathname === "/api/provider/object/list"
+          && request.postDataJSON()?.uri === webspaceMutableUri, { timeout: 30_000 }),
+        page.locator(".item").filter({ hasText: "Mutable" }).first().dblclick(),
+      ]);
+      await page.locator(".crumb-current").filter({ hasText: "Mutable" }).first().waitFor();
+      await page.locator("#content .empty h2").getByText("Loading folder...", { exact: true }).waitFor();
+      const loadedEmptyState = page.locator("#content .empty h2").getByText("This space is empty", { exact: true });
+      assert(await loadedEmptyState.count() === 0, "The completed empty-folder state must wait for the provider listing");
+      excludesAll(await openBackgroundMenu(page), ["New", "Upload Here", "Paste"], "WebSpace menu while its metadata is pending");
+      const responded = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === "/api/provider/object/list"
+        && response.request().postDataJSON()?.uri === webspaceMutableUri);
+      releaseList();
+      assert((await responded).ok(), "Empty WebSpace listing must succeed");
+      await loadedEmptyState.waitFor();
+      const rows = await openBackgroundMenu(page);
+      includesAll(rows, ["Sort By", "Refresh", "Properties"], "completed empty WebSpace menu");
+      if (readonly) {
+        excludesAll(rows, ["New", "Upload Here", "Paste"], "completed read-only empty WebSpace menu");
+      } else {
+        includesAll(rows, ["New", "Upload Here"], "completed mutable empty WebSpace menu");
+        excludesAll(rows, ["Paste"], "completed mutable empty WebSpace menu");
+      }
+    } finally {
+      releaseList();
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+  }
+}
+
 async function run() {
   const server = createServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -1973,6 +2031,7 @@ async function run() {
       );
     }
 
+    await assertEmptyWebspaceReadiness(context, port);
     await assertKeyboardJourney(page);
 
     for (const label of ["Home", "Desktop", "Documents", "Pictures", "Videos", "Downloads", "Public", "Trash", "Spaces"]) {
@@ -2425,6 +2484,8 @@ async function run() {
     await page.locator(".place").filter({ hasText: "Spaces" }).first().click();
     await page.locator(".item").filter({ hasText: "Mutable" }).first().dblclick();
     await page.locator(".crumb-current").filter({ hasText: "Mutable" }).first().waitFor();
+    // The route changes before the provider returns this folder's metadata.
+    await page.locator("#content .empty h2").getByText("This space is empty", { exact: true }).waitFor();
     const mutableBackgroundRows = await openBackgroundMenu(page);
     includesAll(mutableBackgroundRows, ["New", "Upload Here", "Properties"], "mutable WebSpace background menu");
     excludesAll(mutableBackgroundRows, ["Paste"], "mutable WebSpace background menu");
