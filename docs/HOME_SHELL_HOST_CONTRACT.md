@@ -162,6 +162,36 @@ window. It does not receive another capsule's authority token. App-to-app work
 remains a Runtime-gated intent and, for off-box effects, follows the provider and
 Carrier path described in [Capsule Interface Contract](CAPSULE_INTERFACE_CONTRACT.md).
 
+### Browser toolbar window drag
+
+A window with `unified-toolbar` chrome (today only Browser) has no Home title
+bar. Its capsule draws the top bar, so `home-gui` cannot see a press on it. The
+Browser frame sends `elastos.home.window-drag/v1` to its parent `home-gui`
+frame when the person presses an empty part of `.browser-chrome`:
+
+```json
+{ "type": "elastos.home.window-drag/v1", "homeToken": "<this frame's launch token>",
+  "phase": "start" | "move" | "end", "clientX": 0, "clientY": 0 }
+```
+
+This message is a presentation request only. It can move that one window and
+nothing else. `home-gui` (`attachForwardedWindowDrag` in
+`capsules/home-gui/browser/shell-window-geometry.js`) ignores the message
+unless all of these are true:
+
+- the source is the `WindowProxy` of that window's own frame;
+- the origin is the opaque `null` origin of a sandboxed capsule frame;
+- `homeToken` is not empty and is the same as the `home_token` in the launch
+  route that Home gave that frame;
+- the message has exactly these five keys and `phase` is `start`, `move` or
+  `end`;
+- the window uses `unified-toolbar` chrome and is connected.
+
+On each message the window must also be visible, not maximized, not
+Browser-maximized and not snapped. If not, the drag stops. Home removes the
+listener when it closes the window. The Browser does not send the message when
+it has no launch token. Tests: `scripts/browser-toolbar-window-drag.test.mjs`.
+
 ### First-party Clipboard edge
 
 First-party capsule Clipboard access terminates in the trusted top-level Home
@@ -323,6 +353,7 @@ node scripts/home-shell-switchback-recovery-smoke.mjs
 node scripts/home-shell-unavailable-shell-fallback-smoke.mjs
 node scripts/home-cli-browser-smoke.mjs
 node scripts/wallet-connector-transaction-smoke.mjs
+node --test scripts/browser-toolbar-window-drag.test.mjs
 node scripts/check-product-data.mjs
 node scripts/home-shell-objective-audit.mjs
 (cd elastos && cargo test -p elastos-server test_home_launch -- --nocapture)
