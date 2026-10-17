@@ -38,7 +38,14 @@ http://localhost:8090/home/
 ```
 
 The passkey relying party id is `localhost`. Registration and sign-in use that
-origin. An IP-literal origin, including `http://127.0.0.1:8090`, is refused.
+origin. An IP-literal origin, including `http://127.0.0.1:8090`, is refused
+with HTTP 403. For a loopback address, the reply tells the person to open
+`http://localhost:<port>/home/`.
+
+Each release takes the relying party id from the host of the page, and browsers
+refuse an IP address as a relying party id. A passkey from an earlier release
+therefore names the host where it was made. Sign-in accepts that passkey at
+the same host on any port, and refuses it at every other host.
 
 ## Data directory and lock
 
