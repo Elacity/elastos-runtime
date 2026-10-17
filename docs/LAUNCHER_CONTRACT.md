@@ -115,7 +115,9 @@ path then ends in ` (deleted)`, and the watch exits 75. A supervisor starts
 
 A moved path, a path that cannot be read, and a file that could not be
 re-verified wait for one more sample. A replacement on that next sample exits
-75. A second sample with the same failure exits 1. The message names
+75. A second sample with the same failure exits 1. A different failure on
+that next sample, or a move to a different path, waits for one more sample
+instead. The message names
 `elastos gateway --addr localhost:8090` as the recovery command. A supervisor
 leaves that process stopped.
 

@@ -315,8 +315,19 @@ struct BinarySupersessionWatch {
     current_exe_stamp: BinaryFileStamp,
     current_binary_sha256: String,
     /// A move, an unreadable path, or a failed re-hash waits for one more sample.
+    /// Only the same failure on the next sample confirms it.
     /// The install rename onto the running path is a replacement and does not wait.
-    pending_confirm: bool,
+    pending_failure: Option<WatchFailure>,
+}
+
+/// A failed sample of the binary watch. A move names where the path now points,
+/// so moves to two different paths are two different failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchFailure {
+    PathUnreadable,
+    Moved(PathBuf),
+    Unverifiable,
+    ReverifyFailed,
 }
 
 const EXIT_LAUNCHER_RESTART: i32 = 75;
@@ -384,7 +395,7 @@ impl BinarySupersessionWatch {
             current_exe_path: current_exe,
             current_exe_stamp: snapshot.stamp,
             current_binary_sha256: snapshot.sha256,
-            pending_confirm: false,
+            pending_failure: None,
         })
     }
 
@@ -393,7 +404,7 @@ impl BinarySupersessionWatch {
     }
 
     fn restart(&mut self, reason: String) -> Option<Supersession> {
-        self.pending_confirm = false;
+        self.pending_failure = None;
         Some(Supersession {
             reason,
             exit_code: EXIT_LAUNCHER_RESTART,
@@ -402,12 +413,14 @@ impl BinarySupersessionWatch {
 
     /// A single failed sample can be the middle of an install rename.
     /// The next sample decides. A replacement on that sample restarts.
-    fn confirm_stop(&mut self, reason: String) -> Option<Supersession> {
-        if !self.pending_confirm {
-            self.pending_confirm = true;
+    /// A different failure on that sample waits again; only the same failure
+    /// on two samples in a row stops.
+    fn confirm_stop(&mut self, failure: WatchFailure, reason: String) -> Option<Supersession> {
+        if self.pending_failure.as_ref() != Some(&failure) {
+            self.pending_failure = Some(failure);
             return None;
         }
-        self.pending_confirm = false;
+        self.pending_failure = None;
         Some(Supersession {
             reason,
             exit_code: EXIT_LAUNCHER_STAYS_STOPPED,
@@ -421,7 +434,7 @@ impl BinarySupersessionWatch {
         let current_exe_raw = match reader.current_exe_path_raw() {
             Ok(path) => path,
             Err(err) => {
-                return self.confirm_stop(format!(
+                return self.confirm_stop(WatchFailure::PathUnreadable, format!(
                     "host executable path could not be read for {}: {err:#}. Start `elastos gateway --addr localhost:8090` after the path can be read.",
                     self.current_exe_path.display()
                 ));
@@ -438,7 +451,7 @@ impl BinarySupersessionWatch {
         }
 
         if current_exe != self.current_exe_path {
-            return self.confirm_stop(format!(
+            return self.confirm_stop(WatchFailure::Moved(current_exe.clone()), format!(
                 "host executable moved from {} to {}. Start `elastos gateway --addr localhost:8090` if this Home should run.",
                 self.current_exe_path.display(),
                 current_exe.display()
@@ -448,7 +461,7 @@ impl BinarySupersessionWatch {
         let current_stamp = match reader.metadata_stamp(&self.current_exe_path) {
             Ok(stamp) => stamp,
             Err(err) => {
-                return self.confirm_stop(format!(
+                return self.confirm_stop(WatchFailure::Unverifiable, format!(
                     "host executable {} could not be verified on disk: {err:#}. Start `elastos gateway --addr localhost:8090` after the file can be read.",
                     self.current_exe_path.display()
                 ));
@@ -456,14 +469,14 @@ impl BinarySupersessionWatch {
         };
 
         if current_stamp == self.current_exe_stamp {
-            self.pending_confirm = false;
+            self.pending_failure = None;
             return None;
         }
 
         let current_snapshot = match reader.digest_snapshot(&self.current_exe_path) {
             Ok(snapshot) => snapshot,
             Err(err) => {
-                return self.confirm_stop(format!(
+                return self.confirm_stop(WatchFailure::ReverifyFailed, format!(
                     "host executable {} could not be re-verified: {err:#}. Start `elastos gateway --addr localhost:8090` after the file can be read.",
                     self.current_exe_path.display()
                 ));
@@ -477,7 +490,7 @@ impl BinarySupersessionWatch {
         }
 
         self.current_exe_stamp = current_snapshot.stamp;
-        self.pending_confirm = false;
+        self.pending_failure = None;
         None
     }
 }
@@ -988,6 +1001,44 @@ mod tests {
         let event = watch.superseded_reason_with(&reader).expect("replacement");
         assert_eq!(event.exit_code, EXIT_LAUNCHER_RESTART);
         assert!(event.reason.contains("changed on disk"), "{}", event.reason);
+    }
+
+    /// Only the same failure on two samples in a row exits 1. A different
+    /// failure on the next sample waits for one more sample.
+    #[test]
+    fn supersession_watch_confirms_only_the_same_failure_twice() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+        let (mut watch, reader) = test_watch(&exe);
+
+        reader.fail_metadata_once();
+        assert!(
+            watch.superseded_reason_with(&reader).is_none(),
+            "unreadable file waits"
+        );
+        let moved = temp.path().join("elastos-moved");
+        reader.set_current_exe_raw(moved.clone());
+        assert!(
+            watch.superseded_reason_with(&reader).is_none(),
+            "a move after an unreadable file is a different failure"
+        );
+        let moved_again = temp.path().join("elastos-moved-again");
+        reader.set_current_exe_raw(moved_again.clone());
+        assert!(
+            watch.superseded_reason_with(&reader).is_none(),
+            "a move to another path is a different failure"
+        );
+
+        let event = watch
+            .superseded_reason_with(&reader)
+            .expect("the same move on the next sample confirms");
+        assert_eq!(event.exit_code, EXIT_LAUNCHER_STAYS_STOPPED);
+        assert!(
+            event.reason.contains(&moved_again.display().to_string()),
+            "{}",
+            event.reason
+        );
     }
 
     #[test]
