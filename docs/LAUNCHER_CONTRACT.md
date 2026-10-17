@@ -27,8 +27,9 @@ GET http://localhost:8090/healthz
 ```
 
 returns HTTP 200 and the two bytes `OK`. A different pid, a missing lock, or a
-lock that is not JSON returns HTTP 503. The probe does not treat another
-process on the port as this Home.
+lock that is not JSON returns HTTP 503. A gateway that `elastos serve` starts
+keeps the `serve` record, so its `/healthz` returns 503. The probe does not
+treat another process on the port as this Home.
 
 The Home origin is:
 

@@ -751,6 +751,58 @@ mod trusted_gateway_tests {
         assert!(!crate::runtime_control::gateway_runtime_coord_path(temp.path()).exists());
     }
 
+    /// `elastos serve` holds the host lock as `serve` and can start a gateway in the
+    /// same process. That gateway starts, and its `/healthz` is not Home readiness.
+    #[tokio::test]
+    async fn gateway_inside_serve_starts_and_answers_health_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().to_path_buf();
+        let addr = unused_localhost_address();
+        let _serve =
+            crate::host_lock::acquire_host_process_lock(&data, "serve", "127.0.0.1:3000").unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let task_addr = addr.clone();
+        let task_data = data.clone();
+        let server = tokio::spawn(async move {
+            start_gateway_server_with_shutdown(
+                &task_addr,
+                None,
+                GatewayCollaborationContext::default(),
+                task_data.join("cache"),
+                task_data,
+                None,
+                async {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if server.is_finished() {
+                panic!("the gateway inside serve stopped: {:?}", server.await);
+            }
+            if let Ok(response) = client.get(format!("http://{addr}/healthz")).send().await {
+                break response.status();
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let _ = stop_tx.send(());
+        server.await.unwrap().unwrap();
+        let lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(data.join("host-process.lock")).unwrap())
+                .unwrap();
+        assert_eq!(lock["role"], "serve");
+        assert_eq!(lock["pid"], std::process::id());
+    }
+
     #[tokio::test]
     async fn browser_home_ready_is_skipped_when_auth_setup_fails() {
         let temp = tempfile::tempdir().unwrap();
