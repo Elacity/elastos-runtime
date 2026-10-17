@@ -100,9 +100,17 @@ export function bindAssistantMark(button, options) {
     }
     running = true;
     button.dataset.animating = "true";
-    await playContact(art);
-    delete button.dataset.animating;
-    running = false;
+    try {
+      await playContact(art);
+    } catch {
+      /* Motion is presentation only: a missing layer or a failed animate()
+         must not keep the face shut. */
+    } finally {
+      /* Always release the guard, or every later click is ignored and the
+         toggle is dead until reload. */
+      delete button.dataset.animating;
+      running = false;
+    }
     /* The contact announced an opening. If the face opened (or started to
        move) by another path meanwhile, or the mark was unbound, that opening
        is stale: activating now would toggle the face shut instead. */

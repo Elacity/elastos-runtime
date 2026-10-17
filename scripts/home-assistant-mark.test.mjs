@@ -199,3 +199,19 @@ test("unbinding during the contact drops the activation", async () => {
   await sequence;
   assert.equal(activations, 0, "a torn-down mark opens nothing");
 });
+
+test("a contact that throws still opens, and the toggle keeps answering", async () => {
+  /* A missing chevron layer (or an animate() that throws) used to leave the
+     guard set forever: every later click was ignored, the toggle dead. */
+  const log = [];
+  const button = fakeButton(log);
+  button.art.querySelector = () => null;
+  let activations = 0;
+  bindAssistantMark(button, { onActivate: () => { activations += 1; }, reducedMotion: () => false });
+
+  const swallow = () => {};
+  await button.click()?.catch(swallow);
+  assert.equal(button.dataset.animating, undefined, "no animating flag left behind");
+  await button.click()?.catch(swallow);
+  assert.equal(activations, 2, "the face opens without the motion, and the toggle answers the next click");
+});
