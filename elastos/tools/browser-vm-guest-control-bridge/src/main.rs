@@ -171,16 +171,33 @@ fn run_bridge(config: &BridgeConfig, stdout: &mut dyn Write) -> Result<(), Strin
         })));
     }
 
+    finish_workers_in_accept_order(workers, worker_error)
+}
+
+type ControlWorker = (usize, thread::JoinHandle<Result<(), String>>);
+
+fn finish_workers_in_accept_order(
+    mut workers: Vec<ControlWorker>,
+    mut first_error: Option<(usize, String)>,
+) -> Result<(), String> {
+    // Reaping can reorder retained workers. Preserve the original finite-run
+    // behavior: resolve earlier sessions, then return the first error without
+    // waiting for later requests.
+    workers.sort_unstable_by_key(|(session_id, _)| *session_id);
     for worker in workers {
-        record_worker_result(worker, &mut worker_error);
+        if first_error
+            .as_ref()
+            .is_some_and(|(failed_session, _)| worker.0 > *failed_session)
+        {
+            break;
+        }
+        record_worker_result(worker, &mut first_error);
     }
-    match worker_error {
+    match first_error {
         Some((_, error)) => Err(error),
         None => Ok(()),
     }
 }
-
-type ControlWorker = (usize, thread::JoinHandle<Result<(), String>>);
 
 fn reap_finished_workers(
     workers: &mut Vec<ControlWorker>,
@@ -799,6 +816,123 @@ mod tests {
         record_worker_result((1, first), &mut first_error);
         assert_eq!(earlier_failure, Some((2, "later accepted failure".into())));
         assert_eq!(first_error, Some((1, "first accepted failure".into())));
+    }
+
+    #[test]
+    fn finite_shutdown_does_not_wait_for_requests_after_the_first_failure() {
+        for reap_failure_first in [false, true] {
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (completed, completion) = std::sync::mpsc::channel();
+            let active = thread::spawn(move || {
+                blocked.recv().map_err(|error| error.to_string())?;
+                completed.send(()).unwrap();
+                Ok(())
+            });
+            let failed = thread::spawn(|| Err("first accepted failure".to_string()));
+            wait_until_finished(&failed);
+            // Reaping can leave a later active session ahead of an earlier one.
+            let mut workers = vec![(2, active), (1, failed)];
+            let mut first_error = None;
+            if reap_failure_first {
+                reap_finished_workers(&mut workers, &mut first_error);
+            }
+            let (reported, observation) = std::sync::mpsc::channel();
+            let finisher = thread::spawn(move || {
+                reported
+                    .send(finish_workers_in_accept_order(workers, first_error))
+                    .unwrap();
+            });
+
+            let result = observation.recv_timeout(Duration::from_secs(5));
+            // Release the later worker before assertions, including when a
+            // regression caused finalization to wait for it.
+            release.send(()).unwrap();
+            finisher.join().unwrap();
+            completion.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                result.expect("finalization waited for a later active request"),
+                Err("first accepted failure".to_string()),
+                "reap_failure_first={reap_failure_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn finite_shutdown_resolves_earlier_requests_before_a_reaped_failure() {
+        let (release_earlier, earlier_blocked) = std::sync::mpsc::channel();
+        let (release_later, later_blocked) = std::sync::mpsc::channel();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let earlier_completed = completed.clone();
+        let earlier = thread::spawn(move || {
+            earlier_blocked.recv().map_err(|error| error.to_string())?;
+            earlier_completed.send(()).unwrap();
+            Err("earlier accepted failure".to_string())
+        });
+        let later = thread::spawn(move || {
+            later_blocked.recv().map_err(|error| error.to_string())?;
+            completed.send(()).unwrap();
+            Ok(())
+        });
+        let (reported, observation) = std::sync::mpsc::channel();
+        let finisher = thread::spawn(move || {
+            reported
+                .send(finish_workers_in_accept_order(
+                    vec![(3, later), (1, earlier)],
+                    Some((2, "already reaped failure".to_string())),
+                ))
+                .unwrap();
+        });
+
+        let premature = observation.recv_timeout(Duration::from_millis(20));
+        let returned_before_earlier_finished = premature.is_ok();
+        release_earlier.send(()).unwrap();
+        let result = match premature {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                observation.recv_timeout(Duration::from_secs(5))
+            }
+            other => other,
+        };
+        // Finalization must resolve session 1, but must not wait for session 3.
+        release_later.send(()).unwrap();
+        finisher.join().unwrap();
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!returned_before_earlier_finished);
+        assert_eq!(
+            result.expect("finalization waited for a later active request"),
+            Err("earlier accepted failure".to_string())
+        );
+    }
+
+    #[test]
+    fn finite_shutdown_joins_active_requests_when_none_has_failed() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let active = thread::spawn(move || {
+            blocked.recv().map_err(|error| error.to_string())?;
+            completed.send(()).unwrap();
+            Ok(())
+        });
+        let (reported, observation) = std::sync::mpsc::channel();
+        let finisher = thread::spawn(move || {
+            reported
+                .send(finish_workers_in_accept_order(vec![(1, active)], None))
+                .unwrap();
+        });
+
+        let premature = observation.recv_timeout(Duration::from_millis(20));
+        let returned_before_request_finished = premature.is_ok();
+        release.send(()).unwrap();
+        finisher.join().unwrap();
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = match premature {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                observation.recv_timeout(Duration::from_secs(5))
+            }
+            other => other,
+        };
+        assert!(!returned_before_request_finished);
+        assert_eq!(result.expect("finalization did not report success"), Ok(()));
     }
 
     #[test]
