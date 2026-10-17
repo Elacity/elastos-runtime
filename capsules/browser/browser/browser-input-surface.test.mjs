@@ -37,7 +37,13 @@ function target() {
   return { listeners, hidden: false, videoWidth: 640, videoHeight: 360,
     addEventListener(type, fn) { listeners.set(type, [...listeners.get(type) || [], fn]); },
     focus() {}, setSelectionRange() {}, closest() { return null; }, contains() { return false; },
-    setPointerCapture() {}, releasePointerCapture() {},
+    capturedPointers: new Set(),
+    setPointerCapture(id) { this.capturedPointers.add(id); },
+    hasPointerCapture(id) { return this.capturedPointers.has(id); },
+    releasePointerCapture(id) {
+      this.capturedPointers.delete(id);
+      for (const listener of listeners.get("lostpointercapture") || []) listener({ pointerId: id });
+    },
     getBoundingClientRect() { return { left: 0, top: 0, width: 640, height: 360 }; },
     ownerDocument: { defaultView: { getComputedStyle: () => ({ objectFit: 'fill' }) } },
   };
@@ -95,8 +101,8 @@ function harness(t) {
     }
     now = to; await settle();
   }
-  function emit(type, event = {}) {
-    for (const listener of panel.listeners.get(type) || []) listener({ target: panel, clientX: 20, clientY: 30, deltaX: 0, deltaY: 10,
+  function emit(type, event = {}, eventTarget = panel) {
+    for (const listener of eventTarget.listeners.get(type) || []) listener({ target: eventTarget, clientX: 20, clientY: 30, deltaX: 0, deltaY: 10,
       ctrlKey: false, metaKey: false, altKey: false, preventDefault() {}, stopPropagation() {}, ...event });
   }
   function replace(kind) {
@@ -277,22 +283,125 @@ test("same-owner tap uses the existing Runtime click route once", async t => {
   assert.deepEqual(h.wire, []);
 });
 
-test("overlapping pointers cannot replace an old gesture's release guard", async t => {
+test("overlapping pointers retain the current owner's first gesture", async t => {
+  const h = harness(t);
+  h.emit("pointerdown", { pointerType: "touch", pointerId: 1 });
+  h.emit("pointerdown", { pointerType: "touch", pointerId: 2 });
+  h.emit("pointermove", { pointerId: 2, clientY: 10 });
+  h.emit("pointerup", { pointerId: 2 });
+  h.emit("pointermove", { pointerId: 1, clientY: 20 });
+  h.emit("pointerup", { pointerId: 1 });
+  await h.advance(80);
+  assert.deepEqual(h.inputs.map(input => input.event.delta_y), [10]);
+  assert.deepEqual(h.requests, []);
+});
+
+for (const kind of ["page", "generation", "cleanup"]) {
+  test(`retired ${kind} touch cannot block a new pointer without its old release`, async t => {
+    const h = harness(t);
+    h.emit("pointerdown", { pointerType: "touch", pointerId: 1 });
+    h.replace(kind);
+    h.emit("pointerdown", { pointerType: "touch", pointerId: 2 });
+    assert.deepEqual([...h.state.renderPanel.capturedPointers], [2]);
+    // A late old release and its synthetic click belong to the retired owner.
+    h.emit("pointerup", { pointerId: 1 });
+    h.emit("click");
+    h.emit("pointermove", { pointerId: 2, clientY: 20 });
+    h.emit("pointerup", { pointerId: 2 });
+    await h.advance(80);
+    assert.deepEqual(h.inputs.map(input => input.event.delta_y), [10]);
+    assert.deepEqual(h.wire, ["m,20,20,8,1", "m,20,20,0,0"]);
+    assert.deepEqual(h.requests, []);
+  });
+}
+
+for (const replaceOwner of [false, true]) {
+  test(`lost pointer capture permits a fresh ${replaceOwner ? "replacement" : "same"} owner's gesture`, async t => {
+    const h = harness(t);
+    h.emit("pointerdown", { pointerType: "pen", pointerId: 1 });
+    if (replaceOwner) h.replace("generation");
+    h.emit("lostpointercapture", { pointerId: 1 });
+    h.emit("click");
+    h.emit("pointerdown", { pointerType: "pen", pointerId: 2 });
+    h.emit("pointermove", { pointerId: 2, clientY: 20 });
+    h.emit("pointerup", { pointerId: 2 });
+    await h.advance(80);
+    assert.deepEqual(h.inputs.map(input => input.event.delta_y), [10]);
+    assert.deepEqual(h.requests, []);
+  });
+}
+
+test("a move from a retired owner releases its tracked pointer immediately", async t => {
   const h = harness(t);
   h.emit("pointerdown", { pointerType: "touch", pointerId: 1 });
   h.replace("generation");
-  h.emit("pointerdown", { pointerType: "touch", pointerId: 2 });
-  h.emit("pointerup", { pointerId: 1 });
+  h.emit("pointermove", { pointerId: 1, clientY: 20 });
+  assert.deepEqual([...h.state.renderPanel.capturedPointers], []);
   h.emit("click");
-  h.emit("pointermove", { pointerId: 2, clientY: 10 });
-  h.emit("pointerup", { pointerId: 2 });
   await h.advance(80);
-  assert.deepEqual(h.wire, []);
+  assert.deepEqual(h.inputs, []);
   assert.deepEqual(h.requests, []);
-  h.emit("pointerdown", { pointerType: "touch", pointerId: 3 });
-  h.emit("pointermove", { pointerId: 3, clientY: 20 });
-  h.emit("pointerup", { pointerId: 3 });
-  await h.advance(160);
+});
+
+for (const pointerType of ["touch", "pen"]) {
+  for (const retirement of ["move", "capture loss", "replacement pointer"]) {
+    test(`delayed ${pointerType} release after ${retirement} cannot click the replacement owner`, async t => {
+      let wallClock = 1_000;
+      t.mock.method(Date, "now", () => wallClock);
+      const h = harness(t);
+      h.emit("pointerdown", { pointerType, pointerId: 1 });
+      h.replace("generation");
+      if (retirement === "move") h.emit("pointermove", { pointerType, pointerId: 1, clientY: 20 });
+      if (retirement === "capture loss") h.emit("lostpointercapture", { pointerType, pointerId: 1 });
+      if (retirement === "replacement pointer") h.emit("pointerdown", { pointerType, pointerId: 2 });
+      wallClock = 2_000;
+      h.emit("pointerup", { pointerType, pointerId: 1 });
+      // Provenance protects both click surfaces even after the renewed legacy
+      // fallback expires. A later callback cannot acquire the current owner.
+      wallClock = 3_000;
+      h.emit("click", { pointerType, pointerId: 1 });
+      h.emit("click", { pointerType, pointerId: 1 }, h.state.remoteVideo);
+      await h.settle();
+      assert.deepEqual(h.requests, []);
+      assert.deepEqual(h.wire, []);
+      if (retirement !== "replacement pointer") h.emit("pointerdown", { pointerType, pointerId: 2 });
+      h.emit("pointerup", { pointerType, pointerId: 2 });
+      h.emit("click", { pointerType, pointerId: 2 });
+      await h.settle();
+      assert.deepEqual(h.requests, [{ path: "/api/apps/browser/pages/page%3Aoriginal/input",
+        body: { event: { type: "click", x: 20, y: 30 } } }], "the fresh owner's tap dispatches once");
+    });
+  }
+
+  test(`delayed retired ${pointerType} release renews only the legacy click fallback`, async t => {
+    let wallClock = 1_000;
+    t.mock.method(Date, "now", () => wallClock);
+    const h = harness(t);
+    h.emit("pointerdown", { pointerType, pointerId: 1 });
+    h.replace("generation");
+    h.emit("pointermove", { pointerType, pointerId: 1, clientY: 20 });
+    wallClock = 2_000;
+    h.emit("pointerup", { pointerType, pointerId: 1 });
+    h.emit("click");
+    await h.settle();
+    assert.deepEqual(h.requests, [], "legacy compatibility click follows the late release");
+    h.emit("click", { pointerType: "mouse", pointerId: 9 });
+    await h.settle();
+    assert.equal(h.requests.length, 1, "a fresh known mouse is not the retired touch");
+    wallClock = 3_000;
+    h.emit("click", { sourceCapabilities: { firesTouchEvents: true } });
+    await h.settle();
+    assert.equal(h.requests.length, 1, "legacy touch provenance stays bound after the fallback expires");
+  });
+}
+
+test("losing an unrelated pointer's capture keeps the current gesture", async t => {
+  const h = harness(t);
+  h.emit("pointerdown", { pointerType: "touch", pointerId: 1 });
+  h.emit("lostpointercapture", { pointerId: 2 });
+  h.emit("pointermove", { pointerId: 1, clientY: 20 });
+  h.emit("pointerup", { pointerId: 1 });
+  await h.advance(80);
   assert.deepEqual(h.inputs.map(input => input.event.delta_y), [10]);
 });
 
