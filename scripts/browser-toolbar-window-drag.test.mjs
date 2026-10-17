@@ -99,14 +99,18 @@ function homeWindow({ mode = "unified-toolbar", maximized = false, hidden = fals
   const interactions = { begun: 0, ended: 0, saved: 0, focused: [] };
   const frameWindow = {};
   const classes = new Set(hidden ? ["window", "hidden"] : ["window"]);
+  const nodeListeners = new Set();
   const node = {
     isConnected: true,
+    addEventListener: (type, listener, capture) => type === "load" && capture === true && nodeListeners.add(listener),
+    removeEventListener: (type, listener, capture) => type === "load" && capture === true && nodeListeners.delete(listener),
     offsetWidth: 800,
     classList: { contains: (name) => classes.has(name), add: (name) => classes.add(name) },
     dataset: { windowId: "browser-1", windowChromeMode: mode, ...(maximized ? { maximized: "true" } : {}) },
     style: { left: "100px", top: "50px" },
   };
   const frame = {
+    classList: { contains: (name) => name === "window-frame" },
     contentWindow: frameWindow,
     getBoundingClientRect: () => ({ left: parseFloat(node.style.left) + 1, top: parseFloat(node.style.top) + 1 }),
   };
@@ -148,7 +152,12 @@ function homeWindow({ mode = "unified-toolbar", maximized = false, hidden = fals
     }
   };
   const position = () => [parseFloat(node.style.left), parseFloat(node.style.top)];
-  return { node, interactions, send, position, detach, listeners };
+  const loadFrame = (target = frame) => {
+    for (const listener of [...nodeListeners]) {
+      listener({ target });
+    }
+  };
+  return { node, interactions, send, position, detach, listeners, nodeListeners, loadFrame };
 }
 
 test("Home moves the Browser window with the pointer and saves the place on release", () => {
@@ -208,7 +217,21 @@ test("closing the window removes its drag listener and ends an active drag", () 
   home.send("start", 400, 80);
   home.detach();
   assert.equal(home.listeners.size, 0);
+  assert.equal(home.nodeListeners.size, 0);
   assert.equal(home.interactions.ended, 1);
+});
+
+test("a frame that loads again mid-drag ends the drag", () => {
+  const home = homeWindow();
+  home.send("start", 400, 80);
+  home.send("move", 340, 120);
+  home.loadFrame({ classList: { contains: () => false } });
+  assert.equal(home.interactions.ended, 0, "a load inside another element is not the frame");
+  home.loadFrame();
+  const placed = home.position();
+  assert.deepEqual([home.interactions.begun, home.interactions.ended, home.interactions.saved], [1, 1, 1]);
+  home.send("move", 280, 160);
+  assert.deepEqual(home.position(), placed, "moves after the reload are ignored until a new start");
 });
 
 test("Home ignores drag messages that are not bound to this frame's launch", () => {

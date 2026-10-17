@@ -503,9 +503,18 @@ export function attachForwardedWindowDrag(
     windowNode.style.left = `${safeClamp(pointerX - dragging.offsetX, limits.minX, limits.maxX)}px`;
     windowNode.style.top = `${safeClamp(pointerY - dragging.offsetY, limits.minY, limits.maxY)}px`;
   };
+  // A frame that reloads, navigates or is relaunched mid-drag never sends its
+  // end, and its old token no longer matches.
+  const frameLoaded = (event) => {
+    if (event.target?.classList?.contains("window-frame")) {
+      finish();
+    }
+  };
   window.addEventListener("message", listener);
+  windowNode.addEventListener("load", frameLoaded, true);
   return () => {
     window.removeEventListener("message", listener);
+    windowNode.removeEventListener("load", frameLoaded, true);
     finish();
   };
 }
