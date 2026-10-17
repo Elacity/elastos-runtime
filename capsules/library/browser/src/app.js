@@ -21,6 +21,7 @@ import { createLibraryActions } from "./actions.js?v=library-20260711d";
 import { createLibraryDialog } from "./dialog.js?v=library-20260711d";
 import { createLibraryEditor } from "./editor.js";
 import { bindLibraryEvents } from "./events.js";
+import { createLibraryFolders } from "./folders.js";
 import { createLibraryMenu } from "./menu.js";
 import { createLibraryNavigation } from "./navigation.js";
 import { createLibraryPreview } from "./preview.js";
@@ -168,6 +169,17 @@ import {
       renderFooter: () => renderFooter(),
       state,
       visibleObjects,
+    });
+    const { loadCurrentFolder } = createLibraryFolders({
+      homeNavigation,
+      perf,
+      providerApi,
+      renderAll,
+      runInitialObjectAction,
+      setFolderStatus,
+      setObjects,
+      setStatus,
+      state,
     });
     const {
       handleBrowserPopState,
@@ -706,57 +718,6 @@ import {
       renderPlaces({ animateFrom: previousTops });
       syncPlacesActive();
       setStatus("Sidebar order saved.");
-    }
-
-    async function loadCurrentFolder(options = {}) {
-      if (!state.currentUri) return;
-      const loadSeq = ++state.loadSeq;
-      const uri = state.currentUri;
-      const cached = options.useCache ? state.folderCache.get(uri) : null;
-      let renderedCached = false;
-      let renderAfterFetch = true;
-      if (cached) {
-        perf.folderCacheHits += 1;
-        state.loading = false;
-        state.currentObject = cached.object || null;
-        setObjects(cached.objects);
-        state.selectedUris.clear();
-        setFolderStatus(`${state.objects.length} item${state.objects.length === 1 ? "" : "s"}.`);
-        renderAll();
-        await runInitialObjectAction();
-        renderedCached = true;
-      } else {
-        state.loading = true;
-        state.currentObject = null;
-        setStatus("Loading...");
-      }
-      try {
-        const data = await providerApi("list", { uri });
-        if (loadSeq !== state.loadSeq || uri !== state.currentUri) {
-          return;
-        }
-        const objects = Array.isArray(data.objects) ? data.objects : [];
-        const currentObject = data.object || null;
-        const nextCache = cacheFolderListing(state, perf, uri, objects, currentObject);
-        state.currentObject = currentObject;
-        if (state.mode === "browse" && currentObject?.uri === uri && isDirectory(currentObject)) {
-          homeNavigation.setQuery({ uri });
-        }
-        if (renderedCached && cached.signature === nextCache.signature) {
-          renderAfterFetch = false;
-          setFolderStatus(`${state.objects.length} item${state.objects.length === 1 ? "" : "s"}.`);
-          return;
-        }
-        setObjects(objects);
-        state.selectedUris.clear();
-        setFolderStatus(`${state.objects.length} item${state.objects.length === 1 ? "" : "s"}.`);
-      } finally {
-        if (loadSeq === state.loadSeq && uri === state.currentUri) {
-          state.loading = false;
-          if (renderAfterFetch) renderAll();
-          if (renderAfterFetch) await runInitialObjectAction();
-        }
-      }
     }
 
     async function runInitialObjectAction() {

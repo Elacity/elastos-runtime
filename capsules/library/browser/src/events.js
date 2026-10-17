@@ -42,6 +42,27 @@ export function bindLibraryEvents({
   uploadFiles,
 }) {
   let draggingPlaceId = "";
+  let keyboardMenuReturnTarget = null;
+  let keyboardNavigationJob = 0;
+
+  function restoreKeyboardMenuFocus() {
+    if (keyboardMenuReturnTarget?.isConnected) keyboardMenuReturnTarget.focus({ preventScroll: true });
+    keyboardMenuReturnTarget = null;
+  }
+
+  function moveKeyboardFocus(targetItem, event, focusedItem) {
+    if (!targetItem) return;
+    if (event.shiftKey) {
+      if (!state.selectionAnchorUri && focusedItem) {
+        state.selectionAnchorUri = focusedItem.dataset.uri;
+      }
+      selectRangeTo(targetItem.dataset.uri, event.ctrlKey || event.metaKey);
+    } else if (!event.ctrlKey && !event.metaKey) {
+      selectOnly(targetItem.dataset.uri);
+    }
+    targetItem.focus({ preventScroll: true });
+    targetItem.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
 
   elements.sidebar?.addEventListener("contextmenu", (event) => {
     event.preventDefault();
@@ -147,6 +168,14 @@ export function bindLibraryEvents({
     uploadFiles(elements.fileInput.files).catch(showError);
     elements.fileInput.value = "";
   });
+  elements.content.addEventListener("focusin", (event) => {
+    const item = event.target.closest(".item[data-uri]");
+    if (!item) return;
+    for (const previous of elements.content.querySelectorAll('.item[tabindex="0"]')) {
+      if (previous !== item) previous.tabIndex = -1;
+    }
+    if (item.tabIndex !== 0) item.tabIndex = 0;
+  });
   elements.content.addEventListener("click", (event) => {
     if (isNameEditorTarget(event.target)) return;
     const item = event.target.closest(".item");
@@ -215,19 +244,72 @@ export function bindLibraryEvents({
   document.addEventListener("click", (event) => {
     if (!event.target.closest(".context-menu")) {
       hideMenu();
+      keyboardMenuReturnTarget = null;
     }
   });
+  elements.contextMenu.addEventListener("click", (event) => {
+    const button = event.target.closest(".menu-item");
+    if (button && !button.parentElement.classList.contains("menu-entry-has-children")) {
+      restoreKeyboardMenuFocus();
+    }
+  }, true);
   bindDialogEvents();
+  window.addEventListener("pointerdown", () => { keyboardNavigationJob += 1; });
   window.addEventListener("keydown", (event) => {
+    const navigationJob = ++keyboardNavigationJob;
     if (event.key === "Escape") {
       hideMenu();
       hideDialog();
       clearSelection();
+      restoreKeyboardMenuFocus();
       return;
     }
     const editable = event.target.closest?.("input, textarea, select, [contenteditable='true']");
     const itemShortcutTarget = isItemShortcutTarget(event.target, elements);
     const shortcutSurfaceReady = itemShortcutTarget && !editable && !isDialogOpen(elements) && !isMenuOpen(elements);
+    const focusedItem = shortcutSurfaceReady ? event.target.closest?.(".item[data-uri]") : null;
+    if (shortcutSurfaceReady && !event.altKey) {
+      if (event.key === "End" && elements.content.getAttribute?.("aria-busy") === "true") {
+        event.preventDefault();
+        const renderJob = state.contentRenderJob;
+        if (document.activeElement === elements.content) {
+          // A later chunk can restore the previous row. Keep this new key request in control of focus.
+          elements.content.querySelector('.item[tabindex="0"]')?.focus({ preventScroll: true });
+        }
+        const initialFocus = document.activeElement;
+        const finishNavigation = () => {
+          if (navigationJob !== keyboardNavigationJob || renderJob !== state.contentRenderJob
+            || document.activeElement !== initialFocus) return;
+          if (elements.content.getAttribute("aria-busy") === "true") {
+            window.requestAnimationFrame(finishNavigation);
+          } else {
+            moveKeyboardFocus(keyboardNavigationTarget(elements.content, focusedItem, "End"), event, focusedItem);
+          }
+        };
+        window.requestAnimationFrame(finishNavigation);
+        return;
+      }
+      const targetItem = keyboardNavigationTarget(elements.content, focusedItem, event.key);
+      if (targetItem) {
+        event.preventDefault();
+        moveKeyboardFocus(targetItem, event, focusedItem);
+        return;
+      }
+      if (event.key === " " && focusedItem) {
+        event.preventDefault();
+        if (event.shiftKey) {
+          selectRangeTo(focusedItem.dataset.uri, event.ctrlKey || event.metaKey);
+        } else {
+          toggleSelected(focusedItem.dataset.uri);
+        }
+        return;
+      }
+    }
+    const itemAction = ["Enter", "F2", "Delete", "ContextMenu"].includes(event.key)
+      || (event.shiftKey && event.key === "F10");
+    if (itemAction && focusedItem && state.selectedUris.size === 0) {
+      selectOnly(focusedItem.dataset.uri);
+    }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a" && shortcutSurfaceReady) {
       event.preventDefault();
       selectAllVisible();
@@ -258,12 +340,14 @@ export function bindLibraryEvents({
     }
     if ((event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) && shortcutSurfaceReady) {
       event.preventDefault();
+      keyboardMenuReturnTarget = focusedItem || elements.content;
       const object = selectedObjects()[0];
       if (object) {
         showKeyboardObjectMenu(elements, object, showMenuForObject);
       } else {
         showKeyboardBackgroundMenu(elements, showBackgroundMenu);
       }
+      elements.contextMenu.querySelector(".menu-item:not(:disabled)")?.focus({ preventScroll: true });
     }
   });
   window.addEventListener("popstate", (event) => {
@@ -302,6 +386,30 @@ function clearPlaceDropTargets(elements) {
 
 function isNameEditorTarget(target) {
   return !!target?.closest?.(".rename-input");
+}
+
+function keyboardNavigationTarget(content, focusedItem, key) {
+  const grid = content.dataset.view === "grid";
+  if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(key)
+    && !(grid && ["ArrowLeft", "ArrowRight"].includes(key))) return null;
+  const items = Array.from(content.querySelectorAll(".item[data-uri]"));
+  if (!items.length) return null;
+  if (key === "Home") return items[0];
+  if (key === "End") return items.at(-1);
+  const index = items.indexOf(focusedItem);
+  if (index < 0) return key === "ArrowUp" || key === "ArrowLeft" ? items.at(-1) : items[0];
+  let step = 1;
+  if (grid && (key === "ArrowUp" || key === "ArrowDown")) {
+    const firstTop = items[0].offsetTop;
+    const nextRow = items.findIndex((item) => item.offsetTop > firstTop);
+    step = nextRow > 0 ? nextRow : items.length;
+    if (key === "ArrowUp" && index < step) return items[index];
+    if (key === "ArrowDown" && Math.floor(index / step) === Math.floor((items.length - 1) / step)) {
+      return items[index];
+    }
+  }
+  const direction = key === "ArrowUp" || key === "ArrowLeft" ? -1 : 1;
+  return items[Math.max(0, Math.min(items.length - 1, index + direction * step))];
 }
 
 function isItemShortcutTarget(target, elements) {

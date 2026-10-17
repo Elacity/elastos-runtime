@@ -73,7 +73,9 @@ export function createLibrarySelection({
 
   function syncSelectionDom() {
     for (const item of content.querySelectorAll(".item[data-uri]")) {
-      item.dataset.selected = state.selectedUris.has(item.dataset.uri) ? "true" : "false";
+      const selected = state.selectedUris.has(item.dataset.uri) ? "true" : "false";
+      if (item.dataset.selected !== selected) item.dataset.selected = selected;
+      if (item.getAttribute("aria-selected") !== selected) item.setAttribute("aria-selected", selected);
     }
     renderFooter();
   }

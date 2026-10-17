@@ -45,6 +45,188 @@ tests, and the separate Browser local-exit checks. `just verify-release` adds
 browser-based UI source checks, local Carrier setup and Home front-door proofs.
 Publishing trust and signer verification are separate release gates.
 
+## From requirements to acceptance
+
+For each changed user journey, connect the brief or vision requirement to the
+current [principle](../PRINCIPLES.md) and capsule or provider contract. State the
+observable result, the failure that would violate it, and the existing check
+that exercises that boundary. Use current repository names and workflow when a
+historical brief refers to retired branches or status files. Keep this mapping
+and current evidence in the owning issue's
+[Acceptance record](../AGENTS.md#acceptance-record). Broader
+portability, distribution and host-support claims need their own evidence.
+
+Before selecting an implementation, refresh the relevant remote heads and read
+open pull requests. Check the configured fetch refspec: a fetch that updates only
+the release branch does not establish the state of other work. Compare the
+proposed behavior and exact changed paths with unmerged branches, including
+branches without a pull request. Extend the existing concern when appropriate;
+keep unrelated changes with their owners. Record the observed heads and refresh
+this comparison before publication. Published refs cannot establish the absence
+of unpublished work.
+
+Choose evidence by what the check actually runs:
+
+- Source and manifest checks such as `just product-data` and
+  `node scripts/check-elastos-bus-wit.mjs` enforce declared structure and
+  consistency. Source text matching establishes that the expected text exists.
+- Executed module, Component and browser fixtures establish behavior for the
+  tested inputs. `just bus-conformance` observes provider dispatch and audit;
+  `just library-regression` observes Library state, DOM order, responsiveness
+  and upload requests. Name the substituted provider or host boundary.
+- Installed acceptance exercises the complete journey through the candidate
+  Runtime and providers. Follow the [artifact-parity and installed-proof
+  requirements](../AGENTS.md#verification-gate), including restart, recovery and
+  human checks where required. Signed installation on another compatible node
+  is separate from starting a source Home. Browser engine and microVM claims
+  require a suitable target host and the existing Browser product proof.
+
+Assert results independently of the implementation being changed: expected
+object identities and bytes, actual provider calls, stored state, rendered
+controls and visible errors. For a regression, reproduce the broken behavior
+and show that its check fails before the fix and passes after it when practical.
+Include interrupted, concurrent or unavailable-service cases when those affect
+the journey. Exercise each changed pointer, keyboard, API or Home-message entry
+point through its shared operation; one working entry point proves only that
+path. A mock response or an internal success counter cannot by itself establish
+that the intended effect occurred.
+
+For performance, keep the workload and timing budget explicit, observe user
+input and intermediate frames, and compare measurements on the same host.
+Preserve rooted object identity, granted operations and truthful completion
+while improving responsiveness.
+Preserve runner exit status and confirm that the intended tests executed;
+report skipped and unrun target checks separately from passes. The Library
+browser performance and menu smokes run before the concurrent tests in
+`just test-behaviour`, its CI job and the local pre-push gate. Run
+`just test-behaviour-inputs` to install that suite's pinned browser inputs.
+`just library-regression` provides the focused Library gate; `just verify`
+remains a separate source gate.
+
+## Runtime contract regression checks
+
+Run `just bus-conformance` after changing the Component-to-Runtime operation
+path. It executes the checked-in Component fixture through request, grant,
+provider dispatch and audit, then checks that a grant for a different action
+cannot dispatch the operation. The command requires exactly one discovered test.
+
+For Component loading, run
+`cargo test --locked -p elastos-compute --lib component_load -- --nocapture`
+from `elastos/`. The real Component fixture checks that unrelated async work
+stays responsive, artifact errors are preserved, and stopping a loaded instance
+removes it. The cancellation test queues the compile job behind a held blocking
+worker and checks that the job retains its slot after the caller cancels.
+The blocked-worker test checks executor responsiveness. A paused-clock test
+checks that waiting for the compile slot stops after 30 seconds; an admitted
+blocking job retains its slot until it finishes. This checks loading, while Bus
+conformance checks Runtime dispatch.
+
+For request-store changes, run
+`cargo test --locked -p elastos-runtime` from `elastos/`. This covers the pending
+request and capability stores, including concurrent admission limits,
+expired-request recovery and retention of grants for user revocation. The
+32-record session share covers outstanding requests and retained live grants;
+one full session must leave room for another while global capacity remains.
+Verify that concurrent revocation keeps the epoch monotonic and that cleanup
+retains still-valid grants.
+
+For capacity reclamation, also run
+`cargo test --locked -p elastos-server --lib api::handlers::capability::tests::test_request_capacity_recovers -- --nocapture`
+from `elastos/`. Also run
+`cargo test --locked -p elastos-server --lib api::handlers::capability::tests::test_revoke_all_failure_returns_500_and_keeps_live_grants -- --nocapture`
+to check that a failed epoch write returns an error and leaves live grants
+unchanged. These regressions invoke the real Rust handlers directly with
+`State`, `Extension` and `Json`; HTTP routing, middleware and installed acceptance
+need separate evidence. Together these checks exercise Runtime ownership of
+effects as defined in [PRINCIPLES.md](../PRINCIPLES.md); they complement the source
+gate and installed acceptance checks rather than certifying every product journey.
+
+## Library regression checks
+
+Run `just library-regression` after changing Library sorting, listing caches,
+rendering, menus, keyboard input or uploads. It runs the focused state and action
+tests, the existing structure and dialog-copy smoke, and the browser performance
+and menu smokes. The browser fixtures serve the current Library and Home client
+modules with local provider responses; they do not establish installed Runtime
+or provider acceptance.
+
+Use Node 26 and the Playwright dependency pinned in
+`elastos/tools/browser-playwright-engine/package.json`, with its installed
+Chromium browser. An existing Playwright module and Chromium-compatible browser
+can be selected explicitly:
+
+```bash
+ELASTOS_PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
+BRAVE_BIN=/absolute/path/to/chromium just library-regression
+```
+
+Missing modules or browsers fail the check. The browser smoke exercises a
+shuffled folder of 5,000 files and directories, cached navigation, name and size
+sorting, search, updated listing facts, and overlapping uploads while changing
+folders. Navigation to an uncached folder must clear the previous folder's rows
+while waiting, explain how to retry a failed listing and preserve a newer
+navigation when an old response arrives. Refreshing the same folder keeps its
+current rows until a successful response. The smoke checks that sorting yields
+intermediate frames, reports first-paint and completion times, and rejects
+unexpected console and request errors.
+The existing 750 ms first-paint budget and a 5 s completion budget allow ordinary
+test-host variation; use the reported times to compare changes on the same host.
+
+The menu smoke uses browser keyboard input to check one Tab entry and exit,
+list and grid navigation, range and toggle selection, focused-item operations,
+rename input, menu focus return and folder/back navigation. It observes the
+requested object URI as well as the visible result.
+
+## Browser interaction and control-bridge regressions
+
+Browser observation changes must preserve the selected page's Runtime ownership
+while retiring stopped polling and refresh runs. Exercise delayed success,
+transport failure, authority renewal and terminal failure after both stop and
+restart, including a restart that retains the same page. A retired request must
+not change the current view or start another observation loop. A current request
+must retain the existing authority and cleanup behavior.
+
+```bash
+node --test capsules/browser/browser/*.test.mjs scripts/browser-observation-recovery.test.mjs scripts/browser-viewer-restore.test.mjs scripts/browser-window-close-handshake.test.mjs scripts/browser-input-ordering.test.mjs
+node scripts/browser-window-close-headless-smoke.mjs
+node scripts/home-browser-restored-lifecycle-headless-smoke.mjs
+```
+
+The Node checks execute modules or actual functions with controlled responses.
+The headless checks exercise Home and Browser in Chromium with fixture APIs and
+a substituted peer connection. They establish viewer lifecycle behavior, not
+actual Engine media or installed VM acceptance. The headless scripts support
+`ELASTOS_PLAYWRIGHT_MODULE`; their explicit browser overrides are
+`ELASTOS_BROWSER_CLOSE_CHROMIUM_EXECUTABLE` and `ELASTOS_BROWSER_EXECUTABLE`,
+respectively.
+
+For input batching, verify event ordering, page ownership and bounded pending
+work. Measure encoded movement through the selected Engine protocol as well as
+raw input totals: an encoder that rounds every batch can change the distance
+when batch frequency changes. Preserve discrete actions and make uncertain
+delivery explicit.
+
+The VM guest control bridge is a separate Cargo workspace. Run its lifecycle
+tests and process-level forwarding smoke after changing request-worker handling:
+
+```bash
+cargo test --locked --manifest-path elastos/tools/browser-vm-guest-control-bridge/Cargo.toml
+cargo clippy --locked --manifest-path elastos/tools/browser-vm-guest-control-bridge/Cargo.toml --all-targets -- -D warnings
+scripts/browser-vm-guest-control-bridge-smoke.sh
+```
+
+Completed worker handles are reclaimed when another connection is accepted.
+Finite runs join all remaining workers when every request succeeds. On failure,
+they resolve earlier accepted sessions and report the earliest failed session
+without waiting for later workers. Returning a worker error does not roll back
+effects already dispatched. Test that active requests remain independent and
+that worker failures retain their acceptance order. Repeated
+successful requests can measure completed-history retention separately from
+simultaneous active-request capacity. The Unix-socket smoke exercises a real
+bridge process against a local control-service fixture without requiring KVM.
+Target VM transport, WebRTC media and manual usability remain the separate
+[Browser acceptance gates](../docs/BROWSER_ACCEPTANCE.md).
+
 ## Local pre-push gate
 
 Commit the candidate, then run `just ci-local-prepush`. Resolve the source and

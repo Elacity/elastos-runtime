@@ -34,6 +34,11 @@ export function createLibraryRenderer({
     elements.content.dataset.view = state.view === "list" ? "list" : "grid";
     elements.sortSelect.value = state.sort;
     const objects = visibleObjects();
+    const focusedUri = elements.content.contains(document.activeElement)
+      ? document.activeElement?.closest(".item[data-uri]")?.dataset.uri || "" : "";
+    const previousTabStopUri = elements.content.querySelector('.item[tabindex="0"]')?.dataset.uri;
+    elements.content.tabIndex = objects.length ? -1 : 0;
+    elements.content.setAttribute("aria-busy", String(objects.length > LARGE_RENDER_THRESHOLD));
     if (!objects.length) {
       elements.content.dataset.empty = "true";
       const copy = emptyStateCopy(state);
@@ -41,6 +46,7 @@ export function createLibraryRenderer({
       empty.className = "empty";
       empty.innerHTML = `<div class="empty-inner"><h2>${escapeHtml(copy.title)}</h2><p>${escapeHtml(copy.body)}</p></div>`;
       elements.content.replaceChildren(empty);
+      if (focusedUri) elements.content.focus({ preventScroll: true });
       perf.contentRenderCount += 1;
       perf.lastContentRender = {
         durationMs: performance.now() - startedAt,
@@ -52,14 +58,18 @@ export function createLibraryRenderer({
     elements.content.dataset.empty = "false";
     const chunked = objects.length > LARGE_RENDER_THRESHOLD;
     const firstLimit = chunked ? Math.min(INITIAL_RENDER_LIMIT, objects.length) : objects.length;
+    const initialObjects = objects.slice(0, firstLimit);
+    const tabStopUri = initialObjects.find((object) => object.uri === previousTabStopUri)?.uri
+      || initialObjects.find((object) => isSelected(object.uri))?.uri || initialObjects[0].uri;
     const fragment = document.createDocumentFragment();
     if (state.view === "list") {
       fragment.appendChild(renderListHeader());
     }
-    for (const object of objects.slice(0, firstLimit)) {
-      fragment.appendChild(renderObject(object));
+    for (const object of initialObjects) {
+      fragment.appendChild(renderObject(object, tabStopUri));
     }
     elements.content.replaceChildren(fragment);
+    if (focusedUri) restoreItemFocus(focusedUri);
     pruneObjectNodeCache(objects);
     perf.contentRenderCount += 1;
     perf.lastContentRender = {
@@ -72,11 +82,17 @@ export function createLibraryRenderer({
       view: state.view,
     };
     if (chunked) {
-      renderContentChunks(objects, firstLimit, job, startedAt);
+      renderContentChunks(objects, firstLimit, job, startedAt, focusedUri);
     }
   }
 
   function emptyStateCopy(state) {
+    if (state.loading) {
+      return { title: "Loading folder...", body: "Your items will appear here." };
+    }
+    if (state.loadError) {
+      return { title: "This folder could not be opened", body: "Choose Refresh from More to try again." };
+    }
     if (state.query) {
       return { title: "No matching items", body: "Try another search." };
     }
@@ -89,7 +105,12 @@ export function createLibraryRenderer({
     return { title: "This folder is empty", body: "Upload a file or create a folder." };
   }
 
-  function renderContentChunks(objects, startIndex, job, startedAt) {
+  function restoreItemFocus(uri) {
+    const item = elements.content.querySelector(`.item[data-uri="${CSS.escape(uri)}"]`);
+    (item || elements.content).focus({ preventScroll: true });
+  }
+
+  function renderContentChunks(objects, startIndex, job, startedAt, focusedUri) {
     window.requestAnimationFrame(() => {
       if (job !== state.contentRenderJob) return;
       const fragment = document.createDocumentFragment();
@@ -98,10 +119,12 @@ export function createLibraryRenderer({
         fragment.appendChild(renderObject(object));
       }
       elements.content.appendChild(fragment);
+      if (focusedUri && document.activeElement === elements.content) restoreItemFocus(focusedUri);
       if (nextIndex < objects.length) {
-        renderContentChunks(objects, nextIndex, job, startedAt);
+        renderContentChunks(objects, nextIndex, job, startedAt, focusedUri);
         return;
       }
+      elements.content.setAttribute("aria-busy", "false");
       perf.lastContentRender = {
         ...(perf.lastContentRender || {}),
         durationMs: perf.lastContentRender?.durationMs || 0,
@@ -124,12 +147,16 @@ export function createLibraryRenderer({
     return header;
   }
 
-  function renderObject(object) {
+  function renderObject(object, tabStopUri = "") {
     const signature = objectRenderSignature(object);
     const cached = state.objectNodeCache.get(object.uri);
     if (cached && cached.signature === signature && !cached.node.querySelector(".rename-input")) {
       perf.objectNodeCacheHits += 1;
-      cached.node.dataset.selected = isSelected(object.uri) ? "true" : "false";
+      const selected = isSelected(object.uri) ? "true" : "false";
+      const tabIndex = object.uri === tabStopUri ? 0 : -1;
+      if (cached.node.dataset.selected !== selected) cached.node.dataset.selected = selected;
+      if (cached.node.getAttribute("aria-selected") !== selected) cached.node.setAttribute("aria-selected", selected);
+      if (cached.node.tabIndex !== tabIndex) cached.node.tabIndex = tabIndex;
       state.objectNodeCache.delete(object.uri);
       state.objectNodeCache.set(object.uri, cached);
       return cached.node;
@@ -141,8 +168,10 @@ export function createLibraryRenderer({
     item.dataset.kind = object.kind;
     item.dataset.blocked = isBlockedObject(object) ? "true" : "false";
     item.dataset.selected = isSelected(object.uri) ? "true" : "false";
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", item.dataset.selected);
     item.draggable = !isBlockedObject(object);
-    item.tabIndex = 0;
+    item.tabIndex = object.uri === tabStopUri ? 0 : -1;
     const visibility = visibilityContract(object);
     const inPublicFolder = visibility.placement === "public_folder";
     const badges = [

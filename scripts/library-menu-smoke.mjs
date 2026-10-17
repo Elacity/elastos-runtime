@@ -291,6 +291,7 @@ const localVideoFile = object(`${documentsUri}/Clip.mp4`, "Clip.mp4", "file", [
   "move",
   "copy",
   "publish",
+  "protect",
   "trash",
   "properties",
 ], {
@@ -1813,6 +1814,206 @@ function excludesAll(actual, forbidden, context) {
   }
 }
 
+async function assertKeyboardJourney(page) {
+  const content = page.locator("#content");
+  const rows = page.locator("#content .item");
+  const selected = page.locator('#content .item[aria-selected="true"]');
+  const focusedUri = () => page.evaluate(() => document.activeElement?.dataset.uri || "");
+  const rowUri = (index) => rows.nth(index).getAttribute("data-uri");
+  assert(await content.getAttribute("role") === "listbox", "Library items must expose a selectable collection");
+  assert(await content.getAttribute("aria-multiselectable") === "true", "Library must expose multiple selection");
+  assert(await rows.first().getAttribute("role") === "option", "Library rows must expose selectable item semantics");
+  await page.locator("#more-button").focus();
+  await page.keyboard.press("Tab");
+  assert(await focusedUri() === await rowUri(0), "Tab must enter Library at its current item");
+  assert(await page.locator('#content .item[tabindex="0"]').count() === 1, "Library must have one item in the Tab order");
+  await page.keyboard.press("ArrowDown");
+  assert(await focusedUri() === await rowUri(1), "ArrowDown must focus the next details row");
+  assert(await selected.count() === 1 && await selected.first().getAttribute("data-uri") === await rowUri(1),
+    "ArrowDown must select the focused row");
+  await page.keyboard.press("Shift+ArrowDown");
+  assert(await selected.count() === 2, "Shift+ArrowDown must extend the visible selection");
+  await page.keyboard.press("Shift+ArrowUp");
+  assert(await selected.count() === 1, "Shift+ArrowUp must shrink the selection toward its anchor");
+  await page.keyboard.press(`${multiSelectModifier}+End`);
+  assert(await focusedUri() === await rows.last().getAttribute("data-uri") && await selected.count() === 1,
+    "Modified End must move focus while keeping the selection");
+  await page.keyboard.press("Space");
+  assert(await selected.count() === 2, "Space must add the focused row to the selection");
+  await page.keyboard.press("Space");
+  assert(await selected.count() === 1, "Space must remove the focused row from the selection");
+  await page.keyboard.press("Home");
+  assert(await focusedUri() === await rowUri(0) && await selected.count() === 1, "Home must focus and select the first row");
+
+  const readme = rows.filter({ hasText: "Readme.md" }).first();
+  const published = rows.filter({ hasText: "Published.md" }).first();
+  await readme.click();
+  await published.focus();
+  const readsBefore = ops.filter((entry) => entry.op === "read").length;
+  await page.keyboard.press("Enter");
+  await page.locator(".dialog-card").filter({ hasText: "Readme.md" }).first().waitFor();
+  assert(ops.filter((entry) => entry.op === "read").length === readsBefore + 1
+    && ops.filter((entry) => entry.op === "read").at(-1).payload.uri === `${documentsUri}/Readme.md`,
+    "Enter must open the selected item when a different item has focus");
+  await page.keyboard.press("Escape");
+  await published.click();
+  await readme.focus();
+  await page.keyboard.press("F2");
+  const editor = page.locator(".rename-input");
+  await editor.waitFor();
+  assert(await editor.inputValue() === "Published.md", "F2 must rename the selected item when a different item has focus");
+  await page.keyboard.press(`${multiSelectModifier}+a`);
+  assert(await selected.count() === 1, "Select all inside the name editor must keep item selection unchanged");
+  await page.keyboard.press("ArrowLeft");
+  assert(await editor.evaluate((input) => document.activeElement === input), "Arrow keys must remain in the name editor");
+  await page.keyboard.press("Escape");
+  assert(await focusedUri() === `${documentsUri}/Published.md`, "Cancel rename must return focus to its item");
+  await readme.click();
+  await published.focus();
+  await page.keyboard.press("Shift+F10");
+  assert(await page.evaluate(() => document.activeElement?.matches("#context-menu .menu-item")),
+    "The keyboard context menu must focus its first action");
+  assert(await selected.count() === 1 && await selected.first().getAttribute("data-uri") === `${documentsUri}/Readme.md`,
+    "The keyboard context menu must preserve the selected item when another item has focus");
+  await page.keyboard.press("Escape");
+  assert(await focusedUri() === `${documentsUri}/Published.md`, "Escape from a keyboard menu must return focus to its owner");
+  await readme.click();
+  await published.focus();
+  await page.keyboard.press("Shift+F10");
+  await page.keyboard.press("Enter");
+  await page.locator(".dialog-card").filter({ hasText: "Readme.md" }).first().waitFor();
+  await page.keyboard.press("Escape");
+  assert(await focusedUri() === `${documentsUri}/Published.md`, "Keyboard menu Open must preserve the menu owner's focus target");
+
+  await page.locator("#grid-button").click();
+  await rows.first().focus();
+  const columnCount = await rows.evaluateAll((items) => {
+    const nextRow = items.findIndex((item) => item.offsetTop > items[0].offsetTop);
+    return nextRow < 0 ? items.length : nextRow;
+  });
+  assert(columnCount > 1 && columnCount < await rows.count(), "Keyboard grid fixture must contain multiple columns and rows");
+  await page.keyboard.press("ArrowRight");
+  assert(await focusedUri() === await rowUri(1), "ArrowRight must focus the next icon");
+  await page.keyboard.press("ArrowDown");
+  assert(await focusedUri() === await rowUri(1 + columnCount), "ArrowDown must focus the icon in the next row");
+  await page.keyboard.press("ArrowUp");
+  assert(await focusedUri() === await rowUri(1), "ArrowUp must return to the previous icon row");
+  await page.keyboard.press("ArrowLeft");
+  assert(await focusedUri() === await rowUri(0), "ArrowLeft must focus the previous icon");
+  await page.locator("#list-button").click();
+  const projects = rows.filter({ hasText: "Projects" }).first();
+  await projects.click();
+  await page.keyboard.press("Enter");
+  await page.locator(".crumb-current").filter({ hasText: "Projects" }).first().waitFor();
+  await page.locator("#back-button").focus();
+  await page.keyboard.press("Enter");
+  await page.locator(".crumb-current").filter({ hasText: "Documents" }).first().waitFor();
+  await page.locator("#more-button").focus();
+  await page.keyboard.press("Tab");
+  assert(await focusedUri() !== "", "Tab must re-enter Library after returning from a folder");
+  await page.keyboard.press("Tab");
+  assert(await focusedUri() === "", "One Tab must leave the item collection");
+  await page.keyboard.press("Escape");
+}
+
+async function assertDeselectDeleteJourney(context, port) {
+  const selectedName = "Keyboard selected.md";
+  const deselectedName = "Keyboard deselected.md";
+  const selectedUri = `${documentsUri}/${selectedName}`;
+  const deselectedUri = `${documentsUri}/${deselectedName}`;
+  putObject(documentsUri, createFileObject(selectedUri, selectedName));
+  putObject(documentsUri, createFileObject(deselectedUri, deselectedName));
+  const page = await context.newPage();
+  try {
+    await page.goto(`http://127.0.0.1:${port}/apps/library/#home_token=${encodeURIComponent(token)}`);
+    const selected = page.locator(`#content .item[data-uri="${selectedUri}"]`);
+    const deselected = page.locator(`#content .item[data-uri="${deselectedUri}"]`);
+    await selected.click();
+    await deselected.click({ modifiers: [multiSelectModifier] });
+    assert(await page.locator('#content .item[aria-selected="true"]').count() === 2,
+      "Modified click must add the second item to the selection");
+    await deselected.click({ modifiers: [multiSelectModifier] });
+    assert(await deselected.evaluate((item) => document.activeElement === item),
+      "The deselected item must retain focus for this regression");
+    assert(await selected.getAttribute("aria-selected") === "true" && await deselected.getAttribute("aria-selected") === "false",
+      "Modified click must remove only the focused item from the selection");
+    const before = ops.length;
+    await page.keyboard.press("Delete");
+    await waitForOp((entry) => entry.op === "trash" && entry.payload.uri === selectedUri,
+      "Delete after deselection must trash the remaining selected item");
+    await selected.waitFor({ state: "detached" });
+    const trashed = ops.slice(before).filter((entry) => entry.op === "trash").map((entry) => entry.payload.uri);
+    assert(trashed.length === 1 && trashed[0] === selectedUri,
+      "Delete must dispatch exactly the selected item to Trash");
+    assert(await deselected.count() === 1 && findObject(deselectedUri)?.uri === deselectedUri,
+      "Delete must preserve the focused item that the user deselected");
+  } finally {
+    await page.close();
+    for (const name of [selectedName, deselectedName]) {
+      removeObject(`${documentsUri}/${name}`);
+      removeObject(`${principalRoot}/.Trash/${name}`);
+    }
+  }
+}
+
+async function assertEmptyWebspaceReadiness(context, port) {
+  for (const readonly of [false, true]) {
+    const page = await context.newPage();
+    let releaseList;
+    const held = new Promise((resolve) => { releaseList = resolve; });
+    const folderObject = {
+      ...webspaceMutable,
+      capabilities: readonly ? ["open", "list", "properties"] : webspaceMutable.capabilities,
+      metadata: { ...webspaceMutable.metadata, readonly, access_policy: readonly ? "read-only" : "owner-writable" },
+    };
+    try {
+      await page.route("**/api/provider/object/list", async (route) => {
+        if (route.request().postDataJSON()?.uri !== webspaceMutableUri) {
+          return route.continue();
+        }
+        await held;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: ok({ objects: [], object: folderObject }),
+        });
+      });
+      await page.goto(`http://127.0.0.1:${port}/apps/library/#home_token=${encodeURIComponent(token)}`);
+      await page.locator(".item").filter({ hasText: "Readme.md" }).first().waitFor();
+      await page.locator(".place").filter({ hasText: "Spaces" }).first().click();
+      await Promise.all([
+        page.waitForRequest((request) =>
+          new URL(request.url()).pathname === "/api/provider/object/list"
+          && request.postDataJSON()?.uri === webspaceMutableUri, { timeout: 30_000 }),
+        page.locator(".item").filter({ hasText: "Mutable" }).first().dblclick(),
+      ]);
+      await page.locator(".crumb-current").filter({ hasText: "Mutable" }).first().waitFor();
+      await page.locator("#content .empty h2").getByText("Loading folder...", { exact: true }).waitFor();
+      const loadedEmptyState = page.locator("#content .empty h2").getByText("This space is empty", { exact: true });
+      assert(await loadedEmptyState.count() === 0, "The completed empty-folder state must wait for the provider listing");
+      excludesAll(await openBackgroundMenu(page), ["New", "Upload Here", "Paste"], "WebSpace menu while its metadata is pending");
+      const responded = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === "/api/provider/object/list"
+        && response.request().postDataJSON()?.uri === webspaceMutableUri);
+      releaseList();
+      assert((await responded).ok(), "Empty WebSpace listing must succeed");
+      await loadedEmptyState.waitFor();
+      const rows = await openBackgroundMenu(page);
+      includesAll(rows, ["Sort By", "Refresh", "Properties"], "completed empty WebSpace menu");
+      if (readonly) {
+        excludesAll(rows, ["New", "Upload Here", "Paste"], "completed read-only empty WebSpace menu");
+      } else {
+        includesAll(rows, ["New", "Upload Here"], "completed mutable empty WebSpace menu");
+        excludesAll(rows, ["Paste"], "completed mutable empty WebSpace menu");
+      }
+    } finally {
+      releaseList();
+      await page.unrouteAll({ behavior: "wait" });
+      await page.close();
+    }
+  }
+}
+
 async function run() {
   const server = createServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -1876,6 +2077,10 @@ async function run() {
         )}`,
       );
     }
+
+    await assertEmptyWebspaceReadiness(context, port);
+    await assertDeselectDeleteJourney(context, port);
+    await assertKeyboardJourney(page);
 
     for (const label of ["Home", "Desktop", "Documents", "Pictures", "Videos", "Downloads", "Public", "Trash", "Spaces"]) {
       await page.locator(".place").filter({ hasText: label }).first().click();
@@ -2327,6 +2532,8 @@ async function run() {
     await page.locator(".place").filter({ hasText: "Spaces" }).first().click();
     await page.locator(".item").filter({ hasText: "Mutable" }).first().dblclick();
     await page.locator(".crumb-current").filter({ hasText: "Mutable" }).first().waitFor();
+    // The route changes before the provider returns this folder's metadata.
+    await page.locator("#content .empty h2").getByText("This space is empty", { exact: true }).waitFor();
     const mutableBackgroundRows = await openBackgroundMenu(page);
     includesAll(mutableBackgroundRows, ["New", "Upload Here", "Properties"], "mutable WebSpace background menu");
     excludesAll(mutableBackgroundRows, ["Paste"], "mutable WebSpace background menu");
@@ -2451,6 +2658,10 @@ async function run() {
     await clickMenu(page, "Copy");
     await openItemMenu(page, "Work");
     await clickMenu(page, "Paste Into Folder");
+    await waitForOp(
+      (entry) => entry.op === "copy" && entry.payload.uri === `${documentsUri}/Guide.md` && entry.payload.target_parent_uri === `${documentsUri}/Work`,
+      "Copy/Paste Into Folder must dispatch the intended source and destination",
+    );
     assert(
       ops.some((entry) => entry.op === "copy" && entry.payload.target_parent_uri.endsWith("/Work")),
       "Copy/Paste Into Folder must call copy with the destination folder",
@@ -2477,6 +2688,10 @@ async function run() {
     await page.locator(".item").filter({ hasText: "Upload.txt" }).first().click();
     await dropSelectionOnFolder(page, "Work", { copy: true });
     await page.locator(".item").filter({ hasText: "Upload.txt" }).first().waitFor();
+    await waitForOp(
+      (entry) => entry.op === "copy" && entry.payload.uri === `${documentsUri}/Upload.txt` && entry.payload.target_parent_uri === `${documentsUri}/Work`,
+      "Alt-drag/drop copy must dispatch the intended source and destination",
+    );
     assert(
       ops.some((entry) => entry.op === "copy" && entry.payload.uri.endsWith("/Upload.txt") && entry.payload.target_parent_uri.endsWith("/Work")),
       "Alt-drag/drop copy must call copy with the destination folder",
