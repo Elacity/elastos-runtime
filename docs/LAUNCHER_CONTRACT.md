@@ -14,6 +14,13 @@ elastos gateway --addr localhost:8090
 `--addr` is `host:port`. `elastos home` binds `localhost:8090` and opens the
 Home URL below. The gateway command leaves the system browser closed.
 
+The gateway listens on one socket. For a host name, it binds the first address
+that the name resolves to and that it can bind. `localhost` can resolve to
+`127.0.0.1` or to `::1` first, so `localhost:8090` listens on one address
+family only. A client that connects to the other family gets no answer from
+this gateway. Listening on every address of `localhost` is a gap in this
+contract.
+
 `elastos serve` is the operator runtime. Its readiness route is `GET /api/health`.
 A Home supervisor uses `gateway` and `/healthz`.
 
@@ -26,9 +33,16 @@ with role `gateway` or `gateway-public` and `pid` equal to its process id:
 GET http://localhost:8090/healthz
 ```
 
-returns HTTP 200 and the two bytes `OK`. A different pid, a missing lock, or a
-lock that is not JSON returns HTTP 503. The probe does not treat another
-process on the port as this Home.
+returns HTTP 200 and the two bytes `OK`. A different pid, another role, a
+missing lock, or a lock that is not JSON returns HTTP 503. A gateway that
+`elastos serve` starts keeps the `serve` record, so its `/healthz` returns 503.
+
+The process that answers on the port gives this reply about its own data
+directory. If an ElastOS gateway for another data directory already listens on
+the port, that gateway also returns `OK`. The reply does not name the process.
+Before it trusts `OK`, a supervisor confirms that the child it started is still
+running and that `{data}/host-process.lock` records the pid of that child with
+role `gateway`. A reply that names the lock owner is a gap in this contract.
 
 The Home origin is:
 
@@ -37,7 +51,14 @@ http://localhost:8090/home/
 ```
 
 The passkey relying party id is `localhost`. Registration and sign-in use that
-origin. An IP-literal origin, including `http://127.0.0.1:8090`, is refused.
+origin. An IP-literal origin, including `http://127.0.0.1:8090`, is refused
+with HTTP 403. For a loopback address, the reply tells the person to open
+`http://localhost:<port>/home/`.
+
+Each release takes the relying party id from the host of the page, and browsers
+refuse an IP address as a relying party id. A passkey from an earlier release
+therefore names the host where it was made. Sign-in accepts that passkey at
+the same host on any port, and refuses it at every other host.
 
 ## Data directory and lock
 
