@@ -1582,6 +1582,11 @@ jobs:
           [[ "$RUNNER_OS/$RUNNER_ARCH" == macOS/X64 ]]
           df -Pk .
           df -Pk . | awk 'NR == 2 { if ($4 < 8 * 1024 * 1024) { print "Intel runner has under 8 GiB free"; exit 1 } }'
+      # source-gate runs these tests on Linux. Run them here on macOS too,
+      # where the lock path, lsof and localhost order differ.
+      - name: smoke script tests on macOS
+        timeout-minutes: 5
+        run: python3 scripts/gateway-healthz-smoke-test.py -v
       - name: build the gateway binary
         timeout-minutes: 70
         run: |
