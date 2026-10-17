@@ -32,6 +32,8 @@ from unittest import mock
 INSTALLER = Path(__file__).with_name("install.sh")
 SANDBOX_BASE = Path(__file__).resolve().parent.parent / "target/installer-sandboxes"
 SOURCE = INSTALLER.read_text()
+INTEL_MAC_STOP = ("This Mac has an Intel processor. ElastOS supports Macs with "
+                  "Apple silicon (M1 or later). Intel Mac is not supported yet.")
 if "# ── Main" not in SOURCE:
     raise SystemExit("install.sh is missing the '# ── Main' helper marker")
 HELPERS = SOURCE.split("# ── Main", 1)[0]
@@ -1590,10 +1592,46 @@ detect_platform
 printf '%s\\n' "$PLATFORM"
 ''')
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertIn("Intel Mac has no signed release yet", result.stderr)
-        self.assertIn("docs/MAC.md", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(INTEL_MAC_STOP, result.stderr)
+        self.assertNotIn("source-home", result.stderr)
         main = SOURCE.split("# ── Main", 1)[1]
+        self.assertLess(main.index("detect_platform"), main.index("fetch_url"))
         self.assertLess(main.index("detect_platform"), main.index("release-head.json"))
+
+    def test_intel_mac_full_run_downloads_nothing(self):
+        # The whole installer, not only detect_platform: an Intel Mac exits 1
+        # with the stop message before any network tool runs or any file is written.
+        # The installer refuses a home under a writable parent such as /tmp.
+        SANDBOX_BASE.mkdir(parents=True, exist_ok=True)
+        for path in (SANDBOX_BASE.parent, SANDBOX_BASE):
+            path.chmod(0o755)
+        with tempfile.TemporaryDirectory(prefix="installer-intel-", dir=SANDBOX_BASE) as directory:
+            root = Path(directory)
+            mocks = root / "mocks"
+            home = root / "home"
+            mocks.mkdir()
+            home.mkdir()
+            calls = root / "calls"
+            (mocks / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo x86_64;; *) echo Darwin;; esac\n')
+            for tool in ["curl", "wget"]:
+                (mocks / tool).write_text(f'#!/bin/sh\necho {tool} "$@" >> "$CALLS"\nexit 97\n')
+            for mock in mocks.iterdir():
+                mock.chmod(0o755)
+            # A configured publisher, so only the platform stop can end the run
+            # before the release-head fetch.
+            env = dict(os.environ, HOME=str(home), CALLS=str(calls),
+                       ELASTOS_PUBLISHER_GATEWAY="https://publisher.invalid",
+                       ELASTOS_MAINTAINER_DID="did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+                       PATH=str(mocks) + os.pathsep + os.environ["PATH"])
+            for name in ["ELASTOS_INSTALL_ONLY", "XDG_DATA_HOME"]:
+                env.pop(name, None)
+            result = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", str(INSTALLER.resolve())],
+                                    env=env, text=True, capture_output=True, timeout=15)
+            self.assertFalse(calls.exists(), calls.read_text() if calls.exists() else "")
+            self.assertEqual(list(home.iterdir()), [])
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(INTEL_MAC_STOP, result.stderr)
 
     def test_platform_paths_match_rust_dirs5_contract(self):
         # setup.rs and sources.rs use dirs5.0.1::data_dir. Mac ignores XDG;

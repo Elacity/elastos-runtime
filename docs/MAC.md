@@ -10,13 +10,14 @@ This section is the one record of Intel Mac support. Other documents link
 here instead of repeating it.
 
 The public release id for an Intel Mac is `x86_64-darwin`. `scripts/install.sh`
-stops on that host before a download lookup. The message is
-`Intel Mac has no signed release yet. See docs/MAC.md for the source-home path.`
+stops on that host before it downloads anything, and exits with code 1. The
+message is
+`This Mac has an Intel processor. ElastOS supports Macs with Apple silicon (M1 or later). Intel Mac is not supported yet.`
 
-A person with an Intel Mac has no signed download. The next step is the signed
-installer on an Apple silicon Mac. The source-home commands later in this
-runbook are a developer build. They are not the installer, and this note does
-not claim that build has passed on Intel.
+Intel Mac is not supported yet. There is no signed download and no other
+install path for it. The source-home commands later in this runbook are a
+developer build for Apple silicon. They are not an install path for an Intel
+Mac, and this note does not claim that build works on Intel.
 
 These files hold the rules:
 
