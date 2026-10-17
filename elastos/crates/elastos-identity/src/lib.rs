@@ -18,9 +18,9 @@ pub use store::{
     StoredCredential,
 };
 pub use webauthn::{
-    AuthenticationOutcome, AuthenticationResponse, AuthenticatorAssertionResponse,
-    AuthenticatorAttestationResponse, AuthenticatorSelection, CreationOptions,
-    CredentialDescriptor, IdentityManager, IdentityStatus, PubKeyCredParam,
-    PublicKeyCredentialCreationOptions, PublicKeyCredentialRequestOptions, RegistrationOutcome,
-    RegistrationResponse, RelyingParty, RequestOptions, UserEntity,
+    named_sign_in_account_key, AuthenticationOutcome, AuthenticationResponse,
+    AuthenticatorAssertionResponse, AuthenticatorAttestationResponse, AuthenticatorSelection,
+    CreationOptions, CredentialDescriptor, IdentityManager, IdentityStatus, NamedSignInAccount,
+    PubKeyCredParam, PublicKeyCredentialCreationOptions, PublicKeyCredentialRequestOptions,
+    RegistrationOutcome, RegistrationResponse, RelyingParty, RequestOptions, UserEntity,
 };

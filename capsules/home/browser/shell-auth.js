@@ -34,6 +34,10 @@ const recoveryPasswordLabel = document.querySelector("#home-recovery-password-la
 const recoverOwner = document.querySelector("#home-recover-owner");
 const ownerRecoveryCode = document.querySelector("#home-owner-recovery-code");
 const ownerRecoveryCodeLabel = document.querySelector("#home-owner-recovery-code-label");
+const unlockNamed = document.querySelector("#home-unlock-named");
+const accountName = document.querySelector("#home-unlock-account");
+const accountNameLabel = document.querySelector("#home-unlock-account-label");
+const NAMED_SIGN_IN_SCHEMA = "elastos.auth.passkey.authenticate.named.begin.request/v1";
 const MAX_RECOVERY_KIT_BYTES = 1024 * 1024;
 const RECOVERY_SELECTION_MS = 10 * 60 * 1000;
 let recoveryKit = null;
@@ -187,9 +191,31 @@ export function bindHomeUnlock() {
     setUnlockStatus("", "muted");
     ownerRecoveryCode?.focus();
   });
+  // For a passkey the browser does not offer on the lock face: a security key
+  // or a 0.7.1 passkey that is not discoverable. The account name lets Home
+  // ask for exactly that account's passkeys.
+  unlockNamed?.addEventListener("click", () => {
+    if (busy || pendingRegistration || recoverySession) return;
+    unlockMode = "signin_named";
+    clearRecoverySelection();
+    // The name the lock face shows is the account name this sign-in takes.
+    if (accountName && !accountName.value && unlockPersonLabel) accountName.value = unlockPersonLabel;
+    renderUnlockMode({ registered: true, guestRegistrationEnabled: guestRegistrationAvailable });
+    setUnlockStatus("", "muted");
+    accountName?.focus();
+  });
+  accountName?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || unlockMode !== "signin_named") return;
+    event.preventDefault?.();
+    runNamedSignIn().catch(reportUnlockError);
+  });
   const startUnlock = () => {
     if (unlockMode === "recover_owner") {
       runOwnerRecovery().catch(reportUnlockError);
+      return;
+    }
+    if (unlockMode === "signin_named") {
+      runNamedSignIn().catch(reportUnlockError);
       return;
     }
     if (["create", "create_guest", "resume_owner", "resume_registration"].includes(unlockMode)) {
@@ -214,7 +240,8 @@ export function bindHomeUnlock() {
     clearRecoverySelection();
     recoverySession = null;
     recoveryTerminalToken = "";
-    if (unlockMode === "resume_registration" || unlockMode === "recover_owner") {
+    if (unlockMode === "resume_registration" || unlockMode === "recover_owner"
+      || unlockMode === "signin_named") {
       if (ownerRecoveryCode) ownerRecoveryCode.value = "";
       unlockMode = guestRegistrationAvailable ? "signin_guest_enabled" : "signin";
       renderUnlockMode({ registered: true, guestRegistrationEnabled: guestRegistrationAvailable });
@@ -394,6 +421,31 @@ export async function addAccountPasskey(appToken) {
   }
 }
 
+// After a sign-in by account name the browser could not find this passkey, so
+// Home offers Add passkey once in System: only to an admin (the server lets
+// only an admin add one), and only when the Desktop shell is already the
+// active shell. It never changes the person's shell, guests get no System
+// navigation, and nothing here can fail the sign-in.
+export async function offerPasskeyAddAfterSignIn({ flow, homeToken, desktopActive, openSystem }) {
+  if (flow?.signInMethod !== "account_name" || desktopActive !== true || !readText(homeToken)) {
+    return false;
+  }
+  try {
+    const list = await fetchJson("/api/auth/passkeys", {
+      headers: { "x-elastos-home-token": readText(homeToken) },
+    });
+    const current = Array.isArray(list?.passkeys)
+      ? list.passkeys.find((passkey) => passkey?.current === true)
+      : null;
+    if (current?.role !== "admin") return false;
+    await openSystem({ settings: "account", passkey: "add" });
+    return true;
+  } catch (error) {
+    console.error("add-passkey offer failed", error);
+    return false;
+  }
+}
+
 function passkeyAddFailure(stage, error) {
   const status = Number(error && error.status) || 0;
   const name = String(error && error.name || "");
@@ -449,16 +501,20 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
   const resumingOwner = unlockMode === "resume_owner";
   const resumingRegistration = unlockMode === "resume_registration";
   const recoveringOwner = unlockMode === "recover_owner";
+  const namedSignIn = unlockMode === "signin_named";
   const creatingGuest = unlockMode === "create_guest";
   const creatingAdmin = unlockMode === "create" || resumingOwner;
   const canCreate = (creatingAdmin || creatingGuest) && !resumingOwner;
-  const showFace = registered && !creatingGuest && !resumingOwner && !resumingRegistration && !recoveringOwner && unlockMode !== "unsupported";
+  const showFace = registered && !creatingGuest && !resumingOwner && !resumingRegistration && !recoveringOwner && !namedSignIn && unlockMode !== "unsupported";
   if (unlockTitle) {
-    unlockTitle.textContent = recoveringOwner ? "Recover this Home" : resumingOwner || resumingRegistration ? "Resume setup" : creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
+    unlockTitle.textContent = recoveringOwner ? "Recover this Home" : namedSignIn ? "Sign in with your account name"
+      : resumingOwner || resumingRegistration ? "Resume setup" : creatingGuest ? "Create guest account" : (registered ? "Sign in" : "Set up Home");
   }
   if (unlockCopy) {
     if (recoveringOwner) {
       unlockCopy.textContent = `Lost your passkey? On the computer running this Home, run: ${ownerRecoveryCommand(location)}. Enter the code it shows, choose your Recovery Kit, then create a new passkey.`;
+    } else if (namedSignIn) {
+      unlockCopy.textContent = "Enter your account name as this Home shows it. Then use your security key or the device that has your passkey.";
     } else if (resumingOwner) {
       unlockCopy.textContent = "Finish the passkey setup already verified by this Home.";
     } else if (creatingGuest) {
@@ -472,13 +528,18 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
   if (unlockPrimary) {
     unlockPrimary.textContent = resumingOwner ? "Resume Home setup" : creatingGuest
       ? "Create guest passkey"
-      : (registered ? "Use passkey" : "Create admin passkey");
+      : namedSignIn ? "Continue" : (registered ? "Use passkey" : "Create admin passkey");
     unlockPrimary.disabled = unlockMode === "unsupported";
   }
   if (unlockSecondary) {
-    unlockSecondary.hidden = !registered || !guestRegistrationEnabled && !resumingRegistration && !recoveringOwner;
-    unlockSecondary.textContent = creatingGuest || resumingRegistration || recoveringOwner ? "Back to sign in" : "Create guest account";
+    unlockSecondary.hidden = !registered || !guestRegistrationEnabled && !resumingRegistration && !recoveringOwner && !namedSignIn;
+    unlockSecondary.textContent = creatingGuest || resumingRegistration || recoveringOwner || namedSignIn ? "Back to sign in" : "Create guest account";
   }
+  if (accountName) {
+    accountName.hidden = !namedSignIn;
+    accountName.disabled = !namedSignIn;
+  }
+  if (accountNameLabel) accountNameLabel.hidden = !namedSignIn;
   if (unlockPanel) {
     unlockPanel.dataset.surface = showFace ? "lock-face" : "neutral";
     if (showFace) {
@@ -954,16 +1015,39 @@ async function runOwnerRecovery() {
   }
 }
 
-async function runPasskeySignIn() {
+function runPasskeySignIn() {
+  return signInWithPasskey("");
+}
+
+// Sign-in by account name, for a passkey the browser does not offer on the
+// lock face. Home lists only that account's passkeys, or decoys for a name it
+// does not know; a caller who guesses a real name does learn it has passkeys.
+function runNamedSignIn() {
+  if (busy) return Promise.resolve();
+  const name = String(accountName?.value || "").split(/\s+/).filter(Boolean).join(" ");
+  if (!name) {
+    accountName?.focus();
+    setUnlockStatus("Enter your account name as this Home shows it.", "error");
+    return Promise.resolve();
+  }
+  return signInWithPasskey(name);
+}
+
+async function signInWithPasskey(name) {
   if (busy || !window.PublicKeyCredential) {
     return;
   }
   busy = true;
   setButtonsDisabled(true);
-  setUnlockStatus("Choose your passkey.", "muted");
+  setUnlockStatus(name ? "Use your security key or the device that has your passkey." : "Choose your passkey.", "muted");
   let stage = "start";
   try {
-    const begin = await fetchJson("/api/auth/passkey/authenticate/begin", { method: "POST" });
+    const begin = await fetchJson(
+      name ? "/api/auth/passkey/authenticate/named/begin" : "/api/auth/passkey/authenticate/begin",
+      name
+        ? { method: "POST", body: JSON.stringify({ schema: NAMED_SIGN_IN_SCHEMA, account_name: name }) }
+        : { method: "POST" },
+    );
     const request = toRequestOptions(begin.options);
     stage = "passkey";
     const credential = await navigator.credentials.get(request);
@@ -980,9 +1064,9 @@ async function runPasskeySignIn() {
     });
     setHomeAuthorityToken(response?.home_token);
     stage = "open";
-    await unlockComplete(response);
+    await unlockComplete(response, name ? { signInMethod: "account_name" } : null);
   } catch (error) {
-    throw signInFailure(stage, error);
+    throw signInFailure(stage, error, Boolean(name));
   } finally {
     busy = false;
     setButtonsDisabled(false);
@@ -991,8 +1075,9 @@ async function runPasskeySignIn() {
 
 // One plain reason and one next step per failed sign-in; never a status code
 // or server text. Stages: start (begin or status), passkey (the browser),
-// verify (Home checks the passkey), open (Home opens after sign-in).
-function signInFailure(stage, error) {
+// verify (Home checks the passkey), open (Home opens after sign-in). A wrong
+// account name and a missing passkey get the same message here.
+function signInFailure(stage, error, named = false) {
   const status = Number(error && error.status) || 0;
   const name = String(error && error.name || "");
   let message;
@@ -1001,9 +1086,13 @@ function signInFailure(stage, error) {
     message = "Home could not open after sign-in. Reload this page.";
   } else if (status === 429) {
     message = "Sign-in is busy right now. Wait a minute, then try again.";
+  } else if (named && stage === "start" && status === 422) {
+    message = "Enter your account name as this Home shows it.";
   } else if (stage === "passkey") {
     if (name === "NotAllowedError" || name === "AbortError") {
-      message = "No passkey was used. Select your account to try again.";
+      message = named
+        ? "No passkey for that account name was used. Check the name, then try again with your security key or device."
+        : "No passkey was used. Select your account to try again.";
       tone = "muted";
     } else if (name === "SecurityError") {
       message = "Passkeys do not work at this address. Open Home at the address where you created your passkey.";
@@ -1013,7 +1102,9 @@ function signInFailure(stage, error) {
   } else if (!status) {
     message = "Home is not responding. Check that ElastOS is running, then try again.";
   } else if (stage === "verify") {
-    message = "Home did not accept this passkey. Use the passkey you created for this Home.";
+    message = named
+      ? "Home did not accept this passkey for that account name. Check the name and try again."
+      : "Home did not accept this passkey. Use the passkey you created for this Home.";
   } else {
     message = "Home could not start sign-in. Try again in a moment.";
   }
@@ -1058,6 +1149,8 @@ function setButtonsDisabled(disabled) {
     unlockSecondary.disabled = disabled;
   }
   if (enrollmentDismiss) enrollmentDismiss.disabled = disabled;
+  if (unlockNamed) unlockNamed.disabled = disabled;
+  if (accountName) accountName.disabled = disabled || unlockMode !== "signin_named";
 }
 
 function setUnlockNameVisible(visible) {
