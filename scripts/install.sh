@@ -110,7 +110,7 @@ show_help() {
     echo ""
     echo -e "${BOLD}ElastOS Installer${NC}"
     echo "  Release lookup: Linux x86_64/aarch64 and macOS Apple silicon."
-    echo "  Intel Mac is not supported yet."
+    echo "  ${INTEL_MAC_UNSUPPORTED}"
     echo "  The signed release determines which platforms have downloads."
     echo ""
     echo -e "${BOLD}Usage:${NC}"
@@ -319,6 +319,9 @@ installer_data_dir() {
     esac
 }
 
+# The one Intel Mac stop (docs/MAC.md#intel-mac quotes it).
+INTEL_MAC_UNSUPPORTED="Intel Mac is not supported yet."
+
 detect_platform() {
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
     ARCH=$(uname -m)
@@ -333,7 +336,7 @@ detect_platform() {
     case "${OS}" in
         linux)  PLATFORM="${ARCH}-linux" ;;
         darwin)
-            [[ "$ARCH" == aarch64 ]] || die "This Mac has an Intel processor. ElastOS supports Macs with Apple silicon (M1 or later). Intel Mac is not supported yet."
+            [[ "$ARCH" == aarch64 ]] || die "$INTEL_MAC_UNSUPPORTED"
             PLATFORM="aarch64-darwin"
             ;;
         *) die "Unsupported OS: ${OS}" ;;

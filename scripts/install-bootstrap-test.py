@@ -32,8 +32,29 @@ from unittest import mock
 INSTALLER = Path(__file__).with_name("install.sh")
 SANDBOX_BASE = Path(__file__).resolve().parent.parent / "target/installer-sandboxes"
 SOURCE = INSTALLER.read_text()
-INTEL_MAC_STOP = ("This Mac has an Intel processor. ElastOS supports Macs with "
-                  "Apple silicon (M1 or later). Intel Mac is not supported yet.")
+# Decision 4: the plain stop, and nothing before it.
+INTEL_MAC_STOP = "Intel Mac is not supported yet."
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# sysctl -in answers for (sysctl.proc_translated, hw.optional.arm64). None
+# means sysctl fails; a missing command is its own case.
+INTEL_OR_UNPROVEN = [("0", "0"), ("", ""), ("0", ""), ("2", "0"), None, "missing"]
+
+
+def sysctl_function(answers):
+    """A bash sysctl() for detect_platform: answers, a failure (None) or a missing command."""
+    if answers == "missing":
+        return 'sysctl() { echo "bash: sysctl: command not found" >&2; return 127; }'
+    if answers is None:
+        return 'sysctl() { echo "sysctl: cannot read" >&2; return 1; }'
+    translated, arm64 = answers
+    return ('sysctl() { [ "$1" = -in ] || return 2; case "$2" in '
+            f'sysctl.proc_translated) echo "{translated}";; hw.optional.arm64) echo "{arm64}";; '
+            '*) return 2;; esac; }')
+
+
+def sysctl_mock(answers):
+    """The same answers as an executable for a full installer run."""
+    return "#!/bin/bash\n" + sysctl_function(answers) + '\nsysctl "$@"\n'
 if "# ── Main" not in SOURCE:
     raise SystemExit("install.sh is missing the '# ── Main' helper marker")
 HELPERS = SOURCE.split("# ── Main", 1)[0]
@@ -1585,16 +1606,19 @@ printf '%s\\n' "$PLATFORM"
                 self.assertEqual(result.stdout.strip(), expected)
 
     def test_intel_mac_stops_before_release_lookup(self):
-        result = shell('''
+        # uname says x86_64 on an Intel Mac and in a Rosetta shell. Without the
+        # kernel's word for Apple silicon, the plain stop is the answer.
+        for answers in INTEL_OR_UNPROVEN:
+            result = shell(sysctl_function(answers) + '''
 SYSTEM=Darwin MACHINE=x86_64
 uname() { case "$1" in -s) echo "$SYSTEM";; -m) echo "$MACHINE";; esac; }
 detect_platform
 printf '%s\\n' "$PLATFORM"
 ''')
-        self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertEqual(result.stdout, "")
-        self.assertIn(INTEL_MAC_STOP, result.stderr)
-        self.assertNotIn("source-home", result.stderr)
+            with self.subTest(sysctl=answers):
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(ANSI.sub("", result.stderr), "Error: " + INTEL_MAC_STOP + "\n")
         main = SOURCE.split("# ── Main", 1)[1]
         self.assertLess(main.index("detect_platform"), main.index("fetch_url"))
         self.assertLess(main.index("detect_platform"), main.index("release-head.json"))
@@ -1606,32 +1630,39 @@ printf '%s\\n' "$PLATFORM"
         SANDBOX_BASE.mkdir(parents=True, exist_ok=True)
         for path in (SANDBOX_BASE.parent, SANDBOX_BASE):
             path.chmod(0o755)
-        with tempfile.TemporaryDirectory(prefix="installer-intel-", dir=SANDBOX_BASE) as directory:
-            root = Path(directory)
-            mocks = root / "mocks"
-            home = root / "home"
-            mocks.mkdir()
-            home.mkdir()
-            calls = root / "calls"
-            (mocks / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo x86_64;; *) echo Darwin;; esac\n')
-            for tool in ["curl", "wget"]:
-                (mocks / tool).write_text(f'#!/bin/sh\necho {tool} "$@" >> "$CALLS"\nexit 97\n')
-            for mock in mocks.iterdir():
-                mock.chmod(0o755)
-            # A configured publisher, so only the platform stop can end the run
-            # before the release-head fetch.
-            env = dict(os.environ, HOME=str(home), CALLS=str(calls),
-                       ELASTOS_PUBLISHER_GATEWAY="https://publisher.invalid",
-                       ELASTOS_MAINTAINER_DID="did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
-                       PATH=str(mocks) + os.pathsep + os.environ["PATH"])
-            for name in ["ELASTOS_INSTALL_ONLY", "XDG_DATA_HOME"]:
-                env.pop(name, None)
-            result = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", str(INSTALLER.resolve())],
-                                    env=env, text=True, capture_output=True, timeout=15)
-            self.assertFalse(calls.exists(), calls.read_text() if calls.exists() else "")
-            self.assertEqual(list(home.iterdir()), [])
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn(INTEL_MAC_STOP, result.stderr)
+        # "missing" leaves sysctl off PATH entirely.
+        system_path = [entry for entry in os.environ["PATH"].split(os.pathsep)
+                       if entry and not Path(entry, "sysctl").exists()]
+        for answers in [("0", "0"), None, "missing"]:
+            with self.subTest(sysctl=answers), \
+                    tempfile.TemporaryDirectory(prefix="installer-intel-", dir=SANDBOX_BASE) as directory:
+                root = Path(directory)
+                mocks = root / "mocks"
+                home = root / "home"
+                mocks.mkdir()
+                home.mkdir()
+                calls = root / "calls"
+                (mocks / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo x86_64;; *) echo Darwin;; esac\n')
+                if answers != "missing":
+                    (mocks / "sysctl").write_text(sysctl_mock(answers))
+                for tool in ["curl", "wget"]:
+                    (mocks / tool).write_text(f'#!/bin/sh\necho {tool} "$@" >> "$CALLS"\nexit 97\n')
+                for mock in mocks.iterdir():
+                    mock.chmod(0o755)
+                # A configured publisher, so only the platform stop can end the run
+                # before the release-head fetch.
+                env = dict(os.environ, HOME=str(home), CALLS=str(calls),
+                           ELASTOS_PUBLISHER_GATEWAY="https://publisher.invalid",
+                           ELASTOS_MAINTAINER_DID="did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+                           PATH=os.pathsep.join([str(mocks)] + system_path))
+                for name in ["ELASTOS_INSTALL_ONLY", "XDG_DATA_HOME"]:
+                    env.pop(name, None)
+                result = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", str(INSTALLER.resolve())],
+                                        env=env, text=True, capture_output=True, timeout=15)
+                self.assertFalse(calls.exists(), calls.read_text() if calls.exists() else "")
+                self.assertEqual(list(home.iterdir()), [])
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "Error: " + INTEL_MAC_STOP + "\n")
 
     def test_platform_paths_match_rust_dirs5_contract(self):
         # setup.rs and sources.rs use dirs5.0.1::data_dir. Mac ignores XDG;
