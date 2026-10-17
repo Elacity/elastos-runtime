@@ -156,6 +156,28 @@ and update preserve the owner-only membership record separately from the
 network configuration and product state. Previously published Discovery
 announcements keep their signed expiry; leaving stops their renewal.
 
+Joining Community does not announce anyone. Chat files one Inbox request per
+person; the answer is Always while Home is online, Only while Community is
+open, Later or Never, and System → Community offers Always, Only while open
+and Hidden. Showing is a capability token the Runtime mints for that person
+(subject: their principal; action `message`; resource
+`elastos://chat/presence/<network>/<conversation>/always` or `/while-open`;
+no expiry), kept in their owner-only
+`.AppData/ElastOS/Home/community-presence.json` and never given to a capsule.
+Every announcement validates it with all twelve capability checks against
+the live store: the Runtime timer asks for `/always`, Chat's 15-second
+heartbeat while Community is visible asks for `/while-open`. Hidden, a mode
+change and a Profile change revoke the token; an epoch bump revokes every
+grant, and Chat asks again. A shown person's signed presence carries their
+Profile to the Community topic (including the seed's Community node),
+expiring 45 seconds after the last renewal, and signs the Home's requests for
+earlier posts. Undecided, Later and Never announce nothing. Discovery is a
+separate choice, for being found outside Community and for contact requests.
+Leave Community stops presence for everyone on the Home, whatever they chose.
+After Undo, Community presence follows the Discovery switch in People again.
+If you chose Hidden or Only while open in alpha.23 and Discovery is on, you
+will be announced; turn Discovery off in People to stay hidden.
+
 Setup and update apply the release network to the data root:
 
 - A new Home receives `collaboration-network-v1.json` from the release copy

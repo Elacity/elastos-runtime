@@ -111,6 +111,9 @@ pub(crate) struct DurableOutgoingMessage {
     created_at: u64,
     shared_chat: bool,
     accepted_endpoints: Vec<String>,
+    /// A presence announcement's principal and sender Profile DID; the send
+    /// boundary re-validates that principal's grant before each send.
+    presence_sender: Option<(String, String)>,
 }
 
 pub(crate) struct PendingOutgoingProductProjection {
@@ -148,6 +151,12 @@ impl DurableOutgoingMessage {
 
     pub(crate) fn remote_acceptance_recorded(&self) -> bool {
         !self.accepted_endpoints.is_empty()
+    }
+
+    pub(crate) fn presence_sender(&self) -> Option<(&str, &str)> {
+        self.presence_sender
+            .as_ref()
+            .map(|(principal, profile_did)| (principal.as_str(), profile_did.as_str()))
     }
 }
 
@@ -476,6 +485,47 @@ impl CollaborationCore {
             #[cfg(test)]
             history_write_fault: std::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    /// Seed the signed, receipt-bound legacy shape that lifecycle readers
+    /// repair. Product admission deliberately refuses these malformed payloads.
+    #[cfg(test)]
+    pub(crate) fn test_store_legacy_product_handoffs(
+        &self,
+        remote: &Self,
+        payload_types: &[&str],
+        now: u64,
+    ) {
+        let (state, _) = self.load_state_raw().unwrap();
+        let mut state = state.unwrap_or_else(|| self.empty_state());
+        for payload_type in payload_types {
+            let original = remote
+                .authority
+                .prepare_outgoing(
+                    remote.sender_service(),
+                    payload_type,
+                    serde_json::json!({"extra": true}),
+                    now,
+                    45,
+                )
+                .unwrap();
+            let incoming = self
+                .authority
+                .authorize_incoming(original.envelope_bytes(), &remote.local_device_did(), now)
+                .unwrap();
+            let receipt = self
+                .authority
+                .prepare_acceptance_receipt(&incoming, now)
+                .unwrap();
+            state.incoming.push(IncomingRecord {
+                envelope: String::from_utf8(original.envelope_bytes().to_vec()).unwrap(),
+                acceptance_receipt: String::from_utf8(receipt).unwrap(),
+                product_handoff: ProductHandoffState::Pending,
+            });
+        }
+        self.validate_state(&state).unwrap();
+        self.ensure_state_directory().unwrap();
+        self.write_state(&state).unwrap();
     }
 
     pub(crate) fn sender_service(&self) -> &str {
@@ -1539,37 +1589,80 @@ impl CollaborationCore {
         self.prepare_profile_outgoing(operation, &profile, payload_type, payload, now, ttl_secs)
     }
 
+    fn outgoing_pending(
+        &self,
+        entry: &OutgoingRecord,
+        verified: &VerifiedCollaborationMessage,
+        now: u64,
+    ) -> bool {
+        let payload = &verified.envelope().payload;
+        entry.local_product_projection == OutgoingProductProjectionState::Complete
+            && payload.expires_at > now
+            && payload.created_at <= now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+            && (entry.remote_acceptance_receipts.is_empty()
+                || payload.payload_type == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE)
+    }
+
     pub(crate) fn pending_outgoing(&self, now: u64) -> anyhow::Result<Vec<DurableOutgoingMessage>> {
         let state = self.load_state()?.unwrap_or_else(|| self.empty_state());
-        state
-            .outgoing
-            .iter()
-            .filter_map(|entry| {
-                if entry.local_product_projection == OutgoingProductProjectionState::Complete {
-                    Some((entry, self.verify_outgoing_record(entry)))
-                } else {
-                    None
-                }
-            })
-            .filter_map(|(entry, verified)| match verified {
-                Ok(verified)
-                    if verified.envelope().payload.expires_at > now
-                        && (entry.remote_acceptance_receipts.is_empty()
-                            || verified.envelope().payload.payload_type
-                                == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE) =>
+        let mut pending = Vec::new();
+        for entry in &state.outgoing {
+            let verified = self.verify_outgoing_record(entry)?;
+            if self.outgoing_pending(entry, &verified, now) {
+                pending.push(self.outgoing_handle(entry, verified));
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Pure recovery of verified own-presence operation bindings. Repair stays
+    /// in memory here; lifecycle/effect readers own its durable write.
+    pub(crate) fn own_presence_operations(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<HashMap<String, EspRequestBinding>> {
+        let (state, _) = self.load_state_raw()?;
+        let mut operations = HashMap::new();
+        if let Some(state) = state {
+            for entry in &state.outgoing {
+                let verified = self.verify_outgoing_record(entry)?;
+                let payload = &verified.envelope().payload;
+                if entry.local_product_projection != OutgoingProductProjectionState::Retired
+                    && payload.payload_type == crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE
+                    && payload.expires_at > now
+                    && payload.created_at <= now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+                    && self
+                        .authorize_stored_product_message(entry.envelope.as_bytes())?
+                        .sender_profile()
+                        .authorizes_endpoint(&self.local_device_did())
                 {
-                    if verified.envelope().payload.created_at
-                        <= now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
-                    {
-                        Some(Ok(self.outgoing_handle(entry, verified)))
-                    } else {
-                        None
-                    }
+                    operations.insert(
+                        verified.envelope_sha256().to_string(),
+                        entry.operation.clone(),
+                    );
                 }
-                Ok(_) => None,
-                Err(err) => Some(Err(err)),
-            })
-            .collect()
+            }
+        }
+        Ok(operations)
+    }
+
+    /// Terminal admission after live grant validation, immediately before
+    /// Carrier dispatch. A copied handle loses admission when its queue entry
+    /// is retired. This owns no lock during the network reply.
+    pub(crate) fn pending_outgoing_contains(
+        &self,
+        envelope_hash: &str,
+        now: u64,
+    ) -> anyhow::Result<bool> {
+        let (state, _) = self.load_state_raw()?;
+        let Some(state) = state else { return Ok(false) };
+        for entry in &state.outgoing {
+            if collaboration_message_envelope_sha256(entry.envelope.as_bytes()) == envelope_hash {
+                let verified = self.verify_outgoing_record(entry)?;
+                return Ok(self.outgoing_pending(entry, &verified, now));
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn outgoing_chat_delivery(
@@ -1624,6 +1717,55 @@ impl CollaborationCore {
                 Err(err) => Some(Err(err)),
             })
             .collect()
+    }
+
+    pub(crate) fn data_root(&self) -> &Path {
+        &self.data_root
+    }
+
+    /// Drops every queued presence announcement of `principal_id`, so a
+    /// revoked, refused or hidden grant is never sent again. Presence is a
+    /// short-lived announcement and keeps no replay record.
+    pub(crate) fn retire_outgoing_presence(&self, principal_id: &str) -> anyhow::Result<usize> {
+        self.with_mutation(None, |state| {
+            let before = state.outgoing.len();
+            state.outgoing.retain(|entry| {
+                entry.operation.principal != principal_id
+                    || serde_json::from_str::<SignedCollaborationMessage>(&entry.envelope).map_or(
+                        true,
+                        |message| {
+                            message.payload.payload_type
+                                != crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE
+                        },
+                    )
+            });
+            let retired = before - state.outgoing.len();
+            Ok(Mutation {
+                value: retired,
+                changed: retired > 0,
+            })
+        })
+    }
+
+    /// Denial retires the exact own effect, preserving newer grant work.
+    pub(crate) fn retire_outgoing_presence_operation(
+        &self,
+        envelope_hash: &str,
+    ) -> anyhow::Result<()> {
+        self.with_mutation(None, |state| {
+            let before = state.outgoing.len();
+            state.outgoing.retain(|entry| {
+                collaboration_message_envelope_sha256(entry.envelope.as_bytes()) != envelope_hash
+                    || self.verify_outgoing_record(entry).map_or(true, |verified| {
+                        verified.envelope().payload.payload_type
+                            != crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE
+                    })
+            });
+            Ok(Mutation {
+                value: (),
+                changed: before != state.outgoing.len(),
+            })
+        })
     }
 
     pub(crate) fn acknowledge_outgoing_product_projection(
@@ -3095,6 +3237,14 @@ fn outgoing_handle(
                     .map(|receipt| receipt.accepting_endpoint_did().to_string())
             })
             .collect(),
+        presence_sender: (verified.envelope().payload.payload_type
+            == crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE)
+            .then(|| {
+                (
+                    entry.operation.principal.clone(),
+                    verified.envelope().payload.sender_profile_did.clone(),
+                )
+            }),
     }
 }
 

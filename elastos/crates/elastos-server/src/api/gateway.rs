@@ -266,20 +266,12 @@ const PEOPLE_CAPSULE_ID: &str = "people";
 
 /// Announce this Home's people from the Runtime. See
 /// `gateway_collaboration_presence::publish_runtime_owned_presence`.
-pub fn publish_runtime_owned_presence(
+pub async fn publish_runtime_owned_presence(
     data_dir: &std::path::Path,
     port: &crate::collaboration_presence::CollaborationPresenceProductPort,
-    discovery_service: Option<
-        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
-    >,
     now: u64,
 ) -> anyhow::Result<usize> {
-    gateway_collaboration_presence::publish_runtime_owned_presence(
-        data_dir,
-        port,
-        discovery_service,
-        now,
-    )
+    gateway_collaboration_presence::publish_runtime_owned_presence(data_dir, port, now).await
 }
 
 pub fn capsule_catalog_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
@@ -730,6 +722,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/apps/chat-room/contacts/request",
             post(chat_room_contact_request),
         )
+        .route(
+            "/api/apps/chat-room/community-presence/request",
+            post(chat_room_community_presence_request),
+        )
         .route("/artifacts/*path", get(serve_artifact_file))
         .route(
             "/api/apps/assistant/workspace",
@@ -784,6 +780,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/system/community",
             get(system_community_membership_get).post(system_community_membership_update),
+        )
+        .route(
+            "/api/apps/system/community/presence",
+            get(system_community_presence_get).post(system_community_presence_update),
         )
         .route(
             "/api/apps/system/ai-provider",
@@ -1098,8 +1098,8 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(people_discovery_request_create),
         )
         .route(
-            "/api/apps/home/collaboration/presence",
-            post(home_collaboration_presence),
+            "/api/apps/chat-room/presence",
+            post(chat_room_presence_heartbeat),
         )
         .route(
             "/api/apps/people/presence",
