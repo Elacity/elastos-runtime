@@ -406,13 +406,17 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_child_stopped(result)
 
+    # These two give the stub 3 seconds to start and fork before the smoke
+    # times out. With 1 second, a slow or busy host (such as a hosted Intel
+    # Mac) can time out before the child exists, and the test fails.
+
     def test_group_is_stopped_after_timeout(self):
-        result = self.run_smoke("fork", deadline="1")
+        result = self.run_smoke("fork", deadline="3")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assert_child_stopped(result)
 
     def test_child_ignoring_term_is_killed(self):
-        result = self.run_smoke("ignore-term", deadline="1")
+        result = self.run_smoke("ignore-term", deadline="3")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assert_child_stopped(result)
 
