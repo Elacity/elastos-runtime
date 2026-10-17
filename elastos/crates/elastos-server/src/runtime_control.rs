@@ -2169,6 +2169,16 @@ mod tests {
         assert!(subordinate_gateway_host(data, "home").is_err());
         drop(foreign);
 
+        // A holder whose record is not JSON still owns the home.
+        std::fs::write(data.join("host-process.lock"), "not-json").unwrap();
+        let foreign = foreign_host_lock(data);
+        let err = subordinate_gateway_host(data, "home").unwrap_err();
+        assert!(
+            err.to_string().contains("already owns this identity"),
+            "{err}"
+        );
+        drop(foreign);
+
         // This process holds the lock as `serve`: the lane is refused.
         let serve =
             crate::host_lock::acquire_host_process_lock(data, "serve", "127.0.0.1:3000").unwrap();

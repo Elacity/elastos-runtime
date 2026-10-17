@@ -379,9 +379,13 @@ pub fn active_host_process(data_dir: &Path) -> anyhow::Result<Option<HostProcess
             free.release()?;
             Ok(None)
         }
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-            Ok(read_lock_metadata(&lock_path).map(Into::into))
-        }
+        // The flock decides that a host is active. The record only describes
+        // it, and a holder whose record cannot be read is still a holder.
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(Some(
+            read_lock_metadata(&lock_path)
+                .map(Into::into)
+                .unwrap_or_else(HostProcessInfo::unreadable_record),
+        )),
         Err(err) => Err(err).with_context(|| format!("inspect host lock {}", lock_path.display())),
     }
 }
@@ -392,6 +396,18 @@ fn host_lock_path(data_dir: &Path) -> PathBuf {
 
 fn read_lock_metadata(lock_path: &Path) -> Option<HostProcessMeta> {
     serde_json::from_slice(&fs::read(lock_path).ok()?).ok()
+}
+
+impl HostProcessInfo {
+    /// A process holds the lock, but its record is missing, being written, or
+    /// not a record.
+    fn unreadable_record() -> Self {
+        Self {
+            pid: 0,
+            role: "unknown".to_string(),
+            addr: "unknown".to_string(),
+        }
+    }
 }
 
 impl From<HostProcessMeta> for HostProcessInfo {
@@ -1058,6 +1074,26 @@ mod tests {
             .expect("owner present");
         assert_eq!(owner.role, "gateway");
         assert_eq!(owner.addr, "127.0.0.1:8090");
+    }
+
+    /// Whether a host is active comes from the flock. A holder whose record
+    /// is empty, not JSON, or rewritten to garbage is still active.
+    #[test]
+    fn active_host_process_reports_a_holder_whose_record_cannot_be_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = host_lock_path(temp.path());
+        let host =
+            acquire_host_process_lock(temp.path(), "gateway", "localhost:8090").expect("host lock");
+        for record in ["", "not-json", "{\"pid\":\"1\"}"] {
+            fs::write(&path, record).unwrap();
+            let owner = active_host_process(temp.path())
+                .expect("inspect owner")
+                .unwrap_or_else(|| panic!("held lock with record {record:?} reported free"));
+            assert_eq!(owner.role, "unknown");
+        }
+        drop(host);
+        fs::write(&path, "not-json").unwrap();
+        assert!(active_host_process(temp.path()).unwrap().is_none());
     }
 
     #[test]
