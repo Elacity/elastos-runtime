@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
+use super::manager::CapabilityManager;
 use super::token::{Action, CapabilityToken, ResourceId};
 use crate::primitives::audit::AuditLog;
 use crate::primitives::time::SecureTimestamp;
@@ -216,8 +217,8 @@ impl PendingRequestState {
     fn cleanup_old(&mut self, now: &SecureTimestamp, retention_secs: u64) -> usize {
         let previous_len = self.requests.len();
         self.requests.retain(|_, request| {
-            // Request expiry alone says nothing about token validity. Only an
-            // explicit token expiry or revocation makes a grant reclaimable.
+            // Request expiry alone says nothing about token validity. This pass
+            // checks token expiry; authoritative retirement needs the manager below.
             let resolved = match &request.status {
                 RequestStatus::Pending => false,
                 RequestStatus::Granted { token, .. } => {
@@ -234,13 +235,17 @@ impl PendingRequestState {
 
         let removed = previous_len - self.requests.len();
         if removed != 0 {
-            let requests = &self.requests;
-            self.session_requests.retain(|_, ids| {
-                ids.retain(|id| requests.contains_key(id));
-                !ids.is_empty()
-            });
+            self.prune_session_index();
         }
         removed
+    }
+
+    fn prune_session_index(&mut self) {
+        let requests = &self.requests;
+        self.session_requests.retain(|_, ids| {
+            ids.retain(|id| requests.contains_key(id));
+            !ids.is_empty()
+        });
     }
 }
 
@@ -472,6 +477,44 @@ impl PendingRequestStore {
     pub async fn cleanup_old(&self, retention_secs: u64) -> usize {
         let mut state = self.state.write().await;
         state.cleanup_old(&SecureTimestamp::now(), retention_secs)
+    }
+
+    /// Reclaim authoritatively revoked or exhausted grants when the store is full.
+    ///
+    /// The Runtime owner must supply the manager that issued and validates this
+    /// store's grants. Revocation and remaining uses come from that manager's
+    /// authoritative state, never the requested duration or session visibility.
+    /// This does not consume, revoke or authorize a use.
+    /// Admission still rechecks both limits under the same state lock afterward.
+    pub async fn cleanup_retired_grants_at_capacity(
+        &self,
+        capability_manager: &CapabilityManager,
+    ) -> usize {
+        if self.state.read().await.requests.len() < MAX_PENDING_REQUESTS {
+            return 0;
+        }
+        let mut state = self.state.write().await;
+        if state.requests.len() < MAX_PENDING_REQUESTS {
+            return 0;
+        }
+
+        let mut retired = Vec::new();
+        for (id, request) in &state.requests {
+            if let RequestStatus::Granted { token, .. } = &request.status {
+                // The query reads only the manager's epoch/revocation/use state.
+                // Those guards are released before callers access pending state.
+                if capability_manager.is_revoked_or_exhausted(token).await {
+                    retired.push(id.clone());
+                }
+            }
+        }
+        for id in &retired {
+            state.requests.remove(id);
+        }
+        if !retired.is_empty() {
+            state.prune_session_index();
+        }
+        retired.len()
     }
 
     /// Get the number of pending requests
@@ -784,6 +827,201 @@ mod tests {
         assert!(request_for(&store, "new-session").await.is_pending());
         assert!(store.list_session_granted("grant-session").await.is_empty());
         assert_eq!(store.state.read().await.requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_pressure_reclaims_only_authoritatively_exhausted_grants() {
+        use crate::capability::{CapabilityStore, TokenConstraints};
+        use crate::primitives::metrics::MetricsManager;
+
+        let audit = Arc::new(AuditLog::new());
+        let counts = Arc::new(CapabilityStore::new());
+        let manager = CapabilityManager::new(
+            counts.clone(),
+            audit.clone(),
+            Arc::new(MetricsManager::new()),
+        );
+        let store = PendingRequestStore::new(audit);
+        let mut grants = Vec::new();
+        for (session, max_uses, used) in [
+            ("exhausted-only", Some(1), 1),
+            ("mixed", Some(1), 1),
+            ("mixed", Some(1), 0),
+            ("mixed", None, 0),
+            ("mixed", Some(2), 1),
+        ] {
+            let request = request_for(&store, session).await;
+            let token = manager.grant(
+                session,
+                request.resource.clone(),
+                request.action,
+                TokenConstraints::new(0, false, None, max_uses),
+                None,
+            );
+            store
+                .grant_request(request.id.as_str(), token.clone(), GrantDuration::Once)
+                .await
+                .unwrap();
+            for _ in 0..used {
+                manager
+                    .validate(&token, session, request.action, &request.resource, None)
+                    .await
+                    .unwrap();
+            }
+            grants.push((request, token, used));
+        }
+        assert_eq!(store.cleanup_retired_grants_at_capacity(&manager).await, 0);
+        for index in 0..MAX_PENDING_REQUESTS - grants.len() {
+            assert!(request_for(&store, &format!("prefill-{index}"))
+                .await
+                .is_pending());
+        }
+
+        assert_eq!(store.cleanup_retired_grants_at_capacity(&manager).await, 2);
+        for (index, (request, token, used)) in grants.iter().enumerate() {
+            assert_eq!(
+                store.get_request(request.id.as_str()).await.is_some(),
+                index >= 2
+            );
+            assert_eq!(counts.get_use_count(token.id()).await, *used);
+        }
+        let state = store.state.read().await;
+        assert!(!state.session_requests.contains_key("exhausted-only"));
+        assert_eq!(state.session_requests["mixed"].len(), 3);
+        assert_eq!(state.requests.len(), MAX_PENDING_REQUESTS - 2);
+        assert_eq!(
+            state.session_requests.values().map(Vec::len).sum::<usize>(),
+            state.requests.len()
+        );
+        drop(state);
+
+        assert!(request_for(&store, "recovered").await.is_pending());
+        assert!(request_for(&store, "recovered").await.is_pending());
+        assert_eq!(store.cleanup_retired_grants_at_capacity(&manager).await, 0);
+        assert!(request_for(&store, "overflow").await.is_denied());
+    }
+
+    #[tokio::test]
+    async fn test_pressure_reclaims_revoked_grants_without_changing_authority_state() {
+        use crate::capability::{manager::ValidationError, CapabilityStore, TokenConstraints};
+        use crate::primitives::metrics::MetricsManager;
+
+        let audit = Arc::new(AuditLog::new());
+        let authority = Arc::new(CapabilityStore::new());
+        let manager = CapabilityManager::new(
+            authority.clone(),
+            audit.clone(),
+            Arc::new(MetricsManager::new()),
+        );
+        let store = PendingRequestStore::new(audit);
+        let stale = request_for(&store, "stale-epoch").await;
+        let stale_token = manager.grant(
+            "stale-epoch",
+            stale.resource.clone(),
+            stale.action,
+            TokenConstraints::default(),
+            None,
+        );
+        let epoch = manager.revoke_all("retire old epoch");
+        store.revoke_all_granted().await;
+        // A grant minted before revocation can finish registering afterward.
+        store
+            .grant_request(
+                stale.id.as_str(),
+                stale_token.clone(),
+                GrantDuration::Session,
+            )
+            .await
+            .unwrap();
+
+        let revoked = request_for(&store, "mixed").await;
+        let revoked_token = manager.grant(
+            "mixed",
+            revoked.resource.clone(),
+            revoked.action,
+            TokenConstraints::new(epoch, false, None, Some(2)),
+            None,
+        );
+        store
+            .grant_request(
+                revoked.id.as_str(),
+                revoked_token.clone(),
+                GrantDuration::Session,
+            )
+            .await
+            .unwrap();
+        manager
+            .validate(
+                &revoked_token,
+                "mixed",
+                revoked.action,
+                &revoked.resource,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .revoke(*revoked_token.id(), "retire individual token")
+            .await;
+
+        let live = request_for(&store, "mixed").await;
+        let live_token = manager.grant(
+            "mixed",
+            live.resource.clone(),
+            live.action,
+            TokenConstraints::default(),
+            None,
+        );
+        store
+            .grant_request(live.id.as_str(), live_token.clone(), GrantDuration::Session)
+            .await
+            .unwrap();
+        for index in 0..MAX_PENDING_REQUESTS - 3 {
+            assert!(request_for(&store, &format!("prefill-{index}"))
+                .await
+                .is_pending());
+        }
+        let revoked_before = authority.get_revoked_tokens().await;
+
+        assert_eq!(store.cleanup_retired_grants_at_capacity(&manager).await, 2);
+        assert_eq!(authority.current_epoch(), epoch);
+        assert_eq!(authority.get_revoked_tokens().await, revoked_before);
+        assert!(authority.is_token_revoked(revoked_token.id()).await);
+        assert!(!authority.is_token_revoked(stale_token.id()).await);
+        assert_eq!(authority.get_use_count(revoked_token.id()).await, 1);
+        for (token, session, resource) in [
+            (&stale_token, "stale-epoch", &stale.resource),
+            (&revoked_token, "mixed", &revoked.resource),
+        ] {
+            assert!(matches!(
+                manager
+                    .validate(token, session, Action::Read, resource, None)
+                    .await,
+                Err(ValidationError::TokenRevoked)
+            ));
+        }
+        assert_eq!(authority.get_use_count(revoked_token.id()).await, 1);
+        manager
+            .validate(&live_token, "mixed", live.action, &live.resource, None)
+            .await
+            .unwrap();
+        assert_eq!(store.list_session_granted("mixed").await[0].id, live.id);
+        let state = store.state.read().await;
+        assert!(!state.requests.contains_key(stale.id.as_str()));
+        assert!(!state.requests.contains_key(revoked.id.as_str()));
+        assert!(!state.session_requests.contains_key("stale-epoch"));
+        assert_eq!(state.session_requests["mixed"].len(), 1);
+        assert_eq!(state.requests.len(), MAX_PENDING_REQUESTS - 2);
+        assert_eq!(
+            state.session_requests.values().map(Vec::len).sum::<usize>(),
+            state.requests.len()
+        );
+        drop(state);
+
+        assert!(request_for(&store, "recovered").await.is_pending());
+        assert!(request_for(&store, "recovered").await.is_pending());
+        assert_eq!(store.cleanup_retired_grants_at_capacity(&manager).await, 0);
+        assert!(request_for(&store, "overflow").await.is_denied());
     }
 
     #[tokio::test]

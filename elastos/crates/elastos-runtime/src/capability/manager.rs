@@ -345,6 +345,23 @@ impl CapabilityManager {
         token
     }
 
+    /// Whether an issued token is revoked or has no uses remaining.
+    ///
+    /// This is only a bookkeeping query for already-granted tokens: it neither
+    /// validates authority nor consumes a use. Callers must still use `validate`
+    /// before exercising a capability.
+    pub(crate) async fn is_revoked_or_exhausted(&self, token: &CapabilityToken) -> bool {
+        if !self.store.is_epoch_valid(token.constraints.epoch)
+            || self.store.is_token_revoked(&token.id).await
+        {
+            return true;
+        }
+        match token.constraints.max_uses {
+            Some(max_uses) => self.store.has_exceeded_uses(&token.id, max_uses).await,
+            None => false,
+        }
+    }
+
     /// Validate a token for use
     ///
     /// This performs all 12 validation checks as specified in PHASE3.md.
