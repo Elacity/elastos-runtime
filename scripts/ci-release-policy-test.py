@@ -1652,6 +1652,8 @@ class ReleasePolicyTests(unittest.TestCase):
                         build.index("cargo build --locked --release"))
         self.assertIn('test -x "$CARGO_TARGET_DIR/release/elastos"', build)
         self.assertIn('scripts/gateway-healthz-smoke.sh "$CARGO_TARGET_DIR/release/elastos"', probe)
+        # The probe keeps the contract address localhost:8090 (the script default).
+        self.assertNotIn("ELASTOS_GATEWAY_ADDR", probe)
 
     def test_github_runners_and_check_names_stay_fixed(self):
         expected = {

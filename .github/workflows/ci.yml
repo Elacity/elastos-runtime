@@ -1560,9 +1560,10 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # Native Intel Mac proof of the /healthz owner check. This job builds the
-  # gateway binary and requires HTTP 200 and the two bytes OK from that
-  # process. An empty Home can pass. It is not a signed release.
+  # Native Intel Mac proof of gateway readiness as docs/LAUNCHER_CONTRACT.md
+  # defines it: `elastos gateway --addr localhost:8090`, then
+  # GET http://localhost:8090/healthz returns HTTP 200 and OK while that pid
+  # owns host-process.lock. The Home is empty. This is not a signed release.
   gateway-smoke-macos-intel:
     name: gateway-smoke-macos-intel
     runs-on: macos-15-intel
@@ -1591,7 +1592,7 @@ jobs:
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
           cargo build --locked --release --manifest-path elastos/Cargo.toml -p elastos-server --bin elastos
           test -x "$CARGO_TARGET_DIR/release/elastos"
-      - name: gateway /healthz returns OK
+      - name: gateway is ready at localhost:8090 with an empty Home
         timeout-minutes: 10
         run: |
           set -euo pipefail
