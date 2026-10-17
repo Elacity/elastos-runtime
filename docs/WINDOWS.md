@@ -24,7 +24,8 @@ WSL2.
 
 - Package the Runtime as a signed or importable ElastOS WSL distribution.
 - Provide a small Windows launcher that starts, stops, updates, health-checks,
-  and opens `http://localhost:61180/apps/home/`.
+  and opens the Home origin in the
+  [launcher contract](LAUNCHER_CONTRACT.md#readiness-and-home-url).
 - Keep Runtime state in the Linux filesystem, not in mixed host paths.
 - Enforce explicit storage budgets and cleanup.
 - Keep localhost and passkey origin stable.
