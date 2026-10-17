@@ -126,6 +126,7 @@ fn sign_in_route(path: &str, method: &Method) -> bool {
                 "/api/auth/passkey/register/begin"
                     | "/api/auth/passkey/register/complete"
                     | "/api/auth/passkey/authenticate/begin"
+                    | "/api/auth/passkey/authenticate/named/begin"
                     | "/api/auth/passkey/authenticate/complete"
                     | "/api/auth/owner-recovery/begin"
                     | "/api/auth/owner-recovery/complete"

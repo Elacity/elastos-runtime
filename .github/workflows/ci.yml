@@ -131,14 +131,11 @@ jobs:
           while IFS= read -r lock; do [[ -n "$lock" ]] && locks+=("$lock"); done <<< "$listing"
           (( ${#locks[@]} > 0 ))
           db="$RUNNER_TEMP/advisory-db"
-          fetch=()
           failed=0
           for lock in "${locks[@]}"; do
             echo "::group::$lock"
-            cargo-audit audit --db "$db" ${fetch[@]+"${fetch[@]}"} --file "../$lock" || failed=1
+            cargo-audit audit --db "$db" --file "../$lock" || failed=1
             echo "::endgroup::"
-            # One database fetch per run; every lockfile is checked against it.
-            fetch=(--no-fetch)
           done
           exit "$failed"
 

@@ -544,8 +544,8 @@ def validate_dependency_audit(source):
                 raise AssertionError(f"cargo-audit checks every tracked Cargo.lock (failing {failing})")
             if {cwd for cwd, _ in calls} != {str((root / "elastos").resolve())}:
                 raise AssertionError("cargo-audit runs where elastos/.cargo/audit.toml applies")
-            if ["--no-fetch" in args for _, args in calls] != [False] + [True] * (len(locks) - 1):
-                raise AssertionError("cargo-audit fetches the advisory database once per run")
+            if any("--no-fetch" in args for _, args in calls):
+                raise AssertionError("cargo-audit retains online yanked checks for every lockfile")
             if (result.returncode != 0) != (failing is not None):
                 raise AssertionError(f"cargo-audit result ignores {failing or 'a clean run'}")
         # A lockfile listing that prints part of the list and then fails must fail the job.
@@ -1435,7 +1435,7 @@ class ReleasePolicyTests(unittest.TestCase):
                 ("| sha256sum -c -", "| cat", "pinned digest"),
                 (' || failed=1', '', "every tracked Cargo.lock"),
                 ('exit "$failed"', 'exit 0', "result ignores Cargo.lock"),
-                ("            fetch=(--no-fetch)\n", "", "database once")):
+                ('audit --db "$db" --file', 'audit --db "$db" --no-fetch --file', "online yanked")):
             with self.subTest(new=new):
                 self.assertIn(old, SOURCE)
                 with self.assertRaisesRegex(AssertionError, message):
@@ -2733,7 +2733,7 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
         owner.engine, owner.engine_members = None, set()
         owner.stop = mock.Mock()
         owner.stop.is_set.return_value = False
-        owner.thread, owner.error, owner.launch_requested = None, None, True
+        owner.thread, owner.error, owner.failure, owner.launch_requested = None, None, None, True
         owner.baseline_events = {"oom": 0, "oom_kill": 0}
         owner.show = mock.Mock(return_value=dict(owner.binding))
         owner.command = mock.Mock()
@@ -3076,12 +3076,208 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
                 numeric_kill.assert_not_called()
                 # A vanished executable/leader is not proof that its whole group exited.
                 owner.observe_once.return_value = {pid: row for pid, row in rows.items() if pid != 103}
-                with self.assertRaisesRegex(RuntimeError, "group exit is unconfirmed"):
+                clock = mock.Mock()
+                clock.monotonic.side_effect = [0, 0, 0, 20]
+                with mock.patch.dict(self.globals, {"time": clock}), \
+                        self.assertRaisesRegex(RuntimeError, "group exit is unconfirmed"):
                     owner.action({"id": 3, "action": "engine_stopped"})
                 self.assertEqual(owner.last_action, 2)
             with mock.patch.dict(self.globals, {"pidfd_exited": lambda _: True}):
                 owner.action({"id": 3, "action": "engine_stopped"})
             self.assertEqual([row["action"] for row in owner.actions], ["engine_running", "crash_engine", "engine_stopped"])
+
+    def test_finite_engine_group_exit_waits_for_every_retained_pidfd(self):
+        for action in ("engine_stopped", "idle_stopped"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                rows = self.process_rows(owner)
+                rows[102]["group"] = rows[103]["group"]
+                owner.known, owner.fds = rows, {pid: pid + 1000 for pid in rows}
+                owner.observe_once = mock.Mock(return_value=rows)
+                owner.action({"id": 1, "action": "engine_running"})
+                self.assertEqual(owner.engine_members, {102, 103})
+                now, samples = [0], []
+                clock = mock.Mock()
+                clock.monotonic.side_effect = lambda: now[0]
+
+                def observe():
+                    samples.append(len(samples) + 1)
+                    if action == "idle_stopped":
+                        now[0] = max(now[0], 51)
+                    return {pid: row for pid, row in rows.items() if pid != 103}
+
+                def wait(seconds):
+                    self.assertEqual(owner.last_action, 1)
+                    self.assertEqual(len(owner.actions), 1)
+                    self.assertEqual(self.journey["private_json"](owner.control / "response.json")["id"], 1)
+                    now[0] += seconds
+
+                owner.observe_once.side_effect = observe
+                owner.stop.wait.side_effect = wait
+                with mock.patch.dict(self.globals, {"time": clock,
+                        "pidfd_exited": lambda fd: fd != owner.fds[102] or len(samples) >= 2}):
+                    owner.action({"id": 2, "action": action})
+                self.assertEqual(samples, [1, 2])
+                owner.stop.wait.assert_called_once_with(.1)
+                self.assertEqual(owner.engine_members, {102, 103})
+                self.assertEqual(owner.last_action, 2)
+                self.assertEqual(owner.actions[-1]["action"], action)
+                self.assertEqual(self.journey["private_json"](owner.control / "response.json")["status"], "passed")
+
+    def test_finite_idle_checks_engine_exit_before_waiting_for_its_guard(self):
+        for engine_exited_early in (True, False):
+            with self.subTest(engine_exited_early=engine_exited_early), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                rows = self.process_rows(owner)
+                rows[102]["group"] = rows[103]["group"]
+                owner.known, owner.fds = rows, {pid: pid + 1000 for pid in rows}
+                owner.observe_once = mock.Mock(return_value=rows)
+                owner.action({"id": 1, "action": "engine_running"})
+                now, samples, clock = [0], [], mock.Mock()
+                clock.monotonic.side_effect = lambda: now[0]
+
+                def observe():
+                    samples.append(len(samples) + 1)
+                    now[0] = 49 if len(samples) == 1 else 51
+                    # Early engine exit leaves the guard; parent-chain absence
+                    # leaves a live engine after the guard itself has exited.
+                    removed = 103 if engine_exited_early else 102
+                    return {pid: row for pid, row in rows.items() if pid != removed}
+
+                def exited(fd):
+                    if len(samples) >= 2:
+                        return True
+                    return fd == owner.fds[103 if engine_exited_early else 102]
+
+                owner.observe_once.side_effect = observe
+                with mock.patch.dict(self.globals, {"time": clock, "pidfd_exited": exited}):
+                    if engine_exited_early:
+                        with self.assertRaisesRegex(RuntimeError, "idle engine closed early"):
+                            owner.action({"id": 2, "action": "idle_stopped"})
+                        owner.stop.wait.assert_not_called()
+                        self.assertEqual(owner.last_action, 1)
+                    else:
+                        owner.action({"id": 2, "action": "idle_stopped"})
+                        owner.stop.wait.assert_called_once_with(.1)
+                        self.assertEqual(samples, [1, 2])
+                        self.assertEqual(owner.last_action, 2)
+
+    def test_finite_engine_group_exit_uses_the_original_deadline(self):
+        for action, limit in (("engine_stopped", 20), ("idle_stopped", 95)):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                owner.engine, owner.engine_members, owner.fds = 103, {102, 103}, {102: 1102, 103: 1103}
+                owner.observe_once = mock.Mock(return_value={})
+                owner.engines = mock.Mock(return_value=[])
+                now, clock = [0], mock.Mock()
+                clock.monotonic.side_effect = lambda: now[0]
+                owner.stop.wait.side_effect = lambda _: now.__setitem__(0, limit)
+                with mock.patch.dict(self.globals, {"time": clock, "pidfd_exited": lambda _: False}), \
+                        self.assertRaisesRegex(RuntimeError, "group exit is unconfirmed"):
+                    owner.action({"id": 1, "action": action})
+                owner.stop.wait.assert_called_once_with(.1)
+                self.assertEqual(now[0], limit)
+                self.assertEqual(owner.last_action, 0)
+                self.assertEqual(owner.actions, [])
+                self.assertFalse((owner.control / "response.json").exists())
+
+    def test_finite_engine_group_wait_preserves_census_failure_and_interruption(self):
+        for fault in ("census", "interrupted"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                owner.engine, owner.engine_members, owner.fds = 103, {103}, {103: 1103}
+                owner.engines = mock.Mock(return_value=[])
+                owner.observe_once = mock.Mock(side_effect=[{}, RuntimeError("finite journey child escaped its finite unit")])
+                clock = mock.Mock()
+                clock.monotonic.return_value = 0
+                if fault == "interrupted":
+                    owner.stop.wait.side_effect = lambda _: setattr(owner.stop.is_set, "return_value", True)
+                expected = "child escaped" if fault == "census" else "stage interrupted"
+                with mock.patch.dict(self.globals, {"time": clock, "pidfd_exited": lambda _: False}), \
+                        self.assertRaisesRegex(RuntimeError, expected):
+                    owner.action({"id": 1, "action": "engine_stopped"})
+                owner.stop.wait.assert_called_once_with(.1)
+                self.assertEqual(owner.observe_once.call_count, 2 if fault == "census" else 1)
+                self.assertEqual(owner.actions, [])
+                self.assertFalse((owner.control / "response.json").exists())
+
+    def test_finite_engine_group_wait_preserves_missing_engine_and_early_idle_errors(self):
+        for fault in ("missing", "empty_members", "missing_handle", "early_idle", "pidfd_error"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                owner.engine = None if fault == "missing" else 103
+                owner.engine_members, owner.fds = {103}, {103: 1103}
+                if fault == "empty_members":
+                    owner.engine_members.clear()
+                elif fault == "missing_handle":
+                    owner.fds.clear()
+                owner.observe_once = mock.Mock(return_value={})
+                owner.engines = mock.Mock(return_value=[])
+                clock = mock.Mock()
+                clock.monotonic.return_value = 0
+                exited = mock.Mock(return_value=True)
+                if fault == "pidfd_error":
+                    exited.side_effect = RuntimeError("finite journey process exit is unavailable")
+                expected = ("closed early" if fault == "early_idle" else
+                            "process exit is unavailable" if fault == "pidfd_error" else "group exit is unconfirmed")
+                with mock.patch.dict(self.globals, {"time": clock, "pidfd_exited": exited}), \
+                        self.assertRaisesRegex(RuntimeError, expected):
+                    owner.action({"id": 1, "action": "idle_stopped"})
+                owner.stop.wait.assert_not_called()
+                self.assertEqual(owner.actions, [])
+
+    def test_finite_observer_saves_phase_type_and_only_public_messages(self):
+        secret = "Bearer PrivateToken1234567890 /private/operator/identity.key\n" + "x" * 600
+        safe = "finite journey engine group exit is unconfirmed"
+        detail = mock.Mock()
+        detail.__str__ = mock.Mock(side_effect=AssertionError("private exception detail was formatted"))
+        private_type = type("PrivateTypeToken1234567890", (Exception,), {"__str__": detail.__str__})
+        errors = ((RuntimeError(safe), "RuntimeError", safe),
+                  (RuntimeError(secret), "RuntimeError", "observer detail redacted"),
+                  (OSError(2, secret), "FileNotFoundError", "observer detail redacted"),
+                  (ValueError(secret), "ValueError", "observer detail redacted"),
+                  (RuntimeError(detail), "RuntimeError", "observer detail redacted"),
+                  (private_type(secret), "redacted", "observer detail redacted"))
+        for index, (error, expected_type, expected_message) in enumerate(errors):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                owner.started, owner.launch_requested = 0, False
+                owner.observe_once = mock.Mock(side_effect=error)
+                clock = mock.Mock()
+                clock.monotonic.return_value = 1
+                with mock.patch.dict(self.globals, {"time": clock}):
+                    owner.observe()
+                self.assertEqual(owner.error, "finite_resource_observation_failed")
+                self.assertEqual(owner.failure["phase"], "census")
+                self.assertEqual(owner.failure["type"], expected_type)
+                self.assertEqual(owner.failure["message"], expected_message)
+                receipt = owner.finish()
+                encoded = json.dumps(receipt) + self.globals["failure_suffix"](owner.failure)
+                self.assertEqual(receipt["observer_failure"], owner.failure)
+                self.assertEqual(receipt["status"], "failed")
+                self.assertLessEqual(len(owner.failure["message"]), 480)
+                self.assertNotIn("\n", owner.failure["message"])
+                for private in ("PrivateToken", "PrivateTypeToken", "/private/operator", "identity.key", "x" * 50):
+                    self.assertNotIn(private, encoded)
+                self.assertEqual(self.journey["private_json"](owner.control / "response.json")["status"], "failed")
+                self.assertEqual(self.journey["private_json"](owner.control / "stop.json"), {"stop": True})
+        detail.__str__.assert_not_called()
+
+    def test_finite_observer_stage_phase_uses_only_validated_action_text(self):
+        for action in ("engine_stopped", "private-action-Token1234567890"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                owner.started, owner.launch_requested = 0, False
+                owner.observe_once = mock.Mock(return_value={})
+                owner.action = mock.Mock(side_effect=RuntimeError("finite journey stage is unsupported"))
+                self.journey["private_json"](owner.control / "request.json", {"id": 1, "action": action})
+                clock = mock.Mock()
+                clock.monotonic.return_value = 1
+                with mock.patch.dict(self.globals, {"time": clock}):
+                    owner.observe()
+                expected = "stage_engine_stopped" if action == "engine_stopped" else "stage_request"
+                self.assertEqual(owner.failure["phase"], expected)
+                self.assertNotIn("Token123", json.dumps(owner.finish()))
 
     def test_finite_engine_stage_refuses_wrong_binding_interruption_and_deadline(self):
         with tempfile.TemporaryDirectory() as temp:
