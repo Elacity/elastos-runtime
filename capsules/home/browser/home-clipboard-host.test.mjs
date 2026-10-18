@@ -271,6 +271,32 @@ test("Assistant transcript prompt is explicit and does not render conversation t
   allowButton.click();
   assert.equal(await decision, true);
 });
+test("Clipboard prompt never stacks on Home's web-link sheet", async () => {
+  function node() {
+    return { hidden: true, textContent: "", addEventListener() {}, setAttribute() {}, focus() {} };
+  }
+  let linkSheetShown = true;
+  const root = node();
+  const prompt = createHomeClipboardPrompt({
+    root,
+    title: node(),
+    copy: node(),
+    allowButton: node(),
+    cancelButton: node(),
+    otherSheetShown: () => linkSheetShown,
+  });
+  const request = {
+    requestId: "wallet:1",
+    targetId: "wallet",
+    operation: "write",
+    purpose: "wallet.address",
+  };
+  await assert.rejects(prompt.request(request), { code: "busy" });
+  assert.equal(root.hidden, true);
+  linkSheetShown = false;
+  prompt.request({ ...request, requestId: "wallet:2" });
+  assert.equal(root.hidden, false);
+});
 test("Recovery Key prompt classifies secret material without receiving its payload", async () => {
   function node() {
     const listeners = new Map();

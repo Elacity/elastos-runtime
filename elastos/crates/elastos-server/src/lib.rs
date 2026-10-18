@@ -29,6 +29,7 @@ pub(crate) mod collaboration_discovery_runtime;
 pub(crate) mod collaboration_history;
 pub mod collaboration_network;
 pub mod collaboration_presence;
+pub(crate) mod collaboration_presence_grant;
 pub mod collaboration_product;
 pub(crate) mod collaboration_profile_authority;
 pub(crate) mod collaboration_profile_loader;

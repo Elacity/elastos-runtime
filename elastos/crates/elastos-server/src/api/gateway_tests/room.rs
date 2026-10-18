@@ -2422,9 +2422,16 @@ fn test_participant_cards_project_relationships_without_dids() {
     directory
         .discoverable
         .insert("did:key:zVisible".to_string());
-    directory.present.insert("did:key:zContact".to_string());
+    directory.present.insert(
+        "did:key:zContact".to_string(),
+        PresentMember {
+            display_name: "Contact".to_string(),
+            last_seen_at: 9,
+        },
+    );
     let mut poll = GatewayRoomPollView {
         own_delivery: Vec::new(),
+        community_presence: None,
         room_slug: "community".to_string(),
         display_name: "Community".to_string(),
         latest_seq: 0,
@@ -2478,6 +2485,94 @@ fn test_participant_cards_project_relationships_without_dids() {
     assert_eq!(
         poll.participants[1].card.as_ref().unwrap().participant_ref,
         home_people_contact_id("did:key:zContact")
+    );
+}
+
+#[test]
+fn test_participants_include_online_members_once_by_profile_did() {
+    // A fresh Community has few posts, so members whose Home is online are
+    // listed beside members who posted: one row per Profile DID.
+    let mut directory = ParticipantCardDirectory {
+        local_profile_did: Some("did:key:zSelf".to_string()),
+        ..ParticipantCardDirectory::default()
+    };
+    for (did, name) in [
+        ("did:key:zSelf", "Me"),
+        ("did:key:zPoster", "Poster renamed"),
+        ("did:key:zLurker", "Lurker"),
+    ] {
+        directory.present.insert(
+            did.to_string(),
+            PresentMember {
+                display_name: name.to_string(),
+                last_seen_at: 50,
+            },
+        );
+    }
+    let mut poster = card_test_participant("did:key:zPoster", true);
+    poster.display_name = "Poster".to_string();
+    poster.last_seen_at = 10;
+    let mut poll = GatewayRoomPollView {
+        own_delivery: Vec::new(),
+        community_presence: None,
+        room_slug: "community".to_string(),
+        display_name: "Community".to_string(),
+        latest_seq: 0,
+        participants: vec![poster],
+        objects: Vec::new(),
+        transport: Default::default(),
+    };
+
+    poll.apply_participant_cards(&directory);
+
+    let rows = poll
+        .participants
+        .iter()
+        .map(|participant| {
+            let card = participant.card.as_ref().unwrap();
+            (
+                participant.display_name.as_str(),
+                participant.is_current_session,
+                card.relationship,
+                card.active_now,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            ("Me", true, "you", true),
+            ("Lurker", false, "none", true),
+            ("Poster", false, "none", true),
+        ]
+    );
+    assert_eq!(poll.participants[1].last_seen_at, 50);
+    assert_eq!(poll.participants[2].last_seen_at, 10);
+    let json = serde_json::to_string(&poll).unwrap();
+    assert!(
+        !json.contains("did:key:"),
+        "rows must not expose DIDs: {json}"
+    );
+
+    // Presence that expired is not in the directory, so its row is gone.
+    directory.present.remove("did:key:zLurker");
+    let mut poll = GatewayRoomPollView {
+        own_delivery: Vec::new(),
+        community_presence: None,
+        room_slug: "community".to_string(),
+        display_name: "Community".to_string(),
+        latest_seq: 0,
+        participants: Vec::new(),
+        objects: Vec::new(),
+        transport: Default::default(),
+    };
+    poll.apply_participant_cards(&directory);
+    assert_eq!(
+        poll.participants
+            .iter()
+            .map(|participant| participant.display_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Me", "Poster renamed"]
     );
 }
 

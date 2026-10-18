@@ -371,10 +371,12 @@ fn shell_content_security_policy(
     } else {
         default_source.clone()
     };
+    // No allow-popups: a new window escapes connect-src and frame-src. Home
+    // opens web links for its apps (`home:open-external`).
     let sandbox = if is_home_host {
         ""
     } else {
-        "sandbox allow-scripts allow-forms allow-popups allow-downloads; "
+        "sandbox allow-scripts allow-forms allow-downloads; "
     };
     let script_source = if is_home_host {
         "'self'"
@@ -1008,6 +1010,11 @@ mod tests {
         let policy = first.headers()["content-security-policy"].clone();
         assert!(policy.to_str().unwrap().starts_with("sandbox "));
         assert!(!policy.to_str().unwrap().contains("allow-same-origin"));
+        assert!(policy
+            .to_str()
+            .unwrap()
+            .starts_with("sandbox allow-scripts allow-forms allow-downloads; "));
+        assert!(!policy.to_str().unwrap().contains("allow-popups"));
         headers.insert("if-none-match", first.headers()["etag"].clone());
         let cached = serve_browser_capsule_asset(
             data_dir.path(),

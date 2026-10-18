@@ -344,7 +344,7 @@ const server = createServer(async (req, res) => {
     const path = staticPath(url.pathname);
     if (path && existsSync(path)) {
       if (path.endsWith(".html")) {
-        res.setHeader("content-security-policy", "sandbox allow-scripts allow-forms allow-popups allow-downloads");
+        res.setHeader("content-security-policy", "sandbox allow-scripts allow-forms allow-downloads");
       }
       send(res, 200, contentType(path), readFileSync(path));
       return;
