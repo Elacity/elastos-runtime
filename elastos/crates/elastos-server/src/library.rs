@@ -4173,7 +4173,7 @@ fn archive_preview_entry_for_object(
     if !is_extractable_archive_name(archive_name) {
         bail!("library archive preview only supports .tar, .tar.gz, .tgz, and .zip archives");
     }
-    let normalized = normalized_archive_entry_path(Path::new(entry))?;
+    let normalized = normalized_archive_entry_path(entry)?;
     let preview = if archive_name.to_ascii_lowercase().ends_with(".zip") {
         preview_zip_archive_entry(bytes, &normalized)?
     } else {
@@ -4243,7 +4243,7 @@ fn preview_zip_archive_entry(
             .name()
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?
             .into_owned();
-        let Ok(normalized) = normalized_archive_entry_path(Path::new(&raw_name)) else {
+        let Ok(normalized) = normalized_archive_entry_path(&raw_name) else {
             continue;
         };
         if normalized != selected {
@@ -4284,11 +4284,9 @@ fn preview_tar_archive_entry(
     let mut archive = tar::Archive::new(reader);
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let path = match entry.path() {
-            Ok(path) => path.to_path_buf(),
-            Err(_) => continue,
-        };
-        let Ok(normalized) = normalized_archive_entry_path(&path) else {
+        let Ok(normalized) =
+            tar_entry_name(&entry).and_then(|name| normalized_archive_entry_path(&name))
+        else {
             continue;
         };
         if normalized != selected {
@@ -4395,35 +4393,23 @@ fn list_tar_archive_entries(name: &str, bytes: Vec<u8>) -> anyhow::Result<(Vec<V
         let entry_type = entry.header().entry_type();
         let size = entry.header().size().ok();
         let modified_at = entry.header().mtime().ok();
-        let path = match entry.path() {
-            Ok(path) => path.to_path_buf(),
-            Err(err) => {
-                entries.push(blocked_archive_entry_listing(
-                    index,
-                    format!("entry-{index}"),
-                    None,
-                    None,
-                    modified_at,
-                    format!("invalid archive entry path: {err}"),
-                ));
-                continue;
-            }
-        };
-        let display_path = archive_entry_display_path(&path, index);
-        let normalized = match normalized_archive_entry_path(&path) {
-            Ok(path) => path,
-            Err(err) => {
-                entries.push(blocked_archive_entry_listing(
-                    index,
-                    display_path,
-                    size,
-                    None,
-                    modified_at,
-                    err.to_string(),
-                ));
-                continue;
-            }
-        };
+        let display_path =
+            archive_entry_display_name(&String::from_utf8_lossy(&entry.path_bytes()), index);
+        let normalized =
+            match tar_entry_name(&entry).and_then(|name| normalized_archive_entry_path(&name)) {
+                Ok(path) => path,
+                Err(err) => {
+                    entries.push(blocked_archive_entry_listing(
+                        index,
+                        display_path,
+                        size,
+                        None,
+                        modified_at,
+                        err.to_string(),
+                    ));
+                    continue;
+                }
+            };
         let kind = if entry_type.is_dir() {
             "directory"
         } else if entry_type.is_file() {
@@ -4464,8 +4450,7 @@ fn list_zip_archive_entries(bytes: Vec<u8>) -> anyhow::Result<(Vec<Value>, bool)
             .name()
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?
             .into_owned();
-        let path = Path::new(&raw_name);
-        let normalized = match normalized_archive_entry_path(path) {
+        let normalized = match normalized_archive_entry_path(&raw_name) {
             Ok(path) => path,
             Err(err) => {
                 entries.push(blocked_archive_entry_listing(
@@ -4506,42 +4491,56 @@ fn list_zip_archive_entries(bytes: Vec<u8>) -> anyhow::Result<(Vec<Value>, bool)
     Ok((entries, truncated))
 }
 
-fn normalized_archive_entry_path(path: &Path) -> anyhow::Result<String> {
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(name) => {
-                let name = name
-                    .to_str()
-                    .ok_or_else(|| anyhow!("library archive entry path must be UTF-8"))?;
-                if name.is_empty()
-                    || name.contains('/')
-                    || name.contains('\\')
-                    || name.contains('\0')
-                    || name == "."
-                    || name == ".."
-                {
-                    bail!("library archive entry path must be relative and safe");
-                }
-                parts.push(name);
-            }
-            _ => bail!("library archive entry path must be relative and safe"),
-        }
+const UNSAFE_ARCHIVE_ENTRY_PATH: &str = "library archive entry path must be relative and safe";
+
+/// The one rule for an archive entry name. Every Library archive reader
+/// passes each entry name through it: list, preview, selected extract and
+/// whole-archive extract, for ZIP and for tar. The entry names a person asks
+/// to preview or to extract go through it too. The rule is the same on every
+/// platform. It refuses a name that holds a NUL byte or a `\`, starts with
+/// `/` (this includes `//server/share`), starts with a drive letter (`C:/x`,
+/// `C:x`), or has a `..` part. `\` is refused everywhere, so `C:\x`,
+/// `\\server\share\x` and `..\x` are refused as well. It returns the
+/// path with `/` separators and no empty or `.` parts; an empty path is the
+/// archive root (for example `./`).
+///
+/// It is not `Path::components()`: on Linux and macOS that reads `C:/x` as a
+/// folder `C:` and `\` as an ordinary character. It is not zip 9
+/// `enclosed_name` either: that strips a root or drive prefix and folds `..`,
+/// so a hostile entry would be written under another name.
+fn archive_entry_path(name: &str) -> anyhow::Result<String> {
+    let bytes = name.as_bytes();
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if name.starts_with('/') || drive || name.contains(['\\', '\0']) {
+        bail!(UNSAFE_ARCHIVE_ENTRY_PATH);
     }
-    if parts.is_empty() {
-        bail!("library archive entry path must not be empty");
+    let mut parts = Vec::new();
+    for part in name.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => bail!(UNSAFE_ARCHIVE_ENTRY_PATH),
+            part => parts.push(part),
+        }
     }
     Ok(parts.join("/"))
 }
 
-fn archive_entry_display_path(path: &Path, index: usize) -> String {
-    let display = path.to_string_lossy().trim().to_string();
-    if display.is_empty() {
-        format!("entry-{index}")
-    } else {
-        display
+/// `archive_entry_path` for a reader that names one entry (list, preview,
+/// selected extract): the archive root is not an entry.
+fn normalized_archive_entry_path(name: &str) -> anyhow::Result<String> {
+    let path = archive_entry_path(name)?;
+    if path.is_empty() {
+        bail!("library archive entry path must not be empty");
     }
+    Ok(path)
+}
+
+/// A tar entry name as text (GNU long names and PAX `path` included), before
+/// `archive_entry_path`. The raw bytes are read, so the result is the same
+/// on every platform.
+fn tar_entry_name<R: std::io::Read>(entry: &tar::Entry<'_, R>) -> anyhow::Result<String> {
+    String::from_utf8(entry.path_bytes().into_owned())
+        .map_err(|_| anyhow!("library archive entry path must be UTF-8"))
 }
 
 fn archive_entry_display_name(name: &str, index: usize) -> String {
@@ -4853,7 +4852,7 @@ fn selected_archive_entries(entries: &[String]) -> anyhow::Result<BTreeSet<Strin
         if entry.is_empty() {
             continue;
         }
-        selected.insert(normalized_archive_entry_path(Path::new(entry))?);
+        selected.insert(normalized_archive_entry_path(entry)?);
     }
     if selected.is_empty() {
         bail!("library archive selected extraction requires at least one entry");
@@ -4887,26 +4886,20 @@ fn collect_selected_tar_writes(
     let mut writes = Vec::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let path = match entry.path() {
-            Ok(path) => path.to_path_buf(),
-            Err(err) => {
-                outcome.blocked.push(json!({
-                    "path": "invalid-entry-path",
-                    "reason": format!("invalid archive entry path: {err}"),
-                }));
-                continue;
-            }
-        };
-        let normalized = match normalized_archive_entry_path(&path) {
-            Ok(path) => path,
-            Err(err) => {
-                outcome.blocked.push(json!({
-                    "path": archive_entry_display_path(&path, outcome.processed_entries),
-                    "reason": err.to_string(),
-                }));
-                continue;
-            }
-        };
+        let normalized =
+            match tar_entry_name(&entry).and_then(|name| normalized_archive_entry_path(&name)) {
+                Ok(path) => path,
+                Err(err) => {
+                    outcome.blocked.push(json!({
+                        "path": archive_entry_display_name(
+                            &String::from_utf8_lossy(&entry.path_bytes()),
+                            outcome.processed_entries,
+                        ),
+                        "reason": err.to_string(),
+                    }));
+                    continue;
+                }
+            };
         if !outcome.is_selected(&normalized) {
             continue;
         }
@@ -4949,7 +4942,7 @@ fn collect_selected_zip_writes(
             .name()
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?
             .into_owned();
-        let normalized = match normalized_archive_entry_path(Path::new(&raw_name)) {
+        let normalized = match normalized_archive_entry_path(&raw_name) {
             Ok(path) => path,
             Err(err) => {
                 outcome.blocked.push(json!({
@@ -5395,8 +5388,8 @@ fn extract_tar_archive(
     let mut archive = tar::Archive::new(reader);
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let entry_path = entry.path()?.to_path_buf();
-        let entry_uri = archive_entry_uri(&destination.uri, &entry_path)?;
+        let entry_path = archive_entry_path(&tar_entry_name(&entry)?)?;
+        let entry_uri = archive_entry_uri(&destination.uri, Path::new(&entry_path))?;
         if entry_uri == destination.uri {
             continue;
         }
@@ -5441,9 +5434,8 @@ fn extract_zip_archive(
         let raw_name = file
             .name()
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?;
-        let entry_path = zip_entry_enclosed_path(&raw_name)
-            .ok_or_else(|| anyhow!("library archive entry path must be relative and safe"))?;
-        let entry_uri = archive_entry_uri(&destination.uri, &entry_path)?;
+        let entry_path = archive_entry_path(&raw_name)?;
+        let entry_uri = archive_entry_uri(&destination.uri, Path::new(&entry_path))?;
         if entry_uri == destination.uri {
             continue;
         }
@@ -5470,34 +5462,6 @@ fn extract_zip_archive(
         )?;
     }
     Ok(())
-}
-
-/// The path a whole-archive ZIP extract writes for an entry name, or `None`
-/// when the name holds a NUL byte, is absolute, or climbs above the archive
-/// root. Absolute means a leading `/` or `\` (this includes `\\server\share`
-/// and `\\?\` names) or a drive letter (`C:\x`, `C:/x`, `C:x`). The rule is
-/// the same on every platform: `\` counts as a separator, and a drive letter
-/// is refused also where `Path` has no drive prefix (Linux and macOS).
-/// `archive_entry_uri` then refuses any `..` or `\` that is left. This keeps
-/// the rule in the runtime: zip 9 `enclosed_name` strips a root or drive
-/// prefix and folds `..` instead, which would write entries that this
-/// extract refuses.
-fn zip_entry_enclosed_path(name: &str) -> Option<PathBuf> {
-    let bytes = name.as_bytes();
-    let rooted = matches!(bytes.first(), Some(b'/' | b'\\'));
-    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    if name.contains('\0') || rooted || drive {
-        return None;
-    }
-    let mut depth = 0usize;
-    for part in name.split(['/', '\\']) {
-        match part {
-            "" | "." => {}
-            ".." => depth = depth.checked_sub(1)?,
-            _ => depth += 1,
-        }
-    }
-    Some(PathBuf::from(name))
 }
 
 fn archive_entry_uri(destination_uri: &str, path: &Path) -> anyhow::Result<String> {
@@ -7218,7 +7182,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zip_entry_enclosed_path_refuses_root_drive_and_climb_on_every_platform() {
+    fn archive_entry_path_refuses_root_drive_and_climb_on_every_platform() {
         let refused = [
             "/a.txt",
             "\\a.txt",
@@ -7233,28 +7197,131 @@ mod tests {
             "../a.txt",
             "..\\a.txt",
             "Nested/../../a.txt",
+            "Nested/../a.txt",
             "Nested\\..\\..\\a.txt",
             "a\0.txt",
         ];
         let accepted: Vec<&str> = refused
             .into_iter()
-            .filter(|name| zip_entry_enclosed_path(name).is_some())
+            .filter(|name| archive_entry_path(name).is_ok())
             .collect();
         assert!(accepted.is_empty(), "accepted hostile names: {accepted:?}");
 
-        for name in [
-            "a.txt",
-            "./a.txt",
-            "Nested/a.txt",
-            "Nested/",
-            "Nested/C:a.txt",
+        for (name, path) in [
+            ("a.txt", "a.txt"),
+            ("./a.txt", "a.txt"),
+            ("Nested/a.txt", "Nested/a.txt"),
+            ("Nested/", "Nested"),
+            ("Nested/C:a.txt", "Nested/C:a.txt"),
+            ("./", ""),
         ] {
-            assert_eq!(
-                zip_entry_enclosed_path(name),
-                Some(PathBuf::from(name)),
-                "{name:?}"
-            );
+            assert_eq!(archive_entry_path(name).unwrap(), path, "{name:?}");
         }
+    }
+
+    /// The list, preview and selected-extract readers, called directly (past
+    /// the check on the entry a person asks for): an entry whose name is
+    /// rooted, has a drive or UNC prefix, or climbs is shown as blocked and is
+    /// never matched, previewed or written, in ZIP and in tar.
+    #[test]
+    fn archive_readers_block_root_drive_unc_and_climb_entry_names() {
+        use std::io::Write as _;
+
+        let reason = "library archive entry path must be relative and safe";
+        let mut failures = Vec::new();
+        for entry_name in [
+            "C:/drive-slash-escape.txt",
+            "C:\\drive-backslash-escape.txt",
+            "\\\\server\\share\\unc-escape.txt",
+            "/etc/absolute-escape.txt",
+            "../dotdot-escape.txt",
+        ] {
+            let leaf = entry_name.rsplit(['/', '\\']).next().unwrap();
+            for archive_name in ["Case.zip", "Case.tar"] {
+                let label = format!("{archive_name} {entry_name:?}");
+                let bytes = if archive_name.ends_with(".zip") {
+                    let options = zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored);
+                    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+                    writer.start_file(entry_name, options).unwrap();
+                    writer.write_all(b"escape").unwrap();
+                    writer.start_file("safe.txt", options).unwrap();
+                    writer.write_all(b"safe").unwrap();
+                    writer.finish().unwrap().into_inner()
+                } else {
+                    // `tar::Builder` refuses these names, so write the header
+                    // name byte for byte.
+                    let mut builder = tar::Builder::new(Vec::new());
+                    for (name, body) in [(entry_name, b"escape".as_slice()), ("safe.txt", b"safe")]
+                    {
+                        let mut header = tar::Header::new_gnu();
+                        header.as_gnu_mut().unwrap().name[..name.len()]
+                            .copy_from_slice(name.as_bytes());
+                        header.set_entry_type(tar::EntryType::Regular);
+                        header.set_size(body.len() as u64);
+                        header.set_mode(0o644);
+                        header.set_cksum();
+                        builder.append(&header, body).unwrap();
+                    }
+                    builder.into_inner().unwrap()
+                };
+                let zip = archive_name.ends_with(".zip");
+
+                let (rows, _) = if zip {
+                    list_zip_archive_entries(bytes.clone())
+                } else {
+                    list_tar_archive_entries(archive_name, bytes.clone())
+                }
+                .unwrap();
+                let hostile_rows: Vec<&Value> = rows
+                    .iter()
+                    .filter(|row| row["path"] != "safe.txt")
+                    .collect();
+                if hostile_rows.len() != 1
+                    || hostile_rows[0]["kind"] != "blocked"
+                    || hostile_rows[0]["safety"]["reason"] != reason
+                {
+                    failures.push(format!("{label} list: {hostile_rows:?}"));
+                }
+
+                for selected in [entry_name, leaf] {
+                    let preview = if zip {
+                        preview_zip_archive_entry(bytes.clone(), selected)
+                    } else {
+                        preview_tar_archive_entry(archive_name, bytes.clone(), selected)
+                    };
+                    if let Ok(preview) = preview {
+                        failures.push(format!(
+                            "{label} preview {selected:?}: {:?}",
+                            String::from_utf8_lossy(&preview.bytes)
+                        ));
+                    }
+                }
+
+                let requested = BTreeSet::from([entry_name.to_string(), leaf.to_string()]);
+                let mut outcome = ArchiveExtractOutcome::new(requested);
+                let writes =
+                    collect_selected_archive_writes(archive_name, bytes, &mut outcome).unwrap();
+                if !writes.is_empty()
+                    || outcome.blocked.len() != 1
+                    || outcome.blocked[0]["reason"] != reason
+                {
+                    failures.push(format!(
+                        "{label} selected: writes={writes:?} blocked={:?}",
+                        outcome.blocked
+                    ));
+                }
+            }
+            if selected_archive_entries(&[entry_name.to_string()]).is_ok() {
+                failures.push(format!("selection {entry_name:?} accepted"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} reader checks failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     #[test]
