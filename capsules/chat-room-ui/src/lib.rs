@@ -1708,6 +1708,20 @@ impl App {
                 }
                 return;
             }
+            if let Some(anchor) = target.closest("[data-open-external]").ok().flatten() {
+                let Some(url) = anchor.get_attribute("data-open-external") else {
+                    return;
+                };
+                match link_app.open_external_link_from_shell(&url) {
+                    Ok(true) => event.prevent_default(),
+                    Ok(false) => {}
+                    Err(error) => {
+                        link_app.set_error(Some(js_error(error)));
+                        let _ = link_app.render();
+                    }
+                }
+                return;
+            }
             let Some(anchor) = target.closest("[data-open-uri]").ok().flatten() else {
                 return;
             };
@@ -3055,6 +3069,21 @@ impl App {
             "type": "home:open-uri", "uri": clean_uri, "preferredViewer": "documents",
             "homeToken": home_token,
         }))
+    }
+
+    /// App documents have no popup permission. Inside Home a web link asks
+    /// Home, which shows the exact address and opens it only when the person
+    /// chooses Open link; the link never navigates Chat itself. Home checks the
+    /// address, so Chat sends it unchanged. Outside Home it navigates normally.
+    fn open_external_link_from_shell(&self, url: &str) -> Result<bool, JsValue> {
+        let Some(home_token) = self.home_token() else {
+            return Ok(false);
+        };
+        if !self.is_shell_mode() {
+            return Ok(false);
+        }
+        self.post_home_message(&home_open_external_message(url, &home_token))?;
+        Ok(true)
     }
 
     fn open_attachment_in_documents(&self, attachment_id: &str) -> Result<bool, JsValue> {
@@ -4683,7 +4712,7 @@ impl App {
                             anchor.set_attribute("data-open-uri", &link.url)?;
                             anchor.set_attribute("aria-label", "Open published document")?;
                         } else {
-                            anchor.set_attribute("target", "_blank")?;
+                            anchor.set_attribute("data-open-external", &link.url)?;
                             anchor.set_attribute("rel", "noopener noreferrer")?;
                         }
 
@@ -5036,6 +5065,11 @@ fn documents_attachment_message(
             "dataUrl": data_url,
         },
     })
+}
+
+/// The typed request asking Home to show and, on consent, open one web link.
+fn home_open_external_message(url: &str, home_token: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "home:open-external", "url": url, "homeToken": home_token })
 }
 
 /// The first element under `root` whose `attribute` is exactly `value`. The
@@ -5507,13 +5541,14 @@ mod tests {
         commit_requested_direct_selection_if_current, commit_shared_selection,
         conversation_initial, current_selection_guard, decode_query_value,
         documents_attachment_message, extract_fragment_param, extract_query_param,
-        format_chat_message_request_id, note_composer_edit, object_sender_name, participant_detail,
-        participant_shown_name, pending_chat_request_id, render_projection,
-        resolve_conversation_choice, room_send_error_text, selection_guard_matches,
-        settle_sent_draft, shell_summary_allows_session, switch_composer_draft, AccessMode,
-        AppConfig, AppState, AttachmentView, CommunityState, ConversationObjectKind,
-        ConversationObjectView, ParticipantView, PendingChatSend, RenderProjection, RoomPollView,
-        RoomTransportView, ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
+        format_chat_message_request_id, home_open_external_message, note_composer_edit,
+        object_sender_name, participant_detail, participant_shown_name, pending_chat_request_id,
+        render_projection, resolve_conversation_choice, room_send_error_text,
+        selection_guard_matches, settle_sent_draft, shell_summary_allows_session,
+        switch_composer_draft, AccessMode, AppConfig, AppState, AttachmentView, CommunityState,
+        ConversationObjectKind, ConversationObjectView, ParticipantView, PendingChatSend,
+        RenderProjection, RoomPollView, RoomTransportView, ShellSessionBootstrapFailure,
+        ShellSessionStartOutput, SummaryView,
     };
 
     fn two_direct_conversations() -> AppState {
@@ -6392,6 +6427,25 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn web_links_ask_home_with_the_exact_address() {
+        // Chat sends the link's own text; Home and the Runtime decide.
+        for url in [
+            "https://example.com/a?b=1#c",
+            " HTTP://Example.com",
+            "javascript:x",
+        ] {
+            assert_eq!(
+                home_open_external_message(url, "home-token"),
+                serde_json::json!({
+                    "type": "home:open-external",
+                    "url": url,
+                    "homeToken": "home-token",
+                })
+            );
+        }
     }
 
     #[test]

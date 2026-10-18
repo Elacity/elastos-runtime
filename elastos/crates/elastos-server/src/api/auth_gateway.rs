@@ -652,8 +652,85 @@ pub async fn passkey_authenticate_complete(
 ) -> Response {
     match passkey_authenticate_complete_inner(&state, &headers, input).await {
         Ok(response) => passkey_verified_response(&headers, response),
-        Err(err) => auth_error_response(err),
+        Err(err) => passkey_sign_in_failure_response(err),
     }
+}
+
+const PASSKEY_SIGN_IN_FAILURE: &str = "Home could not sign you in with this passkey.";
+
+/// Every failed sign-in completion, anonymous or named, gets the same status
+/// and body; only a busy Home is told apart. A distinct answer for an unknown
+/// credential ID would let anyone holding a list of IDs (such as a named
+/// begin's allow-list) tell real credentials from decoys without an
+/// authenticator. The reason stays in the debug log.
+fn passkey_sign_in_failure_response(err: anyhow::Error) -> Response {
+    if err.is::<elastos_identity::webauthn::CeremonyCapacityExceeded>() {
+        return auth_error_response(err);
+    }
+    tracing::debug!("passkey sign-in completion refused: {err:#}");
+    (StatusCode::FORBIDDEN, PASSKEY_SIGN_IN_FAILURE).into_response()
+}
+
+const NAMED_SIGN_IN_BEGIN_REQUEST_SCHEMA: &str =
+    "elastos.auth.passkey.authenticate.named.begin.request/v1";
+const NAMED_SIGN_IN_CEREMONY_PREFIX: &str = "passkey:authenticate-named:";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyAuthenticateNamedBeginRequest {
+    schema: String,
+    /// The account name as Home shows it: the signed Profile display name.
+    account_name: String,
+}
+
+/// Why a named sign-in was refused.
+#[derive(Debug)]
+enum NamedSignInRefused {
+    /// Empty, over-long or control characters: refused before any lookup.
+    InvalidName,
+    /// The asserted credential is not one the named account owned at begin.
+    NotTheNamedAccount,
+}
+
+impl std::fmt::Display for NamedSignInRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidName => "invalid account name",
+            Self::NotTheNamedAccount => "passkey does not belong to the named account",
+        })
+    }
+}
+
+impl std::error::Error for NamedSignInRefused {}
+
+/// Lock screen fallback for a passkey the browser cannot discover: sign in
+/// by account name. Same rate limit, challenge store and expiry as the
+/// anonymous begin, which keeps its empty allow-list.
+pub async fn passkey_authenticate_named_begin(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(input): Json<PasskeyAuthenticateNamedBeginRequest>,
+) -> Response {
+    match passkey_authenticate_named_begin_inner(&state, &headers, input).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => named_sign_in_error_response(err),
+    }
+}
+
+/// A named begin refuses only an invalid name or a busy Home on its own;
+/// every other failure is the generic sign-in failure.
+fn named_sign_in_error_response(err: anyhow::Error) -> Response {
+    if matches!(
+        err.downcast_ref::<NamedSignInRefused>(),
+        Some(NamedSignInRefused::InvalidName)
+    ) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Enter your account name as this Home shows it.",
+        )
+            .into_response();
+    }
+    passkey_sign_in_failure_response(err)
 }
 
 /// Step-up operation and exact intent a passkey add consumes: the same fresh
@@ -3711,6 +3788,17 @@ async fn passkey_authenticate_complete_inner(
     let origin = outcome.origin.clone();
     let user_verified = outcome.user_verified;
     drop(manager);
+    // A named sign-in binds the session to the account the name matched at
+    // begin; the allow-list already held only its credentials.
+    if let Some(named) = &outcome.named_principal_ids {
+        let principal = crate::auth::load_principal_for_proof_binding(
+            &state.data_dir,
+            &passkey_proof_binding_id(&credential),
+        )?;
+        if !named.contains(&principal.principal_id) {
+            return Err(NamedSignInRefused::NotTheNamedAccount.into());
+        }
+    }
     issue_named_passkey_session_grant(
         state,
         &outcome.user_id,
@@ -3720,6 +3808,86 @@ async fn passkey_authenticate_complete_inner(
         "passkey authentication verified and session granted",
         None,
     )
+}
+
+async fn passkey_authenticate_named_begin_inner(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    input: PasskeyAuthenticateNamedBeginRequest,
+) -> anyhow::Result<PasskeyBeginResponse<RequestOptions>> {
+    if input.schema != NAMED_SIGN_IN_BEGIN_REQUEST_SCHEMA {
+        anyhow::bail!("unsupported named sign-in request schema");
+    }
+    let account_key = elastos_identity::named_sign_in_account_key(&input.account_name)
+        .ok_or(NamedSignInRefused::InvalidName)?;
+    let rp = super::handlers::identity::derive_rp(headers)?;
+    let account = named_sign_in_account(&state.data_dir, &account_key)?;
+    let ceremony_id = format!("{NAMED_SIGN_IN_CEREMONY_PREFIX}{}", random_hex(16));
+    let manager = state.identity_manager()?;
+    let mut manager = manager.lock().await;
+    let options =
+        manager.begin_named_authentication(&ceremony_id, &rp.id, &account_key, account)?;
+    // Same schema and shape as the anonymous begin; only the allow-list differs.
+    Ok(PasskeyBeginResponse {
+        schema: "elastos.auth.passkey.authenticate.begin/v1".to_string(),
+        ceremony_id,
+        options,
+        guest_client_cookie: None,
+    })
+}
+
+/// The active principals whose account name is `account_key`, with every
+/// active passkey credential they own.
+///
+/// The account name is the one Home shows for the account on its lock screen
+/// and desktop: the signed Profile display name, or, for an account without a
+/// readable signed Profile, its principal label (which Home shows during
+/// Profile setup). Names are not unique, so every matching principal counts;
+/// the finish binds the session to the one whose credential signed. Every
+/// principal's name is read on every call, so a known and an unknown name do
+/// the same work.
+fn named_sign_in_account(
+    data_dir: &std::path::Path,
+    account_key: &str,
+) -> anyhow::Result<elastos_identity::NamedSignInAccount> {
+    let principals = crate::auth::active_passkey_principals(data_dir)?;
+    let mut checked = std::collections::BTreeSet::new();
+    let mut matched = std::collections::BTreeSet::new();
+    for principal in &principals {
+        if !checked.insert(principal.principal_id.as_str()) {
+            continue;
+        }
+        let profile = crate::collaboration_profile_authority::load_profile_authority(
+            data_dir,
+            &principal.principal_id,
+            &principal.localhost_root,
+        )
+        .ok()
+        .flatten();
+        let is_named = |name: &str| {
+            elastos_identity::named_sign_in_account_key(name).as_deref() == Some(account_key)
+        };
+        let named = match &profile {
+            Some(profile) => is_named(&profile.document().display_name),
+            None => principals
+                .iter()
+                .filter(|record| record.principal_id == principal.principal_id)
+                .any(|record| is_named(&record.display_name)),
+        };
+        if named {
+            matched.insert(principal.principal_id.clone());
+        }
+    }
+    let credential_ids = principals
+        .iter()
+        .filter(|principal| matched.contains(&principal.principal_id))
+        .filter_map(|principal| principal.proof_binding.passkey.as_ref())
+        .map(|passkey| passkey.credential_id.clone())
+        .collect();
+    Ok(elastos_identity::NamedSignInAccount {
+        principal_ids: matched.into_iter().collect(),
+        credential_ids,
+    })
 }
 
 #[derive(Debug)]
@@ -4979,6 +5147,359 @@ mod tests {
                 |principal| principal.principal_id == completed["principal_id"]
                     && principal.role == crate::auth::RuntimePrincipalRole::Guest
             ));
+    }
+
+    #[tokio::test]
+    async fn named_passkey_sign_in_lists_only_that_account_and_decoys_otherwise() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        async fn admission(
+            State(state): State<GatewayState>,
+            request: axum::extract::Request,
+            next: axum::middleware::Next,
+        ) -> Response {
+            let peer = request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|peer| peer.0);
+            if let Err(response) = admit_passkey_begin(&state.data_dir, peer, request.uri().path())
+            {
+                return *response;
+            }
+            next.run(request).await
+        }
+
+        let root = local_profile_fixture_root();
+        let state = test_gateway_state(root.path());
+        let origin = "https://elastos.elacitylabs.com";
+        // Two accounts. Neither has a signed Profile, so each is named by its
+        // principal label, as Home shows it during Profile setup.
+        for (credential, name) in [
+            (test_credential(), "Alice Example"),
+            (test_credential_2(), "Bob"),
+        ] {
+            store_test_credential(root.path(), credential.clone());
+            seed_test_passkey_principal(
+                &state,
+                &credential,
+                origin,
+                crate::auth::RuntimePrincipalRole::Admin,
+            );
+            crate::auth::set_principal_display_name(
+                root.path(),
+                &passkey_proof_binding_id(&credential),
+                name,
+                crate::auth::now_ts(),
+            )
+            .unwrap();
+        }
+        let app = axum::Router::new()
+            .route(
+                "/api/auth/passkey/authenticate/begin",
+                post(passkey_authenticate_begin),
+            )
+            .route(
+                "/api/auth/passkey/authenticate/named/begin",
+                post(passkey_authenticate_named_begin),
+            )
+            .route(
+                "/api/auth/passkey/authenticate/complete",
+                post(passkey_authenticate_complete),
+            )
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                admission,
+            ));
+        let send = |path: &'static str, peer: &'static str, body: Value| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header("host", "elastos.elacitylabs.com")
+                            .header("origin", origin)
+                            .header("content-type", "application/json")
+                            .extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap()))
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 96 * 1024).await.unwrap();
+                (status, String::from_utf8(bytes.to_vec()).unwrap())
+            }
+        };
+        let named = |name: &str| {
+            json!({
+                "schema": "elastos.auth.passkey.authenticate.named.begin.request/v1",
+                "account_name": name,
+            })
+        };
+        let allow_ids = |body: &Value| -> Vec<String> {
+            body["options"]["publicKey"]["allowCredentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    let mut keys: Vec<_> = entry.as_object().unwrap().keys().cloned().collect();
+                    keys.sort();
+                    assert_eq!(keys, ["id", "type"]);
+                    assert_eq!(entry["type"], "public-key");
+                    entry["id"].as_str().unwrap().to_string()
+                })
+                .collect()
+        };
+        let shape = |body: &Value| -> Vec<String> {
+            let mut keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
+            keys.extend(
+                body["options"]["publicKey"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(|key| format!("publicKey.{key}")),
+            );
+            keys.sort();
+            keys
+        };
+
+        // Known name, matched with case and spacing folded: exactly that
+        // account's credential, never the other account's.
+        let (status, text) = send(
+            "/api/auth/passkey/authenticate/named/begin",
+            "192.0.2.1:1234",
+            named("  alice   EXAMPLE "),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(!text.contains(&test_credential_2().credential_id));
+        let known: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(allow_ids(&known), [test_credential().credential_id]);
+        assert_eq!(
+            known["schema"],
+            "elastos.auth.passkey.authenticate.begin/v1"
+        );
+
+        // Unknown name: decoys of the same shape, stable across calls.
+        let (status, text) = send(
+            "/api/auth/passkey/authenticate/named/begin",
+            "192.0.2.1:1234",
+            named("Mallory"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let unknown: Value = serde_json::from_str(&text).unwrap();
+        let decoys = allow_ids(&unknown);
+        assert!(!decoys.is_empty());
+        for credential in [test_credential(), test_credential_2()] {
+            assert!(!text.contains(&credential.credential_id));
+        }
+        assert_eq!(shape(&unknown), shape(&known));
+        let (_, again) = send(
+            "/api/auth/passkey/authenticate/named/begin",
+            "192.0.2.2:1234",
+            named("mallory"),
+        )
+        .await;
+        assert_eq!(allow_ids(&serde_json::from_str(&again).unwrap()), decoys);
+
+        // A's assertion against a challenge named for B fails plainly and
+        // grants no session.
+        let (status, text) = send(
+            "/api/auth/passkey/authenticate/named/begin",
+            "192.0.2.1:1234",
+            named("Bob"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let for_bob: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(allow_ids(&for_bob), [test_credential_2().credential_id]);
+        let sessions_before = crate::auth::load_auth_state(root.path())
+            .unwrap()
+            .sessions
+            .len();
+        let client_data = URL_SAFE_NO_PAD.encode(
+            json!({
+                "type": "webauthn.get",
+                "challenge": for_bob["options"]["publicKey"]["challenge"],
+                "origin": origin,
+            })
+            .to_string(),
+        );
+        let alice_id = test_credential().credential_id;
+        let (status, text) = send(
+            "/api/auth/passkey/authenticate/complete",
+            "192.0.2.1:1234",
+            json!({
+                "ceremony_id": for_bob["ceremony_id"],
+                "response": {
+                    "id": alice_id,
+                    "rawId": alice_id,
+                    "type": "public-key",
+                    "response": {
+                        "clientDataJson": client_data,
+                        "authenticatorData": "AA",
+                        "signature": "AA",
+                        "userHandle": null,
+                    },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(text, PASSKEY_SIGN_IN_FAILURE);
+        assert_eq!(
+            crate::auth::load_auth_state(root.path())
+                .unwrap()
+                .sessions
+                .len(),
+            sessions_before
+        );
+
+        // No existence oracle at completion: a decoy ID and a listed real ID
+        // with a bad signature get byte-identical answers, on an anonymous
+        // and on a named ceremony.
+        let complete = |begin: Value, credential_id: String| {
+            let send = &send;
+            async move {
+                let challenge = begin["options"]["publicKey"]["challenge"].clone();
+                let mut auth_data = Sha256::digest(b"elastos.elacitylabs.com").to_vec();
+                auth_data.push(0x05);
+                auth_data.extend_from_slice(&100u32.to_be_bytes());
+                send(
+                    "/api/auth/passkey/authenticate/complete",
+                    "192.0.2.1:1234",
+                    json!({
+                        "ceremony_id": begin["ceremony_id"],
+                        "response": {
+                            "id": credential_id,
+                            "rawId": credential_id,
+                            "type": "public-key",
+                            "response": {
+                                "clientDataJson": URL_SAFE_NO_PAD.encode(json!({
+                                    "type": "webauthn.get",
+                                    "challenge": challenge,
+                                    "origin": origin,
+                                }).to_string()),
+                                "authenticatorData": URL_SAFE_NO_PAD.encode(&auth_data),
+                                "signature": "AA",
+                                "userHandle": null,
+                            },
+                        },
+                    }),
+                )
+                .await
+            }
+        };
+        let begin_json = |(status, text): (StatusCode, String)| -> Value {
+            assert_eq!(status, StatusCode::OK, "{text}");
+            serde_json::from_str(&text).unwrap()
+        };
+        let decoy_id = decoys[0].clone();
+        let mut answers = Vec::new();
+        for credential_id in [decoy_id.clone(), alice_id.clone()] {
+            let anonymous = begin_json(
+                send(
+                    "/api/auth/passkey/authenticate/begin",
+                    "192.0.2.4:1234",
+                    json!({}),
+                )
+                .await,
+            );
+            answers.push(complete(anonymous, credential_id).await);
+        }
+        for (name, credential_id) in [("Mallory", decoy_id), ("Alice Example", alice_id)] {
+            let begin = begin_json(
+                send(
+                    "/api/auth/passkey/authenticate/named/begin",
+                    "192.0.2.5:1234",
+                    named(name),
+                )
+                .await,
+            );
+            answers.push(complete(begin, credential_id).await);
+        }
+        for answer in &answers {
+            assert_eq!(
+                answer,
+                &(StatusCode::FORBIDDEN, PASSKEY_SIGN_IN_FAILURE.to_string())
+            );
+        }
+        assert_eq!(
+            crate::auth::load_auth_state(root.path())
+                .unwrap()
+                .sessions
+                .len(),
+            sessions_before
+        );
+
+        // An invalid name is refused before any lookup, with its own plain
+        // sentence; it still spends a start.
+        let (status, text) = send(
+            "/api/auth/passkey/authenticate/named/begin",
+            "192.0.2.1:1234",
+            named("   "),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(text, "Enter your account name as this Home shows it.");
+
+        // The same Authentication quota as the anonymous begin, shared by both.
+        let (status, _) = send(
+            "/api/auth/passkey/authenticate/named/begin",
+            "192.0.2.1:1234",
+            named("Alice Example"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let (status, _) = send(
+            "/api/auth/passkey/authenticate/begin",
+            "192.0.2.1:1234",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // The anonymous begin keeps its empty allow-list.
+        let (status, text) = send(
+            "/api/auth/passkey/authenticate/begin",
+            "192.0.2.3:1234",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let anonymous: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            anonymous["options"]["publicKey"]["allowCredentials"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn named_sign_in_uses_the_signed_profile_name_home_shows() {
+        let root = local_profile_fixture_root();
+        let _auth = super::super::gateway::set_test_home_launch_auth_data_dir(root.path());
+        let state = test_gateway_state(root.path());
+        let (credential, grant) = local_profile_owner_grant(root.path());
+        // Signing in finishes the initial Profile: display name "Public name",
+        // principal label "Private label".
+        passkey_response_for_grant(&state, grant.clone()).unwrap();
+        let account = named_sign_in_account(root.path(), "public name").unwrap();
+        assert_eq!(account.principal_ids, [grant.principal_id]);
+        assert_eq!(account.credential_ids, [credential.credential_id]);
+        // With a signed Profile, the private label is not the account name.
+        for other in ["private label", "nobody"] {
+            assert_eq!(
+                named_sign_in_account(root.path(), other).unwrap(),
+                elastos_identity::NamedSignInAccount::default()
+            );
+        }
     }
 
     #[test]
