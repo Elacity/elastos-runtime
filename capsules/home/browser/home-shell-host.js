@@ -26,7 +26,6 @@ import {
   isHomeAuthError,
   refreshHomeSession,
   requestPasskeyStepUp,
-  offerPasskeyAddAfterSignIn,
   profileReadinessActionTarget,
   showHomeUnlock,
   signOutHome,
@@ -53,7 +52,7 @@ import {
   EXTERNAL_LINK_REQUEST_SCHEMA,
   HOME_OPEN_EXTERNAL_TYPE,
   MAX_EXTERNAL_LINK_LENGTH,
-} from "./home-external-link.js?v=home-20261017b";
+} from "./home-external-link.js?v=home-20261017c";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -490,15 +489,6 @@ async function showHostAuthGate(options = {}) {
         query.recovery = "import";
       }
       await openTargetFromHomeGui(profileActionTarget, { query });
-    } else {
-      // Never switches the person's shell and never fails the sign-in.
-      await offerPasskeyAddAfterSignIn({
-        flow,
-        homeToken: response?.home_token,
-        desktopActive: activeShellTarget(shellState.currentSummary) === HOME_GUI_SHELL_ID
-          && shellState.activeShellRootTarget === HOME_GUI_SHELL_ID,
-        openSystem: (query) => openTargetFromHomeGui("system", { query }),
-      });
     }
   }, {
     ...options,
