@@ -528,6 +528,25 @@ async function handleApi(req, res, url) {
     json(res, 200, { status: "ok", data: { roots: LIBRARY_FIXTURE_ROOTS } });
     return true;
   }
+  // Stand-in for the Runtime link check (gateway_home_external_link.rs): the
+  // app comes from its launch token, the address is canonical http(s).
+  if (url.pathname === "/api/apps/home/external-link" && req.method === "POST") {
+    const input = await readBody(req);
+    const app = FIRST_PARTY_APPS.find(([id]) => input?.app_token === `fixture-${id}-launch-token`);
+    let href = "";
+    try {
+      const parsed = new URL(input?.url);
+      href = ["http:", "https:"].includes(parsed.protocol) && !parsed.username && !parsed.password ? parsed.href : "";
+    } catch (_error) {
+      href = "";
+    }
+    if (input?.schema !== "elastos.home.external-link.request/v1" || !app || !href) {
+      json(res, 403, { error: "fixture link refused" });
+      return true;
+    }
+    json(res, 200, { schema: "elastos.home.external-link.result/v1", app_id: app[0], app_title: app[1], url: href });
+    return true;
+  }
   if (url.pathname.startsWith("/api/")) {
     // Capsule APIs are out of scope: the capsule shows its own empty/error
     // state and the shell around it is what this smoke measures.
@@ -915,6 +934,151 @@ function promptCloseFailures(run) {
     return [`${label}: the Close tap must land while the open guard is armed to test it. Got ${JSON.stringify(probe)}`];
   }
   return probe.closed ? [] : [`${label}: a fresh tap on Close right after a tap opened ${probe.target} must close it. Got ${JSON.stringify(probe)}`];
+}
+
+// Home's web-link sheet (#430) on the real host in this engine: an app frame
+// asks, Home shows the Runtime-named app and the whole address, and only a
+// real press on Open link opens it, once, with no opener and no referrer.
+const LINK_DESTINATION_ORIGIN = "https://links.example";
+async function probeExternalLink(page, dir, target) {
+  const context = page.context();
+  const destinationRequests = [];
+  const routeDestination = (route) => {
+    destinationRequests.push(route.request().url());
+    return route.fulfill({ status: 200, contentType: "text/html", body: "<!doctype html><title>Destination</title><p>Destination</p>" });
+  };
+  await context.route(`${LINK_DESTINATION_ORIGIN}/**`, routeDestination);
+  const address = `${LINK_DESTINATION_ORIGIN}/${"segment-".repeat(40)}end?ref=elastos&q=${"x".repeat(60)}`;
+  try {
+    const appFrame = page.frames().find((candidate) => candidate.url().includes(`/apps/${target}/`));
+    assert(appFrame, "Library frame for the link probe");
+    const token = new URLSearchParams(new URL(appFrame.url()).hash.slice(1)).get("home_token");
+    const ask = (url) => appFrame.evaluate(({ url, token }) => {
+      window.top.postMessage({ type: "home:open-external", url, homeToken: token }, "*");
+    }, { url, token });
+    const sheet = () => page.evaluate(() => {
+      const root = document.querySelector("#home-link-prompt");
+      const card = root.querySelector(".home-prompt-card").getBoundingClientRect();
+      const box = (selector) => {
+        const rect = document.querySelector(selector).getBoundingClientRect();
+        return { width: Math.round(rect.width), height: Math.round(rect.height) };
+      };
+      const address = document.querySelector("#home-link-address");
+      return {
+        hidden: root.hidden,
+        app: document.querySelector("#home-link-app").textContent,
+        host: document.querySelector("#home-link-host").textContent,
+        address: address.textContent,
+        addressWraps: address.scrollWidth <= address.clientWidth,
+        focus: document.activeElement?.id || null,
+        cardInside: card.left >= 0 && card.top >= 0 && card.right <= innerWidth && card.bottom <= innerHeight,
+        overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+        open: box("#home-link-open"),
+        cancel: box("#home-link-cancel"),
+      };
+    });
+    const shown = async (label) => {
+      await waitFor(() => page.evaluate(() => !document.querySelector("#home-link-prompt").hidden), BOOT_TIMEOUT_MS, label);
+      return sheet();
+    };
+    await ask(address);
+    const first = await shown("link sheet");
+    const textSize = await page.evaluate(measureSurface, { minTarget: MIN_TARGET_PX, minText: MIN_TEXT_PX });
+    await screenshot(page, dir, "link-sheet");
+    await ask(`${LINK_DESTINATION_ORIGIN}/swap`);
+    await sleep(SURFACE_SETTLE_MS);
+    const afterSwap = await sheet();
+    const pagesBefore = context.pages().length;
+    await page.evaluate(() => document.querySelector("#home-link-open").click());
+    await sleep(SURFACE_SETTLE_MS);
+    const afterSynthetic = { pages: context.pages().length - pagesBefore, requests: destinationRequests.length, sheet: await sheet() };
+    const popupOpened = context.waitForEvent("page", { timeout: BOOT_TIMEOUT_MS });
+    await page.locator("#home-link-open").click();
+    const popup = await popupOpened;
+    await popup.waitForLoadState("domcontentloaded");
+    const opened = {
+      url: popup.url(),
+      openerIsNull: await popup.evaluate(() => window.opener === null),
+      referrer: await popup.evaluate(() => document.referrer),
+      sheetHidden: (await sheet()).hidden,
+    };
+    await popup.close();
+    // The new tab took the foreground; Home's animations need it back.
+    await page.bringToFront();
+    await ask(`${LINK_DESTINATION_ORIGIN}/escape`);
+    await shown("link sheet for Escape");
+    await page.keyboard.press("Escape");
+    await sleep(SURFACE_SETTLE_MS);
+    const afterEscape = (await sheet()).hidden;
+    await ask(`${LINK_DESTINATION_ORIGIN}/cool-down`);
+    await sleep(SURFACE_SETTLE_MS);
+    const duringCooldown = (await sheet()).hidden;
+    await sleep(3_200);
+    await ask(`${LINK_DESTINATION_ORIGIN}/cancel`);
+    await shown("link sheet after the cool-down");
+    await page.locator("#home-link-cancel").click();
+    await sleep(SURFACE_SETTLE_MS);
+    const afterCancel = (await sheet()).hidden;
+    return {
+      address,
+      first,
+      smallText: textSize.smallText.filter((entry) => /home-link|home-prompt/.test(entry.selector)),
+      afterSwap,
+      afterSynthetic,
+      opened,
+      afterEscape,
+      duringCooldown,
+      afterCancel,
+      destinationRequests: [...destinationRequests],
+      pagesAfter: context.pages().length,
+      pagesBefore,
+    };
+  } finally {
+    await context.unroute(`${LINK_DESTINATION_ORIGIN}/**`, routeDestination);
+  }
+}
+
+function externalLinkFailures(run) {
+  const probe = run.externalLink;
+  const label = `${run.engine}/${run.profile}/external-link`;
+  if (!probe) {
+    return [`${label}: the link probe did not run`];
+  }
+  const failures = [];
+  const { first } = probe;
+  if (first.hidden || first.app !== "Library" || first.host !== "links.example" || first.address !== probe.address) {
+    failures.push(`${label}: the sheet must name Library and show the whole address. Got ${JSON.stringify(first)}`);
+  }
+  if (first.focus !== "home-link-cancel") {
+    failures.push(`${label}: focus must start on Cancel. Got ${first.focus}`);
+  }
+  if (!first.cardInside || first.overflow || !first.addressWraps) {
+    failures.push(`${label}: the sheet must fit the screen with the address wrapped. Got ${JSON.stringify(first)}`);
+  }
+  for (const button of ["open", "cancel"]) {
+    if (Math.min(first[button].width, first[button].height) < MIN_TARGET_PX) {
+      failures.push(`${label}: ${button} must be at least ${MIN_TARGET_PX} px. Got ${JSON.stringify(first[button])}`);
+    }
+  }
+  if (probe.smallText.length) {
+    failures.push(`${label}: sheet text under ${MIN_TEXT_PX} px: ${JSON.stringify(probe.smallText)}`);
+  }
+  if (probe.afterSwap.address !== probe.address || probe.afterSwap.hidden) {
+    failures.push(`${label}: a second request must not change the open sheet. Got ${JSON.stringify(probe.afterSwap)}`);
+  }
+  if (probe.afterSynthetic.pages !== 0 || probe.afterSynthetic.requests !== 0 || probe.afterSynthetic.sheet.hidden) {
+    failures.push(`${label}: a synthetic Open click must open nothing and keep the sheet. Got ${JSON.stringify(probe.afterSynthetic)}`);
+  }
+  if (probe.opened.url !== probe.address || !probe.opened.openerIsNull || probe.opened.referrer !== "" || !probe.opened.sheetHidden) {
+    failures.push(`${label}: Open link must open exactly the address with no opener and no referrer. Got ${JSON.stringify(probe.opened)}`);
+  }
+  if (!probe.afterEscape || !probe.duringCooldown || !probe.afterCancel) {
+    failures.push(`${label}: Escape and Cancel must close the sheet, and the app must wait out its cool-down. Got ${JSON.stringify({ afterEscape: probe.afterEscape, duringCooldown: probe.duringCooldown, afterCancel: probe.afterCancel })}`);
+  }
+  if (JSON.stringify(probe.destinationRequests) !== JSON.stringify([probe.address]) || probe.pagesAfter !== probe.pagesBefore) {
+    failures.push(`${label}: the destination must be requested once, only after Open link. Got ${JSON.stringify(probe.destinationRequests)}`);
+  }
+  return failures;
 }
 
 // One Back as the system button takes it: a joint-session-history step.
@@ -1861,7 +2025,26 @@ async function runProfile(browser, engineId, profile, origin) {
   } finally {
     await context.close();
   }
-  return { engine: engineId, profile: profile.id, viewport: profile.viewport, viewportMeta, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, link: linkProbe, touchMenu: touchMenuProbe, inboxOpen: inboxOpenProbe, home: homeProbe, homeEdit: homeEditProbe, back: backProbe, promptClose: promptCloseProbe, backRaces: backRacesProbe, bootRetries };
+  return { engine: engineId, profile: profile.id, viewport: profile.viewport, viewportMeta, surfaces, dock: dockProbe, stage: stageProbe, keyboard: keyboardProbe, spotlight: spotlightProbe, sheetHandles: sheetHandleProbe, link: linkProbe, touchMenu: touchMenuProbe, inboxOpen: inboxOpenProbe, home: homeProbe, homeEdit: homeEditProbe, back: backProbe, promptClose: promptCloseProbe, backRaces: backRacesProbe, externalLink: await runExternalLinkProbe(browser, profile, origin, dir), bootRetries };
+}
+
+// The link probe opens a real new tab, so it runs on its own Home: the layout
+// run above never sees a tab switch.
+async function runExternalLinkProbe(browser, profile, origin, dir) {
+  const context = await browser.newContext({
+    viewport: profile.viewport,
+    deviceScaleFactor: profile.deviceScaleFactor,
+    isMobile: profile.isMobile,
+    hasTouch: profile.hasTouch,
+    reducedMotion: "reduce",
+  });
+  try {
+    const { page, frame } = await bootHome(context, origin);
+    await openWindow(frame, "library");
+    return await probeExternalLink(page, dir, "library");
+  } finally {
+    await context.close();
+  }
 }
 
 // Open on an Inbox rail entry reaches Home as the host's open-target command
@@ -3283,7 +3466,7 @@ try {
         }
         const run = await runProfile(browser, engineId, profile, origin);
         report.runs.push(run);
-        failures.push(...shellFailures(run), ...viewportMetaFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run), ...phoneTouchMenuFailures(run), ...phoneHomeFailures(run), ...phoneHomeEditFailures(run), ...phoneBackFailures(run), ...promptCloseFailures(run), ...backRaceFailures(run));
+        failures.push(...shellFailures(run), ...viewportMetaFailures(run), ...phoneDockFailures(run), ...phoneStageFailures(run), ...phoneKeyboardFailures(run), ...phoneSpotlightFailures(run), ...phoneSheetHandleFailures(run), ...phoneLinkFailures(run), ...phoneTouchMenuFailures(run), ...phoneHomeFailures(run), ...phoneHomeEditFailures(run), ...phoneBackFailures(run), ...promptCloseFailures(run), ...backRaceFailures(run), ...externalLinkFailures(run));
         console.log(`[home-phone-layout] ${engineId}/${profile.id} ${summarize(run)}`);
       }
       const closedStream = await runClosedStream(browser, engineId, origin);

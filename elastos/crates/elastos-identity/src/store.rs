@@ -395,6 +395,48 @@ fn derive_storage_key(device_key: &[u8; 32]) -> [u8; 32] {
     okm
 }
 
+/// Salt that separates the named sign-in decoy key from every other key this
+/// Home derives from `device.key`.
+const NAMED_SIGN_IN_DECOY_SALT: &[u8] = b"elastos-named-sign-in-decoy/v1";
+/// Credential ID lengths in bytes that authenticators return in practice:
+/// platform passkeys and password managers (16, 20, 32), Android
+/// non-discoverable credentials (65), and security-key key handles that wrap
+/// the private key (48 to 256). Real IDs can be 1 to 1024 bytes; this set only
+/// keeps a decoy from standing out by length among common authenticators.
+const DECOY_CREDENTIAL_ID_LENGTHS: [usize; 14] =
+    [16, 20, 32, 48, 64, 65, 70, 72, 80, 96, 128, 160, 192, 256];
+const MAX_DECOY_CREDENTIAL_ID_BYTES: usize = 256;
+const MAX_DECOY_CREDENTIALS: usize = 2;
+
+/// Deterministic decoy credential IDs for one named sign-in account key,
+/// sorted as the real allow-list is.
+///
+/// The PRF is HKDF-SHA256 (HMAC-SHA256) keyed by `HKDF-Extract(salt,
+/// device.key)`, with the account key as `info`. `device.key` is this Home's
+/// existing protected secret (0600, the root of the encrypted credential
+/// store), so the decoys need no new state, survive restarts, differ per Home
+/// and per name, and cannot be computed by a caller.
+fn named_sign_in_decoys(device_key: &[u8; 32], account_key: &str) -> Vec<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    const SLOT: usize = 1 + MAX_DECOY_CREDENTIAL_ID_BYTES;
+    let hk = Hkdf::<Sha256>::new(Some(NAMED_SIGN_IN_DECOY_SALT), device_key);
+    // One count byte, then per decoy one length byte and the longest ID.
+    let mut okm = Zeroizing::new([0u8; 1 + MAX_DECOY_CREDENTIALS * SLOT]);
+    hk.expand(account_key.as_bytes(), okm.as_mut())
+        .expect("HKDF output length is within bounds");
+    let count = 1 + usize::from(okm[0]) % MAX_DECOY_CREDENTIALS;
+    let mut decoys: Vec<String> = (0..count)
+        .map(|index| {
+            let start = 1 + index * SLOT;
+            let length = DECOY_CREDENTIAL_ID_LENGTHS
+                [usize::from(okm[start]) % DECOY_CREDENTIAL_ID_LENGTHS.len()];
+            URL_SAFE_NO_PAD.encode(&okm[start + 1..start + 1 + length])
+        })
+        .collect();
+    decoys.sort_unstable();
+    decoys
+}
+
 fn nickname_path(data_dir: &Path) -> PathBuf {
     data_dir.join("did").join("nickname.enc")
 }
@@ -597,6 +639,13 @@ impl IdentityStore {
         hex::encode(self.device_key.as_ref())
     }
 
+    /// Stable decoy credential IDs a named sign-in lists when the name has no
+    /// eligible account. They only stop casual enumeration of unknown names;
+    /// they do not hide whether a guessed name has passkeys.
+    pub fn named_sign_in_decoy_ids(&self, account_key: &str) -> Vec<String> {
+        named_sign_in_decoys(&self.device_key, account_key)
+    }
+
     /// Access the underlying identity data (if loaded).
     pub fn data(&self) -> Option<&IdentityData> {
         self.data.as_ref()
@@ -754,6 +803,46 @@ mod tests {
         assert!(store2.is_registered());
         assert_eq!(store2.user_id(), Some(user_id.as_str()));
         assert_eq!(store2.get_credentials().len(), 1);
+    }
+
+    #[test]
+    fn named_sign_in_decoys_are_stable_per_home_and_name() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let dir = tempfile::tempdir().unwrap();
+        let store = IdentityStore::new(dir.path()).unwrap();
+        let first = store.named_sign_in_decoy_ids("alice");
+        assert!((1..=MAX_DECOY_CREDENTIALS).contains(&first.len()));
+        for id in &first {
+            let bytes = URL_SAFE_NO_PAD.decode(id).unwrap();
+            assert!(DECOY_CREDENTIAL_ID_LENGTHS.contains(&bytes.len()));
+        }
+        // Stable across calls and across a reopened store (the key is device.key).
+        assert_eq!(store.named_sign_in_decoy_ids("alice"), first);
+        let reopened = IdentityStore::new(dir.path()).unwrap();
+        assert_eq!(reopened.named_sign_in_decoy_ids("alice"), first);
+        // Different per name and per Home.
+        assert_ne!(store.named_sign_in_decoy_ids("bob"), first);
+        let other_home = tempfile::tempdir().unwrap();
+        let other = IdentityStore::new(other_home.path()).unwrap();
+        assert_ne!(other.named_sign_in_decoy_ids("alice"), first);
+        // Over many names both decoy counts and several lengths occur, so the
+        // shape does not single out decoys.
+        let mut counts = std::collections::BTreeSet::new();
+        let mut lengths = std::collections::BTreeSet::new();
+        for index in 0..64 {
+            let ids = store.named_sign_in_decoy_ids(&format!("name {index}"));
+            counts.insert(ids.len());
+            for id in ids {
+                lengths.insert(URL_SAFE_NO_PAD.decode(id).unwrap().len());
+            }
+        }
+        assert_eq!(counts.len(), MAX_DECOY_CREDENTIALS);
+        assert!(lengths.len() > 4);
+        assert!(lengths.iter().any(|length| *length >= 96), "{lengths:?}");
+        for index in 0..64 {
+            let ids = store.named_sign_in_decoy_ids(&format!("name {index}"));
+            assert!(ids.windows(2).all(|pair| pair[0] <= pair[1]), "{ids:?}");
+        }
     }
 
     fn persistence_credential(id: &str, sign_count: u32) -> StoredCredential {

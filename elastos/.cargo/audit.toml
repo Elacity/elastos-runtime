@@ -1,0 +1,15 @@
+# Reviewed cargo-audit exceptions. The CI job `cargo-audit` runs from elastos/ and reads this file
+# for every tracked Cargo.lock. Each entry says why it does not apply and which issue removes it.
+[advisories]
+ignore = [
+  # zip 2.4.2 (elastos-server): the zip crate's own ZipArchive::extract and
+  # ZipStreamReader::extract write entries, symlinks and Unix permission bits to disk. ElastOS
+  # never calls them. Library reads each entry with ZipArchive::by_index; its own extraction
+  # (extract_zip_archive, write_selected_archive_file in library.rs) refuses symlink entries and
+  # writes bytes without archive permission bits; ZipWriter builds archives in memory.
+  # Upgrade to zip >= 9.0.1 (upstream GHSA-4684-h2q9-2vcp is fixed in 9.0.1, not 9.0.0) and
+  # remove these three lines: #414.
+  "RUSTSEC-2026-0367",
+  "RUSTSEC-2026-0368",
+  "RUSTSEC-2026-0369",
+]
