@@ -3331,7 +3331,7 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
         did = "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
         private = ["/home/ci-person", "ci-person", "observer root", "Application Support", "/opt/build-cache",
                    "eyJhbGciOiJFZERTQSJ9.payload-77", "s3cr3t-value", "hunter2pass", hexdigest, did,
-                   "QWxhZGRpbjpvcGVuIHNlc2FtZQ9xYz"]
+                   "QWxhZGRpbjpvcGVuIHNlc2FtZQ9xYz", "q-secret-9"]
 
         def message(home, data):
             return (f"[Errno 2] No such file or directory: '{data / 'finite-control/request.json'}' "
@@ -3339,7 +3339,7 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
                     f"/opt/build-cache/run-41/llama.bin and file:///home/ci-person/x; "
                     "Authorization: Bearer eyJhbGciOiJFZERTQSJ9.payload-77 token=s3cr3t-value "
                     f"password: hunter2pass digest {hexdigest} holder did:key:{did} "
-                    "blob QWxhZGRpbjpvcGVuIHNlc2FtZQ9xYz")
+                    "blob QWxhZGRpbjpvcGVuIHNlc2FtZQ9xYz body {\"token\": \"q-secret-9\"}")
 
         def assert_redacted(text, failure, finite=False):
             for value in private:
@@ -3426,6 +3426,34 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
                          "3/4 samples and/or a // b"):
                 with self.subTest(text=text):
                     self.assertEqual(self.journey["observer_failure"]("census", OSError(text))["message"], text)
+
+    def test_observer_failure_redacts_secret_values_under_quoted_and_escaped_keys(self):
+        # Each case: the error text, the secret that must not survive, and the
+        # saved cause. The key and the names around it stay readable.
+        cases = (
+            # The reviewer's case: one letter, so only the exact saved text proves it.
+            ('{"token":"x"}', None, '{"token":"<redacted>"}'),
+            ('{"api_key": "abc9"}', "abc9", '{"api_key": "<redacted>"}'),
+            ("{'password': 'p4ss'}", "p4ss", "{'password': '<redacted>'}"),
+            ('cause "secret" :  "s-9 9" in census', "s-9", 'cause "secret" : "<redacted>" in census'),
+            (r'body {\"token\":\"xq7\"}', "xq7", r'body {\"token\":\"<redacted>\"}'),
+            ('{"access_token":"at1","phase":"stage_engine_running"}', "at1",
+             '{"access_token":"<redacted>","phase":"stage_engine_running"}'),
+            (r'{"token":"a\"b c","stage":"census"}', "b c", '{"token":"<redacted>","stage":"census"}'),
+            (r'{\"token\":\"a1\\\"b2\",\"phase\":\"census\"}', "b2",
+             r'{\"token\":\"<redacted>\",\"phase\":\"census\"}'),
+            ('"client_secret" = \'c c\' tail', "c c", '"client_secret" = \'<redacted>\' tail'),
+            ('token: "no closing quote', "closing", 'token: "<redacted>"'),
+            ("token = x9 then", "x9", "token = <redacted> then"),
+            ("{token:k5}", "k5", "{token:<redacted>}"),
+        )
+        with mock.patch.dict(os.environ, {"HOME": "/home/runner"}):
+            for text, secret, saved in cases:
+                with self.subTest(text=text):
+                    failure = self.journey["observer_failure"]("stage_engine_running", OSError(text))
+                    self.assertEqual(failure["message"], saved)
+                    if secret:
+                        self.assertNotIn(secret, failure["message"])
 
     def test_repair_control_failure_reaches_its_record(self):
         owner = self.journey["RepairRuntime"].__new__(self.journey["RepairRuntime"])

@@ -95,10 +95,19 @@ PATH_START = "|".join((
 ))
 # The user part of a URL (scheme://user:password@host) is a credential.
 URL_USERINFO = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)[^\s/?#'\"`<>]*@")
+# The value of a secret-named key. The key may be bare, quoted or
+# JSON-escaped (token=x, "token": "x", 'password': 'p', \"token\":\"x\").
+# A quoted value ends at the same quote with no backslash before it, so an
+# escaped quote inside it stays redacted; with no closing quote the value
+# takes the rest of the line. A bare value ends at a space, a quote, a comma,
+# a semicolon or a closing bracket.
+SECRET_VALUE = re.compile(
+    rf"""\b({SECRET_NAME})(\\*["']?\s*[=:]\s*)"""
+    r"""(?:(\\*["'])(?:.*?(?<!\\)\3|.*)|(?!(?:Bearer|Basic|Token)\s)[^\s'"`,;}\]]+)""", re.I)
 REDACTIONS = (
     # Credentials after an auth scheme or a secret-named key (token=..., password: ...).
-    (re.compile(r"\b(Bearer|Basic|Token)\s+[^\s'\",;]+", re.I), r"\1 <redacted>"),
-    (re.compile(rf"\b({SECRET_NAME})(\s*[=:]\s*)(?!(?:Bearer|Basic|Token)\s)(['\"]?)[^\s'\",;]+\3", re.I), r"\1\2<redacted>"),
+    (re.compile(r"\b(Bearer|Basic|Token)\s+(?![=:])[^\s'\",;]+", re.I), r"\1 <redacted>"),
+    (SECRET_VALUE, lambda found: found[1] + found[2] + ((found[3] or "") + "<redacted>" + (found[3] or ""))),
     # A DID names a key, so a person or a device: keep only its method.
     (re.compile(r"\bdid:([a-z0-9]+):[^\s'\",;]+"), r"did:\1:<redacted>"),
     # Long hex, base64 or base58 runs: digests, keys, tokens, CIDs, unit and session ids.
