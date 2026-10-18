@@ -1823,6 +1823,16 @@ async function assertKeyboardJourney(page) {
   assert(await content.getAttribute("role") === "listbox", "Library items must expose a selectable collection");
   assert(await content.getAttribute("aria-multiselectable") === "true", "Library must expose multiple selection");
   assert(await rows.first().getAttribute("role") === "option", "Library rows must expose selectable item semantics");
+  const initialTabOrder = await rows.evaluateAll((items) => ({
+    rowFocused: items.some((item) => item.contains(document.activeElement)),
+    contentTabIndex: document.getElementById("content").tabIndex,
+    tabStops: items.filter((item) => item.tabIndex >= 0)
+      .map((item) => ({ uri: item.dataset.uri, tabIndex: item.tabIndex })),
+  }));
+  assert(!initialTabOrder.rowFocused, "Initial Tab order must be checked before a Library row receives focus");
+  assert(initialTabOrder.contentTabIndex === -1 && initialTabOrder.tabStops.length === 1
+    && initialTabOrder.tabStops[0].uri === await rowUri(0) && initialTabOrder.tabStops[0].tabIndex === 0,
+  "The first Library row must be the only initial sequential tab stop before focus can repair it");
   await page.locator("#more-button").focus();
   await page.keyboard.press("Tab");
   assert(await focusedUri() === await rowUri(0), "Tab must enter Library at its current item");

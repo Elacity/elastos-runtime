@@ -371,7 +371,15 @@ async function run() {
         const first = content?.querySelector(".item");
         if (!first || content.getAttribute("aria-busy") !== "true") return;
         observer.disconnect();
-        window.__libraryEarlyEnd = { initialCount: content.querySelectorAll(".item").length };
+        const items = Array.from(content.querySelectorAll(".item"));
+        window.__libraryEarlyEnd = {
+          initialCount: items.length,
+          initialRowFocused: items.some((item) => item.contains(document.activeElement)),
+          initialContentTabIndex: content.tabIndex,
+          initialFirstUri: first.dataset.uri,
+          initialTabStops: items.filter((item) => item.tabIndex >= 0)
+            .map((item) => ({ uri: item.dataset.uri, tabIndex: item.tabIndex })),
+        };
         first.focus();
         first.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true, cancelable: true }));
       });
@@ -414,6 +422,11 @@ async function run() {
     }));
     assert(earlyEnd.initialCount > 0 && earlyEnd.initialCount < objectCount,
       "End must be pressed while only part of the folder has rendered");
+    assert(earlyEnd.initialRowFocused === false,
+      "Initial chunk Tab order must be captured before a Library row receives focus");
+    assert(earlyEnd.initialContentTabIndex === -1 && earlyEnd.initialTabStops.length === 1
+      && earlyEnd.initialTabStops[0].uri === earlyEnd.initialFirstUri && earlyEnd.initialTabStops[0].tabIndex === 0,
+    "The first rendered row must be the only initial sequential tab stop before focus can repair it");
     assert(earlyEnd.focusedUri === expectedLastUri && earlyEnd.lastUri === expectedLastUri,
       "End during rendering must focus the last object in the complete folder");
     assert(earlyEnd.selected.length === 1 && earlyEnd.selected[0] === expectedLastUri,
