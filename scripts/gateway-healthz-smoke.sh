@@ -2,7 +2,7 @@
 # Start one elastos gateway and require the readiness that
 # docs/LAUNCHER_CONTRACT.md "Readiness and Home URL" defines:
 #   GET http://localhost:8090/healthz returns HTTP 200 and the two bytes OK
-#   while this gateway pid owns {data}/host-process.lock with role gateway
+#   while this gateway pid holds {data}/host-process.lock with role gateway
 #   or gateway-public.
 # By default the gateway gets the contract command
 # `elastos gateway --addr localhost:8090` and the probe uses the contract URL.
