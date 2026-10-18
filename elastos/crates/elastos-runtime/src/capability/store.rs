@@ -314,7 +314,15 @@ impl CapabilityStore {
                         self.write_epoch(0)?;
                         0
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        return Err(std::io::Error::new(error.kind(), format!(
+                            "Capability store startup refused: cannot load revocation epoch at {}: {error}. \
+                             Stop all Runtime processes that share this data directory and preserve the capability store. \
+                             Restore the latest committed epoch from trusted valid state. \
+                             If that value cannot be established, keep Runtime stopped and seek recovery help.",
+                            path.join("epoch").display()
+                        )));
+                    }
                 };
                 self.set_epoch(epoch);
             }
@@ -687,21 +695,71 @@ mod tests {
             let store = CapabilityStore::with_persistence(directory.path())
                 .await
                 .unwrap();
+            for _ in 0..7 {
+                store.advance_epoch().unwrap();
+            }
             let epoch_path = directory.path().join("epoch");
+            let trusted_epoch = fs::read(&epoch_path).unwrap();
             if missing {
                 fs::remove_file(&epoch_path).unwrap();
             } else {
                 fs::write(&epoch_path, "invalid").unwrap();
             }
-            assert!(!store.is_epoch_valid(0));
+            assert!(!store.is_epoch_valid(7));
             assert!(store.advance_epoch().is_err());
             assert!(store.persist().await.is_err());
-            assert!(CapabilityStore::with_persistence(directory.path())
+            let error = CapabilityStore::with_persistence(directory.path())
                 .await
-                .is_err());
-            assert_eq!(store.current_epoch(), 0);
-            fs::write(&epoch_path, "0").unwrap();
-            assert_eq!(store.advance_epoch().unwrap(), 1);
+                .err()
+                .expect("startup must refuse unreadable durable state");
+            assert_eq!(
+                error.kind(),
+                if missing {
+                    std::io::ErrorKind::NotFound
+                } else {
+                    std::io::ErrorKind::InvalidData
+                }
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("Capability store startup refused"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&epoch_path.display().to_string()),
+                "{message}"
+            );
+            assert!(message.contains("Stop all Runtime processes"), "{message}");
+            assert!(
+                message.contains("preserve the capability store"),
+                "{message}"
+            );
+            assert!(
+                message.contains("Restore the latest committed epoch from trusted valid state"),
+                "{message}"
+            );
+            assert!(
+                message.contains("keep Runtime stopped and seek recovery help"),
+                "{message}"
+            );
+            if missing {
+                assert!(!epoch_path.exists());
+            } else {
+                assert_eq!(fs::read_to_string(&epoch_path).unwrap(), "invalid");
+            }
+            assert!(directory.path().join("epoch.lock").is_file());
+            assert_eq!(store.current_epoch(), 7);
+            drop(store);
+
+            // Restore the last committed value from this fixture's trusted state.
+            fs::write(&epoch_path, trusted_epoch).unwrap();
+            let repaired = CapabilityStore::with_persistence(directory.path())
+                .await
+                .unwrap();
+            assert_eq!(repaired.current_epoch(), 7);
+            assert!(!repaired.is_epoch_valid(6));
+            assert!(repaired.is_epoch_valid(7));
+            assert_eq!(repaired.advance_epoch().unwrap(), 8);
         }
     }
 
