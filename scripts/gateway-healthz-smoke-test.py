@@ -27,6 +27,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SMOKE = ROOT / "scripts" / "gateway-healthz-smoke.sh"
 
+# No test may depend on how fast the stub starts. A slow python3 start (the
+# macOS /usr/bin/python3 shim, a cold cache, a busy host) can take seconds.
+# Tests that end on an event (an answer, a refusal, the stub's exit) give the
+# smoke the largest deadline it accepts, so the deadline never ends them.
+# Tests that need the deadline to pass first wait for the stub's own event
+# before the first probe (see gated_curl_path). HANG_GUARD only stops a hung
+# run; no passing run comes near it.
+NO_DEADLINE = "9999"
+HANG_GUARD = 600
+
 STUB = textwrap.dedent(
     """\
     #!/usr/bin/env python3
@@ -48,6 +58,14 @@ STUB = textwrap.dedent(
             time.sleep(60)
             os._exit(0)
     if mode == "exit":
+        sys.exit(1)
+    if mode == "exit-after-probe":
+        # Stay alive until the smoke has run curl once, then exit. The smoke
+        # must then report the exit; no deadline decides the result.
+        probed = os.environ["SMOKE_PROBED"]
+        give_up = time.monotonic() + 600
+        while not os.path.exists(probed) and time.monotonic() < give_up:
+            time.sleep(0.05)
         sys.exit(1)
     if mode == "secret":
         print("attach_secret=planted-secret", flush=True)
@@ -120,7 +138,12 @@ STUB = textwrap.dedent(
             # lookup that can take seconds on macOS. The smoke does not need it.
             socketserver.TCPServer.server_bind(self)
             self.server_name, self.server_port = host, int(port)
-    Server((host, int(port)), Handler).serve_forever()
+    server = Server((host, int(port)), Handler)
+    if "SMOKE_READY" in os.environ:
+        # The socket is bound and listening, so a probe now reaches the stub.
+        with open(os.environ["SMOKE_READY"], "w") as handle:
+            handle.write("ready")
+    server.serve_forever()
     """
 )
 
@@ -170,7 +193,7 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
         self.port = free_port()
         self.child_pid = Path(self.tmp.name) / "child.pid"
 
-    def env(self, stub, addr=None, deadline="3", **extra):
+    def env(self, stub, addr=None, deadline=NO_DEADLINE, **extra):
         env = os.environ.copy()
         env["SMOKE_STUB"] = stub
         env["SMOKE_CHILD_PID"] = str(self.child_pid)
@@ -179,14 +202,36 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
         env.update(extra)
         return env
 
-    def run_smoke(self, stub, addr=None, deadline="3", **extra):
+    def run_smoke(self, stub, addr=None, deadline=NO_DEADLINE, **extra):
         return subprocess.run(
             ["bash", str(SMOKE), str(self.binary)],
             env=self.env(stub, addr, deadline, **extra),
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=HANG_GUARD,
         )
+
+    def gated_curl_path(self, marker):
+        # A curl that waits until the stub has written to marker, then runs the
+        # real curl. The smoke checks its deadline only after a probe returns,
+        # so the first probe always sees the stub at that point, however slow
+        # the stub was to start.
+        real_curl = shutil.which("curl")
+        self.assertIsNotNone(real_curl, "this host has no curl")
+        shim = Path(self.tmp.name) / "gated-bin"
+        shim.mkdir()
+        curl = shim / "curl"
+        # The wait stops after HANG_GUARD seconds so a broken run cannot
+        # leave it behind.
+        curl.write_text('#!/bin/sh\n'
+                        'i=0\n'
+                        f'while [ ! -s "{marker}" ] && [ "$i" -lt {HANG_GUARD * 20} ]; do\n'
+                        '    sleep 0.05\n'
+                        '    i=$((i + 1))\n'
+                        'done\n'
+                        f'exec "{real_curl}" "$@"\n')
+        curl.chmod(0o755)
+        return f"{shim}{os.pathsep}{os.environ.get('PATH', '')}"
 
     def serve_ok(self, family, host, port):
         class Server(HTTPServer):
@@ -210,7 +255,7 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
         self.assertIn(f"fact: GET http://[::1]:{self.port}/healthz: no answer", result.stdout)
 
     def test_503_then_200_is_ready(self):
-        result = self.run_smoke("ok", deadline="10", SMOKE_503_COUNT="2")
+        result = self.run_smoke("ok", SMOKE_503_COUNT="2")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_localhost_name_is_probed_as_given(self):
@@ -234,20 +279,25 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
         return f"{shim}{os.pathsep}{os.environ.get('PATH', '')}"
 
     def test_default_is_the_contract_command(self):
+        # The stub writes its arguments first, stays alive until the smoke has
+        # probed once, then exits. The smoke ends on that exit, not on its
+        # deadline, so a slow stub start cannot change the result. Nothing
+        # listens or connects, so it passes whether port 8090 is free or not.
         args = Path(self.tmp.name) / "args.json"
         curl_log = Path(self.tmp.name) / "curl-args.txt"
-        env = self.env("exit", SMOKE_ARGS=str(args), PATH=self.no_network_path(curl_log))
+        env = self.env("exit-after-probe", SMOKE_ARGS=str(args),
+                       SMOKE_PROBED=str(curl_log), PATH=self.no_network_path(curl_log))
         env.pop("ELASTOS_GATEWAY_ADDR")
         result = subprocess.run(["bash", str(SMOKE), str(self.binary)], env=env,
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(args.read_text(), '["gateway", "--addr", "localhost:8090"]')
-        self.assertIn("GET http://localhost:8090/healthz", result.stderr)
-        if curl_log.exists():
-            urls = [line for line in curl_log.read_text().splitlines()
-                    if line.startswith("http")]
-            self.assertTrue(urls, curl_log.read_text())
-            self.assertEqual(set(urls), {"http://localhost:8090/healthz"})
+        self.assertIn("gateway exited before GET http://localhost:8090/healthz was ready",
+                      result.stderr)
+        urls = [line for line in curl_log.read_text().splitlines()
+                if line.startswith("http")]
+        self.assertTrue(urls, curl_log.read_text())
+        self.assertEqual(set(urls), {"http://localhost:8090/healthz"})
 
     @unittest.skipUnless(ipv6_loopback(), "this host has no IPv6 loopback")
     def test_ipv6_loopback_ok(self):
@@ -262,7 +312,9 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
         # [::1]. Another process on 127.0.0.1 then answers the IPv4 URL.
         port = free_port()
         self.serve_ok(socket.AF_INET, "127.0.0.1", port)
-        result = self.run_smoke("ok", addr=f"localhost:{port}", SMOKE_LOCALHOST_BIND="::1")
+        ready = Path(self.tmp.name) / "stub-ready"
+        result = self.run_smoke("ok", addr=f"localhost:{port}", SMOKE_LOCALHOST_BIND="::1",
+                                SMOKE_READY=str(ready), PATH=self.gated_curl_path(ready))
         if f"answered on 127.0.0.1:{port}" in result.stderr:
             self.skipTest("curl on this host chose 127.0.0.1 for localhost")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -273,7 +325,11 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
     # Not ready.
 
     def test_503_until_deadline_is_not_ready(self):
-        result = self.run_smoke("always-503", deadline="2")
+        # The first probe waits until the stub listens, so it gets a 503
+        # before the 1 s deadline can pass.
+        ready = Path(self.tmp.name) / "stub-ready"
+        result = self.run_smoke("always-503", deadline="1", SMOKE_READY=str(ready),
+                                PATH=self.gated_curl_path(ready))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("last: HTTP 503", result.stderr)
 
@@ -358,7 +414,7 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
         self.assertIn(f"answered on [::1]:{port}", result.stderr)
 
     def test_early_exit_is_not_ready(self):
-        result = self.run_smoke("exit", deadline="5")
+        result = self.run_smoke("exit")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("exited before", result.stderr)
 
@@ -412,7 +468,7 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
     def test_missing_binary_exits_one(self):
         missing = Path(self.tmp.name) / "missing"
         result = subprocess.run(["bash", str(SMOKE), str(missing)],
-                                capture_output=True, text=True, timeout=10)
+                                capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, 1, result.stderr)
 
     # Cleanup stops the whole process group on every exit path.
@@ -427,31 +483,37 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_child_stopped(result)
 
-    # These two give the stub 3 seconds to start and fork before the smoke
-    # times out. With 1 second, a slow or busy host (such as a hosted Intel
-    # Mac) can time out before the child exists, and the test fails.
+    # These two need the deadline to pass after the stub has forked. The first
+    # probe waits until the child has written its pid, so the 1 s deadline can
+    # only pass after the child exists, however slow the host is.
 
     def test_group_is_stopped_after_timeout(self):
-        result = self.run_smoke("fork", deadline="3")
+        result = self.run_smoke("fork", deadline="1",
+                                PATH=self.gated_curl_path(self.child_pid))
         self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("was not ready within 1s", result.stderr)
         self.assert_child_stopped(result)
 
     def test_child_ignoring_term_is_killed(self):
-        result = self.run_smoke("ignore-term", deadline="3")
+        result = self.run_smoke("ignore-term", deadline="1",
+                                PATH=self.gated_curl_path(self.child_pid))
         self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("was not ready within 1s", result.stderr)
         self.assert_child_stopped(result)
 
     def test_group_is_stopped_when_the_smoke_is_interrupted(self):
         proc = subprocess.Popen(["bash", str(SMOKE), str(self.binary)],
-                                env=self.env("fork", deadline="60"),
+                                env=self.env("fork"),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            for _ in range(100):
-                if self.child_pid.exists() and self.child_pid.read_text():
-                    break
-                time.sleep(0.1)
+            # Signal only after the child exists, however long that takes.
+            guard = time.monotonic() + HANG_GUARD
+            while not (self.child_pid.exists() and self.child_pid.read_text()):
+                self.assertIsNone(proc.poll(), "the smoke ended before the stub forked")
+                self.assertLess(time.monotonic(), guard, "the stub never forked")
+                time.sleep(0.05)
             proc.send_signal(signal.SIGTERM)
-            _, stderr = proc.communicate(timeout=20)
+            _, stderr = proc.communicate(timeout=HANG_GUARD)
         finally:
             if proc.poll() is None:
                 proc.kill()
