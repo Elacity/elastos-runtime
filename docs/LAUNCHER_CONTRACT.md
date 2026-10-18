@@ -47,21 +47,41 @@ that path was removed or replaced after the gateway took its lock, and when
 the gateway has released it. A gateway that `elastos serve` starts keeps the
 `serve` lock, so its `/healthz` returns 503.
 
-What proves ownership: the process that owns the listening socket answers,
-and it checks its own state. It holds an exclusive lock (`flock`) on an open
-file, `{data}/host-process.lock` names that same file now (the same device
-and inode), and a new open of that file cannot take the lock. The JSON record
-in the file is not proof. Any process that runs as the same user can rewrite
-it, so `/healthz` does not read it, and a gateway does not skip taking the
-lock because the record names its pid.
+What proves that this gateway holds the lock: the process that owns the
+listening socket answers, and it checks its own state. It holds an exclusive
+lock (`flock`) on an open file, `{data}/host-process.lock` names that same file
+now (the same device and inode), and a new open of that file cannot take the
+lock. The JSON record in the file is not proof. Any process that runs as the
+same user can rewrite it, so `/healthz` does not read it, and a gateway does
+not skip taking the lock because the record names its pid.
+
+The lock proves possession, not identity. A process that holds the `flock`
+has the host lock. That does not prove that the holder is a gateway, or that
+it is ElastOS. Any process that runs as the same user can open
+`{data}/host-process.lock` and hold the lock. While it holds the lock, a
+gateway for that data directory does not start (see "Data directory and
+lock"), and a gateway that does not hold the lock itself returns 503 from
+`/healthz`. A gateway can prove only that it holds the lock itself, so `OK` is
+a statement that the gateway makes about itself.
+
+The same limit applies to a Home terminal that the gateway starts. The gateway
+gives it `ELASTOS_GATEWAY_HOST_PID`, its own pid, and
+`ELASTOS_GATEWAY_HOST_LOCK_FD`, a descriptor of the open file that holds the
+lock. The terminal checks that its parent has that pid and that the descriptor
+holds the lock now. This proves lock possession, not that the parent is the
+gateway. A process that runs as the same user and holds the lock can give the
+same variables and its descriptor to a child of its own, and that child's
+check accepts them.
 
 The process that answers on the port gives this reply about its own data
 directory. If an ElastOS gateway for another data directory already listens on
-the port, that gateway also returns `OK`. The reply does not name the process.
+the port, that gateway also returns `OK`, and so can any other program that
+listens on the port. The reply does not name the process.
 Before it trusts `OK`, a supervisor confirms that the child it started is still
 running and that `{data}/host-process.lock` records the pid of that child with
-role `gateway`. That record is a hint, not proof, for the reason above. A reply
-that names the lock owner is a gap in this contract.
+role `gateway`. That record is a hint, not proof, for the reasons above: a
+process that is not that child can hold the lock and write a record that names
+the child. A reply that names the lock holder is a gap in this contract.
 
 The Home origin is:
 
@@ -100,6 +120,9 @@ The lock record stores `pid`, `role`, and `addr`. `addr` is the `--addr`
 value as given, for example `localhost:8090`. The record is for people and
 tools to read; the `flock` on the file is the lock. A second live host for the
 same data directory exits 1. Its error contains `another ElastOS host already owns`.
+The gateway gives this error when any process holds the lock, also a process
+that is not ElastOS. The error names the holder from the record, and the
+record can be false.
 
 ## Stop
 

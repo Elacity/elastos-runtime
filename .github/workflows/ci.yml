@@ -1563,7 +1563,7 @@ jobs:
   # Native Intel Mac proof of gateway readiness as docs/LAUNCHER_CONTRACT.md
   # defines it: `elastos gateway --addr localhost:8090`, then
   # GET http://localhost:8090/healthz returns HTTP 200 and OK while that pid
-  # owns host-process.lock. The Home is empty. This is not a signed release.
+  # holds host-process.lock. The Home is empty. This is not a signed release.
   gateway-smoke-macos-intel:
     name: gateway-smoke-macos-intel
     runs-on: macos-15-intel

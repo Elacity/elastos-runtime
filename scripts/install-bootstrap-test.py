@@ -848,6 +848,20 @@ exit "$status"
 ''')
 
 
+def mock_gnu_mktemp(sandbox):
+    """mktemp as GNU coreutils ships it: -d with no template uses TMPDIR.
+
+    The fixture Linux run must not use the host's own mktemp. On a Mac host
+    that is Apple's mktemp, which ignores TMPDIR (see mock_apple_mktemp). The
+    template form is one that GNU and BSD mktemp both accept.
+    """
+    real = shutil.which("mktemp")
+    sandbox.mock("mktemp", f'''#!/bin/sh
+if [ "$#" = 1 ] && [ "$1" = -d ]; then exec "{real}" -d "${{TMPDIR:-/tmp}}/tmp.XXXXXXXXXX"; fi
+exec "{real}" "$@"
+''')
+
+
 def mock_apple_mktemp(sandbox):
     """mktemp as macOS ships it: -d with no template ignores TMPDIR."""
     (sandbox.root / "darwin-user-temp").mkdir(mode=0o700)
@@ -1182,13 +1196,15 @@ class InstallationTests(unittest.TestCase):
             platform: {"binary": binary, "components": components}
             for platform in ("x86_64-linux", "aarch64-darwin")}})
         cases = [
-            # (uname -s, uname -m, commands hidden from PATH, Apple mktemp, TMPDIR is a symlink, hasher)
-            ("Linux", "x86_64", (), False, False, "sha256sum"),
-            ("Darwin", "arm64", (), True, True, "sha256sum"),
+            # (uname -s, uname -m, commands hidden from PATH, mktemp, TMPDIR is a symlink, hasher)
+            # Each case mocks mktemp, so the result does not depend on the
+            # host: on a Mac host the real mktemp is Apple's.
+            ("Linux", "x86_64", (), "gnu", False, "sha256sum"),
+            ("Darwin", "arm64", (), "apple", True, "sha256sum"),
             # A Mac without sha256sum: the installer falls back to shasum -a 256.
-            ("Darwin", "arm64", ("sha256sum",), True, True, "shasum"),
+            ("Darwin", "arm64", ("sha256sum",), "apple", True, "shasum"),
         ]
-        for system, machine, hidden, apple_mktemp, tmp_link, hasher in cases:
+        for system, machine, hidden, mktemp, tmp_link, hasher in cases:
             with self.subTest(system=system, hasher=hasher), \
                     InstallerSandbox(head, release, did, system, machine) as sandbox:
                 sandbox.respond("binary", RUNTIME_STUB)
@@ -1196,8 +1212,10 @@ class InstallationTests(unittest.TestCase):
                 mock_swapping_hashers(sandbox)
                 if hidden:
                     sandbox.hide_commands(*hidden)
-                if apple_mktemp:
+                if mktemp == "apple":
                     mock_apple_mktemp(sandbox)
+                else:
+                    mock_gnu_mktemp(sandbox)
                 if tmp_link:
                     # macOS /tmp and /var are symlinks into /private.
                     (sandbox.root / "tmp-link").symlink_to(sandbox.tmpdir)
@@ -1209,7 +1227,7 @@ class InstallationTests(unittest.TestCase):
                 swaps = (sandbox.root / "swaps").read_text().split() if (sandbox.root / "swaps").exists() else []
                 self.assertEqual(swaps, [hasher, download, hashlib.sha256(RUNTIME_STUB).hexdigest(),
                                          hashlib.sha256(swapped).hexdigest()], output)
-                scratch = sandbox.root / ("darwin-user-temp" if apple_mktemp else "tmp")
+                scratch = sandbox.root / ("darwin-user-temp" if mktemp == "apple" else "tmp")
                 self.assertEqual(Path(download).resolve().parent.parent, scratch.resolve())
                 # Then the installer refused it: it never ran, nothing was installed.
                 self.assertFalse((sandbox.root / "swapped-ran").exists(), output)
