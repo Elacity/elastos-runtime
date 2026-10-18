@@ -5,11 +5,18 @@
 // to download. Only items on screen are fetched, a few at a time, and object
 // URLs are released when the cache is full. A picture whose header declares a
 // canvas too large to decode, or whose header cannot be read, keeps its icon.
+//
+// The cache is bounded by bytes, not only by count: each entry is charged the
+// memory one decode of its picture takes (width x height x 4) plus its file
+// size. A picture at Runtime's pixel limit (24 MP) decodes to about 96 MB, so
+// the 256 MiB bound keeps at most two of the largest pictures, or about forty
+// 1920 x 1080 ones. The oldest entries go first.
 
-import { isBoundedImage } from "./image-header.js";
+import { decodedImageBytes, isBoundedImage, readImageHeader } from "./image-header.js";
 
 const THUMBNAIL_MAX_BYTES = 4 * 1024 * 1024;
 const THUMBNAIL_CACHE_LIMIT = 160;
+export const THUMBNAIL_CACHE_MAX_BYTES = 256 * 1024 * 1024;
 const THUMBNAIL_CONCURRENCY = 3;
 const THUMBNAIL_ROOT_MARGIN = "200px";
 // Only formats whose header Library can read; SVG and others keep the icon.
@@ -27,6 +34,7 @@ export function thumbnailSignature(object) {
 
 export function createLibraryThumbnails({ readObjectBlob, root }) {
   const cache = new Map();
+  let cachedBytes = 0;
   const pending = new Map();
   const targets = new WeakMap();
   const queue = [];
@@ -90,12 +98,15 @@ export function createLibraryThumbnails({ readObjectBlob, root }) {
   async function load({ object, signature }) {
     const nodes = pending.get(signature) || [];
     let objectUrl = "";
+    let bytes = 0;
     try {
       const blob = await readObjectBlob(object.thumbnail_uri || object.uri);
-      if (blob.size > THUMBNAIL_MAX_BYTES || !isBoundedImage(new Uint8Array(await blob.arrayBuffer()))) {
+      const head = blob.size > THUMBNAIL_MAX_BYTES ? null : new Uint8Array(await blob.arrayBuffer());
+      if (!head || !isBoundedImage(head)) {
         pending.delete(signature);
         return;
       }
+      bytes = decodedImageBytes(readImageHeader(head)) + blob.size;
       objectUrl = URL.createObjectURL(blob);
     } catch (_error) {
       // Keep the generic file icon; the object may be unreadable or offline.
@@ -103,7 +114,7 @@ export function createLibraryThumbnails({ readObjectBlob, root }) {
       return;
     }
     pending.delete(signature);
-    remember(signature, objectUrl);
+    remember(signature, objectUrl, bytes);
     for (const node of nodes) {
       applyThumbnail(node, signature, objectUrl);
     }
@@ -118,11 +129,14 @@ export function createLibraryThumbnails({ readObjectBlob, root }) {
     node.classList.add("item--thumbnail");
   }
 
-  function remember(signature, objectUrl) {
-    cache.set(signature, { objectUrl });
-    while (cache.size > THUMBNAIL_CACHE_LIMIT) {
+  function remember(signature, objectUrl, bytes) {
+    cache.set(signature, { objectUrl, bytes });
+    cachedBytes += bytes;
+    // The newest entry always stays, so a picture on screen keeps its thumbnail.
+    while (cache.size > 1 && (cache.size > THUMBNAIL_CACHE_LIMIT || cachedBytes > THUMBNAIL_CACHE_MAX_BYTES)) {
       const [oldest, entry] = cache.entries().next().value;
       cache.delete(oldest);
+      cachedBytes -= entry.bytes;
       URL.revokeObjectURL(entry.objectUrl);
     }
   }
@@ -136,9 +150,10 @@ export function createLibraryThumbnails({ readObjectBlob, root }) {
     observer?.disconnect();
     for (const entry of cache.values()) URL.revokeObjectURL(entry.objectUrl);
     cache.clear();
+    cachedBytes = 0;
     pending.clear();
     queue.length = 0;
   }
 
-  return { observe, release };
+  return { observe, release, cachedBytes: () => cachedBytes, cachedCount: () => cache.size };
 }

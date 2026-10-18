@@ -25,10 +25,15 @@ impl ImageFormat {
     }
 }
 
+// These two limits are the one source of truth for picture size. Library's
+// thumbnails copy them in `capsules/library/browser/src/image-header.js`,
+// and a test there fails when the copies differ.
+
 /// Longest side Runtime accepts for a decoded picture.
-pub(crate) const IMAGE_MAX_SIDE: u32 = 16_384;
-/// Most pixels Runtime accepts for a decoded picture (about 200 MB as RGBA).
-pub(crate) const IMAGE_MAX_PIXELS: u64 = 50_000_000;
+pub(crate) const IMAGE_MAX_SIDE: u32 = 8_192;
+/// Most pixels Runtime accepts for a decoded picture. One decode of a
+/// picture this size is about 96 MB as RGBA (4 bytes per pixel).
+pub(crate) const IMAGE_MAX_PIXELS: u64 = 24_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ImageHeader {
@@ -473,16 +478,22 @@ pub(crate) mod tests {
         assert!(bomb.len() < 64, "the bomb is a tiny file");
         assert_eq!(require_bounded_image(&bomb), Err(ImageBoundError::TooLarge));
         // Under the side limit, over the pixel limit.
-        assert!(require_bounded_image(&png_header(16_000, 16_000)).is_err());
-        assert!(require_bounded_image(&png_header(16_385, 10)).is_err());
+        assert!(require_bounded_image(&png_header(8_000, 8_000)).is_err());
+        assert!(require_bounded_image(&png_header(8_193, 10)).is_err());
+        assert!(require_bounded_image(&png_header(10, 8_193)).is_err());
+        assert!(require_bounded_image(&png_header(8_192, 10)).is_ok());
         assert!(require_bounded_image(&jpeg_header(65_535, 65_535)).is_err());
         assert!(require_bounded_image(&gif((65_535, 65_535), (1, 1))).is_err());
         assert_eq!(
             require_bounded_image(&webp_extended(0xFF_FFFF, 0xFF_FFFF)),
             Err(ImageBoundError::TooLarge)
         );
-        // An 8000x6000 camera picture is accepted.
-        assert!(require_bounded_image(&png_header(8000, 6000)).is_ok());
+        // A 6000x4000 (24 MP) camera picture is accepted, one more row is not.
+        assert!(require_bounded_image(&png_header(6000, 4000)).is_ok());
+        assert_eq!(
+            require_bounded_image(&png_header(6000, 4001)),
+            Err(ImageBoundError::TooLarge)
+        );
     }
 
     #[test]

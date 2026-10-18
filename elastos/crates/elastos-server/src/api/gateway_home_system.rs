@@ -8056,7 +8056,7 @@ fn validate_background_image_len(len: usize) -> anyhow::Result<()> {
 const BACKGROUND_IMAGE_UNREADABLE: &str =
     "background image must be a readable PNG, JPEG, WebP, or GIF";
 const BACKGROUND_IMAGE_TOO_LARGE: &str =
-    "background image is too large to show; use a picture of at most 16384 pixels per side and 50 million pixels";
+    "background image is too large to show; use a picture of at most 8192 pixels per side and 24 million pixels";
 
 /// Reads the format and canvas size from the bytes, never from a caller's
 /// label, and refuses a canvas a browser should not decode. Returns the

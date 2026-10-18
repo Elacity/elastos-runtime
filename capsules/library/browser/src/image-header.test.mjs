@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import { crc32 } from "node:zlib";
 
-import { IMAGE_MAX_PIXELS, JPEG_MAX_SEGMENTS_BEFORE_FRAME, isBoundedImage, readImageHeader } from "./image-header.js";
-import { createLibraryThumbnails, isThumbnailCandidate } from "./thumbnails.js";
+import { IMAGE_MAX_PIXELS, IMAGE_MAX_SIDE, JPEG_MAX_SEGMENTS_BEFORE_FRAME, isBoundedImage, readImageHeader } from "./image-header.js";
+import { THUMBNAIL_CACHE_MAX_BYTES, createLibraryThumbnails, isThumbnailCandidate } from "./thumbnails.js";
 
 function pngHeader(width, height) {
   const bytes = new Uint8Array(33);
@@ -90,13 +91,24 @@ test("a tiny file that declares a huge canvas is not decoded", () => {
   const bomb = pngHeader(100_000, 100_000);
   assert.ok(bomb.length < 64);
   assert.equal(isBoundedImage(bomb), false);
-  assert.equal(isBoundedImage(pngHeader(16_000, 16_000)), false, "over the pixel limit");
-  assert.equal(isBoundedImage(pngHeader(16_385, 10)), false, "over the side limit");
+  assert.equal(isBoundedImage(pngHeader(8_000, 8_000)), false, "over the pixel limit");
+  assert.equal(isBoundedImage(pngHeader(8_193, 10)), false, "over the side limit");
+  assert.equal(isBoundedImage(pngHeader(10, 8_193)), false, "over the side limit");
+  assert.equal(isBoundedImage(pngHeader(8_192, 10)), true, "at the side limit");
   assert.equal(isBoundedImage(jpegHeader(65_535, 65_535)), false);
   assert.equal(isBoundedImage(gif(65_535, 65_535, 1, 1)), false);
   assert.equal(isBoundedImage(webpExtended(0xffffff, 0xffffff)), false);
-  assert.equal(isBoundedImage(pngHeader(8000, 6000)), true);
-  assert.ok(8000 * 6000 <= IMAGE_MAX_PIXELS);
+  assert.equal(isBoundedImage(pngHeader(6000, 4000)), true, "24 MP");
+  assert.equal(isBoundedImage(pngHeader(6000, 4001)), false, "one row past 24 MP");
+});
+
+test("the limits are the ones Runtime applies", () => {
+  const rust = readFileSync(new URL("../../../../elastos/crates/elastos-server/src/image_bounds.rs", import.meta.url), "utf8");
+  const constant = (name) => Number(rust.match(new RegExp(`const ${name}: u\\d+ = ([\\d_]+);`))[1].replaceAll("_", ""));
+  assert.equal(IMAGE_MAX_SIDE, constant("IMAGE_MAX_SIDE"));
+  assert.equal(IMAGE_MAX_PIXELS, constant("IMAGE_MAX_PIXELS"));
+  assert.equal(IMAGE_MAX_SIDE, 8192);
+  assert.equal(IMAGE_MAX_PIXELS, 24_000_000);
 });
 
 test("unreadable or inconsistent headers fail closed", () => {
@@ -224,5 +236,42 @@ test("a bomb keeps the file icon and is never turned into an object URL", async 
     assert.equal(okImg.src, "blob:test/1");
   } finally {
     URL.createObjectURL = originalCreate;
+  }
+});
+
+test("the thumbnail cache evicts once its pictures pass the byte limit", async () => {
+  const created = [];
+  const revoked = [];
+  const originalCreate = URL.createObjectURL;
+  const originalRevoke = URL.revokeObjectURL;
+  URL.createObjectURL = (blob) => {
+    created.push(blob);
+    return `blob:test/${created.length}`;
+  };
+  URL.revokeObjectURL = (url) => revoked.push(url);
+  try {
+    // 6000 x 4000 decodes to 96,000,000 bytes: two fit in 256 MiB, three do not.
+    const big = pngHeader(6000, 4000);
+    const perPicture = 6000 * 4000 * 4 + big.length;
+    assert.ok(2 * perPicture <= THUMBNAIL_CACHE_MAX_BYTES && 3 * perPicture > THUMBNAIL_CACHE_MAX_BYTES);
+    const thumbnails = createLibraryThumbnails({ readObjectBlob: async () => new Blob([big]), root: null });
+    const show = async (name) => {
+      const img = { dataset: {}, src: "" };
+      thumbnails.observe({ isConnected: true, classList: { add() {} }, querySelector: () => img },
+        { uri: `localhost://Users/a/Pictures/${name}`, kind: "file", mime: "image/png", size: big.length });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    };
+    await show("one.png");
+    await show("two.png");
+    assert.deepEqual(revoked, []);
+    assert.equal(thumbnails.cachedBytes(), 2 * perPicture);
+    await show("three.png");
+    assert.deepEqual(revoked, ["blob:test/1"], "the oldest picture is released");
+    assert.equal(thumbnails.cachedCount(), 2);
+    assert.equal(thumbnails.cachedBytes(), 2 * perPicture);
+    assert.ok(thumbnails.cachedBytes() <= THUMBNAIL_CACHE_MAX_BYTES);
+  } finally {
+    URL.createObjectURL = originalCreate;
+    URL.revokeObjectURL = originalRevoke;
   }
 });

@@ -3,11 +3,18 @@
 // A browser decodes an image to about four bytes per pixel, so a small file can
 // still need gigabytes once decoded. Library reads only the container header
 // and keeps the file icon when the canvas is too large or the header cannot be
-// read. Runtime applies the same limits to the desktop background
-// (elastos/crates/elastos-server/src/image_bounds.rs).
+// read. The limits are Runtime's (IMAGE_MAX_SIDE and IMAGE_MAX_PIXELS in
+// elastos/crates/elastos-server/src/image_bounds.rs, the one source of truth);
+// these are copies, and image-header.test.mjs fails when they differ. One
+// decode of a picture at the pixel limit is about 96 MB as RGBA.
 
-export const IMAGE_MAX_SIDE = 16384;
-export const IMAGE_MAX_PIXELS = 50_000_000;
+export const IMAGE_MAX_SIDE = 8192;
+export const IMAGE_MAX_PIXELS = 24_000_000;
+
+/** Bytes one decode of `header` takes as RGBA (4 bytes per pixel). */
+export function decodedImageBytes(header) {
+  return header.width * header.height * 4;
+}
 
 const be16 = (b, at) => (at + 2 <= b.length ? (b[at] << 8) | b[at + 1] : null);
 const be32 = (b, at) => (at + 4 <= b.length ? ((b[at] << 24) >>> 0) + ((b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]) : null);

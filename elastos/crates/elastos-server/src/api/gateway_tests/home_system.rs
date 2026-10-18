@@ -5401,8 +5401,17 @@ async fn test_background_image_refuses_a_decompression_bomb() {
     let (status, text) = upload("image/png", bomb.clone()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(text.contains("too large to show"), "{text}");
+    // The message names the limits Runtime applies.
+    assert!(
+        text.contains(&format!(
+            "at most {} pixels per side and {} million pixels",
+            crate::image_bounds::IMAGE_MAX_SIDE,
+            crate::image_bounds::IMAGE_MAX_PIXELS / 1_000_000
+        )),
+        "{text}"
+    );
     // Over the pixel limit while each side is under the side limit.
-    let (status, _) = upload("image/png", test_png_picture(16_000, 16_000, b"")).await;
+    let (status, _) = upload("image/png", test_png_picture(8_000, 8_000, b"")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     // The label must match the bytes: a JPEG sent as PNG is refused.
     let (status, text) = upload("image/png", test_jpeg_picture(10, 10, b"")).await;
