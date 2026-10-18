@@ -219,14 +219,35 @@ class GatewayHealthzSmokeTest(unittest.TestCase):
         self.assertIn(f"GET http://localhost:{self.port}/healthz", result.stdout)
         self.assertIn("resolves localhost to", result.stdout)
 
+    def no_network_path(self, log):
+        # A curl that records its arguments and never connects. The default
+        # address is the contract's localhost:8090, and this test must not
+        # depend on whatever listens on that port on the test host.
+        shim = Path(self.tmp.name) / "no-network-bin"
+        shim.mkdir()
+        curl = shim / "curl"
+        curl.write_text('#!/bin/sh\n'
+                        f'printf \'%s\\n\' "$@" >>"{log}"\n'
+                        'printf 000\n'
+                        'exit 7\n')
+        curl.chmod(0o755)
+        return f"{shim}{os.pathsep}{os.environ.get('PATH', '')}"
+
     def test_default_is_the_contract_command(self):
         args = Path(self.tmp.name) / "args.json"
-        env = self.env("exit", SMOKE_ARGS=str(args))
+        curl_log = Path(self.tmp.name) / "curl-args.txt"
+        env = self.env("exit", SMOKE_ARGS=str(args), PATH=self.no_network_path(curl_log))
         env.pop("ELASTOS_GATEWAY_ADDR")
         result = subprocess.run(["bash", str(SMOKE), str(self.binary)], env=env,
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(args.read_text(), '["gateway", "--addr", "localhost:8090"]')
+        self.assertIn("GET http://localhost:8090/healthz", result.stderr)
+        if curl_log.exists():
+            urls = [line for line in curl_log.read_text().splitlines()
+                    if line.startswith("http")]
+            self.assertTrue(urls, curl_log.read_text())
+            self.assertEqual(set(urls), {"http://localhost:8090/healthz"})
 
     @unittest.skipUnless(ipv6_loopback(), "this host has no IPv6 loopback")
     def test_ipv6_loopback_ok(self):
