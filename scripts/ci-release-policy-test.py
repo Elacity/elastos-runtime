@@ -3233,6 +3233,23 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
                 self.assertEqual(self.journey["private_json"](owner.control / "stop.json"), {"stop": True})
         detail.__str__.assert_not_called()
 
+    def test_finite_observer_fixed_messages_and_phase_still_pass_redaction(self):
+        failure_of = self.journey["finite_observer_failure"]
+        # Every fixed message is readable after redact(), so it is saved as written.
+        for message in sorted(self.globals["FINITE_OBSERVER_MESSAGES"]):
+            with self.subTest(message=message):
+                self.assertEqual(failure_of("census", RuntimeError(message))["message"], message)
+        # A message or phase added later with a secret value or a path is still redacted.
+        added = 'finite journey control said {"token":"tq-41"} at /home/ci-person/x'
+        with mock.patch.dict(self.globals, {"FINITE_OBSERVER_MESSAGES": frozenset({added})}), \
+                mock.patch.dict(os.environ, {"HOME": "/home/ci-person"}):
+            failure = failure_of('stage_{"token":"pq-17"}', RuntimeError(added))
+        self.assertEqual(failure["message"], 'finite journey control said {"token":"<redacted>"} at <path>')
+        self.assertEqual(failure["phase"], 'stage_{"token":"<redacted>"}')
+        self.assertEqual(failure["type"], "RuntimeError")
+        for private in ("tq-41", "pq-17", "ci-person"):
+            self.assertNotIn(private, json.dumps(failure))
+
     def test_finite_observer_stage_phase_uses_only_validated_action_text(self):
         for action in ("engine_stopped", "private-action-Token1234567890"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as temp:

@@ -202,12 +202,15 @@ FINITE_OBSERVER_MESSAGES = frozenset({
 })
 
 
-def finite_observer_failure(phase, error):
+def finite_observer_failure(phase, error, roots=()):
     message = (error.args[0] if type(error) is RuntimeError and len(error.args) == 1
                and type(error.args[0]) is str else None)
     if message not in FINITE_OBSERVER_MESSAGES:
         message = "observer detail redacted"
-    return {"phase": phase, "type": PUBLIC_ERROR_TYPES.get(type(error), "redacted"), "message": message[:480]}
+    # The fixed text still goes through redact(), so a message or phase added
+    # later cannot carry a path or a secret value into the receipt.
+    return {"phase": redact(phase, roots), "type": PUBLIC_ERROR_TYPES.get(type(error), "redacted"),
+            "message": redact(message, roots)[:480]}
 
 
 def failure_suffix(failure):
@@ -688,7 +691,8 @@ class FiniteRuntime:
         except BaseException as error:
             # "census" with "Runtime left its unit" and runtime_exited true means
             # Runtime itself ended; other census messages name the failed check.
-            self.failure = {**finite_observer_failure(phase, error), "runtime_exited": self.runtime_exited()}
+            self.failure = {**finite_observer_failure(phase, error, (self.home, self.data)),
+                            "runtime_exited": self.runtime_exited()}
             self.error = "finite_resource_observation_failed"
             private_json(self.control / "response.json", {"id": self.last_action + 1, "status": "failed"})
             private_json(self.control / "stop.json", {"stop": True})
