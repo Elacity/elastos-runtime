@@ -99,19 +99,11 @@ CAPSULE_RECORD_DOMAIN = "elastos.capsule.record.v1"
 CAPSULE_RECORD_SCHEMA = "elastos.capsule.record/v1"
 # A release is one UnixFS chunk; Runtime refuses larger release metadata.
 MAX_RELEASE_METADATA = 256 * 1024
-# The signed release ids. Package keys live in scripts/release-platforms.json.
-# x86_64-darwin is mapped there and is absent from this set.
-SIGNED_RELEASE_PLATFORMS = frozenset({"x86_64-linux", "aarch64-linux", "aarch64-darwin"})
 
 
 def require(condition, message):
     if not condition:
         raise ValueError(message)
-
-
-def require_signed_release_platforms(platforms):
-    require(type(platforms) is dict and platforms and set(platforms) <= SIGNED_RELEASE_PLATFORMS,
-            "release platforms refused")
 
 
 def sha256(data):
@@ -459,6 +451,15 @@ def installer_template(policy, blob_oid, fetch):
 COMPONENT_KEYS = {"x86_64-linux": ("linux-amd64", "x86_64-linux"),
                   "aarch64-linux": ("linux-arm64", "aarch64-linux"),
                   "aarch64-darwin": ("darwin-arm64", "macos-arm64")}
+# Frozen at import. prepare() and the artifact prefix both use this set.
+# A later mutation of COMPONENT_KEYS does not admit a platform by itself.
+RELEASE_PLATFORMS = frozenset(COMPONENT_KEYS)
+
+
+def artifact_prefix_accepted(prefix):
+    names = ["mac" if platform == "aarch64-darwin" else platform for platform in sorted(RELEASE_PLATFORMS)]
+    names.append("seed")
+    return re.fullmatch(r"release-(?:proof-)?(?:" + "|".join(map(re.escape, names)) + ")", prefix) is not None
 
 
 def merge_components(template, manifests):
@@ -627,7 +628,7 @@ def checked_package_run(approval, run_id, fetch):
 
 
 def package_artifact(approval, run, prefix, fetch):
-    require(re.fullmatch(r"release-(?:proof-)?(?:mac|x86_64-linux|aarch64-linux|seed)", prefix), "package artifact prefix refused")
+    require(artifact_prefix_accepted(prefix), "package artifact prefix refused")
     pattern = re.compile(rf"{prefix}-{approval['source']['commit']}-([1-9][0-9]*)\Z")
     matches = []
     for page in range(1, 11):
@@ -1049,9 +1050,6 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
     require(sha256(manifest_data) == checked_hash(policy.get("manifest_sha256")), "manifest differs from operator approval")
     manifest = parse_json(manifest_data)
     require(set(manifest) == {"source", "version", "channel", "files", "installer", "release", "head", "provenance"}, "signing input fields refused")
-    # Refuse an unsigned platform before provenance or any signature bytes.
-    if type(manifest.get("release")) is dict and type(manifest["release"].get("platforms")) is dict:
-        require_signed_release_platforms(manifest["release"]["platforms"])
     source = {field: policy[field] for field in ("commit", "tree")}
     require(manifest["source"] == source and manifest["version"] == policy["version"] and manifest["channel"] == policy["channel"], "input source/version/channel differs")
     records = manifest["files"]
@@ -1072,6 +1070,10 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
     usage = shutil.disk_usage(snapshot_root)
     require(usage.free >= total + 3 * MAX_JSON,
             "snapshot needs more free space than the volume has")
+    preview = manifest.get("release")
+    preview_platforms = preview.get("platforms") if type(preview) is dict else None
+    require(type(preview_platforms) is dict and preview_platforms
+            and set(preview_platforms) <= RELEASE_PLATFORMS, "release platforms refused")
     verify_release_provenance(policy, manifest, records, held_root, fetch, snapshot_root, root)
     for name, record in sorted(records.items()):
         destination = snapshot_root / name
@@ -1092,7 +1094,7 @@ def prepare_from_root(policy, root, manifest_name, fetch, snapshot_root, held_ro
     if release["prev_release_cid"] is not None:
         cid_info(release["prev_release_cid"])
     platforms = release["platforms"]
-    require_signed_release_platforms(platforms)
+    require(type(platforms) is dict and platforms and set(platforms) <= RELEASE_PLATFORMS, "release platforms refused")
     advertised = set()
     approved_refs = {(record["cid"], record["sha256"]) for record in records.values()}
     def admit_ref(cid, digest, size=None, release_path=None):
