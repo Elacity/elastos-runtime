@@ -74,8 +74,8 @@ PUBLISHER_DID = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe"
 FIXTURE_DID = "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
 
 
-def unixfs_v0_cid(data):
-    """CIDv0 from scripts/release-signer.py, the publisher's implementation."""
+def release_signer():
+    """scripts/release-signer.py, the publisher's implementation."""
     global _SIGNER_CID
     if _SIGNER_CID is None:
         import importlib.util
@@ -84,7 +84,20 @@ def unixfs_v0_cid(data):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         _SIGNER_CID = module
-    return _SIGNER_CID.unixfs_metadata_cid(data)
+    return _SIGNER_CID
+
+
+def unixfs_v0_cid(data):
+    """CIDv0 from scripts/release-signer.py, the publisher's implementation."""
+    return release_signer().unixfs_metadata_cid(data)
+
+
+def rendered_installer(did):
+    """The actual install.sh as the release signer stamps it for publication."""
+    stamps = {"MAINTAINER_DID": did, "SOURCE_CONNECT_TICKET": "fixture-ticket",
+              "PUBLISHER_GATEWAY": "https://test.invalid", "PUBLISHER_NODE_ID": "fixture-node",
+              "IPNS_NAME": ""}
+    return release_signer().render_installer(INSTALLER.read_bytes(), stamps, did)
 
 
 _SIGNER_CID = None
@@ -645,6 +658,8 @@ class InstallerSandbox:
         # Release publication stamps the reviewed source route into install.sh.
         self.installer.write_text(SOURCE.replace("__SOURCE_CONNECT_TICKET__", "fixture-ticket", 1)
                                   .replace("__PUBLISHER_NODE_ID__", "fixture-node", 1))
+        # The repository template takes its DID and publisher URL from flags.
+        self.stamped = False
         self.home = self.root / "home"
         self.data = self.home / "xdg-data/elastos"
         self.binary = self.home / ".local/bin/elastos"
@@ -695,6 +710,11 @@ if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"
     def __enter__(self):
         return self
 
+    def use_rendered_installer(self):
+        """Run the published form: every trust anchor stamped, no trust flags."""
+        self.installer.write_bytes(rendered_installer(self.did))
+        self.stamped = True
+
     def __exit__(self, *exc):
         self.directory.cleanup()
 
@@ -730,9 +750,15 @@ if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"
                     (system / entry).symlink_to(target)
         self.path_tail = system
 
-    def run(self, *options, umask="0022", head_cid=""):
+    def run(self, *options, umask="0022", head_cid="", env=None, did_flag=None):
+        """did_flag: pass --maintainer-did DID (default: only to the unstamped template)."""
         seen = len(self.requests())
-        result = shell('umask "$6"\n' + '''
+        trust = [] if self.stamped else ["--publisher-gateway", "https://test.invalid"]
+        if (not self.stamped) if did_flag is None else did_flag:
+            trust = ["--maintainer-did", self.did, *trust]
+        extra = "unset ELASTOS_MAINTAINER_DID\n" + "".join(
+            f"export {name}={shlex.quote(value)}\n" for name, value in (env or {}).items())
+        result = shell('umask "$6"\n' + extra + '''
 export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$8" FIXTURES="$1" PATH="$1/mocks:${9:-$PATH}"
 # Apple Python otherwise adds bytecode caches to HOME during file-preservation checks.
 export PYTHONDONTWRITEBYTECODE=1
@@ -742,8 +768,7 @@ export ELASTOS_TEST_CALLS="$1/calls" ELASTOS_TEST_SETUP_MARKER="$1/setup-marker"
 # Feed the complete stamped script through stdin, as curl | bash does.
 cat "$3" | "$2" --noprofile --norc -s -- "${@:10}"
 ''', self.root, OPTIONS.bash, self.installer, self.system, self.machine, umask, head_cid,
-                       self.tmpdir, self.path_tail or "",
-                       "--maintainer-did", self.did, "--publisher-gateway", "https://test.invalid", *options)
+                       self.tmpdir, self.path_tail or "", *trust, *options)
         return result, self.requests()[seen:]
 
     def runtime_calls(self):
@@ -1038,6 +1063,82 @@ class InstallationTests(unittest.TestCase):
                 self.assertIn("MAINTAINER_DID must be a did:key value", result.stderr)
                 self.assertNotIn("Maintainer DID:", result.stdout)
                 self.assertNotIn("\x1b]", result.stdout + result.stderr)
+
+    def test_rendered_installer_installs_with_its_built_in_did_and_no_trust_flags(self):
+        did, head, release = installable_fixture()
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.use_rendered_installer()
+            self.assertNotIn("__MAINTAINER" + "_DID__", sandbox.installer.read_text())
+            self.existing_installation(sandbox)
+            sandbox.respond("binary", RUNTIME_STUB)
+            self.assert_clean_install(sandbox, did, head, release, sandbox.home_state())
+
+    def test_rendered_installer_refuses_another_did_from_environment_or_flag_before_any_download(self):
+        # #434: the published installer has one trust root, the DID the signer
+        # stamped. No environment variable or flag can replace it, and the
+        # placeholder or the stamp variable's own name cannot make it look unstamped.
+        did, head, release = installable_fixture()
+        other = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+        placeholder = "__MAINTAINER" + "_DID__"
+        cases = {
+            "environment": ({"ELASTOS_MAINTAINER_DID": other}, []),
+            "flag": ({}, ["--maintainer-did", other]),
+            "flag same, environment other": ({"ELASTOS_MAINTAINER_DID": other}, ["--maintainer-did", did]),
+            "environment same, flag other": ({"ELASTOS_MAINTAINER_DID": did}, ["--maintainer-did", other]),
+            "placeholder in environment": ({"ELASTOS_MAINTAINER_DID": placeholder}, []),
+            "placeholder as flag": ({}, ["--maintainer-did", placeholder]),
+            "stamp variable in environment": ({"MAINTAINER_DID_STAMP": placeholder, "ELASTOS_MAINTAINER_DID": other}, []),
+            "control text": ({"ELASTOS_MAINTAINER_DID": did + "\x1b]0;owned\x07"}, []),
+            "uninstall": ({"ELASTOS_MAINTAINER_DID": other}, ["--uninstall"]),
+        }
+        for name, (env, flags) in cases.items():
+            with self.subTest(name), InstallerSandbox(head, release, did) as sandbox:
+                sandbox.use_rendered_installer()
+                sandbox.respond("binary", RUNTIME_STUB)
+                self.existing_installation(sandbox)
+                before = sandbox.home_state()
+                result, requests = sandbox.run(*flags, "--install-only", env=env, did_flag=False)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(requests, [])
+                self.assertEqual(sandbox.downloads(), {})
+                self.assert_no_installation_effects(sandbox, before, result)
+                self.assertIn("This installer has its maintainer DID built in.", result.stderr)
+                self.assertIn('"Maintainer DID:" line. Compare that line with the DID in the ElastOS README.', result.stderr)
+                self.assertNotIn("Maintainer DID: did", result.stdout)
+                self.assertNotIn("Check this computer", result.stdout)
+                self.assertNotIn(other, result.stdout + result.stderr)
+                self.assertNotIn("\x1b]", result.stdout + result.stderr)
+
+    def test_rendered_installer_accepts_a_request_for_its_own_did(self):
+        # The launcher passes --maintainer-did with the DID it pins; the same DID changes nothing.
+        did, head, release = installable_fixture()
+        for env, flags in (({"ELASTOS_MAINTAINER_DID": did}, []), ({}, ["--maintainer-did", did]),
+                           ({"ELASTOS_MAINTAINER_DID": did}, ["--maintainer-did", did])):
+            with self.subTest(env=env, flags=flags), InstallerSandbox(head, release, did) as sandbox:
+                sandbox.use_rendered_installer()
+                result, requests = sandbox.run(*flags, "--install-only", env=env, did_flag=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("artifact-request-blocked", result.stderr)
+                self.assertEqual(requests, self.REQUESTS)
+                self.assertIn(f"Maintainer DID: {did}", result.stdout)
+
+    def test_unstamped_template_takes_its_did_from_the_flag_then_the_environment(self):
+        # Repo smokes and tests run the template; it still needs the DID from outside.
+        did, head, release = installable_fixture()
+        other = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+        for env, did_flag, shown in (({"ELASTOS_MAINTAINER_DID": did}, False, did),
+                                     ({}, True, did),
+                                     ({"ELASTOS_MAINTAINER_DID": other}, True, did)):
+            with self.subTest(env=env, did_flag=did_flag), InstallerSandbox(head, release, did) as sandbox:
+                result, requests = sandbox.run("--install-only", env=env, did_flag=did_flag)
+                self.assertIn("artifact-request-blocked", result.stderr)
+                self.assertEqual(requests, self.REQUESTS)
+                self.assertIn(f"Maintainer DID: {shown}", result.stdout)
+        with InstallerSandbox(head, release, did) as sandbox:
+            result, requests = sandbox.run("--install-only", did_flag=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(requests, [])
+            self.assertIn("MAINTAINER_DID not set. This repository copy of install.sh has no built-in DID.", result.stderr)
 
     def test_stamped_head_cid_must_match_the_verified_head(self):
         did, head, release = installable_fixture()

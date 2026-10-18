@@ -369,6 +369,8 @@ The maintainer release DID is
 `did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
 installer's `Maintainer DID:` line with the complete DID in the repository
 [README](../README.md#install-from-the-publisher).
+The published installer has no override for this DID; the README says how it
+refuses one.
 
 An existing Home with the old source pin refuses a release signed by the new
 maintainer. On the Runtimes that still trust the old key, `elastos update`

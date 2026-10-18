@@ -45,6 +45,9 @@ The public installer looks up signed releases for Linux x86_64/aarch64 and macOS
 The maintainer release DID is
 `did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe`. Compare the
 installer's `Maintainer DID:` line with this complete DID. Stop if they differ.
+The published installer has this DID built in and trusts no other. It refuses a
+different DID from `ELASTOS_MAINTAINER_DID` or `--maintainer-did` before it
+downloads anything, so this comparison is the check.
 
 The maintainer changed the release signing key because the previous key was
 stored on the public server.
