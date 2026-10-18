@@ -26,6 +26,7 @@ import {
   isHomeAuthError,
   refreshHomeSession,
   requestPasskeyStepUp,
+  offerPasskeyAddAfterSignIn,
   profileReadinessActionTarget,
   showHomeUnlock,
   signOutHome,
@@ -39,7 +40,7 @@ import {
   createHomeClipboardHost,
   createHomeClipboardPrompt,
   homeClipboardTargetSupported,
-} from "./home-clipboard-host.js?v=home-20260726a";
+} from "./home-clipboard-host.js?v=home-20261017a";
 import { loadOrCreateHomeBrowserContextId } from "./home-browser-context.js?v=home-20260805a";
 import {
   FORM_FACTOR_MESSAGE,
@@ -47,6 +48,12 @@ import {
   bindKeyboardInsetRelay,
 } from "./home-keyboard-inset.js?v=home-20260924a";
 import { createHomeLinkStatus } from "./home-link-status.js?v=home-20260924a";
+import {
+  createHomeExternalLinkPrompt,
+  EXTERNAL_LINK_REQUEST_SCHEMA,
+  HOME_OPEN_EXTERNAL_TYPE,
+  MAX_EXTERNAL_LINK_LENGTH,
+} from "./home-external-link.js?v=home-20261017b";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -119,15 +126,30 @@ const stalledActiveShellReady = {
   target: "",
   route: "",
 };
+// Home's two sheets (Clipboard and web link) never stack: each refuses to show
+// while the other is on screen.
+const homeClipboardPromptRoot = document.querySelector("#home-clipboard-prompt");
+const homeLinkPromptRoot = document.querySelector("#home-link-prompt");
 const homeClipboardPrompt = createHomeClipboardPrompt({
-  root: document.querySelector("#home-clipboard-prompt"),
+  root: homeClipboardPromptRoot,
   title: document.querySelector("#home-clipboard-title"),
   copy: document.querySelector("#home-clipboard-copy"),
   allowButton: document.querySelector("#home-clipboard-allow"),
   cancelButton: document.querySelector("#home-clipboard-cancel"),
+  otherSheetShown: () => !homeLinkPromptRoot.hidden,
 });
 const homeClipboardHost = createHomeClipboardHost({
   prompt: homeClipboardPrompt,
+});
+const homeExternalLinkPrompt = createHomeExternalLinkPrompt({
+  root: homeLinkPromptRoot,
+  appName: document.querySelector("#home-link-app"),
+  host: document.querySelector("#home-link-host"),
+  address: document.querySelector("#home-link-address"),
+  openButton: document.querySelector("#home-link-open"),
+  cancelButton: document.querySelector("#home-link-cancel"),
+  isLive: externalLinkSenderIsLive,
+  otherSheetShown: () => !homeClipboardPromptRoot.hidden,
 });
 
 function hideHostBootMask() {
@@ -190,6 +212,7 @@ function retireLaunchedAppContext(homeToken) {
   cancelChatReconnect(context);
   cancelLibraryPicker(context);
   homeClipboardHost.retireFrame(context.clipboardState);
+  homeExternalLinkPrompt.retire(homeToken);
   launchedAppContexts.delete(homeToken);
   return true;
 }
@@ -202,6 +225,7 @@ function clearLaunchedAppContexts() {
     homeClipboardHost.retireFrame(context.clipboardState);
   }
   launchedAppContexts.clear();
+  homeExternalLinkPrompt.clear();
 }
 
 function cancelChatReconnect(context) {
@@ -466,6 +490,15 @@ async function showHostAuthGate(options = {}) {
         query.recovery = "import";
       }
       await openTargetFromHomeGui(profileActionTarget, { query });
+    } else {
+      // Never switches the person's shell and never fails the sign-in.
+      await offerPasskeyAddAfterSignIn({
+        flow,
+        homeToken: response?.home_token,
+        desktopActive: activeShellTarget(shellState.currentSummary) === HOME_GUI_SHELL_ID
+          && shellState.activeShellRootTarget === HOME_GUI_SHELL_ID,
+        openSystem: (query) => openTargetFromHomeGui("system", { query }),
+      });
     }
   }, {
     ...options,
@@ -1606,6 +1639,8 @@ window.addEventListener("message", (event) => {
   }
   if (data.type === "home:shell-ready") {
     if (context.kind === "shell-frame") {
+      // A reloaded Home CLI cannot inherit its earlier link request.
+      homeExternalLinkPrompt.retire(context.homeToken);
       settleActiveShellReady(context);
       if (context.targetId === HOME_GUI_SHELL_ID) {
         let browserContextId = "";
@@ -1637,6 +1672,8 @@ window.addEventListener("message", (event) => {
         homeToken: context.homeToken, navigation: null });
     }
     if (context.kind === "app-frame") {
+      // A reloaded app document cannot inherit its earlier link request.
+      homeExternalLinkPrompt.retire(context.homeToken);
       const app = launchedAppContexts.get(context.homeToken);
       if (app?.pickerRequest) cancelLibraryPicker(app);
       if (app?.pickerOwner?.phase === "delivering") settleLibraryPicker(app.pickerOwner, false);
@@ -1922,6 +1959,10 @@ window.addEventListener("message", (event) => {
     switchToHomeGuiAndOpenTarget(context, target, { query })
       .then(() => replyToShellRequest(event, requestId, true))
       .catch((error) => replyToShellRequest(event, requestId, null, error));
+    return;
+  }
+  if (data.type === HOME_OPEN_EXTERNAL_TYPE) {
+    requestExternalLink(context, data);
     return;
   }
   if (data.type === "home:open-uri") {
@@ -2234,6 +2275,55 @@ function isBoundedStepUpRequest(request) {
 
 function canOpenUriFromHomeMessage(context) {
   return context.kind === "home" || SHELL_MESSAGE_OPEN_URI_SOURCES.has(context.targetId);
+}
+
+// An app frame or Home CLI asks Home to open a web link. The Runtime names the
+// app from its signed launch and returns the one validated address; Home then
+// shows its own sheet (home-external-link.js). The app never gets a reply.
+function requestExternalLink(context, data) {
+  const sender = context.kind === "app-frame" ||
+    (context.kind === "shell-frame" && context.targetId === HOME_CLI_SHELL_ID);
+  if (
+    !sender ||
+    !hasExactMessageKeys(data, ["type", "url", "homeToken"]) ||
+    typeof data.url !== "string" ||
+    !data.url ||
+    data.url.length > MAX_EXTERNAL_LINK_LENGTH
+  ) {
+    console.warn("home ignored an open-external message");
+    return;
+  }
+  const requestId = homeExternalLinkPrompt.begin({
+    homeToken: context.homeToken,
+    appId: context.targetId,
+  });
+  if (!requestId) {
+    return;
+  }
+  fetchJson("/api/apps/home/external-link", {
+    method: "POST",
+    body: JSON.stringify({
+      schema: EXTERNAL_LINK_REQUEST_SCHEMA,
+      app_token: context.homeToken,
+      url: data.url,
+    }),
+  })
+    .then((result) => {
+      if (!homeExternalLinkPrompt.show(requestId, result)) {
+        console.warn("home ignored an open-external message");
+      }
+    })
+    .catch(() => {
+      homeExternalLinkPrompt.abandon(requestId);
+      console.warn("home ignored an open-external message");
+    });
+}
+
+function externalLinkSenderIsLive(homeToken) {
+  return launchedAppContexts.has(homeToken) || (
+    shellState.activeShellRootTarget === HOME_CLI_SHELL_ID &&
+    activeShellRootHomeToken() === homeToken
+  );
 }
 
 function canOpenTargetFromHomeMessage(context, target) {

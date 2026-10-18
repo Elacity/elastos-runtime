@@ -159,6 +159,18 @@ function notifyHomeShellReady() {
   }, homeParentOrigin);
 }
 
+// Home CLI has no popup permission. Home shows the exact address and opens a
+// terminal web link only when the person chooses Open link.
+const homeLinkHandler = {
+  activate(event, url) {
+    event?.preventDefault?.();
+    if (!homeToken || !homeParentOrigin || !window.parent || window.parent === window) {
+      return;
+    }
+    window.parent.postMessage({ type: "home:open-external", url, homeToken }, homeParentOrigin);
+  },
+};
+
 async function attachXtermTerminal(size) {
   if (!xtermNode) {
     throw new Error("Home CLI display is unavailable.");
@@ -176,6 +188,7 @@ async function attachXtermTerminal(size) {
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
     fontSize: 14,
     scrollback: 5000,
+    linkHandler: homeLinkHandler,
     theme: {
       background: "#050608",
       foreground: "#d7f5ea",
