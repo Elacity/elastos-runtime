@@ -432,7 +432,8 @@ pub(super) fn request_host(headers: &HeaderMap) -> anyhow::Result<Option<String>
 /// Launcher readiness, `docs/LAUNCHER_CONTRACT.md` ("Readiness and Home URL").
 /// The process that owns the listening socket answers. The body is the two
 /// bytes `OK` only while this process holds the host lock as a gateway; the
-/// JSON record in the lock file is not read.
+/// JSON record in the lock file is not read. Any process of the same user can
+/// hold that lock. While another process holds it, this one answers 503.
 pub(super) async fn healthz(State(state): State<GatewayState>) -> Response {
     if crate::host_lock::holds_gateway_host_lock(&state.data_dir) {
         (StatusCode::OK, "OK").into_response()

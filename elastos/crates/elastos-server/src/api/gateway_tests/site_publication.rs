@@ -377,8 +377,97 @@ async fn test_healthz_refuses_a_forged_or_foreign_lock_owner() {
     assert!(contract.contains("The reply does not name the process."));
     assert!(contract.contains("its `/healthz` returns 503"));
     // The contract names the flock, not the record, as the proof of ownership.
-    assert!(contract.contains("What proves ownership:"));
+    assert!(contract.contains("What proves that this gateway holds the lock:"));
     assert!(!contract.contains("recorded owner"));
+}
+
+/// The host lock proves possession, not identity (`docs/LAUNCHER_CONTRACT.md`,
+/// "Readiness and Home URL"). A separate process of the same user that is not
+/// a gateway, and not ElastOS, opens the lock file and holds the flock. The
+/// record names that process as a gateway. From outside the holder, the held
+/// lock and the record look the same as a gateway's.
+/// The gateway refuses to start, and `/healthz` here does not treat that
+/// holder as this gateway.
+#[tokio::test]
+async fn test_the_host_lock_proves_possession_not_that_the_holder_is_the_gateway() {
+    use crate::host_lock::test_support::{lock_is_free, HeldByAnotherProcess};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("host-process.lock");
+    std::fs::write(&path, "").unwrap();
+    let holder = HeldByAnotherProcess::new(&path);
+    std::fs::write(
+        &path,
+        format!(
+            "{{\"pid\":{},\"role\":\"gateway\",\"addr\":\"localhost:8090\"}}\n",
+            holder.pid()
+        ),
+    )
+    .unwrap();
+
+    // The lock is held, and the report looks like a gateway with that pid.
+    // The holder is `/bin/sleep`.
+    assert!(!lock_is_free(&path), "the other process holds the lock");
+    let reported = crate::host_lock::active_host_process(dir.path())
+        .unwrap()
+        .expect("a held lock is reported as held");
+    assert_eq!(
+        (reported.pid, reported.role.as_str()),
+        (holder.pid(), "gateway")
+    );
+
+    // A gateway for this data directory does not start, by either path.
+    for start in [
+        crate::host_lock::acquire_host_process_lock(dir.path(), "gateway", "localhost:8090")
+            .map(|_| ()),
+        crate::host_lock::publish_gateway_lock_if_unowned(dir.path(), "localhost:8090").map(|_| ()),
+    ] {
+        let err = start.expect_err("a gateway does not start while another process holds the lock");
+        let text = err.to_string();
+        assert!(text.contains("another ElastOS host already owns"), "{text}");
+        assert!(text.contains(&format!("pid {}", holder.pid())), "{text}");
+    }
+
+    // This process does not hold the lock, so it does not claim to be the
+    // gateway: its `/healthz` answers 503, and it gives no descriptor to a child.
+    assert_eq!(crate::host_lock::held_host_role(dir.path()), None);
+    assert!(!crate::host_lock::holds_gateway_host_lock(dir.path()));
+    assert!(crate::host_lock::gateway_host_lock_for_child(dir.path()).is_none());
+    assert_eq!(
+        healthz_status(dir.path()).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a lock held by another process"
+    );
+
+    // When the other process ends, its lock ends, and the record it left
+    // proves nothing. Then this process takes the lock and answers `OK`.
+    holder.stop();
+    assert!(lock_is_free(&path));
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("\"gateway\""));
+    assert!(crate::host_lock::active_host_process(dir.path())
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        healthz_status(dir.path()).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the record left by the ended holder"
+    );
+    let gateway = super::hold_gateway_health_lock(dir.path());
+    assert_eq!(healthz_status(dir.path()).await, StatusCode::OK);
+    drop(gateway);
+
+    let contract = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../docs/LAUNCHER_CONTRACT.md"
+    ))
+    .unwrap();
+    let contract = contract.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(contract.contains("The lock proves possession, not identity."));
+    assert!(contract.contains("That does not prove that the holder is a gateway"));
+    assert!(
+        contract.contains("when any process holds the lock, also a process that is not ElastOS")
+    );
 }
 
 #[tokio::test]
