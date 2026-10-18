@@ -27,10 +27,7 @@ impl CeremonyKind {
             "/api/auth/passkey/register/begin"
             | "/api/auth/owner-recovery/begin"
             | "/api/auth/owner-recovery/complete" => Some(Self::Registration),
-            // The named fallback shares the anonymous begin's pool, so a
-            // caller cannot double its sign-in starts by alternating them.
-            "/api/auth/passkey/authenticate/begin"
-            | "/api/auth/passkey/authenticate/named/begin" => Some(Self::Authentication),
+            "/api/auth/passkey/authenticate/begin" => Some(Self::Authentication),
             _ => None,
         }
     }
@@ -365,33 +362,5 @@ mod tests {
         ] {
             assert!(admit_passkey_begin(Path::new("home"), None, path).is_ok());
         }
-    }
-
-    #[test]
-    fn named_and_anonymous_sign_in_share_one_quota() {
-        let mut limiter = BeginLimiter::default();
-        let root = Path::new("home");
-        let peer = Some("192.0.2.9".parse().unwrap());
-        let now = Instant::now();
-        for path in [
-            "/api/auth/passkey/authenticate/begin",
-            "/api/auth/passkey/authenticate/named/begin",
-        ] {
-            assert!(matches!(
-                CeremonyKind::from_path(path),
-                Some(CeremonyKind::Authentication)
-            ));
-        }
-        for path in [
-            "/api/auth/passkey/authenticate/begin",
-            "/api/auth/passkey/authenticate/named/begin",
-            "/api/auth/passkey/authenticate/begin",
-            "/api/auth/passkey/authenticate/named/begin",
-        ] {
-            let kind = CeremonyKind::from_path(path).unwrap();
-            assert!(limiter.admit(root, peer, kind, now).is_ok());
-        }
-        let named = CeremonyKind::from_path("/api/auth/passkey/authenticate/named/begin").unwrap();
-        assert_eq!(limiter.admit(root, peer, named, now), Err(SHORT_WINDOW));
     }
 }
