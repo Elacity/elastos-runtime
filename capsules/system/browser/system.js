@@ -293,16 +293,13 @@ function configureHomeRecoverySave() {
           ok = await onRecoveryDownload({ isActive: () => active && frameHomeToken === apiHomeToken });
         } else if (data.action === "navigate" && query && typeof query === "object"
           && !Array.isArray(query)
-          && Object.keys(query).every(key => key === "settings" || key === "recovery" || key === "passkey")
+          && Object.keys(query).every(key => key === "settings" || key === "recovery")
           && typeof query.settings === "string"
           && normalizedRequestedSettingsTab(query.settings) === query.settings
           && query.settings !== ""
-          && (query.recovery === undefined || (query.recovery === "import" && query.settings === "security"))
-          && (query.passkey === undefined || (query.passkey === "add" && query.settings === "account"))) {
+          && (query.recovery === undefined || (query.recovery === "import" && query.settings === "security"))) {
           activateSettingsTab(query.settings);
-          if (query.passkey === "add") {
-            offerPasskeyAdd();
-          } else if (query.settings === "security") {
+          if (query.settings === "security") {
             (query.recovery === "import" ? recoveryImportInput
               : (recoveryProfileRequired ? recoveryProfileName : recoveryDownloadButton))?.focus();
           }
@@ -2973,20 +2970,6 @@ async function onPasskeyAdd() {
   } finally {
     passkeyAddButton.disabled = false;
   }
-}
-
-// Home asks once, right after a sign-in by account name: this device has no
-// passkey the browser can find, so point at Add passkey. Only an admin can
-// add one; for anyone else this is a no-op.
-function offerPasskeyAdd() {
-  if (!passkeyAddButton || passkeyAddButton.hidden) {
-    return;
-  }
-  showPasskeyStatus(
-    "You signed in with your account name. Add a passkey on this device to sign in with one tap next time.",
-    "muted",
-  );
-  passkeyAddButton.focus();
 }
 
 // Passkeys can only be created by Home itself, never inside this frame.
