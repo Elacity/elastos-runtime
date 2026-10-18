@@ -62,6 +62,8 @@ mod gateway_esp;
 mod gateway_frontdoor;
 #[path = "gateway_home_agent.rs"]
 mod gateway_home_agent;
+#[path = "gateway_home_external_link.rs"]
+mod gateway_home_external_link;
 #[path = "gateway_home_runtime.rs"]
 mod gateway_home_runtime;
 #[path = "gateway_home_system.rs"]
@@ -115,6 +117,7 @@ use gateway_browser::browser_runtime_stream_socket_path;
 use gateway_capsule_catalog::*;
 use gateway_collaboration_presence::*;
 use gateway_esp::*;
+use gateway_home_external_link::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
 
@@ -147,7 +150,7 @@ pub(super) use gateway_home_token::home_session_cookie_name;
 pub(super) use gateway_home_token::HomeLaunchTokenContext;
 pub(crate) use gateway_home_token::RuntimeWalletAuthority;
 pub(super) use gateway_home_token::{
-    home_launch_token_header, home_session_clear_cookie_header,
+    home_browser_origin, home_launch_token_header, home_session_clear_cookie_header,
     home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
     issue_home_projection_launch_token_with_context, require_carried_home_launch_token,
     require_home_launch_token, require_home_launch_token_binding,
@@ -266,20 +269,12 @@ const PEOPLE_CAPSULE_ID: &str = "people";
 
 /// Announce this Home's people from the Runtime. See
 /// `gateway_collaboration_presence::publish_runtime_owned_presence`.
-pub fn publish_runtime_owned_presence(
+pub async fn publish_runtime_owned_presence(
     data_dir: &std::path::Path,
     port: &crate::collaboration_presence::CollaborationPresenceProductPort,
-    discovery_service: Option<
-        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
-    >,
     now: u64,
 ) -> anyhow::Result<usize> {
-    gateway_collaboration_presence::publish_runtime_owned_presence(
-        data_dir,
-        port,
-        discovery_service,
-        now,
-    )
+    gateway_collaboration_presence::publish_runtime_owned_presence(data_dir, port, now).await
 }
 
 pub fn capsule_catalog_snapshot(data_dir: &std::path::Path) -> serde_json::Value {
@@ -660,6 +655,11 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(super::auth_gateway::passkey_authenticate_begin),
         )
         .route(
+            "/api/auth/passkey/authenticate/named/begin",
+            post(super::auth_gateway::passkey_authenticate_named_begin)
+                .layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
             "/api/auth/passkey/authenticate/complete",
             post(super::auth_gateway::passkey_authenticate_complete)
                 .layer(DefaultBodyLimit::max(96 * 1024)),
@@ -730,6 +730,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/apps/chat-room/contacts/request",
             post(chat_room_contact_request),
         )
+        .route(
+            "/api/apps/chat-room/community-presence/request",
+            post(chat_room_community_presence_request),
+        )
         .route("/artifacts/*path", get(serve_artifact_file))
         .route(
             "/api/apps/assistant/workspace",
@@ -784,6 +788,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/system/community",
             get(system_community_membership_get).post(system_community_membership_update),
+        )
+        .route(
+            "/api/apps/system/community/presence",
+            get(system_community_presence_get).post(system_community_presence_update),
         )
         .route(
             "/api/apps/system/ai-provider",
@@ -1044,6 +1052,7 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         )
         .route("/api/apps/home/runtime/ensure", post(home_runtime_ensure))
         .route("/api/apps/home/launch", post(home_launch))
+        .route("/api/apps/home/external-link", post(home_external_link))
         .route(
             "/api/apps/home-cli/terminal/contract",
             get(home_cli_terminal_contract),
@@ -1102,8 +1111,8 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(people_discovery_request_create),
         )
         .route(
-            "/api/apps/home/collaboration/presence",
-            post(home_collaboration_presence),
+            "/api/apps/chat-room/presence",
+            post(chat_room_presence_heartbeat),
         )
         .route(
             "/api/apps/people/presence",

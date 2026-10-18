@@ -543,7 +543,10 @@ pub(super) async fn people_summary(
     };
     let data_dir = state.data_dir.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
-    let presence_port = state.collaboration_presence_product_port.clone();
+    let presence_snapshot = match state.collaboration_presence_product_port.as_ref() {
+        Some(port) => port.authorized_snapshot(now_ts()).await.ok(),
+        None => None,
+    };
     match tokio::task::spawn_blocking(move || {
         let mut state = home_state(&data_dir);
         let contact_authority = load_configured_contact_authority_for_context(
@@ -557,7 +560,9 @@ pub(super) async fn people_summary(
         )?;
         let mut people = state.people;
         let now = now_ts();
-        apply_contact_reachability(&mut people, presence_port.as_ref(), now);
+        if let Some(snapshot) = presence_snapshot.as_ref() {
+            stamp_contact_reachability(&mut people, snapshot, now);
+        }
         let discovery = if let (Some(service), Some(authority)) =
             (discovery_service.as_ref(), contact_authority.as_ref())
         {
@@ -2071,20 +2076,6 @@ mod discovery_summary_tests {
 /// presence projection People's snapshot reads; this mints no new signal and
 /// touches no store. Heartbeat-derived, so it stays out of the People
 /// realtime signature the way `last_seen_at` does.
-fn apply_contact_reachability(
-    people: &mut HomePeopleSummary,
-    presence_port: Option<&crate::collaboration_presence::CollaborationPresenceProductPort>,
-    now: u64,
-) {
-    let Some(port) = presence_port else {
-        return;
-    };
-    let Ok(snapshot) = port.snapshot(now) else {
-        return;
-    };
-    stamp_contact_reachability(people, &snapshot, now);
-}
-
 fn stamp_contact_reachability(
     people: &mut HomePeopleSummary,
     snapshot: &crate::collaboration_presence::CollaborationPresenceSnapshot,

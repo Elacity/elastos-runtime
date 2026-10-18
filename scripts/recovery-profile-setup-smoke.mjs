@@ -64,18 +64,23 @@ Object.assign(context, {
   clearRecoveryPending: () => {}, setRecoveryButton: () => {},
   showRecoveryStatus: (text, kind) => outcomes.push({ text, kind }),
   showRecoveryNote: (text, kind) => outcomes.push({ text, kind }),
-  downloadRecoveryKit: () => outcomes.push("download"), recoveryPasswordInput: null,
+  downloadRecoveryKit: (kit) => { outcomes.push("download"); return context.recoveryKitFileName(kit); }, recoveryPasswordInput: null,
   notifyHomeSummaryChanged: () => outcomes.push("refresh-home"),
   refreshSystemSummary: async () => { throw new Error("summary failed"); },
 });
 vm.runInContext(functionSource(system, "onRecoveryDownload"), context);
-context.exportFullRecoveryBundle = async () => ({ included: { people_identity: true } });
+vm.runInContext(functionSource(system, "recoveryKitFileName"), context);
+const longPrincipal = "did:elastos:iqTKjH4ZKXbM4hnZtYV8M2pnf6Ag7Lqb9zW";
+assert.equal(context.recoveryKitFileName({ principal_id: longPrincipal }),
+  "elastos-recovery-did-elastos-iqTKjH4ZKXbM4hnZtYV8M2pnf6Ag7Lqb9zW.json");
+assert.equal(context.recoveryKitFileName({}), "elastos-recovery-principal.json");
+context.exportFullRecoveryBundle = async () => ({ principal_id: longPrincipal, included: { people_identity: true } });
 context.fetchJson = async () => status;
 await context.onRecoveryDownload();
 assert(outcomes.includes("download"));
 assert(outcomes.includes("refresh-home"));
 assert(!outcomes.some((outcome) => outcome.kind === "error"));
-assert(outcomes.some((outcome) => outcome.text?.includes("Recovery Kit downloaded")));
+assert(outcomes.some((outcome) => outcome.text?.includes("Recovery Kit downloaded as elastos-recovery-did-elastos-iqTKjH4ZKXbM4hnZtYV8M2pnf6Ag7Lqb9zW.json")));
 let releaseExport;
 let exportCount = 0;
 vm.runInContext(functionSource(system, "setRecoveryButton"), context);

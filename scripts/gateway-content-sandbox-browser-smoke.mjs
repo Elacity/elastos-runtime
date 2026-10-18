@@ -209,45 +209,35 @@ async function checkFrontdoor(browser, context, page) {
       `${path}: the app keeps its existing opener isolation policy`);
     assert.ok(policy?.includes('sandbox allow-scripts'), `${path}: document has a response sandbox`);
     assert.ok(!policy.includes('allow-same-origin'), `${path}: sandbox gives an opaque origin`);
+    assert.ok(!policy.includes('allow-popups'), `${path}: app documents cannot open popups`);
     assert.ok(policy.includes("script-src 'self'"), `${path}: scripts keep the document source boundary`);
     await assertAppDocument(page, path);
   }
+  // App documents have no popup permission: neither a target=_blank click nor
+  // window.open creates a window. Home opens web links for its apps instead.
   await page.goto(`${origin}/apps/assistant/`);
-  const failedPopupRequests = [];
-  const popupApiRequests = [];
-  const recordFailure = request => {
-    if (new URL(request.url()).pathname === '/apps/assistant/extra.html') {
-      failedPopupRequests.push(request.failure()?.errorText);
-    }
+  await assertAppDocument(page, 'app before popup probe');
+  const pagesBeforePopup = context.pages().length;
+  const popupRequests = [];
+  const recordPopupRequest = request => {
+    const path = new URL(request.url()).pathname;
+    if (path === '/apps/assistant/extra.html' || path.startsWith('/api/')) popupRequests.push(request.url());
   };
-  const recordApiRequest = request => {
-    if (new URL(request.url()).pathname.startsWith('/api/')) popupApiRequests.push(request.url());
-  };
-  context.on('requestfailed', recordFailure);
-  context.on('request', recordApiRequest);
-  const popupPromise = page.waitForEvent('popup');
-  await page.locator('#escape').click();
-  const popup = await popupPromise;
+  let popupEvents = 0;
+  const countPopup = () => { popupEvents += 1; };
+  context.on('request', recordPopupRequest);
+  page.on('popup', countPopup);
   try {
-    await popup.waitForLoadState('domcontentloaded');
-    if (popup.url() === 'chrome-error://chromewebdata/') {
-      // An inherited sandbox cannot navigate a popup to a COOP same-origin
-      // document. Chromium refuses the response before app scripts can run.
-      assert.deepEqual(failedPopupRequests, ['net::ERR_BLOCKED_BY_RESPONSE'],
-        'the attempted app popup is refused by response policy');
-      assert.equal(await popup.evaluate(() => Boolean(window.appProbe)), false,
-        'the refused popup never executes the app probe');
-      assert.equal(await popup.locator('body').innerText(), '',
-        'the refused popup displays no app or Home data');
-      assert.deepEqual(popupApiRequests, [], 'the refused popup sends no Home or app API request');
-    } else {
-      assert.equal(popup.url(), `${origin}/apps/assistant/extra.html`);
-      await assertAppDocument(popup, 'app popup');
-    }
+    await page.locator('#escape').click();
+    const opened = await page.evaluate(() => window.open('/apps/assistant/extra.html', '_blank') !== null);
+    await page.waitForTimeout(500);
+    assert.equal(opened, false, 'window.open returns null in an app document');
+    assert.equal(popupEvents, 0, 'the app document cannot open a popup');
+    assert.equal(context.pages().length, pagesBeforePopup, 'no new window exists');
+    assert.deepEqual(popupRequests, [], 'the blocked popup sends no request');
   } finally {
-    context.off('requestfailed', recordFailure);
-    context.off('request', recordApiRequest);
-    await popup.close();
+    context.off('request', recordPopupRequest);
+    page.off('popup', countPopup);
   }
 
   // Home -> sandboxed Home GUI shell -> app, as the installed Home mounts windows.

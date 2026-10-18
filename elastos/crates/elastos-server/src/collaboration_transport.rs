@@ -446,6 +446,21 @@ impl CollaborationTransportDriver {
         let mut summary = CollaborationOutgoingRetrySummary::default();
         for outgoing in selected {
             self.core.community_membership().require_joined()?;
+            // Every own-presence send presents the grant to the live manager.
+            // A driver without the Runtime's port has no authority to send it.
+            if let Some((principal_id, profile_did)) = outgoing.presence_sender() {
+                let Some(delivery) = &self.home_delivery else {
+                    self.core.retire_outgoing_presence(principal_id)?;
+                    continue;
+                };
+                if !delivery
+                    .presence
+                    .own_presence_effect_usable(outgoing.envelope_sha256(), profile_did, now)
+                    .await?
+                {
+                    continue;
+                }
+            }
             // Recorded per send, so a cycle cut short leaves the rest due.
             {
                 let mut schedule = self
@@ -458,10 +473,19 @@ impl CollaborationTransportDriver {
                     .or_insert((attempted_at, 0));
                 *entry = (attempted_at, entry.1.saturating_add(1));
             }
-            summary.attempted += 1;
             let frame = self
                 .core
                 .prepare_transport_frame(outgoing.envelope_bytes())?;
+            // No await separates this queue admission from Carrier dispatch.
+            // Revocation can complete while an earlier selected send waits.
+            if outgoing.presence_sender().is_some()
+                && !self
+                    .core
+                    .pending_outgoing_contains(outgoing.envelope_sha256(), now)?
+            {
+                continue;
+            }
+            summary.attempted += 1;
             match self.network.send_gossip(&self.core, &frame, None).await {
                 Ok(CollaborationCarrierSendOutcome::RemoteBroadcast { .. }) => {
                     summary.remote_broadcasts += 1;
@@ -592,6 +616,7 @@ mod tests {
         SignedCollaborationNetworkProfile, VerifiedCollaborationNetworkProfile,
         COLLABORATION_NETWORK_PROFILE_SCHEMA, COLLABORATION_NETWORK_PROFILE_SIGNATURE_DOMAIN,
     };
+    use crate::collaboration_presence_grant::PresenceDecision;
     use crate::collaboration_protocol::sign_collaboration_transport_frame;
     use crate::esp_binding::{esp_request_binding, EspRequestBinding};
     use elastos_common::collaboration_protocol::{
@@ -615,6 +640,7 @@ mod tests {
         requests: Mutex<Vec<serde_json::Value>>,
         replies: Mutex<VecDeque<Result<serde_json::Value, ProviderError>>>,
         blocked_metadata: AtomicBool,
+        send_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
         durable_incoming_before_send: Mutex<Option<Arc<CollaborationCore>>>,
     }
     impl FakeCarrier {
@@ -623,6 +649,7 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
                 replies: Mutex::new(VecDeque::new()),
                 blocked_metadata: AtomicBool::new(false),
+                send_barrier: Mutex::new(None),
                 durable_incoming_before_send: Mutex::new(None),
             })
         }
@@ -670,6 +697,15 @@ mod tests {
                         "the receipt is sent only after acceptance is durable"
                     );
                 }
+            }
+            let barrier = if request["op"] == "gossip_send" {
+                self.send_barrier.lock().unwrap().take()
+            } else {
+                None
+            };
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
             }
             if request["op"] == "gossip_send" && self.blocked_metadata.load(Ordering::SeqCst) {
                 return std::future::pending().await;
@@ -918,6 +954,588 @@ mod tests {
         .unwrap()
     }
 
+    const PRESENCE_PRINCIPAL: &str = "runtime-principal";
+
+    /// A presence port whose person has granted "Always", as on a Home.
+    async fn granted_presence_port(
+        fixture: &Fixture,
+        core: Arc<CollaborationCore>,
+    ) -> (
+        CollaborationPresenceProductPort,
+        Arc<crate::collaboration_presence_grant::PresenceAuthority>,
+    ) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fixture.data_root, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        crate::auth::store_test_principal_root_protection(&fixture.data_root, PRESENCE_PRINCIPAL);
+        let mut seed = fixture.device_key.to_bytes();
+        seed[0] ^= 0xa5;
+        seed[31] ^= 0x5a;
+        let key = SigningKey::from_bytes(&seed);
+        let profile = fixture
+            .authority(fixture.device_key.clone())
+            .sender_profile_for_test()
+            .unwrap();
+        crate::collaboration_presence_grant::store_test_profile(
+            &fixture.data_root,
+            PRESENCE_PRINCIPAL,
+            &key,
+            &profile,
+        );
+        let authority = crate::collaboration_presence_grant::test_authority();
+        let port = CollaborationPresenceProductPort::new(core)
+            .unwrap()
+            .with_presence_authority(authority.clone());
+        set_presence(fixture, &port, &authority, PresenceDecision::Always).await;
+        (port, authority)
+    }
+
+    async fn granted_presence_driver(
+        fixture: &Fixture,
+        core: Arc<CollaborationCore>,
+        carrier: Arc<dyn Provider>,
+    ) -> (
+        CollaborationTransportDriver,
+        CollaborationPresenceProductPort,
+        Arc<crate::collaboration_presence_grant::PresenceAuthority>,
+    ) {
+        let (port, authority) = granted_presence_port(fixture, core.clone()).await;
+        let driver = fixture
+            .driver(core, carrier)
+            .await
+            .with_home_delivery(port.clone(), Arc::new(ProviderRegistry::new()))
+            .await
+            .unwrap();
+        (driver, port, authority)
+    }
+
+    async fn set_presence(
+        fixture: &Fixture,
+        port: &CollaborationPresenceProductPort,
+        authority: &crate::collaboration_presence_grant::PresenceAuthority,
+        decision: PresenceDecision,
+    ) {
+        let profile = fixture
+            .authority(fixture.device_key.clone())
+            .sender_profile_for_test()
+            .unwrap();
+        crate::collaboration_presence_grant::set_presence_grant(
+            authority,
+            &fixture.data_root,
+            PRESENCE_PRINCIPAL,
+            &profile.document().profile_did,
+            &port.presence_scope(),
+            decision,
+            NOW,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn queued_presence(
+        fixture: &Fixture,
+        port: &CollaborationPresenceProductPort,
+        request_id: &str,
+    ) -> crate::collaboration_core::DurableOutgoingMessage {
+        let profile = fixture
+            .authority(fixture.device_key.clone())
+            .sender_profile_for_test()
+            .unwrap();
+        let grant = crate::collaboration_presence_grant::presence_grant(
+            port.presence_authority().unwrap(),
+            &fixture.data_root,
+            PRESENCE_PRINCIPAL,
+            &profile.document().profile_did,
+            &port.presence_scope(),
+            crate::collaboration_presence_grant::PresencePublisher::Runtime,
+            NOW,
+        )
+        .await
+        .unwrap();
+        let presence = port
+            .test_core()
+            .prepare_profile_outgoing(
+                crate::collaboration_presence::presence_request_binding(
+                    &grant.bind_request_id(request_id),
+                    PRESENCE_PRINCIPAL,
+                    &profile,
+                )
+                .unwrap(),
+                &profile,
+                crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE,
+                serde_json::json!({}),
+                NOW,
+                45,
+            )
+            .unwrap();
+        port.test_core()
+            .acknowledge_outgoing_product_projection(presence.envelope_sha256())
+            .unwrap();
+        presence
+    }
+
+    #[tokio::test]
+    async fn stale_profile_effect_preserves_the_replacement_profile_presence() {
+        use crate::collaboration_presence_grant::{
+            presence_grant, set_presence_grant, PresencePublisher,
+        };
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let carrier = FakeCarrier::new();
+        let (driver, port, authority) =
+            granted_presence_driver(&fixture, core.clone(), carrier.clone()).await;
+        let old_profile = fixture
+            .authority(fixture.device_key.clone())
+            .sender_profile_for_test()
+            .unwrap();
+        let old = queued_presence(&fixture, &port, "old-profile-effect").await;
+
+        // A selected old effect can outlive a Profile/grant replacement. The
+        // new Profile has its own signed authority, grant and queued projection.
+        let (key, _) = generate_keypair();
+        let replacement = crate::collaboration_profile_authority::signed_profile_document_for_test(
+            &key,
+            "Replacement Profile",
+            None,
+            1,
+            None,
+            NOW,
+            vec![core.local_device_did()],
+        )
+        .unwrap();
+        crate::collaboration_presence_grant::store_test_profile(
+            &fixture.data_root,
+            PRESENCE_PRINCIPAL,
+            &key,
+            &replacement,
+        );
+        set_presence_grant(
+            &authority,
+            &fixture.data_root,
+            PRESENCE_PRINCIPAL,
+            &replacement.document().profile_did,
+            &port.presence_scope(),
+            PresenceDecision::Always,
+            NOW,
+        )
+        .await
+        .unwrap();
+        let grant = presence_grant(
+            &authority,
+            &fixture.data_root,
+            PRESENCE_PRINCIPAL,
+            &replacement.document().profile_did,
+            &port.presence_scope(),
+            PresencePublisher::Runtime,
+            NOW,
+        )
+        .await
+        .unwrap();
+        let fresh = port
+            .prepare_presence(
+                crate::collaboration_presence::presence_request_binding(
+                    &grant.bind_request_id("replacement-profile-effect"),
+                    PRESENCE_PRINCIPAL,
+                    &replacement,
+                )
+                .unwrap(),
+                &replacement,
+                NOW,
+            )
+            .unwrap();
+        port.project_authorized_presence(&fresh, NOW).await.unwrap();
+
+        assert!(
+            port.own_presence_effect_usable(
+                fresh.envelope_sha256(),
+                &replacement.document().profile_did,
+                NOW,
+            )
+            .await
+            .unwrap(),
+            "replacement Profile effect must be authorized before stale cleanup"
+        );
+        assert!(
+            core.pending_outgoing_contains(fresh.envelope_sha256(), NOW)
+                .unwrap(),
+            "replacement Profile effect must be pending before stale cleanup"
+        );
+        assert!(!port
+            .own_presence_effect_usable(
+                old.envelope_sha256(),
+                &old_profile.document().profile_did,
+                NOW,
+            )
+            .await
+            .unwrap());
+        assert!(core
+            .pending_outgoing_contains(fresh.envelope_sha256(), NOW)
+            .unwrap());
+        let snapshot = port.authorized_snapshot(NOW).await.unwrap();
+        assert_eq!(snapshot.records().len(), 1);
+        assert_eq!(
+            snapshot.records()[0].sender_profile_did(),
+            replacement.document().profile_did
+        );
+        let crate::collaboration_presence::OwnHistoryPresence::Usable(history) =
+            port.own_history_presence(NOW).await.unwrap()
+        else {
+            panic!("replacement Profile must retain history authority")
+        };
+        assert_eq!(
+            history.into_envelope().as_bytes(),
+            fresh.test_envelope_bytes()
+        );
+        assert_eq!(driver.retry_gossip_once(NOW).await.unwrap().attempted, 1);
+        let sent = carrier
+            .requests()
+            .into_iter()
+            .filter(|request| request["op"] == "gossip_send")
+            .collect::<Vec<_>>();
+        assert_eq!(sent.len(), 1);
+        let frame = crate::collaboration_protocol::verify_collaboration_transport_frame(
+            sent[0]["message"].as_str().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(frame.envelope_bytes(), fresh.test_envelope_bytes());
+
+        // A real Hidden decision still retires all current work, even when the
+        // maintenance caller carries the previous Profile identity.
+        set_presence_grant(
+            &authority,
+            &fixture.data_root,
+            PRESENCE_PRINCIPAL,
+            &replacement.document().profile_did,
+            &port.presence_scope(),
+            PresenceDecision::Hidden,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !port
+                .retire_denied_current_presence(
+                    PRESENCE_PRINCIPAL,
+                    &old_profile.document().profile_did,
+                    NOW,
+                )
+                .await
+        );
+        assert!(core.pending_outgoing(NOW).unwrap().is_empty());
+        assert!(port
+            .authorized_snapshot(NOW)
+            .await
+            .unwrap()
+            .records()
+            .is_empty());
+        assert!(!matches!(
+            port.own_history_presence(NOW).await.unwrap(),
+            crate::collaboration_presence::OwnHistoryPresence::Usable(_)
+        ));
+        assert_eq!(driver.retry_gossip_once(NOW).await.unwrap().attempted, 0);
+    }
+
+    #[tokio::test]
+    async fn selected_presence_keeps_its_original_grant_and_pending_operation() {
+        use crate::collaboration_presence_grant::{
+            presence_grant, set_presence_grant, PresencePublisher,
+        };
+        // A currently valid grant cannot authorize an older effect. Exercise
+        // both publisher replacement and a fresh generation of the same mode.
+        for same_mode in [false, true] {
+            let fixture = Fixture::new();
+            let core = fixture.core();
+            let carrier = FakeCarrier::new();
+            let (driver, port, authority) =
+                granted_presence_driver(&fixture, core.clone(), carrier.clone()).await;
+            let first = queued_presence(&fixture, &port, "first-person").await;
+            let second = "person:local:second-presence";
+            crate::auth::store_test_principal_root_protection(&fixture.data_root, second);
+            let (key, _) = generate_keypair();
+            let profile = crate::collaboration_profile_authority::signed_profile_document_for_test(
+                &key,
+                "Second person",
+                None,
+                1,
+                None,
+                NOW,
+                vec![core.local_device_did()],
+            )
+            .unwrap();
+            crate::collaboration_presence_grant::store_test_profile(
+                &fixture.data_root,
+                second,
+                &key,
+                &profile,
+            );
+            set_presence_grant(
+                &authority,
+                &fixture.data_root,
+                second,
+                &profile.document().profile_did,
+                &port.presence_scope(),
+                PresenceDecision::Always,
+                NOW,
+            )
+            .await
+            .unwrap();
+            let old_grant = presence_grant(
+                &authority,
+                &fixture.data_root,
+                second,
+                &profile.document().profile_did,
+                &port.presence_scope(),
+                PresencePublisher::Runtime,
+                NOW,
+            )
+            .await
+            .unwrap();
+            let old = port
+                .prepare_presence(
+                    crate::collaboration_presence::presence_request_binding(
+                        &old_grant.bind_request_id("second-person"),
+                        second,
+                        &profile,
+                    )
+                    .unwrap(),
+                    &profile,
+                    NOW,
+                )
+                .unwrap();
+            port.project_authorized_presence(&old, NOW).await.unwrap();
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            *carrier.send_barrier.lock().unwrap() = Some(barrier.clone());
+            let change = async {
+                barrier.wait().await; // The first send owns the selected batch.
+                if same_mode {
+                    set_presence_grant(
+                        &authority,
+                        &fixture.data_root,
+                        second,
+                        &profile.document().profile_did,
+                        &port.presence_scope(),
+                        PresenceDecision::Hidden,
+                        NOW,
+                    )
+                    .await
+                    .unwrap();
+                }
+                let decision = if same_mode {
+                    PresenceDecision::Always
+                } else {
+                    PresenceDecision::WhileOpen
+                };
+                set_presence_grant(
+                    &authority,
+                    &fixture.data_root,
+                    second,
+                    &profile.document().profile_did,
+                    &port.presence_scope(),
+                    decision,
+                    NOW,
+                )
+                .await
+                .unwrap();
+                port.retire_own_presence(second, &profile.document().profile_did)
+                    .unwrap();
+                let publisher = if same_mode {
+                    PresencePublisher::Runtime
+                } else {
+                    PresencePublisher::CommunityOpen
+                };
+                assert!(
+                    presence_grant(
+                        &authority,
+                        &fixture.data_root,
+                        second,
+                        &profile.document().profile_did,
+                        &port.presence_scope(),
+                        publisher,
+                        NOW,
+                    )
+                    .await
+                    .is_some(),
+                    "the replacement grant itself is live"
+                );
+                // No Chat heartbeat runs during the switch. The while-open
+                // token is valid, but there is no new operation to announce.
+                barrier.wait().await;
+            };
+            let (result, ()) = tokio::join!(driver.retry_gossip_once(NOW), change);
+            assert_eq!(result.unwrap().attempted, 1);
+            let sent = carrier
+                .requests()
+                .into_iter()
+                .filter(|r| r["op"] == "gossip_send")
+                .collect::<Vec<_>>();
+            assert_eq!(sent.len(), 1);
+            let sent_frame = crate::collaboration_protocol::verify_collaboration_transport_frame(
+                sent[0]["message"].as_str().unwrap().as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(sent_frame.envelope_bytes(), first.envelope_bytes());
+            assert!(!core
+                .pending_outgoing_contains(old.envelope_sha256(), NOW)
+                .unwrap());
+            // Even a stale preparation that lands after retirement keeps its
+            // old binding and cannot be projected or dispatched.
+            let stale = port
+                .prepare_presence(
+                    crate::collaboration_presence::presence_request_binding(
+                        &old_grant.bind_request_id("late-old-preparation"),
+                        second,
+                        &profile,
+                    )
+                    .unwrap(),
+                    &profile,
+                    NOW,
+                )
+                .unwrap();
+            core.acknowledge_outgoing_product_projection(stale.envelope_sha256())
+                .unwrap();
+            port.project_authorized_presence(&stale, NOW).await.unwrap();
+            assert!(!port
+                .own_presence_effect_usable(
+                    stale.envelope_sha256(),
+                    &profile.document().profile_did,
+                    NOW
+                )
+                .await
+                .unwrap());
+            // A new timer/Chat preparation under the new grant still works,
+            // including within the very same heartbeat bucket.
+            let publisher = if same_mode {
+                PresencePublisher::Runtime
+            } else {
+                PresencePublisher::CommunityOpen
+            };
+            let new_grant = presence_grant(
+                &authority,
+                &fixture.data_root,
+                second,
+                &profile.document().profile_did,
+                &port.presence_scope(),
+                publisher,
+                NOW,
+            )
+            .await
+            .unwrap();
+            assert_ne!(
+                old_grant.bind_request_id("second-person"),
+                new_grant.bind_request_id("second-person")
+            );
+            let fresh = port
+                .prepare_presence(
+                    crate::collaboration_presence::presence_request_binding(
+                        &new_grant.bind_request_id("second-person"),
+                        second,
+                        &profile,
+                    )
+                    .unwrap(),
+                    &profile,
+                    NOW,
+                )
+                .unwrap();
+            port.project_authorized_presence(&fresh, NOW).await.unwrap();
+            assert!(port
+                .own_presence_effect_usable(
+                    fresh.envelope_sha256(),
+                    &profile.document().profile_did,
+                    NOW
+                )
+                .await
+                .unwrap());
+            // An old prepared handle also fails after the fresh projection:
+            // its denial preserves the new record and history authority.
+            port.project_authorized_presence(&old, NOW).await.unwrap();
+            assert!(port
+                .authorized_snapshot(NOW)
+                .await
+                .unwrap()
+                .records()
+                .iter()
+                .any(|record| record.sender_profile_did() == profile.document().profile_did));
+            let crate::collaboration_presence::OwnHistoryPresence::Usable(history) =
+                port.own_history_presence(NOW).await.unwrap()
+            else {
+                panic!("fresh history presence")
+            };
+            assert_eq!(
+                history.into_envelope().as_bytes(),
+                fresh.test_envelope_bytes()
+            );
+            let result = driver.retry_gossip_once(NOW).await.unwrap();
+            assert_eq!(result.attempted, 1);
+            let sent = carrier
+                .requests()
+                .into_iter()
+                .filter(|r| r["op"] == "gossip_send")
+                .collect::<Vec<_>>();
+            assert_eq!(sent.len(), 2);
+            let frame = crate::collaboration_protocol::verify_collaboration_transport_frame(
+                sent[1]["message"].as_str().unwrap().as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(frame.envelope_bytes(), fresh.test_envelope_bytes());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_presence_is_not_sent_after_hidden() {
+        let a = Fixture::new();
+        let ac = a.core();
+        let (driver, port, authority) =
+            granted_presence_driver(&a, ac.clone(), FakeCarrier::new()).await;
+        queued_presence(&a, &port, "granted-presence").await;
+        assert_eq!(driver.retry_outgoing_once(NOW).await.unwrap().attempted, 1);
+        // Hidden lands while the announcement is still queued and live; the
+        // next send, as after a reconnect, discloses nothing.
+        set_presence(&a, &port, &authority, PresenceDecision::Hidden).await;
+        tokio::time::advance(SHARED_CUSTODY_RETRY).await;
+        assert_eq!(
+            driver.retry_outgoing_once(NOW + 5).await.unwrap().attempted,
+            0
+        );
+        assert!(ac.pending_outgoing(NOW + 5).unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_presence_is_not_sent_after_an_epoch_bump() {
+        let a = Fixture::new();
+        let ac = a.core();
+        let (driver, port, authority) =
+            granted_presence_driver(&a, ac.clone(), FakeCarrier::new()).await;
+        queued_presence(&a, &port, "granted-presence").await;
+        assert_eq!(driver.retry_outgoing_once(NOW).await.unwrap().attempted, 1);
+        authority.manager().revoke_all("test epoch");
+        tokio::time::advance(SHARED_CUSTODY_RETRY).await;
+        assert_eq!(
+            driver.retry_outgoing_once(NOW + 5).await.unwrap().attempted,
+            0
+        );
+        assert!(ac.pending_outgoing(NOW + 5).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bare_driver_cannot_send_queued_own_presence() {
+        let a = Fixture::new();
+        let core = a.core();
+        let carrier = FakeCarrier::new();
+        let driver = a.driver(core.clone(), carrier.clone()).await;
+        let presence = prepare_metadata(&a, &core, "bare-driver-presence");
+        core.acknowledge_outgoing_product_projection(presence.envelope_sha256())
+            .unwrap();
+        assert_eq!(driver.retry_outgoing_once(NOW).await.unwrap().attempted, 0);
+        assert!(core.pending_outgoing(NOW).unwrap().is_empty());
+        assert!(carrier
+            .requests()
+            .iter()
+            .all(|request| request["op"] != "gossip_send"));
+    }
+
     fn remote_receipt(
         fixture: &Fixture,
         outgoing: &crate::collaboration_core::DurableOutgoingMessage,
@@ -1055,7 +1673,11 @@ mod tests {
         peer_core: Arc<CollaborationCore>,
         lose_reply: bool,
         stall: bool,
-    ) -> (CollaborationTransportDriver, Arc<Plane>) {
+    ) -> (
+        CollaborationTransportDriver,
+        Arc<Plane>,
+        CollaborationPresenceProductPort,
+    ) {
         let presence = CollaborationPresenceProductPort::new(core.clone()).unwrap();
         observe(fixture, &core, &presence, peer);
         let peers = BTreeMap::from([(
@@ -1072,9 +1694,13 @@ mod tests {
         peers: BTreeMap<String, SharedHomeDelivery>,
         lose_reply: bool,
         stall: bool,
-    ) -> (CollaborationTransportDriver, Arc<Plane>) {
+    ) -> (
+        CollaborationTransportDriver,
+        Arc<Plane>,
+        CollaborationPresenceProductPort,
+    ) {
         let registry = Arc::new(ProviderRegistry::new());
-        let presence = CollaborationPresenceProductPort::new(core.clone()).unwrap();
+        let (presence, _authority) = granted_presence_port(fixture, core.clone()).await;
         let plane = Arc::new(Plane {
             source: core.local_device_did(),
             peers,
@@ -1087,10 +1713,10 @@ mod tests {
         let driver = fixture
             .driver(core, carrier)
             .await
-            .with_home_delivery(presence, registry)
+            .with_home_delivery(presence.clone(), registry)
             .await
             .unwrap();
-        (driver, plane)
+        (driver, plane, presence)
     }
 
     /// One gossip topic whose bootstrap forwards every frame to every other
@@ -1228,7 +1854,7 @@ mod tests {
         );
         ac.acknowledge_outgoing_product_projection(outgoing.envelope_sha256())
             .unwrap();
-        let (driver, plane) =
+        let (driver, plane, _) =
             home_driver(&a, ac.clone(), carrier.clone(), &b, bc.clone(), true, false).await;
         // The gossip broadcast fails offline next to the lost direct reply.
         assert_eq!(
@@ -1283,56 +1909,71 @@ mod tests {
         let b = peer_fixture(&a);
         let ac = a.core();
         let bc = b.core();
-        let profile = a
-            .authority(a.device_key.clone())
-            .sender_profile_for_test()
-            .unwrap();
-        let kind = crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE;
-        let metadata = ac
-            .prepare_profile_outgoing(
-                operation(&profile, "local-metadata", kind, &serde_json::json!({}), 45),
-                &profile,
-                kind,
-                serde_json::json!({}),
-                NOW,
-                45,
-            )
-            .unwrap();
-        ac.acknowledge_outgoing_product_projection(metadata.envelope_sha256())
-            .unwrap();
-        assert!(ac
-            .pending_outgoing(NOW)
-            .unwrap()
-            .iter()
-            .any(|message| message.envelope_sha256() == metadata.envelope_sha256()));
+        let carrier = FakeCarrier::new();
+        carrier.blocked_metadata.store(true, Ordering::SeqCst);
+        // The blocked send has to be a granted presence. A presence with no
+        // grant is refused and never occupies gossip, so the direct chat is
+        // what blocks and the next cycle has nothing left to send.
+        let (driver, plane, port) =
+            home_driver(&a, ac.clone(), carrier.clone(), &b, bc.clone(), true, false).await;
+        // Queue both metadata originals ahead of Chat. At the 500 ms retry,
+        // the first is not due for its 5 s resend; the untouched second one is.
+        let metadata = [
+            queued_presence(&a, &port, "local-metadata-first").await,
+            queued_presence(&a, &port, "local-metadata-retry").await,
+        ];
+        assert_ne!(metadata[0].envelope_sha256(), metadata[1].envelope_sha256());
+        for message in &metadata {
+            let (_, profile_did) = message.presence_sender().unwrap();
+            assert!(
+                port.own_presence_effect_usable(message.envelope_sha256(), profile_did, NOW)
+                    .await
+                    .unwrap(),
+                "blocked metadata must be authorized by the driver's presence port"
+            );
+            assert!(ac
+                .pending_outgoing(NOW)
+                .unwrap()
+                .iter()
+                .any(|pending| pending.envelope_sha256() == message.envelope_sha256()));
+        }
         let outgoing = prepare_outgoing(&ac, "Chat", serde_json::json!({"body":"direct"}));
         ac.acknowledge_outgoing_product_projection(outgoing.envelope_sha256())
             .unwrap();
-        let carrier = FakeCarrier::new();
-        carrier.blocked_metadata.store(true, Ordering::SeqCst);
-        let (driver, plane) =
-            home_driver(&a, ac.clone(), carrier.clone(), &b, bc.clone(), true, false).await;
         let driver = Arc::new(driver);
         for count in [1, 2] {
             let running = driver.clone();
             let cycle = tokio::spawn(async move { running.retry_outgoing_once(NOW + 1).await });
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while plane.calls.lock().unwrap().len() < count {
+            while plane.calls.lock().unwrap().len() < count
+                || carrier
+                    .requests()
+                    .iter()
+                    .filter(|request| request["op"] == "gossip_send")
+                    .count()
+                    < count
+            {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "direct attempt waited for blocked metadata"
                 );
                 tokio::task::yield_now().await;
             }
+            let sends = carrier
+                .requests()
+                .into_iter()
+                .filter(|request| request["op"] == "gossip_send")
+                .collect::<Vec<_>>();
             assert_eq!(
-                carrier
-                    .requests()
-                    .iter()
-                    .filter(|request| request["op"] == "gossip_send")
-                    .count(),
+                sends.len(),
                 count,
                 "each direct attempt starts while its metadata send is blocked"
             );
+            let frame = crate::collaboration_protocol::verify_collaboration_transport_frame(
+                sends[count - 1]["message"].as_str().unwrap().as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(frame.envelope_bytes(), metadata[count - 1].envelope_bytes());
             assert!(
                 !cycle.is_finished(),
                 "metadata must still be pending at direct dispatch"
@@ -1340,6 +1981,12 @@ mod tests {
             tokio::time::advance(SHARED_CUSTODY_FAST_RETRY).await;
             cycle.await.unwrap().unwrap();
         }
+        let calls = plane.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0], calls[1],
+            "the lost reply retries the same original"
+        );
         assert_eq!(bc.summary().unwrap().pending_product_handoffs, 1);
         assert!(ac
             .pending_outgoing(NOW + 1)
@@ -1358,7 +2005,7 @@ mod tests {
         let ac = a.core();
         let bc = b.core();
         let carrier = FakeCarrier::new();
-        let (driver, plane) = home_driver(&a, ac.clone(), carrier, &b, bc, false, false).await;
+        let (driver, plane, _) = home_driver(&a, ac.clone(), carrier, &b, bc, false, false).await;
         // Every selected Home is unavailable; a failure cannot discard a claim.
         plane
             .peers
@@ -1590,7 +2237,7 @@ mod tests {
             let relay = BootstrapRelay::new(&a.profile);
             let a_carrier = relay.join();
             let b_carrier = relay.join();
-            let (ad, plane) = plane_driver(
+            let (ad, plane, _) = plane_driver(
                 &a,
                 ac.clone(),
                 a_carrier.clone(),
@@ -1706,15 +2353,16 @@ mod tests {
     async fn unanswered_gossip_resends_on_its_schedule_not_every_cycle() {
         let a = Fixture::new();
         let ac = a.core();
-        let presence = prepare_metadata(&a, &ac, "unanswered-presence");
+        let carrier = FakeCarrier::new();
+        let (driver, port, _authority) =
+            granted_presence_driver(&a, ac.clone(), carrier.clone()).await;
+        let presence = queued_presence(&a, &port, "unanswered-presence").await;
         let post = prepare_outgoing(&ac, "unanswered-post", serde_json::json!({"body":"hi"}));
         for message in [&presence, &post] {
             ac.acknowledge_outgoing_product_projection(message.envelope_sha256())
                 .unwrap();
         }
         // No Home answers and every broadcast fails, as with an overloaded seed.
-        let carrier = FakeCarrier::new();
-        let driver = a.driver(ac.clone(), carrier.clone()).await;
         let mut ticks = HashMap::<String, Vec<u32>>::new();
         let mut seen = 1;
         // 400 worker cycles of 500 ms: 200 s.
@@ -1867,7 +2515,7 @@ mod tests {
             bc.local_device_did(),
             delivery(bc.clone(), Arc::new(ProviderRegistry::new())),
         )]);
-        let (ad, plane) =
+        let (ad, plane, _) =
             plane_driver(&a, ac.clone(), a_carrier.clone(), peers, false, false).await;
         let bd = b.driver(bc.clone(), b_carrier).await;
         let outgoing = prepare_outgoing(&ac, "both-paths", serde_json::json!({"body":"hi"}));
@@ -2213,7 +2861,10 @@ mod tests {
         assert_eq!(core.summary().unwrap().pending_product_handoffs, 1);
         core.acknowledge_product_handoff(&collaboration_message_envelope_sha256(&envelope))
             .unwrap();
-        assert_eq!(core.summary().unwrap().replay_tombstones, 1);
+        // Presence is suppressed in memory until its expiry, not tombstoned,
+        // so after the ack its receipt replay is no longer a durable record.
+        assert_eq!(core.summary().unwrap().replay_tombstones, 0);
+        *carrier.durable_incoming_before_send.lock().unwrap() = None;
 
         carrier.push([peek(0, 1, vec![gossip(&frame)])]);
         carrier.push_failure("receipt send failed");
@@ -2263,10 +2914,13 @@ mod tests {
     async fn outgoing_observations_never_replace_verified_remote_acceptance() {
         let fixture = Fixture::new();
         let core = fixture.core();
-        let outgoing: Vec<_> = ["metadata-one", "metadata-two", "metadata-three"]
-            .into_iter()
-            .map(|request| prepare_metadata(&fixture, &core, request))
-            .collect();
+        let carrier = FakeCarrier::new();
+        let (driver, presence, _authority) =
+            granted_presence_driver(&fixture, core.clone(), carrier.clone()).await;
+        let mut outgoing = Vec::new();
+        for request in ["metadata-one", "metadata-two", "metadata-three"] {
+            outgoing.push(queued_presence(&fixture, &presence, request).await);
+        }
         for message in &outgoing {
             core.acknowledge_outgoing_product_projection(message.envelope_sha256())
                 .unwrap();
@@ -2274,8 +2928,6 @@ mod tests {
         let (recipient, _) = generate_keypair();
         let receipt = remote_receipt(&fixture, &outgoing[0], recipient.clone());
         let receipt = sign_collaboration_transport_frame(&recipient, &receipt).unwrap();
-        let carrier = FakeCarrier::new();
-        let driver = fixture.driver(core.clone(), carrier.clone()).await;
         carrier.push([
             serde_json::json!({"status":"ok","data":{"remote_peer_count":1}}),
             serde_json::json!({"status":"ok","broadcast":"local_only","data":{"remote_peer_count":0}}),
@@ -2322,7 +2974,7 @@ mod tests {
         let outgoing = prepare_outgoing(&ac, "cancel", serde_json::json!({"body":"pending"}));
         ac.acknowledge_outgoing_product_projection(outgoing.envelope_sha256())
             .unwrap();
-        let (driver, plane) = home_driver(
+        let (driver, plane, _) = home_driver(
             &a,
             ac.clone(),
             FakeCarrier::new(),

@@ -606,6 +606,7 @@ pub(crate) async fn start_carrier_plane(
     did: &str,
     data_dir: &Path,
     bind_addr: Option<std::net::SocketAddr>,
+    community_bootstrap_node_ids: &[String],
 ) -> anyhow::Result<elastos_server::carrier::CarrierNode> {
     let carrier_node = elastos_server::carrier::start_carrier_node_with_registry_bound(
         signing_key,
@@ -613,6 +614,7 @@ pub(crate) async fn start_carrier_plane(
         data_dir.to_path_buf(),
         Some(Arc::downgrade(provider_registry)),
         bind_addr,
+        community_bootstrap_node_ids,
     )
     .await?;
     provider_registry
@@ -1554,6 +1556,7 @@ async fn setup_server_infrastructure_impl(
             &carrier_did,
             &data_dir,
             carrier_bind_addr,
+            &collaboration_configuration.community_bootstrap_node_ids(),
         )
         .await
         {
@@ -1611,6 +1614,7 @@ async fn setup_server_infrastructure_impl(
             collaboration_configuration,
             collaboration_carrier_provider,
             provider_registry.clone(),
+            Some(capability_manager.clone()),
         )
         .await?;
     if let (Some(collaboration), Some(carrier)) =

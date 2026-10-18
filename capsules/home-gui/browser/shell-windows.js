@@ -385,14 +385,6 @@ const COMMON_IFRAME_SANDBOX = [
   "allow-pointer-lock",
   "allow-scripts",
 ];
-const BROWSER_IFRAME_SANDBOX_EXTRAS = [
-  "allow-popups",
-  "allow-popups-to-escape-sandbox",
-];
-const WALLET_CONNECTOR_IFRAME_SANDBOX_EXTRAS = [
-  "allow-popups",
-  "allow-popups-to-escape-sandbox",
-];
 const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
   "allow-top-navigation-by-user-activation",
   "allow-top-navigation-to-custom-protocols",
@@ -407,12 +399,6 @@ window.addEventListener("message", handleDocumentsWindowCloseResult);
 
 export function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
-  if (launched?.target === "browser") {
-    tokens.push(...BROWSER_IFRAME_SANDBOX_EXTRAS);
-  }
-  if (launched?.target === "wallet-unisat") {
-    tokens.push(...WALLET_CONNECTOR_IFRAME_SANDBOX_EXTRAS);
-  }
   if (launched?.target === SYSTEM_APP_ID) {
     tokens.push(...SYSTEM_IFRAME_SANDBOX_EXTRAS);
   }

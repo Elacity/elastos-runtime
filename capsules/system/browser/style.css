@@ -673,6 +673,11 @@ input[type="file"].visually-hidden {
   background: var(--el-inset);
 }
 
+/* Three long choices: wrap on a phone instead of overflowing the row. */
+#community-presence {
+  flex-wrap: wrap;
+}
+
 .system-segment-option {
   padding: 4px 12px;
   border: 0;
@@ -1046,6 +1051,10 @@ input[type="file"].visually-hidden {
 [data-field="recovery-note"]:not([hidden]),
 #recovery-profile-setup:not([hidden]) {
   margin-top: 10px;
+}
+
+[data-field="recovery-note"] {
+  overflow-wrap: anywhere;
 }
 
 .recovery-pending {
