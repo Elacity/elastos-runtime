@@ -83,6 +83,8 @@ export function createHomeExternalLinkPrompt({
   }
   let active = null;
   let sequence = 0;
+  let pointerPress = null;
+  let keyboardPress = null;
   const cooldownUntil = new Map();
 
   function hide() {
@@ -97,6 +99,8 @@ export function createHomeExternalLinkPrompt({
   function close() {
     const request = active;
     active = null;
+    pointerPress = null;
+    keyboardPress = null;
     if (request?.phase === "shown") {
       hide();
     }
@@ -111,13 +115,75 @@ export function createHomeExternalLinkPrompt({
     cooldownUntil.set(request.appId, now() + cooldownMs);
   }
 
+  function eligiblePress(event) {
+    return event?.isTrusted === true
+      && active?.phase === "shown"
+      && now() - active.shownAt >= EXTERNAL_LINK_OPEN_GUARD_MS;
+  }
+
+  // A press anywhere on the sheet records when the gesture began: iOS may
+  // move a tap that lands just outside Open link onto it.
+  root.addEventListener("pointerdown", (event) => {
+    keyboardPress = null;
+    pointerPress = {
+      requestId: active?.requestId,
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      eligible: eligiblePress(event) && event.button === 0 && event.isPrimary !== false,
+    };
+  }, true);
+  root.addEventListener("pointercancel", () => { pointerPress = null; }, true);
+  openButton.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    if (event.repeat) {
+      // A repeat cannot begin a new gesture; retain an initial Space press.
+      event.preventDefault();
+      return;
+    }
+    pointerPress = null;
+    keyboardPress = {
+      requestId: active?.requestId,
+      key: event.key,
+      eligible: eligiblePress(event),
+    };
+    if (!keyboardPress.eligible) event.preventDefault();
+  });
+  openButton.addEventListener("keyup", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const press = keyboardPress;
+    if (event.key === " " && (
+      !press?.eligible || press.key !== event.key || press.requestId !== active?.requestId
+    )) event.preventDefault();
+  });
+  windowRef.addEventListener("keyup", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const press = keyboardPress;
+    // Retain the decision through Space's native keyup click; discard it
+    // afterward so a later assistive-technology click can stand on its own.
+    windowRef.setTimeout?.(() => { if (keyboardPress === press) keyboardPress = null; }, 0);
+  }, true);
+
   openButton.addEventListener("click", (event) => {
+    // Each click consumes the press that began it. A touch tap's click can
+    // arrive several tasks after pointerup (iOS), so nothing expires it early.
+    const press = pointerPress;
+    pointerPress = null;
     // A synthetic click never opens; only the person's own press does, and
     // only once the sheet has been on screen for the guard time.
     if (
       event?.isTrusted !== true ||
       active?.phase !== "shown" ||
-      now() - active.shownAt < EXTERNAL_LINK_OPEN_GUARD_MS
+      now() - active.shownAt < EXTERNAL_LINK_OPEN_GUARD_MS ||
+      ((event.detail > 0 || event.pointerType) && (
+        !press?.eligible || press.requestId !== active.requestId ||
+        // Only touch ids carry from a touch press to its click: WebKit sends
+        // a tap's click as a mouse click, and Chromium gives a pen tap's click
+        // a new id.
+        (event.pointerType === "touch" && press.pointerType === "touch" && event.pointerId !== press.pointerId)
+      )) ||
+      (keyboardPress && (
+        !keyboardPress.eligible || keyboardPress.requestId !== active.requestId
+      ))
     ) {
       return;
     }
@@ -176,6 +242,8 @@ export function createHomeExternalLinkPrompt({
         active = null;
         return false;
       }
+      pointerPress = null;
+      keyboardPress = null;
       active.phase = "shown";
       active.shownAt = now();
       active.href = checked.href;

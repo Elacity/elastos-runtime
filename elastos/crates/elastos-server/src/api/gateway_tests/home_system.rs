@@ -13385,10 +13385,9 @@ async fn home_external_link_names_the_launched_app_and_the_exact_address() {
         })
     };
 
-    // System is launchable on every host; Browser availability is platform-specific.
-    let system_token = launched(SYSTEM_CAPSULE_ID);
+    let library_token = launched(LIBRARY_CAPSULE_ID);
     for (app_token, app_id, app_title) in [
-        (system_token.clone(), SYSTEM_CAPSULE_ID, "System"),
+        (library_token.clone(), LIBRARY_CAPSULE_ID, "Library"),
         (
             launched(HOME_CLI_CAPSULE_ID_FOR_TEST),
             "home-cli",
@@ -13420,13 +13419,13 @@ async fn home_external_link_names_the_launched_app_and_the_exact_address() {
             "foreign origin",
             "https://evil.example",
             home_token.clone(),
-            system_token.clone(),
+            library_token.clone(),
         ),
         (
             "an app frame calling directly",
             "null",
             home_token.clone(),
-            system_token.clone(),
+            library_token.clone(),
         ),
         (
             "app token from another Home session",
@@ -13434,8 +13433,8 @@ async fn home_external_link_names_the_launched_app_and_the_exact_address() {
             home_token.clone(),
             issue_home_projection_launch_token_with_context(
                 dir.path(),
-                SYSTEM_CAPSULE_ID,
-                SYSTEM_CAPSULE_ID,
+                LIBRARY_CAPSULE_ID,
+                LIBRARY_CAPSULE_ID,
                 &other_session,
             )
             .unwrap(),
@@ -13445,13 +13444,13 @@ async fn home_external_link_names_the_launched_app_and_the_exact_address() {
             "http://localhost:61180",
             issue_home_launch_token_with_context(dir.path(), HOME_CAPSULE_ID, &other_session)
                 .unwrap(),
-            system_token.clone(),
+            library_token.clone(),
         ),
         (
             "app token Home did not mint",
             "http://localhost:61180",
             home_token.clone(),
-            issue_home_launch_token_with_context(dir.path(), SYSTEM_CAPSULE_ID, &context).unwrap(),
+            issue_home_launch_token_with_context(dir.path(), LIBRARY_CAPSULE_ID, &context).unwrap(),
         ),
         (
             "Home GUI is not a link sender",
@@ -13478,7 +13477,7 @@ async fn home_external_link_names_the_launched_app_and_the_exact_address() {
             issue_home_projection_launch_token_with_context(
                 dir.path(),
                 "assistant",
-                SYSTEM_CAPSULE_ID,
+                LIBRARY_CAPSULE_ID,
                 &context,
             )
             .unwrap(),
@@ -13502,7 +13501,7 @@ async fn home_external_link_names_the_launched_app_and_the_exact_address() {
     }
 
     let expired =
-        issue_expired_home_launch_token_with_context(dir.path(), SYSTEM_CAPSULE_ID, &context)
+        issue_expired_home_launch_token_with_context(dir.path(), LIBRARY_CAPSULE_ID, &context)
             .unwrap();
     let (status, body) = home_external_link_raw(
         &app,
@@ -13529,7 +13528,7 @@ async fn home_external_link_names_the_launched_app_and_the_exact_address() {
             &app,
             "http://localhost:61180",
             &home_token,
-            request(&system_token, url),
+            request(&library_token, url),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{url:?}: {body}");
@@ -13540,13 +13539,13 @@ async fn home_external_link_names_the_launched_app_and_the_exact_address() {
         &home_token,
         json!({
             "schema": "elastos.home.external-link.request/v2",
-            "app_token": system_token,
+            "app_token": library_token,
             "url": "https://example.com/",
         }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let mut extra = request(&system_token, "https://example.com/");
+    let mut extra = request(&library_token, "https://example.com/");
     extra["app_id"] = json!("wallet");
     let (status, _) =
         home_external_link_raw(&app, "http://localhost:61180", &home_token, extra).await;

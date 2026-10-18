@@ -22,6 +22,7 @@ import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { LONG_PRESS_MS } from "../capsules/home-gui/browser/shell-touch.js";
+import { EXTERNAL_LINK_OPEN_GUARD_MS } from "../capsules/home/browser/home-external-link.js";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const outputRoot = process.env.HOME_PHONE_SMOKE_OUT
@@ -940,6 +941,8 @@ function promptCloseFailures(run) {
 // asks, Home shows the Runtime-named app and the whole address, and only a
 // real press on Open link opens it, once, with no opener and no referrer.
 const LINK_DESTINATION_ORIGIN = "https://links.example";
+// A press that began inside the guard is held until well after it.
+const EARLY_PRESS_HOLD_MS = EXTERNAL_LINK_OPEN_GUARD_MS + 300;
 async function probeExternalLink(page, dir, target) {
   const context = page.context();
   const destinationRequests = [];
@@ -1005,6 +1008,75 @@ async function probeExternalLink(page, dir, target) {
     await popup.close();
     // The new tab took the foreground; Home's animations need it back.
     await page.bringToFront();
+    // Only a press that begins after the guard opens the link (#430). An early
+    // press held past the guard, an early held Space and an early Enter with
+    // key repeat open nothing; a fresh tap on the same sheet then opens once.
+    const earlyPresses = [];
+    for (const kind of ["pointer", "space", "enter-repeat"]) {
+      const url = `${LINK_DESTINATION_ORIGIN}/early-${kind}`;
+      await page.evaluate(() => {
+        const root = document.querySelector("#home-link-prompt");
+        const timing = { shownAt: null, pressAt: null };
+        window.__earlyPress = timing;
+        const observer = new MutationObserver(() => {
+          if (!root.hidden) {
+            timing.shownAt = performance.now();
+            observer.disconnect();
+          }
+        });
+        observer.observe(root, { attributes: true, attributeFilter: ["hidden"] });
+        const pressed = () => { timing.pressAt ??= performance.now(); };
+        const open = document.querySelector("#home-link-open");
+        open.addEventListener("pointerdown", pressed, { capture: true, once: true });
+        open.addEventListener("keydown", pressed, { capture: true, once: true });
+      });
+      await ask(url);
+      await page.locator("#home-link-prompt").waitFor({ state: "visible", timeout: BOOT_TIMEOUT_MS });
+      const before = { pages: context.pages().length, requests: destinationRequests.length };
+      if (kind === "pointer") {
+        // hover waits until Open link is visible, stable and hit by the pointer.
+        await page.locator("#home-link-open").hover();
+        await page.mouse.down();
+        await sleep(EARLY_PRESS_HOLD_MS);
+        await page.mouse.up();
+      } else {
+        const key = kind === "space" ? "Space" : "Enter";
+        await page.locator("#home-link-open").focus();
+        await page.keyboard.down(key);
+        await sleep(EARLY_PRESS_HOLD_MS);
+        if (kind === "enter-repeat") {
+          // A second down without an up is sent with repeat set.
+          await page.keyboard.down(key);
+        }
+        await page.keyboard.up(key);
+      }
+      await sleep(SURFACE_SETTLE_MS);
+      const timing = await page.evaluate(() => window.__earlyPress);
+      const press = {
+        kind,
+        url,
+        pressedAfterMs: timing.shownAt === null || timing.pressAt === null ? null : Math.round(timing.pressAt - timing.shownAt),
+        pages: context.pages().length - before.pages,
+        requests: destinationRequests.length - before.requests,
+        sheetShown: !(await sheet()).hidden,
+      };
+      earlyPresses.push(press);
+      if (!press.sheetShown) {
+        // The early press opened the link: close what it opened and report it.
+        await Promise.all(context.pages().slice(before.pages).map((opened) => opened.close()));
+        await page.bringToFront();
+        continue;
+      }
+      const retried = context.waitForEvent("page", { timeout: BOOT_TIMEOUT_MS });
+      // A touch tap, not a mouse click: its click can follow pointerup late.
+      await page.locator("#home-link-open").tap();
+      const retry = await retried;
+      await retry.waitForLoadState("domcontentloaded");
+      press.retryUrl = retry.url();
+      press.retryOpenerIsNull = await retry.evaluate(() => window.opener === null);
+      await retry.close();
+      await page.bringToFront();
+    }
     await ask(`${LINK_DESTINATION_ORIGIN}/escape`);
     await shown("link sheet for Escape");
     await page.keyboard.press("Escape");
@@ -1026,6 +1098,7 @@ async function probeExternalLink(page, dir, target) {
       afterSwap,
       afterSynthetic,
       opened,
+      earlyPresses,
       afterEscape,
       duringCooldown,
       afterCancel,
@@ -1072,11 +1145,21 @@ function externalLinkFailures(run) {
   if (probe.opened.url !== probe.address || !probe.opened.openerIsNull || probe.opened.referrer !== "" || !probe.opened.sheetHidden) {
     failures.push(`${label}: Open link must open exactly the address with no opener and no referrer. Got ${JSON.stringify(probe.opened)}`);
   }
+  for (const press of probe.earlyPresses) {
+    if (press.pressedAfterMs === null || press.pressedAfterMs >= EXTERNAL_LINK_OPEN_GUARD_MS) {
+      failures.push(`${label}: the early ${press.kind} press must begin inside the ${EXTERNAL_LINK_OPEN_GUARD_MS} ms guard to test it. Got ${JSON.stringify(press)}`);
+    } else if (press.pages !== 0 || press.requests !== 0 || !press.sheetShown) {
+      failures.push(`${label}: an early ${press.kind} press held past the guard must open nothing and keep the sheet. Got ${JSON.stringify(press)}`);
+    } else if (press.retryUrl !== press.url || !press.retryOpenerIsNull) {
+      failures.push(`${label}: a fresh press after an early ${press.kind} press must open the link once with no opener. Got ${JSON.stringify(press)}`);
+    }
+  }
   if (!probe.afterEscape || !probe.duringCooldown || !probe.afterCancel) {
     failures.push(`${label}: Escape and Cancel must close the sheet, and the app must wait out its cool-down. Got ${JSON.stringify({ afterEscape: probe.afterEscape, duringCooldown: probe.duringCooldown, afterCancel: probe.afterCancel })}`);
   }
-  if (JSON.stringify(probe.destinationRequests) !== JSON.stringify([probe.address]) || probe.pagesAfter !== probe.pagesBefore) {
-    failures.push(`${label}: the destination must be requested once, only after Open link. Got ${JSON.stringify(probe.destinationRequests)}`);
+  const expectedRequests = [probe.address, ...probe.earlyPresses.map((press) => press.url)];
+  if (JSON.stringify(probe.destinationRequests) !== JSON.stringify(expectedRequests) || probe.pagesAfter !== probe.pagesBefore) {
+    failures.push(`${label}: each destination must be requested once, only after a press that began after the guard. Got ${JSON.stringify(probe.destinationRequests)}`);
   }
   return failures;
 }
