@@ -671,7 +671,7 @@ mod plain_publish_cid;
 pub(crate) use desktop_background::PROTECTION_CHECK_LEGACY_SOURCES;
 pub(crate) use desktop_background::{
     keep_found_source_digests, read_library_object_for_desktop_background, DesktopBackgroundRead,
-    DesktopBackgroundSourceRefusal, ProtectionCheckBudget,
+    DesktopBackgroundSourceRefusal, FoundSourceDigest, ProtectionCheckBudget,
 };
 
 /// Test fixture: a publish record for `object_uri` with `content_security`.

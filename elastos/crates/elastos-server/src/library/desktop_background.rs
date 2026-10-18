@@ -27,8 +27,8 @@
 //! The check reads and hashes files, so callers run it on a blocking thread,
 //! and one request does a bounded amount of work (`ProtectionCheckBudget`).
 //! The check itself writes nothing: it returns the digests it found
-//! (`DesktopBackgroundRead::found`), and the caller keeps them only while its
-//! request is still live (`keep_found_source_digests`).
+//! (`DesktopBackgroundRead::found`), and the caller keeps them only when the
+//! check answered within the request's time limit (`keep_found_source_digests`).
 
 use std::borrow::Cow;
 use std::path::{Component, Path};
@@ -185,8 +185,8 @@ pub(crate) fn read_library_object_for_desktop_background(
 }
 
 /// Keeps each found digest in its record so later checks need no read. A
-/// record changed since it was read is left as it is. Call this only while
-/// the request that ran the check is still live.
+/// record changed since it was read is left as it is. Call this only after
+/// the check answered within its request's time limit, and before answering.
 pub(crate) fn keep_found_source_digests(
     data_dir: &Path,
     principal_id: &str,

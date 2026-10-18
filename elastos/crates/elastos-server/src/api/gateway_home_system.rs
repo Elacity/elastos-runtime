@@ -8084,14 +8084,15 @@ const HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES: u64 =
 
 /// Longest a desktop background request waits for Library's read and
 /// protection check. The check stops itself earlier (its own budget); this
-/// bounds the wait if the disk itself stalls.
+/// bounds the wait if the disk itself stalls. The digests a timely check found
+/// are saved after it, before the handler answers.
 const HOME_BACKGROUND_IMAGE_SOURCE_READ_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(15);
 
 /// Library's read, under Library's scope rules: the principal's own files,
 /// never Trash, Runtime-private areas, links, or protected content. It reads
 /// and hashes files, so it runs on a blocking thread, never on this handler's.
-/// Nothing is saved from a check that answered after this handler gave up.
+/// Nothing is saved from a check that did not answer within the time limit.
 async fn read_desktop_background_source(
     data_dir: std::path::PathBuf,
     principal_id: String,
@@ -8112,85 +8113,42 @@ async fn read_desktop_background_source(
     };
     read_desktop_background_source_within(
         HOME_BACKGROUND_IMAGE_SOURCE_READ_TIMEOUT,
-        data_dir,
-        principal_id,
         check,
+        move |found| crate::library::keep_found_source_digests(&data_dir, &principal_id, found),
     )
     .await
 }
 
-/// Whether the request that started a protection check still waits for it.
-/// The check's thread and the handler each move it out of `LIVE` once, in one
-/// atomic step, so a found digest is saved only if the handler had not given
-/// up first.
-#[derive(Default)]
-struct DesktopBackgroundCheckLive(std::sync::atomic::AtomicU8);
-
-impl DesktopBackgroundCheckLive {
-    const LIVE: u8 = 0;
-    const SAVING: u8 = 1;
-    const GAVE_UP: u8 = 2;
-
-    /// True when the handler still waits; from then on it cannot give up.
-    fn begin_save(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        self.0
-            .compare_exchange(
-                Self::LIVE,
-                Self::SAVING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    fn give_up(&self) {
-        use std::sync::atomic::Ordering;
-        let _ = self.0.compare_exchange(
-            Self::LIVE,
-            Self::GAVE_UP,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-    }
-}
-
-/// Runs `check` on a blocking thread and waits at most `timeout`. The check
-/// writes nothing itself; the digests it found are kept only if this handler
-/// still waits when the check answers.
-pub(super) async fn read_desktop_background_source_within<F>(
+/// Runs `check` on a blocking thread and waits at most `timeout` for it.
+/// Neither the check nor its thread writes anything. Only when the check
+/// answers in time does this handler `keep` the digests it found, and it waits
+/// for that save before it answers, so a hash is never saved after the person
+/// was told the check did not finish. A check that answers late is dropped.
+pub(super) async fn read_desktop_background_source_within<F, K>(
     timeout: std::time::Duration,
-    data_dir: std::path::PathBuf,
-    principal_id: String,
     check: F,
+    keep: K,
 ) -> Result<Vec<u8>, Response>
 where
     F: FnOnce() -> crate::library::DesktopBackgroundRead + Send + 'static,
+    K: FnOnce(Vec<crate::library::FoundSourceDigest>) + Send + 'static,
 {
     use crate::library::DesktopBackgroundSourceRefusal as Refusal;
-    let live = std::sync::Arc::new(DesktopBackgroundCheckLive::default());
-    let read = tokio::task::spawn_blocking({
-        let live = live.clone();
-        move || {
-            let crate::library::DesktopBackgroundRead { result, found } = check();
-            if !found.is_empty() && live.begin_save() {
-                crate::library::keep_found_source_digests(&data_dir, &principal_id, found);
-            }
-            result
-        }
-    });
     let refused = |refusal: Refusal| {
         (StatusCode::BAD_REQUEST, refusal.message().into_owned()).into_response()
     };
-    match tokio::time::timeout(timeout, read).await {
-        Ok(Ok(Ok(bytes))) => Ok(bytes),
-        Ok(Ok(Err(refusal))) => Err(refused(refusal)),
-        Ok(Err(_)) => Err(refused(Refusal::Unreadable)),
-        Err(_) => {
-            live.give_up();
-            Err(refused(Refusal::CheckUnfinished))
-        }
+    let read = match tokio::time::timeout(timeout, tokio::task::spawn_blocking(check)).await {
+        Ok(Ok(read)) => read,
+        Ok(Err(_)) => return Err(refused(Refusal::Unreadable)),
+        Err(_) => return Err(refused(Refusal::CheckUnfinished)),
+    };
+    let crate::library::DesktopBackgroundRead { result, found } = read;
+    if !found.is_empty() {
+        // A few small record writes; a failed save only means a later check
+        // reads the file again, so its outcome does not change the answer.
+        let _ = tokio::task::spawn_blocking(move || keep(found)).await;
     }
+    result.map_err(refused)
 }
 
 fn home_save_background_image_from_library_bytes(

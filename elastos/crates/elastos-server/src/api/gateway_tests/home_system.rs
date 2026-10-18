@@ -6155,6 +6155,13 @@ impl LegacyProtectedLibrary {
         library_object_op(&self.data_dir, &self.admin, request)
     }
 
+    /// Keeps found digests the way the handler does.
+    fn keep(&self) -> impl FnOnce(Vec<crate::library::FoundSourceDigest>) + Send + 'static {
+        let data_dir = self.data_dir.clone();
+        let principal_id = self.admin.principal_id.clone();
+        move |found| crate::library::keep_found_source_digests(&data_dir, &principal_id, found)
+    }
+
     fn recorded_digest(&self) -> Option<String> {
         crate::library::test_publish_record_source_sha256(
             &self.data_dir,
@@ -6562,9 +6569,8 @@ fn test_home_background_from_object_check_answering_late_saves_nothing() {
     };
     let late = first.block_on(read_desktop_background_source_within(
         Duration::from_millis(20),
-        library.data_dir.clone(),
-        library.admin.principal_id.clone(),
         check(Duration::from_millis(400)),
+        library.keep(),
     ));
     let response = late.expect_err("the handler gave up");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -6579,9 +6585,8 @@ fn test_home_background_from_object_check_answering_late_saves_nothing() {
     let second = runtime();
     let in_time = second.block_on(read_desktop_background_source_within(
         Duration::from_secs(15),
-        library.data_dir.clone(),
-        library.admin.principal_id.clone(),
         check(Duration::ZERO),
+        library.keep(),
     ));
     assert!(in_time.is_ok());
     second.shutdown_timeout(Duration::from_secs(30));
@@ -6589,6 +6594,58 @@ fn test_home_background_from_object_check_answering_late_saves_nothing() {
         library.recorded_digest(),
         Some(sha256_label(&library.protected_bytes))
     );
+}
+
+/// A save of found digests that is still running when the handler's timeout
+/// passes must not leave a hash behind a "did not finish" answer. Either the
+/// handler waits for the save and gives the real answer, or nothing is saved.
+#[test]
+fn test_home_background_from_object_slow_save_never_follows_check_unfinished() {
+    use std::time::Duration;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let library =
+        runtime.block_on(async { LegacyProtectedLibrary::new(legacy_key_release_security()) });
+    // Run the real check first, so the check itself answers at once and only
+    // the save is slow.
+    let read = crate::library::read_library_object_for_desktop_background(
+        &library.data_dir,
+        &library.admin.principal_id,
+        &library.other_uri,
+        10 * 1024 * 1024,
+        crate::library::ProtectionCheckBudget::for_request(std::time::Instant::now()),
+    );
+    assert!(read.result.is_ok(), "the picture is not protected");
+    assert!(!read.found.is_empty(), "the check found the legacy digest");
+    let keep = library.keep();
+    let answer = runtime.block_on(read_desktop_background_source_within(
+        Duration::from_millis(200),
+        move || read,
+        move |found| {
+            std::thread::sleep(Duration::from_millis(1000));
+            keep(found);
+        },
+    ));
+    // Shutting the runtime down waits for a save still running.
+    runtime.shutdown_timeout(Duration::from_secs(30));
+    let saved = library.recorded_digest();
+    match answer {
+        Ok(_) => assert_eq!(
+            saved,
+            Some(sha256_label(&library.protected_bytes)),
+            "the handler answered with the picture, so the found hash is kept"
+        ),
+        Err(response) => {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                saved, None,
+                "the handler said the check did not finish, but a hash was saved"
+            );
+        }
+    }
 }
 
 /// The set-from-object path reads a file from disk on Home's request, so every
