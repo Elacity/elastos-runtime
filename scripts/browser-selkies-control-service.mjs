@@ -3274,7 +3274,6 @@ class CdpClient {
   }
 
   close() {
-    this._browserDomainsReady = null;
     this.closed = true;
     this.ws.close();
   }
