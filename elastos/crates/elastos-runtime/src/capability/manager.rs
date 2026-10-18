@@ -856,6 +856,9 @@ mod tests {
                 None,
             );
             if blocked_path != "overflow" {
+                if blocked_path == "epoch" {
+                    std::fs::remove_file(directory.path().join("epoch")).unwrap();
+                }
                 std::fs::create_dir(directory.path().join(blocked_path)).unwrap();
             }
             let audit_before = audit.recent_events(100).len();
@@ -878,6 +881,10 @@ mod tests {
             }));
             if blocked_path != "overflow" {
                 std::fs::remove_dir(directory.path().join(blocked_path)).unwrap();
+                if blocked_path == "epoch" {
+                    std::fs::write(directory.path().join("epoch"), original_epoch.to_string())
+                        .unwrap();
+                }
             }
             let reloaded_store = Arc::new(
                 CapabilityStore::with_persistence(directory.path())

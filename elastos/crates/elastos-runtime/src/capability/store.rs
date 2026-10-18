@@ -7,12 +7,50 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::RwLock;
 
 use super::token::TokenId;
+
+/// The stable lock file orders epoch writers across Runtime processes.
+struct EpochFileLock(fs::File);
+
+impl EpochFileLock {
+    fn acquire(path: &Path, initialize: bool) -> std::io::Result<(Self, bool)> {
+        let lock_path = path.join("epoch.lock");
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let (file, created) = if initialize {
+            match options.create_new(true).open(&lock_path) {
+                Ok(file) => (file, true),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    (options.create_new(false).open(&lock_path)?, false)
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            (options.open(&lock_path)?, false)
+        };
+        file.lock()?;
+        Ok((Self(file), created))
+    }
+}
+
+impl Drop for EpochFileLock {
+    fn drop(&mut self) {
+        // Release at scope exit even if a concurrently spawned child briefly
+        // inherited this open description before its exec closes the fd.
+        let _ = self.0.unlock();
+    }
+}
 
 /// Capability store - manages token state
 ///
@@ -69,7 +107,7 @@ impl CapabilityStore {
         Ok(store)
     }
 
-    /// Get the current revocation epoch
+    /// Get the last observed revocation epoch. Validation refreshes disk state.
     pub fn current_epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
@@ -98,12 +136,15 @@ impl CapabilityStore {
     /// Runtime caller is construction-time loading; use `advance_epoch` for
     /// revocation, which persists the new value before publishing it.
     pub fn set_epoch(&self, epoch: u64) {
-        self.epoch_transaction(|current| Ok(current.max(epoch)), |_| Ok(()))
-            .expect("initializing an epoch cannot fail");
+        let _epoch_writer = self
+            .epoch_writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.epoch.fetch_max(epoch, Ordering::SeqCst);
     }
 
-    /// All epoch writers share this synchronous transaction. The update and
-    /// writer run under one lock; memory is published only after writer success.
+    /// Serialize the durable snapshot, update and write across instances and
+    /// processes. A stale instance always starts from the durable maximum.
     fn epoch_transaction(
         &self,
         update: impl FnOnce(u64) -> std::io::Result<u64>,
@@ -113,24 +154,72 @@ impl CapabilityStore {
             .epoch_writer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file_lock = self
+            .storage_path
+            .as_ref()
+            .map(|path| EpochFileLock::acquire(path, false))
+            .transpose()?;
+        if let Some(path) = &self.storage_path {
+            self.epoch
+                .fetch_max(Self::read_epoch(path)?, Ordering::SeqCst);
+        }
         let next = update(self.current_epoch())?;
-        writer(next)?;
-        self.epoch.store(next, Ordering::SeqCst);
+        if let Err(error) = writer(next) {
+            // Rename can succeed before directory synchronization fails. Keep
+            // the advanced state while reporting the durability error.
+            if let Some(path) = &self.storage_path {
+                if let Ok(persisted) = Self::read_epoch(path) {
+                    self.epoch.fetch_max(persisted, Ordering::SeqCst);
+                }
+            }
+            return Err(error);
+        }
+        self.epoch.fetch_max(next, Ordering::SeqCst);
         Ok(next)
+    }
+
+    fn read_epoch(path: &Path) -> std::io::Result<u64> {
+        fs::read_to_string(path.join("epoch"))?
+            .trim()
+            .parse()
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid capability epoch")
+            })
     }
 
     fn write_epoch(&self, epoch: u64) -> std::io::Result<()> {
         if let Some(path) = &self.storage_path {
             let epoch_path = path.join("epoch");
             let tmp_path = path.join("epoch.tmp");
-            fs::write(&tmp_path, epoch.to_string())?;
+            let mut options = fs::OpenOptions::new();
+            options.create(true).truncate(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut staged = options.open(&tmp_path)?;
+            staged.write_all(epoch.to_string().as_bytes())?;
+            staged.sync_all()?;
             fs::rename(&tmp_path, &epoch_path)?;
+            #[cfg(unix)]
+            fs::File::open(path).and_then(|directory| directory.sync_all()).map_err(|error| {
+                std::io::Error::new(error.kind(), format!(
+                    "Capability epoch was written, but directory synchronization failed; durability is uncertain: {error}"
+                ))
+            })?;
         }
         Ok(())
     }
 
     /// Check if a token's epoch is valid
     pub fn is_epoch_valid(&self, token_epoch: u64) -> bool {
+        if let Some(path) = &self.storage_path {
+            let Ok(persisted) = Self::read_epoch(path) else {
+                return false;
+            };
+            self.epoch.fetch_max(persisted, Ordering::SeqCst);
+        }
         token_epoch >= self.current_epoch()
     }
 
@@ -214,14 +303,20 @@ impl CapabilityStore {
     /// Load state from disk
     async fn load_state(&self) -> std::io::Result<()> {
         if let Some(path) = &self.storage_path {
-            // Load epoch
-            let epoch_path = path.join("epoch");
-            if epoch_path.exists() {
-                if let Ok(content) = fs::read_to_string(&epoch_path) {
-                    if let Ok(epoch) = content.trim().parse::<u64>() {
-                        self.set_epoch(epoch);
+            // Only the creator of the stable lock can initialize an absent
+            // epoch. An interrupted initialization or removed epoch requires
+            // explicit repair instead of silently restoring epoch zero.
+            {
+                let (_file_lock, created) = EpochFileLock::acquire(path, true)?;
+                let epoch = match Self::read_epoch(path) {
+                    Ok(epoch) => epoch,
+                    Err(error) if created && error.kind() == std::io::ErrorKind::NotFound => {
+                        self.write_epoch(0)?;
+                        0
                     }
-                }
+                    Err(error) => return Err(error),
+                };
+                self.set_epoch(epoch);
             }
 
             // Load revoked tokens
@@ -393,6 +488,9 @@ mod tests {
             let store = CapabilityStore::with_persistence(directory.path())
                 .await
                 .unwrap();
+            if blocked_path == "epoch" {
+                fs::remove_file(directory.path().join("epoch")).unwrap();
+            }
             fs::create_dir(directory.path().join(blocked_path)).unwrap();
             assert!(store.advance_epoch().is_err());
             assert_eq!(store.current_epoch(), 0);
@@ -401,6 +499,9 @@ mod tests {
             assert!(store.persist().await.is_err());
             assert_eq!(store.current_epoch(), 0);
             fs::remove_dir(directory.path().join(blocked_path)).unwrap();
+            if blocked_path == "epoch" {
+                fs::write(directory.path().join("epoch"), "0").unwrap();
+            }
             assert_eq!(store.advance_epoch().unwrap(), 1);
             let reloaded = CapabilityStore::with_persistence(directory.path())
                 .await
@@ -433,6 +534,214 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reloaded.current_epoch(), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_independent_epoch_writers_preserve_every_advance() {
+        use std::sync::{Arc, Barrier};
+        const WRITERS: usize = 4;
+        const ADVANCES: usize = 4;
+        let directory = tempfile::tempdir().unwrap();
+        let mut stores = Vec::new();
+        for _ in 0..WRITERS {
+            stores.push(
+                CapabilityStore::with_persistence(directory.path())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let handles = stores
+            .into_iter()
+            .map(|store| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..ADVANCES)
+                        .map(|_| store.advance_epoch().unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut epochs = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        epochs.sort_unstable();
+        assert_eq!(
+            epochs,
+            (1..=(WRITERS * ADVANCES) as u64).collect::<Vec<_>>()
+        );
+        let reloaded = CapabilityStore::with_persistence(directory.path())
+            .await
+            .unwrap();
+        assert_eq!(reloaded.current_epoch(), (WRITERS * ADVANCES) as u64);
+    }
+
+    #[test]
+    fn test_epoch_file_lock_is_process_wide() {
+        const CHILD_PATH: &str = "ELASTOS_EPOCH_LOCK_TEST_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            assert!(
+                matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)),
+                "a second process entered an active epoch transaction"
+            );
+            println!("EPOCH_FILE_LOCK_CHILD_VERIFIED");
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = runtime
+            .block_on(CapabilityStore::with_persistence(directory.path()))
+            .unwrap();
+        store
+            .epoch_transaction(
+                |current| {
+                    let result = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "capability::store::tests::test_epoch_file_lock_is_process_wide",
+                            "--nocapture",
+                        ])
+                        .env(CHILD_PATH, directory.path().join("epoch.lock"))
+                        .output()
+                        .unwrap();
+                    assert!(
+                        result.status.success(),
+                        "cross-process lock probe failed: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    let output = String::from_utf8_lossy(&result.stdout);
+                    assert!(
+                        output.contains("running 1 test")
+                            && output.contains("EPOCH_FILE_LOCK_CHILD_VERIFIED"),
+                        "the exact child lock probe did not execute: {output}"
+                    );
+                    Ok(current)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_external_epoch_advance_retires_old_tokens_in_a_running_store() {
+        use crate::capability::manager::ValidationError;
+        use crate::capability::{Action, CapabilityManager, ResourceId, TokenConstraints};
+        use crate::primitives::{audit::AuditLog, metrics::MetricsManager};
+        use std::sync::Arc;
+
+        let directory = tempfile::tempdir().unwrap();
+        let running = Arc::new(
+            CapabilityStore::with_persistence(directory.path())
+                .await
+                .unwrap(),
+        );
+        let manager = CapabilityManager::new(
+            running.clone(),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        );
+        let resource = ResourceId::new("localhost://Users/self/Documents/test");
+        let tokens = ["first", "second"].map(|capsule| {
+            manager.grant(
+                capsule,
+                resource.clone(),
+                Action::Read,
+                TokenConstraints::default(),
+                None,
+            )
+        });
+        assert_ne!(tokens[0].id, tokens[1].id);
+        let external = CapabilityStore::with_persistence(directory.path())
+            .await
+            .unwrap();
+        assert!(running.is_epoch_valid(0));
+        assert_eq!(external.advance_epoch().unwrap(), 1);
+        for token in tokens {
+            assert!(
+                matches!(
+                    manager
+                        .validate(&token, &token.capsule, Action::Read, &resource, None)
+                        .await,
+                    Err(ValidationError::TokenRevoked)
+                ),
+                "a running store must reject tokens from the earlier durable epoch"
+            );
+        }
+        assert!(running.is_epoch_valid(1));
+        assert_eq!(running.current_epoch(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_missing_or_invalid_epoch_fails_closed_until_repaired() {
+        for missing in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CapabilityStore::with_persistence(directory.path())
+                .await
+                .unwrap();
+            let epoch_path = directory.path().join("epoch");
+            if missing {
+                fs::remove_file(&epoch_path).unwrap();
+            } else {
+                fs::write(&epoch_path, "invalid").unwrap();
+            }
+            assert!(!store.is_epoch_valid(0));
+            assert!(store.advance_epoch().is_err());
+            assert!(store.persist().await.is_err());
+            assert!(CapabilityStore::with_persistence(directory.path())
+                .await
+                .is_err());
+            assert_eq!(store.current_epoch(), 0);
+            fs::write(&epoch_path, "0").unwrap();
+            assert_eq!(store.advance_epoch().unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_epoch_initialization_requires_explicit_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::File::create(directory.path().join("epoch.lock")).unwrap();
+        assert!(
+            CapabilityStore::with_persistence(directory.path())
+                .await
+                .is_err(),
+            "interrupted initialization must require explicit repair"
+        );
+        assert!(!directory.path().join("epoch").exists());
+    }
+
+    #[tokio::test]
+    async fn test_post_write_error_keeps_the_observed_epoch_advanced() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = CapabilityStore::with_persistence(directory.path())
+            .await
+            .unwrap();
+        let error = store
+            .epoch_transaction(
+                |current| Ok(current + 1),
+                |next| {
+                    store.write_epoch(next)?;
+                    Err(std::io::Error::other("fixture: durability is uncertain"))
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("durability is uncertain"));
+        assert_eq!(
+            store.current_epoch(),
+            1,
+            "a post-write error must retain the observed advanced epoch"
+        );
+        assert_eq!(CapabilityStore::read_epoch(directory.path()).unwrap(), 1);
+        store.persist().await.unwrap();
+        assert_eq!(CapabilityStore::read_epoch(directory.path()).unwrap(), 1);
     }
 
     #[test]
