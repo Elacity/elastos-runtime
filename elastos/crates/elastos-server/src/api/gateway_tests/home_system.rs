@@ -11899,3 +11899,215 @@ async fn test_system_ai_provider_migrates_legacy_openrouter_secret() {
     assert_eq!(connection(&payload, "openrouter")["connected"], true);
     assert_ai_provider_http_omits_secrets(&body);
 }
+
+async fn home_external_link_raw(
+    app: &axum::Router,
+    origin: &'static str,
+    home_token: &str,
+    body: serde_json::Value,
+) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", origin)
+                .method("POST")
+                .uri("/api/apps/home/external-link")
+                .header("x-elastos-home-token", home_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn home_external_link_names_the_launched_app_and_the_exact_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let context = local_home_launch_token_context(dir.path()).unwrap();
+    let home_token =
+        issue_home_launch_token_with_context(dir.path(), HOME_CAPSULE_ID, &context).unwrap();
+    let launched = |target: &str| {
+        issue_home_projection_launch_token_with_context(dir.path(), target, target, &context)
+            .unwrap()
+    };
+    let request = |app_token: &str, url: &str| {
+        json!({
+            "schema": "elastos.home.external-link.request/v1",
+            "app_token": app_token,
+            "url": url,
+        })
+    };
+
+    let browser_token = launched(BROWSER_CAPSULE_ID);
+    for (app_token, app_id, app_title) in [
+        (browser_token.clone(), BROWSER_CAPSULE_ID, "Browser"),
+        (
+            launched(HOME_CLI_CAPSULE_ID_FOR_TEST),
+            "home-cli",
+            "Home CLI",
+        ),
+    ] {
+        let (status, body) = home_external_link_raw(
+            &app,
+            "http://localhost:61180",
+            &home_token,
+            request(&app_token, "https://Example.com/a b?q=1#part"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            json!({
+                "schema": "elastos.home.external-link.result/v1",
+                "app_id": app_id,
+                "app_title": app_title,
+                "url": "https://example.com/a%20b?q=1#part",
+            })
+        );
+    }
+
+    let other_session = local_home_launch_token_context(dir.path()).unwrap();
+    let refused_authority = [
+        (
+            "foreign origin",
+            "https://evil.example",
+            home_token.clone(),
+            browser_token.clone(),
+        ),
+        (
+            "an app frame calling directly",
+            "null",
+            home_token.clone(),
+            browser_token.clone(),
+        ),
+        (
+            "app token from another Home session",
+            "http://localhost:61180",
+            home_token.clone(),
+            issue_home_projection_launch_token_with_context(
+                dir.path(),
+                BROWSER_CAPSULE_ID,
+                BROWSER_CAPSULE_ID,
+                &other_session,
+            )
+            .unwrap(),
+        ),
+        (
+            "Home token from another session",
+            "http://localhost:61180",
+            issue_home_launch_token_with_context(dir.path(), HOME_CAPSULE_ID, &other_session)
+                .unwrap(),
+            browser_token.clone(),
+        ),
+        (
+            "app token Home did not mint",
+            "http://localhost:61180",
+            home_token.clone(),
+            issue_home_launch_token_with_context(dir.path(), BROWSER_CAPSULE_ID, &context).unwrap(),
+        ),
+        (
+            "Home GUI is not a link sender",
+            "http://localhost:61180",
+            home_token.clone(),
+            launched(HOME_GUI_SHELL_ID),
+        ),
+        (
+            "Home's own token",
+            "http://localhost:61180",
+            home_token.clone(),
+            home_token.clone(),
+        ),
+        (
+            "an app that is not installed",
+            "http://localhost:61180",
+            home_token.clone(),
+            launched("not-installed"),
+        ),
+        (
+            "a projection onto another app",
+            "http://localhost:61180",
+            home_token.clone(),
+            issue_home_projection_launch_token_with_context(
+                dir.path(),
+                "assistant",
+                BROWSER_CAPSULE_ID,
+                &context,
+            )
+            .unwrap(),
+        ),
+        (
+            "a forged token",
+            "http://localhost:61180",
+            home_token.clone(),
+            "not-a-launch-token".to_string(),
+        ),
+    ];
+    for (label, origin, home, app_token) in refused_authority {
+        let (status, body) = home_external_link_raw(
+            &app,
+            origin,
+            &home,
+            request(&app_token, "https://example.com/"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+    }
+
+    let expired =
+        issue_expired_home_launch_token_with_context(dir.path(), BROWSER_CAPSULE_ID, &context)
+            .unwrap();
+    let (status, body) = home_external_link_raw(
+        &app,
+        "http://localhost:61180",
+        &home_token,
+        request(&expired, "https://example.com/"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("expired"), "{body}");
+
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,x",
+        "file:///etc/passwd",
+        "elastos://doc",
+        "https://user:pass@example.com/",
+        "https://example.com/\u{7}",
+        // Home's own pages (the request's Host) open inside Home.
+        "http://localhost:61180/apps/home/",
+        "http://localhost:61180/api/apps/home/summary",
+    ] {
+        let (status, body) = home_external_link_raw(
+            &app,
+            "http://localhost:61180",
+            &home_token,
+            request(&browser_token, url),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{url:?}: {body}");
+    }
+    let (status, _) = home_external_link_raw(
+        &app,
+        "http://localhost:61180",
+        &home_token,
+        json!({
+            "schema": "elastos.home.external-link.request/v2",
+            "app_token": browser_token,
+            "url": "https://example.com/",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mut extra = request(&browser_token, "https://example.com/");
+    extra["app_id"] = json!("wallet");
+    let (status, _) =
+        home_external_link_raw(&app, "http://localhost:61180", &home_token, extra).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}

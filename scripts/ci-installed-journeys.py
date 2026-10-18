@@ -57,6 +57,74 @@ def private_json(path, value=None):
     return json.loads(encoded)
 
 
+# Only fixed harness messages can leave the isolated Home. Other exception
+# details can contain paths, keys or Runtime text and use one redacted message.
+FINITE_OBSERVER_MESSAGES = frozenset({
+    'finite journey Runtime left its unit',
+    'finite journey actual Runtime identity differs',
+    'finite journey cgroup membership is invalid',
+    'finite journey child UID differs',
+    'finite journey child escaped its finite unit',
+    'finite journey child executable is outside installed artifacts',
+    'finite journey control exceeds its bound',
+    'finite journey control ownership differs',
+    'finite journey engine group exit is unconfirmed',
+    'finite journey engine stage deadline',
+    'finite journey engine stage interrupted',
+    'finite journey idle engine closed early',
+    'finite journey kernel limits changed',
+    'finite journey kernel limits differ',
+    'finite journey live child identity is unavailable',
+    'finite journey live child left its unit census',
+    'finite journey live child observation is unavailable',
+    'finite journey memory events are invalid',
+    'finite journey memory events are unavailable',
+    'finite journey memory exceeded its kernel boundary',
+    'finite journey memory metric exceeds its bound',
+    'finite journey observation exceeds its bound',
+    'finite journey observed a second local engine',
+    'finite journey observed an OOM event',
+    'finite journey observed process bound exceeded',
+    'finite journey observer deadline',
+    'finite journey observer, holder or browser entered the unit',
+    'finite journey outside process identity is unavailable',
+    'finite journey process census differs',
+    'finite journey process changed during pidfd binding',
+    'finite journey process exit is unavailable',
+    'finite journey process identity changed',
+    'finite journey process identity is unavailable',
+    'finite journey required ancestor memory bound differs',
+    'finite journey requires runner UID and a 1 or 4 GiB budget',
+    'finite journey requires visible cgroup v2 membership',
+    'finite journey selected engine is unavailable',
+    'finite journey service binding differs',
+    'finite journey service observation exceeds its bound',
+    'finite journey stage binding differs',
+    'finite journey stage is unsupported',
+    'finite journey starts with an OOM event',
+})
+
+
+def finite_observer_failure(phase, error):
+    message = (error.args[0] if type(error) is RuntimeError and len(error.args) == 1
+               and type(error.args[0]) is str else None)
+    if message not in FINITE_OBSERVER_MESSAGES:
+        message = "observer detail redacted"
+    public_types = {
+        RuntimeError: "RuntimeError", OSError: "OSError", FileNotFoundError: "FileNotFoundError",
+        PermissionError: "PermissionError", ProcessLookupError: "ProcessLookupError",
+        ValueError: "ValueError", KeyError: "KeyError", TypeError: "TypeError",
+        AttributeError: "AttributeError", UnicodeDecodeError: "UnicodeDecodeError",
+        json.JSONDecodeError: "JSONDecodeError", subprocess.SubprocessError: "SubprocessError",
+        subprocess.CalledProcessError: "CalledProcessError", subprocess.TimeoutExpired: "TimeoutExpired",
+    }
+    return {"phase": phase, "type": public_types.get(type(error), "redacted"), "message": message[:480]}
+
+
+def failure_suffix(failure):
+    return f" ({failure['phase']}: {failure['type']}: {failure['message']})" if failure else ""
+
+
 def linux_process_identity(pid, proc=Path("/proc"), retained=None):
     """Bind a live process by UID, kernel start tick and executable inode."""
     directory = proc / str(pid)
@@ -237,6 +305,7 @@ class FiniteRuntime:
         self.metric_fds = {}
         self.stop = threading.Event()
         self.error = None
+        self.failure = None
         self.thread = None
         self.outside = [os.getpid()]
         self.engine = None
@@ -458,11 +527,13 @@ class FiniteRuntime:
             raise RuntimeError("finite journey stage is unsupported")
         deadline = time.monotonic() + (95 if action == "idle_stopped" else 20)
         began = time.monotonic()
+        group_exit_pending = False
         while time.monotonic() < deadline:
             if self.stop.is_set():
                 raise RuntimeError("finite journey engine stage interrupted")
             current = self.observe_once()
             engines = self.engines(current)
+            group_exit_pending = False
             if action == "engine_running" and engines:
                 pid = engines[0]
                 self.engine = pid
@@ -475,13 +546,26 @@ class FiniteRuntime:
                 signal.pidfd_send_signal(self.fds[self.engine], signal.SIGKILL)
                 break
             if action in ("engine_stopped", "idle_stopped") and not engines:
-                if self.engine is None or any(not pidfd_exited(self.fds[pid]) for pid in self.engine_members):
+                if (self.engine is None or self.engine not in self.engine_members
+                        or any(pid not in self.fds for pid in self.engine_members)):
                     raise RuntimeError("finite journey engine group exit is unconfirmed")
-                if action == "idle_stopped" and time.monotonic() - began < 50:
+                # Engine exit before the idle minimum remains a failure even
+                # when its guard takes longer to exit. Parent-chain absence
+                # alone does not prove the retained engine process has exited.
+                if (action == "idle_stopped" and pidfd_exited(self.fds[self.engine])
+                        and time.monotonic() - began < 50):
                     raise RuntimeError("finite journey idle engine closed early")
-                break
+                group_exit_pending = any(not pidfd_exited(self.fds[pid]) for pid in self.engine_members)
+                # An absent engine can precede whole-group exit. Keep observing
+                # its retained handles within this action's existing deadline.
+                if not group_exit_pending:
+                    if action == "idle_stopped" and time.monotonic() - began < 50:
+                        raise RuntimeError("finite journey idle engine closed early")
+                    break
             self.stop.wait(.1)
         else:
+            if group_exit_pending:
+                raise RuntimeError("finite journey engine group exit is unconfirmed")
             raise RuntimeError("finite journey engine stage deadline")
         self.last_action = request["id"]
         self.actions.append({"action": action, "elapsed_seconds": round(time.monotonic() - began, 3),
@@ -489,18 +573,25 @@ class FiniteRuntime:
         private_json(self.control / "response.json", {"id": self.last_action, "status": "passed", "engine_start_ticks": self.known[self.engine]["start_ticks"], "engine_pid": self.engine})
 
     def observe(self):
+        phase = "census"
         try:
             while not self.stop.is_set() and time.monotonic() - self.started < 1800:
+                phase = "census"
                 self.observe_once()
                 path = self.control / "request.json"
                 if path.exists():
+                    phase = "stage_request"
                     request = private_json(path)
                     if request.get("id") != self.last_action:
+                        if request.get("action") in ("engine_running", "engine_stopped", "idle_stopped", "crash_engine"):
+                            phase = "stage_" + request["action"]
                         self.action(request)
                 self.stop.wait(.1)
             if not self.stop.is_set():
+                phase = "deadline"
                 raise RuntimeError("finite journey observer deadline")
-        except BaseException:
+        except BaseException as error:
+            self.failure = finite_observer_failure(phase, error)
             self.error = "finite_resource_observation_failed"
             private_json(self.control / "response.json", {"id": self.last_action + 1, "status": "failed"})
             private_json(self.control / "stop.json", {"stop": True})
@@ -513,6 +604,8 @@ class FiniteRuntime:
                   "status": "failed", "cgroup_empty": False,
                   "observer_complete": self.thread is None or not self.thread.is_alive(),
                   "actions": self.actions, "outside_runtime_unit": True}
+        if self.failure:
+            record["observer_failure"] = self.failure
         phase = "unit_binding"
         try:
             if not self.launch_requested:
@@ -865,7 +958,7 @@ def free_port(kind=socket.SOCK_STREAM):
 def wait_healthy(child, address, label, stop=None):
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not (stop and stop.is_set()):
-        assert child.poll() is None, f"installed {label} exited before health"
+        assert child.poll() is None, f"installed {label} exited before health" + failure_suffix(getattr(child, "failure", None))
         try:
             with urllib.request.urlopen(f"http://{address}/healthz", timeout=1) as response:
                 if response.status == 200:
@@ -1258,7 +1351,7 @@ def run(home, data, evidence, model=True, carrier=False, memory_gib=0, repair=Fa
                             while browser_owner.poll() is None and time.monotonic() < deadline and not finite.error:
                                 time.sleep(.1)
                             if browser_owner.poll() != 0 or finite.error:
-                                raise RuntimeError("finite installed UI journey failed")
+                                raise RuntimeError("finite installed UI journey failed" + failure_suffix(finite.failure))
                         finally:
                             if browser_owner.poll() is None:
                                 browser_owner.terminate()
