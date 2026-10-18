@@ -1557,6 +1557,58 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # Native Intel Mac proof of gateway readiness as docs/LAUNCHER_CONTRACT.md
+  # defines it: `elastos gateway --addr localhost:8090`, then
+  # GET http://localhost:8090/healthz returns HTTP 200 and OK while that pid
+  # holds host-process.lock. The Home is empty. This is not a signed release.
+  gateway-smoke-macos-intel:
+    name: gateway-smoke-macos-intel
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    needs: source-gate
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
+      - name: require an Intel Mac with room to compile
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_OS/$RUNNER_ARCH" == macOS/X64 ]]
+          df -Pk .
+          df -Pk . | awk 'NR == 2 { if ($4 < 8 * 1024 * 1024) { print "Intel runner has under 8 GiB free"; exit 1 } }'
+      # source-gate runs these tests on Linux. Run them here on macOS too,
+      # where the lock path, lsof and localhost order differ.
+      - name: smoke script tests on macOS
+        timeout-minutes: 5
+        run: python3 scripts/gateway-healthz-smoke-test.py -v
+      - name: build the gateway binary
+        timeout-minutes: 70
+        run: |
+          set -euo pipefail
+          # GITHUB_ENV applies on the next step. Export it here so this build
+          # writes the binary the /healthz probe executes.
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/gateway-intel-target"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+          cargo build --locked --release --manifest-path elastos/Cargo.toml -p elastos-server --bin elastos
+          test -x "$CARGO_TARGET_DIR/release/elastos"
+      - name: gateway is ready at localhost:8090 with an empty Home
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          export ELASTOS_GATEWAY_LOG="$RUNNER_TEMP/gateway.log"
+          scripts/gateway-healthz-smoke.sh "$CARGO_TARGET_DIR/release/elastos"
+      - name: upload gateway log
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: gateway-smoke-macos-intel-log
+          path: ${{ runner.temp }}/gateway.log
+          retention-days: 7
+          if-no-files-found: ignore
+
   # A pull request run stops at its first failed job, so the macOS and Linux
   # journeys do not run on for 30+ minutes after a decisive failure. Pushes,
   # merge queues and dispatches keep running every job to the end. This job

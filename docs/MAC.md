@@ -4,6 +4,40 @@ The public installer looks up Apple silicon (`aarch64-darwin`) releases. This
 runbook is the source-home staging path for local Mac verification, Browser VM
 artifacts, and `.dmg` packaging work.
 
+## Intel Mac
+
+The public release id for an Intel Mac is `x86_64-darwin`. `scripts/install.sh`
+stops on that host before a download lookup. The message is
+`macOS release lookup requires Apple silicon`.
+
+A person with an Intel Mac has no signed download. The next step is the signed
+installer on an Apple silicon Mac. The source-home commands later in this
+runbook are a developer build. They are not the installer, and this note does
+not claim that build has passed on Intel.
+
+CI job `gateway-smoke-macos-intel` builds the native `elastos` binary on
+`macos-15-intel`. It runs `scripts/gateway-healthz-smoke.sh`, which starts the
+command in [the launcher contract](LAUNCHER_CONTRACT.md) and requires the
+readiness that contract defines. The probe uses `http://localhost:8090/healthz`
+and passes only when all of these are true:
+
+- the answer is HTTP 200 with the two bytes `OK`, without a proxy,
+- the address that answered is a listen socket of the gateway process,
+- `host-process.lock` names that process, a gateway role and `localhost:8090`.
+
+The job uses an empty Home. A pass does not prove providers, capsules,
+sign-in, or a signed install. `elastos serve` reports operator status at
+`GET /api/health`.
+
+For `--addr localhost:8090` the gateway listens on every loopback address that
+[the launcher contract](LAUNCHER_CONTRACT.md) names for `localhost`. After the
+readiness check, the job log prints facts, not pass or fail: the `localhost`
+lookup order, the addresses the gateway listens on, and what `GET /healthz`
+returns at `localhost:8090`, `127.0.0.1:8090` and `[::1]:8090`.
+
+This runbook claims no local Intel Browser engine. See
+[Browser support](BROWSER_SUPPORT.md). The job uploads no release tarball.
+
 ## From Fresh Mac To Home
 
 Install the host tools first:
