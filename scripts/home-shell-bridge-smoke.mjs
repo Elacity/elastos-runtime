@@ -403,6 +403,18 @@ elementForSelector("#desktop-context-menu").hidden = true;
 elementForSelector("#home-notification-toast").hidden = true;
 elementForSelector("#home-unlock").hidden = true;
 elementForSelector("#launcher").hidden = true;
+elementForSelector("#home-clipboard-prompt").hidden = true;
+
+// Stand-in for the Runtime check (gateway_home_external_link.rs, tested in
+// Rust): the app comes from its launch token, the address is canonical.
+const externalLinkApps = {
+  "people-token": ["people", "People"],
+  "wallet-token": ["wallet", "Wallet"],
+  "root-token": ["home-cli", "Home CLI"],
+  "chat-token-": ["chat-room", "Chat"],
+};
+let externalLinkGate = null;
+let externalLinkResult = null;
 
 globalThis.fetch = async (url, init = {}) => {
   const body = init.body ? JSON.parse(init.body) : null;
@@ -412,6 +424,28 @@ globalThis.fetch = async (url, init = {}) => {
     method: init.method || "GET",
     url: String(url),
   });
+  if (url === "/api/apps/home/external-link") {
+    await externalLinkGate?.promise;
+    const app = Object.entries(externalLinkApps)
+      .find(([prefix]) => body?.app_token?.startsWith(prefix))?.[1];
+    let href = "";
+    try {
+      const parsed = new URL(body?.url);
+      href = ["http:", "https:"].includes(parsed.protocol) && !parsed.username && !parsed.password
+        ? parsed.href : "";
+    } catch (_error) {
+      href = "";
+    }
+    if (body?.schema !== "elastos.home.external-link.request/v1" || !app || !href) {
+      return { ok: false, status: 403, statusText: "Forbidden", text: async () => "refused" };
+    }
+    return jsonResponse(externalLinkResult?.(body) || {
+      schema: "elastos.home.external-link.result/v1",
+      app_id: app[0],
+      app_title: app[1],
+      url: href,
+    });
+  }
   if (url === "/api/apps/home/summary") {
     if (requests.filter((request) => request.url === "/api/apps/home/summary").length === 1) {
       assert(
@@ -854,6 +888,99 @@ assert(
   "Home CLI appearance write changed the canonical Home summary",
   shellMessages,
 );
+
+// Home's web-link sheet (#430). Home opens an app's web link only after its
+// own sheet shows the Runtime-named app and the exact address and the person
+// presses Open link; window.open is recorded only inside these checks.
+const openedLinks = [];
+const strictWindowOpen = window.open;
+function recordLinkOpen(...args) {
+  openedLinks.push(args);
+  return null;
+}
+function linkNode(id) {
+  return elementForSelector(`#home-link-${id}`);
+}
+function linkSheet() {
+  return {
+    hidden: linkNode("prompt").hidden,
+    app: linkNode("app").textContent,
+    host: linkNode("host").textContent,
+    address: linkNode("address").textContent,
+    openDisabled: linkNode("open").disabled,
+  };
+}
+function shownLinkSheet(app, host, address) {
+  return JSON.stringify({ hidden: false, app, host, address, openDisabled: false });
+}
+function linkChecks() {
+  return requests.filter((request) => request.url === "/api/apps/home/external-link").length;
+}
+function askLink(source, homeToken, url, extra = {}) {
+  sendChildMessage("null", source, { type: "home:open-external", url, homeToken, ...extra });
+}
+// An Open press lands after Open link's 500 ms guard unless `immediate` is set.
+function pressLink(id, event = { isTrusted: true }, { immediate = id !== "open" } = {}) {
+  const node = linkNode(id);
+  const clock = Date.now;
+  if (!immediate) Date.now = () => clock() + 600;
+  try {
+    for (const listener of node.listeners.get("click") || []) {
+      listener({ target: node, ...event });
+    }
+  } finally {
+    Date.now = clock;
+  }
+}
+function pressLinkKey(key) {
+  dispatchWindowEvent({ type: "keydown", key, preventDefault() {} });
+}
+async function settleLinks() {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+function assertOpenedLinks(expected, message) {
+  const opened = openedLinks.splice(0);
+  assert(
+    JSON.stringify(opened) ===
+      JSON.stringify(expected.map((url) => [url, "_blank", "noopener,noreferrer"])),
+    message,
+    opened,
+  );
+}
+{
+  window.open = recordLinkOpen;
+  const checksBefore = linkChecks();
+  askLink(shellFrameWindow, "wrong-token", "https://example.com/cli");
+  await settleLinks();
+  assert(linkChecks() === checksBefore && linkSheet().hidden,
+    "a Home CLI link with a wrong token reached the Runtime", linkSheet());
+  askLink(shellFrameWindow, "root-token", "https://example.com/cli?x=1");
+  await settleLinks();
+  assert(linkSheet().hidden === false && JSON.stringify(linkSheet()) ===
+    shownLinkSheet("Home CLI", "example.com", "https://example.com/cli?x=1"),
+  "Home CLI link did not show the exact address", linkSheet());
+  const check = requests.filter((request) => request.url === "/api/apps/home/external-link").at(-1);
+  assert(JSON.stringify(check.body) === JSON.stringify({
+    schema: "elastos.home.external-link.request/v1",
+    app_token: "root-token",
+    url: "https://example.com/cli?x=1",
+  }), "Home did not hand the Runtime the sender's own launch token and unchanged address", check);
+  assertOpenedLinks([], "Home opened a Home CLI link before Open link");
+  pressLink("open");
+  assertOpenedLinks(["https://example.com/cli?x=1"], "Open link did not open the Home CLI link once");
+  assert(linkSheet().hidden, "the link sheet stayed open after Open link", linkSheet());
+  // Reload: a reloaded Home CLI (same launch token) loses its shown request.
+  askLink(shellFrameWindow, "root-token", "https://example.com/cli-reload");
+  await settleLinks();
+  assert(!linkSheet().hidden, "Home CLI link did not show before reload", linkSheet());
+  sendChildMessage("null", shellFrameWindow, { type: "home:shell-ready", homeToken: "root-token" });
+  assert(linkSheet().hidden, "a reloaded Home CLI kept its link request", linkSheet());
+  pressLink("open");
+  assertOpenedLinks([], "a reloaded Home CLI's link opened");
+  window.open = strictWindowOpen;
+}
 for (const listener of windowListeners.get("message") || []) {
   listener({
     origin: "null",
@@ -1192,6 +1319,159 @@ sendChildMessage("null", walletFrameWindow, {
   type: "home:app-ready",
   homeToken: "wallet-token",
 });
+{
+  window.open = recordLinkOpen;
+  const realNow = Date.now;
+  let clock = realNow();
+  Date.now = () => clock;
+  const people = "people-token";
+  const address = "https://example.com/a?b=1";
+  const ask = (source, data) => sendChildMessage("null", source, { type: "home:open-external", ...data });
+  const checksBefore = linkChecks();
+  // Refused before the Runtime: source and token binding, sender, exact shape.
+  sendChildMessage("https://evil.invalid", peopleFrameWindow,
+    { type: "home:open-external", url: address, homeToken: people });
+  for (const [source, data] of [
+    [{ postMessage() {} }, { url: address, homeToken: people }],
+    [peopleFrameWindow, { url: address, homeToken: "forged-token" }],
+    [peopleFrameWindow, { url: address }],
+    [{ postMessage() {} }, { url: address, homeToken: "stranger-token" }],
+    [walletFrameWindow, { url: address, homeToken: people }],
+    [shellFrameWindow, { url: address, homeToken: "gui-token" }],
+    [peopleFrameWindow, { url: address, homeToken: people, target: "_self" }],
+    [peopleFrameWindow, { homeToken: people }],
+    [peopleFrameWindow, { url: { href: address }, homeToken: people }],
+    [peopleFrameWindow, { url: "", homeToken: people }],
+    [peopleFrameWindow, { url: `https://example.com/${"a".repeat(2029)}`, homeToken: people }],
+  ]) ask(source, data);
+  await settleLinks();
+  assert(linkChecks() === checksBefore && linkSheet().hidden,
+    "a forged, unbound, foreign or malformed link request reached the Runtime or showed a sheet",
+    { checks: linkChecks() - checksBefore, sheet: linkSheet() });
+  // Refused by the Runtime: nothing shows.
+  for (const url of [
+    "javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", "elastos://doc",
+    "https://user:pass@example.com/",
+  ]) {
+    askLink(peopleFrameWindow, people, url);
+    await settleLinks();
+    assert(linkSheet().hidden, `Home showed a refused address ${url}`, linkSheet());
+  }
+  assert(linkChecks() === checksBefore + 5, "Home did not let the Runtime decide each address", requests);
+  // A Runtime result for another app, or with another address form, is refused.
+  for (const forged of [
+    (body) => ({ schema: "elastos.home.external-link.result/v1", app_id: "wallet", app_title: "Wallet", url: body.url }),
+    () => ({ schema: "elastos.home.external-link.result/v1", app_id: "people", app_title: "People", url: "javascript:alert(1)" }),
+    () => ({ schema: "elastos.home.external-link.result/v1", app_id: "people", app_title: "People", url: "https://Example.com" }),
+    () => ({ schema: "elastos.home.external-link.result/v1", app_id: "people", app_title: "People", url: "https://u@example.com/" }),
+    () => ({ schema: "elastos.home.external-link.result/v1", app_id: "people", app_title: "People", url: "http://localhost:61180/apps/home/" }),
+    (body) => ({ schema: "elastos.home.external-link.result/v1", app_id: "people", app_title: "People", url: body.url, extra: 1 }),
+  ]) {
+    externalLinkResult = forged;
+    askLink(peopleFrameWindow, people, address);
+    await settleLinks();
+    assert(linkSheet().hidden, "Home showed a substituted Runtime result", linkSheet());
+  }
+  externalLinkResult = null;
+  assertOpenedLinks([], "a refused link request opened a window");
+
+  // No stacking: while the Clipboard prompt is on screen, a link request is
+  // dropped, also when the prompt appears during the Runtime check.
+  const clipboardPrompt = elementForSelector("#home-clipboard-prompt");
+  clipboardPrompt.hidden = false;
+  askLink(peopleFrameWindow, people, address);
+  await settleLinks();
+  assert(linkSheet().hidden, "the link sheet stacked on a visible Clipboard prompt", linkSheet());
+  clipboardPrompt.hidden = true;
+  externalLinkGate = deferred();
+  askLink(peopleFrameWindow, people, address);
+  await settleLinks();
+  clipboardPrompt.hidden = false;
+  externalLinkGate.resolve();
+  externalLinkGate = null;
+  await settleLinks();
+  assert(linkSheet().hidden, "the link sheet stacked on a Clipboard prompt shown during its check", linkSheet());
+  clipboardPrompt.hidden = true;
+
+  // Source and swap: the sheet names the Runtime's app and keeps request A.
+  askLink(peopleFrameWindow, people, address);
+  await settleLinks();
+  assert(JSON.stringify(linkSheet()) === shownLinkSheet("People", "example.com", address),
+    "Home did not name the asking app and the exact address", linkSheet());
+  const checksWhileOpen = linkChecks();
+  askLink(peopleFrameWindow, people, "https://evil.example/b");
+  askLink(walletFrameWindow, "wallet-token", "https://evil.example/c");
+  await settleLinks();
+  assert(linkChecks() === checksWhileOpen &&
+    JSON.stringify(linkSheet()) === shownLinkSheet("People", "example.com", address),
+  "a second request changed or queued behind the open sheet", linkSheet());
+  // Consent: nothing opens without Home's own trusted Open link press.
+  pressLink("open", { isTrusted: false });
+  assert(!linkSheet().hidden, "a synthetic Open click closed the sheet", linkSheet());
+  assertOpenedLinks([], "a synthetic Open click opened the link");
+  // Click timing: a real press within 500 ms of the sheet appearing (an app
+  // timing the sheet under a double-click) opens nothing and keeps the sheet.
+  pressLink("open", { isTrusted: true }, { immediate: true });
+  assert(!linkSheet().hidden, "an immediate Open press closed the sheet", linkSheet());
+  assertOpenedLinks([], "an Open press inside the 500 ms guard opened the link");
+  pressLink("open");
+  assertOpenedLinks([address], "Open link did not open exactly the address shown");
+  pressLink("open");
+  assertOpenedLinks([], "a second Open press replayed the link");
+
+  // Cancel opens nothing and cools that app down; other apps are not affected.
+  askLink(peopleFrameWindow, people, "https://example.com/cancel");
+  await settleLinks();
+  pressLink("cancel");
+  assert(linkSheet().hidden, "Cancel left the sheet open", linkSheet());
+  const checksAfterCancel = linkChecks();
+  askLink(peopleFrameWindow, people, "https://example.com/loop");
+  await settleLinks();
+  assert(linkChecks() === checksAfterCancel && linkSheet().hidden,
+    "an app re-asked during its cool-down after Cancel", linkSheet());
+  askLink(walletFrameWindow, "wallet-token", "https://example.com/wallet");
+  await settleLinks();
+  assert(JSON.stringify(linkSheet()) === shownLinkSheet("Wallet", "example.com", "https://example.com/wallet"),
+    "another app was blocked by People's cool-down", linkSheet());
+  pressLinkKey("Escape");
+  assert(linkSheet().hidden, "Escape did not cancel the sheet", linkSheet());
+  clock += 3_001;
+  askLink(peopleFrameWindow, people, "https://example.com/backdrop");
+  await settleLinks();
+  assert(!linkSheet().hidden, "the cool-down did not end", linkSheet());
+  pressLink("prompt");
+  assert(linkSheet().hidden, "the backdrop did not cancel the sheet", linkSheet());
+  assertOpenedLinks([], "Cancel, Escape or the backdrop opened the link");
+  clock += 3_001;
+
+  // Reload: an app that reloads loses its shown request.
+  askLink(walletFrameWindow, "wallet-token", "https://example.com/reload");
+  await settleLinks();
+  assert(!linkSheet().hidden, "Wallet link did not show", linkSheet());
+  sendChildMessage("null", walletFrameWindow, { type: "home:app-ready", homeToken: "wallet-token" });
+  assert(linkSheet().hidden, "a reloaded app kept its link request", linkSheet());
+  pressLink("open");
+  assertOpenedLinks([], "a reloaded app's link opened");
+
+  // Close while the Runtime check is in flight: the late result shows nothing.
+  externalLinkGate = deferred();
+  askLink(peopleFrameWindow, people, "https://example.com/stale");
+  await settleLinks();
+  assert(linkSheet().hidden && linkSheet().openDisabled, "the sheet showed before the Runtime check", linkSheet());
+  sendChildMessage("null", peopleFrameWindow, { type: "home:close-self", homeToken: people });
+  externalLinkGate.resolve();
+  externalLinkGate = null;
+  await settleLinks();
+  assert(linkSheet().hidden, "a closed app's late Runtime result showed a sheet", linkSheet());
+  const checksAfterClose = linkChecks();
+  askLink(peopleFrameWindow, people, address);
+  await settleLinks();
+  assert(linkChecks() === checksAfterClose && linkSheet().hidden, "a closed app could still ask", linkSheet());
+  pressLink("open");
+  assertOpenedLinks([], "a closed app's link opened");
+  Date.now = realNow;
+  window.open = strictWindowOpen;
+}
 
 for (const actor of ["assistant", "home-agent"]) {
   sendChildMessage("null", shellFrameWindow, { type: "home:launch-target", requestId: `launch-${actor}`,
@@ -2400,10 +2680,27 @@ assert(unavailableReply.payload.error && chatReconnectTimers.size === 0,
   "GUI failure leaked fresh authority or recovery timer", chatReplies);
 assertChatTokenRetired(`chat-token-${chatLaunchCount}`);
 
+// Reconnect: Chat's link request under its old authority closes when the
+// reconnect retires that authority; the fresh authority can ask again.
+window.open = recordLinkOpen;
+askLink(chatFrameWindow, "chat-token-1", "https://example.com/chat-old");
+await settleLinks();
+assert(JSON.stringify(linkSheet()) === shownLinkSheet("Chat", "example.com", "https://example.com/chat-old"),
+  "Chat link did not show before reconnect", linkSheet());
 sendChildMessage("null", chatFrameWindow, reconnect("chat-success"));
 const successfulPrepare = await waitForChatPrepare("chat-success");
 const freshChatToken = acknowledgeChat(successfulPrepare, true);
 const chatSuccess = await waitForShellResponse(chatReplies, "chat-success");
+assert(linkSheet().hidden, "reconnect left the old Chat link request open", linkSheet());
+pressLink("open");
+assertOpenedLinks([], "the retired Chat authority's link opened");
+askLink(chatFrameWindow, freshChatToken, "https://example.com/chat-new");
+await settleLinks();
+assert(JSON.stringify(linkSheet()) === shownLinkSheet("Chat", "example.com", "https://example.com/chat-new"),
+  "the reconnected Chat could not ask for a link", linkSheet());
+pressLink("open");
+assertOpenedLinks(["https://example.com/chat-new"], "the reconnected Chat link did not open once");
+window.open = strictWindowOpen;
 assert(chatSuccess.payload.result.route === successfulPrepare.launched.route && chatReconnectTimers.size === 0,
   "GUI acceptance did not return the canonical Runtime Chat launch", chatReplies);
 assert(shellMessages.some(m => m.payload?.command === "renew-chat-authority"
@@ -2433,10 +2730,32 @@ for (const target of ["people", "inbox"]) sendChildMessage("null", chatFrameWind
   { type: "home:open-target", homeToken: freshChatToken, target, query: {} });
 await new Promise(resolve => setTimeout(resolve, 0));
 assert(openCommands() === beforeProfileActions + 2, "Profile card did not open its exact People and Inbox targets", shellMessages);
+// Stale result inside one app: the old authority's Runtime check is still in
+// flight when the reconnect retires it and the new authority asks. The old
+// result arrives first and is dropped; only the new request shows and opens.
+window.open = recordLinkOpen;
+externalLinkGate = deferred();
+askLink(chatFrameWindow, freshChatToken, "https://example.com/chat-stale");
+await settleLinks();
 sendChildMessage("null", chatFrameWindow, { ...reconnect("chat-commit-refused"), homeToken: freshChatToken });
 const refusedCommitPrepare = await waitForChatPrepare("chat-commit-refused");
 const refusedCommitToken = acknowledgeChat(refusedCommitPrepare, true);
 await waitForShellResponse(chatReplies, "chat-commit-refused");
+askLink(chatFrameWindow, refusedCommitToken, "https://example.com/chat-current");
+await settleLinks();
+assert(linkSheet().hidden, "a link sheet showed before either Runtime check returned", linkSheet());
+const staleAndCurrentChecks = requests.filter((request) => request.url === "/api/apps/home/external-link").slice(-2);
+assert(JSON.stringify(staleAndCurrentChecks.map((request) => request.body.app_token)) ===
+  JSON.stringify([freshChatToken, refusedCommitToken]),
+"the new Chat authority could not ask while the old check was in flight", staleAndCurrentChecks);
+externalLinkGate.resolve();
+externalLinkGate = null;
+await settleLinks();
+assert(JSON.stringify(linkSheet()) === shownLinkSheet("Chat", "example.com", "https://example.com/chat-current"),
+  "the old authority's late result replaced or hid the current request", linkSheet());
+pressLink("open");
+assertOpenedLinks(["https://example.com/chat-current"], "a stale Chat result opened instead of the current one");
+window.open = strictWindowOpen;
 acknowledgeChatCommit(refusedCommitPrepare, false, {});
 const beforeWrongCommitReceipt = openCommands();
 sendChildMessage("null", chatFrameWindow, { type: "home:open-target", target: "inbox", query: {}, homeToken: refusedCommitToken });
@@ -2477,6 +2796,10 @@ assert(
   requests,
 );
 
+window.open = recordLinkOpen;
+askLink(chatFrameWindow, signOutChatToken, "https://example.com/sign-out");
+await settleLinks();
+assert(!linkSheet().hidden, "Chat link did not show before sign-out", linkSheet());
 sendChildMessage("null", shellFrameWindow, {
   type: "home:sign-out",
   requestId: "trusted-gui-sign-out",
@@ -2512,4 +2835,8 @@ assert(chatReconnectTimers.size === 0, "Home sign-out kept a pending Chat author
 assert(!chatReplies.some(r => r.payload.requestId === "chat-sign-out" && r.payload.result),
   "Home sign-out delivered a prepared Chat authority", chatReplies);
 assertChatTokenRetired(new URL(signOutChatPrepare.launched.route, window.location.origin).hash.split("home_token=")[1]);
+assert(linkSheet().hidden, "sign-out left a link request open", linkSheet());
+pressLink("open");
+assertOpenedLinks([], "a link opened after sign-out");
+window.open = strictWindowOpen;
 console.log("[home-shell-bridge] PASS");

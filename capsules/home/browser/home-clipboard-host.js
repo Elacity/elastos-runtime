@@ -167,6 +167,9 @@ export function createHomeClipboardPrompt({
   copy,
   allowButton,
   cancelButton,
+  // True while another Home sheet (the web-link sheet) is on screen; the two
+  // never stack.
+  otherSheetShown = () => false,
 } = {}) {
   if (!root || !title || !copy || !allowButton || !cancelButton) {
     throw new TypeError("Home Clipboard prompt nodes are required");
@@ -264,8 +267,8 @@ export function createHomeClipboardPrompt({
 
   return {
     request({ requestId, targetId, operation, purpose }) {
-      if (active) {
-        const error = new Error("Home already has an active Clipboard prompt");
+      if (active || otherSheetShown()) {
+        const error = new Error("Home already has an active prompt");
         error.code = "busy";
         return Promise.reject(error);
       }
