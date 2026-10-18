@@ -392,7 +392,9 @@ fn parent_gateway_holds_host_lock(data_dir: &Path) -> bool {
 /// The gateway starts a Home terminal with the marker, its own pid, and a
 /// descriptor of the open file that holds its host lock
 /// (`gateway_home_terminal.rs`). This process must be that direct child, and
-/// that descriptor must hold the flock now.
+/// that descriptor must hold the flock now. This proves lock possession, not
+/// that the parent is the gateway: a same-user parent that holds the lock can
+/// set the same variables.
 fn parent_gateway_lock_proven(
     data_dir: &Path,
     marker: Option<&std::ffi::OsStr>,
@@ -2263,5 +2265,116 @@ mod tests {
         forge_host_lock_record(data, parent, "gateway");
         assert!(!proven(&inherited, marker, &parent_text, Some(parent)));
         drop(foreign);
+    }
+
+    const LANE_PROBE_DATA_ENV: &str = "ELASTOS_TEST_LANE_PROBE_DATA";
+    const LANE_PROBE_ANSWER: &str = "HOME_TERMINAL_LANE_PROOF=";
+
+    /// The child half of the test below: a separate process that runs the
+    /// Home terminal check on what its parent gave it, and prints the answer.
+    #[test]
+    #[ignore = "run as a child by the test below"]
+    #[cfg(unix)]
+    fn home_terminal_lane_probe_child() {
+        let data = std::env::var_os(LANE_PROBE_DATA_ENV).expect("data directory");
+        let proven = parent_gateway_holds_host_lock(Path::new(&data));
+        println!("{LANE_PROBE_ANSWER}{proven}");
+    }
+
+    /// The inherited lock descriptor proves possession of the host lock, not
+    /// that the parent is the gateway (`docs/LAUNCHER_CONTRACT.md`, "Readiness
+    /// and Home URL"). Here the parent is this test process. It is not a
+    /// gateway: it takes the flock with a plain open, not as a host, and the
+    /// record does not name a gateway. It sets the variables a gateway sets and
+    /// gives the descriptor to a real child process. The child's check accepts
+    /// it while the parent holds the lock, and refuses a descriptor that does
+    /// not hold the lock and the same descriptor after the parent releases it.
+    #[test]
+    #[cfg(unix)]
+    fn home_terminal_lane_proves_lock_possession_not_that_the_parent_is_the_gateway() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        let path = data.join("host-process.lock");
+        std::fs::write(&path, "not a gateway record\n").unwrap();
+        let child_answer = |fd: std::os::fd::RawFd| -> bool {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    &format!(
+                        "{}::home_terminal_lane_probe_child",
+                        module_path!().split_once("::").unwrap().1
+                    ),
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(LANE_PROBE_DATA_ENV, data)
+                .env(GATEWAY_OWNED_HOME_TERMINAL_ENV, "1")
+                .env(GATEWAY_HOST_PID_ENV, std::process::id().to_string())
+                .env(GATEWAY_HOST_LOCK_FD_ENV, fd.to_string())
+                .stdin(std::process::Stdio::null());
+            unsafe {
+                command.pre_exec(move || {
+                    // Keep this one descriptor open across exec, as a gateway does.
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "child failed: {stdout}");
+            let answer = stdout
+                .lines()
+                .find_map(|line| line.split_once(LANE_PROBE_ANSWER))
+                .map(|(_, answer)| answer.trim())
+                .unwrap_or_else(|| panic!("no answer from the child: {stdout}"));
+            answer == "true"
+        };
+
+        // This process holds the flock, but not as a host, so it is no gateway.
+        let held =
+            crate::host_lock::FileLock::try_exclusive(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(crate::host_lock::held_host_role(data), None);
+        assert!(!crate::host_lock::holds_gateway_host_lock(data));
+        assert!(crate::host_lock::gateway_host_lock_for_child(data).is_none());
+
+        // The child accepts the descriptor: it proves the lock is held through
+        // it, and that its parent is the pid it was given. Nothing more.
+        assert!(
+            child_answer(held.as_raw_fd()),
+            "a descriptor that holds the lock, from a parent that is not a gateway"
+        );
+
+        // A descriptor of the same file that does not hold the lock is refused.
+        let plain = std::fs::File::open(&path).unwrap();
+        assert!(
+            !child_answer(plain.as_raw_fd()),
+            "a descriptor without the lock"
+        );
+
+        // After the parent releases the lock, the same descriptor is refused.
+        let descriptor = held.try_clone().unwrap();
+        held.release().unwrap();
+        assert!(
+            !child_answer(descriptor.as_raw_fd()),
+            "the descriptor after the release"
+        );
+        assert!(crate::host_lock::test_support::lock_is_free(&path));
+
+        let contract = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/LAUNCHER_CONTRACT.md"
+        ))
+        .unwrap();
+        let contract = contract.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(contract.contains("`ELASTOS_GATEWAY_HOST_LOCK_FD`"));
+        assert!(
+            contract.contains("This proves lock possession, not that the parent is the gateway.")
+        );
     }
 }
