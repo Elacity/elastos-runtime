@@ -77,8 +77,10 @@ impl Drop for FileLock {
 }
 
 /// Host locks that this process holds now. `docs/LAUNCHER_CONTRACT.md`
-/// ("Readiness and Home URL") states what proves ownership. The JSON record
+/// ("Readiness and Home URL") states what the lock proves. The JSON record
 /// in the lock file is not proof: any process of the same user can rewrite it.
+/// The flock proves possession, not identity: any process of the same user can
+/// hold it. So this process proves only that it holds the lock itself.
 ///
 /// Each entry keeps a second descriptor of the open file description that
 /// holds the flock. A proof keeps this mutex for its whole check, and a guard
@@ -236,7 +238,9 @@ pub fn gateway_host_lock_for_child(data_dir: &Path) -> Option<fs::File> {
 /// `data_dir`. The check is the same flock proof the gateway uses for
 /// `/healthz`, run against the gateway's own open file description. The JSON
 /// record is not read. After the gateway releases its lock, or after another
-/// process takes the lock, the answer is `false`.
+/// process takes the lock, the answer is `false`. A `true` answer proves that
+/// `fd` holds the lock, not that the process that gave it is a gateway: any
+/// process of the same user that holds the lock can give its descriptor.
 ///
 /// The check marks `fd` close-on-exec, so commands this process starts later
 /// do not receive it. This process never closes `fd`. If the gateway releases
@@ -379,8 +383,10 @@ pub fn active_host_process(data_dir: &Path) -> anyhow::Result<Option<HostProcess
             free.release()?;
             Ok(None)
         }
-        // The flock decides that a host is active. The record only describes
-        // it, and a holder whose record cannot be read is still a holder.
+        // The flock decides that a holder is active. It proves possession,
+        // not that the holder is ElastOS: any process of the same user can
+        // hold it. The record only describes the holder and can be false, and
+        // a holder whose record cannot be read is still a holder.
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(Some(
             read_lock_metadata(&lock_path)
                 .map(Into::into)
@@ -686,6 +692,57 @@ pub(crate) mod test_support {
     }
 
     impl Drop for SpawnedWhileOpen {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A separate process of the same user that is not a gateway and not
+    /// ElastOS (`/bin/sleep`). Before exec it opens `path` itself and takes
+    /// the exclusive flock on that new open file description, which it keeps
+    /// across exec. It shares no descriptor with this process.
+    pub(crate) struct HeldByAnotherProcess(Child);
+
+    impl HeldByAnotherProcess {
+        pub(crate) fn new(path: &Path) -> Self {
+            use std::os::unix::ffi::OsStrExt as _;
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let mut command = Command::new("/bin/sleep");
+            command
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            unsafe {
+                command.pre_exec(move || {
+                    // No O_CLOEXEC: the descriptor and its lock survive exec.
+                    let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
+                    if fd == -1 || libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            // `spawn` returns after exec, so the child holds the lock now.
+            Self(
+                command
+                    .spawn()
+                    .expect("another process takes the host lock"),
+            )
+        }
+
+        pub(crate) fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        /// Ends the process, which releases its lock.
+        pub(crate) fn stop(self) {
+            drop(self);
+        }
+    }
+
+    impl Drop for HeldByAnotherProcess {
         fn drop(&mut self) {
             let _ = self.0.kill();
             let _ = self.0.wait();
