@@ -88,7 +88,7 @@ async function openAssistant(t, { firstReply = null, eventsPage = null } = {}) {
       // The Runtime's app-document sandbox (browser_capsules.rs
       // shell_content_security_policy): no allow-modals, so confirm() is ignored.
       const csp = match[1] === "assistant" && path === resolve(base, "index.html")
-        ? { "content-security-policy": "sandbox allow-scripts allow-forms allow-popups allow-downloads" } : {};
+        ? { "content-security-policy": "sandbox allow-scripts allow-forms allow-downloads" } : {};
       res.writeHead(200, { ...headers, ...csp, "content-type": types[extname(path)] || "application/octet-stream" });
       res.end(bytes);
     } catch (error) { errors.push(String(error)); res.writeHead(500); res.end(); }
