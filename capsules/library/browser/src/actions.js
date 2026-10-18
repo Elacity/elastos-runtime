@@ -53,6 +53,8 @@ export function createLibraryActions({
   const RUNTIME_CUSTODY_METADATA_SCHEMA = "elastos.library.protected-content-identity/v1";
   const MINT_ID_HEX_RE = /^[0-9a-f]{64}$/;
   const protectAndListInFlight = new Map();
+  const activeUploads = new Set();
+  let uploadBatchId = 0;
 
   async function openObject(object) {
     if (!object) return;
@@ -195,23 +197,27 @@ export function createLibraryActions({
       setStatus("This Space is read-only.");
       return;
     }
-    const batch = Date.now().toString(36);
-    state.uploads = list.map((file, index) => ({
+    const destinationUri = state.currentUri;
+    const batch = ++uploadBatchId;
+    const uploads = list.map((file, index) => ({
       id: `${batch}:${index}`,
       name: file.name,
       progress: 0,
       status: "Queued",
     }));
+    // A new selection replaces old results while active batches keep their rows.
+    state.uploads = state.uploads.filter((upload) => activeUploads.has(upload)).concat(uploads);
+    for (const upload of uploads) activeUploads.add(upload);
     renderUploads();
     try {
       for (let index = 0; index < list.length; index += 1) {
         const file = list[index];
-        const upload = state.uploads[index];
+        const upload = uploads[index];
         try {
           setStatus(`Uploading ${file.name}...`);
           setUploadProgress(upload.id, { status: "Preparing", progress: 4 });
           await uploadObject({
-            uri: childUri(state.currentUri, file.name),
+            uri: childUri(destinationUri, file.name),
             file,
             mime: file.type || "application/octet-stream",
             onProgress: (fraction) => {
@@ -227,16 +233,28 @@ export function createLibraryActions({
           });
           setUploadProgress(upload.id, { status: "Complete", progress: 100 });
         } catch (error) {
-          setUploadProgress(upload.id, { status: "Upload failed" });
+          setUploadProgress(upload.id, {
+            status: "Upload not confirmed. Check the destination before retrying.",
+          });
+          for (const pending of uploads.slice(index + 1)) {
+            setUploadProgress(pending.id, { status: "Not started" });
+          }
           throw error;
         }
       }
-      setStatus(`Uploaded ${list.length} file${list.length === 1 ? "" : "s"}.`);
-      await loadCurrentFolder();
+      const completedStatus = `Uploaded ${list.length} file${list.length === 1 ? "" : "s"}.`;
+      try {
+        await loadCurrentFolder();
+        setStatus(completedStatus);
+      } catch {
+        setStatus(`${completedStatus} Refresh Library to see the latest items.`);
+      }
     } finally {
+      for (const upload of uploads) activeUploads.delete(upload);
       window.setTimeout(() => {
-        if (state.uploads.every((upload) => upload.progress >= 100)) {
-          state.uploads = [];
+        if (uploads.every((upload) => upload.progress >= 100)) {
+          const completedIds = new Set(uploads.map((upload) => upload.id));
+          state.uploads = state.uploads.filter((upload) => !completedIds.has(upload.id));
           renderUploads();
         }
       }, 1_200);

@@ -655,11 +655,6 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(super::auth_gateway::passkey_authenticate_begin),
         )
         .route(
-            "/api/auth/passkey/authenticate/named/begin",
-            post(super::auth_gateway::passkey_authenticate_named_begin)
-                .layer(DefaultBodyLimit::max(8 * 1024)),
-        )
-        .route(
             "/api/auth/passkey/authenticate/complete",
             post(super::auth_gateway::passkey_authenticate_complete)
                 .layer(DefaultBodyLimit::max(96 * 1024)),
