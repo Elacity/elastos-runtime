@@ -19,9 +19,11 @@ from pathlib import Path
 import platform
 import re
 import shlex
+import shutil
 import signal
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -32,6 +34,32 @@ from unittest import mock
 INSTALLER = Path(__file__).with_name("install.sh")
 SANDBOX_BASE = Path(__file__).resolve().parent.parent / "target/installer-sandboxes"
 SOURCE = INSTALLER.read_text()
+# Decision 4: the plain stop, and nothing before it.
+INTEL_MAC_STOP = "Intel Mac is not supported yet."
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# sysctl -in answers for (sysctl.proc_translated, hw.optional.arm64). None
+# means sysctl fails; a missing command is its own case.
+ROSETTA_ON_APPLE_SILICON = [("1", "1"), ("1", ""), ("", "1"), ("0", "1")]
+INTEL_OR_UNPROVEN = [("0", "0"), ("", ""), ("0", ""), ("2", "0"), None, "missing"]
+
+
+def sysctl_function(answers):
+    """A bash sysctl() for detect_platform: answers, a failure (None) or a missing command."""
+    if answers == "missing":
+        return 'sysctl() { echo "bash: sysctl: command not found" >&2; return 127; }'
+    if answers is None:
+        return 'sysctl() { echo "sysctl: cannot read" >&2; return 1; }'
+    translated, arm64 = answers
+    return ('sysctl() { [ "$1" = -in ] || return 2; case "$2" in '
+            f'sysctl.proc_translated) echo "{translated}";; hw.optional.arm64) echo "{arm64}";; '
+            '*) return 2;; esac; }')
+
+
+def sysctl_mock(answers):
+    """The same answers as an executable for a full installer run."""
+    return "#!/bin/bash\n" + sysctl_function(answers) + '\nsysctl "$@"\n'
+if "# ── Main" not in SOURCE:
+    raise SystemExit("install.sh is missing the '# ── Main' helper marker")
 HELPERS = SOURCE.split("# ── Main", 1)[0]
 PYTHON = SOURCE.split("<<'PY_ED25519'\n", 1)[1].split("\nPY_ED25519", 1)[0]
 CRYPTO = {"__name__": "installer_test"}
@@ -44,6 +72,26 @@ UNINSTALL_SOURCE = SOURCE.split("<<'PY_UNINSTALL'\n", 1)[1].split("\nPY_UNINSTAL
 PUBLISHER_DID = "did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe"
 
 FIXTURE_DID = "did:key:z6MkvDqGT54cXesYGvABpF1UapVNwjCqRcafi4Px6Thv5T3Z"
+
+
+def unixfs_v0_cid(data):
+    """CIDv0 from scripts/release-signer.py, the publisher's implementation."""
+    global _SIGNER_CID
+    if _SIGNER_CID is None:
+        import importlib.util
+        path = Path(__file__).with_name("release-signer.py")
+        spec = importlib.util.spec_from_file_location("release_signer_cid", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SIGNER_CID = module
+    return _SIGNER_CID.unixfs_metadata_cid(data)
+
+
+_SIGNER_CID = None
+
+
+def sha256_files(paths):
+    return [hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in paths]
 
 
 def binding_fixture():
@@ -449,7 +497,7 @@ class ShellTests(unittest.TestCase):
                                     "release_sha256": hashlib.sha256(paths[1].read_bytes()).hexdigest()}}
                 paths[0].write_text(json.dumps(head))
                 expected = subprocess.run([OPTIONS.bash, str(policy), version], capture_output=True)
-                actual = shell('validate_release_identity "$1" "$2"\n', *paths)
+                actual = shell('validate_release_identity "$1" "$2" "$3" "$4"\n', *paths, *sha256_files(paths))
                 with self.subTest(version=version):
                     self.assertEqual(expected.returncode == 0, version in accepted_versions,
                                      expected.stdout + expected.stderr)
@@ -478,9 +526,102 @@ class ShellTests(unittest.TestCase):
                 first = copy.deepcopy(first)
                 first["payload"]["release_sha256"] = hashlib.sha256(paths[1].read_bytes()).hexdigest()
                 paths[0].write_text(json.dumps(first))
-                result = shell('validate_release_identity "$1" "$2"\n', *paths)
+                result = shell('validate_release_identity "$1" "$2" "$3" "$4"\n', *paths, *sha256_files(paths))
                 with self.subTest(case=index):
                     self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+
+    def test_reads_after_the_signature_check_refuse_other_bytes(self):
+        # Every later read of a verified envelope names the SHA-256 that the
+        # signature check saw. One changed byte must stop each of them.
+        did, head, release = installable_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory, "release-head.json"), Path(directory, "release.json")]
+            paths[0].write_bytes(head)
+            paths[1].write_bytes(release)
+            verified = shell('verify_signature "$1" elastos.release.head.v1 "$2"\nprintf "%s\\n" "$VERIFIED_SHA256"\n',
+                             paths[0], did)
+            self.assertEqual(verified.stdout.splitlines()[-1], hashlib.sha256(head).hexdigest(), verified.stderr)
+            head_sha256, release_sha256 = sha256_files(paths)
+            reads = {
+                "json_get": ('json_get "$1" \'d["payload"]["version"]\' "$3"\n', "0.7.1"),
+                "bind_verified_head_cid": ('HEAD_CID=""\nbind_verified_head_cid "$1" "$3"\n', ""),
+                "validate_release_identity": ('validate_release_identity "$1" "$2" "$3" "$4"\n', ""),
+            }
+            for name, (script, output) in reads.items():
+                with self.subTest(read=name, bytes="verified"):
+                    paths[0].write_bytes(head)
+                    result = shell(script, *paths, head_sha256, release_sha256)
+                    self.assertEqual((result.returncode, result.stdout.strip()), (0, output), result.stderr)
+                with self.subTest(read=name, bytes="changed"):
+                    paths[0].write_bytes(head.replace(b'"updated_at":1', b'"updated_at":2'))
+                    self.assertNotEqual(paths[0].read_bytes(), head)
+                    result = shell(script, *paths, head_sha256, release_sha256)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("0.7.1", result.stdout)
+                    if name != "json_get":
+                        self.assertIn("The release files changed on this computer after they were checked",
+                                      result.stderr)
+
+    def test_held_runtime_refuses_any_change_to_the_held_file_or_its_path(self):
+        # The check behind every staged run, alone. fd 9 holds the staged file.
+        with tempfile.TemporaryDirectory() as directory:
+            staged = Path(directory) / "elastos"
+            expected = hashlib.sha256(RUNTIME_STUB).hexdigest()
+            setups = {
+                "unchanged": "",
+                "path renamed over": 'printf x > "$1.new"; chmod 0500 "$1.new"; mv -f "$1.new" "$1"',
+                "path removed": 'rm -f "$1"',
+                "path now a symlink": 'cp "$1" "$1.real"; rm -f "$1"; ln -s "$1.real" "$1"',
+                "written in place": 'chmod u+w "$1"; printf x >> "$1"; chmod 0500 "$1"',
+                "made writable": 'chmod u+w "$1"',
+                "second link": 'ln "$1" "$1.link"',
+            }
+            for name, change in setups.items():
+                for path in Path(directory).iterdir():
+                    path.unlink()
+                staged.write_bytes(RUNTIME_STUB)
+                staged.chmod(0o500)
+                result = shell('''exec 9<"$1"
+id="$(held_runtime hash "$1" "$2")" || exit 10
+held_runtime check "$1" "$id" || exit 11
+''' + change + '''
+held_runtime check "$1" "$id" || exit 12
+''', staged, expected)
+                with self.subTest(change=name):
+                    self.assertEqual(result.returncode, 0 if name == "unchanged" else 12, result.stderr)
+                    self.assertEqual(result.stderr, "")
+            # The hash is of the held file's bytes, and a mode other than 0500 is refused.
+            staged.chmod(0o700)
+            staged.write_bytes(RUNTIME_STUB)
+            staged.chmod(0o500)
+            wrong = shell('exec 9<"$1"; held_runtime hash "$1" "$2"', staged, "0" * 64)
+            self.assertEqual(wrong.returncode, 3)
+            staged.chmod(0o700)
+            loose = shell('exec 9<"$1"; held_runtime hash "$1" "$2"', staged, expected)
+            self.assertEqual(loose.returncode, 3)
+
+    def test_verified_head_cid_is_the_hashed_bytes(self):
+        vector = b'{"payload":{"version":"0.7.1-rc.2"}}\n'
+        expected = "QmZFMnZjkiTqy9VY5FDdKudvpsKtKxifk1poBrV7k4sqp8"
+        self.assertEqual(unixfs_v0_cid(vector), expected)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "release-head.json")
+            path.write_bytes(vector)
+            digest = hashlib.sha256(vector).hexdigest()
+            stored = shell('HEAD_CID=""\nbind_verified_head_cid "$1" "$2"\nprintf "%s\\n" "$HEAD_CID"\n', path, digest)
+            self.assertEqual((stored.returncode, stored.stdout.strip()), (0, ""), stored.stderr)
+            same = shell('HEAD_CID="$3"\nbind_verified_head_cid "$1" "$2"\nprintf "%s\\n" "$HEAD_CID"\n',
+                         path, digest, expected)
+            self.assertEqual((same.returncode, same.stdout.strip()), (0, expected), same.stderr)
+            mismatch = shell('HEAD_CID="QmStampNamesOtherBytes"\nbind_verified_head_cid "$1" "$2"\n', path, digest)
+            self.assertEqual(mismatch.returncode, 1, mismatch.stdout)
+            self.assertIn("Stamped head CID differs from the verified release head", mismatch.stderr)
+            self.assertIn("Stamp: QmStampNamesOtherBytes", mismatch.stderr)
+            self.assertIn("Verified: " + expected, mismatch.stderr)
+            path.write_bytes(b"")
+            empty = shell('HEAD_CID=""\nbind_verified_head_cid "$1" "$2"\n', path, hashlib.sha256(b"").hexdigest())
+            self.assertEqual(empty.returncode, 1, empty.stdout)
+            self.assertIn("no single-block CID", empty.stderr)
 
 
 class InstallerSandbox:
@@ -511,6 +652,10 @@ class InstallerSandbox:
         self.responses = self.root / "responses"
         for path in (self.home, self.root / "tmp", self.responses, self.root / "mocks"):
             path.mkdir(parents=True)
+        # The installer's TMPDIR is this private folder, never the caller's.
+        (self.root / "tmp").chmod(0o700)
+        self.tmpdir = self.root / "tmp"
+        self.path_tail = None
         (self.root / "requests").write_text("")
         self.respond("release-head.json", head)
         self.respond("release.json", release)
@@ -540,6 +685,8 @@ case "$(cat "$FIXTURES/responses/$response.redirect" 2>/dev/null)" in
   http://*) echo 'curl: (1) Protocol "http" not supported' >&2; exit 1;;
 esac
 [ -f "$FIXTURES/responses/$response" ] || { echo artifact-request-blocked >&2; exit 93; }
+# Each file curl writes, so a test can name the exact download path.
+[ -z "$destination" ] || printf '%s %s\\n' "$response" "$destination" >> "$FIXTURES/downloads"
 if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"; else cat "$FIXTURES/responses/$response"; fi
 ''')
         for path in mocks.iterdir():
@@ -554,21 +701,48 @@ if [ -n "$destination" ]; then cp "$FIXTURES/responses/$response" "$destination"
     def respond(self, name, data):
         (self.responses / name).write_bytes(data)
 
+    def mock(self, name, text):
+        """Put one more executable ahead of the system on the installer's PATH."""
+        path = self.root / "mocks" / name
+        path.write_text(text)
+        path.chmod(0o755)
+
     def requests(self):
         return (self.root / "requests").read_text().splitlines()
 
-    def run(self, *options, umask="0022"):
+    def downloads(self):
+        path = self.root / "downloads"
+        return dict(line.split(" ", 1) for line in path.read_text().splitlines()) if path.exists() else {}
+
+    def hide_commands(self, *names):
+        """Run with a PATH that has no command by these names, mock or system."""
+        for name in names:
+            (self.root / "mocks" / name).unlink(missing_ok=True)
+        system = self.root / "system-bin"
+        system.mkdir()
+        for directory in os.environ["PATH"].split(os.pathsep):
+            if not os.path.isdir(directory):
+                continue
+            for entry in sorted(os.listdir(directory)):
+                target = os.path.join(directory, entry)
+                if (entry not in names and not (system / entry).exists()
+                        and os.path.isfile(target) and os.access(target, os.X_OK)):
+                    (system / entry).symlink_to(target)
+        self.path_tail = system
+
+    def run(self, *options, umask="0022", head_cid=""):
         seen = len(self.requests())
         result = shell('umask "$6"\n' + '''
-export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$1/tmp" FIXTURES="$1" PATH="$1/mocks:$PATH"
+export HOME="$1/home" XDG_DATA_HOME="$1/home/xdg-data" TMPDIR="$8" FIXTURES="$1" PATH="$1/mocks:${9:-$PATH}"
 # Apple Python otherwise adds bytecode caches to HOME during file-preservation checks.
 export PYTHONDONTWRITEBYTECODE=1
-export ELASTOS_PUBLISHER_GATEWAY="" ELASTOS_HEAD_CID=""
+export ELASTOS_PUBLISHER_GATEWAY="" ELASTOS_HEAD_CID="$7"
 export ELASTOS_SOURCE_CONNECT_TICKET="" ELASTOS_PUBLISHER_NODE_ID="" ELASTOS_INSTALL_ONLY=""
 export ELASTOS_TEST_CALLS="$1/calls" ELASTOS_TEST_SETUP_MARKER="$1/setup-marker" MOCK_SYSTEM="$4" MOCK_MACHINE="$5"
 # Feed the complete stamped script through stdin, as curl | bash does.
-cat "$3" | "$2" --noprofile --norc -s -- "${@:7}"
-''', self.root, OPTIONS.bash, self.installer, self.system, self.machine, umask,
+cat "$3" | "$2" --noprofile --norc -s -- "${@:10}"
+''', self.root, OPTIONS.bash, self.installer, self.system, self.machine, umask, head_cid,
+                       self.tmpdir, self.path_tail or "",
                        "--maintainer-did", self.did, "--publisher-gateway", "https://test.invalid", *options)
         return result, self.requests()[seen:]
 
@@ -597,6 +771,80 @@ def run_offline_installer(head, release, did, system="Linux", machine="x86_64"):
         if sandbox.binary.exists():
             raise AssertionError("Offline fixture reached installation")
         return result, requests
+
+
+# sha256sum FILE and shasum -a 256 FILE print the real hash; "held" only swaps
+# (the real python3 already hashed the held file). Then the first file that
+# matches swap-rule is replaced, once, and the swap is logged:
+#   download inplace   the file curl downloaded, rewritten in place
+#   staged rename      the staged Runtime, replaced by another file at its path
+#   staged inplace     the staged Runtime, rewritten in place, mode put back
+SWAP_HASHER = """import hashlib, os, pathlib, sys
+fixtures, tool, path = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[-1]
+digest = lambda: hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+before = digest()
+if tool != "held":
+    print(before + "  " + path, flush=True)
+rule = fixtures / "swap-rule"
+target, how = rule.read_text().split() if rule.exists() else ("download", "inplace")
+downloads = dict(line.split(" ", 1) for line in (fixtures / "downloads").read_text().splitlines())
+hit = path == downloads.get("binary") if target == "download" else "/.elastos.install." in path
+log = fixtures / "swaps"
+if hit and not log.exists():
+    swap = (fixtures / "swap-binary").read_bytes()
+    mode = os.stat(path).st_mode & 0o777
+    if how == "rename":
+        pathlib.Path(path + ".swap").write_bytes(swap)
+        os.chmod(path + ".swap", mode)
+        os.replace(path + ".swap", path)
+    else:
+        os.chmod(path, mode | 0o200)
+        with open(path, "r+b") as handle:
+            handle.write(swap)
+            handle.truncate()
+        os.chmod(path, mode)
+    log.write_text(" ".join([tool, path, before, digest()]) + "\\n")
+"""
+
+
+def mock_swapping_hashers(sandbox, rule=None):
+    (sandbox.root / "swap-hasher.py").write_text(SWAP_HASHER)
+    if rule:
+        (sandbox.root / "swap-rule").write_text(rule)
+    run = f'"{sys.executable}" -I "$FIXTURES/swap-hasher.py" "$FIXTURES"'
+    sandbox.mock("sha256sum", f'#!/bin/sh\n[ "$#" = 1 ] || exit 2\nexec {run} sha256sum "$@"\n')
+    sandbox.mock("shasum", f'#!/bin/sh\n[ "$#" = 3 ] && [ "$1 $2" = "-a 256" ] || exit 2\nexec {run} shasum "$@"\n')
+    # install.sh hashes the held staged Runtime with python3 (held_runtime hash).
+    sandbox.mock("python3", f'''#!/bin/sh
+"{sys.executable}" "$@"
+status=$?
+if [ "$status" = 0 ] && [ "$1" = - ] && [ "$2" = hash ]; then {run} held "$3"; fi
+exit "$status"
+''')
+
+
+def mock_gnu_mktemp(sandbox):
+    """mktemp as GNU coreutils ships it: -d with no template uses TMPDIR.
+
+    The fixture Linux run must not use the host's own mktemp. On a Mac host
+    that is Apple's mktemp, which ignores TMPDIR (see mock_apple_mktemp). The
+    template form is one that GNU and BSD mktemp both accept.
+    """
+    real = shutil.which("mktemp")
+    sandbox.mock("mktemp", f'''#!/bin/sh
+if [ "$#" = 1 ] && [ "$1" = -d ]; then exec "{real}" -d "${{TMPDIR:-/tmp}}/tmp.XXXXXXXXXX"; fi
+exec "{real}" "$@"
+''')
+
+
+def mock_apple_mktemp(sandbox):
+    """mktemp as macOS ships it: -d with no template ignores TMPDIR."""
+    (sandbox.root / "darwin-user-temp").mkdir(mode=0o700)
+    real = shutil.which("mktemp")
+    sandbox.mock("mktemp", f'''#!/bin/sh
+if [ "$#" = 1 ] && [ "$1" = -d ]; then exec "{real}" -d "$FIXTURES/darwin-user-temp/tmp.XXXXXXXXXX"; fi
+exec "{real}" "$@"
+''')
 
 
 def changed_paths(before, after):
@@ -707,8 +955,9 @@ class BindingTests(unittest.TestCase):
                 paths[1].write_bytes(candidate)
                 result = shell('''
 verify_signature "$1" elastos.release.head.v1 "$3"
+head_sha256="$VERIFIED_SHA256"
 verify_signature "$2" elastos.release.v1 "$3"
-validate_release_identity "$1" "$2"
+validate_release_identity "$1" "$2" "$head_sha256" "$VERIFIED_SHA256"
 ''', *paths, did)
                 with self.subTest(case=name):
                     self.assertEqual(result.stdout.count("Signature verified"), 2, result.stderr)
@@ -723,7 +972,7 @@ validate_release_identity "$1" "$2"
                 first = json.loads(head)
                 first["payload"]["release_sha256"] = value
                 paths[0].write_text(json.dumps(first))
-                result = shell('validate_release_identity "$1" "$2"\n', *paths)
+                result = shell('validate_release_identity "$1" "$2" "$3" "$4"\n', *paths, *sha256_files(paths))
                 with self.subTest(value=value):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("Release identity check failed", result.stderr)
@@ -789,6 +1038,245 @@ class InstallationTests(unittest.TestCase):
                 self.assertIn("MAINTAINER_DID must be a did:key value", result.stderr)
                 self.assertNotIn("Maintainer DID:", result.stdout)
                 self.assertNotIn("\x1b]", result.stdout + result.stderr)
+
+    def test_stamped_head_cid_must_match_the_verified_head(self):
+        did, head, release = installable_fixture()
+        verified = unixfs_v0_cid(head)
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            refused, requests = sandbox.run("--install-only", head_cid="QmStampNamesOtherBytes")
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("Stamped head CID differs from the verified release head", refused.stderr)
+            self.assertIn(verified, refused.stderr)
+            self.assertEqual(requests, ["https://test.invalid/release-head.json"])
+            self.assertFalse(sandbox.binary.exists())
+            accepted, accepted_requests = sandbox.run("--install-only", head_cid=verified)
+            self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+            self.assertEqual(accepted_requests, self.REQUESTS)
+            sources = json.loads((sandbox.root / "candidate" / "sources.json").read_text())
+            self.assertEqual(sources["sources"][0]["head_cid"], verified)
+
+    def test_rosetta_shell_installs_the_apple_silicon_build_and_intel_downloads_nothing(self):
+        # Terminal under Rosetta on an M1 or later Mac: uname -m says x86_64,
+        # sysctl.proc_translated says 1. The signed aarch64-darwin build is
+        # fetched, checked and installed. A native Intel answer stops first.
+        binary = {"cid": "binary-a", "sha256": hashlib.sha256(RUNTIME_STUB).hexdigest(),
+                  "size": len(RUNTIME_STUB)}
+        did, head, release = installable_fixture(release_extra={"platforms": {"aarch64-darwin": {
+            "binary": binary, "components": {"cid": "components-a", "sha256": "c" * 64, "size": 1}}}})
+        with InstallerSandbox(head, release, did, system="Darwin", machine="x86_64") as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            sandbox.mock("sysctl", sysctl_mock(("0", "0")))
+            intel, intel_requests = sandbox.run("--install-only")
+            self.assertEqual(intel.returncode, 1, intel.stdout + intel.stderr)
+            self.assertEqual(intel.stderr, "Error: " + INTEL_MAC_STOP + "\n")
+            self.assertEqual(intel_requests, [])
+            self.assertFalse(sandbox.binary.exists())
+            sandbox.mock("sysctl", sysctl_mock(("1", "1")))
+            rosetta, requests = sandbox.run("--install-only")
+            self.assertEqual(rosetta.returncode, 0, rosetta.stdout + rosetta.stderr)
+            self.assertIn("(aarch64-darwin)", rosetta.stdout)
+            self.assertEqual(requests, self.REQUESTS[:2] + ["https://test.invalid/artifacts/elastos-aarch64-darwin"])
+            self.assertEqual(sandbox.binary.read_bytes(), RUNTIME_STUB)
+
+    def test_runtime_swapped_after_its_checksum_check_is_not_run_or_installed(self):
+        # Another process changes the download right after its SHA-256 passed.
+        # The installer runs and installs only bytes it checked, so the swapped
+        # Runtime never runs. The swap targets the exact path curl wrote, so it
+        # does not depend on where mktemp puts the scratch folder: Apple's
+        # mktemp -d ignores TMPDIR and uses the per-user folder from confstr
+        # (shell_cmds mktemp.c, implied -t mode), GNU mktemp -d uses TMPDIR.
+        swapped = RUNTIME_STUB.replace(b"#!/bin/bash\n", b'#!/bin/bash\necho ran >> "$FIXTURES/swapped-ran"\n', 1)
+        self.assertNotEqual(swapped, RUNTIME_STUB)
+        binary = {"cid": "binary-a", "sha256": hashlib.sha256(RUNTIME_STUB).hexdigest(), "size": len(RUNTIME_STUB)}
+        components = {"cid": "components-a", "sha256": hashlib.sha256(COMPONENTS).hexdigest(),
+                      "size": len(COMPONENTS)}
+        did, head, release = installable_fixture(release_extra={"platforms": {
+            platform: {"binary": binary, "components": components}
+            for platform in ("x86_64-linux", "aarch64-darwin")}})
+        cases = [
+            # (uname -s, uname -m, commands hidden from PATH, mktemp, TMPDIR is a symlink, hasher)
+            # Each case mocks mktemp, so the result does not depend on the
+            # host: on a Mac host the real mktemp is Apple's.
+            ("Linux", "x86_64", (), "gnu", False, "sha256sum"),
+            ("Darwin", "arm64", (), "apple", True, "sha256sum"),
+            # A Mac without sha256sum: the installer falls back to shasum -a 256.
+            ("Darwin", "arm64", ("sha256sum",), "apple", True, "shasum"),
+        ]
+        for system, machine, hidden, mktemp, tmp_link, hasher in cases:
+            with self.subTest(system=system, hasher=hasher), \
+                    InstallerSandbox(head, release, did, system, machine) as sandbox:
+                sandbox.respond("binary", RUNTIME_STUB)
+                (sandbox.root / "swap-binary").write_bytes(swapped)
+                mock_swapping_hashers(sandbox)
+                if hidden:
+                    sandbox.hide_commands(*hidden)
+                if mktemp == "apple":
+                    mock_apple_mktemp(sandbox)
+                else:
+                    mock_gnu_mktemp(sandbox)
+                if tmp_link:
+                    # macOS /tmp and /var are symlinks into /private.
+                    (sandbox.root / "tmp-link").symlink_to(sandbox.tmpdir)
+                    sandbox.tmpdir = sandbox.root / "tmp-link"
+                result, requests = sandbox.run("--install-only")
+                output = result.stdout + result.stderr
+                # The swap happened, once, to the download, right after it was hashed.
+                download = sandbox.downloads()["binary"]
+                swaps = (sandbox.root / "swaps").read_text().split() if (sandbox.root / "swaps").exists() else []
+                self.assertEqual(swaps, [hasher, download, hashlib.sha256(RUNTIME_STUB).hexdigest(),
+                                         hashlib.sha256(swapped).hexdigest()], output)
+                scratch = sandbox.root / ("darwin-user-temp" if mktemp == "apple" else "tmp")
+                self.assertEqual(Path(download).resolve().parent.parent, scratch.resolve())
+                # Then the installer refused it: it never ran, nothing was installed.
+                self.assertFalse((sandbox.root / "swapped-ran").exists(), output)
+                self.assertEqual(result.returncode, 1, output)
+                self.assertIn("The downloaded Runtime changed on this computer after its check", result.stderr)
+                artifact = "elastos-x86_64-linux" if system == "Linux" else "elastos-aarch64-darwin"
+                self.assertEqual(requests, self.REQUESTS[:2] + ["https://test.invalid/artifacts/" + artifact])
+                self.assertFalse(sandbox.binary.exists())
+                self.assertEqual(list(sandbox.binary.parent.iterdir()), [])
+                self.assertEqual(sandbox.runtime_calls(), [])
+
+    def test_staged_runtime_swapped_between_its_hash_and_its_run_is_refused(self):
+        # Another process of this user replaces the staged Runtime after its
+        # hash passed and before it runs, at its path or in place. The installer
+        # holds the staged file open; each run first checks that the held file
+        # is unchanged and that its path still names it, so nothing runs.
+        swapped = RUNTIME_STUB.replace(b"#!/bin/bash\n", b'#!/bin/bash\necho ran >> "$FIXTURES/swapped-ran"\n', 1)
+        binary = {"cid": "binary-a", "sha256": hashlib.sha256(RUNTIME_STUB).hexdigest(), "size": len(RUNTIME_STUB)}
+        components = {"cid": "components-a", "sha256": hashlib.sha256(COMPONENTS).hexdigest(),
+                      "size": len(COMPONENTS)}
+        did, head, release = installable_fixture(release_extra={"platforms": {
+            platform: {"binary": binary, "components": components}
+            for platform in ("x86_64-linux", "aarch64-darwin")}})
+        for system, machine in (("Linux", "x86_64"), ("Darwin", "arm64")):
+            for how in ("rename", "inplace"):
+                with self.subTest(system=system, swap=how), \
+                        InstallerSandbox(head, release, did, system, machine) as sandbox:
+                    sandbox.respond("binary", RUNTIME_STUB)
+                    (sandbox.root / "swap-binary").write_bytes(swapped)
+                    mock_swapping_hashers(sandbox, "staged " + how)
+                    if system == "Darwin":
+                        sandbox.hide_commands("sha256sum")
+                        mock_apple_mktemp(sandbox)
+                    result, requests = sandbox.run("--install-only")
+                    output = result.stdout + result.stderr
+                    swaps = (sandbox.root / "swaps").read_text().split() if (sandbox.root / "swaps").exists() else []
+                    self.assertEqual(swaps[2:], [hashlib.sha256(RUNTIME_STUB).hexdigest(),
+                                                 hashlib.sha256(swapped).hexdigest()], output)
+                    self.assertFalse((sandbox.root / "swapped-ran").exists(), output)
+                    self.assertRegex(swaps[1], r"/\.elastos\.install\.\w+/elastos$")
+                    self.assertEqual(sandbox.runtime_calls(), [])
+                    self.assertEqual(result.returncode, 1, output)
+                    self.assertTrue(result.stderr.endswith(
+                        "Error: The downloaded Runtime changed on this computer after its check. "
+                        "Nothing was installed. Run the installer again.\n"), result.stderr)
+                    self.assertEqual(len(requests), 3)
+                    self.assertFalse(sandbox.binary.exists())
+                    self.assertEqual(list(sandbox.binary.parent.iterdir()), [])
+
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "the kernel cannot start an open file here (macOS)")
+    def test_staged_runtime_swapped_after_its_last_check_still_runs_the_checked_bytes(self):
+        # The window between the last check and exec: where /proc/self/fd
+        # exists the installer starts the held file, not the path, so the
+        # replaced path never runs. The writer then reads the candidate path,
+        # finds bytes without the signed SHA-256 and refuses, as Runtime's
+        # writer does (installed_release.rs admit_candidate).
+        runtime = RUNTIME_STUB.replace(b"    install-release)\n", b'''    install-release)
+        if [[ "${*: -1}" != --check ]] && [[ "$(python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "${@: -4:1}")" != "$(cat "$FIXTURES/signed-sha256")" ]]; then
+            echo "Error: fixture writer refused a candidate without the signed SHA-256" >&2; exit 1
+        fi
+''', 1)
+        self.assertNotEqual(runtime, RUNTIME_STUB)
+        swapped = runtime.replace(b"#!/bin/bash\n", b'#!/bin/bash\necho ran >> "$FIXTURES/swapped-ran"\n', 1)
+        did, head, release = installable_fixture(runtime=runtime)
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", runtime)
+            (sandbox.root / "signed-sha256").write_text(hashlib.sha256(runtime).hexdigest())
+            (sandbox.root / "swap-binary").write_bytes(swapped)
+            (sandbox.root / "swap-hasher.py").write_text(SWAP_HASHER)
+            (sandbox.root / "swap-rule").write_text("staged rename")
+            # The third check is the one right before the writer installs.
+            sandbox.mock("python3", f'''#!/bin/sh
+"{sys.executable}" "$@"
+status=$?
+if [ "$status" = 0 ] && [ "$1" = - ] && [ "$2" = check ]; then
+    echo check >> "$FIXTURES/checks"
+    if [ "$(wc -l < "$FIXTURES/checks")" -eq 3 ]; then "{sys.executable}" -I "$FIXTURES/swap-hasher.py" "$FIXTURES" held "$3"; fi
+fi
+exit "$status"
+''')
+            result, _ = sandbox.run("--install-only")
+            output = result.stdout + result.stderr
+            self.assertTrue((sandbox.root / "swaps").exists(), output)
+            self.assertFalse((sandbox.root / "swapped-ran").exists(), output)
+            calls = sandbox.runtime_calls()
+            self.assertEqual([call.split()[0] for call in calls], ["--version", "install-release", "install-release"])
+            self.assertEqual(result.returncode, 1, output)
+            self.assertIn("fixture writer refused a candidate without the signed SHA-256", result.stderr)
+            self.assertIn("The previous installation was preserved", result.stderr)
+            self.assertFalse(sandbox.binary.exists())
+
+    def test_release_head_swapped_after_its_signature_check_is_refused(self):
+        # Another process replaces release-head.json right after its signature
+        # passed, with a head signed by its own key. Nothing after the check may
+        # read those new bytes, and no other key may become the publisher pin.
+        did, head, release = installable_fixture()
+        payload = json.loads(head)["payload"]
+        seed = bytes([9]) * 32
+        attacker_did = sign_envelope({}, "elastos.release.head.v1", seed=seed)["signer_did"]
+        attacker = sign_envelope(dict(payload, signer_did=attacker_did), "elastos.release.head.v1", seed=seed)
+        self.assertNotEqual(attacker["signer_did"], did)
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            (sandbox.root / "swap-head").write_bytes(encode_envelope(attacker))
+            sandbox.mock("python3", f'''#!/bin/sh
+"{sys.executable}" "$@"
+status=$?
+if [ "$status" = 0 ] && [ "$1" = - ] && [ "$3" = elastos.release.head.v1 ]; then
+    cp "$FIXTURES/swap-head" "$2"
+fi
+exit "$status"
+''')
+            result, requests = sandbox.run("--install-only")
+            candidate = sandbox.root / "candidate" / "sources.json"
+            pinned = json.loads(candidate.read_text())["sources"][0]["publisher_dids"] if candidate.exists() else None
+            self.assertEqual(result.returncode, 1, f"pinned publisher_dids={pinned}\n" + result.stdout + result.stderr)
+            self.assertIn("The release files changed on this computer after they were checked", result.stderr)
+            self.assertEqual(requests, self.REQUESTS[:1])
+            self.assertFalse(sandbox.binary.exists())
+            self.assertIsNone(pinned)
+
+    def test_publisher_pin_is_the_trust_root_not_a_second_read(self):
+        # The head is swapped after the installer's last read of it, so only the
+        # writer reads the new bytes. sources.json must still pin the maintainer
+        # DID; the writer then refuses a head signed by any other key
+        # (update.rs installer_moves_a_canary_home_to_stable_but_never_stable_to_canary).
+        did, head, release = installable_fixture()
+        payload = json.loads(head)["payload"]
+        seed = bytes([9]) * 32
+        attacker_did = sign_envelope({}, "elastos.release.head.v1", seed=seed)["signer_did"]
+        attacker = encode_envelope(sign_envelope(dict(payload, signer_did=attacker_did),
+                                                 "elastos.release.head.v1", seed=seed))
+        with InstallerSandbox(head, release, did) as sandbox:
+            sandbox.respond("binary", RUNTIME_STUB)
+            (sandbox.root / "swap-head").write_bytes(attacker)
+            # After validate_release_identity, the last check that reads both files.
+            sandbox.mock("python3", f'''#!/bin/sh
+"{sys.executable}" "$@"
+status=$?
+if [ "$status" = 0 ] && [ "$1" = - ] && [ "${{2##*/}}" = release-head.json ] && [ "${{3##*/}}" = release.json ]; then
+    cp "$FIXTURES/swap-head" "$2"
+fi
+exit "$status"
+''')
+            result, requests = sandbox.run("--install-only")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            candidate = sandbox.root / "candidate"
+            self.assertEqual((candidate / "release-head.json").read_bytes(), attacker)
+            sources = json.loads((candidate / "sources.json").read_text())
+            self.assertEqual(sources["sources"][0]["publisher_dids"], [did])
 
     def test_installer_prints_the_selected_maintainer_did_before_verification(self):
         did, head, release = installable_fixture()
@@ -1018,7 +1506,7 @@ class InstallationTests(unittest.TestCase):
         self.assertIn("Runtime installed:", result.stdout)
         self.assertNotIn("Setting up Home", result.stdout)
         calls = sandbox.runtime_calls()
-        writer = "^install-release --data-dir %s --binary %s --candidate %s/\\.elastos\\.install\\.\\w+ " \
+        writer = "^install-release --data-dir %s --binary %s --candidate %s/\\.elastos\\.install\\.\\w+/elastos " \
                  "(\\S+)/sources\\.json \\1/release-head\\.json \\1/release\\.json" % (
                      re.escape(str(sandbox.data)), re.escape(str(sandbox.binary)),
                      re.escape(str(sandbox.binary.parent)))
@@ -1524,6 +2012,83 @@ printf '%s\\n' "$PLATFORM"
             with self.subTest(system=system, machine=machine):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
+
+    def test_intel_mac_stops_before_release_lookup(self):
+        # uname says x86_64 on an Intel Mac and in a Rosetta shell. Without the
+        # kernel's word for Apple silicon, the plain stop is the answer.
+        for answers in INTEL_OR_UNPROVEN:
+            result = shell(sysctl_function(answers) + '''
+SYSTEM=Darwin MACHINE=x86_64
+uname() { case "$1" in -s) echo "$SYSTEM";; -m) echo "$MACHINE";; esac; }
+detect_platform
+printf '%s\\n' "$PLATFORM"
+''')
+            with self.subTest(sysctl=answers):
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(ANSI.sub("", result.stderr), "Error: " + INTEL_MAC_STOP + "\n")
+        main = SOURCE.split("# ── Main", 1)[1]
+        self.assertLess(main.index("detect_platform"), main.index("fetch_url"))
+        self.assertLess(main.index("detect_platform"), main.index("release-head.json"))
+
+    def test_rosetta_shell_on_apple_silicon_is_apple_silicon(self):
+        # Terminal under Rosetta reports uname -m x86_64 on an M1 or later Mac.
+        for answers in ROSETTA_ON_APPLE_SILICON:
+            result = shell(sysctl_function(answers) + '''
+uname() { case "$1" in -s) echo Darwin;; -m) echo x86_64;; esac; }
+detect_platform
+printf '%s\\n' "$PLATFORM"
+''')
+            with self.subTest(sysctl=answers):
+                self.assertEqual((result.returncode, result.stdout), (0, "aarch64-darwin\n"), result.stderr)
+        # Linux never asks sysctl, so a Linux x86_64 host stays x86_64.
+        linux = shell(sysctl_function(("1", "1")) + '''
+uname() { case "$1" in -s) echo Linux;; -m) echo x86_64;; esac; }
+detect_platform
+printf '%s\\n' "$PLATFORM"
+''')
+        self.assertEqual(linux.stdout, "x86_64-linux\n", linux.stderr)
+
+    def test_intel_mac_full_run_downloads_nothing(self):
+        # The whole installer, not only detect_platform: an Intel Mac exits 1
+        # with the stop message before any network tool runs or any file is written.
+        # The installer refuses a home under a writable parent such as /tmp.
+        SANDBOX_BASE.mkdir(parents=True, exist_ok=True)
+        for path in (SANDBOX_BASE.parent, SANDBOX_BASE):
+            path.chmod(0o755)
+        # "missing" leaves sysctl off PATH entirely.
+        system_path = [entry for entry in os.environ["PATH"].split(os.pathsep)
+                       if entry and not Path(entry, "sysctl").exists()]
+        for answers in [("0", "0"), None, "missing"]:
+            with self.subTest(sysctl=answers), \
+                    tempfile.TemporaryDirectory(prefix="installer-intel-", dir=SANDBOX_BASE) as directory:
+                root = Path(directory)
+                mocks = root / "mocks"
+                home = root / "home"
+                mocks.mkdir()
+                home.mkdir()
+                calls = root / "calls"
+                (mocks / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo x86_64;; *) echo Darwin;; esac\n')
+                if answers != "missing":
+                    (mocks / "sysctl").write_text(sysctl_mock(answers))
+                for tool in ["curl", "wget"]:
+                    (mocks / tool).write_text(f'#!/bin/sh\necho {tool} "$@" >> "$CALLS"\nexit 97\n')
+                for mock in mocks.iterdir():
+                    mock.chmod(0o755)
+                # A configured publisher, so only the platform stop can end the run
+                # before the release-head fetch.
+                env = dict(os.environ, HOME=str(home), CALLS=str(calls),
+                           ELASTOS_PUBLISHER_GATEWAY="https://publisher.invalid",
+                           ELASTOS_MAINTAINER_DID="did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+                           PATH=os.pathsep.join([str(mocks)] + system_path))
+                for name in ["ELASTOS_INSTALL_ONLY", "XDG_DATA_HOME"]:
+                    env.pop(name, None)
+                result = subprocess.run([OPTIONS.bash, "--noprofile", "--norc", str(INSTALLER.resolve())],
+                                        env=env, text=True, capture_output=True, timeout=15)
+                self.assertFalse(calls.exists(), calls.read_text() if calls.exists() else "")
+                self.assertEqual(list(home.iterdir()), [])
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "Error: " + INTEL_MAC_STOP + "\n")
 
     def test_platform_paths_match_rust_dirs5_contract(self):
         # setup.rs and sources.rs use dirs5.0.1::data_dir. Mac ignores XDG;
