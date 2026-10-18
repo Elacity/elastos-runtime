@@ -12,12 +12,23 @@
 //! record the person holds. A protected publish records the SHA-256 of the
 //! exact bytes custody read and protected. For a record written before that
 //! (a legacy record), the digest comes from custody's media preparation
-//! journal, or else from the record's own file while it is still in place;
-//! once found, it is kept in the record. A legacy record whose bytes cannot be
-//! found refuses every picture and names the file to put back.
+//! journal, or else from the record's own file, but only while that file
+//! still has the CID the record says was published
+//! (`plain_publish_cid::plain_publish_file_cid`). Once found, the digest is
+//! kept in the record. A legacy record whose bytes cannot be found, or whose
+//! file no longer matches its CID, refuses every picture and names the file
+//! to put back. A custody record has the CID of its encrypted payload, so
+//! without custody's journal its file can never prove its bytes and it is
+//! refused the same way.
+//!
+//! Protection follows exact bytes. An edited or re-encoded copy of protected
+//! content has a new digest, so it is not refused; this gap is accepted.
 //!
 //! The check reads and hashes files, so callers run it on a blocking thread,
 //! and one request does a bounded amount of work (`ProtectionCheckBudget`).
+//! The check itself writes nothing: it returns the digests it found
+//! (`DesktopBackgroundRead::found`), and the caller keeps them only while its
+//! request is still live (`keep_found_source_digests`).
 
 use std::borrow::Cow;
 use std::path::{Component, Path};
@@ -136,6 +147,21 @@ impl ProtectionCheckBudget {
     }
 }
 
+/// A protected record's source digest that a check found and that is not yet
+/// kept in the record.
+pub(crate) struct FoundSourceDigest {
+    stored: StoredPublishRecord,
+    digest: String,
+}
+
+/// What one desktop background read answers: the bytes or why they were
+/// refused, and the source digests the protection check found on the way.
+/// Nothing is written while reading; see `keep_found_source_digests`.
+pub(crate) struct DesktopBackgroundRead {
+    pub(crate) result: Result<Vec<u8>, DesktopBackgroundSourceRefusal>,
+    pub(crate) found: Vec<FoundSourceDigest>,
+}
+
 /// Reads one of `principal_id`'s own Library files for the desktop background.
 /// `max_stored_bytes` bounds the stored (encrypted) size before any read.
 /// This does blocking file I/O and hashing: call it from a blocking thread.
@@ -145,6 +171,43 @@ pub(crate) fn read_library_object_for_desktop_background(
     uri: &str,
     max_stored_bytes: u64,
     budget: ProtectionCheckBudget,
+) -> DesktopBackgroundRead {
+    let mut found = Vec::new();
+    let result = read_checked(
+        data_dir,
+        principal_id,
+        uri,
+        max_stored_bytes,
+        budget,
+        &mut found,
+    );
+    DesktopBackgroundRead { result, found }
+}
+
+/// Keeps each found digest in its record so later checks need no read. A
+/// record changed since it was read is left as it is. Call this only while
+/// the request that ran the check is still live.
+pub(crate) fn keep_found_source_digests(
+    data_dir: &Path,
+    principal_id: &str,
+    found: Vec<FoundSourceDigest>,
+) {
+    for FoundSourceDigest { stored, digest } in found {
+        if let Err(err) =
+            super::remember_publish_record_source_digest(data_dir, principal_id, &stored, &digest)
+        {
+            tracing::debug!(error = %err, "library could not keep a protected record's source digest");
+        }
+    }
+}
+
+fn read_checked(
+    data_dir: &Path,
+    principal_id: &str,
+    uri: &str,
+    max_stored_bytes: u64,
+    budget: ProtectionCheckBudget,
+    found: &mut Vec<FoundSourceDigest>,
 ) -> Result<Vec<u8>, DesktopBackgroundSourceRefusal> {
     use DesktopBackgroundSourceRefusal as Refusal;
 
@@ -194,8 +257,8 @@ pub(crate) fn read_library_object_for_desktop_background(
         &target.localhost_root,
         &target.uri,
         &bytes,
-        max_stored_bytes,
         budget,
+        found,
     )?;
     Ok(bytes)
 }
@@ -292,8 +355,8 @@ fn require_unprotected(
     localhost_root: &str,
     uri: &str,
     bytes: &[u8],
-    max_stored_bytes: u64,
     budget: ProtectionCheckBudget,
+    found: &mut Vec<FoundSourceDigest>,
 ) -> Result<(), DesktopBackgroundSourceRefusal> {
     use DesktopBackgroundSourceRefusal as Refusal;
     // The object's own record.
@@ -329,10 +392,10 @@ fn require_unprotected(
     let mut legacy = LegacyCheck {
         data_dir,
         principal_id,
-        max_stored_bytes,
         budget,
         sources_hashed: 0,
         bytes_read: 0,
+        found,
     };
     let mut not_in_place: Vec<&super::LibraryPublishRecord> = Vec::new();
     for stored in records
@@ -343,7 +406,6 @@ fn require_unprotected(
             Some(source_digest) => vec![source_digest.clone()],
             None => match legacy.source_digests(stored)? {
                 LegacySource::Digests(digests) => digests,
-                LegacySource::CannotMatch => Vec::new(),
                 LegacySource::NotInPlace => {
                     not_in_place.push(&stored.record);
                     Vec::new()
@@ -370,22 +432,22 @@ fn require_unprotected(
 enum LegacySource {
     /// The protected bytes have one of these digests.
     Digests(Vec<String>),
-    /// The source is larger than any desktop background, so it cannot match.
-    CannotMatch,
-    /// The record's file is not where the record says, and custody has no
-    /// digest for it: its bytes are unknown.
+    /// No file proves the protected bytes: the record's file is not where the
+    /// record says, or it no longer has the record's published CID, and
+    /// custody has no digest for it. Its bytes are unknown.
     NotInPlace,
 }
 
-/// Finds the protected bytes of legacy records within one request's budget,
-/// and keeps each digest found in its record, so this is done once.
+/// Finds the protected bytes of legacy records within one request's budget.
+/// Each digest found is added to `found`, for the caller to keep in its
+/// record, so this is done once.
 struct LegacyCheck<'a> {
     data_dir: &'a Path,
     principal_id: &'a str,
-    max_stored_bytes: u64,
     budget: ProtectionCheckBudget,
     sources_hashed: usize,
     bytes_read: u64,
+    found: &'a mut Vec<FoundSourceDigest>,
 }
 
 impl LegacyCheck<'_> {
@@ -403,14 +465,21 @@ impl LegacyCheck<'_> {
         // depend on where the file is now.
         if super::record_is_runtime_custody(record) {
             let digests = self.custody_source_digests(&record.object_uri)?;
+            if let [only] = digests.as_slice() {
+                self.found.push(FoundSourceDigest {
+                    stored: stored.clone(),
+                    digest: only.clone(),
+                });
+            }
             if !digests.is_empty() {
-                if let [only] = digests.as_slice() {
-                    self.remember(stored, only);
-                }
                 return Ok(LegacySource::Digests(digests));
             }
+            // A custody record's CID names its encrypted payload, so no
+            // plaintext file can match it: the file proves nothing.
+            return Ok(LegacySource::NotInPlace);
         }
-        // Otherwise the record's own file is the best evidence left.
+        // Otherwise the record's own file is the evidence left, but only
+        // while it still holds the bytes that were published.
         let Ok(source) = library_target(self.data_dir, self.principal_id, &record.object_uri)
         else {
             return Err(Refusal::ProtectionUnknown);
@@ -425,12 +494,9 @@ impl LegacyCheck<'_> {
         if !metadata.is_file() {
             return Ok(LegacySource::NotInPlace);
         }
-        // `max_stored_bytes` is the stored size a desktop background may have.
-        // The caller sets it with room for the principal-root envelope (base64
-        // plus a fixed header), so a source stored larger than it holds more
-        // bytes than a desktop background may be and cannot match.
-        if metadata.len() > self.max_stored_bytes {
-            return Ok(LegacySource::CannotMatch);
+        // A file that no request may read whole can never be checked.
+        if metadata.len() > self.budget.legacy_bytes {
+            return Ok(LegacySource::NotInPlace);
         }
         if self.sources_hashed >= self.budget.legacy_sources
             || self.bytes_read.saturating_add(metadata.len()) > self.budget.legacy_bytes
@@ -445,11 +511,22 @@ impl LegacyCheck<'_> {
             &source.localhost_root,
             &source.uri,
             &source.path,
-            self.max_stored_bytes,
+            metadata.len(),
         )
         .map_err(|_| Refusal::ProtectionUnknown)?;
+        // The file changed after it was published (or the CID is of a form
+        // this check does not compute): its bytes say nothing about the
+        // protected bytes, so nothing is kept and the check fails closed.
+        if super::plain_publish_cid::plain_publish_file_cid(&bytes).as_deref()
+            != Some(record.cid.as_str())
+        {
+            return Ok(LegacySource::NotInPlace);
+        }
         let digest = super::content_sha256_label(&bytes);
-        self.remember(stored, &digest);
+        self.found.push(FoundSourceDigest {
+            stored: stored.clone(),
+            digest: digest.clone(),
+        });
         Ok(LegacySource::Digests(vec![digest]))
     }
 
@@ -488,19 +565,6 @@ impl LegacyCheck<'_> {
             }
         }
         Ok(digests)
-    }
-
-    /// Keeps `digest` in the record so later checks need no read. A record
-    /// changed since it was read is left as it is.
-    fn remember(&self, stored: &StoredPublishRecord, digest: &str) {
-        if let Err(err) = super::remember_publish_record_source_digest(
-            self.data_dir,
-            self.principal_id,
-            stored,
-            digest,
-        ) {
-            tracing::debug!(error = %err, "library could not keep a protected record's source digest");
-        }
     }
 }
 

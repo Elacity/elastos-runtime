@@ -666,11 +666,12 @@ pub(crate) fn handle_library_download_selection_bytes_with_format(
 }
 
 mod desktop_background;
+mod plain_publish_cid;
 #[cfg(test)]
 pub(crate) use desktop_background::PROTECTION_CHECK_LEGACY_SOURCES;
 pub(crate) use desktop_background::{
-    read_library_object_for_desktop_background, DesktopBackgroundSourceRefusal,
-    ProtectionCheckBudget,
+    keep_found_source_digests, read_library_object_for_desktop_background, DesktopBackgroundRead,
+    DesktopBackgroundSourceRefusal, ProtectionCheckBudget,
 };
 
 /// Test fixture: a publish record for `object_uri` with `content_security`.
@@ -688,6 +689,22 @@ pub(crate) fn write_test_publish_record(
         content_security,
         None,
     );
+}
+
+/// Test fixture: a protected record written before records named their
+/// digest, whose CID is the one Library's plain publish gives `published`.
+#[cfg(test)]
+pub(crate) fn write_test_legacy_publish_record(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+    content_security: Value,
+    published: &[u8],
+) {
+    write_test_publish_record(data_dir, principal_id, object_uri, content_security);
+    let mut record = read_publish_record(data_dir, principal_id, object_uri).unwrap();
+    record.cid = plain_publish_cid::plain_publish_file_cid(published).unwrap();
+    write_publish_record(data_dir, principal_id, &record).unwrap();
 }
 
 /// Test probe: the source digest a publish record names, if any.
@@ -6957,6 +6974,7 @@ fn digest32_sha256_label(digest: elastos_protected_content_contracts::Digest32) 
 
 /// One publish record as stored, with the revision its bytes had when read,
 /// so a later write can replace it only if nothing changed it since.
+#[derive(Clone)]
 struct StoredPublishRecord {
     record_uri: String,
     record_path: PathBuf,

@@ -8091,30 +8091,105 @@ const HOME_BACKGROUND_IMAGE_SOURCE_READ_TIMEOUT: std::time::Duration =
 /// Library's read, under Library's scope rules: the principal's own files,
 /// never Trash, Runtime-private areas, links, or protected content. It reads
 /// and hashes files, so it runs on a blocking thread, never on this handler's.
-/// Nothing is saved from a read that did not answer in time.
+/// Nothing is saved from a check that answered after this handler gave up.
 async fn read_desktop_background_source(
     data_dir: std::path::PathBuf,
     principal_id: String,
     source_uri: String,
 ) -> Result<Vec<u8>, Response> {
+    let check = {
+        let data_dir = data_dir.clone();
+        let principal_id = principal_id.clone();
+        move || {
+            crate::library::read_library_object_for_desktop_background(
+                &data_dir,
+                &principal_id,
+                &source_uri,
+                HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES,
+                crate::library::ProtectionCheckBudget::for_request(std::time::Instant::now()),
+            )
+        }
+    };
+    read_desktop_background_source_within(
+        HOME_BACKGROUND_IMAGE_SOURCE_READ_TIMEOUT,
+        data_dir,
+        principal_id,
+        check,
+    )
+    .await
+}
+
+/// Whether the request that started a protection check still waits for it.
+/// The check's thread and the handler each move it out of `LIVE` once, in one
+/// atomic step, so a found digest is saved only if the handler had not given
+/// up first.
+#[derive(Default)]
+struct DesktopBackgroundCheckLive(std::sync::atomic::AtomicU8);
+
+impl DesktopBackgroundCheckLive {
+    const LIVE: u8 = 0;
+    const SAVING: u8 = 1;
+    const GAVE_UP: u8 = 2;
+
+    /// True when the handler still waits; from then on it cannot give up.
+    fn begin_save(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.0
+            .compare_exchange(
+                Self::LIVE,
+                Self::SAVING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn give_up(&self) {
+        use std::sync::atomic::Ordering;
+        let _ = self.0.compare_exchange(
+            Self::LIVE,
+            Self::GAVE_UP,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+/// Runs `check` on a blocking thread and waits at most `timeout`. The check
+/// writes nothing itself; the digests it found are kept only if this handler
+/// still waits when the check answers.
+pub(super) async fn read_desktop_background_source_within<F>(
+    timeout: std::time::Duration,
+    data_dir: std::path::PathBuf,
+    principal_id: String,
+    check: F,
+) -> Result<Vec<u8>, Response>
+where
+    F: FnOnce() -> crate::library::DesktopBackgroundRead + Send + 'static,
+{
     use crate::library::DesktopBackgroundSourceRefusal as Refusal;
-    let read = tokio::task::spawn_blocking(move || {
-        crate::library::read_library_object_for_desktop_background(
-            &data_dir,
-            &principal_id,
-            &source_uri,
-            HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES,
-            crate::library::ProtectionCheckBudget::for_request(std::time::Instant::now()),
-        )
+    let live = std::sync::Arc::new(DesktopBackgroundCheckLive::default());
+    let read = tokio::task::spawn_blocking({
+        let live = live.clone();
+        move || {
+            let crate::library::DesktopBackgroundRead { result, found } = check();
+            if !found.is_empty() && live.begin_save() {
+                crate::library::keep_found_source_digests(&data_dir, &principal_id, found);
+            }
+            result
+        }
     });
     let refused = |refusal: Refusal| {
         (StatusCode::BAD_REQUEST, refusal.message().into_owned()).into_response()
     };
-    match tokio::time::timeout(HOME_BACKGROUND_IMAGE_SOURCE_READ_TIMEOUT, read).await {
+    match tokio::time::timeout(timeout, read).await {
         Ok(Ok(Ok(bytes))) => Ok(bytes),
         Ok(Ok(Err(refusal))) => Err(refused(refusal)),
         Ok(Err(_)) => Err(refused(Refusal::Unreadable)),
-        Err(_) => Err(refused(Refusal::CheckUnfinished)),
+        Err(_) => {
+            live.give_up();
+            Err(refused(Refusal::CheckUnfinished))
+        }
     }
 }
 

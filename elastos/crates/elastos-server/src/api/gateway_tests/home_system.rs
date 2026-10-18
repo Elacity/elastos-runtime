@@ -5881,23 +5881,29 @@ async fn test_home_background_from_object_requires_library_capability_and_unprot
     let trash_uri = write(".Trash/old.png");
     let private_uri = write(".AppData/LocalHost/secret.png");
 
-    crate::library::write_test_publish_record(
+    // The protected records name their bytes, or (written before records
+    // did) still have the CID of their file, so they block only themselves.
+    let picture_at = |relative: &str| test_png_picture(800, 600, relative.as_bytes());
+    crate::library::write_test_publish_record_with_source(
         dir.path(),
         &admin.principal_id,
         &protected_uri,
         serde_json::json!({ "published_payload": "runtime_custody_encrypted", "key_release_required": true }),
+        Some(&picture_at("Pictures/protected.png")),
     );
-    crate::library::write_test_publish_record(
+    crate::library::write_test_legacy_publish_record(
         dir.path(),
         &admin.principal_id,
         &unknown_uri,
         serde_json::json!({ "published_payload": "a_future_protection_format" }),
+        &picture_at("Pictures/unknown-protection.png"),
     );
-    crate::library::write_test_publish_record(
+    crate::library::write_test_legacy_publish_record(
         dir.path(),
         &admin.principal_id,
         &key_release_uri,
         serde_json::json!({ "published_payload": "plain_content", "key_release_required": true }),
+        &picture_at("Pictures/key-release.png"),
     );
     crate::library::write_test_publish_record(
         dir.path(),
@@ -6077,7 +6083,8 @@ async fn test_home_background_from_object_refuses_protected_bytes_after_copy_ren
 }
 
 /// Builds a Library with one protected picture whose publish record was
-/// written before records named their digest, plus one ordinary picture.
+/// written before records named their digest, plus one ordinary picture. The
+/// record's CID is the one Library's plain publish gives the picture.
 struct LegacyProtectedLibrary {
     _dir: tempfile::TempDir,
     data_dir: std::path::PathBuf,
@@ -6112,11 +6119,12 @@ impl LegacyProtectedLibrary {
             "Pictures/other.png",
             &test_png_picture(800, 600, b"other-picture"),
         );
-        crate::library::write_test_publish_record(
+        crate::library::write_test_legacy_publish_record(
             &data_dir,
             &admin.principal_id,
             &protected_uri,
             content_security,
+            &protected_bytes,
         );
         let library_token =
             projection_launch_token_for_authority_context(&data_dir, LIBRARY_CAPSULE_ID, &admin);
@@ -6160,6 +6168,12 @@ fn legacy_custody_security() -> serde_json::Value {
     serde_json::json!({ "published_payload": "runtime_custody_encrypted", "key_release_required": false })
 }
 
+/// A protected form published through the content provider, whose CID is
+/// that of the plain bytes.
+fn legacy_key_release_security() -> serde_json::Value {
+    serde_json::json!({ "published_payload": "plain_content", "key_release_required": true })
+}
+
 fn sha256_label(bytes: &[u8]) -> String {
     use sha2::Digest as _;
     format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
@@ -6171,7 +6185,7 @@ fn sha256_label(bytes: &[u8]) -> String {
 /// still refused, while other pictures are allowed.
 #[tokio::test]
 async fn test_home_background_from_object_legacy_protected_record_is_checked_once_and_kept() {
-    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let library = LegacyProtectedLibrary::new(legacy_key_release_security());
     let root = library.root.clone();
     assert_eq!(library.recorded_digest(), None);
 
@@ -6207,7 +6221,7 @@ async fn test_home_background_from_object_legacy_protected_record_is_checked_onc
 /// move again without blocking anything.
 #[tokio::test]
 async fn test_home_background_from_object_legacy_record_not_in_place_names_the_file_and_recovers() {
-    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let library = LegacyProtectedLibrary::new(legacy_key_release_security());
     let root = library.root.clone();
     let moved_uri = library.op(serde_json::json!({
         "op": "move", "uri": library.protected_uri, "target_parent_uri": format!("{root}/Documents"),
@@ -6254,7 +6268,7 @@ async fn test_home_background_from_object_legacy_record_not_in_place_names_the_f
 /// The refusal names one file and counts the others that need the same step.
 #[tokio::test]
 async fn test_home_background_from_object_legacy_records_not_in_place_are_counted() {
-    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let library = LegacyProtectedLibrary::new(legacy_key_release_security());
     for name in ["second.png", "third.png"] {
         let uri = write_home_principal_object_bytes_for_authority(
             &library.data_dir,
@@ -6266,7 +6280,7 @@ async fn test_home_background_from_object_legacy_records_not_in_place_are_counte
             &library.data_dir,
             &library.admin.principal_id,
             &uri,
-            legacy_custody_security(),
+            legacy_key_release_security(),
         );
         library.op(serde_json::json!({ "op": "trash", "uri": uri }));
     }
@@ -6338,20 +6352,22 @@ async fn test_home_background_from_object_legacy_custody_record_uses_custody_jou
 /// message; the digests found so far are kept, so the next try goes on.
 #[tokio::test]
 async fn test_home_background_from_object_legacy_check_is_bounded() {
-    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let library = LegacyProtectedLibrary::new(legacy_key_release_security());
     for index in 0..crate::library::PROTECTION_CHECK_LEGACY_SOURCES {
         let name = format!("Pictures/legacy-{index}.png");
+        let picture = test_png_picture(800, 600, name.as_bytes());
         let uri = write_home_principal_object_bytes_for_authority(
             &library.data_dir,
             &library.admin,
             &name,
-            &test_png_picture(800, 600, name.as_bytes()),
+            &picture,
         );
-        crate::library::write_test_publish_record(
+        crate::library::write_test_legacy_publish_record(
             &library.data_dir,
             &library.admin.principal_id,
             &uri,
-            legacy_custody_security(),
+            legacy_key_release_security(),
+            &picture,
         );
     }
     // Nine legacy sources: the first request hashes eight, then stops.
@@ -6364,8 +6380,29 @@ async fn test_home_background_from_object_legacy_check_is_bounded() {
     let (status, text) = library.set(&library.other_uri).await;
     assert_eq!(status, StatusCode::OK, "second try: {text}");
 
-    // The byte limit and the deadline, on a fresh legacy record.
-    let fresh = LegacyProtectedLibrary::new(legacy_custody_security());
+    // The byte limit and the deadline, on fresh legacy records.
+    let fresh = LegacyProtectedLibrary::new(legacy_key_release_security());
+    let second = test_png_picture(800, 600, b"second-legacy");
+    let second_uri = write_home_principal_object_bytes_for_authority(
+        &fresh.data_dir,
+        &fresh.admin,
+        "Pictures/second.png",
+        &second,
+    );
+    crate::library::write_test_legacy_publish_record(
+        &fresh.data_dir,
+        &fresh.admin.principal_id,
+        &second_uri,
+        legacy_key_release_security(),
+        &second,
+    );
+    let stored_len = |uri: &str| {
+        let path =
+            elastos_common::localhost::rooted_localhost_fs_path(&fresh.data_dir, uri).unwrap();
+        std::fs::metadata(path).unwrap().len()
+    };
+    // Room for either source alone, not for both.
+    let one_source = stored_len(&fresh.protected_uri).max(stored_len(&second_uri));
     let read = |budget: crate::library::ProtectionCheckBudget| {
         crate::library::read_library_object_for_desktop_background(
             &fresh.data_dir,
@@ -6374,16 +6411,25 @@ async fn test_home_background_from_object_legacy_check_is_bounded() {
             10 * 1024 * 1024,
             budget,
         )
+        .result
     };
     let now = std::time::Instant::now();
     let full = crate::library::ProtectionCheckBudget::for_request(now);
     assert_eq!(
         read(crate::library::ProtectionCheckBudget {
-            legacy_bytes: 16,
+            legacy_bytes: one_source,
             ..full
         }),
         Err(crate::library::DesktopBackgroundSourceRefusal::CheckUnfinished)
     );
+    // A source no request may read whole can never be checked: fail closed.
+    assert!(matches!(
+        read(crate::library::ProtectionCheckBudget {
+            legacy_bytes: 16,
+            ..full
+        }),
+        Err(crate::library::DesktopBackgroundSourceRefusal::ProtectedFileNotInPlace { .. })
+    ));
     assert_eq!(
         read(crate::library::ProtectionCheckBudget {
             deadline: now,
@@ -6392,10 +6438,156 @@ async fn test_home_background_from_object_legacy_check_is_bounded() {
         Err(crate::library::DesktopBackgroundSourceRefusal::CheckUnfinished)
     );
     assert_eq!(fresh.recorded_digest(), None);
-    assert!(read(full).is_ok());
+    let in_full = crate::library::read_library_object_for_desktop_background(
+        &fresh.data_dir,
+        &fresh.admin.principal_id,
+        &fresh.other_uri,
+        10 * 1024 * 1024,
+        full,
+    );
+    assert!(in_full.result.is_ok());
+    assert_eq!(
+        fresh.recorded_digest(),
+        None,
+        "the check itself writes nothing"
+    );
+    crate::library::keep_found_source_digests(
+        &fresh.data_dir,
+        &fresh.admin.principal_id,
+        in_full.found,
+    );
     assert_eq!(
         fresh.recorded_digest(),
         Some(sha256_label(&fresh.protected_bytes))
+    );
+}
+
+/// A legacy record whose file was changed after it was published: the file
+/// no longer has the record's CID, so its bytes say nothing about the
+/// protected bytes. Nothing is kept, and every picture is refused with the
+/// recovery message, including a copy of the original protected bytes.
+#[tokio::test]
+async fn test_home_background_from_object_legacy_record_changed_after_publish_keeps_nothing() {
+    let library = LegacyProtectedLibrary::new(legacy_key_release_security());
+    let root = library.root.clone();
+    let copy_uri = library.op(serde_json::json!({
+        "op": "copy", "uri": library.protected_uri, "target_parent_uri": format!("{root}/Documents"),
+    }));
+    // The published file is changed in place.
+    write_home_principal_object_bytes_for_authority(
+        &library.data_dir,
+        &library.admin,
+        "Pictures/legacy.png",
+        &test_png_picture(800, 600, b"changed-after-publish"),
+    );
+    let recovery = "Library cannot check your protected file \"legacy.png\" because it is not in \"Pictures\". \
+         Move it back to \"Pictures\", then try again. \
+         Or upload the picture in System > Background > Choose image.";
+
+    let (status, text) = library.set(&copy_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "copy: {text}");
+    assert_eq!(text, recovery, "copy");
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "other: {text}");
+    assert_eq!(text, recovery, "other");
+    assert_eq!(library.recorded_digest(), None, "no hash is saved");
+
+    // Putting the published bytes back lets the check finish.
+    write_home_principal_object_bytes_for_authority(
+        &library.data_dir,
+        &library.admin,
+        "Pictures/legacy.png",
+        &library.protected_bytes,
+    );
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::OK, "restored: {text}");
+    let (status, text) = library.set(&copy_uri).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "copy after restore: {text}"
+    );
+    assert!(text.contains("protected content cannot be"), "{text}");
+}
+
+/// A legacy custody record names the CID of its encrypted payload, so without
+/// custody's journal its file cannot prove which bytes were protected, even
+/// unchanged and in place. Nothing is kept and every picture is refused.
+#[tokio::test]
+async fn test_home_background_from_object_legacy_custody_record_without_journal_fails_closed() {
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(
+        text.starts_with("Library cannot check your protected file \"legacy.png\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("Or upload the picture in System > Background > Choose image."),
+        "{text}"
+    );
+    assert_eq!(library.recorded_digest(), None);
+}
+
+/// A check that answers after the handler gave up (its timeout passed) saves
+/// nothing, even though it found the digest. The same check answering in time
+/// keeps it.
+#[test]
+fn test_home_background_from_object_check_answering_late_saves_nothing() {
+    use std::time::Duration;
+    let runtime = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let first = runtime();
+    let library =
+        first.block_on(async { LegacyProtectedLibrary::new(legacy_key_release_security()) });
+    let check = |delay: Duration| {
+        let data_dir = library.data_dir.clone();
+        let principal_id = library.admin.principal_id.clone();
+        let uri = library.other_uri.clone();
+        move || {
+            std::thread::sleep(delay);
+            crate::library::read_library_object_for_desktop_background(
+                &data_dir,
+                &principal_id,
+                &uri,
+                10 * 1024 * 1024,
+                crate::library::ProtectionCheckBudget::for_request(std::time::Instant::now()),
+            )
+        }
+    };
+    let late = first.block_on(read_desktop_background_source_within(
+        Duration::from_millis(20),
+        library.data_dir.clone(),
+        library.admin.principal_id.clone(),
+        check(Duration::from_millis(400)),
+    ));
+    let response = late.expect_err("the handler gave up");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Shutting the runtime down waits for the slow check to finish.
+    first.shutdown_timeout(Duration::from_secs(30));
+    assert_eq!(
+        library.recorded_digest(),
+        None,
+        "a check that answered after the timeout saved a hash"
+    );
+
+    let second = runtime();
+    let in_time = second.block_on(read_desktop_background_source_within(
+        Duration::from_secs(15),
+        library.data_dir.clone(),
+        library.admin.principal_id.clone(),
+        check(Duration::ZERO),
+    ));
+    assert!(in_time.is_ok());
+    second.shutdown_timeout(Duration::from_secs(30));
+    assert_eq!(
+        library.recorded_digest(),
+        Some(sha256_label(&library.protected_bytes))
     );
 }
 
