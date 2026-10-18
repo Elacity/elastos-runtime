@@ -28,6 +28,7 @@
             <p id="conversation-detail">Opening Community</p>
           </div>
         </div>
+        <span id="community-presence-hidden" class="detail community-presence-hidden" title="Change it in System → Community" hidden>Hidden from members</span>
         <button id="participant-toggle" type="button" class="secondary participant-toggle" aria-expanded="false">People</button>
       </header>
       <section class="conversation-surface">
@@ -45,6 +46,7 @@
         <p id="community-status" class="detail" role="status" hidden>Community unreachable</p>
         <p id="error-text" class="error" hidden></p>
         <button id="reconnect-button" type="button" class="secondary reconnect" hidden>Reconnect</button>
+        <button id="community-presence-request" type="button" class="secondary community-presence-request" hidden>Show me in Community</button>
         <ol id="message-list" class="messages"></ol>
         <form id="composer-form" class="composer">
           <button id="attach-button" type="button" class="composer-icon" aria-label="Attach" title="Attach" hidden disabled>
