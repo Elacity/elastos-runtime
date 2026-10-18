@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::{Session, SessionType};
+use crate::capability::{CapabilityManager, PendingRequestStore};
 use crate::primitives::audit::AuditLog;
 use crate::primitives::time::SecureTimestamp;
 
@@ -23,6 +24,10 @@ pub struct SessionRegistry {
 
     /// Audit log for session events
     audit_log: Arc<AuditLog>,
+
+    /// Capability ownership is present for Runtime session APIs. A gateway
+    /// control registry without capability APIs needs only session validation.
+    capabilities: Option<(Arc<CapabilityManager>, Arc<PendingRequestStore>)>,
 }
 
 impl SessionRegistry {
@@ -33,6 +38,34 @@ impl SessionRegistry {
             vm_sessions: RwLock::new(HashMap::new()),
             default_owner: RwLock::new(None),
             audit_log,
+            capabilities: None,
+        }
+    }
+
+    /// Build one lifecycle owner for authenticated sessions and their grants.
+    /// Returning the bound pending store keeps server wiring on this owner.
+    pub fn with_capabilities(
+        audit_log: Arc<AuditLog>,
+        manager: Arc<CapabilityManager>,
+    ) -> (Self, Arc<PendingRequestStore>) {
+        let pending = Arc::new(PendingRequestStore::with_session_lifecycle(
+            audit_log.clone(),
+        ));
+        let mut registry = Self::new(audit_log);
+        registry.capabilities = Some((manager, pending.clone()));
+        (registry, pending)
+    }
+
+    async fn session_is_active(&self, session: &Session) -> bool {
+        match &self.capabilities {
+            Some((_, pending)) => pending.session_is_active(session.id.as_str()).await,
+            None => true,
+        }
+    }
+
+    async fn retire_capabilities(&self, session: &Session) {
+        if let Some((manager, pending)) = &self.capabilities {
+            pending.retire_session(manager, session.id.as_str()).await;
         }
     }
 
@@ -59,6 +92,11 @@ impl SessionRegistry {
         // Store session
         {
             let mut sessions = self.sessions.write().await;
+            if let Some((_, pending)) = &self.capabilities {
+                pending.register_session(session.id.as_str()).await;
+            }
+            // Registration and publication have no intervening await. A
+            // canceled creation cannot leave an unowned active scope.
             sessions.insert(session.token.clone(), session.clone());
         }
 
@@ -83,7 +121,10 @@ impl SessionRegistry {
     /// Validate a bearer token and return the session if valid
     pub async fn validate_token(&self, token: &str) -> Option<Session> {
         let sessions = self.sessions.read().await;
-        sessions.get(token).cloned()
+        let session = sessions.get(token)?;
+        self.session_is_active(session)
+            .await
+            .then(|| session.clone())
     }
 
     /// Get a session by token (mutable access for updates)
@@ -92,43 +133,106 @@ impl SessionRegistry {
         F: FnOnce(&mut Session) -> R,
     {
         let mut sessions = self.sessions.write().await;
-        sessions.get_mut(token).map(f)
+        let session = sessions.get_mut(token)?;
+        self.session_is_active(session).await.then(|| f(session))
     }
 
     /// Update last activity for a session
     pub async fn touch_session(&self, token: &str) {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(token) {
-            session.touch();
+            if self.session_is_active(session).await {
+                session.touch();
+            }
         }
     }
 
     /// Check if a token belongs to a shell session
     pub async fn is_shell(&self, token: &str) -> bool {
-        let sessions = self.sessions.read().await;
-        sessions.get(token).map(|s| s.is_shell()).unwrap_or(false)
+        self.validate_token(token)
+            .await
+            .is_some_and(|s| s.is_shell())
     }
 
     /// Invalidate a session by token
     pub async fn invalidate_session(&self, token: &str) -> Option<Session> {
+        self.invalidate_session_with_reason(token, "invalidated".to_string(), None)
+            .await
+    }
+
+    async fn invalidate_session_with_reason(
+        &self,
+        token: &str,
+        reason: String,
+        max_idle_secs: Option<u64>,
+    ) -> Option<Session> {
+        self.invalidate_session_with_retirement(
+            token,
+            reason,
+            max_idle_secs,
+            |session| async move {
+                self.retire_capabilities(&session).await;
+            },
+        )
+        .await
+    }
+
+    async fn invalidate_session_with_retirement<F, Fut>(
+        &self,
+        token: &str,
+        reason: String,
+        max_idle_secs: Option<u64>,
+        retire: F,
+    ) -> Option<Session>
+    where
+        F: FnOnce(Session) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let session = {
+            let sessions = self.sessions.write().await;
+            let session = sessions.get(token)?;
+            if let Some(max_idle_secs) = max_idle_secs {
+                let idle_secs = SecureTimestamp::now()
+                    .unix_secs
+                    .saturating_sub(session.last_active.unix_secs);
+                if idle_secs <= max_idle_secs && self.session_is_active(session).await {
+                    return None;
+                }
+            }
+            if let Some((_, pending)) = &self.capabilities {
+                pending.deactivate_session(session.id.as_str()).await;
+            }
+            session.clone()
+        };
+
+        // Deactivation is serialized with touch/creation; revocation needs no
+        // registry or pending-state guard. Cancellation leaves the inactive
+        // entry for cleanup to retry without blocking unrelated sessions.
+        retire(session).await;
+        let session = {
+            // Acquire both guards before removing the retry owner. Session
+            // and matching VM mapping removal then have no cancellation gap.
             let mut sessions = self.sessions.write().await;
-            sessions.remove(token)
+            let mut vm_sessions = self.vm_sessions.write().await;
+            let session = sessions.remove(token);
+            if let Some(vm_id) = session.as_ref().and_then(|session| session.vm_id.as_ref()) {
+                if vm_sessions
+                    .get(vm_id)
+                    .is_some_and(|current| current == token)
+                {
+                    vm_sessions.remove(vm_id);
+                }
+            }
+            session
         };
 
         if let Some(ref session) = session {
-            // Remove VM mapping if exists
-            if let Some(ref vm_id) = session.vm_id {
-                let mut vm_sessions = self.vm_sessions.write().await;
-                vm_sessions.remove(vm_id);
-            }
-
             // Audit
             self.audit_log
                 .emit(crate::primitives::audit::AuditEvent::SessionDestroyed {
                     timestamp: SecureTimestamp::now(),
                     session_id: session.id.to_string(),
-                    reason: "invalidated".to_string(),
+                    reason,
                 });
         }
 
@@ -143,28 +247,8 @@ impl SessionRegistry {
         };
 
         if let Some(token) = token {
-            let session = {
-                let mut sessions = self.sessions.write().await;
-                sessions.remove(&token)
-            };
-
-            // Remove VM mapping
-            {
-                let mut vm_sessions = self.vm_sessions.write().await;
-                vm_sessions.remove(vm_id);
-            }
-
-            if let Some(ref session) = session {
-                // Audit
-                self.audit_log
-                    .emit(crate::primitives::audit::AuditEvent::SessionDestroyed {
-                        timestamp: SecureTimestamp::now(),
-                        session_id: session.id.to_string(),
-                        reason: format!("vm_terminated:{}", vm_id),
-                    });
-            }
-
-            session
+            self.invalidate_session_with_reason(&token, format!("vm_terminated:{}", vm_id), None)
+                .await
         } else {
             None
         }
@@ -173,72 +257,53 @@ impl SessionRegistry {
     /// Get all active sessions (for debugging/admin)
     pub async fn list_sessions(&self) -> Vec<Session> {
         let sessions = self.sessions.read().await;
-        sessions.values().cloned().collect()
+        let mut active = Vec::new();
+        for session in sessions.values() {
+            if self.session_is_active(session).await {
+                active.push(session.clone());
+            }
+        }
+        active
     }
 
     /// Get session count
     pub async fn session_count(&self) -> usize {
-        let sessions = self.sessions.read().await;
-        sessions.len()
+        self.list_sessions().await.len()
     }
 
     /// Check if a VM has an active session
     pub async fn has_vm_session(&self, vm_id: &str) -> bool {
-        let vm_sessions = self.vm_sessions.read().await;
-        vm_sessions.contains_key(vm_id)
+        self.get_vm_token(vm_id).await.is_some()
     }
 
     /// Get session token for a VM
     pub async fn get_vm_token(&self, vm_id: &str) -> Option<String> {
-        let vm_sessions = self.vm_sessions.read().await;
-        vm_sessions.get(vm_id).cloned()
+        let token = self.vm_sessions.read().await.get(vm_id).cloned()?;
+        self.validate_token(&token).await.map(|_| token)
     }
 
     /// Cleanup stale sessions (called periodically)
     ///
     /// Removes sessions that haven't been active for the specified duration
     pub async fn cleanup_stale_sessions(&self, max_idle_secs: u64) -> usize {
-        let now = SecureTimestamp::now();
-        let mut removed = Vec::new();
-
-        {
-            let mut sessions = self.sessions.write().await;
-            sessions.retain(|token, session| {
-                let idle_secs = now.unix_secs.saturating_sub(session.last_active.unix_secs);
-                if idle_secs > max_idle_secs {
-                    removed.push((token.clone(), session.clone()));
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-
-        // Remove VM mappings and audit
-        for (token, session) in &removed {
-            if let Some(ref vm_id) = session.vm_id {
-                let mut vm_sessions = self.vm_sessions.write().await;
-                vm_sessions.remove(vm_id);
+        let tokens: Vec<_> = self.sessions.read().await.keys().cloned().collect();
+        let mut removed = 0;
+        for token in tokens {
+            // The helper rechecks activity while holding the writer, then
+            // retries inactive sessions regardless of their last-active time.
+            if self
+                .invalidate_session_with_reason(
+                    &token,
+                    "stale_cleanup".to_string(),
+                    Some(max_idle_secs),
+                )
+                .await
+                .is_some()
+            {
+                removed += 1;
             }
-
-            self.audit_log
-                .emit(crate::primitives::audit::AuditEvent::SessionDestroyed {
-                    timestamp: SecureTimestamp::now(),
-                    session_id: session.id.to_string(),
-                    reason: format!(
-                        "stale_cleanup:idle_{}s",
-                        now.unix_secs.saturating_sub(session.last_active.unix_secs)
-                    ),
-                });
-
-            tracing::info!(
-                session_id = %session.id,
-                token = %token[..8.min(token.len())],
-                "Cleaned up stale session"
-            );
         }
-
-        removed.len()
+        removed
     }
 
     /// Check if sessions exist for a list of VM IDs and remove dead ones
@@ -256,8 +321,12 @@ impl SessionRegistry {
         };
 
         let mut count = 0;
-        for (vm_id, _) in vm_tokens {
-            if self.invalidate_vm_session(&vm_id).await.is_some() {
+        for (vm_id, token) in vm_tokens {
+            if self
+                .invalidate_session_with_reason(&token, format!("vm_terminated:{vm_id}"), None)
+                .await
+                .is_some()
+            {
                 count += 1;
             }
         }
@@ -272,6 +341,93 @@ mod tests {
 
     fn create_test_registry() -> SessionRegistry {
         SessionRegistry::new(Arc::new(AuditLog::new()))
+    }
+
+    #[tokio::test]
+    async fn test_canceled_registry_retirement_keeps_retry_owner_and_other_sessions_responsive() {
+        use crate::capability::{
+            Action, CapabilityStore, GrantDuration, ResourceId, TokenConstraints,
+        };
+        use crate::primitives::metrics::MetricsManager;
+        use std::future::Future as _;
+        use std::task::{Context, Waker};
+
+        let audit = Arc::new(AuditLog::new());
+        let manager = Arc::new(CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            audit.clone(),
+            Arc::new(MetricsManager::new()),
+        ));
+        let (registry, pending) = SessionRegistry::with_capabilities(audit, manager.clone());
+        let ended = registry
+            .create_session(SessionType::Capsule, Some("reused-vm".to_string()))
+            .await;
+        let request = pending
+            .admit_request(
+                &manager,
+                ended.id.clone(),
+                ResourceId::new("localhost://Users/self/Documents/test"),
+                Action::Read,
+                String::new(),
+            )
+            .await;
+        let token = manager.grant(
+            ended.id.as_str(),
+            request.resource.clone(),
+            request.action,
+            TokenConstraints::default(),
+            None,
+        );
+        pending
+            .grant_request(request.id.as_str(), token.clone(), GrantDuration::Session)
+            .await
+            .unwrap();
+
+        let mut retirement = Box::pin(tokio::task::unconstrained(
+            registry.invalidate_session_with_retirement(
+                &ended.token,
+                "test paused retirement".to_string(),
+                None,
+                |_| std::future::pending::<()>(),
+            ),
+        ));
+        assert!(retirement
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        // The real registry path releases its writer before async revocation.
+        assert!(
+            registry.sessions.try_read().is_ok(),
+            "revocation must release the registry writer"
+        );
+        let replacement = registry
+            .create_session(SessionType::Capsule, Some("reused-vm".to_string()))
+            .await;
+        assert!(registry.validate_token(&replacement.token).await.is_some());
+        assert!(registry.validate_token(&ended.token).await.is_none());
+        drop(retirement);
+        assert!(
+            registry.sessions.read().await.contains_key(&ended.token),
+            "canceled retirement must retain its retry owner"
+        );
+        assert!(pending.get_request(request.id.as_str()).await.is_some());
+        assert_eq!(registry.cleanup_stale_sessions(u64::MAX).await, 1);
+        assert!(manager
+            .validate(
+                &token,
+                ended.id.as_str(),
+                request.action,
+                &request.resource,
+                None
+            )
+            .await
+            .is_err());
+        assert!(pending.get_request(request.id.as_str()).await.is_none());
+        assert!(!registry.sessions.read().await.contains_key(&ended.token));
+        assert_eq!(
+            registry.get_vm_token("reused-vm").await,
+            Some(replacement.token)
+        );
     }
 
     #[tokio::test]

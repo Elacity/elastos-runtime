@@ -2,7 +2,7 @@
 //!
 //! Tracks capability requests that are awaiting user approval (grant/deny).
 //! Requests have a timeout and are cleaned up periodically.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -23,6 +23,20 @@ pub const MAX_PENDING_REQUESTS: usize = 1024;
 /// Maximum outstanding requests and retained live grants per session.
 /// A session keeps its live grant records within its own bounded share.
 pub const MAX_PENDING_PER_SESSION: usize = 32;
+
+/// Runtime-owned request scope. Session scopes end with their authenticated
+/// connection; Component Bus scopes retain their existing capsule ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RequestScope {
+    Session(SessionId),
+    Capsule(String),
+}
+
+impl From<SessionId> for RequestScope {
+    fn from(session: SessionId) -> Self {
+        Self::Session(session)
+    }
+}
 
 /// Unique identifier for a pending request
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -112,6 +126,9 @@ pub struct PendingCapabilityRequest {
     /// Session that made the request
     pub session_id: SessionId,
 
+    /// Only authenticated Session scopes participate in registry retirement.
+    scope: RequestScope,
+
     /// Requested resource
     pub resource: ResourceId,
 
@@ -154,6 +171,7 @@ impl PendingCapabilityRequest {
 
         Self {
             id: RequestId::new(),
+            scope: RequestScope::Session(session_id.clone()),
             session_id,
             resource,
             action,
@@ -198,12 +216,21 @@ struct PendingRequestState {
     /// Requests and their index change together under the store's lock.
     requests: HashMap<String, PendingCapabilityRequest>,
     /// Index from session ID to request IDs (for listing)
-    session_requests: HashMap<String, Vec<String>>,
+    session_requests: HashMap<RequestScope, Vec<String>>,
+    /// Present only when this store belongs to a capability-enabled registry.
+    /// Ended IDs leave this set instead of accumulating as tombstones.
+    active_sessions: Option<HashSet<String>>,
 }
 
 impl PendingRequestState {
-    fn session_admission_count(&self, session_id: &str, now: &SecureTimestamp) -> usize {
-        self.session_requests.get(session_id).map_or(0, |ids| {
+    fn session_is_active(&self, session_id: &str) -> bool {
+        self.active_sessions
+            .as_ref()
+            .is_none_or(|active| active.contains(session_id))
+    }
+
+    fn session_admission_count(&self, scope: &RequestScope, now: &SecureTimestamp) -> usize {
+        self.session_requests.get(scope).map_or(0, |ids| {
             ids.iter()
                 .filter(|id| {
                     self.requests
@@ -286,6 +313,76 @@ impl PendingRequestStore {
         }
     }
 
+    pub(crate) fn with_session_lifecycle(audit_log: Arc<AuditLog>) -> Self {
+        Self {
+            state: RwLock::new(PendingRequestState {
+                active_sessions: Some(HashSet::new()),
+                ..PendingRequestState::default()
+            }),
+            audit_log,
+            timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        }
+    }
+
+    pub(crate) async fn register_session(&self, session_id: &str) {
+        let mut state = self.state.write().await;
+        if let Some(active) = &mut state.active_sessions {
+            active.insert(session_id.to_string());
+        }
+    }
+
+    pub(crate) async fn session_is_active(&self, session_id: &str) -> bool {
+        self.state.read().await.session_is_active(session_id)
+    }
+
+    pub(crate) async fn deactivate_session(&self, session_id: &str) {
+        let mut state = self.state.write().await;
+        if let Some(active) = &mut state.active_sessions {
+            active.remove(session_id);
+        }
+    }
+
+    pub(crate) async fn retire_session(&self, manager: &CapabilityManager, session_id: &str) {
+        self.retire_session_with(session_id, |token_id| async move {
+            manager.revoke(token_id, "Session ended").await;
+        })
+        .await;
+    }
+
+    async fn retire_session_with<F, Fut>(&self, session_id: &str, mut revoke: F)
+    where
+        F: FnMut(super::token::TokenId) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let tokens = {
+            let mut state = self.state.write().await;
+            if let Some(active) = &mut state.active_sessions {
+                active.remove(session_id);
+            }
+            state
+                .requests
+                .values()
+                .filter(|request| {
+                    matches!(&request.scope, RequestScope::Session(id) if id.as_str() == session_id)
+                })
+                .filter_map(|request| request.granted_token().map(|token| *token.id()))
+                .collect::<Vec<_>>()
+        };
+
+        // Inactive scopes cannot acquire new requests or grants. Retain their
+        // records until revocation finishes so cancellation can be retried.
+        // The registry retains its inactive session entry until this completes.
+        for token_id in tokens {
+            revoke(token_id).await;
+        }
+
+        let mut state = self.state.write().await;
+        state.requests.retain(|_, request| {
+            !(matches!(&request.scope, RequestScope::Session(id) if id.as_str() == session_id))
+        });
+        state.prune_session_index();
+    }
+
     /// Shared audit sink used by Runtime-owned bridge adapters.
     pub fn audit_log(&self) -> Arc<AuditLog> {
         self.audit_log.clone()
@@ -308,14 +405,15 @@ impl PendingRequestStore {
     pub async fn admit_request(
         &self,
         capability_manager: &CapabilityManager,
-        session_id: SessionId,
+        scope: impl Into<RequestScope>,
         resource: ResourceId,
         action: Action,
         reason: String,
     ) -> PendingCapabilityRequest {
-        self.cleanup_retired_grants_at_capacity(capability_manager, Some(session_id.as_str()))
+        let scope = scope.into();
+        self.cleanup_retired_grants_at_capacity(capability_manager, Some(&scope))
             .await;
-        self.create_request_with_reason(session_id, resource, action, reason)
+        self.create_request_with_reason(scope, resource, action, reason)
             .await
     }
 
@@ -326,31 +424,39 @@ impl PendingRequestStore {
         resource: ResourceId,
         action: Action,
     ) -> PendingCapabilityRequest {
-        self.create_request_with_reason(session_id, resource, action, String::new())
+        self.create_request_with_reason(session_id.into(), resource, action, String::new())
             .await
     }
 
     async fn create_request_with_reason(
         &self,
-        session_id: SessionId,
+        scope: RequestScope,
         resource: ResourceId,
         action: Action,
         reason: String,
     ) -> PendingCapabilityRequest {
+        let session_id = match &scope {
+            RequestScope::Session(session_id) => session_id.clone(),
+            RequestScope::Capsule(capsule_id) => SessionId(capsule_id.clone()),
+        };
         // Admission, cleanup, and both index updates are one state transition.
         let mut state = self.state.write().await;
         let now = SecureTimestamp::now();
         if state.requests.len() >= MAX_PENDING_REQUESTS
-            || state.session_admission_count(session_id.as_str(), &now) >= MAX_PENDING_PER_SESSION
+            || state.session_admission_count(&scope, &now) >= MAX_PENDING_PER_SESSION
         {
             state.cleanup_expired(&now);
             state.cleanup_old(&now, 0);
         }
 
-        let denial = if state.requests.len() >= MAX_PENDING_REQUESTS {
+        let denial = if matches!(scope, RequestScope::Session(_))
+            && !state.session_is_active(session_id.as_str())
+        {
+            Some("Session has ended")
+        } else if state.requests.len() >= MAX_PENDING_REQUESTS {
             Some("Too many pending requests")
         } else {
-            (state.session_admission_count(session_id.as_str(), &now) >= MAX_PENDING_PER_SESSION)
+            (state.session_admission_count(&scope, &now) >= MAX_PENDING_PER_SESSION)
                 .then_some("Too many outstanding requests or grants for this session")
         };
 
@@ -361,6 +467,7 @@ impl PendingRequestStore {
             reason,
             self.timeout_secs,
         );
+        request.scope = scope.clone();
         if let Some(reason) = denial {
             request.status = RequestStatus::Denied {
                 reason: reason.to_string(),
@@ -375,7 +482,7 @@ impl PendingRequestStore {
         state.requests.insert(request.id.0.clone(), request.clone());
         state
             .session_requests
-            .entry(session_id.0.clone())
+            .entry(scope)
             .or_default()
             .push(request.id.0.clone());
         drop(state);
@@ -407,6 +514,16 @@ impl PendingRequestStore {
         duration: GrantDuration,
     ) -> Result<(), String> {
         let mut state = self.state.write().await;
+
+        let request = state
+            .requests
+            .get(request_id)
+            .ok_or_else(|| format!("Request not found: {}", request_id))?;
+        if matches!(request.scope, RequestScope::Session(_))
+            && !state.session_is_active(request.session_id.as_str())
+        {
+            return Err("Session has ended".to_string());
+        }
 
         let request = state
             .requests
@@ -478,7 +595,7 @@ impl PendingRequestStore {
 
         state
             .session_requests
-            .get(session_id)
+            .get(&RequestScope::Session(SessionId::from_string(session_id)))
             .map(|ids| {
                 ids.iter()
                     .filter_map(|id| state.requests.get(id))
@@ -510,9 +627,9 @@ impl PendingRequestStore {
     async fn cleanup_retired_grants_at_capacity(
         &self,
         capability_manager: &CapabilityManager,
-        session_id: Option<&str>,
+        scope: Option<&RequestScope>,
     ) -> usize {
-        self.reclaim_retired_grants_with(session_id, |token| async move {
+        self.reclaim_retired_grants_with(scope, |token| async move {
             capability_manager.is_revoked_or_exhausted(&token).await
         })
         .await
@@ -520,7 +637,7 @@ impl PendingRequestStore {
 
     async fn reclaim_retired_grants_with<F, Fut>(
         &self,
-        session_id: Option<&str>,
+        scope: Option<&RequestScope>,
         mut is_retired: F,
     ) -> usize
     where
@@ -530,8 +647,8 @@ impl PendingRequestStore {
         let candidates = {
             let state = self.state.read().await;
             let global_pressure = state.requests.len() >= MAX_PENDING_REQUESTS;
-            let session_pressure = session_id.is_some_and(|session_id| {
-                state.session_admission_count(session_id, &SecureTimestamp::now())
+            let session_pressure = scope.is_some_and(|scope| {
+                state.session_admission_count(scope, &SecureTimestamp::now())
                     >= MAX_PENDING_PER_SESSION
             });
             if !global_pressure && !session_pressure {
@@ -540,9 +657,7 @@ impl PendingRequestStore {
             state
                 .requests
                 .iter()
-                .filter(|(_, request)| {
-                    global_pressure || Some(request.session_id.as_str()) == session_id
-                })
+                .filter(|(_, request)| global_pressure || Some(&request.scope) == scope)
                 .filter_map(|(id, request)| match &request.status {
                     RequestStatus::Granted { token, duration } => {
                         Some((id.clone(), token.as_ref().clone(), *duration))
@@ -592,7 +707,7 @@ impl PendingRequestStore {
         let state = self.state.read().await;
         state
             .session_requests
-            .get(session_id)
+            .get(&RequestScope::Session(SessionId::from_string(session_id)))
             .into_iter()
             .flatten()
             .filter_map(|id| state.requests.get(id))
@@ -626,16 +741,19 @@ impl PendingRequestStore {
         }
     }
 
-    /// Mark all granted requests as revoked
+    /// Mark grants from epochs older than the persisted revocation epoch revoked.
     ///
     /// Called when epoch is advanced to revoke all capabilities
-    pub async fn revoke_all_granted(&self) {
+    pub async fn revoke_all_granted_before_epoch(&self, new_epoch: u64) {
         let mut state = self.state.write().await;
         let now = SecureTimestamp::now();
         let mut events = Vec::new();
 
         for (request_id, request) in state.requests.iter_mut() {
-            if request.is_granted() {
+            if request
+                .granted_token()
+                .is_some_and(|token| token.constraints().epoch() < new_epoch)
+            {
                 request.status = RequestStatus::Denied {
                     reason: "Epoch advanced - all capabilities revoked".to_string(),
                 };
@@ -658,6 +776,377 @@ impl PendingRequestStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability::{CapabilityStore, TokenConstraints};
+    use crate::primitives::metrics::MetricsManager;
+    use crate::session::{SessionRegistry, SessionType};
+
+    fn lifecycle_store() -> (
+        SessionRegistry,
+        Arc<PendingRequestStore>,
+        Arc<CapabilityManager>,
+    ) {
+        let audit = Arc::new(AuditLog::new());
+        let manager = Arc::new(CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            audit.clone(),
+            Arc::new(MetricsManager::new()),
+        ));
+        let (registry, pending) = SessionRegistry::with_capabilities(audit, manager.clone());
+        (registry, pending, manager)
+    }
+
+    async fn lifecycle_grant(
+        pending: &PendingRequestStore,
+        manager: &CapabilityManager,
+        scope: impl Into<RequestScope>,
+    ) -> (PendingCapabilityRequest, CapabilityToken) {
+        let request = pending
+            .admit_request(
+                manager,
+                scope,
+                ResourceId::new("localhost://Users/self/Documents/lifecycle"),
+                Action::Read,
+                "session lifecycle".to_string(),
+            )
+            .await;
+        assert!(request.is_pending());
+        let token = manager.grant(
+            request.session_id.as_str(),
+            request.resource.clone(),
+            request.action,
+            TokenConstraints::default(),
+            None,
+        );
+        pending
+            .grant_request(request.id.as_str(), token.clone(), GrantDuration::Session)
+            .await
+            .unwrap();
+        (request, token)
+    }
+
+    #[tokio::test]
+    async fn test_ended_sessions_release_full_global_grant_capacity() {
+        let (registry, pending, manager) = lifecycle_store();
+        let mut grants = Vec::new();
+        for _ in 0..MAX_PENDING_REQUESTS / MAX_PENDING_PER_SESSION {
+            let session = registry.create_session(SessionType::Capsule, None).await;
+            for _ in 0..MAX_PENDING_PER_SESSION {
+                grants.push(lifecycle_grant(&pending, &manager, session.id.clone()).await);
+            }
+            registry
+                .get_session_mut(&session.token, |session| {
+                    session.last_active = SecureTimestamp::at(0);
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(grants.len(), 32 * 32);
+        assert_eq!(
+            pending.state.read().await.requests.len(),
+            MAX_PENDING_REQUESTS
+        );
+        let fresh = registry.create_session(SessionType::Capsule, None).await;
+        assert!(request_for(&pending, fresh.id.as_str()).await.is_denied());
+
+        assert_eq!(registry.cleanup_stale_sessions(600).await, 32);
+        let admitted = pending
+            .admit_request(
+                &manager,
+                fresh.id.clone(),
+                ResourceId::new("localhost://Users/self/Documents/fresh"),
+                Action::Read,
+                String::new(),
+            )
+            .await;
+        assert!(
+            admitted.is_pending(),
+            "ended sessions must release global grant capacity"
+        );
+        for (request, token) in grants {
+            assert!(pending.get_request(request.id.as_str()).await.is_none());
+            assert!(manager
+                .validate(
+                    &token,
+                    request.session_id.as_str(),
+                    request.action,
+                    &request.resource,
+                    None
+                )
+                .await
+                .is_err());
+        }
+        let state = pending.state.read().await;
+        assert_eq!(state.requests.len(), 1);
+        assert_eq!(state.session_requests.len(), 1);
+        assert_eq!(state.active_sessions.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            state.session_requests[&RequestScope::Session(fresh.id.clone())],
+            vec![admitted.id.0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_session_end_paths_retire_grants_and_preserve_active_sessions() {
+        for mode in 0..4 {
+            let (registry, pending, manager) = lifecycle_store();
+            let ended = registry
+                .create_session(SessionType::Capsule, Some("ended".to_string()))
+                .await;
+            let active = registry
+                .create_session(SessionType::Capsule, Some("active".to_string()))
+                .await;
+            let (request, token) = lifecycle_grant(&pending, &manager, ended.id.clone()).await;
+            let (live_request, live_token) =
+                lifecycle_grant(&pending, &manager, active.id.clone()).await;
+            match mode {
+                0 => {
+                    registry.invalidate_session(&ended.token).await.unwrap();
+                }
+                1 => {
+                    registry.invalidate_vm_session("ended").await.unwrap();
+                }
+                2 => {
+                    assert_eq!(
+                        registry
+                            .cleanup_dead_vm_sessions(&["active".to_string()])
+                            .await,
+                        1
+                    );
+                }
+                _ => {
+                    registry
+                        .get_session_mut(&ended.token, |session| {
+                            session.last_active = SecureTimestamp::at(0)
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(registry.cleanup_stale_sessions(600).await, 1);
+                }
+            }
+            assert!(registry.validate_token(&ended.token).await.is_none());
+            assert!(registry.get_vm_token("ended").await.is_none());
+            assert_eq!(registry.session_count().await, 1);
+            assert!(pending.get_request(request.id.as_str()).await.is_none());
+            assert!(request_for(&pending, ended.id.as_str()).await.is_denied());
+            assert!(manager
+                .validate(
+                    &token,
+                    ended.id.as_str(),
+                    request.action,
+                    &request.resource,
+                    None
+                )
+                .await
+                .is_err());
+            assert!(registry.validate_token(&active.token).await.is_some());
+            assert_eq!(
+                pending.list_session_granted(active.id.as_str()).await.len(),
+                1
+            );
+            manager
+                .validate(
+                    &live_token,
+                    active.id.as_str(),
+                    live_request.action,
+                    &live_request.resource,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_canceled_session_retirement_fails_closed_and_cleanup_retries() {
+        use std::future::Future as _;
+        use std::task::{Context, Waker};
+
+        let (registry, pending, manager) = lifecycle_store();
+        let session = registry
+            .create_session(SessionType::Shell, Some("retiring".to_string()))
+            .await;
+        let (granted, token) = lifecycle_grant(&pending, &manager, session.id.clone()).await;
+        let late = request_for(&pending, session.id.as_str()).await;
+        let late_token = manager.grant(
+            session.id.as_str(),
+            late.resource.clone(),
+            late.action,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut retiring = Box::pin(tokio::task::unconstrained(
+            pending.retire_session_with(session.id.as_str(), |_| std::future::pending::<()>()),
+        ));
+        assert!(retiring
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        drop(retiring);
+
+        assert!(registry.validate_token(&session.token).await.is_none());
+        assert!(!registry.is_shell(&session.token).await);
+        assert!(!registry.has_vm_session("retiring").await);
+        assert!(registry.get_vm_token("retiring").await.is_none());
+        assert!(registry.list_sessions().await.is_empty());
+        assert_eq!(registry.session_count().await, 0);
+        assert!(registry
+            .get_session_mut(&session.token, |_| ())
+            .await
+            .is_none());
+        registry.touch_session(&session.token).await;
+        assert!(
+            request_for(&pending, session.id.as_str()).await.is_denied(),
+            "ended session must reject late admission"
+        );
+        assert!(
+            pending
+                .grant_request(late.id.as_str(), late_token, GrantDuration::Session)
+                .await
+                .is_err(),
+            "ended session must reject a late grant"
+        );
+        // The canceled operation preserves the identities needed for retry.
+        assert!(pending.get_request(granted.id.as_str()).await.is_some());
+        assert!(pending.get_request(late.id.as_str()).await.is_some());
+        assert_eq!(registry.cleanup_stale_sessions(u64::MAX).await, 1);
+        assert!(manager
+            .validate(
+                &token,
+                session.id.as_str(),
+                granted.action,
+                &granted.resource,
+                None
+            )
+            .await
+            .is_err());
+        let state = pending.state.read().await;
+        assert!(state.requests.is_empty());
+        assert!(state.session_requests.is_empty());
+        assert!(state.active_sessions.as_ref().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_session_retirement_preserves_capsule_scope_with_same_owner_string() {
+        let (registry, pending, manager) = lifecycle_store();
+        let session = registry.create_session(SessionType::Capsule, None).await;
+        let mut session_grants = Vec::new();
+        for _ in 0..MAX_PENDING_PER_SESSION {
+            session_grants.push(lifecycle_grant(&pending, &manager, session.id.clone()).await);
+        }
+        assert!(request_for(&pending, session.id.as_str()).await.is_denied());
+        let (capsule_request, capsule_token) = lifecycle_grant(
+            &pending,
+            &manager,
+            RequestScope::Capsule(session.id.to_string()),
+        )
+        .await;
+        assert_eq!(
+            pending
+                .list_session_granted(session.id.as_str())
+                .await
+                .len(),
+            MAX_PENDING_PER_SESSION
+        );
+        assert_eq!(pending.state.read().await.session_requests.len(), 2);
+        registry.invalidate_session(&session.token).await.unwrap();
+        for (session_request, session_token) in session_grants {
+            assert!(pending
+                .get_request(session_request.id.as_str())
+                .await
+                .is_none());
+            assert!(manager
+                .validate(
+                    &session_token,
+                    session.id.as_str(),
+                    session_request.action,
+                    &session_request.resource,
+                    None
+                )
+                .await
+                .is_err());
+        }
+        assert!(pending
+            .list_session_granted(session.id.as_str())
+            .await
+            .is_empty());
+        assert!(pending
+            .get_request(capsule_request.id.as_str())
+            .await
+            .unwrap()
+            .is_granted());
+        manager
+            .validate(
+                &capsule_token,
+                session.id.as_str(),
+                capsule_request.action,
+                &capsule_request.resource,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.state.read().await.session_requests
+                [&RequestScope::Capsule(session.id.to_string())],
+            vec![capsule_request.id.0]
+        );
+        let second_capsule = lifecycle_grant(
+            &pending,
+            &manager,
+            RequestScope::Capsule(session.id.to_string()),
+        )
+        .await;
+        assert!(pending
+            .get_request(second_capsule.0.id.as_str())
+            .await
+            .unwrap()
+            .is_granted());
+    }
+
+    #[tokio::test]
+    async fn test_epoch_retirement_preserves_grant_landing_after_advance() {
+        let (registry, pending, manager) = lifecycle_store();
+        let session = registry.create_session(SessionType::Capsule, None).await;
+        let (old_request, old_token) =
+            lifecycle_grant(&pending, &manager, session.id.clone()).await;
+        let epoch = manager.revoke_all("test epoch race").unwrap();
+        // Deterministically place a new-epoch grant in the handler's gap.
+        let (new_request, new_token) =
+            lifecycle_grant(&pending, &manager, session.id.clone()).await;
+        assert_eq!(new_token.constraints().epoch(), epoch);
+        pending.revoke_all_granted_before_epoch(epoch).await;
+        assert!(pending
+            .get_request(old_request.id.as_str())
+            .await
+            .unwrap()
+            .is_denied());
+        let visible = pending.list_session_granted(session.id.as_str()).await;
+        assert_eq!(
+            visible.len(),
+            1,
+            "new-epoch grant must remain visible and revocable"
+        );
+        assert_eq!(visible[0].id, new_request.id);
+        assert!(manager
+            .validate(
+                &old_token,
+                session.id.as_str(),
+                old_request.action,
+                &old_request.resource,
+                None
+            )
+            .await
+            .is_err());
+        manager
+            .validate(
+                &new_token,
+                session.id.as_str(),
+                new_request.action,
+                &new_request.resource,
+                None,
+            )
+            .await
+            .unwrap();
+    }
 
     fn create_test_store() -> PendingRequestStore {
         PendingRequestStore::new(Arc::new(AuditLog::new()))
@@ -829,20 +1318,24 @@ mod tests {
             .read()
             .await
             .session_requests
-            .contains_key("expired-session"));
+            .contains_key(&RequestScope::Session(SessionId::from_string(
+                "expired-session"
+            ))));
 
         // Individual and epoch revocation make grant records eligible for cleanup.
         store.revoke_request(once.id.as_str()).await;
         assert_eq!(store.cleanup_old(0).await, 1);
         assert!(store.list_session_granted("mixed-session").await.is_empty());
-        store.revoke_all_granted().await;
+        store.revoke_all_granted_before_epoch(1).await;
         assert_eq!(store.cleanup_old(0).await, 1);
         assert!(!store
             .state
             .read()
             .await
             .session_requests
-            .contains_key("grant-session"));
+            .contains_key(&RequestScope::Session(SessionId::from_string(
+                "grant-session"
+            ))));
         assert_eq!(store.cleanup_old(0).await, 0);
         assert_eq!(
             store.list_session_pending("mixed-session").await[0].id,
@@ -904,7 +1397,7 @@ mod tests {
         );
         assert_eq!(store.cleanup_old(0).await, 0);
 
-        store.revoke_all_granted().await;
+        store.revoke_all_granted_before_epoch(1).await;
         assert!(request_for(&store, "grant-session").await.is_pending());
         assert!(store.list_session_granted("grant-session").await.is_empty());
     }
@@ -1014,50 +1507,53 @@ mod tests {
             assert!(request_for(&store, "owner").await.is_pending());
         }
         let removed = store
-            .reclaim_retired_grants_with(Some("owner"), |token| {
-                let store = &store;
-                let granted = &granted;
-                async move {
-                    // This fails immediately if either a read or write guard escaped
-                    // the snapshot scope. It does not rely on a timeout or scheduler.
-                    let mut state = store
-                        .state
-                        .try_write()
-                        .expect("manager query holds pending lock");
-                    let index = granted
-                        .iter()
-                        .position(|(_, old)| old.id() == token.id())
-                        .unwrap();
-                    let request = state
-                        .requests
-                        .get_mut(granted[index].0.id.as_str())
-                        .unwrap();
-                    match index {
-                        0 => {}
-                        1 => {
-                            request.status = RequestStatus::Denied {
-                                reason: "changed during query".into(),
+            .reclaim_retired_grants_with(
+                Some(&RequestScope::Session(SessionId::from_string("owner"))),
+                |token| {
+                    let store = &store;
+                    let granted = &granted;
+                    async move {
+                        // This fails immediately if either a read or write guard escaped
+                        // the snapshot scope. It does not rely on a timeout or scheduler.
+                        let mut state = store
+                            .state
+                            .try_write()
+                            .expect("manager query holds pending lock");
+                        let index = granted
+                            .iter()
+                            .position(|(_, old)| old.id() == token.id())
+                            .unwrap();
+                        let request = state
+                            .requests
+                            .get_mut(granted[index].0.id.as_str())
+                            .unwrap();
+                        match index {
+                            0 => {}
+                            1 => {
+                                request.status = RequestStatus::Denied {
+                                    reason: "changed during query".into(),
+                                }
                             }
-                        }
-                        2 => {
-                            request.status = RequestStatus::Granted {
-                                token: Box::new(token_for(request)),
-                                duration: GrantDuration::Session,
+                            2 => {
+                                request.status = RequestStatus::Granted {
+                                    token: Box::new(token_for(request)),
+                                    duration: GrantDuration::Session,
+                                }
                             }
-                        }
-                        3 => {
-                            request.status = RequestStatus::Granted {
-                                token: Box::new(token),
-                                duration: GrantDuration::Once,
+                            3 => {
+                                request.status = RequestStatus::Granted {
+                                    token: Box::new(token),
+                                    duration: GrantDuration::Once,
+                                }
                             }
+                            _ => unreachable!(),
                         }
-                        _ => unreachable!(),
+                        drop(state);
+                        tokio::task::yield_now().await;
+                        true
                     }
-                    drop(state);
-                    tokio::task::yield_now().await;
-                    true
-                }
-            })
+                },
+            )
             .await;
         assert_eq!(removed, 1);
         assert!(store.get_request(granted[0].0.id.as_str()).await.is_none());
@@ -1081,7 +1577,10 @@ mod tests {
         ));
         let state = store.state.read().await;
         assert_eq!(state.requests.len(), MAX_PENDING_PER_SESSION - 1);
-        assert_eq!(state.session_requests["owner"].len(), state.requests.len());
+        assert_eq!(
+            state.session_requests[&RequestScope::Session(SessionId::from_string("owner"))].len(),
+            state.requests.len()
+        );
     }
 
     #[tokio::test]
@@ -1151,8 +1650,13 @@ mod tests {
             assert_eq!(counts.get_use_count(token.id()).await, *used);
         }
         let state = store.state.read().await;
-        assert!(!state.session_requests.contains_key("exhausted-only"));
-        assert_eq!(state.session_requests["mixed"].len(), 3);
+        assert!(!state.session_requests.contains_key(&RequestScope::Session(
+            SessionId::from_string("exhausted-only")
+        )));
+        assert_eq!(
+            state.session_requests[&RequestScope::Session(SessionId::from_string("mixed"))].len(),
+            3
+        );
         assert_eq!(state.requests.len(), MAX_PENDING_REQUESTS - 2);
         assert_eq!(
             state.session_requests.values().map(Vec::len).sum::<usize>(),
@@ -1193,7 +1697,7 @@ mod tests {
             None,
         );
         let epoch = manager.revoke_all("retire old epoch").unwrap();
-        store.revoke_all_granted().await;
+        store.revoke_all_granted_before_epoch(epoch).await;
         // A grant minted before revocation can finish registering afterward.
         store
             .grant_request(
@@ -1284,8 +1788,13 @@ mod tests {
         let state = store.state.read().await;
         assert!(!state.requests.contains_key(stale.id.as_str()));
         assert!(!state.requests.contains_key(revoked.id.as_str()));
-        assert!(!state.session_requests.contains_key("stale-epoch"));
-        assert_eq!(state.session_requests["mixed"].len(), 1);
+        assert!(!state.session_requests.contains_key(&RequestScope::Session(
+            SessionId::from_string("stale-epoch")
+        )));
+        assert_eq!(
+            state.session_requests[&RequestScope::Session(SessionId::from_string("mixed"))].len(),
+            1
+        );
         assert_eq!(state.requests.len(), MAX_PENDING_REQUESTS - 2);
         assert_eq!(
             state.session_requests.values().map(Vec::len).sum::<usize>(),
@@ -1333,7 +1842,9 @@ mod tests {
             .read()
             .await
             .session_requests
-            .contains_key("expired-grant-session"));
+            .contains_key(&RequestScope::Session(SessionId::from_string(
+                "expired-grant-session"
+            ))));
     }
 
     #[tokio::test]

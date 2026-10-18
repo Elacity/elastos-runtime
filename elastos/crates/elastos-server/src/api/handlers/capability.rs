@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use elastos_common::localhost::{is_supported_resource_scheme, is_system_only_backend_resource};
 use elastos_runtime::capability::{
-    pending::PendingRequestStore, Action, CapabilityManager, GrantDuration, PolicyEvaluator,
-    PolicyOutcome, ResourceId, TokenConstraints,
+    pending::PendingRequestStore, Action, CapabilityManager, CapabilityToken, GrantDuration,
+    PolicyEvaluator, PolicyOutcome, ResourceId, TokenConstraints,
 };
 use elastos_runtime::session::Session;
 
@@ -350,18 +350,36 @@ pub async fn grant_request(
         None, // No expiry for now (session-scoped)
     );
 
-    // Mark request as granted
-    state
-        .pending_store
-        .grant_request(&input.request_id, token.clone(), duration)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    record_grant(&state, &input.request_id, &token, duration).await?;
 
     Ok(Json(GrantRequestOutput {
         success: true,
         token: Some(token.to_base64().unwrap_or_default()),
         error: None,
     }))
+}
+
+async fn record_grant(
+    state: &CapabilityState,
+    request_id: &str,
+    token: &CapabilityToken,
+    duration: GrantDuration,
+) -> Result<(), (StatusCode, String)> {
+    if let Err(error) = state
+        .pending_store
+        .grant_request(request_id, token.clone(), duration)
+        .await
+    {
+        // The owner can end while the Shell's decision is in flight. Retire
+        // the minted token when its request can no longer record that grant.
+        state
+            .capability_manager
+            .revoke(*token.id(), "Grant registration failed")
+            .await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error));
+    }
+
+    Ok(())
 }
 
 // === Deny Request (Shell Only) ===
@@ -555,8 +573,11 @@ pub async fn revoke_all_capabilities(
             )
         })?;
 
-    // Mark all granted requests as revoked
-    state.pending_store.revoke_all_granted().await;
+    // A grant issued after advancement keeps its authority and visible record.
+    state
+        .pending_store
+        .revoke_all_granted_before_epoch(new_epoch)
+        .await;
 
     Ok(Json(RevokeAllOutput {
         success: true,
@@ -791,6 +812,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_failed_grant_registration_retires_unreturned_token() {
+        use elastos_runtime::session::{SessionRegistry, SessionType};
+
+        let mut state = test_state();
+        let (registry, pending) = SessionRegistry::with_capabilities(
+            state.pending_store.audit_log(),
+            state.capability_manager.clone(),
+        );
+        state.pending_store = pending;
+        let session = registry.create_session(SessionType::Capsule, None).await;
+        let request = state
+            .pending_store
+            .admit_request(
+                &state.capability_manager,
+                session.id.clone(),
+                ResourceId::new("localhost://Users/self/Documents/test"),
+                Action::Read,
+                String::new(),
+            )
+            .await;
+        // The handler has read the pending request and minted a token before
+        // the session ends; recording that stale decision must retire it.
+        let token = state.capability_manager.grant(
+            session.id.as_str(),
+            request.resource.clone(),
+            request.action,
+            TokenConstraints::default(),
+            None,
+        );
+        registry.invalidate_session(&session.token).await.unwrap();
+        let error = record_grant(&state, request.id.as_str(), &token, GrantDuration::Session)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            state
+                .capability_manager
+                .validate(
+                    &token,
+                    session.id.as_str(),
+                    request.action,
+                    &request.resource,
+                    None
+                )
+                .await
+                .is_err(),
+            "unreturned token must be retired when grant registration fails"
+        );
+    }
+
+    #[tokio::test]
     async fn test_revoke_all_failure_returns_500_and_keeps_live_grants() {
         use elastos_runtime::capability::{CapabilityStore, RequestStatus};
         use elastos_runtime::primitives::{audit::AuditEvent, metrics::MetricsManager};
@@ -836,6 +908,9 @@ mod tests {
                 .await
                 .unwrap();
             if blocked_path != "overflow" {
+                if blocked_path == "epoch" {
+                    std::fs::remove_file(directory.path().join("epoch")).unwrap();
+                }
                 std::fs::create_dir(directory.path().join(blocked_path)).unwrap();
             }
             let epoch = authority.current_epoch();
@@ -867,7 +942,7 @@ mod tests {
                 .recent_events(100)
                 .iter()
                 .all(|event| !matches!(event, AuditEvent::EpochAdvance { .. })));
-            state
+            let validation = state
                 .capability_manager
                 .validate(
                     &token,
@@ -876,10 +951,31 @@ mod tests {
                     &request.resource,
                     None,
                 )
-                .await
-                .unwrap();
+                .await;
+            if blocked_path == "epoch" {
+                assert!(
+                    validation.is_err(),
+                    "unreadable epoch state must fail closed"
+                );
+            } else {
+                validation.unwrap();
+            }
             if blocked_path != "overflow" {
                 std::fs::remove_dir(directory.path().join(blocked_path)).unwrap();
+                if blocked_path == "epoch" {
+                    std::fs::write(directory.path().join("epoch"), epoch.to_string()).unwrap();
+                }
+                state
+                    .capability_manager
+                    .validate(
+                        &token,
+                        session.id.as_str(),
+                        request.action,
+                        &request.resource,
+                        None,
+                    )
+                    .await
+                    .unwrap();
                 let recovered = revoke_all_capabilities(
                     State(state.clone()),
                     Extension(Session::new_shell("test-shell".to_string())),

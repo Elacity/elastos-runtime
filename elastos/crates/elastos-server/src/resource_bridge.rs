@@ -844,7 +844,9 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                     .pending_store
                     .admit_request(
                         &ctx.capability_manager,
-                        elastos_runtime::session::SessionId(ctx.capsule_id.clone()),
+                        elastos_runtime::capability::pending::RequestScope::Capsule(
+                            ctx.capsule_id.clone(),
+                        ),
                         resource_id.clone(),
                         action,
                         reason,
