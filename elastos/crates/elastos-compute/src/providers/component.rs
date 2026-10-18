@@ -447,7 +447,9 @@ impl elastos::bus::providers::Host for ComponentState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::sync::Mutex;
+    use std::task::Poll;
 
     fn component_fixture() -> (std::path::PathBuf, CapsuleManifest) {
         let path =
@@ -538,51 +540,74 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .max_blocking_threads(1)
             .enable_all()
+            .start_paused(true)
             .build()
             .unwrap();
         let (release, waiting) = std::sync::mpsc::channel();
+        let (blocked, observing_blocker) = tokio::sync::oneshot::channel();
         let blocker = runtime.spawn_blocking(move || {
+            blocked.send(()).unwrap();
             let _ = waiting.recv();
         });
         let provider = Arc::new(ComponentProvider::new());
         let (path, manifest) = component_fixture();
 
         runtime.block_on(async {
+            observing_blocker.await.unwrap();
             let (started, observing) = tokio::sync::oneshot::channel();
             let loading_provider = provider.clone();
             let first_path = path.clone();
             let first_manifest = manifest.clone();
             let loading = tokio::spawn(async move {
+                let mut load = loading_provider.load(&first_path, first_manifest);
+                // Poll through admission before acknowledging the caller. The
+                // sole blocking worker stays gated until both waits finish.
+                let initial = std::future::poll_fn(|cx| Poll::Ready(load.as_mut().poll(cx))).await;
                 started.send(()).unwrap();
-                loading_provider.load(&first_path, first_manifest).await
+                match initial {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => load.await,
+                }
             });
             observing.await.unwrap();
-            tokio::task::yield_now().await;
-            let slot_held_during_load = provider.compile_slot.available_permits() == 0;
             loading.abort();
             let cancelled = loading.await.unwrap_err().is_cancelled();
-            let slot_held_after_cancellation = provider.compile_slot.available_permits() == 0;
 
-            let (started, observing) = tokio::sync::oneshot::channel();
-            let loading_provider = provider.clone();
-            let next_load = tokio::spawn(async move {
-                started.send(()).unwrap();
-                loading_provider.load(&path, manifest).await
-            });
-            observing.await.unwrap();
-            tokio::task::yield_now().await;
-            let next_load_waited = !next_load.is_finished();
+            let result = {
+                let next_load = tokio::time::timeout(
+                    COMPONENT_COMPILE_WAIT_TIMEOUT + Duration::from_secs(1),
+                    provider.load(&path, manifest.clone()),
+                );
+                tokio::pin!(next_load);
+                // Register the queue wait, then advance virtual time while the
+                // cancelled caller's compile still owns its slot. Polling the
+                // load directly lets its queue timeout win over the outer guard.
+                match std::future::poll_fn(|cx| Poll::Ready(next_load.as_mut().poll(cx))).await {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => {
+                        tokio::time::advance(
+                            COMPONENT_COMPILE_WAIT_TIMEOUT + Duration::from_secs(1),
+                        )
+                        .await;
+                        next_load.await
+                    }
+                }
+            };
 
+            // Release and drain the blocking work before asserting, including
+            // when early slot release admitted the second load to the worker.
             release.send(()).unwrap();
             blocker.await.unwrap();
-            let handle = next_load.await.unwrap().unwrap();
+            tokio::time::resume();
+            let handle = provider.load(&path, manifest).await.unwrap();
             provider.stop(&handle).await.unwrap();
 
-            assert!(slot_held_during_load);
             assert!(cancelled);
-            assert!(slot_held_after_cancellation);
-            assert!(next_load_waited);
-            assert_eq!(provider.compile_slot.available_permits(), 1);
+            assert!(
+                matches!(result, Ok(Err(ElastosError::Compute(message)))
+                    if message == "Timed out waiting for the component compiler"),
+                "cancelling a load must keep later loads queued until its blocking compile finishes"
+            );
             assert!(provider.instances.read().await.is_empty());
         });
     }
