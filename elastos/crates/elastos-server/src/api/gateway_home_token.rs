@@ -804,7 +804,8 @@ fn require_capsule_browser_origin(headers: &HeaderMap) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn require_exact_home_browser_origin(headers: &HeaderMap) -> anyhow::Result<()> {
+/// The origin a Home browser request was addressed to (scheme and Host).
+pub(in crate::api) fn home_browser_origin(headers: &HeaderMap) -> anyhow::Result<String> {
     let host = single_browser_header(headers, axum::http::header::HOST.as_str())?
         .ok_or_else(|| anyhow::anyhow!("Home browser request is missing its host"))?;
     let authority = host
@@ -815,9 +816,13 @@ fn require_exact_home_browser_origin(headers: &HeaderMap) -> anyhow::Result<()> 
     } else {
         "http"
     };
-    let expected = url::Url::parse(&format!("{scheme}://{authority}"))?
+    Ok(url::Url::parse(&format!("{scheme}://{authority}"))?
         .origin()
-        .ascii_serialization();
+        .ascii_serialization())
+}
+
+fn require_exact_home_browser_origin(headers: &HeaderMap) -> anyhow::Result<()> {
+    let expected = home_browser_origin(headers)?;
     let mut has_same_origin_provenance = false;
     if let Some(origin) = single_browser_header(headers, axum::http::header::ORIGIN.as_str())? {
         let parsed = url::Url::parse(origin)
