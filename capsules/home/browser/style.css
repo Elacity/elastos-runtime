@@ -347,10 +347,6 @@ img {
   cursor: pointer;
 }
 
-.home-unlock .home-unlock-recover + .home-unlock-recover {
-  margin-top: 4px;
-}
-
 .home-unlock-create {
   appearance: none;
   margin-top: 18px;
