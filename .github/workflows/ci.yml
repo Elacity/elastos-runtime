@@ -275,6 +275,30 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+  # This bridge is a separate Cargo workspace, outside the Runtime tests.
+  test-browser-guest-control-bridge:
+    name: test-browser-guest-control-bridge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: source-gate
+    defaults:
+      run:
+        working-directory: elastos/tools/browser-vm-guest-control-bridge
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@72504271e02fb719eb4eb3eaece3a8e3d06f57c0 # 1.91.0
+        with:
+          components: rustfmt, clippy
+      - name: bridge formatting
+        run: cargo fmt -- --check
+      - name: bridge Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: bridge tests
+        run: cargo test --locked
+
   lint:
     name: lint
     runs-on: ubuntu-24.04
