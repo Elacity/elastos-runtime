@@ -12,11 +12,18 @@ const homeAuthorityToken = "fixture-home-authority-token";
 const homeGuiToken = "fixture-home-gui-launch-token";
 const browserOwnerToken = "fixture-browser-owner-launch-token";
 const browserRefreshedToken = "fixture-browser-refreshed-launch-token";
+const browserReopenedToken = "fixture-browser-reopened-launch-token";
 const openId = "browser-open-fixture-0001";
 const pageId = "browser-page-fixture-0001";
+const reopenedPageId = "browser-page-fixture-0002";
 const principalId = "did:elastos:fixture-home-refresh";
 const recoveredCleanupId = "browser-cleanup:fixture-recovered";
 const openedCleanupId = "browser-cleanup:fixture-opened";
+const retainedEngineId = "fixture-retained-engine";
+const retainedExitId = "fixture-retained-exit";
+const initialDisplayGeneration = `display:${"1".repeat(32)}`;
+const restoredDisplayGeneration = `display:${"2".repeat(32)}`;
+const reopenedDisplayGeneration = `display:${"3".repeat(32)}`;
 let releaseBrowserWindowCloseTerminal;
 const browserWindowCloseTerminalGate = new Promise((resolveGate) => {
   releaseBrowserWindowCloseTerminal = resolveGate;
@@ -24,8 +31,8 @@ const browserWindowCloseTerminalGate = new Promise((resolveGate) => {
 
 const state = {
   phase: "placeholder",
-  homeGuiLaunches: { placeholder: 0, restored: 0 },
-  browserLaunches: { placeholder: 0, restored: 0 },
+  homeGuiLaunches: { placeholder: 0, restored: 0, reopened: 0 },
+  browserLaunches: { placeholder: 0, restored: 0, reopened: 0 },
   browserOpenRequests: 0,
   browserSummaryBindings: 0,
   browserOpenBindings: 0,
@@ -33,6 +40,12 @@ const state = {
   browserOpenIntent: null,
   browserOpenCompleted: false,
   browserStatusPolls: 0,
+  browserPageStatusReads: 0,
+  browserFastStatusReads: 0,
+  browserDisplayAttachRequests: [],
+  browserDisplayAttachEffects: 0,
+  browserSignals: [],
+  reopenedBrowserInstanceId: null,
   browserPageCount: 0,
   browserVmCount: 0,
   browserCleanupEffects: 0,
@@ -40,6 +53,8 @@ const state = {
   browserWindowCloseTerminalReceipts: 0,
   browserReapedCleanupId: null,
   activeCleanupId: null,
+  activePageId: null,
+  activeDisplayGeneration: initialDisplayGeneration,
   homeStateWrites: [],
   errors: [],
 };
@@ -157,6 +172,8 @@ function homeSummary() {
             height: 720,
             query: {
               browser_instance: browserInstanceId,
+              browser_engine_id: "fixture-default-engine",
+              remote_exit_id: "fixture-other-exit",
             },
           },
         ],
@@ -225,6 +242,9 @@ function browserSummary() {
   return {
     sessions: {
       schema: "elastos.browser.session-capacity/v1",
+      status: "configured",
+      capacity_available: true,
+      fresh_start_allowed: state.activeCleanupId === null,
       active_sessions: state.browserPageCount,
       launching_sessions: 0,
       total_sessions: state.browserPageCount,
@@ -232,39 +252,69 @@ function browserSummary() {
         ? {
             schema: "elastos.browser.recoverable-page/v1",
             state: "active",
-            page_id: pageId,
+            page_id: state.activePageId,
             cleanup: {
               schema: "elastos.browser.cleanup-handle/v1",
               id: state.activeCleanupId,
             },
-            engine_page: {
-              schema: "elastos.browser.engine.page/v1",
-              page_id: pageId,
-              url: "https://ela.city/",
+            service_selection: {
+              schema: "elastos.browser.service-selection/v1",
+              engine_id: state.activePageId === pageId ? retainedEngineId : "",
+              exit_id: state.activePageId === pageId ? retainedExitId : "",
             },
+            engine_page: enginePage(state.activePageId, state.activeDisplayGeneration),
           }
         : null,
     },
     engine_adapter: {
+      display_attach_supported: true,
       supported_display_modes: ["webrtc_remote_display"],
       supported_guarantee_levels: ["mechanism_microvm"],
-      adapters: [
-        {
-          id: "fixture-engine",
-          default: true,
+      adapters: ["fixture-default-engine", retainedEngineId].map((id, index) => ({
+          id,
+          default: index === 0,
           engine: "fixture-microvm",
           backing_substrate: "local_microvm",
           direct_network: false,
           wallet_injection: false,
           supported_display_modes: ["webrtc_remote_display"],
           supported_guarantee_levels: ["mechanism_microvm"],
-        },
-      ],
+        })),
     },
     net: {
       exit_provider: {
-        remote_carrier_exits: [],
+        remote_carrier_exits: ["fixture-other-exit", retainedExitId].map((id) => ({
+          id, grant_id: `grant:${id}`, display_name: id, state: "ready", allowed_for_principal: true,
+        })),
       },
+    },
+  };
+}
+
+function enginePage(id, displayGeneration) {
+  const retained = id === pageId;
+  return {
+    schema: "elastos.browser.engine.page/v1",
+    page_id: id,
+    url: retained ? "https://fixture.invalid/retained" : "https://ela.city/",
+    actual_url: retained ? "https://fixture.invalid/retained" : "https://ela.city/",
+    title: retained ? "Retained page" : "ela.city",
+    view: { width: 1280, height: 720 },
+    display_session: {
+      schema: "elastos.browser.display-session/v1",
+      mode: "webrtc_remote_display",
+      signaling_url: `/api/apps/browser/pages/${id}/webrtc`,
+      display_generation: displayGeneration,
+      input: "runtime_route",
+      input_protocol: "elastos_json",
+      offerer: retained ? "engine" : "browser",
+      media_transport: "runtime_relay",
+      ice_servers: [],
+      audio: false,
+      video: true,
+      direct_network: false,
+      width: 1280,
+      height: 720,
     },
   };
 }
@@ -272,27 +322,7 @@ function browserSummary() {
 function browserOpenResult() {
   return {
     schema: "elastos.browser.open-result/v1",
-    engine_page: {
-      schema: "elastos.browser.engine.page/v1",
-      page_id: pageId,
-      url: "https://ela.city/",
-      actual_url: "https://ela.city/",
-      title: "ela.city",
-      view: { width: 1280, height: 720 },
-      display_session: {
-        schema: "elastos.browser.display-session/v1",
-        mode: "webrtc_remote_display",
-        signaling_url: `/api/apps/browser/pages/${pageId}/webrtc`,
-        input: "runtime_route",
-        input_protocol: "elastos_json",
-        offerer: "browser",
-        media_transport: "runtime_relay",
-        ice_servers: [],
-        audio: false,
-        video: true,
-        direct_network: false,
-      },
-    },
+    engine_page: enginePage(reopenedPageId, reopenedDisplayGeneration),
     stream_session: {
       schema: "elastos.net.stream-session/v1",
       backend: "fixture-local-exit",
@@ -319,11 +349,13 @@ function launchRoute(origin, target, query) {
     params.set(key, String(value));
   }
   params.set("home_origin", origin);
-  if (target === "browser" && state.phase === "restored") {
+  if (target === "browser" && state.phase === "reopened") {
     params.set("fixture_duplicate_open", "1");
   }
   const token = target === "home-gui"
     ? homeGuiToken
+    : state.phase === "reopened"
+      ? browserReopenedToken
     : state.phase === "restored"
       ? browserRefreshedToken
       : browserOwnerToken;
@@ -336,6 +368,11 @@ function launchResponse(origin, target, query) {
     state.homeGuiLaunches[bucket] += 1;
   } else if (target === "browser") {
     state.browserLaunches[bucket] += 1;
+    if (bucket === "reopened") {
+      assert(query?.browser_instance && query.browser_instance !== browserInstanceId,
+        "Home fresh reopen reused the retired Browser instance", query);
+      state.reopenedBrowserInstanceId = query.browser_instance;
+    }
   }
   return {
     target,
@@ -356,6 +393,22 @@ function requireToken(req, expected, res) {
   }
   json(res, 401, { error: "fixture launch owner rejected" });
   return false;
+}
+
+function currentBrowserToken() {
+  return state.phase === "reopened" ? browserReopenedToken : browserRefreshedToken;
+}
+
+function currentBrowserInstance() {
+  return state.phase === "reopened" ? state.reopenedBrowserInstanceId : browserInstanceId;
+}
+
+function fixtureOffer() {
+  return {
+    schema: "elastos.browser.webrtc-offer/v1", type: "offer",
+    sdp: "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=fixture\r\nt=0 0\r\n",
+    candidates: [], end_of_candidates: true,
+  };
 }
 
 function placeholderBrowser(res) {
@@ -427,28 +480,30 @@ async function handleApi(req, res, url) {
     return true;
   }
   if (url.pathname === "/api/apps/browser/summary" && req.method === "GET") {
-    if (!requireToken(req, browserRefreshedToken, res)) {
+    if (!requireToken(req, currentBrowserToken(), res)) {
       return true;
     }
     assert(
-      url.searchParams.get("browser_instance") === browserInstanceId,
-      "refreshed Browser summary omitted its exact stable instance binding",
-      { actual: url.searchParams.get("browser_instance"), expected: browserInstanceId },
+      url.searchParams.get("browser_instance") === currentBrowserInstance(),
+      "Browser summary omitted its exact instance binding",
+      { actual: url.searchParams.get("browser_instance"), expected: currentBrowserInstance() },
     );
     state.browserSummaryBindings += 1;
     json(res, 200, browserSummary());
     return true;
   }
   if (url.pathname === "/api/apps/browser/open" && req.method === "POST") {
-    if (!requireToken(req, browserRefreshedToken, res)) {
+    if (!requireToken(req, browserReopenedToken, res)) {
       return true;
     }
     const intent = await readBody(req);
     assert(
-      intent?.browser_instance === browserInstanceId,
-      "refreshed Browser open omitted its exact stable instance binding",
-      { actual: intent?.browser_instance, expected: browserInstanceId },
+      state.phase === "reopened" && intent?.browser_instance === state.reopenedBrowserInstanceId,
+      "fresh Browser open omitted its new instance binding",
+      { actual: intent?.browser_instance, expected: state.reopenedBrowserInstanceId },
     );
+    assert(!intent.adapter_id && !intent.remote_exit_id,
+      "fresh Home launch inherited retired Engine or Exit choices", intent);
     state.browserOpenBindings += 1;
     state.browserOpenRequests += 1;
     if (state.browserOpenIntent === null) {
@@ -458,6 +513,8 @@ async function handleApi(req, res, url) {
       state.browserPageCount = 1;
       state.browserVmCount = 1;
       state.activeCleanupId = openedCleanupId;
+      state.activePageId = reopenedPageId;
+      state.activeDisplayGeneration = reopenedDisplayGeneration;
     } else if (!exactIntent(state.browserOpenIntent, intent)) {
       json(res, 409, { error: "fixture launch owns a different open intent" });
       return true;
@@ -466,7 +523,7 @@ async function handleApi(req, res, url) {
     return true;
   }
   if (url.pathname === `/api/apps/browser/open/${openId}` && req.method === "GET") {
-    if (!requireToken(req, browserRefreshedToken, res)) {
+    if (!requireToken(req, browserReopenedToken, res)) {
       return true;
     }
     state.browserStatusPolls += 1;
@@ -478,17 +535,43 @@ async function handleApi(req, res, url) {
     });
     return true;
   }
-  if (
-    url.pathname === `/api/apps/browser/pages/${pageId}/webrtc` &&
-    req.method === "POST"
-  ) {
-    if (!requireToken(req, browserRefreshedToken, res)) {
+  const pageRoute = url.pathname.match(/^\/api\/apps\/browser\/pages\/([^/]+)\/(webrtc|status|heartbeat|input|close)$/);
+  const requestPageId = pageRoute?.[1];
+  const pageToken = requestPageId === pageId ? browserRefreshedToken : browserReopenedToken;
+  if (pageRoute && ![pageId, reopenedPageId].includes(requestPageId)) {
+    json(res, 404, { error: "fixture page is not owned" });
+    return true;
+  }
+  if (pageRoute?.[2] === "webrtc" && req.method === "POST") {
+    if (!requireToken(req, pageToken, res)) {
       return true;
     }
     const signal = await readBody(req);
+    assert(state.activePageId === requestPageId, "signaling used a retired page", signal);
+    if (signal?.type === "display_attach") {
+      assert(requestPageId === pageId && signal.display_generation === initialDisplayGeneration &&
+        signal.request_id === initialDisplayGeneration.slice("display:".length) &&
+        Object.keys(signal).sort().join(",") === "display_generation,request_id,type",
+        "retained display attach changed its exact request contract", signal);
+      const previous = state.browserDisplayAttachRequests[0];
+      assert(!previous || exactIntent(previous, signal), "display attach retries changed request identity", signal);
+      state.browserDisplayAttachRequests.push(signal);
+      if (!previous) state.browserDisplayAttachEffects += 1;
+      state.activeDisplayGeneration = restoredDisplayGeneration;
+      json(res, 200, {
+        schema: "elastos.browser.display-attach-result/v1", page_id: pageId,
+        request_id: signal.request_id, previous_display_generation: signal.display_generation,
+        display_generation: restoredDisplayGeneration, initial_offer: fixtureOffer(), audio_offer: fixtureOffer(),
+      });
+      return true;
+    }
+    assert(signal?.display_generation === state.activeDisplayGeneration,
+      "Browser signaling used the wrong display generation", signal);
+    state.browserSignals.push({ page_id: requestPageId, ...signal });
     if (signal?.type === "offer") {
       json(res, 200, {
         schema: "elastos.browser.webrtc-answer/v1",
+        display_generation: signal.display_generation,
         type: "answer",
         sdp: [
           "v=0",
@@ -506,6 +589,7 @@ async function handleApi(req, res, url) {
     } else {
       json(res, 200, {
         schema: "elastos.browser.webrtc-signal-ack/v1",
+        display_generation: signal.display_generation,
         type: signal?.type || "end_of_candidates",
         accepted: true,
         candidates: [],
@@ -514,57 +598,53 @@ async function handleApi(req, res, url) {
     }
     return true;
   }
-  if (
-    url.pathname === `/api/apps/browser/pages/${pageId}/status` &&
-    req.method === "GET"
-  ) {
-    if (!requireToken(req, browserRefreshedToken, res)) {
+  if (pageRoute?.[2] === "status" && req.method === "GET") {
+    if (!requireToken(req, pageToken, res)) {
       return true;
     }
+    state.browserPageStatusReads += 1;
+    if (url.searchParams.get("fast") === "1") state.browserFastStatusReads += 1;
+    const current = enginePage(requestPageId, state.activeDisplayGeneration);
     json(res, 200, {
       schema: "elastos.browser.page-status/v1",
-      page_id: pageId,
-      actual_url: "https://ela.city/",
-      title: "ela.city",
+      page_id: requestPageId,
+      actual_url: current.actual_url,
+      title: requestPageId === pageId && url.searchParams.get("fast") === "1"
+        ? "Retained page after status poll" : current.title,
+      direct_network: false,
       can_go_back: false,
       can_go_forward: false,
       view: { width: 1280, height: 720 },
     });
     return true;
   }
-  if (
-    (url.pathname === `/api/apps/browser/pages/${pageId}/heartbeat` ||
-      url.pathname === `/api/apps/browser/pages/${pageId}/input`) &&
-    req.method === "POST"
-  ) {
-    if (!requireToken(req, browserRefreshedToken, res)) {
+  if (["heartbeat", "input"].includes(pageRoute?.[2]) && req.method === "POST") {
+    if (!requireToken(req, pageToken, res)) {
       return true;
     }
     json(res, 200, {
       schema: "elastos.browser.input-result/v1",
-      page_id: pageId,
+      page_id: requestPageId,
       accepted: true,
     });
     return true;
   }
-  if (
-    url.pathname === `/api/apps/browser/pages/${pageId}/close` &&
-    req.method === "POST"
-  ) {
-    if (!requireToken(req, browserRefreshedToken, res)) {
+  if (pageRoute?.[2] === "close" && req.method === "POST") {
+    if (!requireToken(req, pageToken, res)) {
       return true;
     }
     const closeRequest = await readBody(req);
     if (
       closeRequest?.schema !== "elastos.browser.close-request/v2" ||
-      closeRequest.cleanup_id !==
-        (state.activeCleanupId || state.browserReapedCleanupId)
+      closeRequest.cleanup_id !== state.activeCleanupId ||
+      requestPageId !== state.activePageId ||
+      closeRequest.browser_instance !== currentBrowserInstance()
     ) {
       json(res, 400, { error: "fixture received a mismatched Browser cleanup identifier" });
       return true;
     }
-    if (closeRequest.cleanup_id === openedCleanupId) {
-      state.browserWindowCloseRequests += 1;
+    state.browserWindowCloseRequests += 1;
+    if (closeRequest.cleanup_id === recoveredCleanupId) {
       if (state.browserWindowCloseRequests === 1) {
         json(res, 200, {
           schema: "elastos.browser.close-result/v1",
@@ -576,31 +656,21 @@ async function handleApi(req, res, url) {
         return true;
       }
       await browserWindowCloseTerminalGate;
-      state.browserWindowCloseTerminalReceipts += 1;
-      json(res, 200, {
-        schema: "elastos.browser.close-result/v1",
-        page_id: pageId,
-        closed: false,
-        already_closed: true,
-        cleanup_id: closeRequest.cleanup_id,
-        terminal_effects: { page_absent: true },
-        cleanup: {
-          schema: "elastos.browser.runtime-session-cleanup/v1",
-          ok: true,
-          action: "already_absent",
-        },
-      });
-      return true;
     }
     state.browserCleanupEffects += 1;
+    state.browserWindowCloseTerminalReceipts += 1;
     state.browserPageCount = 0;
     state.browserVmCount = 0;
+    state.browserReapedCleanupId = state.activeCleanupId;
     state.activeCleanupId = null;
+    state.activePageId = null;
     json(res, 200, {
       schema: "elastos.browser.close-result/v1",
-      page_id: pageId,
+      page_id: requestPageId,
       closed: true,
       cleanup_id: closeRequest.cleanup_id,
+      terminal_effects: { page_absent: true },
+      cleanup: { schema: "elastos.browser.runtime-session-cleanup/v1", ok: true, action: "closed" },
     });
     return true;
   }
@@ -690,6 +760,7 @@ function browserFrame(page) {
 
 const origin = await listen();
 let browser = null;
+let page = null;
 try {
   const imported = await import(playwrightSpecifier());
   const { chromium } = imported.default || imported;
@@ -734,6 +805,14 @@ try {
           return {};
         }
 
+        createDataChannel() {
+          const channel = new EventTarget();
+          channel.readyState = "open";
+          channel.send = () => {};
+          channel.close = () => { channel.readyState = "closed"; };
+          return channel;
+        }
+
         async createOffer() {
           return {
             type: "offer",
@@ -748,6 +827,10 @@ try {
               "",
             ].join("\r\n"),
           };
+        }
+
+        async createAnswer() {
+          return { ...(await this.createOffer()), type: "answer" };
         }
 
         async setLocalDescription(description) {
@@ -797,7 +880,7 @@ try {
     { contextId: browserContextId },
   );
 
-  const page = await context.newPage();
+  page = await context.newPage();
   const recordPageError = (error) => {
     if (pageErrors.length < 20) pageErrors.push(String(error).slice(0, 2000));
   };
@@ -837,30 +920,33 @@ try {
   state.browserPageCount = 1;
   state.browserVmCount = 1;
   state.activeCleanupId = recoveredCleanupId;
+  state.activePageId = pageId;
   await page.reload({ waitUntil: "domcontentloaded" });
   await waitFor(() => page.evaluate(() => document.body.dataset.homeStatus === "ready"), 15_000, "restored Home bootstrap");
   await waitFor(() => homeGuiFrame(page), 15_000, "refreshed real Home GUI frame");
   const restoredGui = homeGuiFrame(page);
   await waitFor(() => restoredGui.locator('.window[data-target="browser"]').isVisible(), 15_000, "restored Browser window");
   await waitFor(
-    () => browserFrame(page)?.url().includes("fixture_duplicate_open=1"),
+    () => browserFrame(page)?.url().includes(encodeURIComponent(browserRefreshedToken)),
     15_000,
     "restored real Browser frame",
   );
   const restoredBrowser = browserFrame(page);
   await waitFor(() => restoredBrowser.locator("#browser-form").isVisible(), 15_000, "restored Browser bootstrap");
   await waitFor(
-    () => state.browserStatusPolls > 0 && state.browserOpenCompleted,
+    () => state.browserPageStatusReads > 0 && state.browserDisplayAttachEffects === 1,
     15_000,
-    "completed coalesced Browser open",
+    "retained page status and fresh display attachment",
   );
   await restoredBrowser.waitForFunction(
-    () =>
-      document.querySelector("#browser-status .browser-status-message")?.textContent ===
-      "Remote display negotiated. Waiting for video...",
-    null,
+    (expectedPage) => document.body.dataset.loading === "false" &&
+      window.__elastosBrowserCurrentPageId === expectedPage,
+    pageId,
     { timeout: 15_000 },
   );
+  await waitFor(() => state.browserFastStatusReads > 0, 5_000, "restored page periodic status polling");
+  await restoredBrowser.waitForFunction(() => document.title.startsWith("Retained page after status poll"),
+    null, { timeout: 5_000 });
 
   const restoredWindowCount = await restoredGui
     .locator('.window[data-target="browser"]')
@@ -882,15 +968,26 @@ try {
   assert(state.homeGuiLaunches.restored === 1, "refresh loaded multiple GUI roots", state);
   assert(state.browserLaunches.placeholder === 1, "first Home replaced the Browser window", state);
   assert(state.browserLaunches.restored === 1, "refresh replaced the Browser window", state);
-  assert(state.browserOpenRequests === 2, "completed-open race did not issue two matching requests", state);
+  assert(state.browserOpenRequests === 0 && state.browserOpenBindings === 0 && state.browserOpenEffects === 0,
+    "Home reload opened a replacement for the retained page", state);
   assert(state.browserSummaryBindings > 0, "refreshed Browser summary was not instance-bound", state);
-  assert(state.browserOpenBindings === 2, "refreshed Browser opens were not instance-bound", state);
-  assert(state.browserOpenEffects === 1, "matching completed-open race duplicated provider work", state);
-  assert(state.browserCleanupEffects === 1, "opaque Home reload did not reap exactly one recovered page", state);
+  assert(state.browserCleanupEffects === 0, "Home reload reaped the retained page", state);
   assert(state.browserPageCount === 1, "restored Browser owns the wrong active page count", state);
   assert(state.browserVmCount === 1, "restored Browser owns the wrong active VM count", state);
-  assert(state.activeCleanupId === openedCleanupId, "restored Browser cleanup ownership is not recoverable", state);
-  assert(state.browserStatusPolls === 1, "restored Browser polled a replacement open job", state);
+  assert(state.activeCleanupId === recoveredCleanupId && state.activePageId === pageId,
+    "restored Browser changed page or cleanup ownership", state);
+  assert(state.browserStatusPolls === 0, "restored Browser polled a replacement open job", state);
+  assert(state.browserDisplayAttachRequests.length === 1 && state.browserDisplayAttachEffects === 1,
+    "restored Browser duplicated display attachment", state);
+  assert(state.browserSignals.some((signal) => signal.type === "answer" &&
+    signal.page_id === pageId && signal.display_generation === restoredDisplayGeneration),
+    "restored viewer did not answer under the new display generation", state);
+  assert(await restoredBrowser.locator("#browser-engine").inputValue() === retainedEngineId &&
+    await restoredBrowser.locator("#browser-exit").inputValue() === retainedExitId,
+    "retained nondefault Engine/Exit choices did not replace stale launch hints");
+  assert(await restoredBrowser.evaluate(() => window.__elastosBrowserCurrentPageId) === pageId &&
+    new URL(restoredBrowser.url()).searchParams.get("display_generation") === restoredDisplayGeneration,
+    "viewer did not publish its retained page and new display generation");
   assert(
     !/failed|could not open|did not start|error/i.test(restoredStatus || ""),
     "restored Browser rendered a false startup failure",
@@ -908,10 +1005,13 @@ try {
     await restoredTaskbarButton.getAttribute("data-open-windows") === "1",
     "restored Browser taskbar entry did not represent exactly one window",
   );
-  state.browserPageCount = 0;
-  state.browserVmCount = 0;
-  state.activeCleanupId = null;
-  state.browserReapedCleanupId = openedCleanupId;
+  await restoredGui.evaluate(() => {
+    window.addEventListener("message", (event) => {
+      if (event.data?.type === "elastos.browser.window-close.result/v1" && event.data.state === "terminal") {
+        window.__fixtureRetiredBrowserClose = { data: event.data, source: event.source, origin: event.origin };
+      }
+    });
+  });
   await restoredGui
     .locator('.window[data-target="browser"] [data-action="close"]')
     .click();
@@ -922,15 +1022,20 @@ try {
   );
   assert(
     await restoredGui.locator('.window[data-target="browser"]').count() === 1 &&
-      await restoredTaskbarButton.getAttribute("data-open-windows") === "1",
-    "nonterminal Browser close removed the shell or taskbar entry",
+      await restoredTaskbarButton.getAttribute("data-open-windows") === "1" &&
+      state.browserPageCount === 1 && state.browserVmCount === 1 &&
+      state.activeCleanupId === recoveredCleanupId && state.browserCleanupEffects === 0,
+    "nonterminal Browser close removed its shell, taskbar or Runtime ownership",
   );
+  await waitFor(() => state.browserWindowCloseRequests === 2, 5_000, "pending terminal close retry");
+  assert(await restoredGui.locator('.window[data-target="browser"]').count() === 1 &&
+    state.browserWindowCloseTerminalReceipts === 0, "pending close retry removed the shell before its receipt");
   releaseBrowserWindowCloseTerminal();
   await waitFor(
     async () =>
       await restoredGui.locator('.window[data-target="browser"]').count() === 0,
     10_000,
-    "delayed already-absent Browser window close",
+    "delayed terminal Browser window close",
   );
   const finalTaskbarButton = restoredGui.locator(
     '.taskbar-item[data-target="browser"]',
@@ -948,22 +1053,80 @@ try {
       state.browserPageCount === 0 &&
       state.browserVmCount === 0 &&
       state.activeCleanupId === null &&
-      state.browserReapedCleanupId === openedCleanupId &&
-      state.browserOpenRequests === 2 &&
-      state.browserOpenEffects === 1,
+      state.activePageId === null &&
+      state.browserReapedCleanupId === recoveredCleanupId &&
+      state.browserOpenRequests === 0 &&
+      state.browserOpenEffects === 0,
     "terminal Browser close duplicated work or retained Runtime residue",
     state,
   );
 
+  // The real Home taskbar opens a new window only after terminal close. The
+  // fetch shim duplicates that fresh request; fixture dedup is not gateway proof.
+  state.phase = "reopened";
+  assert(finalTaskbarCount === 1, "fixture Browser pin is missing from the Home taskbar");
+  await finalTaskbarButton.click();
+  await waitFor(() => state.browserLaunches.reopened === 1 && browserFrame(page),
+    15_000, "fresh Browser launched through Home");
+  const reopenedBrowser = browserFrame(page);
+  await waitFor(() => state.browserOpenCompleted && state.browserStatusPolls === 1,
+    15_000, "completed matching fresh-open requests");
+  await reopenedBrowser.waitForFunction(() =>
+    document.querySelector("#browser-status .browser-status-message")?.textContent ===
+    "Remote display negotiated. Waiting for video...", null, { timeout: 15_000 });
+  assert(state.browserOpenRequests === 2 && state.browserOpenBindings === 2 && state.browserOpenEffects === 1,
+    "matching fresh-open fixture requests duplicated effects or lost instance bindings", state);
+  assert(state.activePageId === reopenedPageId && state.activeCleanupId === openedCleanupId &&
+    state.browserPageCount === 1 && state.browserVmCount === 1 &&
+    state.reopenedBrowserInstanceId !== browserInstanceId,
+    "fresh Browser did not acquire distinct page, cleanup and window ownership", state);
+  assert(await reopenedBrowser.evaluate(() => window.__elastosBrowserCurrentPageId) === reopenedPageId &&
+    new URL(reopenedBrowser.url()).hash.includes(browserReopenedToken),
+    "fresh Browser did not use its new launch authority and page");
+  assert(await reopenedBrowser.locator("#browser-engine").inputValue() === "" &&
+    await reopenedBrowser.locator("#browser-exit").inputValue() === "",
+    "fresh Home launch did not retain its own Automatic Engine/local Exit choices");
+  const replayed = await restoredGui.evaluate(() => {
+    const retired = window.__fixtureRetiredBrowserClose;
+    if (!retired) return false;
+    window.dispatchEvent(new MessageEvent("message", retired));
+    return true;
+  });
+  assert(replayed, "fixture did not observe the original terminal close delivery");
+  assert(await restoredGui.locator('.window[data-target="browser"]').count() === 1 &&
+    page.frames().filter((frame) => frame.url().includes("/apps/browser/")).length === 1 &&
+    state.activePageId === reopenedPageId && state.activeCleanupId === openedCleanupId &&
+    state.browserWindowCloseRequests === 2,
+    "late retired close delivery changed the fresh Browser window or owner");
+  await restoredGui.locator('.window[data-target="browser"] [data-action="close"]').click();
+  await waitFor(async () => await restoredGui.locator('.window[data-target="browser"]').count() === 0,
+    10_000, "fresh Browser terminal cleanup");
+  assert(state.browserWindowCloseRequests === 3 && state.browserWindowCloseTerminalReceipts === 2 &&
+    state.browserCleanupEffects === 2 && state.browserPageCount === 0 && state.browserVmCount === 0 &&
+    state.activeCleanupId === null && state.activePageId === null &&
+    state.browserOpenRequests === 2 && state.browserOpenEffects === 1,
+    "fresh close duplicated work or retained Runtime residue", state);
+  assert(state.errors.length === 0 && pageErrors.length === 0,
+    "Home/Browser lifecycle recorded errors", { pageErrors, serverErrors: state.errors });
+
   console.log(
     "[home-browser-restored-lifecycle-headless] PASS " +
       `home_refresh=1 shell=${restoredWindowCount} frame=${restoredFrameCount} ` +
-      `open_requests=${state.browserOpenRequests} provider_effects=${state.browserOpenEffects} ` +
-      `cleanup_effects=${state.browserCleanupEffects} pages=${state.browserPageCount} ` +
-      `vms=${state.browserVmCount} recoverable_cleanup=1 delayed_close=1 ` +
+      `open_requests=${state.browserOpenRequests} fixture_open_effects=${state.browserOpenEffects} ` +
+      `fixture_cleanup_effects=${state.browserCleanupEffects} fixture_pages=${state.browserPageCount} ` +
+      `fixture_vms=${state.browserVmCount} retained_restore=1 display_attach=1 delayed_close=1 fresh_reopen=1 ` +
       `open_id=${openId}`,
   );
+} catch (error) {
+  const viewer = page ? await browserFrame(page)?.evaluate(() => ({
+    status: document.querySelector("#browser-status .browser-status-message")?.textContent,
+    loading: document.body.dataset.loading,
+    pageId: window.__elastosBrowserCurrentPageId,
+  })).catch(() => null) : null;
+  console.error("[home-browser-restored-lifecycle-headless] diagnostics", JSON.stringify({ state, pageErrors, viewer }));
+  throw error;
 } finally {
+  releaseBrowserWindowCloseTerminal();
   await browser?.close().catch(() => {});
   await new Promise((resolveClose) => server.close(resolveClose));
 }

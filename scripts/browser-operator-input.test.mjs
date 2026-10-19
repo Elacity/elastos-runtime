@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import test from "node:test";
 import vm from "node:vm";
 const source = fs.readFileSync(new URL("./browser-selkies-control-service.mjs", import.meta.url), "utf8");
@@ -221,4 +222,68 @@ test("actual CDP wrapper may connect before the first operator effect", async ()
     assert.equal((await h.input(h.event("type"))).accepted,true);
     assert.equal(effects(h).filter(c=>c.method === "Input.insertText").length,1);
   } finally {h.close();}
+});
+
+
+for (const action of ["type", "click"]) {
+  test(`actual HTTP input route preserves ${action} uncertainty after a lost effect ACK`, async t => {
+    const h = harness({ actualWrapper: true });
+    t.after(() => h.close());
+    await h.acquire();
+    let failed = false;
+    h.hook(async (method, params) => {
+      if (!failed && (action === "type" ? method === "Input.insertText"
+        : method === "Input.dispatchMouseEvent" && params.type === "mousePressed")) {
+        failed = true;
+        throw new Error("browser CDP WebSocket closed");
+      }
+    });
+    Object.assign(h.context, {
+      http, URL, pages: new Map([[h.page.pageId, h.page]]),
+      config: { signalTimeoutMs: 100 }, logControlEvent() {},
+    });
+    // Execute the actual HTTP handler, JSON reader and serializer. Only the
+    // owned CDP/native effect peer is a fixture; the failure follows dispatch.
+    vm.runInContext(
+      block("const DISPLAY_CONTROL_HTTP_STATUS =", "const DISPLAY_RENEGOTIATE_SIGNAL") +
+      block("const INSPECTION_HTTP_STATUS =", "function browserInspectionError") +
+      block("function httpJson(", "\nfunction readTail(") +
+      block("function readJsonRequest(", "\nexport class MinimalWebSocketClient") +
+      block("  const server = http.createServer(async (req, res) => {", "  server.on(\"clientError\"") +
+      "\nglobalThis.controlServer = server;", h.context);
+    const server = h.context.controlServer;
+    t.after(async () => {
+      server.closeAllConnections();
+      if (server.listening) await new Promise(resolve => server.close(resolve));
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    const endpoint = `http://127.0.0.1:${server.address().port}/pages/${encodeURIComponent(h.page.pageId)}/input`;
+    const event = h.event(action);
+    const post = input => fetch(endpoint, { method: "POST", body: JSON.stringify({ event: input }) });
+    const response = await post(event);
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      error: "Browser operator input could not complete.", code: "operator_outcome_uncertain",
+    });
+    const applied = () => effects(h).filter(call => action === "type"
+      ? call.method === "Input.insertText" : call.params.type === "mousePressed");
+    assert.equal(applied().length, 1, "the native effect can happen before its reply is lost");
+    const repeated = await post(event);
+    assert.notEqual(repeated.status, 200);
+    await repeated.json();
+    assert.equal(applied().length, 1, "an uncertain effect is never replayed");
+  });
+}
+
+test("actual HTTP error serialization keeps ordinary failures distinct from uncertainty", () => {
+  const start = source.indexOf("      const displayStatus = Object.hasOwn(DISPLAY_CONTROL_HTTP_STATUS");
+  const end = source.indexOf("\n    }\n  });", start);
+  assert.ok(start > 0 && end > start);
+  const responses = [];
+  const context = vm.createContext({ error: new Error("known failure"), Error,
+    DISPLAY_CONTROL_HTTP_STATUS: {}, INSPECTION_HTTP_STATUS: {},
+    httpJson: (_res, status, body) => responses.push({ status, body }), res: {},
+  });
+  vm.runInContext(source.slice(start, end), context);
+  assert.deepEqual(JSON.parse(JSON.stringify(responses)), [{ status: 500, body: { error: "known failure" } }]);
 });
