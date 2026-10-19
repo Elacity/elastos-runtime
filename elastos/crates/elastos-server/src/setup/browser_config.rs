@@ -352,7 +352,135 @@ fn retire_host(data: &Path, manifest: &super::ComponentsManifest) -> anyhow::Res
     if browser_installed {
         println!("Browser is not available on this computer yet.");
     }
+    #[cfg(target_os = "linux")]
+    if let Some(notice) =
+        earlier_linux_host_access(Path::new("/"), unsafe { libc::getuid() }, ROOT_UID)
+    {
+        println!("{notice}");
+    }
     Ok(())
+}
+
+/// The root-owned copy of scripts/browser-vm-linux-network.py that an earlier
+/// release's installer ran with sudo (scripts/install.sh, prepare_browser_linux_host).
+#[cfg(target_os = "linux")]
+const LINUX_HOST_HELPER: &str = "/usr/local/lib/elastos/browser-vm-linux-network.py";
+
+/// The interpreter the earlier installer ran the helper with.
+#[cfg(target_os = "linux")]
+const LINUX_HOST_PYTHON: &str = "/usr/bin/python3";
+
+/// The owner every path in the removal command must have.
+#[cfg(target_os = "linux")]
+const ROOT_UID: u32 = 0;
+
+/// An earlier installer could set up root-owned Browser host access for this
+/// account (KVM access, private network devices, a udev rule and a boot
+/// service). Setup runs as the Home user, so it does not remove that access.
+/// It changes nothing. It names the sudo removal command only when every path
+/// in that command, and the access record the removal reads, is a file that
+/// only `owner` (root) can change. Otherwise it names the files and no command.
+#[cfg(target_os = "linux")]
+fn earlier_linux_host_access(root: &Path, uid: u32, owner: u32) -> Option<String> {
+    let at = |path: &str| root.join(path.trim_start_matches('/'));
+    let state = format!("/var/lib/elastos-browser/{uid}.json");
+    let leftovers: Vec<String> = [
+        format!("/etc/systemd/system/elastos-browser-network-{uid}.service"),
+        format!("/etc/udev/rules.d/70-elastos-browser-kvm-{uid}.rules"),
+        state.clone(),
+    ]
+    .into_iter()
+    .filter(|path| at(path).symlink_metadata().is_ok())
+    .collect();
+    if leftovers.is_empty() {
+        return None;
+    }
+    // The helper's removal needs its saved KVM access record (the state file).
+    if root_only_file(root, &at(LINUX_HOST_HELPER), owner)
+        && root_only_file(root, &at(&state), owner)
+        && root_only_program(root, LINUX_HOST_PYTHON, owner)
+    {
+        return Some(format!(
+            "An earlier ElastOS release set up Browser access for your account on this computer: KVM access, private network devices and a boot service. Browser is not available on this computer yet, so this access is not in use. To remove it, run this command and confirm:\n  sudo {LINUX_HOST_PYTHON} -I {LINUX_HOST_HELPER} remove --user \"$(id -un)\""
+        ));
+    }
+    Some(format!(
+        "An earlier ElastOS release left Browser access files for your account on this computer: {}. Browser is not available on this computer yet. An administrator can remove these files.",
+        leftovers.join(", ")
+    ))
+}
+
+/// True when `meta` belongs to `owner` and no group or other user can write it.
+/// The helper's own trusted_path applies the same rule.
+#[cfg(target_os = "linux")]
+fn only_owner_writes(meta: &fs::Metadata, owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.uid() == owner && meta.mode() & 0o022 == 0
+}
+
+/// True when every folder above `path`, up to and including `root`, is a real
+/// folder (not a link) that only `owner` can change.
+#[cfg(target_os = "linux")]
+fn root_only_folders(root: &Path, path: &Path, owner: u32) -> bool {
+    path.ancestors()
+        .skip(1)
+        .take_while(|folder| folder.starts_with(root))
+        .all(|folder| {
+            folder
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.is_dir() && only_owner_writes(&meta, owner))
+        })
+}
+
+/// True when `path` is a regular file (not a link) with no set-id or sticky
+/// bit that only `owner` can change, in folders only `owner` can change.
+#[cfg(target_os = "linux")]
+fn root_only_file(root: &Path, path: &Path, owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    root_only_folders(root, path, owner)
+        && path.symlink_metadata().is_ok_and(|meta| {
+            meta.is_file() && meta.mode() & 0o7000 == 0 && only_owner_writes(&meta, owner)
+        })
+}
+
+/// True when `program` resolves, through at most eight links that `owner`
+/// owns in folders only `owner` can change, to an executable regular file
+/// that only `owner` can change. A link target with `..` is refused.
+#[cfg(target_os = "linux")]
+fn root_only_program(root: &Path, program: &str, owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mut path = root.join(program.trim_start_matches('/'));
+    for _ in 0..8 {
+        if !root_only_folders(root, &path, owner) {
+            return false;
+        }
+        let Ok(meta) = path.symlink_metadata() else {
+            return false;
+        };
+        if !meta.file_type().is_symlink() {
+            return root_only_file(root, &path, owner) && meta.mode() & 0o100 != 0;
+        }
+        if meta.uid() != owner {
+            return false;
+        }
+        let Ok(target) = fs::read_link(&path) else {
+            return false;
+        };
+        if target
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        path = match target.strip_prefix("/") {
+            Ok(absolute) => root.join(absolute),
+            Err(_) => match path.parent() {
+                Some(folder) => folder.join(target),
+                None => return false,
+            },
+        };
+    }
+    false
 }
 
 /// True when the data directory and every folder from it down to `relative`'s
@@ -933,6 +1061,262 @@ mod tests {
             .is_symlink());
         // Paths under real folders are still removed.
         assert!(!data.join("scripts/browser-vm-linux-network.py").exists());
+    }
+
+    /// Lays out an earlier release's Browser host access for uid 1000 under
+    /// `root`, as its installer and helper wrote it: folders 0755, the helper
+    /// and the interpreter 0755, the access record 0644, and /usr/bin/python3 a
+    /// link to the interpreter. Everything belongs to the test process.
+    #[cfg(target_os = "linux")]
+    fn earlier_linux_host_layout(root: &Path) {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let place = |path: &str, mode: u32| {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"root-owned fixture").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        place("usr/local/lib/elastos/browser-vm-linux-network.py", 0o755);
+        place("usr/bin/python3.12", 0o755);
+        symlink("python3.12", root.join("usr/bin/python3")).unwrap();
+        place(
+            "etc/systemd/system/elastos-browser-network-1000.service",
+            0o644,
+        );
+        place("etc/udev/rules.d/70-elastos-browser-kvm-1000.rules", 0o644);
+        place("var/lib/elastos-browser/1000.json", 0o644);
+        // The umask must not decide the folder modes.
+        for folder in [
+            "usr",
+            "usr/local",
+            "usr/local/lib",
+            "usr/local/lib/elastos",
+            "usr/bin",
+            "etc",
+            "etc/systemd",
+            "etc/systemd/system",
+            "etc/udev",
+            "etc/udev/rules.d",
+            "var",
+            "var/lib",
+            "var/lib/elastos-browser",
+        ] {
+            fs::set_permissions(root.join(folder), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// A named change to `earlier_linux_host_layout`.
+    #[cfg(target_os = "linux")]
+    type LayoutChange = (&'static str, fn(&Path));
+
+    #[cfg(target_os = "linux")]
+    fn set_mode(root: &Path, path: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.join(path), fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_owner() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn names_sudo(root: &Path, owner: u32) -> bool {
+        earlier_linux_host_access(root, 1000, owner)
+            .unwrap()
+            .contains("sudo")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn earlier_linux_host_access_names_its_exact_removal_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let owner = test_owner();
+        // A fresh host, or another account's setup, needs no notice.
+        assert_eq!(earlier_linux_host_access(root, 1000, owner), None);
+        earlier_linux_host_layout(root);
+        assert_eq!(earlier_linux_host_access(root, 1001, owner), None);
+        // This account's setup, with every path owned by `owner`, gets the
+        // helper's own removal command.
+        let notice = earlier_linux_host_access(root, 1000, owner).unwrap();
+        assert!(notice.contains("Browser is not available on this computer yet"));
+        assert!(notice.ends_with(
+            "\n  sudo /usr/bin/python3 -I /usr/local/lib/elastos/browser-vm-linux-network.py remove --user \"$(id -un)\""
+        ));
+        // The notice only reads; every file stays.
+        assert!(root.join("var/lib/elastos-browser/1000.json").is_file());
+        // Without the helper or its access record the command would fail, so
+        // the notice names the files instead.
+        fs::remove_file(root.join("var/lib/elastos-browser/1000.json")).unwrap();
+        let notice = earlier_linux_host_access(root, 1000, owner).unwrap();
+        assert!(!notice.contains("sudo"));
+        assert!(notice.contains("/etc/systemd/system/elastos-browser-network-1000.service, /etc/udev/rules.d/70-elastos-browser-kvm-1000.rules"));
+        fs::write(root.join("var/lib/elastos-browser/1000.json"), b"{}").unwrap();
+        fs::set_permissions(
+            root.join("var/lib/elastos-browser/1000.json"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(names_sudo(root, owner));
+        fs::remove_file(root.join("usr/local/lib/elastos/browser-vm-linux-network.py")).unwrap();
+        assert!(!names_sudo(root, owner));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn earlier_linux_host_access_names_no_sudo_command_for_files_root_does_not_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        earlier_linux_host_layout(root);
+        let owner = test_owner();
+        assert!(names_sudo(root, owner));
+        if owner == ROOT_UID {
+            // Each path in turn, given to uid 1000, loses the command.
+            let named_sudo: Vec<String> = [
+                "usr/local/lib/elastos/browser-vm-linux-network.py",
+                "usr/local/lib/elastos",
+                "usr/local",
+                "var/lib/elastos-browser/1000.json",
+                "var/lib/elastos-browser",
+                "usr/bin/python3",
+                "usr/bin/python3.12",
+                "usr/bin",
+                "",
+            ]
+            .into_iter()
+            .filter(|path| {
+                let path = root.join(path);
+                std::os::unix::fs::lchown(&path, Some(1000), None).unwrap();
+                let named = names_sudo(root, ROOT_UID);
+                std::os::unix::fs::lchown(&path, Some(ROOT_UID), None).unwrap();
+                named
+            })
+            .map(|path| format!("/{path}"))
+            .collect();
+            assert!(named_sudo.is_empty(), "sudo command named: {named_sudo:?}");
+            assert!(names_sudo(root, ROOT_UID));
+        } else {
+            // The test's files are ordinary user files: no sudo command.
+            assert!(!names_sudo(root, ROOT_UID));
+            eprintln!(
+                "skipped the per-path chown cases: only uid 0 can give a file to another account"
+            );
+        }
+        // Files that belong to another account get no sudo command.
+        assert!(!names_sudo(root, owner.wrapping_add(1)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn earlier_linux_host_access_names_no_sudo_command_through_a_link() {
+        use std::os::unix::fs::symlink;
+        let owner = test_owner();
+        let cases: [LayoutChange; 6] = [
+            ("helper is a link", |root| {
+                let helper = root.join("usr/local/lib/elastos/browser-vm-linux-network.py");
+                fs::rename(&helper, root.join("usr/local/lib/elastos/real.py")).unwrap();
+                symlink("real.py", &helper).unwrap();
+            }),
+            ("access record is a link", |root| {
+                let state = root.join("var/lib/elastos-browser/1000.json");
+                fs::rename(&state, root.join("var/lib/elastos-browser/real.json")).unwrap();
+                symlink("real.json", &state).unwrap();
+            }),
+            ("helper folder is a link", |root| {
+                fs::rename(
+                    root.join("usr/local/lib/elastos"),
+                    root.join("usr/local/lib/real"),
+                )
+                .unwrap();
+                symlink("real", root.join("usr/local/lib/elastos")).unwrap();
+            }),
+            ("a higher helper folder is a link", |root| {
+                fs::rename(root.join("usr/local"), root.join("usr/real")).unwrap();
+                symlink("real", root.join("usr/local")).unwrap();
+            }),
+            ("interpreter link leaves its folder with ..", |root| {
+                fs::remove_file(root.join("usr/bin/python3")).unwrap();
+                symlink("../bin/python3.12", root.join("usr/bin/python3")).unwrap();
+            }),
+            ("interpreter links in a loop", |root| {
+                fs::remove_file(root.join("usr/bin/python3")).unwrap();
+                symlink("python3", root.join("usr/bin/python3")).unwrap();
+            }),
+        ];
+        let named_sudo: Vec<&str> = cases
+            .into_iter()
+            .filter(|(_, change)| {
+                let temp = tempfile::tempdir().unwrap();
+                earlier_linux_host_layout(temp.path());
+                change(temp.path());
+                names_sudo(temp.path(), owner)
+            })
+            .map(|(name, _)| name)
+            .collect();
+        assert!(named_sudo.is_empty(), "sudo command named: {named_sudo:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn earlier_linux_host_access_names_no_sudo_command_for_a_wrong_type_or_mode() {
+        let owner = test_owner();
+        let cases: [LayoutChange; 9] = [
+            ("helper is a folder", |root| {
+                let helper = root.join("usr/local/lib/elastos/browser-vm-linux-network.py");
+                fs::remove_file(&helper).unwrap();
+                fs::create_dir(&helper).unwrap();
+            }),
+            ("access record is a folder", |root| {
+                let state = root.join("var/lib/elastos-browser/1000.json");
+                fs::remove_file(&state).unwrap();
+                fs::create_dir(&state).unwrap();
+            }),
+            ("helper is group-writable", |root| {
+                set_mode(
+                    root,
+                    "usr/local/lib/elastos/browser-vm-linux-network.py",
+                    0o775,
+                )
+            }),
+            ("helper is writable by others", |root| {
+                set_mode(
+                    root,
+                    "usr/local/lib/elastos/browser-vm-linux-network.py",
+                    0o757,
+                )
+            }),
+            ("helper is set-user-id", |root| {
+                set_mode(
+                    root,
+                    "usr/local/lib/elastos/browser-vm-linux-network.py",
+                    0o4755,
+                )
+            }),
+            ("access record is writable by others", |root| {
+                set_mode(root, "var/lib/elastos-browser/1000.json", 0o666)
+            }),
+            ("helper folder is writable by others", |root| {
+                set_mode(root, "usr/local/lib/elastos", 0o777)
+            }),
+            ("interpreter is not executable", |root| {
+                set_mode(root, "usr/bin/python3.12", 0o644)
+            }),
+            ("interpreter folder is group-writable", |root| {
+                set_mode(root, "usr/bin", 0o775)
+            }),
+        ];
+        let named_sudo: Vec<&str> = cases
+            .into_iter()
+            .filter(|(_, change)| {
+                let temp = tempfile::tempdir().unwrap();
+                earlier_linux_host_layout(temp.path());
+                change(temp.path());
+                names_sudo(temp.path(), owner)
+            })
+            .map(|(name, _)| name)
+            .collect();
+        assert!(named_sudo.is_empty(), "sudo command named: {named_sudo:?}");
     }
 
     #[test]
