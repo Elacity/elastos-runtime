@@ -156,6 +156,8 @@ function createActiveAuthorityExpiryHarness(surface) {
     unloadCleanupStarted: false,
     pageHeartbeatTimer: 0,
     pageStatusTimer: 0,
+    pageStatusPollingRun: null,
+    pageHeartbeatRun: null,
     relaunchRequested: false,
     browserAuthorityRenewal: null,
     browserAuthorityRenewalRetryTimer: 0,
@@ -186,12 +188,14 @@ function createActiveAuthorityExpiryHarness(surface) {
     friendlyOpenError,
     showStatus() {},
     stopPageStatusPolling() {
+      context.pageStatusPollingRun = null;
       for (const [id, timer] of timers) {
         if (timer.delay !== 60_000) timers.delete(id);
       }
       context.pageStatusTimer = 0;
     },
     stopPageHeartbeat() {
+      context.pageHeartbeatRun = null;
       for (const [id, timer] of timers) {
         if (timer.delay === 60_000) timers.delete(id);
       }
