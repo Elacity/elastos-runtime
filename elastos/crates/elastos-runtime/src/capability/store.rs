@@ -20,6 +20,19 @@ struct EpochFileLock(fs::File);
 
 impl EpochFileLock {
     fn acquire(path: &Path, initialize: bool) -> std::io::Result<(Self, bool)> {
+        Self::acquire_inner(path, initialize).map_err(|error| {
+            std::io::Error::new(error.kind(), format!(
+                "Capability store refused: cannot acquire revocation epoch lock at {}: {error}. \
+                 Stop all Runtime processes that share this data directory and preserve the capability store. \
+                 Check directory ownership, permissions, and filesystem lock support. \
+                 Keep the epoch and lock files in place; retry after repairing access. \
+                 If repair is uncertain, keep Runtime stopped and seek recovery help.",
+                path.join("epoch.lock").display()
+            ))
+        })
+    }
+
+    fn acquire_inner(path: &Path, initialize: bool) -> std::io::Result<(Self, bool)> {
         let lock_path = path.join("epoch.lock");
         let mut options = fs::OpenOptions::new();
         options.read(true).write(true);
@@ -318,7 +331,7 @@ impl CapabilityStore {
                         return Err(std::io::Error::new(error.kind(), format!(
                             "Capability store startup refused: cannot load revocation epoch at {}: {error}. \
                              Stop all Runtime processes that share this data directory and preserve the capability store. \
-                             Restore the latest committed epoch from trusted valid state. \
+                             Restore a valid unsigned 64-bit epoch at or above the latest committed epoch established from trusted valid state. \
                              If that value cannot be established, keep Runtime stopped and seek recovery help.",
                             path.join("epoch").display()
                         )));
@@ -689,8 +702,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_or_invalid_epoch_fails_closed_until_repaired() {
+    async fn test_epoch_lock_failure_preserves_state_and_explains_recovery() {
         for missing in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CapabilityStore::with_persistence(directory.path())
+                .await
+                .unwrap();
+            assert_eq!(store.advance_epoch().unwrap(), 1);
+            let epoch_path = directory.path().join("epoch");
+            let lock_path = directory.path().join("epoch.lock");
+            fs::remove_file(&lock_path).unwrap();
+            if !missing {
+                fs::create_dir(&lock_path).unwrap();
+            }
+            let expected_kind = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap_err()
+                .kind();
+            let mut errors = vec![
+                store.advance_epoch().unwrap_err(),
+                store.persist().await.unwrap_err(),
+            ];
+            if !missing {
+                errors.push(
+                    CapabilityStore::with_persistence(directory.path())
+                        .await
+                        .err()
+                        .expect("startup must refuse an unusable epoch lock"),
+                );
+            }
+            for error in errors {
+                assert_eq!(error.kind(), expected_kind);
+                let message = error.to_string();
+                assert!(
+                    message.contains("cannot acquire revocation epoch lock"),
+                    "epoch lock failure needs context: {message}"
+                );
+                assert!(
+                    message.contains(&lock_path.display().to_string()),
+                    "{message}"
+                );
+                assert!(message.contains("Stop all Runtime processes"), "{message}");
+                assert!(
+                    message.contains("preserve the capability store"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("ownership, permissions, and filesystem lock support"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("Keep the epoch and lock files in place"),
+                    "{message}"
+                );
+            }
+            assert_eq!(store.current_epoch(), 1);
+            assert_eq!(fs::read_to_string(&epoch_path).unwrap(), "1");
+            assert_eq!(lock_path.exists(), !missing);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_missing_or_invalid_epoch_fails_closed_until_repaired() {
+        for (missing, repaired_epoch) in [(true, 7_u64), (false, 7), (true, 9), (false, 9)] {
             let directory = tempfile::tempdir().unwrap();
             let store = CapabilityStore::with_persistence(directory.path())
                 .await
@@ -699,7 +775,7 @@ mod tests {
                 store.advance_epoch().unwrap();
             }
             let epoch_path = directory.path().join("epoch");
-            let trusted_epoch = fs::read(&epoch_path).unwrap();
+            let trusted_epoch: u64 = fs::read_to_string(&epoch_path).unwrap().parse().unwrap();
             if missing {
                 fs::remove_file(&epoch_path).unwrap();
             } else {
@@ -735,7 +811,7 @@ mod tests {
                 "{message}"
             );
             assert!(
-                message.contains("Restore the latest committed epoch from trusted valid state"),
+                message.contains("Restore a valid unsigned 64-bit epoch at or above the latest committed epoch established from trusted valid state"),
                 "{message}"
             );
             assert!(
@@ -751,15 +827,18 @@ mod tests {
             assert_eq!(store.current_epoch(), 7);
             drop(store);
 
-            // Restore the last committed value from this fixture's trusted state.
-            fs::write(&epoch_path, trusted_epoch).unwrap();
+            // The fixture's latest trusted epoch is the lower bound for repair.
+            assert!(repaired_epoch >= trusted_epoch);
+            fs::write(&epoch_path, repaired_epoch.to_string()).unwrap();
             let repaired = CapabilityStore::with_persistence(directory.path())
                 .await
                 .unwrap();
-            assert_eq!(repaired.current_epoch(), 7);
-            assert!(!repaired.is_epoch_valid(6));
-            assert!(repaired.is_epoch_valid(7));
-            assert_eq!(repaired.advance_epoch().unwrap(), 8);
+            assert_eq!(repaired.current_epoch(), repaired_epoch);
+            for revoked_epoch in 0..repaired_epoch {
+                assert!(!repaired.is_epoch_valid(revoked_epoch));
+            }
+            assert!(repaired.is_epoch_valid(repaired_epoch));
+            assert_eq!(repaired.advance_epoch().unwrap(), repaired_epoch + 1);
         }
     }
 

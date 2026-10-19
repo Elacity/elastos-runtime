@@ -76,11 +76,13 @@ key, so resolve signing-key warnings before relying on authority across restarts
 An established capability store requires a readable, valid epoch at startup.
 Capability validation also fails closed when that epoch is unavailable or
 invalid. For recovery, stop all Runtime processes using the affected data home and preserve
-the capability store. Restore valid state with its latest committed epoch from
-trusted, current recovery data. Keep the epoch and lock files; resetting the
-epoch or deleting the store can discard committed revocations. If the latest
-committed epoch cannot be established, obtain recovery assistance before
-starting Runtime.
+the capability store. Restore a valid unsigned 64-bit epoch at or above the
+latest committed epoch established from trusted, current recovery data. A higher
+epoch preserves committed revocations and can invalidate additional tokens; the
+maximum value leaves no room for another epoch advance. Keep the epoch and lock
+files; resetting the epoch or deleting the store can discard committed
+revocations. If the latest committed epoch cannot be established, obtain
+recovery assistance before starting Runtime.
 
 ## Open Findings
 

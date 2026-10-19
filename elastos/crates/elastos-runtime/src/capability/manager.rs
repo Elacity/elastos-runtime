@@ -670,7 +670,7 @@ impl CapabilityManager {
         self.audit_log.security_warning(
             "signing_key_rotated",
             &format!(
-                "Signing key rotated (reason: {}). Epoch advanced {} → {}. All prior tokens invalidated.",
+                "Signing key rotated (reason: {}). Epoch advanced {} → {}; tokens from earlier epochs are rejected. Other Runtime processes using this data directory require restart to load the new key.",
                 reason, old_epoch, new_epoch
             ),
         );
@@ -999,6 +999,28 @@ mod tests {
             .unwrap();
         assert_ne!(replacement, original_key);
         assert_eq!(reloaded.current_epoch(), 2);
+        let rotation_details = reloaded
+            .audit_log()
+            .recent_events(100)
+            .into_iter()
+            .find_map(|event| match event {
+                crate::primitives::audit::AuditEvent::SecurityWarning {
+                    warning_type,
+                    details,
+                    ..
+                } if warning_type == "signing_key_rotated" => Some(details),
+                _ => None,
+            })
+            .expect("successful rotation must state its scope in the audit log");
+        assert!(rotation_details.contains("Epoch advanced 1 → 2"));
+        assert!(
+            rotation_details.contains("tokens from earlier epochs are rejected"),
+            "rotation audit must scope epoch rejection: {rotation_details}"
+        );
+        assert!(rotation_details.contains(
+            "Other Runtime processes using this data directory require restart to load the new key"
+        ));
+        assert!(!rotation_details.contains("All prior tokens invalidated"));
         let persisted = CapabilityManager::load_or_generate(
             directory.path(),
             Arc::new(
