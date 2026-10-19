@@ -6740,13 +6740,13 @@ async fn test_home_background_from_object_legacy_check_is_bounded() {
         Err(crate::library::DesktopBackgroundSourceRefusal::CheckUnfinished)
     );
     // A source no request may read whole can never be checked: fail closed.
-    assert!(matches!(
+    assert_eq!(
         read(crate::library::ProtectionCheckBudget {
             legacy_bytes: 16,
             ..full
         }),
-        Err(crate::library::DesktopBackgroundSourceRefusal::ProtectedFileNotInPlace { .. })
-    ));
+        Err(crate::library::DesktopBackgroundSourceRefusal::OlderProtectedFileUncheckable)
+    );
     assert_eq!(
         read(crate::library::ProtectionCheckBudget {
             deadline: now,
@@ -6782,7 +6782,8 @@ async fn test_home_background_from_object_legacy_check_is_bounded() {
 /// A legacy record whose file was changed after it was published: the file
 /// no longer has the record's CID, so its bytes say nothing about the
 /// protected bytes. Nothing is kept, and every picture is refused with the
-/// recovery message, including a copy of the original protected bytes.
+/// older-protected-file message (the file is in place, so "move it back"
+/// would be wrong), including a copy of the original protected bytes.
 #[tokio::test]
 async fn test_home_background_from_object_legacy_record_changed_after_publish_keeps_nothing() {
     let library = LegacyProtectedLibrary::new(legacy_key_release_security());
@@ -6797,9 +6798,7 @@ async fn test_home_background_from_object_legacy_record_changed_after_publish_ke
         "Pictures/legacy.png",
         &test_png_picture(800, 600, b"changed-after-publish"),
     );
-    let recovery = "Library cannot check your protected file \"legacy.png\" because it is not in \"Pictures\". \
-         Move it back to \"Pictures\", then try again. \
-         Or upload the picture in System > Background > Choose image.";
+    let recovery = OLDER_PROTECTED_FILE_MESSAGE;
 
     let (status, text) = library.set(&copy_uri).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "copy: {text}");
@@ -6827,23 +6826,49 @@ async fn test_home_background_from_object_legacy_record_changed_after_publish_ke
     assert!(text.contains("protected content cannot be"), "{text}");
 }
 
+/// The refusal for an older protected record (no saved hash) that no file
+/// can prove. Team decision: plain, and no "move it back" step.
+const OLDER_PROTECTED_FILE_MESSAGE: &str =
+    "ElastOS cannot check an older protected file. To use this picture, upload it in System > Background.";
+
 /// A legacy custody record names the CID of its encrypted payload, so without
 /// custody's journal its file cannot prove which bytes were protected, even
-/// unchanged and in place. Nothing is kept and every picture is refused.
+/// unchanged and in place. Nothing is kept and every picture is refused with
+/// the older-protected-file message, never the "move it back" one.
 #[tokio::test]
 async fn test_home_background_from_object_legacy_custody_record_without_journal_fails_closed() {
     let library = LegacyProtectedLibrary::new(legacy_custody_security());
     let (status, text) = library.set(&library.other_uri).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
-    assert!(
-        text.starts_with("Library cannot check your protected file \"legacy.png\""),
-        "{text}"
-    );
-    assert!(
-        text.contains("Or upload the picture in System > Background > Choose image."),
-        "{text}"
-    );
+    assert_eq!(text, OLDER_PROTECTED_FILE_MESSAGE);
+    assert!(!text.contains("Move it back"), "{text}");
     assert_eq!(library.recorded_digest(), None);
+}
+
+/// An older record no file can prove blocks every picture whatever is moved
+/// back, so its message wins over the "move it back" one for a moved record.
+#[tokio::test]
+async fn test_home_background_from_object_older_protected_file_message_comes_before_move_back() {
+    let library = LegacyProtectedLibrary::new(legacy_custody_security());
+    let moved = test_png_picture(800, 600, b"moved-legacy");
+    let moved_uri = write_home_principal_object_bytes_for_authority(
+        &library.data_dir,
+        &library.admin,
+        "Pictures/moved.png",
+        &moved,
+    );
+    crate::library::write_test_legacy_publish_record(
+        &library.data_dir,
+        &library.admin.principal_id,
+        &moved_uri,
+        legacy_key_release_security(),
+        &moved,
+    );
+    library.op(serde_json::json!({ "op": "trash", "uri": moved_uri }));
+    let (status, text) = library.set(&library.other_uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert_eq!(text, OLDER_PROTECTED_FILE_MESSAGE);
+    assert!(!text.contains("Move it back"), "{text}");
 }
 
 /// A check that answers after the handler gave up (its timeout passed) saves

@@ -56,12 +56,19 @@ pub(crate) enum DesktopBackgroundSourceRefusal {
     /// request's limits. Digests found so far are kept, so a retry goes on.
     CheckUnfinished,
     /// A protected record written before records named their digest, whose
-    /// file is no longer where the record says. Its bytes are unknown.
+    /// file is no longer where the record says. Its bytes are unknown, and
+    /// moving the file back lets the check find them.
     ProtectedFileNotInPlace {
         name: String,
         folder: String,
         others: usize,
     },
+    /// A protected record written before records named their digest whose
+    /// bytes no file can prove: a custody record with no digest in custody's
+    /// journal, a file changed since it was published (or published in a
+    /// form this check does not compute), or a file too large for any one
+    /// request to read. Moving a file does not help.
+    OlderProtectedFileUncheckable,
     Unreadable,
 }
 
@@ -98,6 +105,9 @@ impl DesktopBackgroundSourceRefusal {
                      Move it back to \"{folder}\", then try again.{more} \
                      Or upload the picture in System > Background > Choose image."
                 ));
+            }
+            Self::OlderProtectedFileUncheckable => {
+                "ElastOS cannot check an older protected file. To use this picture, upload it in System > Background."
             }
             Self::Unreadable => "background image source could not be read",
         })
@@ -398,6 +408,7 @@ fn require_unprotected(
         found,
     };
     let mut not_in_place: Vec<&super::LibraryPublishRecord> = Vec::new();
+    let mut uncheckable = false;
     for stored in records
         .iter()
         .filter(|stored| is_protected(&stored.record.content_security))
@@ -410,11 +421,20 @@ fn require_unprotected(
                     not_in_place.push(&stored.record);
                     Vec::new()
                 }
+                LegacySource::Uncheckable => {
+                    uncheckable = true;
+                    Vec::new()
+                }
             },
         };
         if source_digests.contains(&digest) {
             return Err(Refusal::Protected);
         }
+    }
+    // An older record no file can prove blocks every picture whatever is
+    // moved back, so its message comes first.
+    if uncheckable {
+        return Err(Refusal::OlderProtectedFileUncheckable);
     }
     if let Some(first) = not_in_place.first() {
         let (name, folder) = display_location(localhost_root, &first.object_uri);
@@ -432,10 +452,13 @@ fn require_unprotected(
 enum LegacySource {
     /// The protected bytes have one of these digests.
     Digests(Vec<String>),
-    /// No file proves the protected bytes: the record's file is not where the
-    /// record says, or it no longer has the record's published CID, and
-    /// custody has no digest for it. Its bytes are unknown.
+    /// The record's file is not where the record says (or is not a regular
+    /// file there). Its bytes are unknown until the file is moved back.
     NotInPlace,
+    /// No file can prove the protected bytes: a custody record with no digest
+    /// in custody's journal, a file that no longer has the record's published
+    /// CID, or one no request may read whole. Its bytes are unknown.
+    Uncheckable,
 }
 
 /// Finds the protected bytes of legacy records within one request's budget.
@@ -476,7 +499,7 @@ impl LegacyCheck<'_> {
             }
             // A custody record's CID names its encrypted payload, so no
             // plaintext file can match it: the file proves nothing.
-            return Ok(LegacySource::NotInPlace);
+            return Ok(LegacySource::Uncheckable);
         }
         // Otherwise the record's own file is the evidence left, but only
         // while it still holds the bytes that were published.
@@ -496,7 +519,7 @@ impl LegacyCheck<'_> {
         }
         // A file that no request may read whole can never be checked.
         if metadata.len() > self.budget.legacy_bytes {
-            return Ok(LegacySource::NotInPlace);
+            return Ok(LegacySource::Uncheckable);
         }
         if self.sources_hashed >= self.budget.legacy_sources
             || self.bytes_read.saturating_add(metadata.len()) > self.budget.legacy_bytes
@@ -520,7 +543,7 @@ impl LegacyCheck<'_> {
         if super::plain_publish_cid::plain_publish_file_cid(&bytes).as_deref()
             != Some(record.cid.as_str())
         {
-            return Ok(LegacySource::NotInPlace);
+            return Ok(LegacySource::Uncheckable);
         }
         let digest = super::content_sha256_label(&bytes);
         self.found.push(FoundSourceDigest {
