@@ -296,6 +296,12 @@ import pathlib
 import sys
 
 if os.environ.get("ELASTOS_SMOKE_FAIL_UPGRADE") == "1":
+    print("migrating Documents")
+    print(
+        "Error: Documents/large.bin is not encrypted and is 17 MiB. Move it out of "
+        + sys.argv[sys.argv.index("--data-dir") + 1]
+        + "/Users/x/Documents and try again."
+    )
     raise SystemExit(41)
 empty_receipt = os.environ.get("ELASTOS_SMOKE_EMPTY_UPGRADE_RECEIPT")
 if empty_receipt is not None:
@@ -714,6 +720,18 @@ def linux_active_proof(base):
         raise AssertionError("failed readiness retained its PID file")
     if "home_readiness_parity_failed" not in failed_result.stderr:
         raise AssertionError("failed readiness did not reach Home parity")
+
+    refused = Fixture(base, "refused-upgrade")
+    refused_result = refused.run(env=refused.environment(ELASTOS_SMOKE_FAIL_UPGRADE="1"), ok=False)
+    expected_line = (
+        "linux-source-home-restart: Error: Documents/large.bin is not encrypted and is 17 MiB. "
+        "Move it out of <data-dir>/Users/x/Documents and try again."
+    )
+    if expected_line not in refused_result.stderr:
+        raise AssertionError(f"refused upgrade did not print its redacted Error: line: {refused_result.stderr!r}")
+    unredacted = refused_result.stderr.replace("<data-dir>/Users/x/Documents", "")
+    if "migrating Documents" in refused_result.stderr or "/Users/x/Documents" in unredacted:
+        raise AssertionError("refused upgrade printed more than its redacted Error: line")
 
     unsafe_fifo = Fixture(base, "unsafe-rollback-fifo")
     fifo = unsafe_fifo.run(
