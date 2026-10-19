@@ -28,6 +28,70 @@ pub(crate) const CACHED_ARTIFACT_SHA_FILE: &str = ".elastos-artifact-sha256";
 const CACHED_EXECUTABLE_SHA_FILE: &str = ".elastos-executable-sha256";
 const PROVIDER_ICON_SIZES: [u16; 4] = [32, 64, 128, 256];
 
+// ── Directory creation with explicit safe modes ──────────────────────────
+
+#[cfg(unix)]
+pub fn create_data_directory_with_safe_modes(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+    // Create each missing ancestor with mode 0755, then the final directory with 0700.
+    // Existing directories are left unchanged.
+
+    // First, ensure the final path doesn't exist, or return early if it does
+    if path.exists() {
+        return Ok(());
+    }
+
+    // Collect ancestors (excluding the final path) that need to be created
+    let mut ancestors = Vec::new();
+    if let Some(parent) = path.parent() {
+        let mut current = parent;
+        loop {
+            if !current.exists() {
+                ancestors.push(current);
+                match current.parent() {
+                    Some(p) => current = p,
+                    None => break,
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Create ancestors with mode 0755 (owner rwx, group rx, other rx)
+    for ancestor in ancestors.iter().rev() {
+        if !ancestor.exists() {
+            fs::DirBuilder::new()
+                .mode(0o755)
+                .create(ancestor)
+                .with_context(|| {
+                    format!(
+                        "Failed to create ancestor directory: {}",
+                        ancestor.display()
+                    )
+                })?;
+        }
+    }
+
+    // Create the final data directory with mode 0700 (owner rwx only)
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .with_context(|| format!("Failed to create data directory: {}", path.display()))?;
+    // Explicitly set permissions to ensure the mode is correct even if umask interfered
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn create_data_directory_with_safe_modes(path: &Path) -> anyhow::Result<()> {
+    // On non-Unix platforms, use the standard create_dir_all
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+
 // ── Manifest types ──────────────────────────────────────────────────
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -281,7 +345,7 @@ async fn run_with_data_dir(
     let _fresh = if list || _writer.is_some() {
         None
     } else {
-        fs::create_dir_all(&data_dir)?;
+        create_data_directory_with_safe_modes(&data_dir)?;
         Some(crate::install_transaction::InstallationGuard::acquire(
             &fs::canonicalize(&data_dir)?,
         )?)
@@ -2928,7 +2992,7 @@ pub fn write_installed_manifest(
 ) -> anyhow::Result<Vec<String>> {
     let mut installed_manifest = manifest.clone();
     let stamped = stamp_installed_file_metadata(&mut installed_manifest, data_dir, platform)?;
-    fs::create_dir_all(data_dir)?;
+    crate::setup::create_data_directory_with_safe_modes(data_dir)?;
     let manifest_bytes = serde_json::to_vec_pretty(&installed_manifest)?;
     atomic_write_file(&data_dir.join("components.json"), &manifest_bytes)?;
     Ok(stamped)
