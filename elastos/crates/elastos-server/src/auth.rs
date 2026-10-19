@@ -12374,6 +12374,123 @@ mod tests {
         );
     }
 
+    /// A limit far above every file here, so the size limit never refuses.
+    #[cfg(unix)]
+    const LIMITED_READ_ROOMY_LIMIT: u64 = 1024 * 1024;
+
+    #[cfg(unix)]
+    #[test]
+    fn principal_root_object_limited_read_refuses_a_link_to_a_valid_protected_object() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:limited-link";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Pictures/linked.png", protection.localhost_root);
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        write_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            b"linked secret image",
+        )
+        .unwrap();
+        // The envelope stays bound to `object_uri`; only its place changes.
+        let held = outside.path().join("held.png");
+        std::fs::rename(&path, &held).unwrap();
+        symlink(&held, &path).unwrap();
+        let read = |at: &Path| {
+            read_principal_root_object_limited(
+                data_dir.path(),
+                principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                at,
+                LIMITED_READ_ROOMY_LIMIT,
+            )
+        };
+        // Read where it is, the envelope passes every check.
+        assert_eq!(read(&held).unwrap(), b"linked secret image");
+        // Read through the link at the object's path, it is refused.
+        let result = read(&path);
+        assert!(
+            result.is_err(),
+            "a link at the object path was followed: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn principal_root_object_limited_read_refuses_links_and_non_regular_objects() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:limited-non-regular";
+        let localhost_root = principal_localhost_root(principal_id);
+        let uri = |name: &str| format!("{localhost_root}/Pictures/{name}");
+        let fs_path = |name: &str| rooted_localhost_fs_path(data_dir.path(), &uri(name)).unwrap();
+        std::fs::create_dir_all(fs_path("plain.png").parent().unwrap()).unwrap();
+        let read = |name: &str, at: &Path| {
+            read_principal_root_object_limited(
+                data_dir.path(),
+                principal_id,
+                &localhost_root,
+                &uri(name),
+                at,
+                LIMITED_READ_ROOMY_LIMIT,
+            )
+        };
+        let outside_file = outside.path().join("outside.png");
+        std::fs::write(&outside_file, b"outside bytes").unwrap();
+        assert_eq!(
+            read("outside.png", &outside_file).unwrap(),
+            b"outside bytes"
+        );
+
+        let mut refused = Vec::new();
+        // A link to a regular file.
+        symlink(&outside_file, fs_path("to-file.png")).unwrap();
+        refused.push("to-file.png");
+        // A link to a character device that reads as empty.
+        symlink("/dev/null", fs_path("to-device.png")).unwrap();
+        refused.push("to-device.png");
+        // A directory.
+        std::fs::create_dir(fs_path("folder.png")).unwrap();
+        refused.push("folder.png");
+        // A character device at the object path itself (needs CAP_MKNOD).
+        let device = fs_path("device.png");
+        let device_c = std::ffi::CString::new(device.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mknod does not keep the pointer.
+        let made = unsafe {
+            libc::mknod(
+                device_c.as_ptr(),
+                libc::S_IFCHR | 0o600,
+                libc::makedev(1, 3),
+            )
+        };
+        if made == 0 {
+            refused.push("device.png");
+        } else {
+            eprintln!(
+                "skipping the device-node case: mknod: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let read_anyway: Vec<_> = refused
+            .into_iter()
+            .filter_map(|name| {
+                read(name, &fs_path(name))
+                    .ok()
+                    .map(|bytes| format!("{name} ({} bytes)", bytes.len()))
+            })
+            .collect();
+        assert!(read_anyway.is_empty(), "read anyway: {read_anyway:?}");
+    }
+
     #[test]
     fn principal_root_object_rest_read_refuses_a_file_that_grows_past_the_limit_after_open() {
         use std::io::Write;
