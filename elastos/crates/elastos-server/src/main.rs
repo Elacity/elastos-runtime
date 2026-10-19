@@ -1446,7 +1446,7 @@ async fn run() -> anyhow::Result<()> {
         }
 
         Commands::Emergency(cmd) => {
-            security_cmd::run_emergency(cmd)?;
+            security_cmd::run_emergency(cmd).await?;
         }
 
         Commands::Config(cmd) => {

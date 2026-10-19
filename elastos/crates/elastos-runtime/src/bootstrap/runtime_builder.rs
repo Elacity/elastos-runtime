@@ -576,6 +576,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_runtime_shutdown_preserves_an_externally_advanced_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig {
+            data_dir: directory.path().to_path_buf(),
+            enable_audit: false,
+            ..Default::default()
+        };
+        let mut runtime =
+            ElastosRuntime::build(config, Arc::new(MockComputeProvider), Arc::new(NullFetcher))
+                .await
+                .unwrap();
+        runtime.start().await.unwrap();
+        let store_path = directory.path().join("capability_store");
+        let external = CapabilityStore::with_persistence(&store_path)
+            .await
+            .unwrap();
+        assert_eq!(external.advance_epoch().unwrap(), 1);
+        assert_eq!(runtime.capability_store.current_epoch(), 0);
+
+        runtime.stop().await.unwrap();
+
+        let reloaded = CapabilityStore::with_persistence(&store_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.current_epoch(),
+            1,
+            "shutdown must preserve the externally advanced epoch"
+        );
+        assert!(!reloaded.is_epoch_valid(0));
+    }
+
+    #[tokio::test]
     async fn test_runtime_accessors() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = RuntimeConfig {

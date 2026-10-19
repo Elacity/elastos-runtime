@@ -762,7 +762,8 @@ async fn heartbeat_is_strict_proof_bound_and_coalesces_exact_presentation() {
         .presence_authority()
         .unwrap()
         .manager()
-        .revoke_all("test epoch");
+        .revoke_all("test epoch")
+        .unwrap();
     assert_eq!(
         response_json(heartbeat().await.unwrap()).await["queued"],
         false
@@ -1034,7 +1035,8 @@ async fn people_snapshot_filters_local_and_exposes_only_signed_live_remote_prese
                 .presence_authority()
                 .unwrap()
                 .manager()
-                .revoke_all("read-only snapshot epoch");
+                .revoke_all("read-only snapshot epoch")
+                .unwrap();
         }
         let state_before = file_snapshot(local_dir.path());
         let snapshot = local_presence.authorized_snapshot(now).await.unwrap();
@@ -1239,7 +1241,8 @@ async fn restarted_presence_get_keeps_legacy_core_bytes_until_lifecycle_repair()
         .presence_authority()
         .unwrap()
         .manager()
-        .revoke_all("restart GET denial");
+        .revoke_all("restart GET denial")
+        .unwrap();
     state.collaboration_presence_product_port = Some(reopened.clone());
     let before = file_snapshot(dir.path());
     assert!(reopened

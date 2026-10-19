@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use elastos_common::localhost::{is_supported_resource_scheme, is_system_only_backend_resource};
 use elastos_runtime::capability::{
-    pending::PendingRequestStore, Action, CapabilityManager, GrantDuration, PolicyEvaluator,
-    PolicyOutcome, ResourceId, TokenConstraints,
+    pending::PendingRequestStore, Action, CapabilityManager, CapabilityToken, GrantDuration,
+    PolicyEvaluator, PolicyOutcome, ResourceId, TokenConstraints,
 };
 use elastos_runtime::session::Session;
 
@@ -118,19 +118,24 @@ pub async fn request_capability(
 
     // For now, all requests go to pending (no auto-grant policy yet)
     // Future: check if session already has this capability, or if policy allows auto-grant
-
     let request = state
         .pending_store
-        .create_request_with_reason(session.id.clone(), resource, action, input.reason)
+        .admit_request(
+            &state.capability_manager,
+            session.id.clone(),
+            resource,
+            action,
+            input.reason,
+        )
         .await;
 
     // If pre-denied (e.g. rate limit), surface the denial immediately
-    if request.is_denied() {
+    if let elastos_runtime::capability::RequestStatus::Denied { reason } = &request.status {
         return Ok(Json(RequestCapabilityOutput {
             status: "denied".to_string(),
             request_id: Some(request.id.to_string()),
             token: None,
-            reason: Some("Too many pending requests".to_string()),
+            reason: Some(reason.clone()),
         }));
     }
 
@@ -345,18 +350,36 @@ pub async fn grant_request(
         None, // No expiry for now (session-scoped)
     );
 
-    // Mark request as granted
-    state
-        .pending_store
-        .grant_request(&input.request_id, token.clone(), duration)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    record_grant(&state, &input.request_id, &token, duration).await?;
 
     Ok(Json(GrantRequestOutput {
         success: true,
         token: Some(token.to_base64().unwrap_or_default()),
         error: None,
     }))
+}
+
+async fn record_grant(
+    state: &CapabilityState,
+    request_id: &str,
+    token: &CapabilityToken,
+    duration: GrantDuration,
+) -> Result<(), (StatusCode, String)> {
+    if let Err(error) = state
+        .pending_store
+        .grant_request(request_id, token.clone(), duration)
+        .await
+    {
+        // The owner can end while the Shell's decision is in flight. Retire
+        // the minted token when its request can no longer record that grant.
+        state
+            .capability_manager
+            .revoke(*token.id(), "Grant registration failed")
+            .await;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error));
+    }
+
+    Ok(())
 }
 
 // === Deny Request (Shell Only) ===
@@ -538,17 +561,29 @@ pub async fn revoke_all_capabilities(
     State(state): State<CapabilityState>,
     Extension(_session): Extension<Session>, // Shell check done by middleware
     Json(input): Json<RevokeAllInput>,
-) -> Json<RevokeAllOutput> {
-    let new_epoch = state.capability_manager.revoke_all(&input.reason);
+) -> Result<Json<RevokeAllOutput>, (StatusCode, String)> {
+    let new_epoch = state
+        .capability_manager
+        .revoke_all(&input.reason)
+        .map_err(|error| {
+            tracing::error!("Failed to persist capability revocation: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to persist capability revocation".to_string(),
+            )
+        })?;
 
-    // Mark all granted requests as revoked
-    state.pending_store.revoke_all_granted().await;
+    // A grant issued after advancement keeps its authority and visible record.
+    state
+        .pending_store
+        .revoke_all_granted_before_epoch(new_epoch)
+        .await;
 
-    Json(RevokeAllOutput {
+    Ok(Json(RevokeAllOutput {
         success: true,
         new_epoch,
         reason: input.reason,
-    })
+    }))
 }
 
 // === Session Info ===
@@ -774,6 +809,549 @@ mod tests {
                 audit_log,
             )),
         }
+    }
+
+    #[tokio::test]
+    async fn test_failed_grant_registration_retires_unreturned_token() {
+        use elastos_runtime::session::{SessionRegistry, SessionType};
+
+        let mut state = test_state();
+        let (registry, pending) = SessionRegistry::with_capabilities(
+            state.pending_store.audit_log(),
+            state.capability_manager.clone(),
+        );
+        state.pending_store = pending;
+        let session = registry.create_session(SessionType::Capsule, None).await;
+        let request = state
+            .pending_store
+            .admit_request(
+                &state.capability_manager,
+                session.id.clone(),
+                ResourceId::new("localhost://Users/self/Documents/test"),
+                Action::Read,
+                String::new(),
+            )
+            .await;
+        // The handler has read the pending request and minted a token before
+        // the session ends; recording that stale decision must retire it.
+        let token = state.capability_manager.grant(
+            session.id.as_str(),
+            request.resource.clone(),
+            request.action,
+            TokenConstraints::default(),
+            None,
+        );
+        registry.invalidate_session(&session.token).await.unwrap();
+        let error = record_grant(&state, request.id.as_str(), &token, GrantDuration::Session)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            state
+                .capability_manager
+                .validate(
+                    &token,
+                    session.id.as_str(),
+                    request.action,
+                    &request.resource,
+                    None
+                )
+                .await
+                .is_err(),
+            "unreturned token must be retired when grant registration fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revoke_all_failure_returns_500_and_keeps_live_grants() {
+        use elastos_runtime::capability::{CapabilityStore, RequestStatus};
+        use elastos_runtime::primitives::{audit::AuditEvent, metrics::MetricsManager};
+
+        for blocked_path in ["epoch.tmp", "epoch", "overflow"] {
+            let directory = tempfile::tempdir().unwrap();
+            if blocked_path == "overflow" {
+                std::fs::write(directory.path().join("epoch"), u64::MAX.to_string()).unwrap();
+            }
+            let authority = Arc::new(
+                CapabilityStore::with_persistence(directory.path())
+                    .await
+                    .unwrap(),
+            );
+            let mut state = test_state();
+            let audit = state.pending_store.audit_log();
+            state.capability_manager = Arc::new(CapabilityManager::new(
+                authority.clone(),
+                audit.clone(),
+                Arc::new(MetricsManager::new()),
+            ));
+            let session = Session::new_capsule("revocation-failure".to_string());
+            let request = state
+                .pending_store
+                .admit_request(
+                    &state.capability_manager,
+                    session.id.clone(),
+                    ResourceId::new("localhost://Users/self/Documents/test"),
+                    Action::Read,
+                    String::new(),
+                )
+                .await;
+            let token = state.capability_manager.grant(
+                session.id.as_str(),
+                request.resource.clone(),
+                request.action,
+                TokenConstraints::default(),
+                None,
+            );
+            state
+                .pending_store
+                .grant_request(request.id.as_str(), token.clone(), GrantDuration::Session)
+                .await
+                .unwrap();
+            if blocked_path != "overflow" {
+                if blocked_path == "epoch" {
+                    std::fs::remove_file(directory.path().join("epoch")).unwrap();
+                }
+                std::fs::create_dir(directory.path().join(blocked_path)).unwrap();
+            }
+            let epoch = authority.current_epoch();
+            let result = revoke_all_capabilities(
+                State(state.clone()),
+                Extension(Session::new_shell("test-shell".to_string())),
+                Json(RevokeAllInput {
+                    reason: "persistence failure".to_string(),
+                }),
+            )
+            .await;
+            let (status, message) = match result {
+                Err(error) => error,
+                Ok(_) => panic!("failed persistence must not report successful revocation"),
+            };
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(message, "Failed to persist capability revocation");
+            assert_eq!(authority.current_epoch(), epoch);
+            assert!(matches!(
+                state
+                    .pending_store
+                    .get_request(request.id.as_str())
+                    .await
+                    .unwrap()
+                    .status,
+                RequestStatus::Granted { .. }
+            ));
+            assert!(audit
+                .recent_events(100)
+                .iter()
+                .all(|event| !matches!(event, AuditEvent::EpochAdvance { .. })));
+            let validation = state
+                .capability_manager
+                .validate(
+                    &token,
+                    session.id.as_str(),
+                    request.action,
+                    &request.resource,
+                    None,
+                )
+                .await;
+            if blocked_path == "epoch" {
+                assert!(
+                    validation.is_err(),
+                    "unreadable epoch state must fail closed"
+                );
+            } else {
+                validation.unwrap();
+            }
+            if blocked_path != "overflow" {
+                std::fs::remove_dir(directory.path().join(blocked_path)).unwrap();
+                if blocked_path == "epoch" {
+                    std::fs::write(directory.path().join("epoch"), epoch.to_string()).unwrap();
+                }
+                state
+                    .capability_manager
+                    .validate(
+                        &token,
+                        session.id.as_str(),
+                        request.action,
+                        &request.resource,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let recovered = revoke_all_capabilities(
+                    State(state.clone()),
+                    Extension(Session::new_shell("test-shell".to_string())),
+                    Json(RevokeAllInput {
+                        reason: "retry after repair".to_string(),
+                    }),
+                )
+                .await
+                .unwrap()
+                .0;
+                assert!(recovered.success);
+                assert_eq!(recovered.new_epoch, epoch + 1);
+                assert!(state
+                    .pending_store
+                    .get_request(request.id.as_str())
+                    .await
+                    .unwrap()
+                    .is_denied());
+                assert!(state
+                    .capability_manager
+                    .validate(
+                        &token,
+                        session.id.as_str(),
+                        request.action,
+                        &request.resource,
+                        None
+                    )
+                    .await
+                    .is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_capacity_recovers_consumed_once_grants_without_losing_live_grants() {
+        use elastos_runtime::capability::{
+            manager::ValidationError, pending::MAX_PENDING_REQUESTS, CapabilityToken,
+        };
+        use elastos_runtime::session::SessionId;
+
+        async fn request(state: &CapabilityState, session: &Session) -> RequestCapabilityOutput {
+            request_capability(
+                State(state.clone()),
+                Extension(session.clone()),
+                Json(RequestCapabilityInput {
+                    resource: "localhost://Users/self/Documents/test".to_string(),
+                    action: "read".to_string(),
+                    reason: "capacity regression".to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0
+        }
+
+        async fn grant(
+            state: &CapabilityState,
+            session: &Session,
+            duration: &str,
+        ) -> (String, CapabilityToken) {
+            let output = request(state, session).await;
+            assert_eq!(output.status, "pending");
+            let request_id = output.request_id.unwrap();
+            let granted = grant_request(
+                State(state.clone()),
+                Extension(Session::new_shell("test-shell".to_string())),
+                Json(GrantRequestInput {
+                    request_id: request_id.clone(),
+                    duration: duration.to_string(),
+                    rationale: Some("capacity regression".to_string()),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert!(granted.success);
+            let token = CapabilityToken::from_base64(&granted.token.unwrap()).unwrap();
+            (request_id, token)
+        }
+
+        let state = test_state();
+        let spent_session = Session::new_capsule("spent".to_string());
+        let live_session = Session::new_capsule("live".to_string());
+        let next_session = Session::new_capsule("next".to_string());
+        let (spent_id, spent) = grant(&state, &spent_session, "once").await;
+        let (unused_id, unused) = grant(&state, &live_session, "once").await;
+        let (live_id, live) = grant(&state, &live_session, "session").await;
+        assert_eq!(spent.constraints().max_uses(), Some(1));
+        assert!(spent.expiry().is_none());
+        for index in 0..MAX_PENDING_REQUESTS - 3 {
+            let pending = state
+                .pending_store
+                .admit_request(
+                    &state.capability_manager,
+                    SessionId::from_string(format!("prefill-{index}")),
+                    spent.resource().clone(),
+                    Action::Read,
+                    String::new(),
+                )
+                .await;
+            assert!(pending.is_pending());
+        }
+        assert_eq!(request(&state, &next_session).await.status, "denied");
+
+        state
+            .capability_manager
+            .validate(
+                &spent,
+                spent_session.id.as_str(),
+                Action::Read,
+                spent.resource(),
+                None,
+            )
+            .await
+            .unwrap();
+        let recovered = request(&state, &next_session).await;
+        assert_eq!(
+            recovered.status, "pending",
+            "consumed grants must not permanently fill the store"
+        );
+        assert!(state
+            .pending_store
+            .get_request(&recovered.request_id.unwrap())
+            .await
+            .is_some());
+        assert!(state.pending_store.get_request(&spent_id).await.is_none());
+        assert!(state
+            .pending_store
+            .list_session_granted(spent_session.id.as_str())
+            .await
+            .is_empty());
+        assert_eq!(
+            state.pending_store.pending_count().await,
+            MAX_PENDING_REQUESTS - 2
+        );
+        assert_eq!(request(&state, &next_session).await.status, "denied");
+
+        let visible = list_capabilities(State(state.clone()), Extension(live_session.clone()))
+            .await
+            .0;
+        assert_eq!(visible.capabilities.len(), 2);
+        assert!(visible
+            .capabilities
+            .iter()
+            .any(|entry| entry.request_id == unused_id));
+        assert!(visible
+            .capabilities
+            .iter()
+            .any(|entry| entry.request_id == live_id));
+        // Pressure reconciliation must not spend an unused one-use allowance.
+        state
+            .capability_manager
+            .validate(
+                &unused,
+                live_session.id.as_str(),
+                Action::Read,
+                unused.resource(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            state
+                .capability_manager
+                .validate(
+                    &unused,
+                    live_session.id.as_str(),
+                    Action::Read,
+                    unused.resource(),
+                    None
+                )
+                .await,
+            Err(ValidationError::UseLimitExceeded { current: 1, max: 1 })
+        ));
+        let revoked = revoke_capability(
+            State(state.clone()),
+            Extension(Session::new_shell("test-shell".to_string())),
+            Path(live_id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(revoked.success);
+        assert!(matches!(
+            state
+                .capability_manager
+                .validate(
+                    &live,
+                    live_session.id.as_str(),
+                    Action::Read,
+                    live.resource(),
+                    None
+                )
+                .await,
+            Err(ValidationError::TokenRevoked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_request_capacity_recovers_late_registered_revoked_grant() {
+        use elastos_runtime::capability::{
+            manager::ValidationError, pending::MAX_PENDING_REQUESTS, CapabilityToken,
+        };
+        use elastos_runtime::session::SessionId;
+
+        let state = test_state();
+        let stale_session = Session::new_capsule("stale-epoch".to_string());
+        let live_session = Session::new_capsule("live-epoch".to_string());
+        let shell = Session::new_shell("test-shell".to_string());
+        let resource = ResourceId::new("localhost://Users/self/Documents/test");
+        let stale_request = state
+            .pending_store
+            .admit_request(
+                &state.capability_manager,
+                stale_session.id.clone(),
+                resource.clone(),
+                Action::Read,
+                String::new(),
+            )
+            .await;
+        // Reproduce the grant handler's mint/register split without timing sleeps.
+        let stale_token = state.capability_manager.grant(
+            stale_session.id.as_str(),
+            resource.clone(),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        let revoked = revoke_all_capabilities(
+            State(state.clone()),
+            Extension(shell.clone()),
+            Json(RevokeAllInput {
+                reason: "capacity regression".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(state
+            .pending_store
+            .get_request(stale_request.id.as_str())
+            .await
+            .unwrap()
+            .is_pending());
+        state
+            .pending_store
+            .grant_request(
+                stale_request.id.as_str(),
+                stale_token.clone(),
+                GrantDuration::Session,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            state
+                .capability_manager
+                .validate(
+                    &stale_token,
+                    stale_session.id.as_str(),
+                    Action::Read,
+                    &resource,
+                    None
+                )
+                .await,
+            Err(ValidationError::TokenRevoked)
+        ));
+
+        let live_request = state
+            .pending_store
+            .admit_request(
+                &state.capability_manager,
+                live_session.id.clone(),
+                resource.clone(),
+                Action::Read,
+                String::new(),
+            )
+            .await;
+        let live_grant = grant_request(
+            State(state.clone()),
+            Extension(shell),
+            Json(GrantRequestInput {
+                request_id: live_request.id.to_string(),
+                duration: "session".to_string(),
+                rationale: Some("capacity regression".to_string()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let live_token = CapabilityToken::from_base64(&live_grant.token.unwrap()).unwrap();
+        assert_eq!(live_token.constraints().epoch(), revoked.new_epoch);
+        assert_eq!(live_token.constraints().max_uses(), None);
+        assert!(live_token.expiry().is_none());
+        for index in 0..MAX_PENDING_REQUESTS - 2 {
+            assert!(state
+                .pending_store
+                .admit_request(
+                    &state.capability_manager,
+                    SessionId::from_string(format!("prefill-{index}")),
+                    resource.clone(),
+                    Action::Read,
+                    String::new()
+                )
+                .await
+                .is_pending());
+        }
+
+        let recovered = request_capability(
+            State(state.clone()),
+            Extension(Session::new_capsule("next".to_string())),
+            Json(RequestCapabilityInput {
+                resource: resource.to_string(),
+                action: "read".to_string(),
+                reason: "capacity regression".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            recovered.status, "pending",
+            "revoked grants must not permanently fill the store"
+        );
+        assert!(state
+            .pending_store
+            .get_request(stale_request.id.as_str())
+            .await
+            .is_none());
+        assert_eq!(
+            state.pending_store.pending_count().await,
+            MAX_PENDING_REQUESTS - 1
+        );
+        assert!(state
+            .pending_store
+            .admit_request(
+                &state.capability_manager,
+                SessionId::from_string("overflow"),
+                resource.clone(),
+                Action::Read,
+                String::new()
+            )
+            .await
+            .is_denied());
+        assert_eq!(state.capability_manager.current_epoch(), revoked.new_epoch);
+        assert!(matches!(
+            state
+                .capability_manager
+                .validate(
+                    &stale_token,
+                    stale_session.id.as_str(),
+                    Action::Read,
+                    &resource,
+                    None
+                )
+                .await,
+            Err(ValidationError::TokenRevoked)
+        ));
+        state
+            .capability_manager
+            .validate(
+                &live_token,
+                live_session.id.as_str(),
+                Action::Read,
+                &resource,
+                None,
+            )
+            .await
+            .unwrap();
+        let visible = list_capabilities(State(state), Extension(live_session))
+            .await
+            .0;
+        assert_eq!(visible.capabilities.len(), 1);
+        assert_eq!(
+            visible.capabilities[0].request_id,
+            live_request.id.to_string()
+        );
     }
 
     #[tokio::test]

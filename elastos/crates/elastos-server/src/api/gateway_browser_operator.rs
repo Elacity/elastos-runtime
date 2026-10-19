@@ -334,7 +334,8 @@ pub(in crate::api::gateway) async fn request_admission(
     service.pending.cleanup_old(60).await;
     let pending = service
         .pending
-        .create_request_with_reason(
+        .admit_request(
+            &service.capabilities,
             session.id.clone(),
             ResourceId::new(format!("elastos://browser/pages/{page_id}/input")),
             Action::Write,

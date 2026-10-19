@@ -1029,7 +1029,7 @@ mod tests {
                 .await
                 .is_some());
         }
-        authority.manager().revoke_all("test epoch");
+        authority.manager().revoke_all("test epoch").unwrap();
         for person in [principal.as_str(), second] {
             assert_eq!(gate(&authority, data, person, ME, runtime, 60).await, None);
             assert_eq!(state(data, person, &scope()).unwrap(), None);

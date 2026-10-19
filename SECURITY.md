@@ -48,23 +48,54 @@ operator. Use hosted accounts only for public demos; keep wallets, private data
 and recovery material on your own device until hosted protection passes its
 acceptance gate. Independent review and installed proof remain security gates.
 
+## Capability revocation and key rotation
+
+Runtime stores the capability revocation epoch in `capability_store/epoch`
+inside its data home. A successful epoch advance commits the new value before
+publishing it in memory. Capability validation reads the stored epoch and
+rejects tokens with a lower epoch, including after another process advances the
+same store.
+Epoch writes are serialized across processes and preserve the highest stored
+or observed value. A stale process that persists its state preserves a newer
+epoch already committed by another process.
+
+`elastos emergency rotate` advances that durable epoch before publishing the
+replacement signing key. An epoch error stops rotation before key publication.
+If key publication fails after the epoch advances, the command reports the
+partial result and retains the higher epoch. The epoch and key are separate
+writes.
+
+A running Runtime loads the replacement signing key only after restart. For a
+complete rotation, stop Runtime for the affected data home, run
+`elastos emergency rotate`, then start Runtime with the same data home. Confirm
+that Runtime loads the stored key and starts successfully before resuming use.
+Command completion confirms the persisted changes; the operator owns the
+restart. Runtime can use an in-memory key when it cannot load or save a signing
+key, so resolve signing-key warnings before relying on authority across restarts.
+
+An established capability store requires a readable, valid epoch at startup.
+Capability validation also fails closed when that epoch is unavailable or
+invalid. For recovery, stop all Runtime processes using the affected data home
+and preserve the capability store. Restore a valid unsigned 64-bit epoch at or
+above the latest committed epoch established from trusted, current recovery data. A higher
+epoch preserves committed revocations and can invalidate additional tokens; the
+maximum value leaves no room for another epoch advance. Preserve the epoch and
+any existing lock file. If only `epoch.lock` is missing, stop every Runtime
+process using that data home, then restart Runtime to recreate the lock without
+changing the valid stored epoch. Resetting the epoch or deleting the store can
+discard committed revocations. If the latest committed epoch cannot be
+established, obtain recovery assistance before starting Runtime.
+
+Upgrade note: Older Runtime versions could start at epoch zero when a stored
+epoch was empty or malformed. Runtime now refuses that state; if an upgrade
+exposes it, preserve the store and use the recovery procedure above before
+restarting. A truncated value that still parses as a number cannot be detected
+from its syntax alone, so establish the recovery lower bound from trusted,
+current data.
+
 ## Open Findings
 
 The following security-relevant findings remain open in the current runtime and are documented here for transparency.
-
-### Capability state and key rotation are not restart safe
-
-**Severity:** Medium
-**Files:** `elastos/crates/elastos-runtime/src/capability/manager.rs`, `elastos/crates/elastos-server/src/security_cmd.rs`
-**Status:** Open
-
-Capability signing-key creation and `elastos emergency rotate` log persistence
-errors but continue with in-memory state. The emergency command can therefore
-report success even when the new key was not written. Rotation also advances a
-fresh in-process capability store rather than a durable epoch record. Until the
-key and revocation state are committed atomically, operators must verify the
-persisted key and restart result instead of treating command completion as a
-durable rotation receipt.
 
 ### Host-plane Carrier providers use Runtime admission
 

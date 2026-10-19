@@ -842,8 +842,11 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                 // Create a pending request — the shell decides whether to grant.
                 let pending = ctx
                     .pending_store
-                    .create_request_with_reason(
-                        elastos_runtime::session::SessionId(ctx.capsule_id.clone()),
+                    .admit_request(
+                        &ctx.capability_manager,
+                        elastos_runtime::capability::pending::RequestScope::Capsule(
+                            ctx.capsule_id.clone(),
+                        ),
                         resource_id.clone(),
                         action,
                         reason,

@@ -650,10 +650,6 @@ async fn setup_server_infrastructure_impl(
         )?;
 
     let audit_log = Arc::new(primitives::audit::AuditLog::new());
-    let session_registry = Arc::new(session::SessionRegistry::new(audit_log.clone()));
-    session_registry
-        .set_default_owner(local_session_owner(&data_dir)?)
-        .await;
     let metrics = Arc::new(primitives::metrics::MetricsManager::new());
     let capability_store = serve_capability_store(&data_dir).await?;
     let capability_manager = Arc::new(capability::CapabilityManager::load_or_generate(
@@ -662,9 +658,12 @@ async fn setup_server_infrastructure_impl(
         audit_log.clone(),
         metrics.clone(),
     ));
-    let pending_store = Arc::new(capability::pending::PendingRequestStore::new(
-        audit_log.clone(),
-    ));
+    let (session_registry, pending_store) =
+        session::SessionRegistry::with_capabilities(audit_log.clone(), capability_manager.clone());
+    let session_registry = Arc::new(session_registry);
+    session_registry
+        .set_default_owner(local_session_owner(&data_dir)?)
+        .await;
 
     let tls_config = match elastos_tls::load_or_create_tls_config(&data_dir).await {
         Ok(config) => {
@@ -4259,7 +4258,7 @@ mod tests {
                 )
                 .await
                 .expect("grant still validates before revoke");
-            manager.revoke_all("test restart revoke");
+            manager.revoke_all("test restart revoke").unwrap();
             token
         };
 
