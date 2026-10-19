@@ -2249,7 +2249,8 @@ fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
             error: RunError {
                 class: ErrorClass::ContextRejected,
                 code: "model_memory_observation_unavailable".into(),
-                message: elastos_model_contract::MODEL_MEMORY_OBSERVATION_UNAVAILABLE_MESSAGE.into(),
+                message: elastos_model_contract::MODEL_MEMORY_OBSERVATION_UNAVAILABLE_MESSAGE
+                    .into(),
             },
             detail: None,
         },
@@ -2257,9 +2258,8 @@ fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
             error: RunError {
                 class: ErrorClass::ContextRejected,
                 code: "model_memory_unavailable".into(),
-                message:
-                    "Not enough free memory for this model. Close other apps or choose a smaller model."
-                        .into(),
+                message: "Not enough free memory for this model. Close other apps, then try again."
+                    .into(),
             },
             detail: None,
         },
@@ -2271,10 +2271,9 @@ fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
             "The local model engine could not start. Check its installation and try again.",
             "local llama engine could not start",
         ),
-        LocalLlamaFault::Failed => AdapterFault::backend_failed(
-            "model backend failed",
-            "local llama engine failed",
-        ),
+        LocalLlamaFault::Failed => {
+            AdapterFault::backend_failed("model backend failed", "local llama engine failed")
+        }
     }
 }
 
@@ -3572,7 +3571,11 @@ mod tests {
         assert_eq!(insufficient.error.code, "model_memory_unavailable");
         assert_eq!(
             insufficient.error.message,
-            "Not enough free memory for this model. Close other apps or choose a smaller model."
+            "Not enough free memory for this model. Close other apps, then try again."
+        );
+        assert!(
+            !insufficient.error.message.contains("smaller model"),
+            "the refusal cannot know a smaller model that fits exists"
         );
         assert!(insufficient.detail.is_none());
     }

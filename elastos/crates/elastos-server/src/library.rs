@@ -3416,15 +3416,11 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
             }
             Err(err) if is_unencrypted_principal_root_object(&err) => {
                 blocked_reason = Some("protected_principal_root_object_not_encrypted".to_string());
-                let revision_input = format!("{}:{}:{}", target.uri, metadata.len(), modified_at);
-                (
-                    metadata.len(),
-                    format!(
-                        "rev:blocked:{}",
-                        hex::encode(Sha256::digest(revision_input))
-                    ),
-                    None,
-                )
+                blocked_object_projection(&target.uri, metadata.len(), modified_at)
+            }
+            Err(err) if is_damaged_principal_root_object(&err) => {
+                blocked_reason = Some("protected_principal_root_object_damaged".to_string());
+                blocked_object_projection(&target.uri, metadata.len(), modified_at)
             }
             Err(err) => return Err(err),
         }
@@ -3644,6 +3640,31 @@ fn is_unencrypted_principal_root_object(err: &anyhow::Error) -> bool {
     })
 }
 
+fn is_damaged_principal_root_object(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains(crate::auth::PROTECTED_PRINCIPAL_ROOT_OBJECT_DAMAGED)
+    })
+}
+
+/// Size, revision and CID of an item Library lists without opening it.
+fn blocked_object_projection(
+    uri: &str,
+    len: u64,
+    modified_at: u64,
+) -> (u64, String, Option<String>) {
+    let revision_input = format!("{uri}:{len}:{modified_at}");
+    (
+        len,
+        format!(
+            "rev:blocked:{}",
+            hex::encode(Sha256::digest(revision_input))
+        ),
+        None,
+    )
+}
+
 fn read_library_file_bytes(
     data_dir: &Path,
     principal_id: &str,
@@ -3841,21 +3862,13 @@ fn protect_legacy_plaintext_library_file(
     principal_id: &str,
     target: &LibraryTarget,
 ) -> anyhow::Result<Vec<u8>> {
-    let bytes = fs::read(&target.path).with_context(|| {
-        format!(
-            "failed to read legacy plaintext library object {:?}",
-            target.path
-        )
-    })?;
-    crate::auth::write_principal_root_object(
+    crate::auth::protect_legacy_plaintext_principal_root_object(
         data_dir,
         principal_id,
         &target.localhost_root,
         &target.uri,
         &target.path,
-        &bytes,
-    )?;
-    Ok(bytes)
+    )
 }
 
 fn archive_library_directory(

@@ -903,7 +903,29 @@ def run_upgrade(gateway, data_dir, home, xdg_data_home, rollback, log_path):
     finally:
         os.close(log_fd)
     if result.returncode != 0:
+        print_last_error_line(log_path, data_dir)
         reject("principal_root_upgrade_failed")
+
+
+def print_last_error_line(log_path, data_dir):
+    # The refusal names the file and the action; show it, nothing else, with
+    # the data directory as <data-dir>. The log keeps the full text.
+    try:
+        with open(log_path, "rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - 65536))
+            tail = log.read().decode("utf-8", "replace")
+    except OSError:
+        return
+    lines = [line for line in tail.splitlines() if line.startswith("Error:")]
+    if lines:
+        text = lines[-1]
+        data_dir = str(data_dir).rstrip("/")
+        prefixes = {data_dir, os.path.realpath(data_dir)} if data_dir else set()
+        for prefix in sorted(prefixes, key=len, reverse=True):
+            text = text.replace(prefix, "<data-dir>")
+        text = "".join(ch if ch.isprintable() else "?" for ch in text)[:4096]
+        print(f"linux-source-home-restart: {text}", file=sys.stderr)
 
 
 def fetch_page(url):

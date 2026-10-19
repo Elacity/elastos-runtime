@@ -2,11 +2,12 @@
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync } from "node:fs";
 import vm from "node:vm";
+import { ownerRecoveryCommand } from "../capsules/home/browser/owner-recovery-command.js";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const source = readFileSync(new URL("../capsules/home/browser/shell-auth.js", import.meta.url), "utf8")
-  .replace(/^import\s*\{[\s\S]*?\}\s*from\s*"[^"]+";\n/, "")
+  .replace(/^import\s*\{[\s\S]*?\}\s*from\s*"[^"]+";\n/gm, "")
   .replace(/export /g, "");
 const key = "elastos.home.pending-registration/v1";
 const grant = { schema: "elastos.auth.passkey.verify/v2", principal_id: "owner",
@@ -50,6 +51,7 @@ function fixture({ guest = false, purpose = "create", terminalLoss = false, owne
     };
     let opened = null;
     const context = vm.createContext({
+      ownerRecoveryCommand, location: { origin: "https://home.test", hostname: "home.test" },
       document: { querySelector: element, getElementById: id => element("#" + id), body: element("body") },
       window: { PublicKeyCredential: {}, location: { protocol: "https:" }, sessionStorage: storage, atob, btoa,
         addEventListener() {}, clearTimeout() {}, setTimeout() {}, setInterval() { return 1; }, clearInterval() {} },
@@ -131,7 +133,7 @@ function fixture({ guest = false, purpose = "create", terminalLoss = false, owne
     const onOpen = (response, flow) => { opened = JSON.parse(JSON.stringify({ response, flow })); };
     return { element, api, opened: () => opened, async show() { await api.showHomeUnlock(onOpen); },
       async selectKit(bundle = recoveryBundle) {
-        element("#home-recovery-file").files = [{ size: 100, text: async () => JSON.stringify(bundle) }];
+        element("#home-recovery-file").files = [{ name: "my-recovery-kit.json", size: 100, text: async () => JSON.stringify(bundle) }];
         await api.selectRecoveryKit();
       },
       async choose() {
@@ -419,6 +421,8 @@ for (const stage of ["before-begin", "after-create"]) {
   assert.equal(f.creates(), 0, "kit without Profile started a passkey");
   const encrypted = { schema: "elastos.full-recovery-bundle.package/v1", ciphertext: "fixture-secret-ciphertext" };
   await home.selectKit(encrypted);
+  assert.match(home.element("#home-unlock-status").textContent, /^Kit selected: my-recovery-kit\.json\. Enter its password/,
+    "the cleared picker says No file chosen, so the status names the accepted kit");
   await home.api.runPasskeyCreate();
   assert.equal(f.creates(), 0, "empty password started a passkey");
   assert.match(home.element("#home-unlock-status").textContent, /Enter.*password/);
