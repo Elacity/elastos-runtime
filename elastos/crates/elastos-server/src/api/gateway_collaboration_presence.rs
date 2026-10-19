@@ -354,7 +354,7 @@ pub(super) async fn system_community_presence_get(
     }
 }
 
-/// System → Community, any role, own grant only: `always`, `while_open` or
+/// System → Security (Community section), any role, own grant only: `always`, `while_open` or
 /// `hidden`.
 pub(super) async fn system_community_presence_update(
     State(state): State<GatewayState>,
@@ -428,7 +428,6 @@ pub(super) async fn answer_community_presence_request(
     context: &HomeLaunchTokenContext,
     action_id: &str,
 ) -> Option<anyhow::Result<String>> {
-    use crate::collaboration_presence_grant::PresenceDecision;
     let (decision, request) = COMMUNITY_PRESENCE_ACTIONS
         .iter()
         .find_map(|(prefix, decision)| Some((*decision, action_id.strip_prefix(prefix)?)))?;
@@ -444,16 +443,31 @@ pub(super) async fn answer_community_presence_request(
             anyhow::bail!("That Community request is no longer open.");
         }
         set_community_presence(state, context, decision).await?;
-        Ok(match decision {
-            PresenceDecision::Always => "Community shows you while your Home is online.",
-            PresenceDecision::WhileOpen => "Community shows you while Community is open.",
-            PresenceDecision::Later => "Later. Show me in Community, in Chat, asks again.",
-            _ => "Hidden. Change it in System → Community.",
-        }
-        .to_string())
+        Ok(presence_answer_text(decision).to_string())
     };
     Some(answer.await)
 }
+
+/// What Inbox shows after the person answers the presence request.
+fn presence_answer_text(
+    decision: crate::collaboration_presence_grant::PresenceDecision,
+) -> &'static str {
+    use crate::collaboration_presence_grant::PresenceDecision;
+    match decision {
+        PresenceDecision::Always => "Community shows you while your Home is online.",
+        PresenceDecision::WhileOpen => "Community shows you while Community is open.",
+        PresenceDecision::Later => {
+            "Not now. Choose Show me in Community in Chat when you want to decide."
+        }
+        _ => "Hidden. Change it in System → Security, under Community.",
+    }
+}
+
+const COMMUNITY_PRESENCE_REQUEST_BODY: &str = "Community members would see your name, your \
+    Profile ID, this Home's device address, and that your Home is online, announced every 15 \
+    seconds while you are shown. Every Home in Community sees it, including the seed's Community \
+    node. It lets members see who is online and lets you load earlier posts. Change it any time \
+    in System → Security, under Community.";
 
 /// The one Inbox card a person with an open request sees.
 pub(super) fn community_presence_request_notification(
@@ -472,12 +486,7 @@ pub(super) fn community_presence_request_notification(
         source_app: CHAT_ROOM_CAPSULE_ID.to_string(),
         kind: "community_presence_request".to_string(),
         title: "Show yourself in Community?".to_string(),
-        body: "Community members would see your name, your Profile ID, this Home's device \
-               address, and that your Home is online, announced every 15 seconds while you are \
-               shown. Every Home in Community sees it, including the seed's Community node. It \
-               lets members see who is online and lets you load earlier posts. Change it any \
-               time in System → Community."
-            .to_string(),
+        body: COMMUNITY_PRESENCE_REQUEST_BODY.to_string(),
         action_ref: Some(HomeNotificationActionSummary {
             app: INBOX_CAPSULE_ID.to_string(),
             action_id: format!("{}{issued_at}", COMMUNITY_PRESENCE_ACTIONS[0].0),
@@ -1005,6 +1014,29 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn presence_texts_name_where_the_setting_is() {
+        // The setting is the Community section of System → Security; there
+        // is no System → Community page.
+        use crate::collaboration_presence_grant::PresenceDecision;
+        let texts = [
+            presence_answer_text(PresenceDecision::Later),
+            presence_answer_text(PresenceDecision::Never),
+            COMMUNITY_PRESENCE_REQUEST_BODY,
+            crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL,
+        ];
+        for text in texts {
+            assert!(!text.contains("System → Community"), "{text}");
+            assert!(!text.contains("Tap "), "device-neutral: {text}");
+        }
+        for text in &texts[1..] {
+            assert!(
+                text.contains("System → Security, under Community"),
+                "{text}"
+            );
+        }
     }
 
     #[test]

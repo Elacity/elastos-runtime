@@ -228,9 +228,7 @@ async fn full_recovery_setup_preserves_identity_and_requires_successful_profile_
         &principal.localhost_root,
     )
     .unwrap();
-    assert!(crate::api::auth_gateway::principal_root_recovery_is_ready(
-        &status
-    ));
+    assert!(status.root_encrypted && status.recovery_configured);
     assert!(status
         .required_actions
         .iter()
@@ -883,17 +881,16 @@ async fn test_full_recovery_fresh_export_rejects_envelope_shaped_data_before_mut
     let save_path =
         elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &save_uri).unwrap();
     std::fs::create_dir_all(save_path.parent().unwrap()).unwrap();
-    let envelope = json!({
-        "schema": "elastos.principal-root.object/v1",
-        "principal_id": authority.principal_id,
-        "localhost_root": principal.localhost_root,
-        "data_key_id": "pdek:unbound-envelope",
-        "object_uri": save_uri,
-        "cipher": "aes-256-gcm",
-        "nonce": "AAAAAAAAAAAAAAAA",
-        "ciphertext": "AQIDBAUGBwgJCgsMDQ4PEA"
-    });
-    let envelope_bytes = serde_json::to_vec_pretty(&envelope).unwrap();
+    // The canonical layout every ElastOS writer emits (pretty, fields in
+    // envelope order, ciphertext last), bound to a key this Home never had.
+    let envelope_bytes = format!(
+        "{{\n  \"schema\": \"elastos.principal-root.object/v1\",\n  \"principal_id\": \"{}\",\n  \
+         \"localhost_root\": \"{}\",\n  \"data_key_id\": \"pdek:unbound-envelope\",\n  \
+         \"object_uri\": \"{save_uri}\",\n  \"cipher\": \"aes-256-gcm\",\n  \
+         \"nonce\": \"AAAAAAAAAAAAAAAA\",\n  \"ciphertext\": \"AQIDBAUGBwgJCgsMDQ4PEA\"\n}}",
+        authority.principal_id, principal.localhost_root,
+    )
+    .into_bytes();
     std::fs::write(&save_path, &envelope_bytes).unwrap();
     let export_intent = json!({
         "principal_id": authority.principal_id,
@@ -916,36 +913,29 @@ async fn test_full_recovery_fresh_export_rejects_envelope_shaped_data_before_mut
             .join("recovery-archive.key");
     assert!(!archive_key_path.exists());
 
-    for _ in 0..2 {
-        let response = app
-            .clone()
-            .oneshot(
-                test_browser_request("localhost:61180", "null")
-                    .method("POST")
-                    .uri("/api/auth/recovery/full-export")
-                    .header("x-elastos-home-token", authority.system_token.as_str())
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({
-                            "schema": "elastos.full-recovery-bundle.export.request/v1",
-                            "principal_id": export_intent["principal_id"],
-                            "localhost_root": export_intent["localhost_root"],
-                            "label": export_intent["label"],
-                            "step_up_token": fresh_token,
-                            "download_password": null
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // The approval is used before the scan; the replay is refused as used.
+    for (expected_status, expected_text) in [
+        (
+            StatusCode::CONFLICT,
+            ".AppData/LocalHost/GBA/ucity/rom-id.sav is encrypted, but this Home has no key yet.",
+        ),
+        // A replayed approval is refused like other step-up refusals.
+        (StatusCode::FORBIDDEN, "already been used"),
+    ] {
+        let response =
+            post_full_recovery_export(&app, &authority, &export_intent, &fresh_token).await;
+        assert_eq!(response.status(), expected_status);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&body)
-            .contains("exact verified protection binding is required"));
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains(expected_text), "{body}");
+        if expected_status == StatusCode::CONFLICT {
+            assert!(body.starts_with("Home could not prepare your Recovery Kit: "));
+            assert!(body.ends_with(
+                ". After that, select Download Recovery Kit again; you will approve with your passkey again."
+            ));
+        }
     }
 
     assert_eq!(std::fs::read(&save_path).unwrap(), envelope_bytes);
@@ -958,6 +948,167 @@ async fn test_full_recovery_fresh_export_rejects_envelope_shaped_data_before_mut
     )
     .unwrap()
     .is_none());
+}
+
+async fn post_full_recovery_export(
+    app: &axum::Router,
+    authority: &TestPasskeyAuthority,
+    intent: &Value,
+    step_up_token: &str,
+) -> Response {
+    let mut request = intent.clone();
+    request["schema"] = json!("elastos.full-recovery-bundle.export.request/v1");
+    request["step_up_token"] = json!(step_up_token);
+    app.clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/auth/recovery/full-export")
+                .header("x-elastos-home-token", authority.system_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn export_consumes_approval_before_scan_and_survives_long_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("alex"));
+    let principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    let damaged_uri = format!(
+        "{}/.AppData/LocalHost/GBA/ucity/damaged.sav",
+        principal.localhost_root
+    );
+    let damaged_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &damaged_uri).unwrap();
+    std::fs::create_dir_all(damaged_path.parent().unwrap()).unwrap();
+    let damaged = b"{\n  \"sche\xffma\": \"elastos.principal-root.object/v1\"".to_vec();
+    std::fs::write(&damaged_path, &damaged).unwrap();
+    let intent = json!({
+        "principal_id": authority.principal_id,
+        "localhost_root": principal.localhost_root,
+        "label": "Recovery test",
+        "download_password": null,
+    });
+    let token = step_up_token_for_app_context(
+        dir.path(),
+        SYSTEM_CAPSULE_ID,
+        &authority.system_token,
+        "auth.full-recovery-bundle.export",
+        &intent,
+    );
+    let auth_state_path = crate::auth::auth_state_path(dir.path()).unwrap();
+    let auth_state_before = std::fs::read(&auth_state_path).unwrap();
+    let archive_key_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), "ElastOS/System/Auth")
+            .unwrap()
+            .join("recovery-archive.key");
+
+    let refused = post_full_recovery_export(&app, &authority, &intent, &token).await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(refused.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.starts_with(
+            "Home could not prepare your Recovery Kit: .AppData/LocalHost/GBA/ucity/damaged.sav \
+             does not carry the label"
+        ),
+        "{body}"
+    );
+    assert!(body.ends_with(
+        "upload it again in Library. After that, select Download Recovery Kit again; you will \
+         approve with your passkey again."
+    ));
+    let replay = post_full_recovery_export(&app, &authority, &intent, &token).await;
+    assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("already been used"));
+    assert_eq!(std::fs::read(&auth_state_path).unwrap(), auth_state_before);
+    assert!(!archive_key_path.exists());
+    assert!(crate::auth::load_principal_root_protection(
+        dir.path(),
+        &authority.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .is_none());
+    assert_eq!(std::fs::read(&damaged_path).unwrap(), damaged);
+
+    // After the person moves the file out, a fresh approval succeeds even
+    // when the scan outlasts the approval's 180 s lifetime.
+    std::fs::remove_file(&damaged_path).unwrap();
+    crate::api::auth_gateway::delay_next_full_recovery_scan_for_test(dir.path());
+    let exported =
+        export_full_recovery_bundle_response(&app, dir.path(), &authority, &principal).await;
+    assert_eq!(exported.status(), StatusCode::OK);
+    assert!(crate::auth::load_principal_root_protection(
+        dir.path(),
+        &authority.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .is_some());
+}
+
+#[tokio::test]
+async fn export_with_protection_returns_kit_despite_damaged_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("alex"));
+    let principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    let first =
+        export_full_recovery_bundle_response(&app, dir.path(), &authority, &principal).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let protection = crate::auth::load_principal_root_protection(
+        dir.path(),
+        &authority.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .expect("the first export creates protection");
+
+    // With protection in place, export only returns the archived kit: a
+    // damaged file does not stop it and is left as it is.
+    let damaged_uri = format!(
+        "{}/.AppData/LocalHost/GBA/ucity/damaged.sav",
+        principal.localhost_root
+    );
+    let damaged_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &damaged_uri).unwrap();
+    std::fs::create_dir_all(damaged_path.parent().unwrap()).unwrap();
+    let damaged = b"{\n  \"sche\xffma\": \"elastos.principal-root.object/v1\"".to_vec();
+    std::fs::write(&damaged_path, &damaged).unwrap();
+    let again =
+        export_full_recovery_bundle_response(&app, dir.path(), &authority, &principal).await;
+    let status = again.status();
+    let body = axum::body::to_bytes(again.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(std::fs::read(&damaged_path).unwrap(), damaged);
+    assert_eq!(
+        crate::auth::load_principal_root_protection(
+            dir.path(),
+            &authority.principal_id,
+            &principal.localhost_root,
+        )
+        .unwrap()
+        .unwrap()
+        .data_key_id,
+        protection.data_key_id
+    );
 }
 
 #[tokio::test]
@@ -2265,4 +2416,207 @@ async fn assert_owner_recovery_restores_same_home(kit_imported_before: bool) {
         .await
         .unwrap();
     assert_eq!(reused.status(), StatusCode::FORBIDDEN);
+}
+
+fn write_protected_test_object(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    localhost_root: &str,
+    relative: &str,
+    plaintext: &[u8],
+) -> std::path::PathBuf {
+    let uri = format!("{localhost_root}/{relative}");
+    let path = elastos_common::localhost::rooted_localhost_fs_path(data_dir, &uri).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    crate::auth::write_principal_root_object(
+        data_dir,
+        principal_id,
+        localhost_root,
+        &uri,
+        &path,
+        plaintext,
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn recovery_status_reports_pending_journal_and_damage() {
+    // A clean root, with one body-flipped envelope: status reads headers only,
+    // so body damage is not listed, and the JSON has exactly today's fields.
+    let dir = tempfile::tempdir().unwrap();
+    let principal_id = "person:local:status-clean";
+    let protection = crate::auth::store_test_principal_root_protection(dir.path(), principal_id);
+    let root = protection.localhost_root.clone();
+    let flipped_path =
+        write_protected_test_object(dir.path(), principal_id, &root, "Documents/a.txt", b"body");
+    let mut envelope: Value =
+        serde_json::from_slice(&std::fs::read(&flipped_path).unwrap()).unwrap();
+    let ciphertext = envelope["ciphertext"].as_str().unwrap().to_string();
+    let replacement = if ciphertext.starts_with('A') {
+        "B"
+    } else {
+        "A"
+    };
+    envelope["ciphertext"] = json!(format!("{replacement}{}", &ciphertext[1..]));
+    let pretty = format!(
+        "{{\n  \"schema\": {},\n  \"principal_id\": {},\n  \"localhost_root\": {},\n  \
+         \"data_key_id\": {},\n  \"object_uri\": {},\n  \"cipher\": {},\n  \"nonce\": {},\n  \
+         \"ciphertext\": {}\n}}",
+        envelope["schema"],
+        envelope["principal_id"],
+        envelope["localhost_root"],
+        envelope["data_key_id"],
+        envelope["object_uri"],
+        envelope["cipher"],
+        envelope["nonce"],
+        envelope["ciphertext"],
+    );
+    std::fs::write(&flipped_path, pretty).unwrap();
+    let status = crate::api::auth_gateway::principal_root_recovery_status_for_verified_principal(
+        dir.path(),
+        principal_id,
+        &root,
+    )
+    .unwrap();
+    assert!(status.root_encrypted);
+    assert!(status.objects_needing_attention.is_empty());
+    let keys: std::collections::BTreeSet<String> = serde_json::to_value(&status)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "schema",
+            "principal_id",
+            "localhost_root",
+            "root_encrypted",
+            "recovery_configured",
+            "recovery_download_available",
+            "protection_configured",
+            "required_actions",
+            "crypto",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    );
+
+    // A damaged label is listed with its problem and action.
+    let dir = tempfile::tempdir().unwrap();
+    let principal_id = "person:local:status-damaged";
+    let protection = crate::auth::store_test_principal_root_protection(dir.path(), principal_id);
+    let root = protection.localhost_root.clone();
+    let damaged_path =
+        write_protected_test_object(dir.path(), principal_id, &root, "Documents/b.txt", b"body");
+    let mut damaged = std::fs::read(&damaged_path).unwrap();
+    damaged[9] = 0xff;
+    std::fs::write(&damaged_path, &damaged).unwrap();
+    let status = crate::api::auth_gateway::principal_root_recovery_status_for_verified_principal(
+        dir.path(),
+        principal_id,
+        &root,
+    )
+    .unwrap();
+    assert!(!status.root_encrypted);
+    assert_eq!(status.objects_needing_attention_count, 1);
+    assert_eq!(status.objects_needing_attention[0].path, "Documents/b.txt");
+    assert_eq!(
+        status.objects_needing_attention[0].problem,
+        "label_unreadable"
+    );
+    assert!(status.objects_needing_attention[0]
+        .action
+        .starts_with("Documents/b.txt does not carry the label"));
+    assert!(!status
+        .required_actions
+        .iter()
+        .any(|action| action == "migrate_declared_plaintext_objects"));
+
+    // A journal left by an interrupted migration is reported.
+    let dir = tempfile::tempdir().unwrap();
+    let principal_id = "person:local:status-journal";
+    let protection = crate::auth::store_test_principal_root_protection(dir.path(), principal_id);
+    let root = protection.localhost_root.clone();
+    let legacy_uri = format!("{root}/Documents/legacy.txt");
+    let legacy_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &legacy_uri).unwrap();
+    std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+    std::fs::write(&legacy_path, b"legacy plaintext").unwrap();
+    let inventory =
+        crate::api::auth_gateway::principal_root_protected_object_inventory(dir.path(), &root);
+    let activation =
+        crate::auth::begin_declarative_principal_root_protection_activation_migrating_plaintext(
+            dir.path(),
+            principal_id,
+            &root,
+            &inventory,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    crate::auth::inject_principal_root_migration_test_fault(
+        dir.path(),
+        crate::auth::PrincipalRootMigrationTestFault::JournalPrepared,
+    );
+    assert!(
+        crate::auth::migrate_principal_root_plaintext_objects_under_activation(
+            &activation.guard,
+            dir.path(),
+            principal_id,
+            &root,
+            activation.plaintext_objects.clone(),
+        )
+        .is_err()
+    );
+    drop(activation);
+    let status = crate::api::auth_gateway::principal_root_recovery_status_for_verified_principal(
+        dir.path(),
+        principal_id,
+        &root,
+    )
+    .unwrap();
+    assert!(!status.root_encrypted);
+    assert!(status
+        .required_actions
+        .iter()
+        .any(|action| action == "finish_interrupted_principal_root_migration"));
+}
+
+#[test]
+fn recovery_status_reads_headers_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let principal_id = "person:local:status-headers";
+    let protection = crate::auth::store_test_principal_root_protection(dir.path(), principal_id);
+    let root = protection.localhost_root.clone();
+    write_protected_test_object(
+        dir.path(),
+        principal_id,
+        &root,
+        "Documents/film.mov",
+        &vec![0x44; 100 * 1024 * 1024],
+    );
+    for index in 0..1_100 {
+        write_protected_test_object(
+            dir.path(),
+            principal_id,
+            &root,
+            &format!("Documents/notes/{index:04}.txt"),
+            b"note",
+        );
+    }
+    let before = crate::auth::principal_root_scan_probes(dir.path());
+    let status = crate::api::auth_gateway::principal_root_recovery_status_for_verified_principal(
+        dir.path(),
+        principal_id,
+        &root,
+    )
+    .unwrap();
+    let after = crate::auth::principal_root_scan_probes(dir.path());
+    assert!(status.root_encrypted);
+    assert_eq!(after.file_opens - before.file_opens, 1_101);
+    // Heads only: no body is read, so nothing is decrypted.
+    assert!(after.bytes_read - before.bytes_read <= 1_101 * (4 * 1024 + 3));
 }

@@ -19,12 +19,13 @@ use web_sys::{
 mod direct;
 
 use direct::{
-    apply_direct_messages, encode_path_segment, pending_direct_request_id,
-    remove_unavailable_conversation, requested_conversation_decision, selected_conversation,
-    should_clear_polled_transient_error, terminal_retry_detail, valid_direct_send_response,
-    DirectConversationList, DirectDeliveryState, DirectMessageDirection, DirectMessageList,
-    DirectSendFailure, DirectSendInput, DirectSendResponse, DirectUiState, PendingDirectSend,
-    RequestedConversationDecision, DIRECT_API_BASE,
+    apply_direct_messages, encode_path_segment, pending_delivery_note, pending_direct_request_id,
+    pending_note_wait_ms, remove_unavailable_conversation, requested_conversation_decision,
+    selected_conversation, should_clear_polled_transient_error, terminal_retry_detail,
+    track_pending_since, valid_direct_send_response, DirectConversationList, DirectDeliveryState,
+    DirectMessageDirection, DirectMessageList, DirectSendFailure, DirectSendInput,
+    DirectSendResponse, DirectUiState, PendingDirectSend, RequestedConversationDecision,
+    DIRECT_API_BASE,
 };
 
 const BROWSER_SESSION_API_BASE: &str = "/api/browser/session";
@@ -163,6 +164,8 @@ struct AppState {
     /// Action state is ephemeral. Runtime owns signed intent and delivery truth.
     direct_in_flight: BTreeMap<String, String>,
     direct_retry_terminal: BTreeMap<String, String>,
+    /// When a manual Retry of a pending message was last accepted.
+    direct_retried_at: BTreeMap<String, u64>,
     direct_send_again: BTreeMap<String, PendingDirectSend>,
 }
 
@@ -214,6 +217,13 @@ struct App {
     /// when it was a message sender. Lists re-render, so closing the card finds
     /// that exact name again and returns focus to it.
     participant_card_opener: RefCell<Option<(String, Option<u64>)>>,
+    /// When this session first saw each outgoing direct message pending, in
+    /// browser monotonic milliseconds (`track_pending_since`).
+    direct_pending_seen: RefCell<BTreeMap<String, f64>>,
+    /// Renders once the next pending message's note is due; unchanged polls
+    /// do not render, so the note needs its own wake-up.
+    pending_note_render: RefCell<Option<Closure<dyn FnMut()>>>,
+    pending_note_timer: Cell<Option<i32>>,
     state: RefCell<AppState>,
     document: Document,
     body: HtmlElement,
@@ -669,6 +679,9 @@ pub fn start() -> Result<(), JsValue> {
         participant_card_opening: Cell::new(0),
         participant_contact_requests: RefCell::new(BTreeSet::new()),
         participant_card_opener: RefCell::new(None),
+        direct_pending_seen: RefCell::new(BTreeMap::new()),
+        pending_note_render: RefCell::new(None),
+        pending_note_timer: Cell::new(None),
         state: RefCell::new(state),
         document: document.clone(),
         body: document
@@ -1712,14 +1725,13 @@ impl App {
                 let Some(url) = anchor.get_attribute("data-open-external") else {
                     return;
                 };
-                match link_app.open_external_link_from_shell(&url) {
-                    Ok(true) => event.prevent_default(),
-                    Ok(false) => {}
-                    Err(error) => {
-                        link_app.set_error(Some(js_error(error)));
-                        let _ = link_app.render();
-                    }
+                // Releasing a drag-selection on the link fires click; selecting
+                // is how an address is copied, so that click opens nothing. The
+                // link has no href, so returning navigates nowhere.
+                if selection_intersects(&anchor) {
+                    return;
                 }
+                link_app.activate_external_link(&event, &url);
                 return;
             }
             let Some(anchor) = target.closest("[data-open-uri]").ok().flatten() else {
@@ -1740,6 +1752,37 @@ impl App {
         self.message_list
             .add_event_listener_with_callback("click", link_click.as_ref().unchecked_ref())?;
         link_click.forget();
+
+        // In Home a web link has no href, so the keyboard reaches it only here.
+        let key_app = Rc::clone(self);
+        let link_key = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::wrap(Box::new(
+            move |event: web_sys::KeyboardEvent| {
+                if !key_app.is_shell_mode() || !activates_link_key(&event.key()) {
+                    return;
+                }
+                let Some(link) = event
+                    .target()
+                    .and_then(|value| value.dyn_into::<Element>().ok())
+                    .and_then(|target| target.closest("[data-open-external]").ok().flatten())
+                else {
+                    return;
+                };
+                let Some(url) = link.get_attribute("data-open-external") else {
+                    return;
+                };
+                key_app.activate_external_link(&event, &url);
+            },
+        ));
+        self.message_list
+            .add_event_listener_with_callback("keydown", link_key.as_ref().unchecked_ref())?;
+        link_key.forget();
+
+        let note_app = Rc::clone(self);
+        *self.pending_note_render.borrow_mut() =
+            Some(Closure::<dyn FnMut()>::wrap(Box::new(move || {
+                note_app.pending_note_timer.set(None);
+                let _ = note_app.render();
+            })));
 
         let library_attach_app = Rc::clone(self);
         let library_attach = Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(
@@ -2925,10 +2968,16 @@ impl App {
                         .direct_send_again
                         .remove(original_request_id);
                 }
-                self.state
-                    .borrow_mut()
-                    .direct_retry_terminal
-                    .remove(original_request_id);
+                {
+                    let mut state = self.state.borrow_mut();
+                    state.direct_retry_terminal.remove(original_request_id);
+                    if !send_again {
+                        state.direct_retried_at.insert(
+                            original_request_id.to_string(),
+                            (js_sys::Date::now() / 1000.0) as u64,
+                        );
+                    }
+                }
                 let _ = self.refresh_direct_messages_for_guard(&guard).await;
                 Ok(())
             }
@@ -3071,19 +3120,58 @@ impl App {
         }))
     }
 
-    /// App documents have no popup permission. Inside Home a web link asks
-    /// Home, which shows the exact address and opens it only when the person
-    /// chooses Open link; the link never navigates Chat itself. Home checks the
-    /// address, so Chat sends it unchanged. Outside Home it navigates normally.
-    fn open_external_link_from_shell(&self, url: &str) -> Result<bool, JsValue> {
-        let Some(home_token) = self.home_token() else {
-            return Ok(false);
+    /// App documents have no popup permission. Inside Home a web link has no
+    /// href and asks Home, which shows the exact address and opens it only when
+    /// the person chooses Open link; the link never navigates Chat itself. Home
+    /// checks the address, so Chat sends it unchanged. Outside Home it is a
+    /// normal anchor and navigates natively.
+    fn activate_external_link(&self, event: &Event, url: &str) {
+        let message =
+            match external_link_request(self.is_shell_mode(), self.home_token().as_deref(), url) {
+                ExternalLinkRequest::Native => return,
+                ExternalLinkRequest::AskHome(message) => Some(message),
+                ExternalLinkRequest::Refuse => None,
+            };
+        event.prevent_default();
+        let asked = message.map_or(Ok(false), |message| self.post_home_message(&message));
+        let error = match asked {
+            Ok(true) => return,
+            Ok(false) => JsValue::from_str(OPEN_LINK_FROM_HOME),
+            Err(error) => error,
         };
-        if !self.is_shell_mode() {
-            return Ok(false);
+        self.set_error(Some(js_error(error)));
+        let _ = self.render();
+    }
+
+    /// A web link card element. Inside Home it has no href, so nothing but
+    /// `activate_external_link` can act on it.
+    fn external_link_element(&self, url: &str, title: &str) -> Result<Element, JsValue> {
+        let link = self.document.create_element("a")?;
+        for (name, value) in external_link_attributes(url, Some(title), self.is_shell_mode()) {
+            link.set_attribute(name, &value)?;
         }
-        self.post_home_message(&home_open_external_message(url, &home_token))?;
-        Ok(true)
+        Ok(link)
+    }
+
+    /// Appends a message's text: plain runs as text nodes (never parsed as
+    /// markup) and each web address as a link element. Shared by room Text
+    /// messages and direct messages.
+    fn append_message_text(&self, body: &Element, text: &str) -> Result<(), JsValue> {
+        for node in message_text_nodes(text, self.is_shell_mode()) {
+            match node {
+                MessageTextNode::Text(text) => body.append_with_str_1(text)?,
+                MessageTextNode::Link { text, attributes } => {
+                    let link = self.document.create_element("a")?;
+                    link.set_class_name("message-link");
+                    for (name, value) in attributes {
+                        link.set_attribute(name, &value)?;
+                    }
+                    link.set_text_content(Some(text));
+                    body.append_child(&link)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn open_attachment_in_documents(&self, attachment_id: &str) -> Result<bool, JsValue> {
@@ -4173,6 +4261,7 @@ impl App {
     fn render_direct_messages(&self, state: &AppState) -> Result<(), JsValue> {
         let direct = &state.direct;
         self.message_list.set_inner_html("");
+        self.schedule_pending_note_render(None);
         let Some(conversation_id) = direct.selected_conversation_id.as_deref() else {
             return Ok(());
         };
@@ -4187,6 +4276,10 @@ impl App {
             self.message_list.append_child(&empty)?;
             return Ok(());
         }
+        let now_ms = monotonic_now_ms();
+        let mut seen = self.direct_pending_seen.borrow_mut();
+        track_pending_since(&mut seen, &direct.messages, now_ms);
+        let mut next_note_ms: Option<f64> = None;
         let mut last_day = None;
         for message in &direct.messages {
             self.append_day_separator_if_new(&mut last_day, message.created_at)?;
@@ -4224,7 +4317,7 @@ impl App {
             meta.append_child(&detail)?;
             let body = self.document.create_element("div")?;
             body.set_class_name("message-body");
-            body.set_text_content(Some(&message.text));
+            self.append_message_text(&body, &message.text)?;
             item.append_child(&meta)?;
             item.append_child(&body)?;
             if outgoing
@@ -4246,10 +4339,27 @@ impl App {
                             (message.delivery_state == DirectDeliveryState::Expired)
                                 .then(|| terminal_retry_detail(Some("retry_expired")).unwrap())
                         });
-                    if let Some(detail) = terminal {
+                    let wait_ms = seen
+                        .get(&message.message_id)
+                        .map(|seen_at| pending_note_wait_ms(*seen_at, now_ms));
+                    if let Some(wait) = wait_ms.filter(|wait| *wait > 0.0) {
+                        next_note_ms = Some(next_note_ms.map_or(wait, |next| next.min(wait)));
+                    }
+                    let pending_note = terminal.is_none().then(|| {
+                        pending_delivery_note(
+                            wait_ms == Some(0.0),
+                            !conversation.removed,
+                            state
+                                .direct_retried_at
+                                .get(request_id)
+                                .map(|at| format_time(*at))
+                                .as_deref(),
+                        )
+                    });
+                    if let Some(detail) = terminal.map(str::to_string).or(pending_note.flatten()) {
                         let note = self.document.create_element("p")?;
                         note.set_class_name("message-meta");
-                        note.set_text_content(Some(detail));
+                        note.set_text_content(Some(&detail));
                         item.append_child(&note)?;
                     }
                     let action = self
@@ -4268,6 +4378,8 @@ impl App {
                     action.set_attribute("data-request-id", request_id)?;
                     action.set_text_content(Some(if terminal.is_some() {
                         "Send again"
+                    } else if state.direct_in_flight.contains_key(request_id) {
+                        "Trying again"
                     } else {
                         "Retry"
                     }));
@@ -4285,7 +4397,29 @@ impl App {
             }
             self.message_list.append_child(&item)?;
         }
+        self.schedule_pending_note_render(next_note_ms);
         Ok(())
+    }
+
+    /// Keeps one timer: a render when the earliest pending note is due.
+    fn schedule_pending_note_render(&self, wait_ms: Option<f64>) {
+        let Some(window) = window() else {
+            return;
+        };
+        if let Some(timer) = self.pending_note_timer.take() {
+            window.clear_timeout_with_handle(timer);
+        }
+        let render = self.pending_note_render.borrow();
+        let (Some(wait_ms), Some(render)) = (wait_ms, render.as_ref()) else {
+            return;
+        };
+        // The slack lands the render just past the threshold.
+        if let Ok(timer) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            render.as_ref().unchecked_ref(),
+            wait_ms.ceil() as i32 + 50,
+        ) {
+            self.pending_note_timer.set(Some(timer));
+        }
     }
 
     fn render_participants(
@@ -4696,7 +4830,7 @@ impl App {
                 }
                 ConversationObjectKind::Text => {
                     body.set_class_name("message-body");
-                    body.set_text_content(object.body.as_deref());
+                    self.append_message_text(&body, object.body.as_deref().unwrap_or_default())?;
                 }
                 ConversationObjectKind::Emoji => {
                     body.set_class_name("message-body emoji-body");
@@ -4705,16 +4839,15 @@ impl App {
                 ConversationObjectKind::Link => {
                     body.set_class_name("message-body link-body");
                     if let Some(link) = &object.link {
-                        let anchor = self.document.create_element("a")?;
-                        let is_elastos_uri = link.url.starts_with("elastos://");
-                        anchor.set_attribute("href", &link.url)?;
-                        if is_elastos_uri {
+                        let anchor = if link.url.starts_with("elastos://") {
+                            let anchor = self.document.create_element("a")?;
+                            anchor.set_attribute("href", &link.url)?;
                             anchor.set_attribute("data-open-uri", &link.url)?;
                             anchor.set_attribute("aria-label", "Open published document")?;
+                            anchor
                         } else {
-                            anchor.set_attribute("data-open-external", &link.url)?;
-                            anchor.set_attribute("rel", "noopener noreferrer")?;
-                        }
+                            self.external_link_element(&link.url, &link.title)?
+                        };
 
                         let title = self.document.create_element("div")?;
                         title.set_class_name("link-title");
@@ -5065,6 +5198,211 @@ fn documents_attachment_message(
             "dataUrl": data_url,
         },
     })
+}
+
+const OPEN_LINK_FROM_HOME: &str = "Open Chat from Home to open web links.";
+
+/// One run of a Text message: plain text, or a web address shown as a link.
+#[derive(Debug, PartialEq, Eq)]
+enum TextSegment<'a> {
+    Text(&'a str),
+    Link(&'a str),
+}
+
+/// One node of a rendered message body: a text node, or a link element with
+/// its visible address and attributes.
+#[derive(Debug, PartialEq, Eq)]
+enum MessageTextNode<'a> {
+    Text(&'a str),
+    Link {
+        text: &'a str,
+        attributes: Vec<(&'static str, String)>,
+    },
+}
+
+/// The nodes a message body renders as, for room Text and direct messages.
+fn message_text_nodes(text: &str, shell_mode: bool) -> Vec<MessageTextNode<'_>> {
+    split_text_links(text)
+        .into_iter()
+        .map(|segment| match segment {
+            TextSegment::Text(text) => MessageTextNode::Text(text),
+            TextSegment::Link(url) => MessageTextNode::Link {
+                text: url,
+                attributes: external_link_attributes(url, None, shell_mode),
+            },
+        })
+        .collect()
+}
+
+/// Splits message text into plain runs and `http://`/`https://` addresses.
+/// An address runs to the next whitespace or full-width (CJK) punctuation,
+/// minus trailing sentence punctuation, quotes and unbalanced closing
+/// brackets. Nothing else (a bare `example.com`) is a link. The address is
+/// sent unchanged; the Runtime checks it.
+fn split_text_links(text: &str) -> Vec<TextSegment<'_>> {
+    let mut segments = Vec::new();
+    let mut plain_start = 0;
+    let mut cursor = 0;
+    while let Some((start, scheme_len)) = next_web_scheme(text, cursor) {
+        let rest = &text[start..];
+        let run_end = start + rest.find(ends_link_run).unwrap_or(rest.len());
+        let end = start + trim_link_end(&text[start..run_end]).len();
+        if end > start + scheme_len {
+            if plain_start < start {
+                segments.push(TextSegment::Text(&text[plain_start..start]));
+            }
+            segments.push(TextSegment::Link(&text[start..end]));
+            plain_start = end;
+            cursor = end;
+        } else {
+            cursor = start + scheme_len;
+        }
+    }
+    if plain_start < text.len() {
+        segments.push(TextSegment::Text(&text[plain_start..]));
+    }
+    segments
+}
+
+/// The next `http://` or `https://` (any ASCII case) at or after `from` that
+/// does not continue an ASCII word, with the scheme's length. CJK text needs
+/// no space before an address.
+fn next_web_scheme(text: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    (from..bytes.len()).find_map(|index| {
+        if !text.is_char_boundary(index)
+            || text[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|before| before.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        ["https://", "http://"].into_iter().find_map(|scheme| {
+            bytes
+                .get(index..index + scheme.len())
+                .filter(|candidate| candidate.eq_ignore_ascii_case(scheme.as_bytes()))
+                .map(|_| (index, scheme.len()))
+        })
+    })
+}
+
+/// Whitespace (including the full-width space) and full-width punctuation end
+/// an address, so CJK prose around it stays text.
+fn ends_link_run(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '。' | '、'
+                | '，'
+                | '．'
+                | '：'
+                | '；'
+                | '！'
+                | '？'
+                | '）'
+                | '」'
+                | '』'
+                | '】'
+                | '〉'
+                | '》'
+        )
+}
+
+fn trim_link_end(candidate: &str) -> &str {
+    const CLOSERS: [char; 4] = [')', ']', '}', '>'];
+    const OPENERS: [char; 4] = ['(', '[', '{', '<'];
+    // Count once; only closers are trimmed, so only their counts change.
+    let openers = OPENERS.map(|opener| candidate.matches(opener).count());
+    let mut closers = CLOSERS.map(|closer| candidate.matches(closer).count());
+    let mut link = candidate;
+    while let Some(last) = link.chars().next_back() {
+        if let Some(pair) = CLOSERS.iter().position(|closer| *closer == last) {
+            if openers[pair] >= closers[pair] {
+                break;
+            }
+            closers[pair] -= 1;
+        } else if !matches!(
+            last,
+            '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | '\u{2019}' | '\u{201D}' | '\u{BB}'
+        ) {
+            break;
+        }
+        link = &link[..link.len() - last.len_utf8()];
+    }
+    link
+}
+
+/// Attributes of a web link element. Inside Home the element has no href, so
+/// the browser has no navigation to perform (click, middle-click, keyboard or
+/// context menu); Chat's own handlers ask Home instead, and the accessible
+/// name keeps any visible title next to the address. Outside Home it is a
+/// normal anchor.
+fn external_link_attributes(
+    url: &str,
+    title: Option<&str>,
+    shell_mode: bool,
+) -> Vec<(&'static str, String)> {
+    let mut attributes = vec![("data-open-external", url.to_string())];
+    if shell_mode {
+        let label = match title.map(str::trim).filter(|title| !title.is_empty()) {
+            Some(title) => format!("Open link: {title} ({url})"),
+            None => format!("Open link: {url}"),
+        };
+        attributes.extend([
+            ("role", "link".to_string()),
+            ("tabindex", "0".to_string()),
+            ("aria-label", label),
+        ]);
+    } else {
+        attributes.extend([
+            ("href", url.to_string()),
+            ("rel", "noopener noreferrer".to_string()),
+        ]);
+    }
+    attributes
+}
+
+/// Whether the page has a non-empty text selection touching `element`.
+fn selection_intersects(element: &Element) -> bool {
+    window()
+        .and_then(|window| window.get_selection().ok().flatten())
+        .filter(|selection| !selection.is_collapsed())
+        .is_some_and(|selection| {
+            selection
+                .contains_node_with_allow_partial_containment(element, true)
+                .unwrap_or(false)
+        })
+}
+
+/// Keys that activate a focused link that has no href.
+fn activates_link_key(key: &str) -> bool {
+    matches!(key, "Enter" | " ")
+}
+
+/// What activating a web link does.
+#[derive(Debug, PartialEq)]
+enum ExternalLinkRequest {
+    /// Outside Home: the anchor navigates natively.
+    Native,
+    /// Inside Home: post this one request to Home, never navigate.
+    AskHome(serde_json::Value),
+    /// Inside Home without a Home session: show an error, never navigate.
+    Refuse,
+}
+
+fn external_link_request(
+    shell_mode: bool,
+    home_token: Option<&str>,
+    url: &str,
+) -> ExternalLinkRequest {
+    match (shell_mode, home_token) {
+        (false, _) => ExternalLinkRequest::Native,
+        (true, Some(home_token)) => {
+            ExternalLinkRequest::AskHome(home_open_external_message(url, home_token))
+        }
+        (true, None) => ExternalLinkRequest::Refuse,
+    }
 }
 
 /// The typed request asking Home to show and, on consent, open one web link.
@@ -5462,6 +5800,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         community_presence: None,
         direct_in_flight: BTreeMap::new(),
         direct_retry_terminal: BTreeMap::new(),
+        direct_retried_at: BTreeMap::new(),
         direct_send_again: BTreeMap::new(),
         error_text: None,
     }
@@ -5532,23 +5871,25 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::direct::{
-        DirectConversationView, DirectMessageList, DirectUiState, PendingDirectSend,
+        DirectConversationView, DirectMessageList, DirectMessageView, DirectUiState,
+        PendingDirectSend,
     };
     use super::{
-        admitted_home_origin, apply_active_poll_if_current, apply_active_poll_state,
-        apply_direct_refresh_if_current, apply_session_loss, begin_poll_request,
-        chat_control_policy, clear_selected_direct_conversation, commit_direct_selection,
-        commit_requested_direct_selection_if_current, commit_shared_selection,
-        conversation_initial, current_selection_guard, decode_query_value,
-        documents_attachment_message, extract_fragment_param, extract_query_param,
-        format_chat_message_request_id, home_open_external_message, note_composer_edit,
-        object_sender_name, participant_detail, participant_shown_name, pending_chat_request_id,
-        render_projection, resolve_conversation_choice, room_send_error_text,
-        selection_guard_matches, settle_sent_draft, shell_summary_allows_session,
-        switch_composer_draft, AccessMode, AppConfig, AppState, AttachmentView, CommunityState,
-        ConversationObjectKind, ConversationObjectView, ParticipantView, PendingChatSend,
-        RenderProjection, RoomPollView, RoomTransportView, ShellSessionBootstrapFailure,
-        ShellSessionStartOutput, SummaryView,
+        activates_link_key, admitted_home_origin, apply_active_poll_if_current,
+        apply_active_poll_state, apply_direct_refresh_if_current, apply_session_loss,
+        begin_poll_request, chat_control_policy, clear_selected_direct_conversation,
+        commit_direct_selection, commit_requested_direct_selection_if_current,
+        commit_shared_selection, conversation_initial, current_selection_guard, decode_query_value,
+        documents_attachment_message, external_link_attributes, external_link_request,
+        extract_fragment_param, extract_query_param, format_chat_message_request_id,
+        home_open_external_message, message_text_nodes, note_composer_edit, object_sender_name,
+        participant_detail, participant_shown_name, pending_chat_request_id, render_projection,
+        resolve_conversation_choice, room_send_error_text, selection_guard_matches,
+        settle_sent_draft, shell_summary_allows_session, split_text_links, switch_composer_draft,
+        AccessMode, AppConfig, AppState, AttachmentView, CommunityState, ConversationObjectKind,
+        ConversationObjectView, ExternalLinkRequest, MessageTextNode, ParticipantView,
+        PendingChatSend, RenderProjection, RoomPollView, RoomTransportView,
+        ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView, TextSegment,
     };
 
     fn two_direct_conversations() -> AppState {
@@ -6446,6 +6787,257 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn text_web_addresses_split_into_links() {
+        use TextSegment::{Link, Text};
+        let cases: &[(&str, &[TextSegment])] = &[
+            ("", &[]),
+            ("no links here", &[Text("no links here")]),
+            ("https://a.example", &[Link("https://a.example")]),
+            (
+                "see https://a.example/x?y=1#z.",
+                &[Text("see "), Link("https://a.example/x?y=1#z"), Text(".")],
+            ),
+            (
+                "end http://a.example/!?;:,",
+                &[Text("end "), Link("http://a.example/"), Text("!?;:,")],
+            ),
+            (
+                "(see https://en.wikipedia.org/wiki/Rust_(language))",
+                &[
+                    Text("(see "),
+                    Link("https://en.wikipedia.org/wiki/Rust_(language)"),
+                    Text(")"),
+                ],
+            ),
+            (
+                "[https://a.example/] {https://b.example} <https://c.example>",
+                &[
+                    Text("["),
+                    Link("https://a.example/"),
+                    Text("] {"),
+                    Link("https://b.example"),
+                    Text("} <"),
+                    Link("https://c.example"),
+                    Text(">"),
+                ],
+            ),
+            (
+                "\"https://a.example\" 'https://b.example' «https://c.example» “https://d.example”",
+                &[
+                    Text("\""),
+                    Link("https://a.example"),
+                    Text("\" '"),
+                    Link("https://b.example"),
+                    Text("' «"),
+                    Link("https://c.example"),
+                    Text("» “"),
+                    Link("https://d.example"),
+                    Text("”"),
+                ],
+            ),
+            (
+                "héllo 🌍 https://exämple.example/päth 日本語",
+                &[
+                    Text("héllo 🌍 "),
+                    Link("https://exämple.example/päth"),
+                    Text(" 日本語"),
+                ],
+            ),
+            (
+                "HTTPS://A.EXAMPLE\nhttp://b.example",
+                &[Link("HTTPS://A.EXAMPLE"), Text("\n"), Link("http://b.example")],
+            ),
+            (
+                "example.com www.example.com ftp://a.example javascript:alert(1) xhttps://a.example https:// http://. https:example",
+                &[Text("example.com www.example.com ftp://a.example javascript:alert(1) xhttps://a.example https:// http://. https:example")],
+            ),
+            (
+                // Markup stays text; the address is sent as typed and the
+                // Runtime decides whether it is valid.
+                "<b>https://a.example/<script>alert(1)</script></b>",
+                &[
+                    Text("<b>"),
+                    Link("https://a.example/<script>alert(1)</script></b>"),
+                ],
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(&split_text_links(text), expected, "{text:?}");
+            let joined: String = split_text_links(text)
+                .iter()
+                .map(|segment| match segment {
+                    Text(part) | Link(part) => *part,
+                })
+                .collect();
+            assert_eq!(&joined, text, "segments keep every character");
+        }
+        // Many unmatched closers trim in one linear pass.
+        let url = "https://a.example/x_(y)";
+        let text = format!("{url}{}", ")".repeat(100_000));
+        assert_eq!(
+            split_text_links(&text),
+            [Link(url), Text(&text[url.len()..])]
+        );
+    }
+
+    #[test]
+    fn web_links_inside_home_have_no_href() {
+        let url = "https://a.example/x?y=1";
+        let shell = external_link_attributes(url, None, true);
+        assert_eq!(
+            shell,
+            vec![
+                ("data-open-external", url.to_string()),
+                ("role", "link".to_string()),
+                ("tabindex", "0".to_string()),
+                ("aria-label", format!("Open link: {url}")),
+            ]
+        );
+        assert!(shell.iter().all(|(name, _)| *name != "href"));
+        // A link card's accessible name keeps its visible title.
+        assert!(external_link_attributes(url, Some("Example"), true)
+            .contains(&("aria-label", format!("Open link: Example ({url})"))));
+        assert!(external_link_attributes(url, Some("  "), true)
+            .contains(&("aria-label", format!("Open link: {url}"))));
+        assert_eq!(
+            external_link_attributes(url, Some("Example"), false),
+            vec![
+                ("data-open-external", url.to_string()),
+                ("href", url.to_string()),
+                ("rel", "noopener noreferrer".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cjk_text_around_web_addresses_stays_text() {
+        use TextSegment::{Link, Text};
+        let cases: &[(&str, &[TextSegment])] = &[
+            (
+                "詳細はhttps://example.com/ を見て",
+                &[
+                    Text("詳細は"),
+                    Link("https://example.com/"),
+                    Text(" を見て"),
+                ],
+            ),
+            (
+                "https://example.com/a。次は",
+                &[Link("https://example.com/a"), Text("。次は")],
+            ),
+            (
+                "見て：https://a.example/x、https://b.example！",
+                &[
+                    Text("見て："),
+                    Link("https://a.example/x"),
+                    Text("、"),
+                    Link("https://b.example"),
+                    Text("！"),
+                ],
+            ),
+            (
+                "「https://a.example/p」と『https://b.example』（https://c.example）",
+                &[
+                    Text("「"),
+                    Link("https://a.example/p"),
+                    Text("」と『"),
+                    Link("https://b.example"),
+                    Text("』（"),
+                    Link("https://c.example"),
+                    Text("）"),
+                ],
+            ),
+            (
+                "https://a.example/x\u{3000}次，https://b.example．【https://c.example】",
+                &[
+                    Link("https://a.example/x"),
+                    Text("\u{3000}次，"),
+                    Link("https://b.example"),
+                    Text("．【"),
+                    Link("https://c.example"),
+                    Text("】"),
+                ],
+            ),
+            // Only an ASCII letter or digit right before the scheme blocks it.
+            (
+                "abchttps://a.example 9https://b.example",
+                &[Text("abchttps://a.example 9https://b.example")],
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(&split_text_links(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn message_text_nodes_give_one_no_href_link_inside_home() {
+        // A direct message's text, through the node list that both
+        // render_direct_messages and room Text use; the smoke covers the DOM.
+        let url = "https://a.example/dm?x=1";
+        let message: DirectMessageView = serde_json::from_value(serde_json::json!({
+            "message_id": "message:a", "direction": "incoming",
+            "text": format!("look ({url}). <b>hi</b>"), "created_at": 1,
+            "delivery_state": "received",
+        }))
+        .unwrap();
+        let nodes = message_text_nodes(&message.text, true);
+        assert_eq!(
+            nodes,
+            vec![
+                MessageTextNode::Text("look ("),
+                MessageTextNode::Link {
+                    text: url,
+                    attributes: external_link_attributes(url, None, true),
+                },
+                MessageTextNode::Text("). <b>hi</b>"),
+            ]
+        );
+        let links: Vec<_> = nodes
+            .iter()
+            .filter_map(|node| match node {
+                MessageTextNode::Link { attributes, .. } => Some(attributes),
+                MessageTextNode::Text(_) => None,
+            })
+            .collect();
+        assert_eq!(links.len(), 1, "exactly one link element");
+        assert!(links[0].iter().all(|(name, _)| *name != "href"));
+        assert!(links[0].contains(&("role", "link".to_string())));
+        // Without an address the body is one plain text node.
+        assert_eq!(
+            message_text_nodes("plain example.com words", true),
+            vec![MessageTextNode::Text("plain example.com words")]
+        );
+        // Outside Home the same link is a normal anchor.
+        assert!(matches!(
+            &message_text_nodes(url, false)[..],
+            [MessageTextNode::Link { attributes, .. }]
+                if attributes.contains(&("href", url.to_string()))
+        ));
+    }
+
+    #[test]
+    fn link_activation_keys_and_requests() {
+        let url = "https://a.example/x?y=1";
+        // The pure parts of activation; the smoke drives real click and keys.
+        assert!(activates_link_key("Enter") && activates_link_key(" "));
+        assert!(!activates_link_key("Tab") && !activates_link_key("a"));
+        assert_eq!(
+            external_link_request(true, Some("home-token"), url),
+            ExternalLinkRequest::AskHome(home_open_external_message(url, "home-token"))
+        );
+        // Without a Home session the link only reports an error; it has no
+        // href, so nothing navigates.
+        assert_eq!(
+            external_link_request(true, None, url),
+            ExternalLinkRequest::Refuse
+        );
+        assert_eq!(
+            external_link_request(false, Some("home-token"), url),
+            ExternalLinkRequest::Native
+        );
     }
 
     #[test]
@@ -7719,6 +8311,13 @@ fn room_access_policy_enabled_default() -> bool {
 
 fn local_date(timestamp_secs: u64) -> js_sys::Date {
     js_sys::Date::new(&(timestamp_secs as f64 * 1000.0).into())
+}
+
+/// Browser monotonic milliseconds, unaffected by wall-clock changes.
+fn monotonic_now_ms() -> f64 {
+    window()
+        .and_then(|window| window.performance())
+        .map_or(0.0, |performance| performance.now())
 }
 
 /// Hours and minutes in the viewer's own time zone.

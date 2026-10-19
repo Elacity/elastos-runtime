@@ -20,6 +20,16 @@ pub struct GatewayControlPlane {
     pub collaboration_service: Option<crate::collaboration_startup::CollaborationRuntimeService>,
 }
 
+/// Start refuses unencrypted or half-migrated protected folders; a damaged
+/// file does not stop Home and is named in the start log instead.
+fn verify_principal_roots_ready_and_report(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let notices = api::auth_gateway::verify_configured_principal_roots_ready(data_dir)?;
+    for line in api::auth_gateway::principal_root_notice_lines(&notices) {
+        eprintln!("[gateway] {line}");
+    }
+    Ok(())
+}
+
 pub async fn run_gateway_direct<F, Fut>(
     addr: String,
     public: bool,
@@ -60,7 +70,7 @@ where
     let _host_guard = crate::host_lock::acquire_host_process_lock(&data_dir, "gateway", &addr)?;
     crate::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "gateway");
     crate::auth::verify_auth_audit_chain_ready(&data_dir)?;
-    api::auth_gateway::verify_configured_principal_roots_ready(&data_dir)?;
+    verify_principal_roots_ready_and_report(&data_dir)?;
     let cache_path = cache_dir.unwrap_or_else(|| data_dir.join("gateway-cache"));
     std::fs::create_dir_all(&cache_path)?;
     let GatewayControlPlane {
@@ -107,7 +117,7 @@ where
         crate::host_lock::acquire_host_process_lock(&data_dir, "gateway-public", &addr)?;
     crate::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "gateway-public");
     crate::auth::verify_auth_audit_chain_ready(&data_dir)?;
-    api::auth_gateway::verify_configured_principal_roots_ready(&data_dir)?;
+    verify_principal_roots_ready_and_report(&data_dir)?;
     let components_path = data_dir.join("components.json");
     if !components_path.exists() {
         anyhow::bail!(
