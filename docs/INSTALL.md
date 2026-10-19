@@ -189,6 +189,20 @@ Refresh-only is not sufficient for package/dependency changes: rebuild the targe
 `scripts/browser-vm-artifact-preflight.sh`, including the complete
 PipeWire/WirePlumber/GStreamer dependency set, before installation.
 
+## Set up Home on a board without a screen or passkey
+
+Home is created with a passkey, and the board needs none of its own. From a Mac
+or Windows computer, open an SSH tunnel to the board and keep it open:
+
+```sh
+ssh -L 8090:localhost:8090 user@board
+```
+
+Open `http://localhost:8090/home/` on that computer and create the passkey there
+(Touch ID or Windows Hello), or on a phone or security key. The passkey belongs
+to this Home at `localhost`, so sign in later through a tunnel the same way;
+using the same tunnel and address, `http://localhost:8090/home/`, is simplest.
+
 ## How updates reach your Home
 
 Updates are pull only. Nothing is pushed to your Home. The publisher's seed

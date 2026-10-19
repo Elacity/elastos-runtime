@@ -523,7 +523,7 @@ try {
       assert.equal(terminal.status, "failed");
       assert.equal(terminal.error?.code, "model_memory_unavailable");
       assert.equal(terminal.error?.class, "context_rejected");
-      const message = "Not enough free memory for this model. Close other apps or choose a smaller model.";
+      const message = "Not enough free memory for this model. Close other apps, then try again.";
       assert.equal(terminal.error?.message, message);
       await visibleFailure(assistant, `Model run failed: ${message}`);
       await page.screenshot({ path: join(evidence, "finite-memory-refusal.png"), fullPage: true });

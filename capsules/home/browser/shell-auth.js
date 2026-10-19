@@ -671,8 +671,10 @@ async function selectRecoveryKit() {
       renderEnrollmentChoice();
       setUnlockStatus("Recovery Kit selection expired. Choose the kit again.", "muted");
     }, RECOVERY_SELECTION_MS);
-    setUnlockStatus(encrypted ? "Kit selected. Enter its password, then continue with your passkey."
-      : "Kit selected. Continue with your passkey to recover this account.", "muted");
+    // The picker is cleared above, so the status names the accepted file.
+    const selected = file.name ? `Kit selected: ${file.name}.` : "Kit selected.";
+    setUnlockStatus(encrypted ? `${selected} Enter its password, then continue with your passkey.`
+      : `${selected} Continue with your passkey to recover this account.`, "muted");
     if (encrypted) recoveryPassword?.focus();
   } catch (_) {
     if (version !== recoverySelectionVersion) return;
@@ -834,6 +836,10 @@ async function runPasskeyCreate() {
           // again with the same intent and original retention deadline.
           pending.ceremony_id = null;
           savePendingRegistration(pending);
+          const name = String(error && error.name || "");
+          if (pending.intent.purpose === "create" && (name === "NotAllowedError" || name === "AbortError")) {
+            throw new Error(PASSKEY_NOT_SAVED);
+          }
           throw error;
         }
         pending.response = serializeCreatedCredential(credential);
@@ -988,6 +994,10 @@ async function runPasskeySignIn() {
     setButtonsDisabled(false);
   }
 }
+
+const PASSKEY_NOT_SAVED = "No passkey was saved. Save it on this computer (Touch ID, or Windows Hello: set up a PIN in "
+  + "Settings → Accounts → Sign-in options), on a phone that can save passkeys, or on a security key. "
+  + "Then choose Resume setup.";
 
 // One plain reason and one next step per failed sign-in; never a status code
 // or server text. Stages: start (begin or status), passkey (the browser),

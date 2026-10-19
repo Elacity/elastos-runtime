@@ -435,6 +435,34 @@ pub(in crate::api) fn consume_prepared_passkey_step_up_effect(
     )
 }
 
+#[cfg(test)]
+static STEP_UP_CLOCK_OFFSETS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Test seam: move the clock that validates step-up tokens for `data_dir`.
+#[cfg(test)]
+pub(crate) fn advance_passkey_step_up_clock_for_test(data_dir: &Path, secs: u64) {
+    *STEP_UP_CLOCK_OFFSETS
+        .lock()
+        .unwrap()
+        .entry(data_dir.to_path_buf())
+        .or_default() += secs;
+}
+
+fn step_up_validation_now(_data_dir: &Path) -> u64 {
+    #[cfg(test)]
+    let offset = STEP_UP_CLOCK_OFFSETS
+        .lock()
+        .unwrap()
+        .get(_data_dir)
+        .copied()
+        .unwrap_or_default();
+    #[cfg(not(test))]
+    let offset = 0;
+    now_ts() + offset
+}
+
 fn consume_passkey_step_up_for_effect(
     data_dir: &Path,
     token: &str,
@@ -472,7 +500,7 @@ fn consume_passkey_step_up_for_effect(
     )
     .map_err(|err| anyhow::anyhow!("invalid passkey step-up token: {err}"))?;
 
-    let now = now_ts();
+    let now = step_up_validation_now(data_dir);
     envelope.payload.validate(now, max_age_secs)?;
     require_step_up_binding(&envelope.payload, launch, &operation, &request_sha256)?;
     let auth_data_dir = home_launch_auth_data_dir(data_dir);
