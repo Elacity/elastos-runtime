@@ -7,6 +7,7 @@ import {
   decimalIntegerToHexQuantity,
   isDirectory,
   parentUri,
+  protectionLabel,
   publishedCid,
   shortUri,
   visibilityContract,
@@ -74,7 +75,7 @@ export function createLibraryDialog({
       ["Storage Market", availability.storageMarket],
       ["Remote Open", remoteAccess.openStatus],
       ["Key Release", remoteAccess.keyRelease],
-      ["Protection", object.blocked_reason || "ok"],
+      ["Protection", protectionLabel(object)],
       ["Public Folder Policy", placement.policy],
       ["Visibility format", object.metadata?.visibility?.schema || "elastos.library.visibility/v1"],
     ];

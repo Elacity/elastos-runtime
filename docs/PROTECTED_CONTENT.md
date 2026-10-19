@@ -209,6 +209,25 @@ through release recovery and Home acceptance. Every Home start, local or public
 and whether the installed Home controller, the installer or the owner started
 it, then removes verified payload files and keeps the migration receipts.
 
+Home start, `elastos update` and Recovery status read the label at the start
+of each file in the protected folders, a few kilobytes for an encrypted file.
+A file without a label is read whole only when it is at most 16 MiB, to tell an
+unencrypted file from a damaged one, and one pass reads at most 80 MiB of such
+files. A file left over once that is spent is named as not checked in this
+pass and treated as damaged until a later pass checks it. They check three
+things: no unencrypted file was found, each encrypted file is labelled for this
+Home's current key and for the place where it is stored, and no interrupted
+encryption step is waiting. Large files and large totals do not stop Home.
+File contents are checked when a file is opened: Home runs the full AES-GCM
+check over the whole file and uses none of it unless the check passes. A file
+that looks encrypted but does not carry a correct label is damaged. This
+includes a file of your own that only looks like an encrypted file; it stays
+unencrypted until you upload it again in Library. A damaged file is named in
+the start log and in Recovery status, shows as Blocked in Library, and is never
+encrypted again. Home never changes or deletes it by itself; a Library save
+over it, Empty Trash, or a new or reset background image in System →
+Appearance (for a damaged background image) still can.
+
 Cleanup holds the installation writer lock and verifies the signed installed
 release, exact Home process and generation, host ownership, health response,
 private attach, served Home hash and configured protected roots. An active

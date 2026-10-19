@@ -1,7 +1,7 @@
 //! A person's grant to be shown in Community: a capability token the Runtime
 //! mints for that person (subject = principal id, action `message`, resource
 //! `elastos://chat/presence/<network>/<conversation>/always|while-open`) when
-//! they answer in Inbox or System → Community, and validates with all twelve
+//! they answer in Inbox or System → Security (Community section), and validates with all twelve
 //! checks on every announcement.
 //!
 //! The token lives with its holder, the Runtime acting for that person, in one
@@ -54,7 +54,7 @@ pub(crate) enum PresenceStatus {
     Requested,
     /// Later: no card; Chat offers one "Show me in Community" line.
     Deferred,
-    /// Never: no card, no line, until changed in System → Community.
+    /// Never: no card, no line, until changed in System → Security (Community section).
     Refused,
     /// System's Hidden: the grant was revoked.
     Hidden,
@@ -98,7 +98,7 @@ struct PresenceGrantFile {
     requests: Vec<PresenceRequest>,
 }
 
-/// The person's answer, in Inbox or System → Community.
+/// The person's answer, in Inbox or System → Security (Community section).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PresenceDecision {
     Always,
@@ -570,7 +570,7 @@ pub(crate) async fn own_presence_operation_authorized(
     allowed
 }
 
-/// Records the person's own answer, from Inbox or System → Community only.
+/// Records the person's own answer, from Inbox or System → Security (Community section) only.
 /// Always and Only-while-open mint a token for `principal_id`; any change
 /// revokes the token it replaces (persisted before this returns).
 pub(crate) async fn set_presence_grant(

@@ -2619,6 +2619,10 @@ fn home_services_selection_state(
         Ok(raw) => raw,
         Err(err) if is_unencrypted_principal_root_state(&err) => return Ok(default_state),
         Err(err) if is_missing_principal_root_state_file(&err) => return Ok(default_state),
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(default_state);
+        }
         Err(err) => return Err(err).with_context(|| format!("could not read {}", path.display())),
     };
     if raw.len() > HOME_SERVICES_STATE_MAX_BYTES {
@@ -2672,7 +2676,7 @@ fn home_save_services_selection_state(
     if raw.len() > HOME_SERVICES_STATE_MAX_BYTES {
         anyhow::bail!("Services state is too large");
     }
-    crate::auth::write_principal_root_object(
+    write_home_state_object(
         data_dir,
         &state.principal_id,
         &state.localhost_root,
@@ -2680,7 +2684,16 @@ fn home_save_services_selection_state(
         &path,
         &raw,
     )
-    .with_context(|| format!("could not write {}", path.display()))
+    .map_err(|err| home_state_write_error(err, &path))
+}
+
+/// Keeps a damaged-file refusal on top, where responses show it.
+fn home_state_write_error(err: anyhow::Error, path: &std::path::Path) -> anyhow::Error {
+    if is_damaged_home_state(&err) {
+        err
+    } else {
+        err.context(format!("could not write {}", path.display()))
+    }
 }
 
 fn home_services_requests_state_uri(context: &HomeLaunchTokenContext) -> String {
@@ -2721,14 +2734,20 @@ fn home_services_requests_state(
     if !path.is_file() {
         return Ok(default_state);
     }
-    let raw = crate::auth::read_principal_root_object(
+    let raw = match crate::auth::read_principal_root_object(
         data_dir,
         &default_state.principal_id,
         &default_state.localhost_root,
         &home_services_requests_state_uri(context),
         &path,
-    )
-    .with_context(|| format!("could not read {}", path.display()))?;
+    ) {
+        Ok(raw) => raw,
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(default_state);
+        }
+        Err(err) => return Err(err).with_context(|| format!("could not read {}", path.display())),
+    };
     if raw.len() > HOME_SERVICES_REQUESTS_MAX_BYTES {
         anyhow::bail!("Services requests state is too large");
     }
@@ -2759,7 +2778,7 @@ fn home_save_services_requests_state(
     if raw.len() > HOME_SERVICES_REQUESTS_MAX_BYTES {
         anyhow::bail!("Services requests state is too large");
     }
-    crate::auth::write_principal_root_object(
+    write_home_state_object(
         data_dir,
         &state.principal_id,
         &state.localhost_root,
@@ -2767,7 +2786,7 @@ fn home_save_services_requests_state(
         &path,
         &raw,
     )
-    .with_context(|| format!("could not write {}", path.display()))
+    .map_err(|err| home_state_write_error(err, &path))
 }
 
 fn home_services_peer_contact_record_for_offer(
@@ -5986,25 +6005,18 @@ pub(super) fn recovery_readiness_for_context(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
 ) -> RecoveryReadinessSummary {
-    match crate::api::auth_gateway::principal_root_recovery_status_for_verified_principal(
+    use crate::api::auth_gateway::PrincipalRootRecoveryReadiness;
+    match crate::api::auth_gateway::principal_root_recovery_readiness_for_verified_principal(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
     ) {
-        Ok(recovery) => {
-            let kit_outdated = recovery
-                .required_actions
-                .iter()
-                .any(|action| action == "download_recovery_kit_with_profile");
-            if crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery)
-                && !kit_outdated
-            {
-                RecoveryReadinessSummary::ready()
-            } else if recovery.recovery_configured {
-                RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_OUTDATED)
-            } else {
-                RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_MISSING)
-            }
+        Ok(PrincipalRootRecoveryReadiness::Ready) => RecoveryReadinessSummary::ready(),
+        Ok(PrincipalRootRecoveryReadiness::KitOutdated) => {
+            RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_OUTDATED)
+        }
+        Ok(PrincipalRootRecoveryReadiness::KitMissing) => {
+            RecoveryReadinessSummary::setup_required(RECOVERY_READINESS_REASON_KIT_MISSING)
         }
         Err(_) => RecoveryReadinessSummary::unavailable(),
     }
@@ -6264,6 +6276,10 @@ fn home_active_shell_state(
         Ok(bytes) => bytes,
         Err(err) if is_unencrypted_principal_root_state(&err) => return Ok(None),
         Err(err) if is_missing_principal_root_state_file(&err) => return Ok(None),
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(None);
+        }
         Err(err) => return Err(err),
     };
     if bytes.len() > HOME_ACTIVE_SHELL_MAX_BYTES {
@@ -6317,7 +6333,7 @@ fn home_save_active_shell(
     if let Some(parent) = path.parent() {
         crate::auth::create_owner_only_dir_all(data_dir, parent)?;
     }
-    crate::auth::write_principal_root_object(
+    write_home_state_object(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
@@ -6582,6 +6598,10 @@ fn home_browser_state(
         Err(err) if is_missing_principal_root_state_file(&err) => {
             return Ok(default_home_browser_state(context));
         }
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(default_home_browser_state(context));
+        }
         Err(err) => return Err(err),
     };
     let mut state: HomeBrowserStateSummary = match serde_json::from_slice(&bytes) {
@@ -6640,6 +6660,59 @@ fn is_missing_principal_root_state_file(err: &anyhow::Error) -> bool {
     })
 }
 
+/// #444 FU2 interim. A Home state file whose label or contents are damaged
+/// reads as its default, so the shell and the Home and System summaries
+/// keep answering; the start log and System → Recovery name the file.
+fn is_damaged_home_state(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains(crate::auth::PROTECTED_PRINCIPAL_ROOT_OBJECT_DAMAGED)
+    })
+}
+
+fn warn_damaged_home_state(path: &std::path::Path, err: &anyhow::Error) {
+    tracing::warn!(
+        path = %path.display(),
+        error = %err,
+        "Home state file is damaged; using its default"
+    );
+}
+
+/// Saves a Home state file, refusing to replace one that is damaged: the
+/// refusal is the damage notice, which names the file and the action, and
+/// the file stays as it is until the person moves it out.
+fn write_home_state_object(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    if path.is_file() {
+        if let Err(err) = crate::auth::read_principal_root_object(
+            data_dir,
+            principal_id,
+            localhost_root,
+            object_uri,
+            path,
+        ) {
+            if is_damaged_home_state(&err) {
+                return Err(err);
+            }
+        }
+    }
+    crate::auth::write_principal_root_object(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        bytes,
+    )
+}
+
 fn home_save_browser_state(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,
@@ -6666,7 +6739,7 @@ fn home_save_browser_state(
     if let Some(parent) = path.parent() {
         crate::auth::create_owner_only_dir_all(data_dir, parent)?;
     }
-    crate::auth::write_principal_root_object(
+    write_home_state_object(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
@@ -7710,13 +7783,20 @@ fn home_appearance_preferences(
         }
         Err(err) => return Err(err.into()),
     }
-    let bytes = crate::auth::read_principal_root_object(
+    let bytes = match crate::auth::read_principal_root_object(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
         &home_appearance_object_uri(context, HOME_APPEARANCE_PREFERENCES_FILE),
         &path,
-    )?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(HomeAppearancePreferences::default());
+        }
+        Err(err) => return Err(err),
+    };
     if bytes.len() > HOME_APPEARANCE_PREFERENCES_MAX_BYTES {
         anyhow::bail!("appearance preferences are too large");
     }
@@ -7826,7 +7906,7 @@ fn home_save_appearance_preferences(
         if let Some(parent) = path.parent() {
             crate::auth::create_owner_only_dir_all(data_dir, parent)?;
         }
-        crate::auth::write_principal_root_object(
+        write_home_state_object(
             data_dir,
             &home_browser_principal_id(context),
             &home_browser_localhost_root(context),
@@ -7914,19 +7994,27 @@ fn home_background_overlay_settings(
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<(bool, f64)> {
     let path = home_appearance_path(data_dir, context, HOME_BACKGROUND_OVERLAY_FILE)?;
+    let defaults = (
+        HOME_BACKGROUND_OVERLAY_DEFAULT,
+        HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT,
+    );
     if !path.is_file() {
-        return Ok((
-            HOME_BACKGROUND_OVERLAY_DEFAULT,
-            HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT,
-        ));
+        return Ok(defaults);
     }
-    let bytes = crate::auth::read_principal_root_object(
+    let bytes = match crate::auth::read_principal_root_object(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),
         &home_appearance_object_uri(context, HOME_BACKGROUND_OVERLAY_FILE),
         &path,
-    )?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) if is_damaged_home_state(&err) => {
+            warn_damaged_home_state(&path, &err);
+            return Ok(defaults);
+        }
+        Err(err) => return Err(err),
+    };
     let payload = serde_json::from_slice::<serde_json::Value>(&bytes)?;
     let enabled = payload
         .get("enabled")
@@ -7954,7 +8042,7 @@ fn home_save_background_overlay(
         "enabled": enabled,
         "opacity": home_clamp_background_overlay_opacity(opacity),
     });
-    crate::auth::write_principal_root_object(
+    write_home_state_object(
         data_dir,
         &home_browser_principal_id(context),
         &home_browser_localhost_root(context),

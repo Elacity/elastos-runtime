@@ -671,8 +671,10 @@ async function selectRecoveryKit() {
       renderEnrollmentChoice();
       setUnlockStatus("Recovery Kit selection expired. Choose the kit again.", "muted");
     }, RECOVERY_SELECTION_MS);
-    setUnlockStatus(encrypted ? "Kit selected. Enter its password, then continue with your passkey."
-      : "Kit selected. Continue with your passkey to recover this account.", "muted");
+    // The picker is cleared above, so the status names the accepted file.
+    const selected = file.name ? `Kit selected: ${file.name}.` : "Kit selected.";
+    setUnlockStatus(encrypted ? `${selected} Enter its password, then continue with your passkey.`
+      : `${selected} Continue with your passkey to recover this account.`, "muted");
     if (encrypted) recoveryPassword?.focus();
   } catch (_) {
     if (version !== recoverySelectionVersion) return;

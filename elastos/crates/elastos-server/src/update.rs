@@ -1712,7 +1712,10 @@ async fn run_upgrade_with_restart(
         repair_version,
     )?;
     let data_dir = transaction.data_dir();
-    crate::api::auth_gateway::verify_configured_principal_roots_ready(data_dir)?;
+    let notices = crate::api::auth_gateway::verify_configured_principal_roots_ready(data_dir)?;
+    for line in crate::api::auth_gateway::principal_root_notice_lines(&notices) {
+        println!("  {line}");
+    }
     let old_components = std::fs::read(data_dir.join("components.json"))?;
     let records = crate::capsule_record::UpdateRecords::new(
         &previous.release,

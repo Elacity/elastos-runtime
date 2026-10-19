@@ -59,6 +59,17 @@ export function isBlockedObject(object) {
   return !!object?.blocked_reason;
 }
 
+const PROTECTION_LABELS = {
+  protected_principal_root_object_damaged: "Damaged or not readable here",
+  protected_principal_root_object_not_encrypted: "Not encrypted",
+};
+
+export function protectionLabel(object) {
+  const reason = object?.blocked_reason;
+  if (!reason) return "ok";
+  return PROTECTION_LABELS[reason] || reason;
+}
+
 export function hasCapability(object, capability) {
   const capabilities = object && object.capabilities;
   return !Array.isArray(capabilities) || capabilities.includes(capability);

@@ -20,6 +20,8 @@ const communityDeliveryMarker = "Own Community message awaiting delivery";
 const interveningPeerMarker = "Peer message before my send response";
 const cursorOwnMarker = "Own message after the unseen peer row";
 const externalLinkUrl = "https://example.invalid/chat-link?from=chat";
+const textLinkUrl = "https://example.invalid/chat-text-link?from=text";
+const directLinkUrl = "https://example.invalid/chat-direct-link?from=direct";
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const playwrightModule = process.env.ELASTOS_PLAYWRIGHT_MODULE
@@ -242,11 +244,13 @@ function startServer(scenario) {
       poll.objects = [historyMessage(10, "Initial Community row", "2026-03-09T12:00:00Z")];
     }
     if (scenario === "external-link-via-home") {
-      poll.latest_seq = 1;
+      // A Link object (local mode) and a Community Text message that holds a
+      // web address: both must ask Home the same way.
+      poll.latest_seq = 2;
       poll.objects = [{
         ...historyMessage(1, "", "2026-03-09T12:00:00Z"), kind: "link", body: null,
         link: { url: externalLinkUrl, host: "example.com", title: "Example link" },
-      }];
+      }, historyMessage(2, `Read (${textLinkUrl}). <b>not markup</b>`, "2026-03-09T12:01:00Z")];
     }
     if (historyScenario) {
       const details = {
@@ -567,7 +571,7 @@ function startServer(scenario) {
           messages: [{
             message_id: "message:fixture-direct",
             direction: "incoming",
-            text: "hello from direct",
+            text: scenario === "external-link-via-home" ? `hello from direct ${directLinkUrl}` : "hello from direct",
             created_at: 1_725_000_000,
             delivery_state: "received",
           }],
@@ -766,28 +770,122 @@ async function runScenario(scenario) {
     if (scenario === "history-status-order-calendar") {
       await page.clock.setFixedTime("2026-03-09T04:30:00Z");
     }
+    if (scenario.startsWith("direct-retry")) {
+      // Chat's own clock decides when the pending note shows; fast-forwarding
+      // it is the only aging. The fixture never changes the message.
+      await page.clock.install();
+    }
     await page.goto(url, { waitUntil: "domcontentloaded" });
     let frame = await chatFrame(page);
 
     if (scenario === "external-link-via-home") {
       await waitForConfiguredChatWithoutLegacyFlash(frame, "external link");
-      const link = frame.locator('#message-list a[data-open-external]');
+      const link = frame.locator('#message-list .link-body a[data-open-external]');
+      const textLink = frame.locator('#message-list a.message-link[data-open-external]');
       await link.waitFor();
-      assert(await link.getAttribute("href") === externalLinkUrl && await link.getAttribute("target") === null,
-        "Chat link keeps its visible href and no popup target");
+      await textLink.waitFor();
+      for (const [element, address, label] of [[link, externalLinkUrl, `Open link: Example link (${externalLinkUrl})`],
+        [textLink, textLinkUrl, `Open link: ${textLinkUrl}`]]) {
+        const attributes = await element.evaluate(node => ({
+          href: node.getAttribute("href"), target: node.getAttribute("target"), role: node.getAttribute("role"),
+          tabindex: node.getAttribute("tabindex"), label: node.getAttribute("aria-label"),
+          address: node.dataset.openExternal,
+        }));
+        assert(JSON.stringify(attributes) === JSON.stringify({ href: null, target: null, role: "link", tabindex: "0",
+          label, address }), "a Chat web link inside Home has no native navigation", attributes);
+      }
       assert(await link.innerText() === "Example link\nexample.com", "Chat link text changed");
+      const textBody = await textLink.evaluate(node => ({
+        text: node.parentElement.textContent, elements: node.parentElement.querySelectorAll("*").length,
+      }));
+      assert(textBody.text === `Read (${textLinkUrl}). <b>not markup</b>` && textBody.elements === 1,
+        "a Text message renders its address as one link and the rest as plain text", textBody);
       const pagesBefore = context.pages().length;
       const destinationRequests = [];
       const recordDestination = request => {
         if (new URL(request.url()).hostname === "example.invalid") destinationRequests.push(request.url());
       };
       context.on("request", recordDestination);
+      // Real input: a click on each link, then Enter and Space on the
+      // focused Text link. Each activation asks Home exactly once.
       await link.click();
-      await waitFor(async () => (await page.evaluate(() => window.fixtureOpenExternal.length)) === 1);
-      const asked = (await page.evaluate(() => window.fixtureOpenExternal))
+      await textLink.click();
+      await textLink.focus();
+      await textLink.press("Enter");
+      await textLink.press(" ");
+      await textLink.click({ button: "middle" });
+      await waitFor(async () => (await page.evaluate(() => window.fixtureOpenExternal.length)) >= 4);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const askedHome = async () => (await page.evaluate(() => window.fixtureOpenExternal))
         .map(message => JSON.stringify(Object.fromEntries(Object.entries(message).sort())));
-      assert(JSON.stringify(asked) === JSON.stringify([JSON.stringify({ homeToken: "test-token", type: "home:open-external", url: externalLinkUrl })]),
-        "Chat did not send Home exactly the typed request with the link's own address");
+      const request = url => JSON.stringify({ homeToken: "test-token", type: "home:open-external", url });
+      const sharedAsks = [externalLinkUrl, textLinkUrl, textLinkUrl, textLinkUrl].map(request);
+      assert(JSON.stringify(await askedHome()) === JSON.stringify(sharedAsks),
+        "Chat did not send Home exactly one typed request per activation with the link's own address", await askedHome());
+      // Selecting is how an address is copied inside Home. Chromium starts no
+      // drag-selection inside a focusable element, so a person drags from the
+      // text before the link into it: that selects the address and asks
+      // nothing. Chromium keeps that selection through the next click inside
+      // it, so that click (released on the link) must not ask Home; it clears
+      // the selection. A double-click asks once: its second click carries the
+      // selected word. A plain click afterwards asks exactly once.
+      const pauseBetweenClicks = () => new Promise(resolve => setTimeout(resolve, 700));
+      const frameBox = await page.locator('iframe[title="Chat"]').boundingBox();
+      const boxes = await textLink.evaluate(node => {
+        const plain = document.createRange();
+        plain.selectNodeContents(node.previousSibling);
+        const box = rect => ({ x: rect.x, y: rect.y, width: rect.width, height: rect.height });
+        return { link: box(node.getClientRects()[0]), before: box(plain.getClientRects()[0]) };
+      });
+      const lineY = frameBox.y + boxes.link.y + boxes.link.height / 2;
+      await page.mouse.move(frameBox.x + boxes.before.x + 2, lineY);
+      await page.mouse.down();
+      await page.mouse.move(frameBox.x + boxes.link.x + boxes.link.width * 0.6, lineY, { steps: 8 });
+      await page.mouse.up();
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const dragged = await frame.evaluate(() => String(getSelection()));
+      assert(dragged.startsWith("Read (https://") && `Read (${textLinkUrl}`.startsWith(dragged),
+        "dragging from the text into the link did not select the address", dragged);
+      assert(JSON.stringify(await askedHome()) === JSON.stringify(sharedAsks),
+        "selecting an address asked Home", await askedHome());
+      await page.mouse.click(frameBox.x + boxes.link.x + boxes.link.width * 0.3, lineY);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      assert(JSON.stringify(await askedHome()) === JSON.stringify(sharedAsks),
+        "a click released on the link with its address selected asked Home", await askedHome());
+      await pauseBetweenClicks();
+      await page.mouse.dblclick(frameBox.x + boxes.link.x + boxes.link.width * 0.3, lineY);
+      sharedAsks.push(request(textLinkUrl));
+      await waitFor(async () => (await askedHome()).length >= sharedAsks.length);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const word = await frame.evaluate(() => String(getSelection()));
+      assert(word.length > 0 && textLinkUrl.includes(word), "double-clicking the link did not select a word", word);
+      assert(JSON.stringify(await askedHome()) === JSON.stringify(sharedAsks),
+        "a double-click on the link did not ask Home exactly once", await askedHome());
+      await pauseBetweenClicks();
+      await page.mouse.click(frameBox.x + boxes.link.x + boxes.link.width * 0.5, lineY);
+      sharedAsks.push(request(textLinkUrl));
+      await waitFor(async () => (await askedHome()).length >= sharedAsks.length);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      assert(JSON.stringify(await askedHome()) === JSON.stringify(sharedAsks),
+        "a plain click after selecting did not ask Home exactly once", await askedHome());
+      // A direct message renders its address the same way.
+      await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').click();
+      await frame.waitForFunction(() => document.body.dataset.chatMode === "direct"
+        && document.querySelector("#message-list")?.textContent.includes("hello from direct"));
+      const directLink = frame.locator('#message-list a.message-link[data-open-external]');
+      assert(await directLink.count() === 1, "a direct message address did not render as exactly one link");
+      const directAttributes = await directLink.evaluate(node => ({
+        href: node.getAttribute("href"), role: node.getAttribute("role"), address: node.dataset.openExternal,
+        text: node.parentElement.textContent,
+      }));
+      assert(JSON.stringify(directAttributes) === JSON.stringify({ href: null, role: "link", address: directLinkUrl,
+        text: `hello from direct ${directLinkUrl}` }), "a direct message link inside Home has no native navigation", directAttributes);
+      await directLink.click();
+      await directLink.press("Enter");
+      await waitFor(async () => (await askedHome()).length >= sharedAsks.length + 2);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      assert(JSON.stringify(await askedHome()) === JSON.stringify([...sharedAsks, request(directLinkUrl), request(directLinkUrl)]),
+        "a direct message link did not ask Home exactly once per activation", await askedHome());
       await new Promise(resolve => setTimeout(resolve, 300));
       context.off("request", recordDestination);
       assert(context.pages().length === pagesBefore, "Chat opened a window itself");
@@ -1154,6 +1252,19 @@ async function runScenario(scenario) {
       const original = frame.locator('[data-direct-message-id="message:retry-original"]');
       await original.locator('[data-direct-action="retry"]').waitFor({ state:"visible" });
       assert((await original.innerText()).includes("Sending"), "pending delivery copy is inaccurate");
+      // The note waits 60 s on Chat's own clock from when it first saw the
+      // message pending. created_at here is two years old and must not count.
+      // Polls keep returning the identical message, so only Chat's own
+      // threshold timer can show the note.
+      const pendingNote = "Delivery unconfirmed. Your Home keeps trying while it is on, for up to 24 hours.";
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 1500));
+      assert(!(await original.innerText()).includes(pendingNote), "the pending note appeared before 60 seconds");
+      await page.clock.fastForward(45_000);
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 500));
+      assert(!(await original.innerText()).includes(pendingNote), "the pending note appeared before 60 seconds");
+      await page.clock.fastForward(15_000);
+      await frame.waitForFunction(note => document.querySelector('[data-direct-message-id="message:retry-original"]')?.textContent.includes(note), pendingNote);
+      assert((await original.innerText()).includes("Sending"), "the pending note replaced the Sending label");
       const draft = "Keep my current draft while retrying a different message";
       await frame.locator("#message-input").fill(draft);
       await original.locator('[data-direct-action="retry"]').click();
@@ -1161,7 +1272,8 @@ async function runScenario(scenario) {
       if (holds.retry) {
         await frame.waitForFunction(() => document.querySelector('[data-direct-message-id="message:retry-original"]')?.textContent.includes("Sending"));
         assert(await frame.locator("#send-button").isDisabled()
-          && await original.locator('[data-direct-action="retry"]').isDisabled(), "in-flight send controls permit duplicate intent");
+          && await original.locator('[data-direct-action="retry"]').isDisabled()
+          && await original.locator('[data-direct-action="retry"]').innerText() === "Trying again", "in-flight Retry gives no feedback or permits duplicate intent");
         await clickSharedChoice(frame);
         await frame.locator("#message-input").fill("Different Community draft");
         holds.retry.release();
@@ -1176,6 +1288,7 @@ async function runScenario(scenario) {
         const text = await original.innerText();
         assert(text.includes("Delivery is unconfirmed") && text.includes(scenario === "direct-retry-terminal" ? "24-hour" : "unavailable"),
           "terminal refusal lacks honest recovery explanation", text);
+        assert(!text.includes(pendingNote), "a terminal message still shows the pending note", text);
         assert(await frame.locator("#message-input").inputValue() === draft, "terminal refusal changed the composer");
         await original.locator('[data-direct-action="send-again"]').click();
         await frame.locator('[data-direct-message-id="message:retry-new"]').waitFor({ state:"visible" });
