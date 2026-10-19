@@ -1066,6 +1066,18 @@ async fn fetch_release_network_for_update(
     .await
 }
 
+/// Plain next step after a terminal update or rollback: Home is stopped and
+/// this exact command starts it from the installed binary.
+fn home_stopped_line(bin_path: &Path) -> String {
+    let binary = bin_path.display().to_string();
+    let binary = if binary.contains(char::is_whitespace) || binary.contains('\'') {
+        format!("'{}'", binary.replace('\'', r"'\''"))
+    } else {
+        binary
+    };
+    format!("Home is stopped. Start it with: {binary} home --browser")
+}
+
 /// The CLI update and Home's System update join the release-pinned network.
 /// The offline hop without a restart owner admits only an unchanged pin.
 fn joins_release_network(apply_mode: ApplyMode, has_restart_owner: bool) -> bool {
@@ -1649,6 +1661,9 @@ async fn run_upgrade_with_restart(
 
         println!();
         println!("  ElastOS {} installed successfully!", version);
+        // A terminal update replaces the binary under any running host, which
+        // then exits; nothing restarts Home from here.
+        println!("  {}", home_stopped_line(&bin_path));
         println!();
 
         return Ok(());
@@ -2169,6 +2184,18 @@ fn optional_release_object_cid(head: &serde_json::Value) -> anyhow::Result<Optio
 mod tests {
     use super::*;
     use crate::sources::save_trusted_sources;
+
+    #[test]
+    fn home_stopped_line_names_the_installed_binary() {
+        assert_eq!(
+            home_stopped_line(Path::new("/home/a/.local/bin/elastos")),
+            "Home is stopped. Start it with: /home/a/.local/bin/elastos home --browser"
+        );
+        assert_eq!(
+            home_stopped_line(Path::new("/Users/a b/bin/elastos")),
+            "Home is stopped. Start it with: '/Users/a b/bin/elastos' home --browser"
+        );
+    }
 
     fn raw_cid(bytes: &[u8]) -> String {
         use sha2::Digest;

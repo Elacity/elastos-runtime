@@ -103,9 +103,7 @@ pub async fn run_serve(
                     .map_err(|e| anyhow::anyhow!("Failed to load capsule: {}", e))?;
 
                 if let Some(vm_id) = vm_provider.get_vm_id(&handle.id).await {
-                    let shell_session = session_registry
-                        .create_session(session::SessionType::Shell, Some(vm_id.clone()))
-                        .await;
+                    let vm_session = create_initial_vm_session(&session_registry, &vm_id).await;
 
                     let needs_tap = manifest.permissions.guest_network;
                     if needs_tap {
@@ -130,14 +128,14 @@ pub async fn run_serve(
                             .ok_or_else(|| anyhow::anyhow!("network not configured"))?;
                         let api_addr = format!("http://{}:{}", net.host_ip, api_port);
                         vm_provider
-                            .set_session_for_vm(&handle.id, &shell_session.token, &api_addr)
+                            .set_session_for_vm(&handle.id, &vm_session.token, &api_addr)
                             .await
                             .map_err(|e| anyhow::anyhow!("Failed to set session: {}", e))?;
                     } else {
                         vm_provider
                             .append_boot_args_for_vm(
                                 &handle.id,
-                                &format!("elastos.token={}", shell_session.token),
+                                &format!("elastos.token={}", vm_session.token),
                             )
                             .await
                             .map_err(|e| anyhow::anyhow!("Failed to set token: {}", e))?;
@@ -182,7 +180,7 @@ pub async fn run_serve(
                 println!("MicroVM capsule '{}' started", handle.manifest.name);
                 println!("  API server: {}://{}", scheme, addr);
                 println!("  VM service: {}://localhost:{}", scheme, vm_port);
-                println!("  Session: configured (shell mode)");
+                println!("  Session: configured (capsule mode)");
                 println!("Press Ctrl+C to stop...");
 
                 let api_bind_addr = if addr.starts_with("127.0.0.1:") {
@@ -499,9 +497,83 @@ pub async fn run_serve(
     Ok(())
 }
 
+/// The first VM capsule gets the same Capsule session the supervisor gives every
+/// capsule other than the shell. Its token is readable inside the guest.
+async fn create_initial_vm_session(
+    registry: &session::SessionRegistry,
+    vm_id: &str,
+) -> session::Session {
+    registry
+        .create_session(session::SessionType::Capsule, Some(vm_id.to_string()))
+        .await
+}
+
 fn current_binary_sha256() -> anyhow::Result<String> {
     let self_exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("Failed to determine runtime binary: {}", e))?;
     let bytes = std::fs::read(self_exe)?;
     Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::{middleware as axum_middleware, routing::post, Router};
+    use elastos_runtime::primitives::audit::AuditLog;
+    use elastos_server::api::middleware::{auth_middleware, shell_only_middleware, ApiState};
+    use tower::ServiceExt;
+
+    async fn shell_route_status(
+        registry: Arc<session::SessionRegistry>,
+        token: &str,
+    ) -> StatusCode {
+        let app = Router::new()
+            .route("/api/capability/grant", post(|| async { "granted" }))
+            .layer(axum_middleware::from_fn(shell_only_middleware))
+            .layer(axum_middleware::from_fn_with_state(
+                ApiState {
+                    session_registry: registry,
+                },
+                auth_middleware,
+            ));
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/capability/grant")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn initial_vm_token_is_a_vm_bound_capsule_session_refused_by_shell_routes() {
+        let registry = Arc::new(session::SessionRegistry::new(Arc::new(AuditLog::new())));
+
+        let vm_session = create_initial_vm_session(&registry, "vm-initial").await;
+        let resolved = registry
+            .validate_token(&vm_session.token)
+            .await
+            .expect("initial VM token resolves");
+        assert_eq!(resolved.session_type, session::SessionType::Capsule);
+        assert!(!resolved.is_shell());
+        assert_eq!(resolved.vm_id.as_deref(), Some("vm-initial"));
+        assert_eq!(
+            shell_route_status(registry.clone(), &vm_session.token).await,
+            StatusCode::FORBIDDEN
+        );
+
+        let shell = registry
+            .create_session(session::SessionType::Shell, None)
+            .await;
+        assert_eq!(
+            shell_route_status(registry, &shell.token).await,
+            StatusCode::OK
+        );
+    }
 }

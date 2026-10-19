@@ -19,6 +19,7 @@ const sharedRenderMarker = "Shared message before metadata";
 const communityDeliveryMarker = "Own Community message awaiting delivery";
 const interveningPeerMarker = "Peer message before my send response";
 const cursorOwnMarker = "Own message after the unseen peer row";
+const externalLinkUrl = "https://example.invalid/chat-link?from=chat";
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const playwrightModule = process.env.ELASTOS_PLAYWRIGHT_MODULE
@@ -240,6 +241,13 @@ function startServer(scenario) {
       poll.latest_seq = 10;
       poll.objects = [historyMessage(10, "Initial Community row", "2026-03-09T12:00:00Z")];
     }
+    if (scenario === "external-link-via-home") {
+      poll.latest_seq = 1;
+      poll.objects = [{
+        ...historyMessage(1, "", "2026-03-09T12:00:00Z"), kind: "link", body: null,
+        link: { url: externalLinkUrl, host: "example.com", title: "Example link" },
+      }];
+    }
     if (historyScenario) {
       const details = {
         searching: "Checking recent Community history from online participants.",
@@ -299,7 +307,18 @@ function startServer(scenario) {
       if (url.pathname === "/fixture") {
         const homeOrigin = `http://127.0.0.1:${server.address().port}`;
         const chatSrc = `/apps/chat-room/?home_origin=${encodeURIComponent(homeOrigin)}${isDirectSwitchScenario(scenario) || initialDirectRecovery ? "&conversation_id=direct%3Asha256%3Afixture-conversation" : ""}#home_token=test-token`;
-        const reconnectHost = initialDirectRecovery || sharedRecovery ? `<script>
+        // Stand-in for Home: record what Chat asks. Home's sheet and the
+        // Runtime check are tested in home-shell-bridge-smoke.mjs and
+        // home-phone-layout-smoke.mjs.
+        const linkHost = scenario === "external-link-via-home" ? `<script>
+          window.fixtureOpenExternal = [];
+          window.addEventListener("message", (event) => {
+            if (event.source !== document.querySelector("iframe").contentWindow || event.origin !== "null"
+              || event.data?.type !== "home:open-external") return;
+            window.fixtureOpenExternal.push(event.data);
+          });
+        </script>` : "";
+        const reconnectHost = linkHost + (initialDirectRecovery || sharedRecovery ? `<script>
           window.fixtureReconnects = 0;
           window.addEventListener("message", (event) => {
             const data = event.data;
@@ -311,7 +330,7 @@ function startServer(scenario) {
               result: { target: "chat-room", attach_kind: "iframe", launch_status: "launched",
                 route: "/apps/chat-room/?home_origin=" + encodeURIComponent(location.origin) + "#home_token=fresh-token" }, status: 0 }, "*");
           });
-        </script>` : "";
+        </script>` : "");
         const body = Buffer.from(`<!doctype html><style>html,body{height:100%;margin:0}iframe{border:0;height:100%;width:100%}</style><iframe title="Chat" sandbox="allow-forms allow-modals allow-pointer-lock allow-scripts" src="${chatSrc}"></iframe>${reconnectHost}<script type="module">
           import { bindCapsuleLayout } from "/shell-capsule-layout.js";
           window.fixtureUnbindLayout = bindCapsuleLayout();
@@ -750,6 +769,32 @@ async function runScenario(scenario) {
     await page.goto(url, { waitUntil: "domcontentloaded" });
     let frame = await chatFrame(page);
 
+    if (scenario === "external-link-via-home") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "external link");
+      const link = frame.locator('#message-list a[data-open-external]');
+      await link.waitFor();
+      assert(await link.getAttribute("href") === externalLinkUrl && await link.getAttribute("target") === null,
+        "Chat link keeps its visible href and no popup target");
+      assert(await link.innerText() === "Example link\nexample.com", "Chat link text changed");
+      const pagesBefore = context.pages().length;
+      const destinationRequests = [];
+      const recordDestination = request => {
+        if (new URL(request.url()).hostname === "example.invalid") destinationRequests.push(request.url());
+      };
+      context.on("request", recordDestination);
+      await link.click();
+      await waitFor(async () => (await page.evaluate(() => window.fixtureOpenExternal.length)) === 1);
+      const asked = (await page.evaluate(() => window.fixtureOpenExternal))
+        .map(message => JSON.stringify(Object.fromEntries(Object.entries(message).sort())));
+      assert(JSON.stringify(asked) === JSON.stringify([JSON.stringify({ homeToken: "test-token", type: "home:open-external", url: externalLinkUrl })]),
+        "Chat did not send Home exactly the typed request with the link's own address");
+      await new Promise(resolve => setTimeout(resolve, 300));
+      context.off("request", recordDestination);
+      assert(context.pages().length === pagesBefore, "Chat opened a window itself");
+      assert(destinationRequests.length === 0, "the destination was requested before Home's consent", destinationRequests);
+      assert(new URL(frame.url()).pathname === "/apps/chat-room/", "Chat itself navigated");
+      return;
+    }
     if (scenario === "community-send-stale-snapshot") {
       await waitForConfiguredChatWithoutLegacyFlash(frame, "Community send response ordering");
       const hold = holds["community-before-send"];
@@ -1018,7 +1063,7 @@ async function runScenario(scenario) {
         });
         parent.postMessage({ type:"elastos:shell-layout", request:true }, new URL(location.href).searchParams.get("home_origin"));
       });
-      const visibility = async expected => frame.waitForFunction(expected => window.fixtureLayouts.at(-1)?.visible === expected, expected);
+      const visibility = async expected => frame.waitForFunction(expected => window.fixtureLayouts.at(-1)?.visible === expected, expected, { polling: 100 });
       await visibility(true);
       for (const style of ["visibility:hidden", "display:none", "opacity:0"]) {
         await page.locator('iframe[title="Chat"]').evaluate((node, style) => { node.style.cssText = style; }, style);
@@ -1274,7 +1319,7 @@ async function runScenario(scenario) {
         const card = document.querySelector("#participant-card");
         const action = document.querySelector("#participant-card-action");
         return card?.hidden === false && card.dataset.participantRef === "participant:fixture-friend"
-          && document.querySelector("#participant-card-state")?.textContent === "Contact · Active now"
+          && document.querySelector("#participant-card-state")?.textContent === "Contact · Home online"
           && action?.hidden === false && !action.disabled && action.dataset.cardAction === "message"
           && action.textContent === "Message"
           && !!document.querySelector('[data-conversation-choice="direct:sha256:fixture-conversation"]');
@@ -1291,7 +1336,7 @@ async function runScenario(scenario) {
           window.fixtureCardObserver = new MutationObserver(() => {
             const action = document.querySelector("#participant-card-action");
             window.fixtureCardRegressed ||= card.hidden
-              || document.querySelector("#participant-card-state")?.textContent !== "Contact · Active now"
+              || document.querySelector("#participant-card-state")?.textContent !== "Contact · Home online"
               || action?.hidden !== false || action.disabled || action.dataset.cardAction !== "message";
           });
           window.fixtureCardObserver.observe(card, { subtree: true, childList: true, characterData: true, attributes: true });
@@ -1308,7 +1353,7 @@ async function runScenario(scenario) {
           return window.fixtureCardRegressed;
         });
         assert(!regressed, "a held request response briefly reverted accepted contact state");
-        assert(await frame.locator("#participant-card-state").innerText() === "Contact · Active now"
+        assert(await frame.locator("#participant-card-state").innerText() === "Contact · Home online"
           && await frame.locator("#participant-card-action").isVisible()
           && await frame.locator("#participant-card-action").innerText() === "Message",
         "a held request response reverted accepted contact state");
@@ -1739,6 +1784,7 @@ async function main() {
     "direct-retry-held",
     "direct-retry-terminal",
     "direct-retry-unavailable",
+    "external-link-via-home",
   ];
   for (const scenario of scenarios) {
     await runScenario(scenario);

@@ -33,6 +33,7 @@ use crate::collaboration_rate_limit::{
     CommunitySendRateLimited, HeldFrame, HeldFrames, HoldOutcome, ProfileRateLimiter,
     COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE, COMMUNITY_RATE_WINDOW_SECS,
     COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW, COMMUNITY_SENDS_PER_WINDOW,
+    PRESENCE_RECEIVES_PER_SENDER_PER_WINDOW,
 };
 use crate::esp_binding::{esp_request_binding, EspRequestBinding, ESP_REQUEST_BINDING_SCHEMA};
 use crate::host_lock::FileLock;
@@ -52,6 +53,7 @@ const MAX_PENDING_INCOMING: usize = 32;
 pub(crate) const MAX_PENDING_INCOMING_PER_SENDER: usize = 8;
 pub(crate) const MAX_ACCEPTANCE_RECEIPTS_PER_OUTGOING: usize = 32;
 const MAX_INCOMING_RECORDS_AND_TOMBSTONES: usize = 4_096;
+const MAX_RECENT_PRESENCE: usize = 4_096;
 type IncomingIdentityIndex = HashMap<(String, String), String>;
 const MAX_VERIFICATION_CACHE_ENTRIES: usize = MAX_OUTGOING_RECORDS
     * MAX_ACCEPTANCE_RECEIPTS_PER_OUTGOING
@@ -71,9 +73,14 @@ pub(crate) struct CollaborationCore {
     /// Counted from stored outgoing messages, so only a saved message counts.
     sends_per_window: usize,
     receive_rate: ProfileRateLimiter,
+    presence_receive_rate: ProfileRateLimiter,
     /// Serializes receive-rate admission through its durable commit and count.
     receive_admission_mutex: Mutex<()>,
     held: HeldFrames,
+    /// Acknowledged presence by envelope hash: its receipt and `expires_at`.
+    /// Presence is admissible only until its own expiry (at most 45 s), so it
+    /// needs no persisted 24-hour tombstone; this suppresses duplicates.
+    recent_presence: Mutex<HashMap<String, (String, u64)>>,
     message_verifications: Mutex<SignedBytesCache<AuthorizedDefaultConversationMessage>>,
     receipt_verifications: Mutex<SignedBytesCache<VerifiedCollaborationAcceptanceReceipt>>,
     bound_receipt_verifications: Mutex<SignedBytesCache<VerifiedCollaborationAcceptanceReceipt>>,
@@ -104,6 +111,9 @@ pub(crate) struct DurableOutgoingMessage {
     created_at: u64,
     shared_chat: bool,
     accepted_endpoints: Vec<String>,
+    /// A presence announcement's principal and sender Profile DID; the send
+    /// boundary re-validates that principal's grant before each send.
+    presence_sender: Option<(String, String)>,
 }
 
 pub(crate) struct PendingOutgoingProductProjection {
@@ -141,6 +151,12 @@ impl DurableOutgoingMessage {
 
     pub(crate) fn remote_acceptance_recorded(&self) -> bool {
         !self.accepted_endpoints.is_empty()
+    }
+
+    pub(crate) fn presence_sender(&self) -> Option<(&str, &str)> {
+        self.presence_sender
+            .as_ref()
+            .map(|(principal, profile_did)| (principal.as_str(), profile_did.as_str()))
     }
 }
 
@@ -449,8 +465,13 @@ impl CollaborationCore {
                 COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW,
                 COMMUNITY_RATE_WINDOW_SECS,
             ),
+            presence_receive_rate: ProfileRateLimiter::new(
+                PRESENCE_RECEIVES_PER_SENDER_PER_WINDOW,
+                COMMUNITY_RATE_WINDOW_SECS,
+            ),
             receive_admission_mutex: Mutex::new(()),
             held: HeldFrames::default(),
+            recent_presence: Mutex::new(HashMap::new()),
             message_verifications: Mutex::new(SignedBytesCache::new()),
             receipt_verifications: Mutex::new(SignedBytesCache::new()),
             bound_receipt_verifications: Mutex::new(SignedBytesCache::new()),
@@ -464,6 +485,47 @@ impl CollaborationCore {
             #[cfg(test)]
             history_write_fault: std::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    /// Seed the signed, receipt-bound legacy shape that lifecycle readers
+    /// repair. Product admission deliberately refuses these malformed payloads.
+    #[cfg(test)]
+    pub(crate) fn test_store_legacy_product_handoffs(
+        &self,
+        remote: &Self,
+        payload_types: &[&str],
+        now: u64,
+    ) {
+        let (state, _) = self.load_state_raw().unwrap();
+        let mut state = state.unwrap_or_else(|| self.empty_state());
+        for payload_type in payload_types {
+            let original = remote
+                .authority
+                .prepare_outgoing(
+                    remote.sender_service(),
+                    payload_type,
+                    serde_json::json!({"extra": true}),
+                    now,
+                    45,
+                )
+                .unwrap();
+            let incoming = self
+                .authority
+                .authorize_incoming(original.envelope_bytes(), &remote.local_device_did(), now)
+                .unwrap();
+            let receipt = self
+                .authority
+                .prepare_acceptance_receipt(&incoming, now)
+                .unwrap();
+            state.incoming.push(IncomingRecord {
+                envelope: String::from_utf8(original.envelope_bytes().to_vec()).unwrap(),
+                acceptance_receipt: String::from_utf8(receipt).unwrap(),
+                product_handoff: ProductHandoffState::Pending,
+            });
+        }
+        self.validate_state(&state).unwrap();
+        self.ensure_state_directory().unwrap();
+        self.write_state(&state).unwrap();
     }
 
     pub(crate) fn sender_service(&self) -> &str {
@@ -1213,6 +1275,34 @@ impl CollaborationCore {
                     .sender_profile_did
                     .clone()
             });
+        // Presence replaces itself every 15 s: a sender over its presence
+        // limit loses the frame quietly, and a presence that claims a longer
+        // life than an honest one is refused, so presence replay tombstones
+        // stay a few per sender and drain within minutes.
+        let payload = &incoming.message().envelope().payload;
+        let presence_sender = (payload.payload_type
+            == crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE)
+            .then(|| payload.sender_profile_did.clone());
+        if presence_sender.is_some()
+            && payload.expires_at.saturating_sub(payload.created_at)
+                > crate::collaboration_presence::PRESENCE_TTL_SECS
+        {
+            return Ok(CollaborationTransportIngestion::Rejected(
+                CollaborationTransportRejection::InvalidMessage,
+            ));
+        }
+        if let Some(sender_profile_did) = &presence_sender {
+            if self
+                .presence_receive_rate
+                .check(sender_profile_did, now)
+                .is_err()
+            {
+                tracing::debug!("Community presence dropped: sender is over its limit");
+                return Ok(CollaborationTransportIngestion::Rejected(
+                    CollaborationTransportRejection::SenderRateLimited,
+                ));
+            }
+        }
         if let Some(sender_profile_did) = &rate_limited_sender {
             if self.receive_rate.check(sender_profile_did, now).is_err() {
                 return self.hold_refused(
@@ -1240,6 +1330,9 @@ impl CollaborationCore {
             .map_err(|_| CollaborationTransportRetryableError)?;
         if let Some(sender_profile_did) = &rate_limited_sender {
             self.receive_rate.record(sender_profile_did, now);
+        }
+        if let Some(sender_profile_did) = &presence_sender {
+            self.presence_receive_rate.record(sender_profile_did, now);
         }
         Ok(CollaborationTransportIngestion::Incoming(
             transport_incoming_acceptance(accepted),
@@ -1496,37 +1589,80 @@ impl CollaborationCore {
         self.prepare_profile_outgoing(operation, &profile, payload_type, payload, now, ttl_secs)
     }
 
+    fn outgoing_pending(
+        &self,
+        entry: &OutgoingRecord,
+        verified: &VerifiedCollaborationMessage,
+        now: u64,
+    ) -> bool {
+        let payload = &verified.envelope().payload;
+        entry.local_product_projection == OutgoingProductProjectionState::Complete
+            && payload.expires_at > now
+            && payload.created_at <= now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+            && (entry.remote_acceptance_receipts.is_empty()
+                || payload.payload_type == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE)
+    }
+
     pub(crate) fn pending_outgoing(&self, now: u64) -> anyhow::Result<Vec<DurableOutgoingMessage>> {
         let state = self.load_state()?.unwrap_or_else(|| self.empty_state());
-        state
-            .outgoing
-            .iter()
-            .filter_map(|entry| {
-                if entry.local_product_projection == OutgoingProductProjectionState::Complete {
-                    Some((entry, self.verify_outgoing_record(entry)))
-                } else {
-                    None
-                }
-            })
-            .filter_map(|(entry, verified)| match verified {
-                Ok(verified)
-                    if verified.envelope().payload.expires_at > now
-                        && (entry.remote_acceptance_receipts.is_empty()
-                            || verified.envelope().payload.payload_type
-                                == COMMUNITY_RATE_LIMITED_PAYLOAD_TYPE) =>
+        let mut pending = Vec::new();
+        for entry in &state.outgoing {
+            let verified = self.verify_outgoing_record(entry)?;
+            if self.outgoing_pending(entry, &verified, now) {
+                pending.push(self.outgoing_handle(entry, verified));
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Pure recovery of verified own-presence operation bindings. Repair stays
+    /// in memory here; lifecycle/effect readers own its durable write.
+    pub(crate) fn own_presence_operations(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<HashMap<String, EspRequestBinding>> {
+        let (state, _) = self.load_state_raw()?;
+        let mut operations = HashMap::new();
+        if let Some(state) = state {
+            for entry in &state.outgoing {
+                let verified = self.verify_outgoing_record(entry)?;
+                let payload = &verified.envelope().payload;
+                if entry.local_product_projection != OutgoingProductProjectionState::Retired
+                    && payload.payload_type == crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE
+                    && payload.expires_at > now
+                    && payload.created_at <= now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+                    && self
+                        .authorize_stored_product_message(entry.envelope.as_bytes())?
+                        .sender_profile()
+                        .authorizes_endpoint(&self.local_device_did())
                 {
-                    if verified.envelope().payload.created_at
-                        <= now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
-                    {
-                        Some(Ok(self.outgoing_handle(entry, verified)))
-                    } else {
-                        None
-                    }
+                    operations.insert(
+                        verified.envelope_sha256().to_string(),
+                        entry.operation.clone(),
+                    );
                 }
-                Ok(_) => None,
-                Err(err) => Some(Err(err)),
-            })
-            .collect()
+            }
+        }
+        Ok(operations)
+    }
+
+    /// Terminal admission after live grant validation, immediately before
+    /// Carrier dispatch. A copied handle loses admission when its queue entry
+    /// is retired. This owns no lock during the network reply.
+    pub(crate) fn pending_outgoing_contains(
+        &self,
+        envelope_hash: &str,
+        now: u64,
+    ) -> anyhow::Result<bool> {
+        let (state, _) = self.load_state_raw()?;
+        let Some(state) = state else { return Ok(false) };
+        for entry in &state.outgoing {
+            if collaboration_message_envelope_sha256(entry.envelope.as_bytes()) == envelope_hash {
+                let verified = self.verify_outgoing_record(entry)?;
+                return Ok(self.outgoing_pending(entry, &verified, now));
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn outgoing_chat_delivery(
@@ -1581,6 +1717,55 @@ impl CollaborationCore {
                 Err(err) => Some(Err(err)),
             })
             .collect()
+    }
+
+    pub(crate) fn data_root(&self) -> &Path {
+        &self.data_root
+    }
+
+    /// Drops every queued presence announcement of `principal_id`, so a
+    /// revoked, refused or hidden grant is never sent again. Presence is a
+    /// short-lived announcement and keeps no replay record.
+    pub(crate) fn retire_outgoing_presence(&self, principal_id: &str) -> anyhow::Result<usize> {
+        self.with_mutation(None, |state| {
+            let before = state.outgoing.len();
+            state.outgoing.retain(|entry| {
+                entry.operation.principal != principal_id
+                    || serde_json::from_str::<SignedCollaborationMessage>(&entry.envelope).map_or(
+                        true,
+                        |message| {
+                            message.payload.payload_type
+                                != crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE
+                        },
+                    )
+            });
+            let retired = before - state.outgoing.len();
+            Ok(Mutation {
+                value: retired,
+                changed: retired > 0,
+            })
+        })
+    }
+
+    /// Denial retires the exact own effect, preserving newer grant work.
+    pub(crate) fn retire_outgoing_presence_operation(
+        &self,
+        envelope_hash: &str,
+    ) -> anyhow::Result<()> {
+        self.with_mutation(None, |state| {
+            let before = state.outgoing.len();
+            state.outgoing.retain(|entry| {
+                collaboration_message_envelope_sha256(entry.envelope.as_bytes()) != envelope_hash
+                    || self.verify_outgoing_record(entry).map_or(true, |verified| {
+                        verified.envelope().payload.payload_type
+                            != crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE
+                    })
+            });
+            Ok(Mutation {
+                value: (),
+                changed: before != state.outgoing.len(),
+            })
+        })
     }
 
     pub(crate) fn acknowledge_outgoing_product_projection(
@@ -1841,27 +2026,28 @@ impl CollaborationCore {
 
     pub(crate) fn acknowledge_product_handoff(&self, envelope_hash: &str) -> anyhow::Result<()> {
         validate_sha256_label(envelope_hash)?;
-        self.with_mutation(None, |state| {
-            if state.incoming_tombstones.iter().any(|entry| {
-                self.verify_receipt_envelope(entry.acceptance_receipt.as_bytes())
-                    .map(|receipt| {
-                        receipt.envelope().payload.message_envelope_sha256 == envelope_hash
+        // A persisted pending record always wins over the in-memory presence
+        // set, and presence is remembered only after its removal is durable.
+        let acknowledged_presence = self.with_mutation(None, |state| {
+            let Some(index) = state.incoming.iter().position(|entry| {
+                collaboration_message_envelope_sha256(entry.envelope.as_bytes()) == envelope_hash
+            }) else {
+                if self.recent_presence_entry(envelope_hash).is_some()
+                    || state.incoming_tombstones.iter().any(|entry| {
+                        self.verify_receipt_envelope(entry.acceptance_receipt.as_bytes())
+                            .map(|receipt| {
+                                receipt.envelope().payload.message_envelope_sha256 == envelope_hash
+                            })
+                            .unwrap_or(false)
                     })
-                    .unwrap_or(false)
-            }) {
-                return Ok(Mutation {
-                    value: (),
-                    changed: false,
-                });
-            }
-            let index = state
-                .incoming
-                .iter()
-                .position(|entry| {
-                    collaboration_message_envelope_sha256(entry.envelope.as_bytes())
-                        == envelope_hash
-                })
-                .context("pending collaboration product handoff was not found")?;
+                {
+                    return Ok(Mutation {
+                        value: None,
+                        changed: false,
+                    });
+                }
+                anyhow::bail!("pending collaboration product handoff was not found");
+            };
             if state.incoming.len() + state.incoming_tombstones.len()
                 > MAX_INCOMING_RECORDS_AND_TOMBSTONES
             {
@@ -1873,16 +2059,63 @@ impl CollaborationCore {
                 record.acceptance_receipt.as_bytes(),
                 verified.message(),
             )?;
-            state.incoming_tombstones.push(IncomingTombstone {
-                acceptance_receipt: record.acceptance_receipt,
-                retain_until: tombstone_retention_deadline(receipt.envelope().payload.accepted_at),
-            });
+            let accepted_at = receipt.envelope().payload.accepted_at;
+            let payload = &verified.message().envelope().payload;
+            let value =
+                if payload.payload_type == crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE {
+                    Some((record.acceptance_receipt, payload.expires_at, accepted_at))
+                } else {
+                    state.incoming_tombstones.push(IncomingTombstone {
+                        acceptance_receipt: record.acceptance_receipt,
+                        retain_until: tombstone_retention_deadline(accepted_at),
+                    });
+                    None
+                };
             ensure_state_fits(state)?;
             Ok(Mutation {
-                value: (),
+                value,
                 changed: true,
             })
-        })
+        })?;
+        if let Some((receipt, expires_at, accepted_at)) = acknowledged_presence {
+            self.remember_presence(envelope_hash, receipt, expires_at, accepted_at);
+        }
+        Ok(())
+    }
+
+    fn recent_presence_entry(&self, envelope_hash: &str) -> Option<(String, u64)> {
+        self.recent_presence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(envelope_hash)
+            .cloned()
+    }
+
+    /// Keeps an acknowledged presence until its expiry plus skew. The receive
+    /// limit keeps this to a few per sender; a full table forgets the oldest,
+    /// which at worst projects a still-live presence once more.
+    fn remember_presence(&self, envelope_hash: &str, receipt: String, expires_at: u64, now: u64) {
+        let mut recent = self
+            .recent_presence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recent.retain(|_, (_, until)| *until >= now);
+        if recent.len() >= MAX_RECENT_PRESENCE {
+            if let Some(oldest) = recent
+                .iter()
+                .min_by_key(|(_, (_, until))| *until)
+                .map(|(hash, _)| hash.clone())
+            {
+                recent.remove(&oldest);
+            }
+        }
+        recent.insert(
+            envelope_hash.to_string(),
+            (
+                receipt,
+                expires_at.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS * 2),
+            ),
+        );
     }
 
     fn exact_incoming_replay(
@@ -1903,6 +2136,17 @@ impl CollaborationCore {
                 acceptance_receipt_bytes: entry.acceptance_receipt.as_bytes().to_vec(),
                 product_handoff_pending: true,
             }));
+        }
+        if let Some((receipt, until)) = self.recent_presence_entry(envelope_hash) {
+            if until >= now {
+                let authorized = self.authorize_stored_product_message(envelope_bytes)?;
+                self.verify_receipt_for_message(receipt.as_bytes(), authorized.message())?;
+                return Ok(Some(DurableIncomingAcceptance {
+                    authorized,
+                    acceptance_receipt_bytes: receipt.into_bytes(),
+                    product_handoff_pending: false,
+                }));
+            }
         }
         if let Some(entry) = state.incoming_tombstones.iter().find(|entry| {
             entry.retain_until >= now
@@ -2993,6 +3237,14 @@ fn outgoing_handle(
                     .map(|receipt| receipt.accepting_endpoint_did().to_string())
             })
             .collect(),
+        presence_sender: (verified.envelope().payload.payload_type
+            == crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE)
+            .then(|| {
+                (
+                    entry.operation.principal.clone(),
+                    verified.envelope().payload.sender_profile_did.clone(),
+                )
+            }),
     }
 }
 
@@ -5892,6 +6144,170 @@ mod tests {
         accept(&other, NOW + 1);
         // The flooder's rebroadcast lands once its window slides.
         accept(&over, NOW + COMMUNITY_RATE_WINDOW_SECS);
+    }
+
+    fn remote_presence_frame(fixture: &Fixture, key: &SigningKey, now: u64, ttl: u64) -> Vec<u8> {
+        let prepared = fixture
+            .authority(key.clone())
+            .prepare_outgoing(
+                SERVICE,
+                crate::collaboration_presence::PRESENCE_PAYLOAD_TYPE,
+                serde_json::json!({}),
+                now,
+                ttl,
+            )
+            .unwrap();
+        wrap_transport_frame(fixture, key, prepared.envelope_bytes())
+    }
+
+    fn acknowledge_all_handoffs(core: &CollaborationCore) {
+        for handoff in core.pending_product_handoffs().unwrap() {
+            core.acknowledge_product_handoff(
+                handoff.authorized_message().message().envelope_sha256(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn steady_presence_from_twenty_peers_never_exhausts_intake() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let peers = (0..20).map(|_| generate_keypair().0).collect::<Vec<_>>();
+        let presence_ttl = crate::collaboration_presence::PRESENCE_TTL_SECS;
+        let mut now = NOW;
+        let mut most_tombstones = 0;
+        // Two simulated hours of presence every 15 s from each peer.
+        while now < NOW + 2 * 60 * 60 {
+            for peer in &peers {
+                let frame = remote_presence_frame(&fixture, peer, now, presence_ttl);
+                assert!(transport_incoming(&core, &frame, now).product_handoff_pending());
+            }
+            acknowledge_all_handoffs(&core);
+            most_tombstones = most_tombstones.max(core.summary().unwrap().replay_tombstones);
+            now += 15;
+        }
+        // Presence is admissible only until its own expiry, so it leaves no
+        // persisted replay tombstone.
+        assert_eq!(most_tombstones, 0);
+        let (_, post) = remote_transport_message(&fixture, peers[0].clone(), now);
+        assert!(transport_incoming(&core, &post, now).product_handoff_pending());
+    }
+
+    #[test]
+    fn hostile_presence_flood_cannot_exhaust_intake_or_spend_chat_budget() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let hostile = generate_keypair().0;
+        let presence_ttl = crate::collaboration_presence::PRESENCE_TTL_SECS;
+        // Five simulated minutes at 50 presence frames per second.
+        for second in 0..5 * 60 {
+            let now = NOW + second;
+            for _ in 0..50 {
+                let frame = remote_presence_frame(&fixture, &hostile, now, presence_ttl);
+                match core.ingest_transport_frame(&frame, now).unwrap() {
+                    CollaborationTransportIngestion::Incoming(_) => {}
+                    CollaborationTransportIngestion::Rejected(reason) => {
+                        assert_eq!(reason, CollaborationTransportRejection::SenderRateLimited);
+                    }
+                    other => panic!("unexpected presence outcome {other:?}"),
+                }
+            }
+            // A presence claiming a longer life than an honest one is refused.
+            let long_lived = remote_presence_frame(&fixture, &hostile, now, TTL);
+            assert_eq!(
+                transport_rejection(&core, &long_lived, now),
+                CollaborationTransportRejection::InvalidMessage
+            );
+            acknowledge_all_handoffs(&core);
+        }
+        let now = NOW + 5 * 60;
+        assert_eq!(core.summary().unwrap().replay_tombstones, 0);
+        assert!(core.held.take(now).is_empty());
+        // Others' posts still arrive, and the flood spent none of the
+        // hostile sender's chat budget.
+        for _ in 0..3 {
+            let (_, post) = remote_transport_message(&fixture, generate_keypair().0, now);
+            assert!(transport_incoming(&core, &post, now).product_handoff_pending());
+        }
+        for _ in 0..COMMUNITY_RECEIVES_PER_SENDER_PER_WINDOW {
+            let (_, post) = remote_transport_message(&fixture, hostile.clone(), now);
+            assert!(transport_incoming(&core, &post, now).product_handoff_pending());
+            acknowledge_all_handoffs(&core);
+        }
+    }
+
+    #[test]
+    fn failed_presence_acknowledgement_keeps_its_slot_until_a_retry_removes_it() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let presence_ttl = crate::collaboration_presence::PRESENCE_TTL_SECS;
+        let frame = remote_presence_frame(&fixture, &generate_keypair().0, NOW, presence_ttl);
+        transport_incoming(&core, &frame, NOW);
+        let hash = core.pending_product_handoffs().unwrap()[0]
+            .authorized_message()
+            .message()
+            .envelope_sha256()
+            .to_string();
+        core.inject_write_fault(WriteFault::BeforeWrite);
+        assert!(core.acknowledge_product_handoff(&hash).is_err());
+        assert_eq!(core.pending_product_handoffs().unwrap().len(), 1);
+        core.acknowledge_product_handoff(&hash).unwrap();
+        assert!(core.pending_product_handoffs().unwrap().is_empty());
+        assert_eq!(core.summary().unwrap().replay_tombstones, 0);
+        core.acknowledge_product_handoff(&hash).unwrap();
+    }
+
+    #[test]
+    fn chat_replays_stay_refused_and_presence_leaves_no_tombstone() {
+        let fixture = Fixture::new();
+        let core = fixture.core();
+        let (_, post) = remote_transport_message(&fixture, generate_keypair().0, NOW);
+        let receipt = transport_incoming(&core, &post, NOW)
+            .acceptance_receipt_bytes()
+            .to_vec();
+        acknowledge_all_handoffs(&core);
+        // A chat replay within its lifetime only gets its original receipt.
+        let replay = transport_incoming(&core, &post, NOW + TTL - 1);
+        assert!(!replay.product_handoff_pending());
+        assert_eq!(replay.acceptance_receipt_bytes(), receipt);
+        assert!(core.pending_product_handoffs().unwrap().is_empty());
+        // A frame never seen before is refused once its expiry has passed.
+        let (_, late) = remote_transport_message(&fixture, generate_keypair().0, NOW);
+        assert_eq!(
+            transport_rejection(&core, &late, NOW + TTL),
+            CollaborationTransportRejection::InvalidMessage
+        );
+
+        // Presence is suppressed in memory until expiry and never persisted.
+        let peer = generate_keypair().0;
+        let presence_ttl = crate::collaboration_presence::PRESENCE_TTL_SECS;
+        let presence = remote_presence_frame(&fixture, &peer, NOW, presence_ttl);
+        let presence_receipt = transport_incoming(&core, &presence, NOW)
+            .acceptance_receipt_bytes()
+            .to_vec();
+        acknowledge_all_handoffs(&core);
+        let replay = transport_incoming(&core, &presence, NOW + presence_ttl - 1);
+        assert!(!replay.product_handoff_pending());
+        assert_eq!(replay.acceptance_receipt_bytes(), presence_receipt);
+        let suppressed_until = NOW + presence_ttl + 2 * MAX_COLLABORATION_CLOCK_SKEW_SECS;
+        assert!(!transport_incoming(&core, &presence, suppressed_until).product_handoff_pending());
+        assert_eq!(
+            transport_rejection(&core, &presence, suppressed_until + 1),
+            CollaborationTransportRejection::InvalidMessage
+        );
+
+        // The state keeps the released format: only the chat tombstone, with
+        // the exact 24-hour deadline the released validator requires.
+        let written: CoreState =
+            serde_json::from_slice(&fs::read(core.state_path()).unwrap()).unwrap();
+        assert!(written.incoming.is_empty());
+        assert_eq!(written.incoming_tombstones.len(), 1);
+        assert_eq!(
+            written.incoming_tombstones[0].retain_until,
+            tombstone_retention_deadline(NOW)
+        );
+        fixture.core().validate_state(&written).unwrap();
     }
 
     #[test]

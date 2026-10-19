@@ -156,6 +156,10 @@ struct AppState {
     /// request ID, so Runtime treats it as the same message.
     held_direct_sends: BTreeMap<String, PendingDirectSend>,
     community_unread: bool,
+    /// This person's Community presence state from Runtime: `requested`,
+    /// `deferred`, `refused`, `hidden`, `always` or `while_open`. Runtime owns
+    /// the decision (Inbox, System); Chat only reflects it and re-asks.
+    community_presence: Option<String>,
     /// Action state is ephemeral. Runtime owns signed intent and delivery truth.
     direct_in_flight: BTreeMap<String, String>,
     direct_retry_terminal: BTreeMap<String, String>,
@@ -226,6 +230,8 @@ struct App {
     conversation_title: HtmlElement,
     conversation_detail: HtmlElement,
     presence_card: HtmlElement,
+    community_presence_request: HtmlButtonElement,
+    community_presence_hidden: HtmlElement,
     message_list: HtmlElement,
     composer_form: HtmlFormElement,
     message_input: HtmlTextAreaElement,
@@ -384,7 +390,7 @@ struct ParticipantCard {
     conversation_id: Option<String>,
     #[serde(default)]
     can_add_contact: bool,
-    /// Shared presence (Discovery on) that has not expired.
+    /// The person's Home announced Community presence that has not expired.
     #[serde(default)]
     active_now: bool,
 }
@@ -445,6 +451,8 @@ struct RoomPollView {
     transport: RoomTransportView,
     #[serde(default)]
     own_delivery: Vec<CommunityDeliveryView>,
+    #[serde(default)]
+    community_presence: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -679,6 +687,8 @@ pub fn start() -> Result<(), JsValue> {
         conversation_title: element_by_id(&document, "conversation-title")?,
         conversation_detail: element_by_id(&document, "conversation-detail")?,
         presence_card: element_by_id(&document, "presence-card")?,
+        community_presence_request: button_by_id(&document, "community-presence-request")?,
+        community_presence_hidden: element_by_id(&document, "community-presence-hidden")?,
         message_list: element_by_id(&document, "message-list")?,
         composer_form: form_by_id(&document, "composer-form")?,
         message_input: textarea_by_id(&document, "message-input")?,
@@ -751,9 +761,18 @@ impl App {
         self.config.access_mode == AccessMode::Shell
     }
 
+    /// The page is on screen: not hidden, and in the shell its window is
+    /// shown (not minimized or switched away).
+    fn view_visible(&self) -> bool {
+        chat_view_visible(
+            self.document.hidden(),
+            self.is_shell_mode(),
+            self.shell_visible.get(),
+        )
+    }
+
     fn can_mark_read(&self, conversation_id: Option<&str>) -> bool {
-        !self.document.hidden()
-            && (!self.is_shell_mode() || self.shell_visible.get())
+        self.view_visible()
             && self
                 .state
                 .borrow()
@@ -800,6 +819,38 @@ impl App {
                 TimeoutFuture::new(poll_app.poll_interval_ms()).await;
             }
         });
+        let heartbeat_app = Rc::clone(self);
+        spawn_local(async move {
+            loop {
+                heartbeat_app.send_presence_heartbeat().await;
+                TimeoutFuture::new(PRESENCE_HEARTBEAT_MS).await;
+            }
+        });
+    }
+
+    /// Tells Runtime this person has the Community view open. Runtime
+    /// announces only if their grant allows it; Chat never holds the grant.
+    async fn send_presence_heartbeat(&self) {
+        let page_visible = self.view_visible();
+        let due = {
+            let state = self.state.borrow();
+            presence_heartbeat_due(
+                community_view_open(&state),
+                state.community_presence.as_deref(),
+                page_visible,
+            )
+        };
+        if !due || self.home_token().is_none() {
+            return;
+        }
+        // A refused or failed heartbeat announces nothing; the next one,
+        // or the next poll's state, tells Chat what changed.
+        let _: Result<serde_json::Value, String> = api_post_json_with_headers(
+            &self.room_api_url("/presence"),
+            &serde_json::json!({}),
+            &self.home_token_headers(),
+        )
+        .await;
     }
 
     async fn poll_and_render_once(&self) {
@@ -1471,6 +1522,13 @@ impl App {
         )?;
         browser_access_click.forget();
         self.install_participant_card_listeners()?;
+        let request_app = Rc::clone(self);
+        let request_presence = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            request_app.request_community_presence();
+        }));
+        self.community_presence_request
+            .add_event_listener_with_callback("click", request_presence.as_ref().unchecked_ref())?;
+        request_presence.forget();
 
         let create_invite_app = Rc::clone(self);
         let create_invite_click =
@@ -1642,6 +1700,20 @@ impl App {
                         );
                         let _ = link_app.render();
                     }
+                    Ok(false) => {}
+                    Err(error) => {
+                        link_app.set_error(Some(js_error(error)));
+                        let _ = link_app.render();
+                    }
+                }
+                return;
+            }
+            if let Some(anchor) = target.closest("[data-open-external]").ok().flatten() {
+                let Some(url) = anchor.get_attribute("data-open-external") else {
+                    return;
+                };
+                match link_app.open_external_link_from_shell(&url) {
+                    Ok(true) => event.prevent_default(),
                     Ok(false) => {}
                     Err(error) => {
                         link_app.set_error(Some(js_error(error)));
@@ -2999,6 +3071,21 @@ impl App {
         }))
     }
 
+    /// App documents have no popup permission. Inside Home a web link asks
+    /// Home, which shows the exact address and opens it only when the person
+    /// chooses Open link; the link never navigates Chat itself. Home checks the
+    /// address, so Chat sends it unchanged. Outside Home it navigates normally.
+    fn open_external_link_from_shell(&self, url: &str) -> Result<bool, JsValue> {
+        let Some(home_token) = self.home_token() else {
+            return Ok(false);
+        };
+        if !self.is_shell_mode() {
+            return Ok(false);
+        }
+        self.post_home_message(&home_open_external_message(url, &home_token))?;
+        Ok(true)
+    }
+
     fn open_attachment_in_documents(&self, attachment_id: &str) -> Result<bool, JsValue> {
         let clean_attachment_id = attachment_id.trim();
         let Some(home_token) = self.home_token() else {
@@ -3146,7 +3233,7 @@ impl App {
         })?;
         let card = participant.card.as_ref()?;
         if card.active_now {
-            Some("Active now".to_string())
+            Some("Home online".to_string())
         } else if participant.last_seen_at > 0 {
             Some(last_message_text(participant.last_seen_at))
         } else {
@@ -3348,6 +3435,32 @@ impl App {
         )
         .await?;
         Ok(())
+    }
+
+    /// "Show me in Community" after Later: Runtime opens the Inbox card
+    /// again. Chat grants nothing; the decision stays in Inbox.
+    fn request_community_presence(self: &Rc<Self>) {
+        self.community_presence_request.set_disabled(true);
+        let app = Rc::clone(self);
+        spawn_local(async move {
+            let result: Result<serde_json::Value, String> = api_post_json_with_headers(
+                &app.room_api_url("/community-presence/request"),
+                &serde_json::json!({}),
+                &app.home_token_headers(),
+            )
+            .await;
+            match result {
+                Ok(response) => {
+                    app.state.borrow_mut().community_presence = response
+                        .get("community_presence")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                }
+                Err(error) => app.set_transient_error(Some(error)),
+            }
+            app.community_presence_request.set_disabled(false);
+            let _ = app.render();
+        });
     }
 
     /// Profile cards: a click, Enter or Space on any name with a card opens
@@ -3788,6 +3901,12 @@ impl App {
             (state.room_mode_known || session_active).then_some(state.community_state),
         )?;
         set_hidden(&self.presence_card, direct_mode)?;
+        let community_open =
+            !direct_mode && session_active && state.community_state != CommunityState::Left;
+        let (show_request, show_hidden) =
+            community_presence_view(community_open, state.community_presence.as_deref());
+        set_hidden(&self.community_presence_request, !show_request)?;
+        set_hidden(&self.community_presence_hidden, !show_hidden)?;
         set_hidden(
             &self.participant_toggle,
             direct_mode || !session_active || state.community_state == CommunityState::Left,
@@ -4593,7 +4712,7 @@ impl App {
                             anchor.set_attribute("data-open-uri", &link.url)?;
                             anchor.set_attribute("aria-label", "Open published document")?;
                         } else {
-                            anchor.set_attribute("target", "_blank")?;
+                            anchor.set_attribute("data-open-external", &link.url)?;
                             anchor.set_attribute("rel", "noopener noreferrer")?;
                         }
 
@@ -4948,6 +5067,11 @@ fn documents_attachment_message(
     })
 }
 
+/// The typed request asking Home to show and, on consent, open one web link.
+fn home_open_external_message(url: &str, home_token: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "home:open-external", "url": url, "homeToken": home_token })
+}
+
 /// The first element under `root` whose `attribute` is exactly `value`. The
 /// value is compared, never spliced into a selector.
 fn element_with_attribute(root: &Element, attribute: &str, value: &str) -> Option<Element> {
@@ -5035,6 +5159,8 @@ fn apply_active_poll_state(
     let previous_history = state.history.clone();
     let previous_collaboration_configured = state.collaboration_configured;
     let previous_community_state = state.community_state;
+    let previous_community_presence = state.community_presence.clone();
+    state.community_presence = poll.community_presence;
     state.collaboration_configured = poll.transport.configured;
     state.community_state = poll.transport.community_state();
     if !was_session_active
@@ -5105,7 +5231,10 @@ fn apply_active_poll_state(
         || previous_participants != state.participants
         || previous_status_badge != state.status_badge
         || previous_status_detail != state.status_detail;
-    let changed = changed || previous_history != state.history || delivery_changed;
+    let changed = changed
+        || previous_history != state.history
+        || previous_community_presence != state.community_presence
+        || delivery_changed;
     (attachments_to_cache, changed)
 }
 
@@ -5330,6 +5459,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         composer_edits: 0,
         held_direct_sends: BTreeMap::new(),
         community_unread: false,
+        community_presence: None,
         direct_in_flight: BTreeMap::new(),
         direct_retry_terminal: BTreeMap::new(),
         direct_send_again: BTreeMap::new(),
@@ -5411,13 +5541,14 @@ mod tests {
         commit_requested_direct_selection_if_current, commit_shared_selection,
         conversation_initial, current_selection_guard, decode_query_value,
         documents_attachment_message, extract_fragment_param, extract_query_param,
-        format_chat_message_request_id, note_composer_edit, object_sender_name, participant_detail,
-        participant_shown_name, pending_chat_request_id, render_projection,
-        resolve_conversation_choice, room_send_error_text, selection_guard_matches,
-        settle_sent_draft, shell_summary_allows_session, switch_composer_draft, AccessMode,
-        AppConfig, AppState, AttachmentView, CommunityState, ConversationObjectKind,
-        ConversationObjectView, ParticipantView, PendingChatSend, RenderProjection, RoomPollView,
-        RoomTransportView, ShellSessionBootstrapFailure, ShellSessionStartOutput, SummaryView,
+        format_chat_message_request_id, home_open_external_message, note_composer_edit,
+        object_sender_name, participant_detail, participant_shown_name, pending_chat_request_id,
+        render_projection, resolve_conversation_choice, room_send_error_text,
+        selection_guard_matches, settle_sent_draft, shell_summary_allows_session,
+        switch_composer_draft, AccessMode, AppConfig, AppState, AttachmentView, CommunityState,
+        ConversationObjectKind, ConversationObjectView, ParticipantView, PendingChatSend,
+        RenderProjection, RoomPollView, RoomTransportView, ShellSessionBootstrapFailure,
+        ShellSessionStartOutput, SummaryView,
     };
 
     fn two_direct_conversations() -> AppState {
@@ -5503,6 +5634,7 @@ mod tests {
     fn a_lost_home_session_shows_how_to_reconnect_until_it_is_back() {
         let poll = || RoomPollView {
             own_delivery: Vec::new(),
+            community_presence: None,
             room_slug: "chat-room".to_string(),
             display_name: "Shared room".to_string(),
             latest_seq: 1,
@@ -5571,6 +5703,7 @@ mod tests {
     fn shared_poll(latest_seq: u64) -> RoomPollView {
         RoomPollView {
             own_delivery: Vec::new(),
+            community_presence: None,
             room_slug: "chat-room".to_string(),
             display_name: "Shared room".to_string(),
             latest_seq,
@@ -5578,6 +5711,72 @@ mod tests {
             objects: vec![],
             transport: RoomTransportView::default(),
         }
+    }
+
+    #[test]
+    fn community_presence_choice_follows_runtime_and_redraws_when_it_changes() {
+        let mut state = AppState::default();
+        let with_choice = |choice: &str| RoomPollView {
+            community_presence: Some(choice.to_string()),
+            ..shared_poll(1)
+        };
+        assert!(apply_active_poll_state(&mut state, with_choice("requested")).1);
+        assert_eq!(state.community_presence.as_deref(), Some("requested"));
+        assert!(apply_active_poll_state(&mut state, with_choice("deferred")).1);
+        assert_eq!(state.community_presence.as_deref(), Some("deferred"));
+        assert!(!apply_active_poll_state(&mut state, with_choice("deferred")).1);
+    }
+
+    #[test]
+    fn community_presence_line_and_header_follow_runtime_state() {
+        use super::community_presence_view as view;
+        assert_eq!(view(true, Some("deferred")), (true, true));
+        for hidden in ["requested", "refused", "hidden"] {
+            assert_eq!(view(true, Some(hidden)), (false, true), "{hidden}");
+        }
+        for shown in ["always", "while_open"] {
+            assert_eq!(view(true, Some(shown)), (false, false), "{shown}");
+        }
+        assert_eq!(view(true, None), (false, false));
+        assert_eq!(view(false, Some("deferred")), (false, false));
+    }
+
+    #[test]
+    fn presence_heartbeat_runs_only_while_a_granted_community_view_is_visible() {
+        use super::presence_heartbeat_due as due;
+        assert!(due(true, Some("while_open"), true));
+        assert!(due(true, Some("always"), true));
+        assert!(!due(false, Some("while_open"), true));
+        assert!(!due(true, Some("while_open"), false));
+        for silent in [
+            None,
+            Some("requested"),
+            Some("deferred"),
+            Some("refused"),
+            Some("hidden"),
+        ] {
+            assert!(!due(true, silent, true), "{silent:?}");
+        }
+    }
+
+    #[test]
+    fn presence_heartbeat_stops_while_shell_hides_chat_and_resumes_when_shown() {
+        use super::{chat_view_visible as visible, presence_heartbeat_due as due};
+        let tick = |shell_visible| {
+            due(
+                true,
+                Some("while_open"),
+                visible(false, true, shell_visible),
+            )
+        };
+        assert!(tick(true));
+        // Minimized window or phone app switch: the iframe stays alive.
+        assert!(!tick(false));
+        assert!(tick(true));
+        // A hidden document stops it regardless of the shell.
+        assert!(!due(true, Some("while_open"), visible(true, true, true)));
+        // Outside the shell only the document decides.
+        assert!(due(true, Some("while_open"), visible(false, false, false)));
     }
 
     #[test]
@@ -6231,6 +6430,25 @@ mod tests {
     }
 
     #[test]
+    fn web_links_ask_home_with_the_exact_address() {
+        // Chat sends the link's own text; Home and the Runtime decide.
+        for url in [
+            "https://example.com/a?b=1#c",
+            " HTTP://Example.com",
+            "javascript:x",
+        ] {
+            assert_eq!(
+                home_open_external_message(url, "home-token"),
+                serde_json::json!({
+                    "type": "home:open-external",
+                    "url": url,
+                    "homeToken": "home-token",
+                })
+            );
+        }
+    }
+
+    #[test]
     fn a_draft_stays_with_its_conversation() {
         let mut state = two_direct_conversations();
         assert_eq!(switch_composer_draft(&mut state, "shared words"), None);
@@ -6581,6 +6799,7 @@ mod tests {
         let mut state = AppState::default();
         let poll = RoomPollView {
             own_delivery: Vec::new(),
+            community_presence: None,
             room_slug: "chat-room".to_string(),
             display_name: "Shared room".to_string(),
             latest_seq: 4,
@@ -7364,10 +7583,10 @@ fn participant_detail(participant: &ParticipantView, is_local: bool, shell_mode:
         .as_ref()
         .filter(|card| card.relationship != "you");
     if let Some(card) = remote_card {
-        // Community members: presence when they share it, otherwise the
-        // time of their last public message.
+        // Community members: "Home online" while their Home announces
+        // presence, otherwise the time of their last public message.
         if card.active_now {
-            parts.push("active now".to_string());
+            parts.push("Home online".to_string());
         } else if participant.last_seen_at > 0 {
             parts.push(last_message_text(participant.last_seen_at));
         }
@@ -7385,6 +7604,46 @@ fn last_message_text(timestamp_secs: u64) -> String {
         format!("last message {}", format_time(timestamp_secs))
     } else {
         format!("last message {}", day_separator_text(timestamp_secs))
+    }
+}
+
+/// Chat's Community heartbeat cadence; Runtime's presence record lives 45 s.
+const PRESENCE_HEARTBEAT_MS: u32 = 15_000;
+
+fn community_view_open(state: &AppState) -> bool {
+    state.direct.selected_conversation_id.is_none()
+        && state.session_active
+        && state.community_state != CommunityState::Left
+}
+
+/// Chat sends a heartbeat only while the person's Community view is on
+/// screen and their grant could use it; Runtime still checks the grant.
+fn presence_heartbeat_due(
+    community_open: bool,
+    presence: Option<&str>,
+    page_visible: bool,
+) -> bool {
+    community_open && page_visible && matches!(presence, Some("always" | "while_open"))
+}
+
+/// Chat is on screen: the document is shown and, in the shell, the shell
+/// reports Chat's window visible.
+fn chat_view_visible(document_hidden: bool, shell_mode: bool, shell_visible: bool) -> bool {
+    !document_hidden && (!shell_mode || shell_visible)
+}
+
+/// Which of (the "Show me in Community" line, the "Hidden from members"
+/// header) Community shows.
+/// The line appears only after Later; other undecided or hidden states
+/// point to Inbox or System, which own the decision.
+fn community_presence_view(community_open: bool, presence: Option<&str>) -> (bool, bool) {
+    if !community_open {
+        return (false, false);
+    }
+    match presence {
+        Some("deferred") => (true, true),
+        Some("requested" | "refused" | "hidden") => (false, true),
+        _ => (false, false),
     }
 }
 

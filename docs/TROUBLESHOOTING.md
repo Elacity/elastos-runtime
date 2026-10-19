@@ -92,8 +92,9 @@ bootstrap Runtime without people, as the release does:
 ### Community stays unreachable after the Community node comes back
 
 A Home that kept running while the bootstrap Runtime was down, with no other
-Home connected, still shows **Community unreachable** after the bootstrap is
-back. Reopening Chat does not help; restarting this Home's Runtime does.
+Home connected, can show **Community unreachable** for up to about five
+minutes after the bootstrap is back. Reopening Chat does not help; the Home
+recovers by itself.
 
 This is a known iroh-gossip 0.101.0 issue. Upstream
 [n0-computer/iroh-gossip#161](https://github.com/n0-computer/iroh-gossip/pull/161)
@@ -106,8 +107,16 @@ and the peer is never dialed again. With `iroh_gossip=debug`, the log shows
 one `dial failed: timed out peer=<bootstrap>` and then a `Join` sent to that
 peer every second with no further `start to dial`.
 
-Workaround: restart the Home's Runtime after the bootstrap is back. A Home
-that stayed connected to another participant stays **Live** through it.
+Runtime's Community link watchdog clears it. A joined Home with no Community
+peer for 60 seconds leaves and rejoins the Community topic; a minute later it
+replaces its Carrier gossip actor, and it keeps repairing while no peer
+returns, waiting twice as long each time up to five minutes. A Home replaces
+its gossip actor at most six times per start (each replacement leaves a small
+address lookup behind in iroh); after that it only rejoins, and restarting
+Home allows replacements again. A quiet Community with a peer listed is left
+alone. The Home's log names each step (`Community link looks dead`,
+`rebuilding Carrier gossip`, `rebuilds are capped`, `Community link
+recovered`). A bootstrap Runtime never runs these steps.
 
 ### `discovery relay outbox delivery failed … discovery advertisement is not active`
 

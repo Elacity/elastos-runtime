@@ -1,12 +1,14 @@
 //! Internal Carrier transport for one verified collaboration network.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use elastos_runtime::provider::Provider;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::time::Instant;
 
 use crate::collaboration_network::{
     validate_collaboration_bootstrap_peer, CollaborationBootstrapPeer,
@@ -21,6 +23,16 @@ const COLLABORATION_TOPIC_PREFIX: &str = "__elastos_internal/collaboration-v1/";
 const COLLABORATION_RECEIVE_BATCH_SIZE: usize = 32;
 const MAX_RECEIVE_RESPONSE_BYTES: usize =
     MAX_COLLABORATION_TRANSPORT_FRAME_BYTES * COLLABORATION_RECEIVE_BATCH_SIZE + 64 * 1024;
+/// How long a joined Home may have no Community peer before it repairs the
+/// link. Gossip neighbours come back within seconds of a working dial, and
+/// the missing-peer rejoin retries every second, so a minute is a dead link.
+pub(crate) const COMMUNITY_LINK_SILENCE: Duration = Duration::from_secs(60);
+/// Longest wait between repairs while a Home stays without a Community peer.
+const MAX_COMMUNITY_LINK_RETRY: Duration = Duration::from_secs(300);
+/// Most gossip rebuilds one process makes. Each rebuild leaves an address
+/// lookup and its eviction task on the endpoint (iroh 1.0.2 cannot remove
+/// them), so after this many the watchdog only rejoins until Home restarts.
+pub(crate) const MAX_COMMUNITY_GOSSIP_REBUILDS: u32 = 6;
 
 /// An exact collaboration-network Carrier subscription.
 ///
@@ -100,6 +112,28 @@ struct LocalTicketData {
 struct TopicPeersData {
     topic: String,
     peers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TopicHealthData {
+    topic: String,
+    peer_count: usize,
+    received_frames: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RebuildData {
+    topics: usize,
+}
+
+/// One reading of the Community topic in Carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommunityLinkHealth {
+    pub(crate) peer_count: usize,
+    /// Frames received from peers since the topic was joined.
+    pub(crate) received_frames: u64,
 }
 
 #[derive(Deserialize)]
@@ -226,12 +260,7 @@ impl JoinedCollaborationNetwork {
         Ok(!self.topic_peers().await?.peers.is_empty())
     }
 
-    /// Repair only missing peers from the verified profile. The Runtime owns
-    /// the retry cadence; a healthy mesh never receives another Join here.
-    pub(crate) async fn restore_missing_bootstrap_peers(&self) -> anyhow::Result<()> {
-        if self.bootstrap_node_ids.is_empty() {
-            return Ok(());
-        }
+    async fn local_node_id(&self) -> anyhow::Result<String> {
         let response = self
             .carrier
             .send_raw(&serde_json::json!({ "op": "get_ticket" }))
@@ -244,11 +273,21 @@ impl JoinedCollaborationNetwork {
             connect_ticket: local.ticket,
         })
         .context("Carrier local endpoint identity is inconsistent")?;
+        Ok(local.node_id)
+    }
+
+    /// Repair only missing peers from the verified profile. The Runtime owns
+    /// the retry cadence; a healthy mesh never receives another Join here.
+    pub(crate) async fn restore_missing_bootstrap_peers(&self) -> anyhow::Result<()> {
+        if self.bootstrap_node_ids.is_empty() {
+            return Ok(());
+        }
+        let local_node_id = self.local_node_id().await?;
         let connected = self.topic_peers().await?;
         let missing = self
             .bootstrap_node_ids
             .iter()
-            .filter(|node_id| *node_id != &local.node_id && !connected.peers.contains(node_id))
+            .filter(|node_id| *node_id != &local_node_id && !connected.peers.contains(node_id))
             .collect::<Vec<_>>();
         if missing.is_empty() {
             return Ok(());
@@ -382,6 +421,184 @@ impl JoinedCollaborationNetwork {
             anyhow::bail!("Carrier gossip_ack returned an invalid collaboration range");
         }
         Ok(())
+    }
+}
+
+/// What the Community link watchdog needs from Carrier.
+pub(crate) trait CommunityLink {
+    /// Only a Home repairs its own link. A bootstrap node (the seed's
+    /// Community node) has nobody to rejoin, and its rebuild would cut every
+    /// Home at once.
+    async fn recovers_its_link(&self) -> anyhow::Result<bool>;
+    async fn link_health(&self) -> anyhow::Result<CommunityLinkHealth>;
+    /// Leaves the Community topic and joins it again with its bootstrap peers.
+    async fn rejoin(&self) -> anyhow::Result<()>;
+    /// Replaces Carrier's gossip actor; returns how many topics joined again.
+    async fn rebuild_gossip(&self) -> anyhow::Result<usize>;
+}
+
+impl CommunityLink for JoinedCollaborationNetwork {
+    async fn recovers_its_link(&self) -> anyhow::Result<bool> {
+        if self.bootstrap_node_ids.is_empty() {
+            return Ok(false);
+        }
+        let local_node_id = self.local_node_id().await?;
+        Ok(!self.bootstrap_node_ids.contains(&local_node_id))
+    }
+
+    async fn link_health(&self) -> anyhow::Result<CommunityLinkHealth> {
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({
+                "op": "gossip_topic_health",
+                "topic": self.topic,
+            }))
+            .await
+            .context("Carrier topic health failed for collaboration network")?;
+        require_bounded_response(&response)?;
+        let health: TopicHealthData = require_ok_response(response, "gossip_topic_health")?;
+        if health.topic != self.topic {
+            anyhow::bail!("Carrier returned a mismatched collaboration topic health");
+        }
+        Ok(CommunityLinkHealth {
+            peer_count: health.peer_count,
+            received_frames: health.received_frames,
+        })
+    }
+
+    async fn rejoin(&self) -> anyhow::Result<()> {
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({ "op": "gossip_rejoin", "topic": self.topic }))
+            .await
+            .context("Carrier gossip_rejoin failed for collaboration network")?;
+        require_bounded_response(&response)?;
+        let joined: JoinExactData = require_ok_response(response, "gossip_rejoin")?;
+        if joined.topic != self.topic {
+            anyhow::bail!("Carrier returned a mismatched collaboration rejoin");
+        }
+        Ok(())
+    }
+
+    async fn rebuild_gossip(&self) -> anyhow::Result<usize> {
+        let response = self
+            .carrier
+            .send_raw(&serde_json::json!({ "op": "gossip_rebuild" }))
+            .await
+            .context("Carrier gossip_rebuild failed for collaboration network")?;
+        require_bounded_response(&response)?;
+        let rebuilt: RebuildData = require_ok_response(response, "gossip_rebuild")?;
+        Ok(rebuilt.topics)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommunityLinkStep {
+    Rejoin,
+    Rebuild,
+}
+
+/// Repairs a joined Home whose Community link has had no peer for a while,
+/// whatever stalled it: first a topic rejoin, then a new gossip actor.
+///
+/// Only a missing peer counts: a quiet Community is normal (Discovery off
+/// means a Home announces nothing). Frames that still trickle in do not prove
+/// the link: a Home the hub evicted from its active view lists no neighbour
+/// yet can still get a frame now and then, and it stays cut off until it
+/// rejoins. While no peer returns it keeps
+/// repairing with a doubling wait up to `MAX_COMMUNITY_LINK_RETRY`; two
+/// steps are never closer than one silence, counted from when the last one
+/// finished. After `MAX_COMMUNITY_GOSSIP_REBUILDS` rebuilds it only rejoins.
+pub(crate) struct CommunityLinkWatchdog {
+    silence: Duration,
+    observed_at: Option<Instant>,
+    no_peers_since: Option<Instant>,
+    last_step_at: Option<Instant>,
+    steps: u32,
+    rebuilds: u32,
+}
+
+impl CommunityLinkWatchdog {
+    pub(crate) fn new(silence: Duration) -> Self {
+        Self {
+            silence,
+            observed_at: None,
+            no_peers_since: None,
+            last_step_at: None,
+            steps: 0,
+            rebuilds: 0,
+        }
+    }
+
+    /// `health` is `None` when Carrier did not answer, which counts as no peer.
+    pub(crate) fn observe(
+        &mut self,
+        health: Option<CommunityLinkHealth>,
+        now: Instant,
+    ) -> Option<CommunityLinkStep> {
+        // A gap (Community left, or a long cycle) starts the window again;
+        // the rest between steps and the process's rebuild count remain.
+        if self
+            .observed_at
+            .is_some_and(|at| now.duration_since(at) > self.silence / 2)
+        {
+            *self = Self {
+                last_step_at: self.last_step_at,
+                rebuilds: self.rebuilds,
+                ..Self::new(self.silence)
+            };
+        }
+        self.observed_at = Some(now);
+        if health.is_some_and(|health| health.peer_count > 0) {
+            if self.steps > 0 {
+                tracing::info!(steps = self.steps, "Community link recovered");
+            }
+            self.steps = 0;
+            self.no_peers_since = None;
+            return None;
+        }
+        let since = *self.no_peers_since.get_or_insert(now);
+        let wait = match self.steps {
+            0 | 1 => self.silence,
+            steps => self
+                .silence
+                .saturating_mul(1 << (steps - 1).min(8))
+                .min(MAX_COMMUNITY_LINK_RETRY),
+        };
+        let anchor = match (self.steps, self.last_step_at) {
+            (0, _) | (_, None) => since,
+            (_, Some(at)) => at,
+        };
+        let rested = self
+            .last_step_at
+            .is_none_or(|at| now.duration_since(at) >= self.silence);
+        if now.duration_since(anchor) < wait || !rested {
+            return None;
+        }
+        let step = if self.steps > 0 && self.rebuilds < MAX_COMMUNITY_GOSSIP_REBUILDS {
+            self.rebuilds += 1;
+            CommunityLinkStep::Rebuild
+        } else {
+            if self.steps > 0 && self.rebuilds == MAX_COMMUNITY_GOSSIP_REBUILDS {
+                self.rebuilds += 1;
+                tracing::info!(
+                    max_rebuilds = MAX_COMMUNITY_GOSSIP_REBUILDS,
+                    "Carrier gossip rebuilds are capped until this Home restarts; \
+                     the Community link watchdog only rejoins from now on"
+                );
+            }
+            CommunityLinkStep::Rejoin
+        };
+        self.steps = self.steps.saturating_add(1);
+        self.last_step_at = Some(now);
+        Some(step)
+    }
+
+    /// Counts the rest before the next step from when this one finished.
+    pub(crate) fn step_finished(&mut self, now: Instant) {
+        if self.last_step_at.is_some() {
+            self.last_step_at = Some(now);
+        }
     }
 }
 
