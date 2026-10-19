@@ -3941,13 +3941,17 @@ mod tests {
             }
             let root_writer = if hold_root {
                 let held = open_journal_directory(&root).unwrap();
-                held.try_lock().unwrap();
+                // Take the lock with the provider's bounded retry: a child forked on
+                // another test thread can briefly hold a copy of an earlier lock fd (#381).
+                lock_journal_directory(&held).unwrap();
                 Some(held)
             } else {
                 None
             };
             let runs_writer = open_journal_directory(&root.join("runs")).unwrap();
-            runs_writer.try_lock().unwrap();
+            // Take the lock with the provider's bounded retry: a child forked on
+            // another test thread can briefly hold a copy of an earlier lock fd (#381).
+            lock_journal_directory(&runs_writer).unwrap();
             assert_eq!(
                 RunJournal::open(root.clone()).err().unwrap().code(),
                 "selection_unavailable"
@@ -4260,7 +4264,9 @@ mod tests {
         let root = temp_root("briefly-held-writer");
         let journal = RunJournal::open(root.clone()).unwrap();
         let holder = open_journal_directory(&root.join("runs")).unwrap();
-        holder.try_lock().unwrap();
+        // Take the lock with the provider's bounded retry: a child forked on
+        // another test thread can briefly hold a copy of an earlier lock fd (#381).
+        lock_journal_directory(&holder).unwrap();
         let release = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
             drop(holder);
@@ -4333,7 +4339,9 @@ mod tests {
             #[cfg(unix)]
             let _writer = {
                 let writer = open_journal_directory(temp.parent().unwrap()).unwrap();
-                writer.try_lock().unwrap();
+                // Take the lock with the provider's bounded retry: a child forked on
+                // another test thread can briefly hold a copy of an earlier lock fd (#381).
+                lock_journal_directory(&writer).unwrap();
                 writer
             };
             assert!(RunJournal::open(root).is_err());
