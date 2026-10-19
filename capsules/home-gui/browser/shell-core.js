@@ -419,9 +419,12 @@ export const HOME_GUI_HOST_SELECTORS = Object.freeze([
 ]);
 
 /* Window chrome modes are presentation-only. Fail closed to standard.
-   unified-sidebar: split-view apps — lights over the leading column. */
+   unified-sidebar: split-view apps — lights over the leading column.
+   unified-toolbar: Browser-style — lights over the tool row; menubar owns the
+   focused app name. */
 export const WINDOW_CHROME_STANDARD = "standard";
 export const WINDOW_CHROME_UNIFIED_SIDEBAR = "unified-sidebar";
+export const WINDOW_CHROME_UNIFIED_TOOLBAR = "unified-toolbar";
 
 const WINDOW_CHROME_BY_TARGET = {
   marketplace: WINDOW_CHROME_UNIFIED_SIDEBAR,
@@ -433,6 +436,7 @@ const WINDOW_CHROME_BY_TARGET = {
   inbox: WINDOW_CHROME_UNIFIED_SIDEBAR,
   chat: WINDOW_CHROME_UNIFIED_SIDEBAR,
   "chat-room": WINDOW_CHROME_UNIFIED_SIDEBAR,
+  browser: WINDOW_CHROME_UNIFIED_TOOLBAR,
 };
 
 const WINDOW_CHROME_CONTINUOUS_TARGETS = new Set([
@@ -447,6 +451,9 @@ const WINDOW_CHROME_CONTINUOUS_TARGETS = new Set([
 export function parseWindowChromeMode(value) {
   if (value === WINDOW_CHROME_UNIFIED_SIDEBAR) {
     return WINDOW_CHROME_UNIFIED_SIDEBAR;
+  }
+  if (value === WINDOW_CHROME_UNIFIED_TOOLBAR) {
+    return WINDOW_CHROME_UNIFIED_TOOLBAR;
   }
   return WINDOW_CHROME_STANDARD;
 }
@@ -463,11 +470,14 @@ export function applyWindowChrome(windowNode, targetId) {
   }
   windowNode.classList.remove(
     "window-chrome-unified-sidebar",
+    "window-chrome-unified-toolbar",
     "window-chrome-continuous",
   );
   const mode = windowChromeModeForTarget(targetId);
   if (mode === WINDOW_CHROME_UNIFIED_SIDEBAR) {
     windowNode.classList.add("window-chrome-unified-sidebar");
+  } else if (mode === WINDOW_CHROME_UNIFIED_TOOLBAR) {
+    windowNode.classList.add("window-chrome-unified-toolbar");
   } else if (WINDOW_CHROME_CONTINUOUS_TARGETS.has(normalizeText(targetId).toLowerCase())) {
     windowNode.classList.add("window-chrome-continuous");
   }
