@@ -1275,19 +1275,42 @@ pub(in crate::api) fn principal_root_recovery_status_for_verified_principal(
         localhost_root,
         &protected_object_inventory,
     )?;
+    let objects_needing_attention_count = inspection.notices.len();
+    let objects_needing_attention = inspection
+        .notices
+        .iter()
+        .take(MAX_RECOVERY_STATUS_ATTENTION_OBJECTS)
+        .map(
+            |notice| elastos_runtime::auth::PrincipalRootObjectAttentionV1 {
+                path: notice.path.clone(),
+                problem: notice.damage.code().to_string(),
+                action: notice.sentence(),
+            },
+        )
+        .collect::<Vec<_>>();
     let Some(protection) = inspection.protection else {
         let mut status = PrincipalRootRecoveryStatusV1::unprotected(
             principal_id.to_string(),
             localhost_root.to_string(),
         );
-        if inspection.plaintext_object_count > 0 {
+        if !inspection.plaintext.is_empty() {
             status
                 .required_actions
                 .insert(0, "migrate_declared_plaintext_objects".to_string());
         }
+        if inspection.pending_journal {
+            status
+                .required_actions
+                .insert(0, "finish_interrupted_principal_root_migration".to_string());
+        }
+        status.objects_needing_attention = objects_needing_attention;
+        status.objects_needing_attention_count = objects_needing_attention_count;
         return Ok(status);
     };
-    let root_encrypted = inspection.plaintext_object_count == 0
+    // Header-level only: contents are authenticated when each file is opened.
+    let root_encrypted = inspection.plaintext.is_empty()
+        && inspection.notices.is_empty()
+        && !inspection.pending_journal
         && inspection.encrypted_object_count == inspection.declared_object_count;
     let protection_configured = !protection.protectors.is_empty();
     let recovery_configured = protection
@@ -1296,25 +1319,17 @@ pub(in crate::api) fn principal_root_recovery_status_for_verified_principal(
         .any(|protector| protector.verified_at.is_some());
     let recovery_download_available = recovery_archive_from_protection(&protection).is_some();
     let mut required_actions = Vec::new();
-    if !root_encrypted {
+    if inspection.pending_journal {
+        required_actions.push("finish_interrupted_principal_root_migration".to_string());
+    }
+    if !inspection.plaintext.is_empty() {
         required_actions.push("migrate_declared_plaintext_objects".to_string());
     }
     if !recovery_configured {
         required_actions.push("verify_recovery_before_public_guest_hosting".to_string());
     }
-    if let Some(profile) = crate::collaboration_profile_authority::load_profile_authority(
-        data_dir,
-        principal_id,
-        localhost_root,
-    )? {
-        if !protection.protectors.iter().any(|protector| {
-            protector
-                .profile_coverage
-                .as_ref()
-                .is_some_and(|coverage| coverage.profile_did == profile.document().profile_did)
-        }) {
-            required_actions.push("download_recovery_kit_with_profile".to_string());
-        }
+    if !protection_covers_current_profile(data_dir, principal_id, localhost_root, &protection)? {
+        required_actions.push("download_recovery_kit_with_profile".to_string());
     }
     Ok(PrincipalRootRecoveryStatusV1 {
         schema: elastos_runtime::auth::PRINCIPAL_ROOT_RECOVERY_STATUS_SCHEMA.to_string(),
@@ -1326,18 +1341,99 @@ pub(in crate::api) fn principal_root_recovery_status_for_verified_principal(
         protection_configured,
         required_actions,
         crypto: protection.crypto,
+        objects_needing_attention,
+        objects_needing_attention_count,
     })
 }
 
-pub(in crate::api) fn principal_root_recovery_is_ready(
-    recovery: &PrincipalRootRecoveryStatusV1,
-) -> bool {
-    recovery.root_encrypted && recovery.recovery_configured
+/// Whether a protector's Recovery Kit covers the root's current Profile. A
+/// root without a Profile has nothing left to cover.
+fn protection_covers_current_profile(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    localhost_root: &str,
+    protection: &elastos_runtime::auth::PrincipalRootProtectionV1,
+) -> anyhow::Result<bool> {
+    let Some(profile) = crate::collaboration_profile_authority::load_profile_authority(
+        data_dir,
+        principal_id,
+        localhost_root,
+    )?
+    else {
+        return Ok(true);
+    };
+    Ok(protection.protectors.iter().any(|protector| {
+        protector
+            .profile_coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.profile_did == profile.document().profile_did)
+    }))
 }
 
-pub fn verify_configured_principal_roots_ready(data_dir: &std::path::Path) -> anyhow::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::api) enum PrincipalRootRecoveryReadiness {
+    Ready,
+    KitOutdated,
+    KitMissing,
+}
+
+/// The periodic Home stream and the identity summary project Recovery
+/// readiness without a walk. They read the protection record and, once a
+/// kit is verified and a Profile exists, its authority file
+/// (`profile-authority.json`, a protected object decrypted under the root
+/// key); they open no other protected object. The explicit Recovery status
+/// scans the folders.
+pub(in crate::api) fn principal_root_recovery_readiness_for_verified_principal(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    localhost_root: &str,
+) -> anyhow::Result<PrincipalRootRecoveryReadiness> {
+    let Some(protection) =
+        crate::auth::load_principal_root_protection(data_dir, principal_id, localhost_root)?
+    else {
+        return Ok(PrincipalRootRecoveryReadiness::KitMissing);
+    };
+    let recovery_configured = protection
+        .protectors
+        .iter()
+        .any(|protector| protector.verified_at.is_some());
+    if !recovery_configured {
+        return Ok(PrincipalRootRecoveryReadiness::KitMissing);
+    }
+    if protection_covers_current_profile(data_dir, principal_id, localhost_root, &protection)? {
+        Ok(PrincipalRootRecoveryReadiness::Ready)
+    } else {
+        Ok(PrincipalRootRecoveryReadiness::KitOutdated)
+    }
+}
+
+/// Start and update readiness. Returns the notices for damaged files, which
+/// do not stop Home; callers print them with
+/// [`principal_root_notice_lines`].
+pub fn verify_configured_principal_roots_ready(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Vec<String>> {
     let declarations = configured_principal_root_upgrade_declarations(data_dir)?;
     crate::auth::verify_declared_principal_roots_ready(data_dir, &declarations)
+}
+
+const MAX_RECOVERY_STATUS_ATTENTION_OBJECTS: usize = 20;
+const MAX_PRINTED_PRINCIPAL_ROOT_NOTICES: usize = 20;
+
+/// At most 20 notices, then one "and N more" line.
+pub fn principal_root_notice_lines(notices: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = notices
+        .iter()
+        .take(MAX_PRINTED_PRINCIPAL_ROOT_NOTICES)
+        .cloned()
+        .collect();
+    if notices.len() > MAX_PRINTED_PRINCIPAL_ROOT_NOTICES {
+        lines.push(format!(
+            "and {} more",
+            notices.len() - MAX_PRINTED_PRINCIPAL_ROOT_NOTICES
+        ));
+    }
+    lines
 }
 
 /// Caller first proves the exact installed Home generation is ready and holds
@@ -1453,7 +1549,6 @@ pub(in crate::api) fn initialize_local_profile(
         let activation = crate::auth::begin_declarative_principal_root_protection_activation_migrating_plaintext(
             &state.data_dir, &principal.principal_id, &principal.localhost_root, &inventory,
         )?;
-        crate::auth::ensure_online_plaintext_migration_is_possible(&activation.plaintext_objects)?;
         if crate::auth::load_principal_root_protection(
             &state.data_dir,
             &principal.principal_id,
@@ -1532,6 +1627,65 @@ fn local_profile_setup_test_fault(data_dir: &std::path::Path, point: &str) -> an
     })
 }
 
+/// Kit export was refused after its approval was used. Names the reason and
+/// tells the person a fresh approval follows.
+#[derive(Debug)]
+pub(in crate::api) struct RecoveryKitPreparationRefused {
+    notice: String,
+}
+
+impl RecoveryKitPreparationRefused {
+    fn from_activation_error(err: anyhow::Error) -> anyhow::Error {
+        let text = err.to_string();
+        let notice = text
+            .strip_prefix(crate::auth::PROTECTED_PRINCIPAL_ROOT_OBJECT_DAMAGED)
+            .and_then(|rest| rest.strip_prefix(": "))
+            .unwrap_or(&text)
+            .trim_end_matches('.')
+            .to_string();
+        Self { notice }.into()
+    }
+}
+
+impl std::fmt::Display for RecoveryKitPreparationRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Home could not prepare your Recovery Kit: {}. After that, select Download Recovery \
+             Kit again; you will approve with your passkey again.",
+            self.notice
+        )
+    }
+}
+
+impl std::error::Error for RecoveryKitPreparationRefused {}
+
+#[cfg(test)]
+static FULL_RECOVERY_SCAN_DELAY_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Test hook: the next export scan for `data_dir` takes longer than the
+/// approval's lifetime (the step-up validation clock moves 200 s on).
+#[cfg(test)]
+pub(in crate::api) fn delay_next_full_recovery_scan_for_test(data_dir: &std::path::Path) {
+    FULL_RECOVERY_SCAN_DELAY_HOOKS
+        .lock()
+        .unwrap()
+        .insert(data_dir.to_path_buf());
+}
+
+#[cfg(test)]
+fn run_full_recovery_scan_delay_test_hook(data_dir: &std::path::Path) {
+    if FULL_RECOVERY_SCAN_DELAY_HOOKS
+        .lock()
+        .unwrap()
+        .remove(data_dir)
+    {
+        super::gateway::advance_passkey_step_up_clock_for_test(data_dir, 200);
+    }
+}
+
 /// Synchronous so the activation guard never enters the export handler's
 /// async state machine. Export consumes its own bound step-up.
 fn full_recovery_bundle_establish_kit(
@@ -1542,28 +1696,16 @@ fn full_recovery_bundle_establish_kit(
     input: &FullRecoveryBundleExportRequest,
     now: u64,
 ) -> anyhow::Result<RecoveryKitV1> {
-    let protected_object_inventory =
-        principal_root_protected_object_inventory(&state.data_dir, &principal.localhost_root);
-    let protection_activation =
-        crate::auth::begin_declarative_principal_root_protection_activation_migrating_plaintext(
-            &state.data_dir,
-            &principal.principal_id,
-            &principal.localhost_root,
-            &protected_object_inventory,
-        )?;
-    // Same refusal, ahead of the same first write: a Recovery Kit export
-    // must not be the thing that leaves a root protected with plaintext
-    // beside it. Checked before the step-up is consumed so a refusal costs
-    // the person nothing but a message.
-    crate::auth::ensure_online_plaintext_migration_is_possible(
-        &protection_activation.plaintext_objects,
-    )?;
     let intent = serde_json::json!({
         "principal_id": input.principal_id,
         "localhost_root": input.localhost_root,
         "label": input.label,
         "download_password": input.download_password,
     });
+    // The approval is validated and consumed before the scan, so a scan of
+    // any length cannot outlive it. A refusal after this point costs one
+    // more passkey approval: nothing was written yet, and the used approval
+    // cannot be replayed.
     consume_passkey_step_up_token(
         &state.data_dir,
         &input.step_up_token,
@@ -1572,6 +1714,18 @@ fn full_recovery_bundle_establish_kit(
         "auth.full-recovery-bundle.export",
         &intent,
     )?;
+    let protected_object_inventory =
+        principal_root_protected_object_inventory(&state.data_dir, &principal.localhost_root);
+    let protection_activation =
+        crate::auth::begin_declarative_principal_root_protection_activation_migrating_plaintext(
+            &state.data_dir,
+            &principal.principal_id,
+            &principal.localhost_root,
+            &protected_object_inventory,
+        )
+        .map_err(RecoveryKitPreparationRefused::from_activation_error)?;
+    #[cfg(test)]
+    run_full_recovery_scan_delay_test_hook(&state.data_dir);
     let kit = recovery_kit_get_or_create_for_principal(
         state,
         &context.session_id,
@@ -4606,6 +4760,9 @@ pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
         )
             .into_response();
     }
+    if err.is::<RecoveryKitPreparationRefused>() {
+        return (StatusCode::CONFLICT, err.to_string()).into_response();
+    }
     let text = err.to_string();
     let status = if err.is::<PasskeyRegistrationDenied>()
         || err.is::<crate::auth::OwnerEnrollmentDenied>()
@@ -4619,6 +4776,7 @@ pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
         || text.contains("unavailable")
         || text.contains("not configured")
         || text.contains("consumed")
+        || text.contains("already been used")
         || text.contains("disabled")
         || text.contains("not found")
         || text.contains("not active")
@@ -7553,7 +7711,10 @@ mod tests {
         .await
         .expect_err("a valid but wrong Recovery Kit must not activate the root");
 
-        assert!(err.to_string().contains("envelope binding is invalid"));
+        // The header names the root's key, not the kit's: D2, by name.
+        let message = err.to_string();
+        assert!(message.contains(crate::auth::PROTECTED_PRINCIPAL_ROOT_OBJECT_DAMAGED));
+        assert!(message.contains("is labelled for key pdek:"), "{message}");
         assert_eq!(std::fs::read(auth_state_path).unwrap(), auth_state_before);
         assert_eq!(std::fs::read(archive_key_path).unwrap(), archive_key_before);
         assert_eq!(std::fs::read(object_path).unwrap(), object_before);

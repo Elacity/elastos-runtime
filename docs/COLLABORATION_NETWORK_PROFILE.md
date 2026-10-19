@@ -158,7 +158,7 @@ announcements keep their signed expiry; leaving stops their renewal.
 
 Joining Community does not announce anyone. Chat files one Inbox request per
 person; the answer is Always while Home is online, Only while Community is
-open, Later or Never, and System → Community offers Always, Only while open
+open, Later or Never, and the Community section of System → Security offers Always, Only while open
 and Hidden. Showing is a capability token the Runtime mints for that person
 (subject: their principal; action `message`; resource
 `elastos://chat/presence/<network>/<conversation>/always` or `/while-open`;

@@ -1626,6 +1626,9 @@ async fn run() -> anyhow::Result<()> {
                 &data_dir,
                 &backup_dir,
             )?;
+            for line in api::auth_gateway::principal_root_notice_lines(&receipt.notices) {
+                eprintln!("{line}");
+            }
             println!("{}", serde_json::to_string_pretty(&receipt)?);
         }
 

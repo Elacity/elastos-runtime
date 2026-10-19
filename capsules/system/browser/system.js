@@ -390,7 +390,13 @@ function hasShellAccess() {
 async function refreshSystemSummary() {
   if (systemSummaryInFlight) return systemSummaryInFlight;
   systemSummaryInFlight = (async () => {
-    const systemSummary = await fetchRuntimeUpdateJson({ headers: shellHeaders() });
+    let systemSummary;
+    try {
+      systemSummary = await fetchRuntimeUpdateJson({ headers: shellHeaders() });
+    } catch (error) {
+      if (runtimeUpdateActive) showCommunityUnavailable(error);
+      throw error;
+    }
     if (runtimeUpdateActive) {
       renderSystemSummary(systemSummary);
       await refreshCommunityMembership();
@@ -729,10 +735,18 @@ async function refreshCommunityMembership() {
     renderCommunityMembership(await fetchRuntimeUpdateJson({ headers: shellHeaders() }, "/api/apps/system/community"));
     setHiddenFields("community-status", true);
   } catch (error) {
-    if (communityButton) communityButton.disabled = true;
-    setTextFields("community-status", publicSystemError(error, "Community setting is unavailable."));
-    setHiddenFields("community-status", false);
+    showCommunityUnavailable(error);
   }
+}
+
+// A failed read is shown, not hidden: only a Home last confirmed without
+// Community keeps it hidden.
+function showCommunityUnavailable(error) {
+  if (communityMembership?.configured === false) return;
+  if (communityButton) communityButton.disabled = true;
+  if (communitySection) communitySection.hidden = false;
+  setTextFields("community-status", publicSystemError(error, "Community setting is unavailable."));
+  setHiddenFields("community-status", false);
 }
 
 async function updateCommunityMembership() {
@@ -816,11 +830,14 @@ function renderCommunityPresence(presence) {
 
 async function refreshCommunityPresence() {
   if (communityPresenceBusy || communityPresenceOptions.length === 0) return;
+  if (communityMembership?.configured === false) return;
   try {
     renderCommunityPresence(await fetchRuntimeUpdateJson({ headers: shellHeaders() }, "/api/apps/system/community/presence"));
     setHiddenFields("community-presence-status", true);
   } catch (error) {
     setCommunityPresenceOptions(null, true);
+    if (communitySection) communitySection.hidden = false;
+    if (communityPresenceRow) communityPresenceRow.hidden = false;
     setTextFields("community-presence-status", publicSystemError(error, "Community setting is unavailable."));
     setHiddenFields("community-presence-status", false);
   }
@@ -3032,6 +3049,27 @@ async function refreshRecoveryStatus() {
   }
 }
 
+const RECOVERY_ROOT_CHECKED_SENTENCE = "No unencrypted file was found in your protected Home folders, and each file there is labelled for this Home's current key. Each file's contents are checked when you open it.";
+
+function recoveryAttentionNote(status) {
+  const notes = [];
+  if (status?.required_actions?.includes("finish_interrupted_principal_root_migration")) {
+    notes.push("An earlier encryption step did not finish. Home will not start again until it is finished or undone; reinstalling ElastOS does that, and your files are kept.");
+  }
+  if (status?.required_actions?.includes("migrate_declared_plaintext_objects")) {
+    const notStarting = status.protection_configured === true ? "; until they are, Home will not start again" : "";
+    notes.push(`Some files in your protected Home folders are not encrypted yet${notStarting}. Saving your Recovery Kit encrypts files of up to 16 MiB after you approve with your passkey; a larger file is named so you can move it out of your protected folders (Library takes uploads up to 100 MiB).`);
+  }
+  const count = Number(status?.objects_needing_attention_count) || 0;
+  const first = Array.isArray(status?.objects_needing_attention) ? status.objects_needing_attention[0] : null;
+  if (count > 0 && first) {
+    // The action already starts with the file's path.
+    const more = count > 1 ? ` And ${count - 1} more.` : "";
+    notes.push(`${count} file(s) in your protected Home folders need attention: ${readText(first.action)}${more}`);
+  }
+  return notes.join(" ");
+}
+
 function setRecoveryStatus(status) {
   if (recoveryProfileStatus === "unavailable") {
     showRecoveryStatus("Unavailable", "error");
@@ -3045,10 +3083,18 @@ function setRecoveryStatus(status) {
     setRecoveryButton("Create Profile and save kit", false);
     return;
   }
+  const attention = recoveryAttentionNote(status);
   if (status?.required_actions?.includes("download_recovery_kit_with_profile")) {
     showRecoveryStatus("Profile needs backup", "muted");
-    showRecoveryNote("Save a new kit that includes your Profile.", "muted");
+    showRecoveryNote(attention ? `Save a new kit that includes your Profile. ${attention}` : "Save a new kit that includes your Profile.", "muted");
     setRecoveryButton("Save complete Recovery Kit", false);
+    return;
+  }
+  if (attention) {
+    showRecoveryStatus("Needs attention", "muted");
+    showRecoveryNote(attention, "muted");
+    const exportReady = status.recovery_configured === true && status.recovery_download_available === true;
+    setRecoveryButton(exportReady ? "Download Recovery Kit" : "Create Recovery Kit", false);
     return;
   }
   const configured = status && status.recovery_configured === true;
@@ -3056,7 +3102,8 @@ function setRecoveryStatus(status) {
   const protectedRoot = status && status.protection_configured === true;
   if (configured && downloadAvailable) {
     showRecoveryStatus("", "success");
-    showRecoveryNote("Saves your Profile, Home recovery authority, and included Wallet keys after passkey verification. Keep your files backed up separately.", "muted");
+    const checked = status.root_encrypted === true ? `${RECOVERY_ROOT_CHECKED_SENTENCE} ` : "";
+    showRecoveryNote(`${checked}Saves your Profile, Home recovery authority, and included Wallet keys after passkey verification. Keep your files backed up separately.`, "muted");
     setRecoveryButton("Download Recovery Kit", false);
     return;
   }

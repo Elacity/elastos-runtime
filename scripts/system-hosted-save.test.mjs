@@ -657,6 +657,8 @@ test("Home update summary refreshes share one bounded request", async () => {
   f.context.fetchJson = () => { reads++; return new Promise(resolve => { finish = resolve; }); };
   f.context.refreshCommunityMembership = async () => { communityReads++; };
   f.context.refreshCommunityPresence = async () => { presenceReads++; };
+  const unavailable = [];
+  f.context.showCommunityUnavailable = error => unavailable.push(error.message);
   f.context.renderSystemSummary = value => { f.context.renderRuntimeUpdate(value.runtime_update); };
   const refresh = source.slice(source.indexOf("async function refreshSystemSummary() {"), source.indexOf("async function fetchJson("));
   vm.runInContext(refresh, f.context);
@@ -677,6 +679,7 @@ test("Home update summary refreshes share one bounded request", async () => {
   const deadline = [...f.timers.values()].find(timer => timer.delay === 10_000);
   deadline.handler();
   await assert.rejects(hung, /request deadline/);
+  assert.deepEqual(unavailable, ["request deadline"], "a failed summary shows Community as unavailable instead of hiding it");
   assert.equal(f.context.systemSummaryInFlight, null, "timed-out request releases the next refresh");
   assert(![...f.timers.values()].some(timer => timer.delay === 10_000));
 });
@@ -847,6 +850,24 @@ test("Community guests cannot dispatch and refused owner changes retain the last
   assert.equal(owner.hidden.get("community-status"), false);
 });
 
+test("Community load failure is visible when configured and stays hidden on a Home without Community", async () => {
+  const none = communityFixture();
+  none.context.renderCommunityMembership({ schema: "elastos.community-membership/v1", configured: false, joined: false });
+  none.context.fetchJson = async () => { throw new Error("request failed: 500"); };
+  await none.context.refreshCommunityMembership();
+  none.context.showCommunityUnavailable(new Error("summary failed"));
+  assert.equal(none.section.hidden, true, "a confirmed unconfigured Home stays hidden after a later failure");
+  assert.equal(none.hidden.get("community-status"), undefined);
+
+  const f = communityFixture();
+  f.context.fetchJson = async () => { throw new Error("request failed: 500"); };
+  await f.context.refreshCommunityMembership();
+  assert.equal(f.section.hidden, false);
+  assert.equal(f.hidden.get("community-status"), false);
+  assert.equal(f.fields.get("community-status"), "Community setting is unavailable.");
+  assert.equal(f.button.disabled, true);
+});
+
 test("Community missing configuration stays hidden and malformed state cannot enable its control", () => {
   const f = communityFixture();
   f.context.renderCommunityMembership({ schema: "elastos.community-membership/v1", configured: false, joined: false });
@@ -857,7 +878,7 @@ test("Community missing configuration stays hidden and malformed state cannot en
 });
 
 test("Show me in Community offers three modes, sets only the caller's own and reverts on refusal", async () => {
-  const row = { hidden: true };
+  const row = { hidden: true }, section = { hidden: true };
   const option = mode => {
     const attrs = new Map([["aria-checked", "false"]]), classes = new Set();
     return {
@@ -871,7 +892,7 @@ test("Show me in Community offers three modes, sets only the caller's own and re
   const fields = new Map(), hidden = new Map(), requests = [];
   let reply = { schema: "elastos.community-presence/v1", configured: true, joined: true, community_presence: "requested" };
   const context = vm.createContext({
-    communityPresenceRow: row, communityPresenceOptions: options, hasShellAccess: () => true,
+    communitySection: section, communityPresenceRow: row, communityPresenceOptions: options, hasShellAccess: () => true,
     setTextFields: (key, value) => fields.set(key, value),
     setHiddenFields: (key, value) => hidden.set(key, value),
     shellHeaders: value => value || {}, publicSystemError: (_, fallback) => fallback,
@@ -883,7 +904,7 @@ test("Show me in Community offers three modes, sets only the caller's own and re
   const end = source.indexOf("function configureAiProvider(", start);
   const fetchStart = source.indexOf("async function fetchRuntimeUpdateJson(");
   const fetchEnd = source.indexOf("async function onRuntimeUpdateApply(", fetchStart);
-  vm.runInContext(`let communityPresenceBusy = false; ${source.slice(start, end)} ${source.slice(fetchStart, fetchEnd)}`, context);
+  vm.runInContext(`let communityPresenceBusy = false; var communityMembership = null; ${source.slice(start, end)} ${source.slice(fetchStart, fetchEnd)}`, context);
 
   await context.refreshCommunityPresence();
   assert.equal(row.hidden, false);
@@ -910,4 +931,24 @@ test("Show me in Community offers three modes, sets only the caller's own and re
   context.fetchJson = async () => ({ ...reply, joined: false, community_presence: "always" });
   await context.refreshCommunityPresence();
   assert.ok(options.every(o => o.disabled), "a Home that left Community cannot change it until it rejoins");
+
+  row.hidden = true;
+  context.fetchJson = async () => ({ ...reply, configured: false });
+  await context.refreshCommunityPresence();
+  assert.equal(row.hidden, true, "a Home without Community keeps the row hidden");
+  assert.equal(section.hidden, true);
+  context.fetchJson = async () => { throw new Error("request failed: 500"); };
+  await context.refreshCommunityPresence();
+  assert.equal(section.hidden, false, "a presence load failure is visible");
+  assert.equal(row.hidden, false);
+  assert.equal(hidden.get("community-presence-status"), false);
+  assert.ok(options.every(o => o.disabled));
+
+  section.hidden = true; row.hidden = true;
+  context.communityMembership = { configured: false };
+  let reads = 0;
+  context.fetchJson = async () => { reads++; throw new Error("request failed: 500"); };
+  await context.refreshCommunityPresence();
+  assert.equal(reads, 0, "a Home without Community never reads presence");
+  assert.equal(section.hidden, true, "and a presence failure cannot reveal it");
 });
