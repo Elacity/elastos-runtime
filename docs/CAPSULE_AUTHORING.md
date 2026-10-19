@@ -17,13 +17,43 @@ as the supported authoring contract, not as evidence of product adoption.
 
 The commands in this guide create capsule source packages. A source package is
 an authoring and build input, not a complete signed Digital Capsule. Source
-packages may omit `signature` during local development; [state.md](../state.md)
-records the current first-party signing gap. The source-home setup copies these
+packages may omit `signature` during local development. The owning
+[GitHub issues](https://github.com/Elacity/elastos-runtime/issues) record
+first-party signing and distribution acceptance. The source-home setup copies these
 packages into its local data home, and local development may launch them. Their
 presence or successful launch does not prove signed distribution, portable
 installation, or Runtime admission on another node. A distributable Digital
 Capsule requires a complete signed artifact. Each Runtime decides separately
 whether to admit it under local trust policy.
+
+## Current isolation and target boundary
+
+First-party apps run as web projections in the browser's opaque sandboxed
+frames. Runtime checks each app's signed launch token and actor before it performs an effect.
+Home can currently obtain every app's capability, so a compromised Home can
+reach those apps' authority. The target limits Home to delegation and gives each
+app a separate, revocable capability. The WASM Component authoring path runs in
+Wasmtime with memory and fuel limits and Runtime Bus hostcalls.
+
+Providers run as native operating-system processes with the Runtime user's
+rights. Only the model provider is partly confined. The trusted shell helper
+also runs as a native host process. The web Terminal is disabled by default;
+host developer mode and closed guest registration are required to enable it.
+An enabled Terminal runs commands with the host user's rights.
+
+The seed operator can read hosted data, wallet keys and recovery material.
+Passkeys control sign-in; stored data and keys remain accessible to the Runtime
+account and root while Home is locked. Protection against hosted operators and
+root, and against other software or OS users while a self-hosted Home is locked,
+is the target of [hosted protection](https://github.com/Elacity/elastos-runtime/issues/209)
+and [locked Home protection](https://github.com/Elacity/elastos-runtime/issues/210).
+An unlocked self-hosted Home trusts its owner and their host software. Recovery
+from a stolen device or profile key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe this source tree. Accepted
+installed proof binds the exact Runtime, components and app assets to the
+journeys tested on that device.
 
 ## Choose one role
 
@@ -82,13 +112,21 @@ The Component imports only `elastos:bus@v1`. It receives no WASI, environment,
 filesystem preopens, FIFO, raw socket, or gateway authority. Runtime validates
 Bus requests, chooses providers, and records audit events.
 
+Shipped first-party manifests retain legacy labels for update compatibility:
+web projections use `type=wasm`, and native providers and the host shell helper
+use `type=microvm` without the new native execution or ABI fields. Runtime
+accepts both formats and reports their actual execution in Home, Marketplace
+and the contract audit. These legacy labels grant the same Runtime-owned launch
+paths as the honest descriptors below. Shipped labels will change only after
+all supported Runtimes can parse the honest values.
+
 ### Web-projection fields
 
 A web projection uses:
 
 ```json
 {
-  "type": "wasm",
+  "type": "web-projection",
   "runtime_abi": "elastos.runtime-projection/v1",
   "bus_contract": "elastos.runtime-projection/v1",
   "execution": "web-projection",
@@ -103,7 +141,33 @@ and routing boundary. Runtime handles core operations directly and sends
 provider-backed effects through the provider registry. Each substrate retains
 its documented lifecycle and cleanup contract. Launch tokens establish bounded
 launch context, but they do not prove principal or session authority by
-themselves. Same-origin access grants no authority.
+themselves. The current Home authority described above also applies to this
+projection path.
+
+### Native-provider fields
+
+Runtime accepts this honest descriptor for a native provider:
+
+```json
+{
+  "type": "native-provider",
+  "runtime_abi": "elastos.provider-stdio/v1",
+  "execution": "native-provider",
+  "entrypoint": "<provider-binary>"
+}
+```
+
+Its role is `provider`. Runtime starts the registered binary as an
+operating-system process through the existing component launcher. Generic
+capsule compute and CLI `run` reject this type. A provider template describes
+its contract; it does not make that provider available for installation or
+execution. `authority` describes requested ownership, not an operating-system
+sandbox. The current provider boundary is described above.
+
+Runtime accepts `native-host` for the `type`, `execution`, and `runtime_abi`
+fields of the internal `shell` host helper. It remains an
+existing trusted host launcher. Generic capsule compute and CLI `run` reject
+this helper type. It is separate from a sandboxed web shell projection.
 
 ### Data fields
 

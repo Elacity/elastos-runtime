@@ -150,3 +150,6 @@ scripts/full-check-inventory.sh
 scripts/control_graph_cron.py
 scripts/status.sh
 scripts/dev/dkms-docker/shared
+
+# Local rehearsal and review output; never part of the repository.
+/output/

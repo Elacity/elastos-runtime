@@ -16,7 +16,8 @@ use bindings::{
     resolve_capsule_method_binding, static_capsule_method_binding, RuntimeCapsuleAffordanceBinding,
 };
 pub(super) use read_model::{
-    capsule_catalog_summary, capsule_interface_registry_summary, CapsuleCatalogResponse,
+    capsule_catalog_summary, capsule_interface_registry_summary,
+    capsule_interface_registry_summary_from_catalog, CapsuleCatalogResponse,
     CapsuleInterfaceRegistryResponse,
 };
 
@@ -52,10 +53,28 @@ pub(super) async fn capsule_catalog(
     }
 }
 
+fn project_model_memory_fit(
+    catalog: &mut CapsuleCatalogResponse,
+    memory: Option<elastos_common::host_memory::HostMemory>,
+) {
+    for row in &mut catalog.capsules {
+        if row.source == "signed-model-catalog" {
+            row.model_memory_fit = row.model_content.as_ref().map(|metadata| {
+                elastos_common::host_memory::model_memory_fit(metadata.minimum_memory_mb, memory)
+            });
+        }
+    }
+}
+
 async fn caller_capsule_catalog_summary(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
 ) -> CapsuleCatalogResponse {
+    // Home may have started offline without its pinned catalogue; Local AI's
+    // read retries it, and otherwise reports it unavailable.
+    if let Err(error) = crate::setup::retry_model_catalog(&state.data_dir).await {
+        tracing::debug!("model catalogue unavailable: {error:#}");
+    }
     #[cfg(unix)]
     {
         // Catalog trust may be revoked while the provider is answering. Rebuild
@@ -81,6 +100,10 @@ async fn caller_capsule_catalog_summary(
             }
         }
         let mut catalog = capsule_catalog_summary(&state.data_dir);
+        project_model_memory_fit(
+            &mut catalog,
+            elastos_common::host_memory::observe_host_memory(std::env::consts::OS).ok(),
+        );
         for row in &mut catalog.capsules {
             if row.model_content.is_some() {
                 row.model_runtime = Some(
@@ -144,7 +167,18 @@ pub(super) async fn capsule_interface_registry_summary_with_bindings(
     data_dir: &std::path::Path,
     registry: Option<&elastos_runtime::provider::ProviderRegistry>,
 ) -> read_model::CapsuleInterfaceRegistryResponse {
-    let mut summary = capsule_interface_registry_summary(data_dir);
+    capsule_interface_registry_summary_with_bindings_from_catalog(
+        &capsule_catalog_summary(data_dir),
+        registry,
+    )
+    .await
+}
+
+pub(super) async fn capsule_interface_registry_summary_with_bindings_from_catalog(
+    catalog: &CapsuleCatalogResponse,
+    registry: Option<&elastos_runtime::provider::ProviderRegistry>,
+) -> read_model::CapsuleInterfaceRegistryResponse {
+    let mut summary = capsule_interface_registry_summary_from_catalog(catalog);
     for entry in &mut summary.interfaces {
         let mut bindings = Vec::with_capacity(entry.interface.methods.len());
         for method in &entry.interface.methods {
@@ -604,14 +638,7 @@ async fn dispatch_capsule_affordance(
                         revalidate,
                     )
                 };
-                let mut output = invoke().map_err(|error| {
-                    tracing::debug!(error = ?error, "private model preparation invocation failed");
-                    (
-                        StatusCode::CONFLICT,
-                        "preparation_unavailable",
-                        "Model preparation is unavailable.".into(),
-                    )
-                })?;
+                let mut output = invoke().map_err(preparation_invoke_error)?;
                 let cid = output["cid"].as_str().unwrap_or("");
                 let operation = output["operation_id"].as_str();
                 let projection =
@@ -626,7 +653,13 @@ async fn dispatch_capsule_affordance(
                 if operation.is_some() && projection["preparation"].is_object() {
                     output = projection["preparation"].clone();
                 }
-                for field in ["admitted", "kept", "dispatch_ready", "offer_id"] {
+                for field in [
+                    "admitted",
+                    "kept",
+                    "dispatch_ready",
+                    "dispatch_unavailable_reason",
+                    "offer_id",
+                ] {
                     output[field] = projection[field].clone();
                 }
                 Ok(output)
@@ -642,6 +675,55 @@ async fn dispatch_capsule_affordance(
             }
         }
     }
+}
+
+/// Known Runtime refusal facts have bounded prose; provider details stay private.
+#[cfg(unix)]
+fn preparation_invoke_error(error: anyhow::Error) -> (StatusCode, &'static str, String) {
+    if let Some(expired) = error
+        .downcast_ref::<crate::api::capsule_inventory::preparation::PreparationRequestExpired>(
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            expired.public_class(),
+            expired.public_message().into(),
+        );
+    }
+    if let Some(memory) =
+        error.downcast_ref::<crate::api::capsule_inventory::preparation::PreparationMemoryRefusal>()
+    {
+        return (
+            StatusCode::CONFLICT,
+            memory.public_class(),
+            memory.public_message().into(),
+        );
+    }
+    if let Some(budget) =
+        error.downcast_ref::<crate::api::capsule_inventory::preparation::PreparationBudgetRefusal>()
+    {
+        return (
+            StatusCode::CONFLICT,
+            budget.public_class(),
+            budget.public_message().into(),
+        );
+    }
+    if let Some(space) = error.downcast_ref::<elastos_common::NotEnoughFreeSpace>() {
+        let reason = space.to_string();
+        let reason = reason
+            .strip_prefix("not enough free space: ")
+            .unwrap_or(&reason);
+        return (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "not_enough_free_space",
+            format!("Not enough free disk space on this Home: {reason}. Free some space, then select Get again."),
+        );
+    }
+    tracing::debug!(error = ?error, "private model preparation invocation failed");
+    (
+        StatusCode::CONFLICT,
+        "preparation_unavailable",
+        "Model preparation is unavailable.".into(),
+    )
 }
 
 async fn dispatch_capsule_launch_affordance(
@@ -824,6 +906,138 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(unix)]
+    #[test]
+    fn model_catalog_device_fit_is_a_signed_row_fact_with_safe_refusals() {
+        use crate::api::capsule_inventory::tests::{
+            model_catalog_fixture, write_model_catalog_fixture,
+        };
+        use elastos_common::host_memory::{HostMemory, ModelMemoryFit};
+        let root = tempfile::tempdir().unwrap();
+        write_model_catalog_fixture(root.path(), &model_catalog_fixture());
+        for (memory, expected) in [
+            (
+                Some(HostMemory {
+                    total: 16 << 30,
+                    available: 0,
+                    pressure_normal: false,
+                }),
+                ModelMemoryFit::Fits,
+            ),
+            (
+                Some(HostMemory {
+                    total: 4 << 30,
+                    available: 4 << 30,
+                    pressure_normal: false,
+                }),
+                ModelMemoryFit::Insufficient,
+            ),
+            (None, ModelMemoryFit::Unavailable),
+        ] {
+            let mut catalog = capsule_catalog_summary(root.path());
+            project_model_memory_fit(&mut catalog, memory);
+            assert_eq!(catalog.capsules.len(), 1);
+            assert_eq!(catalog.capsules[0].model_memory_fit, Some(expected));
+            assert_eq!(catalog.capsules[0].state, "unprepared");
+            let mut public = serde_json::to_value(&catalog).unwrap();
+            assert_eq!(public["counts"]["total"], catalog.capsules.len());
+            // Capsule count is public; raw device memory remains private.
+            public["counts"].as_object_mut().unwrap().remove("total");
+            let projected = serde_json::to_string(&public).unwrap();
+            assert!(!projected.contains(&root.path().display().to_string()));
+            assert!(!projected.contains("\"available\":") && !projected.contains("\"total\":"));
+        }
+        for refusal in [
+            crate::api::capsule_inventory::preparation::PreparationMemoryRefusal::Insufficient,
+            crate::api::capsule_inventory::preparation::PreparationMemoryRefusal::Unavailable,
+        ] {
+            let (status, code, message) = preparation_invoke_error(
+                anyhow::Error::new(refusal).context("private /secret/provider credential"),
+            );
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(code, refusal.public_class());
+            assert_eq!(message, refusal.public_message());
+            assert!(!message.contains("/secret") && !message.contains("credential"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_get_expired_request_shows_only_the_fixed_runtime_reason() {
+        let (status, code, message) = preparation_invoke_error(
+            anyhow::Error::new(
+                crate::api::capsule_inventory::preparation::PreparationRequestExpired,
+            )
+            .context("private provider /secret credential"),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(code, elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE);
+        assert_eq!(
+            message,
+            elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE
+        );
+        let (_, code, _) = preparation_invoke_error(anyhow::anyhow!(
+            elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE
+        ));
+        assert_eq!(code, "preparation_unavailable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_get_disk_refusal_keeps_the_reason_and_size() {
+        let refused = anyhow::Error::new(elastos_common::NotEnoughFreeSpace { needed: 3 << 30 })
+            .context("model preparation reservation");
+        let (status, code, message) = preparation_invoke_error(refused);
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(code, "not_enough_free_space");
+        assert_eq!(
+            message,
+            "Not enough free disk space on this Home: this needs 3 GB plus 2 GB kept free. Free some space, then select Get again."
+        );
+        let (_, code, _) = preparation_invoke_error(anyhow::anyhow!("other failure"));
+        assert_eq!(code, "preparation_unavailable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_get_budget_refusals_show_only_fixed_runtime_facts() {
+        use crate::api::capsule_inventory::preparation::PreparationBudgetRefusal;
+        for budget in [
+            PreparationBudgetRefusal::Cache,
+            PreparationBudgetRefusal::Memory,
+        ] {
+            let error = anyhow::Error::new(budget).context("private provider /secret credential");
+            let (status, code, message) = preparation_invoke_error(error);
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(code, budget.public_class());
+            assert_eq!(message, budget.public_message());
+            assert!(!message.contains("/secret") && !message.contains("credential"));
+        }
+        let (_, code, message) =
+            preparation_invoke_error(anyhow::anyhow!("private provider /secret credential"));
+        assert_eq!(code, "preparation_unavailable");
+        assert_eq!(message, "Model preparation is unavailable.");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Playwright and Chromium; CI uses the content_sandbox_browser filter"]
+    async fn content_sandbox_browser_isolation_ui_truth() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../scripts/isolation-ui-truth-browser-smoke.mjs");
+        let mut command = tokio::process::Command::new("node");
+        command.arg(script).kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(90), command.output())
+            .await
+            .expect("isolation UI browser fixture timeout")
+            .expect("start isolation UI browser fixture");
+        assert!(
+            output.status.success(),
+            "isolation UI fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[derive(Default)]
     struct BindingProvider {
         calls: AtomicUsize,
@@ -972,7 +1186,7 @@ mod tests {
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        if capsule_type == "wasm" {
+        if matches!(capsule_type, "wasm" | "web-projection") {
             fs::write(dir.join(format!("{name}.wasm")), b"\0asm").unwrap();
             fs::create_dir_all(dir.join("browser")).unwrap();
             fs::write(dir.join("browser/index.html"), "<!doctype html>").unwrap();
@@ -993,7 +1207,7 @@ mod tests {
         if manifest
             .get("type")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|capsule_type| capsule_type == "wasm")
+            .is_some_and(|capsule_type| matches!(capsule_type, "wasm" | "web-projection"))
         {
             fs::write(dir.join(format!("{name}.wasm")), b"\0asm").unwrap();
             fs::create_dir_all(dir.join("browser")).unwrap();
@@ -1040,7 +1254,21 @@ mod tests {
             .filter(|capsule| capsule.role == CapsuleRole::Shell && capsule.launchable)
             .map(|capsule| capsule.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(launchable_shells, vec!["home-cli", "home-gui"]);
+        // The browser terminal needs host developer mode, so Terminal is
+        // offered only once it is on.
+        assert_eq!(launchable_shells, vec!["home-gui"]);
+        fs::write(
+            data_dir.path().join("config.toml"),
+            "developer_mode = true\n",
+        )
+        .unwrap();
+        let developer_shells = capsule_catalog_summary(data_dir.path())
+            .capsules
+            .into_iter()
+            .filter(|capsule| capsule.role == CapsuleRole::Shell && capsule.launchable)
+            .map(|capsule| capsule.name)
+            .collect::<Vec<_>>();
+        assert_eq!(developer_shells, vec!["home-cli", "home-gui"]);
         let marketplace = catalog
             .capsules
             .iter()
@@ -1179,7 +1407,16 @@ mod tests {
             "expected the first-party development capsule set to be visible"
         );
 
-        let catalog = capsule_catalog_summary(data_dir.path());
+        for platform in ["linux-arm64", "linux-amd64"] {
+            // Where Browser is unavailable it is absent, not merely unlaunchable.
+            assert!(
+                !read_model::capsule_catalog_summary_for(data_dir.path(), platform)
+                    .capsules
+                    .iter()
+                    .any(|capsule| capsule.name == "browser")
+            );
+        }
+        let catalog = read_model::capsule_catalog_summary_for(data_dir.path(), "darwin-arm64");
         assert_eq!(catalog.schema, read_model::CAPSULE_CATALOG_SCHEMA);
         assert_eq!(catalog.counts.total, catalog.capsules.len());
         let catalog_names = catalog
@@ -1192,6 +1429,11 @@ mod tests {
         let expected = manifest_names
             .intersection(&active_names)
             .copied()
+            // Protected content ships after 0.8.0, so its viewer stays out of Home.
+            .filter(|name| {
+                crate::protected_content_runtime::protected_content_enabled(data_dir.path())
+                    || *name != crate::protected_content_runtime::ELACITY_PLAYER_CAPSULE_ID
+            })
             .collect::<BTreeSet<_>>();
         assert_eq!(catalog_names, expected);
         assert!(!catalog_names.contains("bus-v1-conformance"));
@@ -1237,7 +1479,7 @@ mod tests {
             .filter(|capsule| capsule.role == CapsuleRole::Shell && capsule.launchable)
             .map(|capsule| capsule.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(launchable_shells, vec!["home-cli", "home-gui"]);
+        assert_eq!(launchable_shells, vec!["home-gui"]);
         let home_gui = catalog
             .capsules
             .iter()
@@ -1425,7 +1667,8 @@ mod tests {
             }
         }
 
-        let registry = capsule_interface_registry_summary(data_dir.path());
+        let registry =
+            read_model::capsule_interface_registry_summary_for(data_dir.path(), "darwin-arm64");
         assert_eq!(
             registry.schema,
             read_model::CAPSULE_INTERFACE_REGISTRY_SCHEMA

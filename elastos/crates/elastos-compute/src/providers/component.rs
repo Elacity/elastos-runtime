@@ -147,7 +147,7 @@ impl Default for ComponentProvider {
 #[async_trait]
 impl ComputeProvider for ComponentProvider {
     async fn load(&self, path: &Path, manifest: CapsuleManifest) -> Result<CapsuleHandle> {
-        if !Self::is_component_manifest(&manifest) {
+        if manifest.validate().is_err() || !Self::is_component_manifest(&manifest) {
             return Err(ElastosError::Compute(
                 "ComponentProvider only accepts elastos.component/v1 manifests".into(),
             ));
@@ -430,6 +430,9 @@ mod tests {
         let provider = ComponentProvider::new();
         assert!(provider.supports(&CapsuleType::Wasm));
         assert!(!provider.supports(&CapsuleType::MicroVM));
+        assert!(!provider.supports(&CapsuleType::WebProjection));
+        assert!(!provider.supports(&CapsuleType::NativeProvider));
+        assert!(!provider.supports(&CapsuleType::NativeHost));
     }
 
     #[test]

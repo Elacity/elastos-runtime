@@ -327,6 +327,70 @@ async fn model_runs_create_injects_verified_runtime_binding() {
 }
 
 #[tokio::test]
+async fn model_expired_request_refusal_is_bound_to_provider_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = RecordingModelProvider::default();
+    let app = gateway_router(model_test_state(dir.path(), provider.clone()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let grant = assistant_auth_grant(dir.path(), &authority);
+    let token = issue_home_launch_token_for_auth_grant(dir.path(), "assistant", &grant).unwrap();
+    let request = json!({
+        "offer_id":"offer:sample-model", "operation":"text.generate",
+        "request_id":"request-pruned", "input":{"prompt":"kept draft"},
+    });
+    let expired = json!({
+        "status":"error", "code":elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE,
+        "message":elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE,
+    });
+    *provider.response.lock().await = expired.clone();
+    let response = app
+        .clone()
+        .oneshot(post_model(token.clone(), "runs_create", request.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = response_json(response).await;
+    assert_eq!(response["code"], "model_invocation_refused");
+    assert_eq!(
+        response["reason"],
+        elastos_model_contract::MODEL_REQUEST_EXPIRED_CODE
+    );
+    assert_eq!(
+        response["refusal"],
+        json!({
+            "schema":"elastos.model.invocation-refusal/v1", "scope":"invocation",
+            "dispatch":"provider_refused", "request_id":request["request_id"],
+            "offer_id":request["offer_id"], "operation":request["operation"],
+            "input_hash":model_input_hash(&request["input"]).unwrap(),
+        })
+    );
+    assert_eq!(
+        provider.requests.lock().await.len(),
+        1,
+        "provider validation already ran"
+    );
+    for ambiguous in [
+        json!({"status":"error","code":"provider_error","message":"unknown"}),
+        json!({"status":"error","code":"request_expired","message":"different"}),
+        json!({"status":"error","code":"request_expired","message":elastos_model_contract::MODEL_REQUEST_EXPIRED_MESSAGE,"data":{"run_id":"run:ambiguous"}}),
+        json!({"status":"error","code":"model_invocation_refused","reason":"request_expired","message":"provider assertion"}),
+    ] {
+        *provider.response.lock().await = ambiguous.clone();
+        let response = app
+            .clone()
+            .oneshot(post_model(token.clone(), "runs_create", request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "ambiguous fault is not an expiry receipt"
+        );
+        assert_eq!(response_json(response).await, ambiguous);
+    }
+}
+
+#[tokio::test]
 async fn home_agent_capsule_runs_bind_and_audit_to_its_own_capsule_id() {
     let dir = tempfile::tempdir().unwrap();
     let provider = RecordingModelProvider::default();
@@ -1841,7 +1905,12 @@ async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
         .as_str()
         .unwrap();
     assert!(
-        eval_request_id.starts_with("jev-eval:hosted-http:model_venice:"),
+        elastos_model_contract::validate_new_model_request_id(
+            eval_request_id,
+            crate::auth::now_ts().saturating_mul(1000),
+            0
+        )
+        .is_ok(),
         "{eval_request_id}"
     );
     let eval_prompt = requests[0]["input"].to_string();

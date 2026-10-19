@@ -17,12 +17,13 @@ import {
   abortLiveChatStream,
   detachLiveChatStream,
   selectedLiveOffer,
+  liveDownloadingModel,
   unresolvedModelTurn,
 } from "./agent-live.js";
 import { stampMessageNode, contentHash, newTurnId, createTurnManifest, turnStorePut, turnStorePatch, turnStoreGet, TurnState, cheapTurnSnapshot, resolveReasoningPolicy } from "./agent-context.js";
 import { setAgentComposerProcessing } from "./agent-shelf.js";
 import { renderHarnessPage } from "./agent-configure.js";
-import { postToHome, openInboxFromAgent } from "./harness-host.js";
+import { postToHome, openInboxFromAgent, openModelsFromAgent } from "./harness-host.js";
 import {
   createProgressController,
   snapshotProgress,
@@ -525,6 +526,10 @@ export function formatStreamError(err) {
   if (code === "run_acceptance_unknown") {
     return "Run acceptance is unknown. Start a new chat.";
   }
+  if (["model_invocation_refused", "remote_model_invocation_refused"].includes(code)
+      && err?.reason === "request_expired" && err?.preDispatchRefusal === true) {
+    return "This request is no longer valid. Check your device's clock, then try again.";
+  }
   if (code === "remote_model_invocation_refused" && err?.preDispatchRefusal === true) {
     return "Request refused. This attempt stopped before provider dispatch. Review service access before a new request.";
   }
@@ -858,8 +863,35 @@ export function drainFollowUpQueue() {
     ...(Array.isArray(next.parts) && next.parts.length ? { parts: next.parts } : {}),
   });
   host.renderSessions();
-  appendMessage("user", displayText, { parts: next.parts, modelText: next.text });
+  appendMessage("user", displayText, { msgIndex: target.messages.length - 1, parts: next.parts, modelText: next.text });
   startTurnForPrompt(next.text);
+}
+
+/** Without a model the hero names the one step that unlocks chat. Only a
+ * successful read that found no usable model may say so: an unprobed or failed
+ * read, or a chosen model that is unavailable beside others, keeps the usual
+ * hero and the model menu path. */
+function paintEmptyModelHint(empty) {
+  const noModel = getLiveInferenceState().endpointState === "no-model-offers" && !liveDownloadingModel();
+  empty.querySelector(".agent-harness-empty-sub").textContent = noModel ? NO_MODEL_STATUS : "Private on this Home";
+  let get = empty.querySelector("[data-agent-get-model]");
+  if (noModel && !get) {
+    get = document.createElement("button");
+    get.type = "button";
+    get.className = "agent-harness-empty-action";
+    get.dataset.agentGetModel = "";
+    get.textContent = "Get a model";
+    get.addEventListener("click", () => openModelsFromAgent());
+    empty.append(get);
+  } else if (!noModel) {
+    get?.remove();
+  }
+}
+
+/** The harness calls this when the model list changes. */
+export function refreshEmptyModelHint() {
+  const empty = document.querySelector(".agent-harness-empty");
+  if (empty) paintEmptyModelHint(empty);
 }
 
 export function showEmptyState() {
@@ -877,12 +909,13 @@ export function showEmptyState() {
   const empty = document.createElement("div");
   empty.className = "agent-harness-empty";
   empty.setAttribute("role", "status");
-  const sub = "Private on this Home";
-  empty.innerHTML =
-    `<p class="agent-harness-empty-greeting"></p>` +
-    `<p class="agent-harness-empty-sub"></p>`;
-  empty.querySelector(".agent-harness-empty-greeting").textContent = greeting;
-  empty.querySelector(".agent-harness-empty-sub").textContent = sub;
+  for (const [className, text] of [["agent-harness-empty-greeting", greeting], ["agent-harness-empty-sub", ""]]) {
+    const line = document.createElement("p");
+    line.className = className;
+    line.textContent = text;
+    empty.append(line);
+  }
+  paintEmptyModelHint(empty);
   /* Viewport — not the dock-width column — so the hero sits in true room center. */
   viewport.append(empty);
 }
@@ -1200,6 +1233,59 @@ function paintUserMessageBody(body, text, { parts = null, modelText = "" } = {})
   }
 }
 
+const MSG_ACTION_ICONS = {
+  copy: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.8A1.7 1.7 0 0 0 8.8 1H3.7A1.7 1.7 0 0 0 2 2.7v5.1a1.7 1.7 0 0 0 1.7 1.7h.8"/></svg>`,
+  edit: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.7 1.7 0 0 1 2 2L5 13l-2.6.6L3 11l8.5-8.5Z"/></svg>`,
+  regen: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 6.5A5.5 5.5 0 1 0 14 9.5"/><path d="M13.5 2.5v4h-4"/></svg>`,
+  trash: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M6.5 2h3M4 4l.6 8.6A1.6 1.6 0 0 0 6.2 14h3.6a1.6 1.6 0 0 0 1.6-1.4L12 4"/></svg>`,
+};
+
+function makeMsgAction(svg, label, extra = "") {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = `agent-msg-action${extra ? ` ${extra}` : ""}`;
+  btn.innerHTML = svg;
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  return btn;
+}
+
+function makeDeleteAction() {
+  const del = makeMsgAction(MSG_ACTION_ICONS.trash, "Delete", "is-danger");
+  del.dataset.deleteMessage = "1";
+  del.disabled = Boolean(ctx.turnBusy);
+  return del;
+}
+
+/* A reply that has just finished streaming gets what a redrawn one has: the
+   index of the message it was saved as, Regenerate enabled and Delete. Call
+   after commitAgentReply stored it as the session's last message. */
+function settleStreamedReply(row, session) {
+  if (!row?.isConnected) {
+    return;
+  }
+  const regen = row.querySelector("[data-regenerate]");
+  if (regen) {
+    regen.disabled = false;
+  }
+  const index = (session?.messages?.length ?? 0) - 1;
+  if (session?.messages?.[index]?.role !== "agent") {
+    return;
+  }
+  /* A resumed partial was drawn before this row; the message now holds this
+     row's text, so the stale row would answer to the same index. */
+  for (const stale of host.streamEl()?.querySelectorAll(`.agent-msg[data-msg-index="${index}"]`) || []) {
+    if (stale !== row) stale.remove();
+  }
+  row.dataset.msgIndex = String(index);
+  const actions = row.querySelector(".agent-msg-actions");
+  if (actions && !actions.querySelector("[data-delete-message]")) {
+    const del = makeDeleteAction();
+    del.disabled = false;
+    actions.append(del);
+  }
+}
+
 export function appendMessage(
   role,
   text,
@@ -1232,41 +1318,23 @@ export function appendMessage(
 
   const actions = document.createElement("div");
   actions.className = "agent-msg-actions";
-  const makeIcon = (svg, label, extra = "") => {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = `agent-msg-action${extra ? ` ${extra}` : ""}`;
-    btn.innerHTML = svg;
-    btn.title = label;
-    btn.setAttribute("aria-label", label);
-    return btn;
-  };
-  const ICONS = {
-    copy: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.8A1.7 1.7 0 0 0 8.8 1H3.7A1.7 1.7 0 0 0 2 2.7v5.1a1.7 1.7 0 0 0 1.7 1.7h.8"/></svg>`,
-    edit: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.7 1.7 0 0 1 2 2L5 13l-2.6.6L3 11l8.5-8.5Z"/></svg>`,
-    regen: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 6.5A5.5 5.5 0 1 0 14 9.5"/><path d="M13.5 2.5v4h-4"/></svg>`,
-    trash: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M6.5 2h3M4 4l.6 8.6A1.6 1.6 0 0 0 6.2 14h3.6a1.6 1.6 0 0 0 1.6-1.4L12 4"/></svg>`,
-  };
-  const copyBtn = makeIcon(ICONS.copy, "Copy");
+  const copyBtn = makeMsgAction(MSG_ACTION_ICONS.copy, "Copy");
   copyBtn.dataset.copyMessage = "1";
   actions.append(copyBtn);
   if (role === "user" && !streaming) {
-    const edit = makeIcon(ICONS.edit, "Edit and resubmit");
+    const edit = makeMsgAction(MSG_ACTION_ICONS.edit, "Edit and resubmit");
     edit.dataset.editMessage = "1";
     edit.disabled = Boolean(ctx.turnBusy);
     actions.append(edit);
   }
   if (role === "agent") {
-    const regen = makeIcon(ICONS.regen, "Regenerate reply");
+    const regen = makeMsgAction(MSG_ACTION_ICONS.regen, "Regenerate reply");
     regen.dataset.regenerate = "1";
     regen.disabled = streaming || Boolean(ctx.turnBusy);
     actions.append(regen);
   }
   if (!streaming) {
-    const del = makeIcon(ICONS.trash, "Delete", "is-danger");
-    del.dataset.deleteMessage = "1";
-    del.disabled = Boolean(ctx.turnBusy);
-    actions.append(del);
+    actions.append(makeDeleteAction());
   }
 
   if (!streaming) {
@@ -1319,6 +1387,49 @@ export function openCodeArtifact(code, lang = "") {
   });
 }
 
+/* Delete asks in the row: the Runtime serves app documents without
+   allow-modals, so window.confirm() is ignored and returns false. */
+export function beginDeleteMessage(msgIndex) {
+  const row = host.streamEl()?.querySelector(`.agent-msg[data-msg-index="${Number(msgIndex)}"]`);
+  const actions = row?.querySelector(".agent-msg-actions");
+  if (!row || !actions || ctx.turnBusy || row.querySelector("[data-delete-confirm-bar]")) {
+    return false;
+  }
+  actions.hidden = true;
+  const bar = document.createElement("div");
+  bar.className = "agent-msg-edit-bar agent-msg-delete-confirm";
+  bar.dataset.deleteConfirmBar = "1";
+  bar.setAttribute("role", "group");
+  bar.setAttribute("aria-label", "Delete this message?");
+  const question = document.createElement("span");
+  question.textContent = "Delete this message?";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "agent-msg-edit-cancel";
+  cancel.dataset.deleteCancel = "1";
+  cancel.textContent = "Cancel";
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.className = "agent-msg-edit-send";
+  confirm.dataset.deleteConfirm = "1";
+  confirm.textContent = "Delete";
+  bar.append(question, cancel, confirm);
+  row.append(bar);
+  cancel.focus({ preventScroll: true });
+  return true;
+}
+
+/** Close any open Delete question; true when one was open. */
+export function cancelDeleteMessage() {
+  const bars = host.streamEl()?.querySelectorAll("[data-delete-confirm-bar]") || [];
+  for (const bar of bars) {
+    const actions = bar.closest(".agent-msg")?.querySelector(".agent-msg-actions");
+    if (actions) actions.hidden = false;
+    bar.remove();
+  }
+  return bars.length > 0;
+}
+
 export function deleteMessageAt(msgIndex) {
   const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
   if (!session || ctx.turnBusy) {
@@ -1326,9 +1437,6 @@ export function deleteMessageAt(msgIndex) {
   }
   const index = Number(msgIndex);
   if (!Number.isInteger(index) || index < 0 || index >= session.messages.length) {
-    return false;
-  }
-  if (!window.confirm("Delete this message from the chat?")) {
     return false;
   }
   session.messages.splice(index, 1);
@@ -1542,8 +1650,10 @@ export function stopAgentStream({ keepPartial = true, drainQueue = false, cancel
   }
 }
 
+export const NO_MODEL_STATUS = "Get a model to start. Models run on this Home.";
 export const NO_MODEL_OFFER_STATUS =
-  "No model offer on this Home — install a model provider (Store · Services) to chat";
+  "No model on this Home yet. Open Apps (Marketplace) → Models to get one.";
+export const STOPPED_STATUS = "Stopped.";
 
 export function canSubmitNewTurn() {
   const turn = ctx.sessions.find((s) => s.id === ctx.activeSessionId)?.lastTurn;
@@ -1850,13 +1960,29 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
   let lastFlushAt = 0;
   let sawFirstToken = false;
   let stickToBottom = true;
+  /* scrollTop the stream left a following reader at; null if not following. */
+  let endScrollTop = null;
+  /* Land on the end now and once more after layout settles, unless the reader
+     moved up in between or another turn took the transcript. */
+  const pinToEnd = () => {
+    scroller.scrollTop = scroller.scrollHeight;
+    const top = scroller.scrollTop;
+    window.requestAnimationFrame(() => {
+      if (generation === ctx.streamGeneration && scroller.scrollTop >= top - 1) {
+        scroller.scrollTop = scroller.scrollHeight;
+        if (endScrollTop === top) {
+          endScrollTop = scroller.scrollTop;
+        }
+      }
+    });
+    return top;
+  };
   let answerNotifiedAt = 0;
   let hiddenBuffered = false;
   let progressEl = null;
   let revealTimer = 0;
   let followRaf = 0;
   let followScrollQuiet = false;
-  let streamAnchor = null;
   let longTaskObserver = null;
   let frameWatch = 0;
   let streamingFlush = false;
@@ -1978,12 +2104,14 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     }
     followRaf = window.requestAnimationFrame(() => {
       followRaf = 0;
-      if (!stickToBottom || selectionInStream() || !streamAnchor?.isConnected) {
+      if (!stickToBottom || selectionInStream() || !scroller) {
         return;
       }
       followScrollQuiet = true;
       const t0 = performance.now();
-      streamAnchor.scrollIntoView({ block: "end", inline: "nearest", behavior: "auto" });
+      /* True bottom: the stream's bottom padding keeps the end above the
+         floating composer; scrollIntoView on an anchor left it underneath. */
+      scroller.scrollTop = scroller.scrollHeight;
       const took = performance.now() - t0;
       perf.followMs += took;
       const last = perf.traces[perf.traces.length - 1];
@@ -2102,10 +2230,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     tailEl.className = "agent-stream-tail";
     tailNode = document.createTextNode("");
     tailEl.append(tailNode);
-    streamAnchor = document.createElement("div");
-    streamAnchor.className = "agent-stream-anchor";
-    streamAnchor.setAttribute("aria-hidden", "true");
-    answerBody.append(frozenEl, tailEl, streamAnchor);
+    answerBody.append(frozenEl, tailEl);
   };
 
   const freezeSlice = (text, { markdown = false } = {}) => {
@@ -2519,6 +2644,13 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       const partial = materializeCanonical();
       commitAgentReply(session, partial.answer, partial.reasoning, { partial: true, turn: result.turnManifest });
       answerRow?.classList.remove("is-streaming");
+      settleStreamedReply(answerRow, session);
+      if (result.stopRequested && result.settlementUnknown) {
+        /* Local engines cannot confirm a stop; the turn keeps its unknown state. */
+        progress.dispatch({ type: "GENERATION_STOPPED" });
+        setStreamStatus(STOPPED_STATUS);
+        return;
+      }
       progress.dispatch({ type: "GENERATION_ERROR", text: "Settlement unknown" });
       showRunSettlement(result.turnManifest);
       return;
@@ -2544,6 +2676,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
         progressEl?.remove();
         answerRow?.remove();
       }
+      settleStreamedReply(answerRow, session);
       if (session && result.turnManifest) {
         liveTurn = result.turnManifest;
         session.lastTurn = cheapTurnSnapshot(liveTurn);
@@ -2635,6 +2768,10 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
         abandonRich ||
         perf.slowFrames > 12 ||
         perf.longTasks.some((row) => row.duration >= 50);
+      /* The last flush and the rich render below make the reply taller; keep
+         a reader who was following at the end. One who scrolled up since the
+         stream ended (its listeners are gone) stays where they are. */
+      const pinned = endScrollTop !== null && !!scroller && scroller.scrollTop >= endScrollTop - 1;
       answerBodyRef.dataset.mdSource = answerTextRef;
       const skipRich = unhealthy || stoppedEarly || state.quality === "plain";
       if (!skipRich) {
@@ -2656,6 +2793,9 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
         } catch {
           /* keep streamed prefix — canonical survives presentation failure */
         }
+      }
+      if (pinned) {
+        pinToEnd();
       }
       timings.t6 = Date.now();
       setPhase("presentation_done");
@@ -2722,10 +2862,6 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       }
     };
     scheduleIdleWork(finalize);
-    const regen = answerRow?.querySelector("[data-regenerate]");
-    if (regen) {
-      regen.disabled = false;
-    }
 
     const turnUsage = noteLiveTurnUsage({
       usage: result.usage || null,
@@ -2756,6 +2892,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
         session.lastTurn = cheapTurnSnapshot(liveTurn);
       }
     }
+    settleStreamedReply(answerRow, session);
     if (stoppedEarly && answerRow && !answerRow.querySelector(".agent-msg-stopped")) {
       const note = document.createElement("div");
       note.className = "agent-msg-stopped";
@@ -2804,6 +2941,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     }
     if (partialAnswer) {
       persistPartialAgentReply(partialAnswer, partialThinking);
+      settleStreamedReply(answerRow, session);
       answerRow?.classList.remove("is-streaming");
       if (answerBody) {
         answerBody.dataset.mdSource = partialAnswer;
@@ -2856,6 +2994,11 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     if (followRaf) {
       window.cancelAnimationFrame(followRaf);
       followRaf = 0;
+    }
+    /* The cancelled frame carried the final flush (and the Stopped note sits
+       below it): land on the true end before the listeners go. */
+    if (stickToBottom && scroller && generation === ctx.streamGeneration) {
+      endScrollTop = pinToEnd();
     }
     window.removeEventListener("resize", onResizeFollow);
     document.removeEventListener("keydown", onKeyNav);

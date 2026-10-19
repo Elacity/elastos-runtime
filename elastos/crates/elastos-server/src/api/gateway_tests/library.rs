@@ -575,6 +575,10 @@ async fn create_runtime_custody_publish_directory(
     (init, segments)
 }
 
+fn enable_protected_content(data_dir: &std::path::Path) {
+    std::fs::write(data_dir.join("config.toml"), "protected_content = true\n").unwrap();
+}
+
 async fn publish_runtime_custody(
     app: &axum::Router,
     token: &str,
@@ -5426,6 +5430,172 @@ async fn test_library_provider_auto_protects_plaintext_legacy_objects() {
     assert_eq!(decoded, b"plaintext from an older runtime");
 }
 
+fn library_listed_object<'a>(list: &'a Value, uri: &str) -> &'a Value {
+    list["data"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| object["uri"] == uri)
+        .unwrap_or_else(|| panic!("{uri} is listed"))
+}
+
+#[tokio::test]
+async fn listing_blocks_damaged_items_and_lists_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let folder = format!("{root}/Documents/mixed");
+    let names = [
+        "good-1.txt",
+        "good-2.txt",
+        "good-3.txt",
+        "flipped.txt",
+        "header.txt",
+        "forged.txt",
+        "padded.txt",
+    ];
+    for name in names {
+        write_library_bytes(&app, &token, &format!("{folder}/{name}"), name.as_bytes()).await;
+    }
+    let path_of =
+        |name: &str| rooted_localhost_fs_path(dir.path(), &format!("{folder}/{name}")).unwrap();
+    let mut envelope: Value =
+        serde_json::from_slice(&std::fs::read(path_of("flipped.txt")).unwrap()).unwrap();
+    let ciphertext = envelope["ciphertext"].as_str().unwrap().to_string();
+    let replacement = if ciphertext.starts_with('A') {
+        "B"
+    } else {
+        "A"
+    };
+    envelope["ciphertext"] = Value::String(format!("{replacement}{}", &ciphertext[1..]));
+    std::fs::write(
+        path_of("flipped.txt"),
+        serde_json::to_vec_pretty(&envelope).unwrap(),
+    )
+    .unwrap();
+    let mut header = std::fs::read(path_of("header.txt")).unwrap();
+    header[9] = 0xff;
+    std::fs::write(path_of("header.txt"), &header).unwrap();
+    let mut forged: Value =
+        serde_json::from_slice(&std::fs::read(path_of("forged.txt")).unwrap()).unwrap();
+    let forged_len = forged["ciphertext"].as_str().unwrap().len();
+    forged["ciphertext"] = Value::String("Q".repeat(forged_len));
+    std::fs::write(
+        path_of("forged.txt"),
+        serde_json::to_vec_pretty(&forged).unwrap(),
+    )
+    .unwrap();
+    let mut padded = std::fs::read(path_of("padded.txt")).unwrap();
+    padded.extend_from_slice(b"\n\n");
+    std::fs::write(path_of("padded.txt"), &padded).unwrap();
+    let before: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| std::fs::read(path_of(name)).unwrap())
+        .collect();
+
+    let (list_status, list) =
+        post_library(app.clone(), &token, "list", json!({ "uri": folder })).await;
+    assert_eq!(list_status, StatusCode::OK, "{list}");
+    assert_eq!(list["status"], "ok");
+    assert_eq!(list["data"]["objects"].as_array().unwrap().len(), 7);
+    for name in ["flipped.txt", "header.txt", "forged.txt"] {
+        let object = library_listed_object(&list, &format!("{folder}/{name}"));
+        assert_eq!(
+            object["blocked_reason"], "protected_principal_root_object_damaged",
+            "{name}"
+        );
+        assert_eq!(object["capabilities"], json!(["properties"]), "{name}");
+        assert!(object["content_cid"].is_null(), "{name}");
+        let (_, read) = post_library(
+            app.clone(),
+            &token,
+            "read",
+            json!({ "uri": format!("{folder}/{name}") }),
+        )
+        .await;
+        assert_ne!(read["status"], "ok", "{name}");
+        assert!(
+            read.to_string()
+                .contains(crate::auth::PROTECTED_PRINCIPAL_ROOT_OBJECT_DAMAGED),
+            "{name}: {read}"
+        );
+    }
+    for name in ["good-1.txt", "good-2.txt", "good-3.txt", "padded.txt"] {
+        let uri = format!("{folder}/{name}");
+        assert!(library_listed_object(&list, &uri)["blocked_reason"].is_null());
+        let (read_status, read) =
+            post_library(app.clone(), &token, "read", json!({ "uri": uri })).await;
+        assert_eq!(read_status, StatusCode::OK, "{name}: {read}");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(read["data"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, name.as_bytes());
+    }
+    let after: Vec<Vec<u8>> = names
+        .iter()
+        .map(|name| std::fs::read(path_of(name)).unwrap())
+        .collect();
+    assert_eq!(after, before, "List and Read change no bytes");
+}
+
+#[tokio::test]
+async fn lazy_protection_bounds_size_and_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let folder = format!("{root}/Documents");
+    let small_uri = format!("{folder}/legacy-2mib.bin");
+    let large_uri = format!("{folder}/legacy-17mib.bin");
+    let small_path = rooted_localhost_fs_path(dir.path(), &small_uri).unwrap();
+    let large_path = rooted_localhost_fs_path(dir.path(), &large_uri).unwrap();
+    std::fs::create_dir_all(small_path.parent().unwrap()).unwrap();
+    let small = vec![0x42u8; 2 * 1024 * 1024];
+    std::fs::write(&small_path, &small).unwrap();
+    let large = std::fs::File::create(&large_path).unwrap();
+    large.set_len(17 * 1024 * 1024).unwrap();
+    drop(large);
+
+    let (list_status, list) =
+        post_library(app.clone(), &token, "list", json!({ "uri": folder })).await;
+    assert_eq!(list_status, StatusCode::OK, "{list}");
+    assert!(library_listed_object(&list, &small_uri)["blocked_reason"].is_null());
+    assert_ne!(
+        std::fs::read(&small_path).unwrap(),
+        small,
+        "2 MiB is encrypted"
+    );
+    let (read_status, read) =
+        post_library(app.clone(), &token, "read", json!({ "uri": small_uri })).await;
+    assert_eq!(read_status, StatusCode::OK);
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(decoded, small);
+
+    let large_object = library_listed_object(&list, &large_uri);
+    assert_eq!(
+        large_object["blocked_reason"],
+        "protected_principal_root_object_not_encrypted"
+    );
+    let (_, read) = post_library(app.clone(), &token, "read", json!({ "uri": large_uri })).await;
+    assert!(
+        read.to_string()
+            .contains("Documents/legacy-17mib.bin is not encrypted and is larger than 16 MiB"),
+        "{read}"
+    );
+    let metadata = std::fs::metadata(&large_path).unwrap();
+    assert_eq!(metadata.len(), 17 * 1024 * 1024);
+    let mut head = vec![0u8; 4096];
+    std::io::Read::read_exact(&mut std::fs::File::open(&large_path).unwrap(), &mut head).unwrap();
+    assert!(head.iter().all(|byte| *byte == 0), "17 MiB file unchanged");
+}
+
 #[tokio::test]
 async fn test_library_provider_publish_fails_closed_without_content_provider() {
     let dir = tempfile::tempdir().unwrap();
@@ -6020,6 +6190,7 @@ async fn test_library_provider_rejects_key_release_policy_until_provider_exists(
 #[tokio::test]
 async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_protection_fields() {
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
@@ -6100,6 +6271,7 @@ async fn test_library_provider_runtime_custody_publish_fails_closed_without_comp
 ) {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
     let protected_content_root = dir.path().join("protected-content");
     std::fs::create_dir_all(&protected_content_root).unwrap();
@@ -8480,6 +8652,7 @@ async fn test_runtime_custody_import_rejects_manifest_and_package_mismatch() {
 async fn test_runtime_custody_typed_publish_buy_open_read_segment_and_close() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     crate::protected_content_runtime::tests::write_device_key(dir.path(), 0x5a);
     let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
     let registry = state.provider_registry.as_ref().unwrap().clone();
@@ -8961,6 +9134,7 @@ async fn test_runtime_custody_two_runtime_portable_listing_gateway_journey() {
 
     let shared_content = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     let runtime_a = tempfile::tempdir().unwrap();
+    enable_protected_content(runtime_a.path());
     crate::protected_content_runtime::tests::write_device_key(runtime_a.path(), 0x5a);
     let content_a = TwoRuntimeContentProvider::new(0x5a, shared_content.clone());
     let (state_a, wallet_a) = wallet_chain_test_state_with_observer(runtime_a.path()).await;
@@ -9117,6 +9291,7 @@ async fn test_runtime_custody_two_runtime_portable_listing_gateway_journey() {
     assert_eq!(publish_requests[2]["links"].as_array().unwrap().len(), 2);
 
     let runtime_b = tempfile::tempdir().unwrap();
+    enable_protected_content(runtime_b.path());
     crate::protected_content_runtime::tests::write_device_key(runtime_b.path(), 0x5b);
     let content_b = TwoRuntimeContentProvider::new(0x5b, shared_content);
     assert_ne!(content_a.signer_did(), content_b.signer_did());
@@ -9656,8 +9831,31 @@ async fn test_library_provider_runtime_custody_viewer_ops_require_player_launch_
 }
 
 #[tokio::test]
+async fn test_library_provider_refuses_protected_publish_until_protected_content_is_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/protection-not-released");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &uri, 0x40).await;
+
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &uri,
+        "protected content is not available in this release",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_layouts() {
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
@@ -9948,6 +10146,7 @@ async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_lay
 async fn test_library_provider_runtime_custody_publish_passes_one_file_to_runtime_media_boundary() {
     let _guard = protected_content_gateway_mock_test_guard().lock().await;
     let dir = tempfile::tempdir().unwrap();
+    enable_protected_content(dir.path());
     // The creator wallet/chain binding gate runs ahead of the media gate, so
     // the state must carry wallet + chain providers plus a seeded managed
     // default account for this test to reach the media preparation boundary

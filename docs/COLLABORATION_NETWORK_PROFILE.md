@@ -16,6 +16,16 @@ an absent setting keeps the default listener and ephemeral-port fallback.
 The setting changes the listener address only. Carrier network policy and
 collaboration authority keep their own checks.
 
+> **Tip — pin the bootstrap Runtime's Carrier address before exporting its
+> receipt.** The bootstrap receipt, and so every Home's network file, records
+> the bootstrap Runtime's exact IP address and UDP port. Without
+> `carrier_bind_addr`, a Runtime takes `0.0.0.0:4433` when that port is free
+> and a random port otherwise, so a restart can move it. Pin a port that every
+> joining Home can reach, for example `0.0.0.0:4433`: `127.0.0.1` answers only
+> on the same machine, while the receipt usually names the LAN or public
+> address. When two Runtimes share one machine, give each its own port.
+> See [Troubleshooting](TROUBLESHOOTING.md#collaboration-network-and-carrier).
+
 The canonical JSON envelope uses lexicographically ordered object keys with no
 insignificant whitespace and has exactly three fields: `payload`, `signature`,
 and `signer_did`. The canonical bytes of its `payload` field are signed with the
@@ -69,17 +79,234 @@ fallback. Absence selects isolation. A present file is validated and accepted
 before Carrier subscription or worker startup; invalid permissions, bounds,
 encoding, trust, chain, or grant fail closed.
 
+## Release default network
+
+Every Home joins the shared Community room by default. The signed release
+names that network, and setup installs it; a Home stays isolated only when its
+person chooses isolation.
+
+### Availability
+
+The release network lists one bootstrap peer: the Community node on the seed
+host. This node runs its own Runtime with its own account, data root, Carrier
+port and resource limits, apart from the release and update service. The release
+connection contract uses a direct Carrier path when possible and the seed relay
+otherwise. Carrier owns connection policy and peer resolution through one
+connect-by-DID entry point. Relay implementation and cross-network acceptance
+are tracked in [#345](https://github.com/Elacity/elastos-runtime/issues/345).
+
+The release availability contract while this node is unreachable is:
+
+- Homes already connected keep exchanging Community messages and catch-up.
+- A Home that starts or restarts cannot join Community.
+- Discovery and new contact requests stop.
+- New Direct messages show **Sending**. Runtime retries them for up to
+  24 hours, then shows **Expired**.
+- Homes keep all messages they already received.
+
+Chat states **Community unreachable** when its Community connection is
+unavailable.
+
+An address change requires the next signed network revision in a release.
+More bootstrap peers and participant Homes acting as bootstrap are tracked in
+[#324](https://github.com/Elacity/elastos-runtime/issues/324).
+
+### Release pin
+
+The release pins the network in `components.json` as `collaboration_network`:
+
+- `head_cid`, the raw SHA-256 CIDv1 of the exact startup configuration bytes;
+- `expected_network_id`;
+- `trusted_profile_signer_dids`, the complete trusted signer set.
+
+The release ships those bytes beside `components.json` as
+`collaboration-network-release-v1.json`. The release signature covers
+`components.json`, so the release publisher vouches for the pin, and the pin
+fixes the exact configuration, network and signer set. Setup then checks the
+configuration with the same validator Runtime startup uses. Runtime startup
+itself still reads only `collaboration-network-v1.json`.
+
+The release delivers that file the same way it delivers `model-catalog.json`.
+Release staging binds it to the pin, the custodian signer also requires the
+pin's network ID and signer set to equal the file's, and release
+publication admits it only when its bytes match the pin and pass the startup
+validator. Installed setup fetches the exact pinned CID from the trusted source
+over Carrier, with the startup configuration's 3 MiB byte bound checked before
+the body is read. `elastos update` and Home's System update also fetch it by its
+pinned CID with the Runtime and `components.json`, while Home still runs and
+before the new Runtime replaces the old one. `elastos update` installs it as its last
+update step; System update installs it right after activation, before Home
+restarts. A refusal before or during that step restores the previous release
+files. Undo restores the earlier release and keeps the joined network, its
+accepted revision, contacts, and messages, including state written after the
+update. An older release pin cannot replace a newer accepted configuration.
+Leaving Community is a separate action. A Home that stays isolated
+fetches nothing. An offline update hop refuses a changed pin, like other support
+changes.
+
+The Home's owner can select **Leave Community** in System. This choice applies
+to the whole Home. Runtime stops Community messages, presence and Discovery,
+while it keeps the admitted network, accepted-head witness, contacts, Direct
+messages and stored history. Other Homes keep their own choices. A guest can
+see the setting; the current owner controls it.
+
+The owner can select **Rejoin Community** to reverse the choice. Runtime uses
+the current admitted network head and the saved Discovery preferences. Restart
+and update preserve the owner-only membership record separately from the
+network configuration and product state. Previously published Discovery
+announcements keep their signed expiry; leaving stops their renewal.
+
+Joining Community does not announce anyone. Chat files one Inbox request per
+person; the answer is Always while Home is online, Only while Community is
+open, Later or Never, and the Community section of System → Security offers Always, Only while open
+and Hidden. Showing is a capability token the Runtime mints for that person
+(subject: their principal; action `message`; resource
+`elastos://chat/presence/<network>/<conversation>/always` or `/while-open`;
+no expiry), kept in their owner-only
+`.AppData/ElastOS/Home/community-presence.json` and never given to a capsule.
+Every announcement validates it with all twelve capability checks against
+the live store: the Runtime timer asks for `/always`, Chat's 15-second
+heartbeat while Community is visible asks for `/while-open`. Hidden, a mode
+change and a Profile change revoke the token; an epoch bump revokes every
+grant, and Chat asks again. A shown person's signed presence carries their
+Profile to the Community topic (including the seed's Community node),
+expiring 45 seconds after the last renewal, and signs the Home's requests for
+earlier posts. Undecided, Later and Never announce nothing. Discovery is a
+separate choice, for being found outside Community and for contact requests.
+Leave Community stops presence for everyone on the Home, whatever they chose.
+After Undo, Community presence follows the Discovery switch in People again.
+If you chose Hidden or Only while open in alpha.23 and Discovery is on, you
+will be announced; turn Discovery off in People to stay hidden.
+
+Setup and update apply the release network to the data root:
+
+- A new Home receives `collaboration-network-v1.json` from the release copy
+  and prints one line saying it joins the Community room and how to stay
+  isolated.
+- An update that pins a newer revision of the same network and signer set
+  replaces the file only when the new chain strictly extends the installed
+  chain. The accepted-head marker then advances at the next start.
+- A Home that already holds a configuration for another network keeps it.
+- `elastos setup --isolated` (or `install.sh --isolated`) records the
+  owner-only choice `collaboration-isolated-v1`. Before the first start it
+  also removes the release network file that setup installed, so Runtime never
+  joins it; setup and update then leave the release network uninstalled.
+  Setup refuses and keeps the file when Runtime already accepted a network
+  (the `collaboration` state directory exists), because Runtime refuses to
+  drop an accepted network, and when the file is not the network the installed
+  release pins, because it then belongs to the Home's operator. Runtime
+  startup also treats the recorded choice as isolation until it has accepted
+  a network, so an interrupted `--isolated` run never joins, and startup and
+  `--isolated` share one lock so they cannot interleave. Leaving Community
+  after joining is a separate, later step.
+- Source-home setup keeps its explicit `ELASTOS_COLLABORATION_STARTUP_MODE`
+  (`configured` or `isolated`) and ignores the release pin.
+
+A release without `collaboration_network` leaves every Home's collaboration
+configuration unchanged. The operator provisioning below creates the network
+and its configuration bytes that a release then pins.
+
 ## Operator provisioning
 
-`elastos collaboration-config` is the only repository tool that creates this
-startup file and is never called by the installer or Runtime. Key creation,
-profile generation, and verification are offline. The separate explicit local
+`elastos collaboration-config` creates fixture startup files and verifies exact
+candidate files. The offline custodian creates production startup files through
+the initial-profile operation below. Key creation, profile generation, and
+verification are offline. The separate explicit local
 bootstrap export attaches only to the selected running Runtime. The
-configuration authority is a dedicated raw 32-byte Ed25519 key at an explicit
-operator path; it is not a Runtime device key, Carrier identity, release
-publisher, Wallet/passkey identity, or host identity.
+configuration authority is the signer explicitly named in
+`trusted_profile_signer_dids`. Runtime device, Carrier, Wallet, passkey, and
+user-message authority keep their own identities and checks.
 
-Create the key as a separate explicit action:
+The production Community network's profile signer is the release maintainer
+DID. Runtime checks each signing role separately: the signed release pins the
+file's CID and its signer set, and profile signatures use their own domain,
+`elastos.collaboration-network.profile.v1`. The approved offline release
+custodian signs production profiles outside CI.
+
+The existing release-signing interface, `scripts/release-signer.py`, uses the
+custodian's Ed25519 PEM key through OpenSSL. The `collaboration-config` file
+interface accepts an owner-only raw 32-byte Ed25519 key for the disposable test
+and fixture networks below. Production keys stay in their existing custody
+workflow.
+
+### Initial production profile
+
+The custodian runs the installed, reviewed `release-signer.py` with
+`--operation community-profile`. This operation supports revision 1 with no
+previous profile hash. Later chain revisions need their own reviewed operation.
+It signs the exact approved profile through the existing maintainer PEM and
+publicly verifies the signature before writing a new read-only output set.
+The release/head signing operation keeps its existing domain checks.
+
+Prepare inert `community-profile-input.json` with these exact fields:
+`schema` (`elastos.collaboration-network.signing-input/v1`), `source`
+(`commit`, `tree`), `domain` (`elastos.collaboration-network.profile.v1`),
+`profile` (the unsigned profile schema above), `default_conversation_grant`
+(the canonical grant), and `trusted_profile_signer_dids` (the approved set).
+The profile names the existing maintainer DID, exactly one approved bootstrap
+receipt (release preparation verifies the file with the Runtime's operator
+receipt, which names one peer), and the raw CID of that grant. The grant names
+the same network, the approved conversation, sender service `chat`, and policy
+`profile_scoped_signer`. Before the DID prompt the signer shows the network,
+conversation, revision, signer set, bootstrap node and its ticket addresses,
+and the payload and grant hashes.
+The bootstrap Runtime and its placement are explicit operator inputs; an
+artifact host has its own installation role.
+
+The protected custodian policy retains the source, interpreter, tool, OpenSSL,
+PEM path, and file/total quotas described in the
+[release signer instructions](../scripts/README.md#signing-and-publication-ownership).
+Set `operation` to `community-profile` and `manifest_sha256` to the exact input
+file hash. Its `community_profile` object has these exact fields:
+
+- `expected_network_id` and `conversation_id`: the approved identifiers.
+- `revision`: `1`; `previous_profile_sha256`: `null`.
+- `trusted_profile_signer_dids`: the same explicit signer set as the input.
+- `profile_payload_sha256`: SHA-256 of the canonical unsigned profile bytes.
+- `default_conversation_grant_sha256`: SHA-256 of the canonical grant bytes.
+
+Canonical bytes use sorted object keys, compact UTF-8 JSON, and no trailing
+newline. Keep this policy outside the candidate input directory. It approves
+the unsigned inputs before the final Community file CID or release manifest
+exists. Run the installed tool with a clean environment and confirm the
+complete maintainer DID at its prompt:
+
+```sh
+env -i /path/to/pinned-python -I -S /path/to/installed-release-signer.py \
+  --operation community-profile --manifest community-profile-input.json \
+  --policy /path/to/approved-community-policy.json \
+  --input-root /path/to/unsigned-community-input \
+  --output-root /path/to/new-community-output
+```
+
+The output contains `collaboration-network-release-v1.json` and
+`collaboration-network-release-pin-v1.json`. The latter supplies the
+`collaboration_network` fragment for the components manifest, with the exact
+startup-file CID, network ID and signer set. The tool checks ticket bounds,
+canonical encoding and node binding. The reviewed, key-free Runtime verifier
+checks complete transport semantics before the output goes into the source.
+It reads only owner-only files, and the signer writes read-only (`0444`)
+outputs, so check an owner-only copy:
+
+```text
+install -d -m 700 /path/to/check
+install -m 600 /path/to/new-community-output/collaboration-network-release-v1.json /path/to/check/
+elastos collaboration-config verify \
+  --input /path/to/check/collaboration-network-release-v1.json
+```
+
+The release then carries the output like `model-catalog.json`: a reviewed
+pull request puts the startup file at the repository root and the pin
+fragment's `collaboration_network` object in `components.json`, and release
+preparation binds that source pin to this exact output through
+`RELEASE_COMMUNITY_DIR` and runs the package's own Runtime verifier
+([Publishing a release](VERSIONING.md#publishing-a-release)). Profile signing
+creates inert files; publication and activation use their own explicit
+operator approval.
+
+For an isolated test fixture, create a disposable authority key as a separate
+explicit action. Give the fixture an owner and cleanup condition, keep its trust
+store separate from real Homes, and keep its private key out of source and logs:
 
 ```text
 elastos collaboration-config create-authority-key --key <owner-only-key-path>
@@ -119,6 +346,22 @@ elastos collaboration-config verify \
   --input <data-root>/collaboration-network-v1.json
 ```
 
+When the bootstrap Runtime's address changes, export a fresh bootstrap
+receipt and generate the next signed revision from the current file with the
+same authority key. The network ID, trusted signer set and default-conversation
+grant stay the same; only the bootstrap peers change:
+
+```text
+elastos collaboration-config generate-revision \
+  --authority-key <owner-only-key-path> \
+  --input <current collaboration-network-v1.json> \
+  --bootstrap-peer <owner-only-bootstrap-receipt> \
+  --output <next collaboration-network-v1.json>
+```
+
+Ship the new revision in the next release with its pin; update then advances
+each joined Home along the same chain.
+
 Generation fixes the logical sender service to Chat (`chat`); Runtime startup
 separately binds the operation capsule to `chat-room`. The command creates the
 canonical `profile_scoped_signer` grant, binds its raw SHA-256 CID into the
@@ -129,7 +372,9 @@ accepted-head marker, create a Runtime device identity, join Carrier, or write
 product state. Its receipt contains only public identifiers and hashes; it
 never prints the authority key or connect ticket.
 
-An absent profile means isolated mode. It never falls back to a public network.
+At Runtime startup, an absent profile means isolated mode; Runtime never
+substitutes a network of its own. Joining the default network is a setup and
+update step governed by the release pin above.
 A profile with another valid network ID is a separate namespace and is rejected
 when a different network was requested. Updates fail closed on signature,
 canonicalization, bounds, signer, network, revision, or previous-hash errors.

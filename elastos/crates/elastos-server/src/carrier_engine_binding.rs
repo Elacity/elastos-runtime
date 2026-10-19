@@ -241,7 +241,7 @@ mod egress {
         peer: iroh::PublicKey,
         request: &Value,
         send: &mut iroh::endpoint::SendStream,
-        mut recv: iroh::endpoint::RecvStream,
+        recv: iroh::endpoint::RecvStream,
         buffered: Vec<u8>,
     ) -> Result<()> {
         let admitted = async {
@@ -285,10 +285,13 @@ mod egress {
         let mut socket = tokio::net::UnixStream::connect(path).await?;
         super::super::write_json_line(send, &json!({"ok":true})).await?;
         socket.write_all(&buffered).await?;
-        let (mut input, mut output) = socket.into_split();
+        let (input, mut output) = socket.into_split();
+        let activity = super::super::RelayActivity::new();
+        let mut recv = activity.reader(recv);
+        let mut input = activity.reader(input);
         tokio::select! {
             _ = cancel.changed() => {},
-            result = async {
+            result = super::super::relay_until_idle(&activity, async {
                 tokio::try_join!(
                     async {tokio::io::copy(&mut recv, &mut output).await?; output.shutdown().await},
                     async {
@@ -297,9 +300,8 @@ mod egress {
                         send.finish().ok();
                         Ok::<_, std::io::Error>(())
                     },
-                )?;
-                Ok::<_, anyhow::Error>(())
-            } => {result?;}
+                )
+            }) => {result?;}
         }
         send.finish().ok();
         Ok(())

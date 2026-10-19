@@ -1456,13 +1456,13 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   grid-template-columns: minmax(7rem, 9rem) minmax(0, 1fr);
   gap: 6px 12px;
   margin: 12px 0 0;
-  color: color-mix(in srgb, var(--text) 78%, transparent);
+  color: color-mix(in srgb, var(--text) 82%, transparent);
   font-size: 12px;
 }
 
 .agent-model-selection-facts dt {
   margin: 0;
-  font-weight: 650;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
 }
 
 .agent-model-selection-facts dd {
@@ -1970,6 +1970,20 @@ html[data-agent-reasoning="off"] .agent-thinking {
   text-wrap: balance;
 }
 
+.agent-harness-empty-action {
+  margin-top: 16px;
+  padding: 8px 16px;
+  border: 1px solid color-mix(in srgb, var(--text) 18%, transparent);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
 .agent-msg-meta {
   margin: 4px 2px 0;
   padding: 0 2px;
@@ -2118,14 +2132,6 @@ html[data-agent-reasoning="off"] .agent-thinking {
   overflow-anchor: none;
 }
 
-.agent-stream-anchor {
-  height: 1px;
-  width: 100%;
-  pointer-events: none;
-  overflow-anchor: none;
-  scroll-margin-block-end: 32px;
-}
-
 .agent-stream-frozen {
   display: block;
   contain: content;
@@ -2197,6 +2203,16 @@ html[data-agent-reasoning="off"] .agent-thinking {
 .agent-msg:hover .agent-msg-actions,
 .agent-msg:focus-within .agent-msg-actions {
   opacity: 1;
+}
+
+.agent-msg-actions[hidden] {
+  display: none;
+}
+
+.agent-msg-delete-confirm {
+  justify-content: flex-start;
+  font-size: 13px;
+  color: var(--text);
 }
 
 .agent-msg-action,
@@ -2856,6 +2872,16 @@ html[data-agent-reasoning="off"] .agent-thinking {
   }
 }
 
+/* Phone: the composer keeps Home's Dock gutter, so the Dock → composer morph
+   holds its width end to end. Keyed on the phone form factor Home pushes, not
+   width alone: a narrow Assistant window on a desktop keeps its column. */
+@media (max-width: 640px) {
+  :root[data-el-form-factor="phone"] .taskbar.is-agent-face {
+    width: min(720px, calc(100vw - 20px));
+    max-width: calc(100vw - 20px);
+  }
+}
+
 /* Composer toolbar — one shared 32px control box on every viewport.
    (Was mobile-only; desktop showed mixed 28/30px heights = "raised" chips.) */
 .taskbar.is-agent-face .agent-composer-toolbar {
@@ -3095,6 +3121,12 @@ html[data-agent-reasoning="off"] .agent-thinking {
   height: 32px;
 }
 
+/* When the row is tight the model name ellipsizes; the left tools keep their
+   size. */
+.agent-composer-tools-left {
+  flex-shrink: 0;
+}
+
 .agent-composer-attachments {
   display: flex;
   flex-wrap: wrap;
@@ -3331,6 +3363,10 @@ html[data-agent-reasoning="off"] .agent-thinking {
   font-weight: 300;
 }
 
+.agent-tool-btn[hidden] {
+  display: none;
+}
+
 .agent-tool-btn:hover,
 .agent-model-btn:hover {
   background: color-mix(in srgb, var(--text) 8%, transparent);
@@ -3561,11 +3597,12 @@ html[data-agent-reasoning="off"] .agent-thinking {
   min-width: 0;
   font-size: 13px;
   line-height: 1;
+  white-space: nowrap;
 }
 
 .agent-model-name {
   display: inline-block;
-  min-width: 0;
+  min-width: 1.2em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3741,7 +3778,90 @@ html[data-agent-reasoning="off"] .agent-thinking {
     transform: none !important;
   }
 
+  /* The phone drawer (max-width: 900px above) is placed by its transform:
+     keep its closed and open positions and drop only the slide. */
+  @media (max-width: 900px) {
+    :root[data-el-form-factor="phone"] .agent-harness-sidebar {
+      transform: translateX(-105%) !important;
+      transition: none !important;
+    }
+
+    :root[data-el-form-factor="phone"] body.agent-harness-drawer-open .agent-harness-sidebar {
+      transform: translateX(0) !important;
+    }
+  }
+
   .agent-home-drop-canvas {
     display: none !important;
   }
+}
+
+/* Phone stage (data-el-form-factor from the shell): every control is a 44 px
+   target. Composer chips grow by a transparent border outside the painted
+   chip, so the row keeps its 32 px look; the gaps inside each group go so the
+   row still fits a 390 px phone. */
+:root[data-el-form-factor="phone"] .taskbar.is-agent-face .agent-composer-toolbar {
+  min-height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] .taskbar.is-agent-face .agent-composer-tools-left,
+:root[data-el-form-factor="phone"] .taskbar.is-agent-face .agent-composer-tools-right {
+  height: var(--el-touch-target);
+  gap: 0;
+}
+
+:root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-flip-back, .agent-think-btn, .agent-model-btn) {
+  height: var(--el-touch-target);
+  min-height: var(--el-touch-target);
+  max-height: var(--el-touch-target);
+  border: solid transparent;
+  border-width: 6px 0;
+  background-clip: padding-box;
+}
+
+:root[data-el-form-factor="phone"] .taskbar.is-agent-face :is(.agent-tool-btn, .agent-mic-btn, .agent-send-btn) {
+  width: var(--el-touch-target);
+  flex: 0 0 var(--el-touch-target);
+  height: var(--el-touch-target);
+  min-height: var(--el-touch-target);
+  max-height: var(--el-touch-target);
+  border: 6px solid transparent;
+  background-clip: padding-box;
+}
+
+:root[data-el-form-factor="phone"] .taskbar.is-agent-face .agent-composer-input {
+  min-height: var(--el-touch-target);
+  padding-block: 11px;
+}
+
+:root[data-el-form-factor="phone"] :is(.agent-harness-icon-btn, .agent-harness-drawer-toggle, .agent-projects-add) {
+  width: var(--el-touch-target);
+  height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] :is(.agent-harness-new-chat, .agent-harness-home, .agent-harness-nav-row) {
+  min-height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] .agent-harness-page-close {
+  width: var(--el-touch-target);
+  height: var(--el-touch-target);
+  border: 7px solid transparent;
+  background-clip: padding-box;
+}
+
+:root[data-el-form-factor="phone"] :is(.agent-configure-chip, .agent-prompt-reset) {
+  min-height: var(--el-touch-target);
+  border: solid transparent;
+  border-width: 8px 0;
+  background-clip: padding-box;
+}
+
+:root[data-el-form-factor="phone"] :is(.agent-prompt-check, .agent-prompt-param input) {
+  min-height: var(--el-touch-target);
+}
+
+/* Under 16px, iOS zooms the page when a field takes focus. */
+:root[data-el-form-factor="phone"] :is(.agent-prompt-textarea, .agent-prompt-param input) {
+  font-size: 16px;
 }

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Disposable test Homes never join the Community network a release pins (setup and update skip it).
+export ELASTOS_COLLABORATION_STARTUP_MODE=isolated
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/runtime-cleanup.sh"
 
 # This fixture owns setup, launch, and cleanup after bootstrap.
 export ELASTOS_INSTALL_ONLY=1
@@ -8,13 +12,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_ELASTOS_BIN="${ROOT}/elastos/target/debug/elastos"
 ELASTOS_BIN="${ELASTOS_BIN:-${DEFAULT_ELASTOS_BIN}}"
 HOST_DATA_DIR="${ELASTOS_HOST_DATA_DIR:-}"
-TEST_ROOT="${ELASTOS_LOCAL_CHAT_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/elastos-local-chat.XXXXXX")}"
+TEST_ROOT="${ELASTOS_LOCAL_CHAT_ROOT:-$(smoke_home_dir local-chat)}"
 SKIP_BUILD=0
 TOPIC="${ELASTOS_CHAT_TOPIC:-#general}"
 BOOTSTRAP_MODE="${ELASTOS_CHAT_BOOTSTRAP_MODE:-direct}"
 DISCOVERY_TOPIC="__elastos_internal/chat-presence-v1/${TOPIC}"
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
-MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj}"
+MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6MkgwHd2BCWe1jHMXPiR6H1q1RFPcv1YzhMbK5G1kBarbfe}"
 SOURCE_RUNTIME_COORDS="${ELASTOS_SOURCE_RUNTIME_COORDS:-$HOME/.local/share/elastos/runtime-coords.json}"
 SOURCE_TICKET_OVERRIDE="${ELASTOS_CHAT_SOURCE_TICKET:-}"
 BOOTSTRAP_HOME=""

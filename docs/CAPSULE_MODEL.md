@@ -5,8 +5,36 @@
 manifest fields and supported combinations.
 
 For system context, see the [repository README](../README.md) and
-[ARCHITECTURE.md](ARCHITECTURE.md). [state.md](../state.md) records verified
-implementation status, and [TASKS.md](../TASKS.md) records open work.
+[ARCHITECTURE.md](ARCHITECTURE.md). [GitHub issues](https://github.com/Elacity/elastos-runtime/issues) own status, acceptance and proof.
+
+## Current isolation and target boundary
+
+First-party apps run as web projections in the browser's opaque sandboxed
+frames. Runtime checks each app's signed launch token and actor before it performs an effect.
+Home can currently obtain every app's capability, so a compromised Home can
+reach those apps' authority. The target limits Home to delegation and gives each
+app a separate, revocable capability. The WASM Component authoring path runs in
+Wasmtime with memory and fuel limits and Runtime Bus hostcalls.
+
+Providers run as native operating-system processes with the Runtime user's
+rights. Only the model provider is partly confined. The trusted shell helper
+also runs as a native host process. The web Terminal is disabled by default;
+host developer mode and closed guest registration are required to enable it.
+An enabled Terminal runs commands with the host user's rights.
+
+The seed operator can read hosted data, wallet keys and recovery material.
+Passkeys control sign-in; stored data and keys remain accessible to the Runtime
+account and root while Home is locked. Protection against hosted operators and
+root, and against other software or OS users while a self-hosted Home is locked,
+is the target of [hosted protection](https://github.com/Elacity/elastos-runtime/issues/209)
+and [locked Home protection](https://github.com/Elacity/elastos-runtime/issues/210).
+An unlocked self-hosted Home trusts its owner and their host software. Recovery
+from a stolen device or profile key requires a new identity.
+
+The [isolation plan](https://github.com/Elacity/elastos-runtime/issues/173)
+records the remaining gates. Source checks describe this source tree. Accepted
+installed proof binds the exact Runtime, components and app assets to the
+journeys tested on that device.
 
 ## Core model
 
@@ -22,7 +50,7 @@ five.
 
 | Layer | Meaning |
 | --- | --- |
-| Artifact | Immutable manifest-and-payload closure, normally named by content ID. A verified signature authenticates its publisher; provenance records describe claimed lineage. |
+| Artifact | Immutable manifest-and-payload closure, normally named by content ID. A valid signature proves control of its signing key; Runtime publisher policy establishes publisher trust. Provenance records describe claimed lineage. |
 | Runtime contract | Declared execution or data contract. Component artifacts name a versioned ABI and Bus surface. Host adapters remain below it. |
 | Instance | For executable artifacts, one admitted execution bound to a session, capabilities, resources, and substrate. User-scoped authority also binds a verified principal. |
 | State | Mutable principal, app, or shared data stored outside the immutable artifact. |
@@ -66,16 +94,16 @@ reply alone does not establish working sandbox support.
 
 The [shared state contract](STORAGE_AND_ACCESS.md#shared-application-state)
 defines checkpoints and handoff when execution and durable storage are on
-different nodes. Current accepted placements remain in state.md and the release
-plan; broad placement support is a target, not a claim of hardware qualification.
+different nodes. [Release acceptance](https://github.com/Elacity/elastos-runtime/issues/93) owns placement evidence;
+broad placement support is a target, not a claim of hardware qualification.
 
 ## Isolation boundary
 
 Runtime admits an executable artifact for a session and binds the instance to
 declared resources and capabilities. User-scoped authority also requires a
-verified principal. The instance does not inherit host files,
-sockets, credentials, routes, or provider internals. Mutable state enters
-through capability-scoped object and WebSpace contracts.
+verified principal. The target gives ordinary instances access to mutable state
+through capability-scoped object and WebSpace contracts. The current web-frame
+and native-provider boundaries are described above.
 
 Roles, package types, ABI fields, provider declarations, and rejected
 combinations belong to [Capsule authoring](CAPSULE_AUTHORING.md).
@@ -105,7 +133,7 @@ adapters. They remain under the same authority model but do not inherit the
 Component WIT interface.
 
 The Component fixture and authoring template test this contract. Product App
-migration requires its own evidence, recorded in [state.md](../state.md).
+migration requires its own [isolation evidence](https://github.com/Elacity/elastos-runtime/issues/173).
 
 The current Component ABI is checked against
 [`elastos-bus-v1.wit`](../elastos/wit/elastos-bus-v1.wit). Exact ABI fields,
@@ -114,7 +142,8 @@ SDK behavior, role restrictions, and validation rules belong to
 authority belong to the
 [Home shell host contract](HOME_SHELL_HOST_CONTRACT.md).
 
-A provider may hold DID signing material only when its declared namespace,
+The target permits a provider to hold DID signing material only when its declared
+namespace,
 registered identity, and Runtime policy grant that narrow role. The provider
 role alone grants nothing. Ordinary capsules instead request typed signing
 intents such as `sign_chat_message`; they do not receive arbitrary
@@ -125,9 +154,10 @@ intents such as `sign_chat_message`; they do not receive arbitrary
 Components request effects through typed, capability-secured Bus resources.
 Web projections use narrow, capsule-scoped Runtime adapters. Data capsules
 carry no execution authority. Provider capsules declare a narrow `provides`
-namespace and auditable authority metadata. Operator trust in a provider does
-not grant user authority. A provider that needs principal data must use the
-corresponding capability path.
+namespace and auditable authority metadata. The target separates operator trust
+from user authority. A provider that needs
+principal data uses the corresponding capability path. Current native
+processes can retain host-account access beyond that declaration.
 
 The Runtime, Bus, and provider ownership rule is normative in
 [PRINCIPLES.md](../PRINCIPLES.md). Trust domains and network compatibility

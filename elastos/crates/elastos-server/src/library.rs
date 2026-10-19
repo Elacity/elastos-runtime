@@ -2000,6 +2000,10 @@ async fn library_publish(
     let target = library_target(data_dir, principal_id, uri)?;
     check_revision(data_dir, principal_id, &target.uri, if_revision)?;
     if let Some(protection) = protection {
+        anyhow::ensure!(
+            crate::protected_content_runtime::protected_content_enabled(data_dir),
+            "protected content is not available in this release"
+        );
         let loaded =
             validate_runtime_custody_publish_input(data_dir, principal_id, &target, protection)?;
         let source_storage = published_source_storage(data_dir, principal_id, &target)?.to_string();
@@ -3412,15 +3416,11 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
             }
             Err(err) if is_unencrypted_principal_root_object(&err) => {
                 blocked_reason = Some("protected_principal_root_object_not_encrypted".to_string());
-                let revision_input = format!("{}:{}:{}", target.uri, metadata.len(), modified_at);
-                (
-                    metadata.len(),
-                    format!(
-                        "rev:blocked:{}",
-                        hex::encode(Sha256::digest(revision_input))
-                    ),
-                    None,
-                )
+                blocked_object_projection(&target.uri, metadata.len(), modified_at)
+            }
+            Err(err) if is_damaged_principal_root_object(&err) => {
+                blocked_reason = Some("protected_principal_root_object_damaged".to_string());
+                blocked_object_projection(&target.uri, metadata.len(), modified_at)
             }
             Err(err) => return Err(err),
         }
@@ -3476,6 +3476,11 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
         }
         if is_extractable_archive_name(&name) {
             capabilities.push("extract_archive");
+        }
+        if active_record.is_none()
+            && crate::protected_content_runtime::protected_content_enabled(data_dir)
+        {
+            capabilities.push("protect");
         }
         capabilities
     };
@@ -3633,6 +3638,31 @@ fn is_unencrypted_principal_root_object(err: &anyhow::Error) -> bool {
             .to_string()
             .contains(crate::auth::PROTECTED_PRINCIPAL_ROOT_OBJECT_NOT_ENCRYPTED)
     })
+}
+
+fn is_damaged_principal_root_object(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains(crate::auth::PROTECTED_PRINCIPAL_ROOT_OBJECT_DAMAGED)
+    })
+}
+
+/// Size, revision and CID of an item Library lists without opening it.
+fn blocked_object_projection(
+    uri: &str,
+    len: u64,
+    modified_at: u64,
+) -> (u64, String, Option<String>) {
+    let revision_input = format!("{uri}:{len}:{modified_at}");
+    (
+        len,
+        format!(
+            "rev:blocked:{}",
+            hex::encode(Sha256::digest(revision_input))
+        ),
+        None,
+    )
 }
 
 fn read_library_file_bytes(
@@ -3832,21 +3862,13 @@ fn protect_legacy_plaintext_library_file(
     principal_id: &str,
     target: &LibraryTarget,
 ) -> anyhow::Result<Vec<u8>> {
-    let bytes = fs::read(&target.path).with_context(|| {
-        format!(
-            "failed to read legacy plaintext library object {:?}",
-            target.path
-        )
-    })?;
-    crate::auth::write_principal_root_object(
+    crate::auth::protect_legacy_plaintext_principal_root_object(
         data_dir,
         principal_id,
         &target.localhost_root,
         &target.uri,
         &target.path,
-        &bytes,
-    )?;
-    Ok(bytes)
+    )
 }
 
 fn archive_library_directory(

@@ -146,11 +146,21 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         host_helpers,
     } = config;
     let _host_helpers = host_helpers;
-    // Opaque sandboxed capsules send Origin: null. Local loopback origins
-    // remain available for development, but unrelated web origins do not.
+    // Runtime keeps this control API on its own configured origin.
+    // Browser capsules use the gateway launch boundary.
+    let control_origin = url::Url::parse(&format!(
+        "{}://{addr}",
+        if tls_config.is_some() {
+            "https"
+        } else {
+            "http"
+        }
+    ))?
+    .origin()
+    .ascii_serialization();
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin, _| {
-            super::browser_capsules::is_allowed_capsule_origin(origin)
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            runtime_api_origin_allowed(origin, &control_origin)
         }))
         .allow_methods(Any)
         .allow_headers(Any);
@@ -540,39 +550,36 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
     Ok(())
 }
 
+fn runtime_api_origin_allowed(origin: &HeaderValue, control_origin: &str) -> bool {
+    origin.to_str().is_ok_and(|origin| origin == control_origin)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::browser_capsules::is_allowed_capsule_origin;
+    use super::runtime_api_origin_allowed;
     use axum::http::HeaderValue;
 
     #[test]
-    fn allows_local_loopback_origins() {
-        assert!(is_allowed_capsule_origin(&HeaderValue::from_static(
-            "http://localhost:3000"
-        )));
-        assert!(is_allowed_capsule_origin(&HeaderValue::from_static(
-            "http://127.0.0.1:3000"
-        )));
-        assert!(is_allowed_capsule_origin(&HeaderValue::from_static(
-            "http://[::1]:3000"
-        )));
+    fn runtime_control_api_keeps_only_its_exact_origin() {
+        let own = "http://localhost:61181";
+        assert!(runtime_api_origin_allowed(
+            &HeaderValue::from_static("http://localhost:61181"),
+            own
+        ));
+        for foreign in [
+            "null",
+            "http://localhost:3000",
+            "http://127.0.0.1:61181",
+            "http://[::1]:61181",
+            "https://example.com",
+            "http://localhost.evil.com",
+        ] {
+            assert!(!runtime_api_origin_allowed(
+                &HeaderValue::from_str(foreign).unwrap(),
+                own
+            ));
+        }
     }
-
-    #[test]
-    fn allows_opaque_capsule_origins() {
-        assert!(is_allowed_capsule_origin(&HeaderValue::from_static("null")));
-    }
-
-    #[test]
-    fn rejects_non_local_origins() {
-        assert!(!is_allowed_capsule_origin(&HeaderValue::from_static(
-            "http://localhost.evil.com"
-        )));
-        assert!(!is_allowed_capsule_origin(&HeaderValue::from_static(
-            "https://example.com"
-        )));
-    }
-
     #[tokio::test]
     async fn private_runtime_data_root_is_not_published_at_capsule_data() {
         use axum::body::Body;

@@ -18,6 +18,13 @@ const overlayStatusNode = document.querySelector('[data-field="overlay-status"]'
 const settingsSearchInput = document.querySelector("#settings-search");
 const guestRegistrationInput = document.querySelector("#guest-registration");
 const guestRegistrationStatusNode = document.querySelector('[data-field="guest-registration-status"]');
+const communitySection = document.querySelector("#community-membership");
+const communityButton = document.querySelector("#community-toggle");
+let communityMembership = null;
+let communityBusy = false;
+const communityPresenceRow = document.querySelector("#community-presence-row");
+const communityPresenceOptions = [...document.querySelectorAll("#community-presence [data-presence-mode]")];
+let communityPresenceBusy = false;
 const themeSegment = document.querySelector("#theme-segment");
 const accentPickerNode = document.querySelector("#accent-picker");
 const accentCustomPopover = document.querySelector("#accent-custom-popover");
@@ -27,6 +34,7 @@ const dockAutoHideInput = document.querySelector("#dock-autohide");
 const uiSoundsInput = document.querySelector("#ui-sounds");
 const passkeyStatusNode = document.querySelector('[data-field="passkey-status"]');
 const accountListNode = document.querySelector("#account-list");
+const passkeyAddButton = document.querySelector("#passkey-add");
 const recoveryDownloadButton = document.querySelector("#recovery-download");
 const recoveryProfileSetup = document.querySelector("#recovery-profile-setup");
 const recoveryProfileName = document.querySelector("#recovery-profile-name");
@@ -54,6 +62,9 @@ const technicalInspectDetailNode = document.querySelector("#technical-inspect-de
 const technicalInspectStatusNode = document.querySelector("#technical-inspect-status");
 const technicalInspectRefreshButton = document.querySelector("#technical-inspect-refresh");
 const deviceDidCopyButton = document.querySelector("#device-did-copy");
+const runtimeUpdateNode = document.querySelector("#runtime-update");
+const runtimeUpdateButton = document.querySelector("#runtime-update-apply");
+const runtimeUpdateStatusNode = document.querySelector("#runtime-update-status");
 const frameHomeToken = readLaunchToken();
 const models = window.ElastosModelManagement.create({
   root: document.querySelector("[data-model-management]"), capsule: "system", token: frameHomeToken,
@@ -115,6 +126,22 @@ let accentCustomPicker = null;
 let accentCustomWriteTimer = 0;
 let deviceDidValue = "";
 let deviceDidCopyTimer = 0;
+let systemSummaryInFlight = null;
+let runtimeUpdate;
+let runtimeUpdatePending = null;
+let runtimeUpdateBusy = false;
+let runtimeUpdateActive = true;
+let runtimeUpdateTimer = 0;
+let runtimeUpdateReconnects = 0;
+// Set once this page has seen an update in progress (its own request accepted, or a controller phase
+// from staging to restarting). Home may finish restarting between two polls, so the page does not try
+// to observe the restart itself: after this, the update finishing or Home refusing this page's old
+// session reloads the page once. A reloaded page starts with it false, so it reloads at most once.
+let runtimeUpdateInProgressSeen = false;
+const RUNTIME_UPDATE_RESTART_TEXT = "Restarting to finish the update. Home is usually back within two minutes.";
+// Polls are 2 s apart while Home restarts: 150 polls outlast the controller's 120 s restart budget with margin.
+const RUNTIME_UPDATE_RESTART_POLLS = 150;
+const runtimeUpdateRequests = new Set();
 const DEFAULT_BACKGROUND_IMAGE_URL = "/apps/home-gui/wallpaper.webp";
 const BACKGROUND_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const BACKGROUND_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -151,7 +178,7 @@ const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   security: ["security", "recovery", "access", "guest", "inspection", "technical"],
   catalog: ["catalog", "apps", "services", "capsules"],
   models: ["models", "use", "keep", "preparation", "provider", "openrouter", "venice", "key", "ai provider"],
-  about: ["about", "device", "version", "source", "network", "did"],
+  about: ["about", "device", "version", "source", "network", "did", "update", "publisher", "changes"],
 });
 const ALLOWED_SETTINGS_TABS = new Set(Object.keys(SETTINGS_SEARCH_KEYWORDS));
 const requestedSettingsTab = normalizedRequestedSettingsTab(readQueryParam("settings"));
@@ -179,6 +206,8 @@ async function boot() {
   configureAppearanceEditor();
   configureAppearancePreferences();
   configureGuestAccess();
+  configureCommunityMembership();
+  configureCommunityPresence();
   configureAiProvider();
   configurePasskeyAccess();
   configureRecoveryAccess();
@@ -187,6 +216,7 @@ async function boot() {
   configureCapsuleCatalog();
   configureTechnicalDetails();
   configureDeviceDidCopy();
+  configureRuntimeUpdate();
   initialRecoveryState = (async () => {
     await refreshSystemSummary();
     await refreshActiveShell().catch((error) => showActiveShellStatus(String(error.message || error), "error"));
@@ -299,6 +329,10 @@ function configureSettingsTabs() {
     document.querySelector(".settings-sidebar")?.classList.remove("active");
   });
   document.querySelector(".sidebar-toggle")?.addEventListener("click", () => {
+    // On the phone stage the shared push drawer (elastos-drawer.js) owns it.
+    if (document.documentElement.getAttribute("data-el-form-factor") === "phone") {
+      return;
+    }
     document.querySelector(".settings-sidebar")?.classList.toggle("active");
   });
 }
@@ -354,10 +388,23 @@ function hasShellAccess() {
 }
 
 async function refreshSystemSummary() {
-  const systemSummary = await fetchJson("/api/apps/system/summary", {
-    headers: shellHeaders(),
-  });
-  renderSystemSummary(systemSummary);
+  if (systemSummaryInFlight) return systemSummaryInFlight;
+  systemSummaryInFlight = (async () => {
+    let systemSummary;
+    try {
+      systemSummary = await fetchRuntimeUpdateJson({ headers: shellHeaders() });
+    } catch (error) {
+      if (runtimeUpdateActive) showCommunityUnavailable(error);
+      throw error;
+    }
+    if (runtimeUpdateActive) {
+      renderSystemSummary(systemSummary);
+      await refreshCommunityMembership();
+      await refreshCommunityPresence();
+    }
+  })();
+  try { await systemSummaryInFlight; }
+  finally { systemSummaryInFlight = null; }
 }
 
 async function fetchJson(url, init) {
@@ -365,7 +412,9 @@ async function fetchJson(url, init) {
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
     const suffix = detail.trim() ? ` ${detail.trim()}` : ` ${response.statusText}`;
-    throw new Error(`request failed: ${response.status}${suffix}`);
+    const error = new Error(`request failed: ${response.status}${suffix}`);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -400,6 +449,7 @@ function renderSystemSummary(systemSummary) {
   acceptAppearance(appearance);
   setRuntimeState(runtime);
   setSourceState(source);
+  renderRuntimeUpdate(systemSummary.runtime_update);
 }
 
 function setField(field, value, emptyText, titleValue) {
@@ -660,6 +710,68 @@ function configureGuestAccess() {
   }
 }
 
+function configureCommunityMembership() {
+  if (communityButton) communityButton.addEventListener("click", updateCommunityMembership);
+}
+
+function renderCommunityMembership(membership) {
+  if (!membership || membership.schema !== "elastos.community-membership/v1"
+      || typeof membership.configured !== "boolean" || typeof membership.joined !== "boolean") {
+    throw new Error("Community setting is unavailable.");
+  }
+  communityMembership = membership;
+  if (communitySection) communitySection.hidden = !membership.configured;
+  setTextFields("community-detail", readText(membership.detail));
+  if (communityButton) {
+    communityButton.textContent = membership.joined ? "Leave Community" : "Rejoin Community";
+    communityButton.disabled = communityBusy || !membership.configured
+      || currentAccess.role !== "admin" || !hasShellAccess();
+  }
+}
+
+async function refreshCommunityMembership() {
+  if (communityBusy) return;
+  try {
+    renderCommunityMembership(await fetchRuntimeUpdateJson({ headers: shellHeaders() }, "/api/apps/system/community"));
+    setHiddenFields("community-status", true);
+  } catch (error) {
+    showCommunityUnavailable(error);
+  }
+}
+
+// A failed read is shown, not hidden: only a Home last confirmed without
+// Community keeps it hidden.
+function showCommunityUnavailable(error) {
+  if (communityMembership?.configured === false) return;
+  if (communityButton) communityButton.disabled = true;
+  if (communitySection) communitySection.hidden = false;
+  setTextFields("community-status", publicSystemError(error, "Community setting is unavailable."));
+  setHiddenFields("community-status", false);
+}
+
+async function updateCommunityMembership() {
+  if (communityBusy || !communityMembership?.configured || currentAccess.role !== "admin" || !hasShellAccess()) return;
+  communityBusy = true;
+  renderCommunityMembership(communityMembership);
+  setHiddenFields("community-status", true);
+  try {
+    const membership = await fetchRuntimeUpdateJson({
+      method: "POST",
+      headers: shellHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ joined: !communityMembership.joined }),
+    }, "/api/apps/system/community");
+    renderCommunityMembership(membership);
+    setTextFields("community-status", membership.joined ? "Community rejoined. Discovery uses its saved preference." : "Community and Discovery stopped on this Home.");
+    setHiddenFields("community-status", false);
+  } catch (error) {
+    setTextFields("community-status", publicSystemError(error, "Community setting could not be changed."));
+    setHiddenFields("community-status", false);
+  } finally {
+    communityBusy = false;
+    renderCommunityMembership(communityMembership);
+  }
+}
+
 async function onGuestRegistrationChange() {
   if (!guestRegistrationInput || !hasShellAccess()) {
     return;
@@ -679,6 +791,77 @@ async function onGuestRegistrationChange() {
     showGuestRegistrationStatus(String(error.message || error), "error");
   } finally {
     setGuestRegistrationControlState();
+  }
+}
+
+function configureCommunityPresence() {
+  for (const option of communityPresenceOptions) {
+    option.addEventListener("click", () => updateCommunityPresence(option.dataset.presenceMode));
+  }
+}
+
+// Never shows as Hidden; requested, Later or no answer yet shows no choice.
+function communityPresenceMode(state) {
+  return state === "refused" ? "hidden" : state;
+}
+
+function setCommunityPresenceOptions(mode, disabled) {
+  for (const option of communityPresenceOptions) {
+    const current = option.dataset.presenceMode === mode;
+    option.classList.toggle("active", current);
+    option.setAttribute("aria-checked", current ? "true" : "false");
+    option.disabled = disabled;
+  }
+}
+
+// The calling person's own choice; nobody can set it for someone else.
+// Runtime returns the mode only, never the grant behind it.
+function renderCommunityPresence(presence) {
+  if (!presence || presence.schema !== "elastos.community-presence/v1"
+      || typeof presence.configured !== "boolean" || typeof presence.joined !== "boolean") {
+    throw new Error("Community setting is unavailable.");
+  }
+  if (communityPresenceRow) communityPresenceRow.hidden = !presence.configured;
+  setCommunityPresenceOptions(
+    communityPresenceMode(presence.community_presence),
+    communityPresenceBusy || !presence.joined || !hasShellAccess(),
+  );
+}
+
+async function refreshCommunityPresence() {
+  if (communityPresenceBusy || communityPresenceOptions.length === 0) return;
+  if (communityMembership?.configured === false) return;
+  try {
+    renderCommunityPresence(await fetchRuntimeUpdateJson({ headers: shellHeaders() }, "/api/apps/system/community/presence"));
+    setHiddenFields("community-presence-status", true);
+  } catch (error) {
+    setCommunityPresenceOptions(null, true);
+    if (communitySection) communitySection.hidden = false;
+    if (communityPresenceRow) communityPresenceRow.hidden = false;
+    setTextFields("community-presence-status", publicSystemError(error, "Community setting is unavailable."));
+    setHiddenFields("community-presence-status", false);
+  }
+}
+
+async function updateCommunityPresence(mode) {
+  if (communityPresenceBusy || !hasShellAccess()) return;
+  const previous = communityPresenceOptions.find((option) => option.getAttribute("aria-checked") === "true");
+  communityPresenceBusy = true;
+  setCommunityPresenceOptions(mode, true);
+  setHiddenFields("community-presence-status", true);
+  try {
+    const presence = await fetchRuntimeUpdateJson({
+      method: "POST",
+      headers: shellHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ mode }),
+    }, "/api/apps/system/community/presence");
+    communityPresenceBusy = false;
+    renderCommunityPresence(presence);
+  } catch (error) {
+    communityPresenceBusy = false;
+    setCommunityPresenceOptions(previous?.dataset.presenceMode ?? null, !hasShellAccess());
+    setTextFields("community-presence-status", publicSystemError(error, "Community setting could not be changed."));
+    setHiddenFields("community-presence-status", false);
   }
 }
 
@@ -1160,6 +1343,7 @@ function configurePasskeyAccess() {
   if (accountListNode) {
     accountListNode.addEventListener("click", onAccountListClick);
   }
+  passkeyAddButton?.addEventListener("click", onPasskeyAdd);
 }
 
 function configureRecoveryAccess() {
@@ -2603,7 +2787,12 @@ function renderAccounts(accounts) {
     accountListNode.append(empty);
     return;
   }
-  const adminCount = activeAccounts.filter((account) => readText(account.role) === "admin").length;
+  // Roles belong to accounts; one account may have several passkeys.
+  const adminPasskeyCount = activeAccounts.filter((account) => readText(account.role) === "admin").length;
+  const adminAccountCount = new Set(activeAccounts
+    .filter((account) => readText(account.role) === "admin")
+    .map((account) => readText(account.principal_id))).size;
+  const currentPrincipalId = readText(activeAccounts.find((account) => account.current)?.principal_id);
   const table = document.createElement("table");
   table.className = "account-table";
   table.innerHTML = `
@@ -2621,7 +2810,9 @@ function renderAccounts(accounts) {
   for (const account of activeAccounts) {
     body.append(accountRow(account, {
       activeCount: activeAccounts.length,
-      adminCount,
+      adminPasskeyCount,
+      adminAccountCount,
+      currentPrincipalId,
     }));
   }
   table.append(body);
@@ -2663,7 +2854,9 @@ function accountRow(passkey, listState = {}) {
 
   const passkeyRole = readText(passkey.role);
   const canManagePasskeyRoles = currentAccess.role === "admin";
-  const adminCount = Number(listState.adminCount);
+  const adminAccountCount = Number(listState.adminAccountCount);
+  const ownAccount = Boolean(listState.currentPrincipalId)
+    && readText(passkey.principal_id) === listState.currentPrincipalId;
   if (canManagePasskeyRoles && passkeyRole === "guest") {
     const promote = document.createElement("button");
     promote.className = "system-button system-button-secondary passkey-promote";
@@ -2673,14 +2866,14 @@ function accountRow(passkey, listState = {}) {
     promote.disabled = !promote.dataset.passkeyPromote || !hasShellAccess();
     actions.append(promote);
   }
-  if (canManagePasskeyRoles && passkeyRole === "admin" && !passkey.current) {
+  if (canManagePasskeyRoles && passkeyRole === "admin" && !passkey.current && !ownAccount) {
     const demote = document.createElement("button");
     demote.className = "system-button system-button-secondary passkey-demote";
     demote.type = "button";
     demote.textContent = "Make guest";
     demote.dataset.passkeyDemote = passkey.proof_binding_id || "";
-    demote.disabled = !demote.dataset.passkeyDemote || !hasShellAccess() || adminCount <= 1;
-    if (adminCount <= 1) {
+    demote.disabled = !demote.dataset.passkeyDemote || !hasShellAccess() || adminAccountCount <= 1;
+    if (adminAccountCount <= 1) {
       demote.title = "At least one admin must remain.";
     }
     actions.append(demote);
@@ -2693,7 +2886,7 @@ function accountRow(passkey, listState = {}) {
   remove.dataset.passkeyRevoke = passkey.proof_binding_id || "";
   remove.dataset.current = passkey.current ? "true" : "false";
   const protectsLastAdmin = readText(passkey.role) === "admin"
-    && Number(listState.adminCount) <= 1
+    && Number(listState.adminPasskeyCount) <= 1
     && Number(listState.activeCount) > 1;
   remove.disabled = !remove.dataset.passkeyRevoke || !hasShellAccess() || protectsLastAdmin;
   if (protectsLastAdmin) {
@@ -2778,6 +2971,67 @@ async function onAccountListClick(event) {
   }
 }
 
+async function onPasskeyAdd() {
+  if (!passkeyAddButton || !hasShellAccess()) {
+    return;
+  }
+  passkeyAddButton.disabled = true;
+  showPasskeyStatus("Confirm with your current passkey, then create the new one.", "muted");
+  try {
+    await requestHomePasskeyAdd(apiHomeToken, homeParentOrigin);
+    await refreshAccountList();
+    showPasskeyStatus("Passkey added. You can sign in with it now.", "success");
+    notifyHomeSummaryChanged();
+  } catch (error) {
+    showPasskeyStatus(error, "error");
+  } finally {
+    passkeyAddButton.disabled = false;
+  }
+}
+
+// Passkeys can only be created by Home itself, never inside this frame.
+function requestHomePasskeyAdd(homeToken, parentOrigin) {
+  if (!homeToken || window.top === window || !parentOrigin) {
+    return Promise.reject(new Error("Open System from Home to add a passkey."));
+  }
+  const requestId = window.crypto?.randomUUID?.()
+    || `passkey-add-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return new Promise((resolve, reject) => {
+    // Two passkey prompts, each up to two minutes.
+    const timeout = window.setTimeout(() => {
+      window.removeEventListener("message", onResult);
+      reject(new Error("Adding the passkey timed out. Select Add passkey to try again."));
+    }, 300_000);
+    const onResult = (event) => {
+      if (event.source !== window.top || event.origin !== parentOrigin) {
+        return;
+      }
+      const result = event.data && typeof event.data === "object" ? event.data : null;
+      if (result?.type !== "elastos.home.passkey-add.result/v1" || result.requestId !== requestId) {
+        return;
+      }
+      window.clearTimeout(timeout);
+      window.removeEventListener("message", onResult);
+      const role = readText(result.role);
+      if (!hasExactKeys(result, role ? ["type", "requestId", "role"] : ["type", "requestId", "error"])) {
+        reject(new Error("Home did not add the passkey. Select Add passkey to try again."));
+        return;
+      }
+      if (role) {
+        resolve(role);
+        return;
+      }
+      reject(new Error(readText(result.error) || "Home did not add the passkey. Select Add passkey to try again."));
+    };
+    window.addEventListener("message", onResult);
+    window.top.postMessage({
+      type: "elastos.home.passkey-add.request/v1",
+      requestId,
+      homeToken,
+    }, parentOrigin);
+  });
+}
+
 async function refreshRecoveryStatus() {
   if (!recoveryStatusNode || !hasShellAccess()) {
     return;
@@ -2795,6 +3049,27 @@ async function refreshRecoveryStatus() {
   }
 }
 
+const RECOVERY_ROOT_CHECKED_SENTENCE = "No unencrypted file was found in your protected Home folders, and each file there is labelled for this Home's current key. Each file's contents are checked when you open it.";
+
+function recoveryAttentionNote(status) {
+  const notes = [];
+  if (status?.required_actions?.includes("finish_interrupted_principal_root_migration")) {
+    notes.push("An earlier encryption step did not finish. Home will not start again until it is finished or undone; reinstalling ElastOS does that, and your files are kept.");
+  }
+  if (status?.required_actions?.includes("migrate_declared_plaintext_objects")) {
+    const notStarting = status.protection_configured === true ? "; until they are, Home will not start again" : "";
+    notes.push(`Some files in your protected Home folders are not encrypted yet${notStarting}. Saving your Recovery Kit encrypts files of up to 16 MiB after you approve with your passkey; a larger file is named so you can move it out of your protected folders (Library takes uploads up to 100 MiB).`);
+  }
+  const count = Number(status?.objects_needing_attention_count) || 0;
+  const first = Array.isArray(status?.objects_needing_attention) ? status.objects_needing_attention[0] : null;
+  if (count > 0 && first) {
+    // The action already starts with the file's path.
+    const more = count > 1 ? ` And ${count - 1} more.` : "";
+    notes.push(`${count} file(s) in your protected Home folders need attention: ${readText(first.action)}${more}`);
+  }
+  return notes.join(" ");
+}
+
 function setRecoveryStatus(status) {
   if (recoveryProfileStatus === "unavailable") {
     showRecoveryStatus("Unavailable", "error");
@@ -2808,10 +3083,18 @@ function setRecoveryStatus(status) {
     setRecoveryButton("Create Profile and save kit", false);
     return;
   }
+  const attention = recoveryAttentionNote(status);
   if (status?.required_actions?.includes("download_recovery_kit_with_profile")) {
     showRecoveryStatus("Profile needs backup", "muted");
-    showRecoveryNote("Save a new kit that includes your Profile.", "muted");
+    showRecoveryNote(attention ? `Save a new kit that includes your Profile. ${attention}` : "Save a new kit that includes your Profile.", "muted");
     setRecoveryButton("Save complete Recovery Kit", false);
+    return;
+  }
+  if (attention) {
+    showRecoveryStatus("Needs attention", "muted");
+    showRecoveryNote(attention, "muted");
+    const exportReady = status.recovery_configured === true && status.recovery_download_available === true;
+    setRecoveryButton(exportReady ? "Download Recovery Kit" : "Create Recovery Kit", false);
     return;
   }
   const configured = status && status.recovery_configured === true;
@@ -2819,7 +3102,8 @@ function setRecoveryStatus(status) {
   const protectedRoot = status && status.protection_configured === true;
   if (configured && downloadAvailable) {
     showRecoveryStatus("", "success");
-    showRecoveryNote("Saves your Profile, Home recovery authority, and included Wallet keys after passkey verification. Keep your files backed up separately.", "muted");
+    const checked = status.root_encrypted === true ? `${RECOVERY_ROOT_CHECKED_SENTENCE} ` : "";
+    showRecoveryNote(`${checked}Saves your Profile, Home recovery authority, and included Wallet keys after passkey verification. Keep your files backed up separately.`, "muted");
     setRecoveryButton("Download Recovery Kit", false);
     return;
   }
@@ -2857,7 +3141,7 @@ async function onRecoveryDownload(options = {}) {
     if (!isActive()) return false;
     const bundle = await exportFullRecoveryBundle(status, isActive);
     if (!isActive()) return false;
-    downloadRecoveryKit(bundle);
+    const fileName = downloadRecoveryKit(bundle);
     if (recoveryPasswordInput) {
       recoveryPasswordInput.value = "";
     }
@@ -2865,14 +3149,14 @@ async function onRecoveryDownload(options = {}) {
     const peopleIdentity = bundle && bundle.included && bundle.included.people_identity;
     showRecoveryNote(
       peopleIdentity
-        ? "Recovery Kit downloaded. Store it offline; it includes your signed People identity."
-        : "Recovery Kit downloaded. Store it offline.",
+        ? `Recovery Kit downloaded as ${fileName}. Store it offline; it includes your signed People identity.`
+        : `Recovery Kit downloaded as ${fileName}. Store it offline.`,
       "success"
     );
     setRecoveryButton("Download Recovery Kit", false);
     notifyHomeSummaryChanged();
     await refreshSystemSummary().catch(() => {
-      showRecoveryNote("Recovery Kit downloaded. Store it offline. Refresh System to update setup status.", "success");
+      showRecoveryNote(`Recovery Kit downloaded as ${fileName}. Store it offline. Refresh System to update setup status.`, "success");
     });
     return true;
   } catch (error) {
@@ -3144,17 +3428,28 @@ function recoveryDownloadPassword() {
   return readText(recoveryPasswordInput && recoveryPasswordInput.value);
 }
 
+// The whole principal goes into the file name (no ellipsis), with characters
+// some file systems refuse replaced; the name is returned so System shows it.
+function recoveryKitFileName(kit) {
+  const principal = readText(kit && kit.principal_id)
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 128) || "principal";
+  return `elastos-recovery-${principal}.json`;
+}
+
 function downloadRecoveryKit(kit) {
-  const principal = shortText(readText(kit && kit.principal_id), 12) || "principal";
+  const fileName = recoveryKitFileName(kit);
   const blob = new Blob([JSON.stringify(kit, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `elastos-recovery-${principal}.json`;
+  anchor.download = fileName;
   document.body.append(anchor);
   anchor.click();
   anchor.remove();
   URL.revokeObjectURL(url);
+  return fileName;
 }
 
 function setRecoveryButton(label, disabled) {
@@ -3608,6 +3903,10 @@ function setAccessPolicy(access) {
     guest_registration_enabled: access && access.guest_registration_enabled === true,
   };
   setGuestRegistrationControlState();
+  // Only an owner (admin) adds passkeys; the server refuses anyone else.
+  if (passkeyAddButton) {
+    passkeyAddButton.hidden = !hasShellAccess() || currentAccess.role !== "admin";
+  }
 }
 
 function setGuestRegistrationControlState() {
@@ -3697,6 +3996,266 @@ function setSourceState(source) {
     "source-transport",
     sourcePeer ? `${transport} Peer ${shortText(sourcePeer, 28)}` : transport,
   );
+}
+
+function configureRuntimeUpdate() {
+  runtimeUpdateButton?.addEventListener("click", onRuntimeUpdateApply);
+  window.addEventListener("pagehide", () => {
+    runtimeUpdateActive = false;
+    window.clearTimeout(runtimeUpdateTimer);
+    for (const request of runtimeUpdateRequests) request.abort();
+  }, { once: true });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) scheduleRuntimeUpdateRefresh(0);
+  });
+  window.addEventListener("message", (event) => {
+    if (event.source !== window.top || event.origin !== homeParentOrigin
+      || event.data?.type !== "elastos:runtime-events"
+      || event.data?.schema !== "elastos.home.runtime-events/v1"
+      || !Array.isArray(event.data.events)) return;
+    scheduleRuntimeUpdateRefresh(0);
+  });
+  scheduleRuntimeUpdateRefresh();
+}
+
+function renderRuntimeUpdate(update) {
+  runtimeUpdate = update && typeof update === "object" ? update : null;
+  if (!runtimeUpdateNode || !runtimeUpdateButton) return;
+  const configured = runtimeUpdate?.configured === true;
+  runtimeUpdateNode.hidden = !configured && !runtimeUpdatePending;
+  const controller = runtimeUpdate?.controller;
+  const phase = readText(controller?.phase);
+  // With a request of its own pending, only that request's result is this page's update finishing;
+  // a result left from an earlier update can still be on display before the controller takes it.
+  const finishes = ["updated", "restored"].includes(phase)
+    && (!runtimeUpdatePending || controller?.id === runtimeUpdatePending.intent.request_id);
+  if (runtimeUpdatePending && (controller?.id === runtimeUpdatePending.intent.request_id
+    && ["updated", "restored", "failed"].includes(phase))) {
+    runtimeUpdatePending = null;
+    runtimeUpdateReconnects = 0;
+  }
+  if (["staging", "downloading", "verifying", "restarting"].includes(phase)) markRuntimeUpdateInProgress();
+  // A failed update keeps the current Home and its assets: never reload for it.
+  if (phase === "failed") runtimeUpdateInProgressSeen = false;
+  if (runtimeUpdateInProgressSeen && finishes) {
+    // The new (or restored) Home serves different assets; load them instead of running stale code.
+    showRuntimeUpdateStatus(readText(controller.message) || "Home is back. Reloading System…");
+    reloadForRuntimeUpdate();
+    return;
+  }
+  const choice = runtimeUpdatePending?.intent || runtimeUpdate;
+  const inProgress = runtimeUpdatePending || ["staging", "downloading", "verifying", "restarting"].includes(phase);
+  setTextFields("update-current-version", readText(choice?.current_version) || readText(controller?.current_version));
+  setTextFields("update-new-version", readText(choice?.new_version) || readText(controller?.new_version));
+  const publisher = readText(runtimeUpdatePending?.publisher || runtimeUpdate?.publisher);
+  setTextFields("update-publisher", publisher);
+  setHiddenFields("update-publisher-row", !publisher);
+  const hideOffer = runtimeUpdate?.available !== true && !inProgress;
+  setHiddenFields("update-offer", hideOffer);
+  const notes = runtimeUpdatePending?.changes || runtimeUpdate?.changes;
+  const changes = Array.isArray(notes) ? notes.filter((note) => typeof note === "string")
+    .slice(0, 32).map((note) => readText(note)).filter(Boolean).join("\n") : "";
+  setHiddenFields("update-changes", hideOffer || (inProgress && !changes && runtimeUpdate?.available !== true));
+  setTextFields("update-changes", changes || "Publisher has not supplied change notes.");
+  const actionable = runtimeUpdateCanApply();
+  runtimeUpdateButton.hidden = !actionable && !runtimeUpdatePending;
+  runtimeUpdateButton.disabled = !actionable || runtimeUpdateBusy || Boolean(runtimeUpdatePending);
+  const progress = runtimeUpdateProgressPhase();
+  runtimeUpdateButton.textContent = runtimeUpdatePending
+    ? runtimeUpdatePending.dispatched ? "Update in progress" : "Waiting for update status"
+    : "Update and restart Home";
+  if (runtimeUpdatePending) {
+    showRuntimeUpdateStatus(runtimeUpdateBusy && !runtimeUpdatePending.stepUpToken
+      ? "Verify your passkey to start the update."
+      : progress === "restarting" ? RUNTIME_UPDATE_RESTART_TEXT
+        : ["downloading", "verifying"].includes(progress) ? readText(controller?.message)
+          || "Preparing the update. Home restarts when the update is ready."
+        : progress === "staging" ? "Checking the signed update. Keep Home open."
+          : progress === "queued" ? "The update is queued. Keep Home open."
+            : "Checking the update with Home. Keep Home open.");
+  } else if (["staging", "downloading", "verifying", "restarting"].includes(phase)) {
+    showRuntimeUpdateStatus(phase === "restarting"
+      ? RUNTIME_UPDATE_RESTART_TEXT : readText(controller?.message) || "Checking the signed update. Keep Home open.");
+  } else if (["updated", "restored", "failed"].includes(phase)) {
+    showRuntimeUpdateStatus(readText(controller.message) || "Check the update status again.");
+  } else {
+    showRuntimeUpdateStatus(runtimeUpdate?.available === true
+      ? "An update is available. Home will restart after your approval."
+      : readText(runtimeUpdate?.message) || "Update checks are unavailable on this Home.");
+  }
+  scheduleRuntimeUpdateRefresh();
+}
+
+function runtimeUpdateProgressPhase() {
+  const phase = readText(runtimeUpdate?.controller?.phase);
+  if (!runtimeUpdatePending) return phase;
+  if (runtimeUpdate?.controller?.id === runtimeUpdatePending.intent.request_id
+    && ["staging", "downloading", "verifying", "restarting"].includes(phase)) {
+    runtimeUpdatePending.dispatched = true;
+    runtimeUpdatePending.phase = phase;
+  }
+  return runtimeUpdatePending.phase || "checking";
+}
+
+function markRuntimeUpdateInProgress() {
+  if (runtimeUpdateInProgressSeen) return;
+  // From here a lost Home is most likely its restart: it gets the full restart budget.
+  runtimeUpdateInProgressSeen = true;
+  runtimeUpdateReconnects = 0;
+  if (runtimeUpdatePending) runtimeUpdatePending.polls = 0;
+}
+
+function reloadForRuntimeUpdate() {
+  runtimeUpdateInProgressSeen = false;
+  runtimeUpdateActive = false;
+  window.clearTimeout(runtimeUpdateTimer);
+  window.location.reload();
+}
+
+function runtimeUpdatePollLimit() {
+  return runtimeUpdateInProgressSeen ? RUNTIME_UPDATE_RESTART_POLLS : 90;
+}
+
+function runtimeUpdateCanApply() {
+  return runtimeUpdate?.configured === true && runtimeUpdate.available === true
+    && runtimeUpdate.can_apply === true
+    && ["ready", "updated", "restored", "failed"].includes(readText(runtimeUpdate.controller?.phase))
+    && ["source_name", "channel", "publisher_did", "current_version", "new_version", "head_cid", "release_cid"]
+      .every((field) => readText(runtimeUpdate[field]).length > 0);
+}
+
+function showRuntimeUpdateStatus(message) {
+  if (runtimeUpdateStatusNode) runtimeUpdateStatusNode.textContent = message;
+}
+
+function scheduleRuntimeUpdateRefresh(delay) {
+  window.clearTimeout(runtimeUpdateTimer);
+  if (!runtimeUpdateActive || (runtimeUpdate !== undefined && runtimeUpdate?.configured !== true && !runtimeUpdatePending)) return;
+  runtimeUpdateTimer = window.setTimeout(pollRuntimeUpdate,
+    document.hidden ? 30_000 : delay ?? (runtimeUpdate?.controller?.phase === "restarting"
+      || (runtimeUpdateInProgressSeen && runtimeUpdateReconnects > 0) ? 2_000 : 5_000));
+}
+
+async function pollRuntimeUpdate() {
+  if (!runtimeUpdateActive) return;
+  if (systemSummaryInFlight) {
+    scheduleRuntimeUpdateRefresh();
+    return;
+  }
+  if (runtimeUpdatePending && ++runtimeUpdatePending.polls >= runtimeUpdatePollLimit()) {
+    showRuntimeUpdateStatus(runtimeUpdatePending.dispatched
+      ? "Home has not completed the update. Open System from Home again to check its status."
+      : "Home has not confirmed the update. Open System from Home again to check its status.");
+    return;
+  }
+  try {
+    await refreshSystemSummary();
+    runtimeUpdateReconnects = 0;
+    const controller = runtimeUpdate?.controller;
+    if (runtimeUpdatePending && controller?.id === runtimeUpdatePending.intent.request_id
+      && ["staging", "downloading", "verifying"].includes(readText(controller.phase))) {
+      runtimeUpdatePending.polls = 0;
+    }
+  } catch (error) {
+    if (!runtimeUpdateActive) return;
+    if ((error.status === 401 || error.status === 403) && runtimeUpdateInProgressSeen) {
+      // The restarted Home no longer accepts this page's session token. A reload is a plain GET that
+      // asks Home for a fresh session (or its sign-in); no update request is replayed, and the next
+      // load starts with runtimeUpdateInProgressSeen false, so a second refusal stops below.
+      reloadForRuntimeUpdate();
+      return;
+    }
+    if (error.status === 401 || error.status === 403) {
+      runtimeUpdateButton.hidden = true;
+      runtimeUpdateButton.disabled = true;
+      showRuntimeUpdateStatus("Home access has changed. Open System from Home again to check the update.");
+      return;
+    }
+    if (++runtimeUpdateReconnects >= runtimeUpdatePollLimit()) {
+      runtimeUpdateButton.disabled = true;
+      showRuntimeUpdateStatus("Home has not reconnected. Open Home again to check the update.");
+      return;
+    }
+    showRuntimeUpdateStatus(runtimeUpdateInProgressSeen || runtimeUpdateProgressPhase() === "restarting"
+      ? RUNTIME_UPDATE_RESTART_TEXT
+      : runtimeUpdatePending?.dispatched ? "Waiting for Home to report update progress. Reconnecting…"
+        : runtimeUpdatePending ? "Waiting for Home to confirm the update. Reconnecting…"
+        : "Update status is unavailable. Reconnecting…");
+  }
+  scheduleRuntimeUpdateRefresh();
+}
+
+async function fetchRuntimeUpdateJson(init, url = "/api/apps/system/summary") {
+  const abort = new AbortController();
+  runtimeUpdateRequests.add(abort);
+  // Carrier admission includes connection, signed metadata checks and transport drain.
+  const timeout = window.setTimeout(() => abort.abort(), url === "/api/apps/system/summary" && init.method === "POST" ? 60_000 : 10_000);
+  try { return await fetchJson(url, { ...init, signal: abort.signal }); }
+  finally {
+    window.clearTimeout(timeout);
+    runtimeUpdateRequests.delete(abort);
+  }
+}
+
+async function onRuntimeUpdateApply() {
+  if (runtimeUpdateBusy || runtimeUpdatePending || !runtimeUpdateCanApply()) return;
+  const intent = { action: "apply", request_id: window.crypto.randomUUID().replaceAll("-", "") };
+  for (const field of ["source_name", "channel", "publisher_did", "current_version", "new_version", "head_cid", "release_cid"]) {
+    intent[field] = runtimeUpdate[field];
+  }
+  const pending = { intent, stepUpToken: null, polls: 0, dispatched: false, phase: "checking",
+    publisher: runtimeUpdate.publisher, changes: runtimeUpdate.changes };
+  runtimeUpdatePending = pending;
+  runtimeUpdateBusy = true;
+  renderRuntimeUpdate(runtimeUpdate);
+  let feedback = "";
+  try {
+    pending.stepUpToken = await requestPasskeyStepUp("system.update.apply", intent);
+    if (!runtimeUpdateActive || runtimeUpdatePending !== pending) return;
+    const body = JSON.stringify({ ...intent, step_up_token: pending.stepUpToken });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const reply = await fetchRuntimeUpdateJson({ method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body });
+        if (runtimeUpdatePending !== pending || !runtimeUpdateActive) return;
+        if (reply?.id !== intent.request_id || reply?.phase !== "queued") throw new Error("Update queue confirmation is unavailable.");
+        pending.dispatched = true;
+        markRuntimeUpdateInProgress();
+        if (pending.phase === "checking") pending.phase = "queued";
+        break;
+      } catch (error) {
+        if (!runtimeUpdateActive || (error.status >= 400 && error.status < 500) || attempt === 1) throw error;
+      }
+    }
+  } catch (error) {
+    if (runtimeUpdatePending !== pending) return;
+    if (!pending.stepUpToken || (error.status >= 400 && error.status < 500)) {
+      runtimeUpdatePending = null;
+      feedback = !pending.stepUpToken && (error.name === "NotAllowedError"
+        || /cancelled|canceled|timed out or was not allowed/i.test(readText(error.message)))
+        ? "You cancelled the update. Home is unchanged."
+        : error.status === 424
+          ? "Home could not reach the update source. Your current version is unchanged. Connect to the internet and select Update again."
+        : error.status === 423
+          ? "Another update was started on this Home. Wait for it to finish, then check the update again."
+        : error.status === 410
+          ? "This approval is no longer valid. Check for the update again and approve it once more."
+        : error.status === 401 || error.status === 403
+          ? "Sign in as the Home owner to start the update."
+          : "The update could not start: the release was refused or verification failed. Select Update again.";
+    } else {
+      feedback = runtimeUpdateProgressPhase() === "restarting"
+        ? RUNTIME_UPDATE_RESTART_TEXT
+        : pending.dispatched ? "Waiting for Home to report update progress. Keep Home open."
+          : "Waiting for Home to confirm the update. Keep Home open.";
+    }
+  } finally {
+    runtimeUpdateBusy = false;
+    if (runtimeUpdateActive) {
+      renderRuntimeUpdate(runtimeUpdate);
+      if (feedback) showRuntimeUpdateStatus(feedback);
+      scheduleRuntimeUpdateRefresh(0);
+    }
+  }
 }
 
 function readQueryParam(key) {

@@ -8,7 +8,7 @@ use crate::contract::{
     RUN_OUTPUT_CONTENT_SCHEMA, RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
 };
 use crate::journal::{deterministic_run_id, now_ms};
-use crate::local_llama::{LocalLlamaEngines, LocalLlamaFault};
+use crate::local_llama::{LocalLlamaEngines, LocalLlamaFault, LocalTiming, LocalTimingStage};
 use elastos_model_contract::decisions;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -41,6 +41,7 @@ const MAX_LOCAL_TEXT_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_LOCAL_TEXT_SSE_EVENT_BYTES: usize = 128 * 1024;
 const RUNTIME_HOSTED_EFFECT_URL: &str = "http://runtime.invalid/v1/hosted-effect";
 
+#[allow(clippy::too_many_arguments)]
 fn effect_request(
     client: &reqwest::Client,
     method: reqwest::Method,
@@ -315,7 +316,11 @@ pub(crate) enum WorkerApplyAck {
 #[derive(Debug, Clone)]
 pub(crate) enum WorkerApplyGuard {
     None,
-    HttpArtifactBackendState { backend_state: Value },
+    /// A local Stop settled after owned closure, or retains explicit uncertainty.
+    LocalStopSettlement,
+    HttpArtifactBackendState {
+        backend_state: Value,
+    },
 }
 
 enum WorkerControl {
@@ -796,6 +801,7 @@ impl LiveAdapterExecutor {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_text_worker(
         &self,
         backend: LocalTextBackend,
@@ -1401,6 +1407,10 @@ fn parse_local_text_backend_state(
     Ok(state)
 }
 
+pub(crate) fn local_text_cancel_requested(value: &Value) -> bool {
+    parse_local_text_backend_state(value).is_ok_and(|state| state.cancel_requested)
+}
+
 fn reconcile_local_text(
     executor: &LiveAdapterExecutor,
     binding: &RuntimeCreateBinding,
@@ -1464,30 +1474,65 @@ fn cancel_local_text(
 }
 
 async fn run_local_text_worker(mut task: LocalTextWorkerTask) -> bool {
-    let result = match run_local_text_worker_inner(&mut task).await {
+    let timing =
+        matches!(&task.backend, LocalTextBackend::LocalLlama { .. }).then(LocalTiming::start);
+    if let Some(timing) = &timing {
+        timing.record(LocalTimingStage::RunStarted);
+    }
+    let result = match run_local_text_worker_with_timing(&mut task, timing.as_ref()).await {
         Ok(result) => result,
-        Err(fault) if fault.error.class == ErrorClass::BackendTimeout => return true,
-        Err(fault) => ReconcileResult::Terminal {
-            events: Vec::new(),
-            status: match fault.error.class {
-                ErrorClass::Cancelled => RunStatus::Cancelled,
-                ErrorClass::SettlementUnknown => RunStatus::SettlementUnknown,
-                _ => RunStatus::Failed,
-            },
-            output: None,
-            error: Some(fault.error),
-            backend_report: None,
-        },
+        Err(fault) if fault.error.class == ErrorClass::BackendTimeout => {
+            if let Some(timing) = &timing {
+                timing.record(LocalTimingStage::RunTimeout);
+            }
+            return true;
+        }
+        Err(fault) => {
+            if let Some(timing) = &timing {
+                timing.record(LocalTimingStage::RunFailed);
+            }
+            ReconcileResult::Terminal {
+                events: Vec::new(),
+                status: match fault.error.class {
+                    ErrorClass::Cancelled => RunStatus::Cancelled,
+                    ErrorClass::SettlementUnknown => RunStatus::SettlementUnknown,
+                    _ => RunStatus::Failed,
+                },
+                output: None,
+                error: Some(fault.error),
+                backend_report: None,
+            }
+        }
     };
+    let guard = if matches!(&task.backend, LocalTextBackend::LocalLlama { .. })
+        && *task.cancel_rx.borrow()
+        && pure_local_stop_result(&result)
+    {
+        WorkerApplyGuard::LocalStopSettlement
+    } else {
+        WorkerApplyGuard::None
+    };
+    let applied = send_worker_apply_update_with_timing(
+        &task.run_id,
+        task.generation,
+        guard,
+        result,
+        &task.updates,
+        timing.as_ref(),
+    )
+    .await;
+    if let (Some(timing), Ok(())) = (&timing, &applied) {
+        timing.record(LocalTimingStage::TerminalApplied);
+    }
+    if let (Some(timing), Err(fault)) = (&timing, &applied) {
+        timing.record(if fault.error.class == ErrorClass::BackendTimeout {
+            LocalTimingStage::RunTimeout
+        } else {
+            LocalTimingStage::RunFailed
+        });
+    }
     matches!(
-        send_worker_apply_update(
-            &task.run_id,
-            task.generation,
-            WorkerApplyGuard::None,
-            result,
-            &task.updates,
-        )
-        .await,
+        applied,
         Err(AdapterFault {
             error: RunError {
                 class: ErrorClass::BackendTimeout,
@@ -1704,8 +1749,16 @@ async fn run_http_artifact_status_worker_inner(
     parse_http_job_status_result(value, offer, state, poll_interval_ms)
 }
 
+#[cfg(test)]
 async fn run_local_text_worker_inner(
     task: &mut LocalTextWorkerTask,
+) -> std::result::Result<ReconcileResult, AdapterFault> {
+    run_local_text_worker_with_timing(task, None).await
+}
+
+async fn run_local_text_worker_with_timing(
+    task: &mut LocalTextWorkerTask,
+    timing: Option<&LocalTiming>,
 ) -> std::result::Result<ReconcileResult, AdapterFault> {
     if !matches!(&task.backend, LocalTextBackend::LocalLlama { .. }) {
         require_external_http_containment(task.hosted_socket.as_deref())?;
@@ -1716,6 +1769,9 @@ async fn run_local_text_worker_inner(
     )
     .then(HostedBackendReport::default);
     let mut local_socket = None;
+    // Holds the local execution slot until this run ends; dropping it arms
+    // the engine's idle release.
+    let mut _local_run = None;
     let (api_url, api_key, body, private_endpoint, context_window_tokens) = match &task.backend {
         LocalTextBackend::OpenRouterDecisions {
             api_url,
@@ -1779,6 +1835,19 @@ async fn run_local_text_worker_inner(
             settings,
             requested_output_tokens,
         } => {
+            let run = tokio::select! {
+                biased;
+                _ = task.cancel_rx.wait_for(|cancelled| *cancelled) => {
+                    return Ok(local_cancelled());
+                }
+                run = tokio::time::timeout(
+                    remaining_run_timeout(task.deadline_ms)?,
+                    engines.begin_run(),
+                ) => run
+                    .map_err(|_| map_local_llama_fault(LocalLlamaFault::Timeout))?
+                    .map_err(map_local_llama_fault)?,
+            };
+            _local_run = Some(run);
             let endpoint = engines
                 .endpoint_with_timeout(
                     offer_id,
@@ -1786,9 +1855,14 @@ async fn run_local_text_worker_inner(
                     model,
                     settings,
                     remaining_run_timeout(task.deadline_ms)?,
+                    Some(&mut task.cancel_rx),
                 )
-                .await
-                .map_err(map_local_llama_fault)?;
+                .await;
+            let stop_requested = *task.cancel_rx.borrow();
+            if stop_requested {
+                return Ok(cancel_text_worker(&task.backend).await);
+            }
+            let endpoint = endpoint.map_err(map_local_llama_fault)?;
             let mut body = text_generation_request_body(
                 &task.offer,
                 &endpoint.model,
@@ -1825,15 +1899,20 @@ async fn run_local_text_worker_inner(
             .post(count_url)
             .header("content-type", "application/json")
             .json(&body);
+        if let Some(timing) = timing {
+            timing.record(LocalTimingStage::InputTokensStarted);
+        }
         let counted = tokio::select! {
-            _ = task.cancel_rx.changed() => return Ok(worker_settlement_unknown_result()),
+            biased;
+            _ = task.cancel_rx.changed() => return Ok(cancel_text_worker(&task.backend).await),
             response = count_request.send() => response.map_err(|err| map_text_reqwest_failure(err, true))?,
         };
         if !counted.status().is_success() {
             return Err(map_effect_http_status(&counted, None));
         }
         let count = tokio::select! {
-            _ = task.cancel_rx.changed() => return Ok(worker_settlement_unknown_result()),
+            biased;
+            _ = task.cancel_rx.changed() => return Ok(cancel_text_worker(&task.backend).await),
             response = read_bounded_json_response_async(counted) => response?,
         };
         let input_tokens = count["input_tokens"]
@@ -1845,6 +1924,9 @@ async fn run_local_text_worker_inner(
                     "missing chat input token count",
                 )
             })?;
+        if let Some(timing) = timing {
+            timing.record(LocalTimingStage::InputTokensCompleted);
+        }
         let output_tokens = body["max_tokens"].as_u64().unwrap_or(0);
         if input_tokens.saturating_add(output_tokens) >= u64::from(context_window_tokens) {
             return Err(AdapterFault::context(
@@ -1890,10 +1972,13 @@ async fn run_local_text_worker_inner(
         }
         builder
     };
+    if let Some(timing) = timing {
+        timing.record(LocalTimingStage::GenerationStarted);
+    }
     let response = tokio::select! {
+        biased;
         _ = task.cancel_rx.changed() => {
-            // Closing a local or hosted HTTP stream does not confirm backend stop.
-            return Ok(worker_settlement_unknown_result());
+            return Ok(cancel_text_worker(&task.backend).await);
         }
         response = request.send() => response.map_err(|err| map_text_reqwest_failure(err, private_endpoint))?
     };
@@ -1905,6 +1990,7 @@ async fn run_local_text_worker_inner(
     let mut line = Vec::new();
     let mut event_data = Vec::new();
     let mut stream_state = LocalTextStreamState::new();
+    let mut first_delta_seen = false;
     let mut done = false;
     let mut flush_timer = tokio::time::interval_at(
         tokio::time::Instant::now() + LOCAL_TEXT_DELTA_FLUSH_INTERVAL,
@@ -1915,13 +2001,14 @@ async fn run_local_text_worker_inner(
 
     while !done {
         let next = tokio::select! {
+            biased;
             _ = task.cancel_rx.changed() => {
-                return Ok(worker_settlement_unknown_result());
+                return Ok(cancel_text_worker(&task.backend).await);
             }
             _ = flush_timer.tick(), if timed_flushes < LOCAL_TEXT_TIMED_FLUSH_LIMIT
                 && !stream_state.delta_buffer.is_empty() => {
                 flush_local_text_delta(&task.offer, &task.run_id, task.generation,
-                    &task.updates, &mut stream_state.delta_buffer).await?;
+                    &task.updates, &mut stream_state.delta_buffer, timing).await?;
                 timed_flushes += 1;
                 continue;
             }
@@ -1974,6 +2061,12 @@ async fn run_local_text_worker_inner(
                 match parsed {
                     ParsedTextStreamEvent::Delta(delta) if !delta.is_empty() => {
                         append_local_text_delta(&mut stream_state, &task.offer, &delta)?;
+                        if !first_delta_seen {
+                            if let Some(timing) = timing {
+                                timing.record(LocalTimingStage::FirstDelta);
+                            }
+                            first_delta_seen = true;
+                        }
                         if stream_state.delta_buffer.len() >= LOCAL_TEXT_DELTA_FLUSH_BYTES
                             || local_text_event_bytes(&stream_state.delta_buffer)?
                                 >= task.offer.policy.event_bytes_limit
@@ -1984,11 +2077,15 @@ async fn run_local_text_worker_inner(
                                 task.generation,
                                 &task.updates,
                                 &mut stream_state.delta_buffer,
+                                timing,
                             )
                             .await?;
                         }
                     }
                     ParsedTextStreamEvent::Completed => {
+                        if let Some(timing) = timing {
+                            timing.record(LocalTimingStage::StreamCompleted);
+                        }
                         done = true;
                         break;
                     }
@@ -2022,6 +2119,7 @@ async fn run_local_text_worker_inner(
         task.generation,
         &task.updates,
         &mut stream_state.delta_buffer,
+        timing,
     )
     .await?;
     let output = json!({
@@ -2029,6 +2127,9 @@ async fn run_local_text_worker_inner(
         "text": stream_state.output_text,
     });
     sanitize_output(&output, &task.offer)?;
+    if let Some(timing) = timing {
+        timing.record(LocalTimingStage::GenerationCompleted);
+    }
     Ok(ReconcileResult::Terminal {
         events: Vec::new(),
         status: RunStatus::Completed,
@@ -2040,6 +2141,7 @@ async fn run_local_text_worker_inner(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_decision_worker(
     api_url: &str,
     api_key: Option<&str>,
@@ -2143,15 +2245,98 @@ async fn run_decision_worker(
 
 fn map_local_llama_fault(fault: LocalLlamaFault) -> AdapterFault {
     match fault {
+        LocalLlamaFault::MemoryObservationUnavailable => AdapterFault {
+            error: RunError {
+                class: ErrorClass::ContextRejected,
+                code: "model_memory_observation_unavailable".into(),
+                message: elastos_model_contract::MODEL_MEMORY_OBSERVATION_UNAVAILABLE_MESSAGE
+                    .into(),
+            },
+            detail: None,
+        },
+        LocalLlamaFault::MemoryUnavailable => AdapterFault {
+            error: RunError {
+                class: ErrorClass::ContextRejected,
+                code: "model_memory_unavailable".into(),
+                message: "Not enough free memory for this model. Close other apps, then try again."
+                    .into(),
+            },
+            detail: None,
+        },
         LocalLlamaFault::Timeout => AdapterFault::timeout(
             "model backend timed out",
             "local llama engine health deadline expired",
         ),
-        LocalLlamaFault::Failed => AdapterFault::backend_failed(
-            "model backend failed",
-            "local llama engine was unavailable",
+        LocalLlamaFault::StartFailed => AdapterFault::backend_failed(
+            "The local model engine could not start. Check its installation and try again.",
+            "local llama engine could not start",
         ),
+        LocalLlamaFault::Failed => {
+            AdapterFault::backend_failed("model backend failed", "local llama engine failed")
+        }
     }
+}
+
+async fn cancel_text_worker(backend: &LocalTextBackend) -> ReconcileResult {
+    if let LocalTextBackend::LocalLlama {
+        engines, offer_id, ..
+    } = backend
+    {
+        return cancel_local_execution(engines, offer_id).await;
+    }
+    worker_settlement_unknown_result()
+}
+
+pub(crate) async fn cancel_local_execution(
+    engines: &LocalLlamaEngines,
+    offer_id: &str,
+) -> ReconcileResult {
+    if engines.close_offer(offer_id).await.is_ok() {
+        local_cancelled()
+    } else {
+        worker_settlement_unknown_result()
+    }
+}
+
+fn local_cancelled() -> ReconcileResult {
+    ReconcileResult::Terminal {
+        events: Vec::new(),
+        status: RunStatus::Cancelled,
+        output: None,
+        error: Some(RunError {
+            class: ErrorClass::Cancelled,
+            code: "cancelled".into(),
+            message: "Model run was cancelled.".into(),
+        }),
+        backend_report: None,
+    }
+}
+
+pub(crate) fn pure_local_stop_result(result: &ReconcileResult) -> bool {
+    let ReconcileResult::Terminal {
+        events,
+        status,
+        output: None,
+        error: Some(error),
+        backend_report: None,
+    } = result
+    else {
+        return false;
+    };
+    events.is_empty()
+        && match status {
+            RunStatus::Cancelled => {
+                error.class == ErrorClass::Cancelled
+                    && error.code == "cancelled"
+                    && error.message == "Model run was cancelled."
+            }
+            RunStatus::SettlementUnknown => {
+                error.class == ErrorClass::SettlementUnknown
+                    && error.code == "settlement_unknown"
+                    && error.message == "model backend settlement is unknown"
+            }
+            _ => false,
+        }
 }
 
 fn text_generation_request_body(
@@ -2264,6 +2449,7 @@ async fn flush_local_text_delta(
     generation: u64,
     updates: &mpsc::Sender<WorkerUpdate>,
     delta_buffer: &mut String,
+    timing: Option<&LocalTiming>,
 ) -> std::result::Result<(), AdapterFault> {
     if delta_buffer.is_empty() {
         return Ok(());
@@ -2273,7 +2459,7 @@ async fn flush_local_text_delta(
     while !remaining.is_empty() {
         let end = local_text_chunk_end(remaining, offer.policy.event_bytes_limit)?;
         let delta_event = json!({ "text": &remaining[..end] });
-        send_worker_apply_update(
+        send_worker_apply_update_with_timing(
             run_id,
             generation,
             WorkerApplyGuard::None,
@@ -2286,6 +2472,7 @@ async fn flush_local_text_delta(
                 status: RunStatus::Running,
             },
             updates,
+            timing,
         )
         .await?;
         // Only an applied acknowledgement permits the next chunk.
@@ -2504,6 +2691,19 @@ async fn send_worker_apply_update(
     result: ReconcileResult,
     updates: &mpsc::Sender<WorkerUpdate>,
 ) -> std::result::Result<(), AdapterFault> {
+    send_worker_apply_update_with_timing(run_id, generation, guard, result, updates, None).await
+}
+
+async fn send_worker_apply_update_with_timing(
+    run_id: &str,
+    generation: u64,
+    guard: WorkerApplyGuard,
+    result: ReconcileResult,
+    updates: &mpsc::Sender<WorkerUpdate>,
+    timing: Option<&LocalTiming>,
+) -> std::result::Result<(), AdapterFault> {
+    let started = std::time::Instant::now();
+    let terminal = matches!(&result, ReconcileResult::Terminal { .. });
     let (acknowledge, ack_rx) = oneshot::channel();
     updates
         .send(WorkerUpdate::Apply {
@@ -2515,7 +2715,19 @@ async fn send_worker_apply_update(
         })
         .await
         .map_err(|_| worker_control_lost_fault("worker update channel was dropped"))?;
-    match ack_rx.await {
+    let acknowledgement = ack_rx.await;
+    if let Some(timing) = timing {
+        let outcome = match &acknowledgement {
+            Ok(WorkerApplyAck::Applied) => "applied",
+            Ok(WorkerApplyAck::Rejected) => "rejected",
+            Ok(WorkerApplyAck::TimedOut) => "timeout",
+            Err(_) => "control_lost",
+        };
+        // Applied follows the coordinator's durable reconcile/store_run. Include
+        // channel wait and coordinator work in the acknowledgement duration.
+        timing.acknowledgement(terminal, outcome, started);
+    }
+    match acknowledgement {
         Ok(WorkerApplyAck::Applied) => Ok(()),
         Ok(WorkerApplyAck::Rejected) => Err(worker_update_rejected_fault()),
         Ok(WorkerApplyAck::TimedOut) => Err(AdapterFault::timeout(
@@ -3328,6 +3540,7 @@ fn bound_detail(detail: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::config::{OfferPolicy, MAX_POLL_INTERVAL_MS};
     use elastos_model_contract::RUNTIME_CREATE_BINDING_SCHEMA;
     use std::io::{self, Read, Write};
@@ -3339,6 +3552,116 @@ mod tests {
     };
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn local_memory_refusals_explain_observation_and_capacity_separately() {
+        let unreadable = map_local_llama_fault(LocalLlamaFault::MemoryObservationUnavailable);
+        assert_eq!(unreadable.error.class, ErrorClass::ContextRejected);
+        assert_eq!(
+            unreadable.error.code,
+            "model_memory_observation_unavailable"
+        );
+        assert_eq!(
+            unreadable.error.message,
+            elastos_model_contract::MODEL_MEMORY_OBSERVATION_UNAVAILABLE_MESSAGE
+        );
+        assert!(unreadable.detail.is_none());
+        let insufficient = map_local_llama_fault(LocalLlamaFault::MemoryUnavailable);
+        assert_eq!(insufficient.error.class, ErrorClass::ContextRejected);
+        assert_eq!(insufficient.error.code, "model_memory_unavailable");
+        assert_eq!(
+            insufficient.error.message,
+            "Not enough free memory for this model. Close other apps, then try again."
+        );
+        assert!(
+            !insufficient.error.message.contains("smaller model"),
+            "the refusal cannot know a smaller model that fits exists"
+        );
+        assert!(insufficient.detail.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_engine_start_failure_explains_install_recovery_and_reaps_child() {
+        use crate::test_support::{sha256_file, temp_root_path, write_fake_llama_server};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root_path("model-provider-engine-start", "missing-library");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let (engine_path, model_path, events) = write_fake_llama_server(&root, "loader_failure");
+        let engines = LocalLlamaEngines::default();
+        let (update_tx, mut update_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let mut task = LocalTextWorkerTask {
+            request_id: "fixture-engine-start".into(),
+            hosted_socket: None,
+            run_id: "run-engine-start".into(),
+            generation: 1,
+            backend: LocalTextBackend::LocalLlama {
+                engines: engines.clone(),
+                offer_id: "local-text".into(),
+                engine: LocalArtifactConfig {
+                    sha256: sha256_file(&engine_path),
+                    path: engine_path.to_string_lossy().into_owned(),
+                },
+                model: LocalArtifactConfig {
+                    sha256: sha256_file(&model_path),
+                    path: model_path.to_string_lossy().into_owned(),
+                },
+                settings: LocalLlamaSettings {
+                    context_size: 256,
+                    parallel: 1,
+                    threads: 1,
+                    batch_threads: 1,
+                    gpu_layers: 0,
+                    health_timeout_ms: 30_000,
+                    shutdown_timeout_ms: 5_000,
+                    enable_thinking: false,
+                },
+                requested_output_tokens: None,
+            },
+            offer: offer(),
+            deadline_ms: now_ms().saturating_add(30_000),
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            cancel_rx,
+            updates: update_tx,
+        };
+
+        let error = run_local_text_worker_inner(&mut task)
+            .await
+            .unwrap_err()
+            .error;
+        assert_eq!(error.class, ErrorClass::BackendFailed);
+        assert_eq!(error.code, "backend_failed");
+        assert_eq!(
+            error.message,
+            "The local model engine could not start. Check its installation and try again."
+        );
+        assert!(!error.message.contains("libgomp"));
+        assert!(std::fs::read_to_string(events)
+            .unwrap()
+            .contains("loader_failure"));
+        assert!(update_rx.try_recv().is_err());
+        engines.shutdown().await.unwrap();
+        assert!(!engines.retains_artifacts().await);
+    }
+
+    #[test]
+    fn local_backend_failures_keep_install_recovery_specific_to_startup() {
+        let failure = map_local_llama_fault(LocalLlamaFault::Failed);
+        assert_eq!(failure.error.class, ErrorClass::BackendFailed);
+        assert_eq!(failure.error.code, "backend_failed");
+        assert_eq!(failure.error.message, "model backend failed");
+        let startup = map_local_llama_fault(LocalLlamaFault::StartFailed);
+        assert_eq!(startup.error.class, ErrorClass::BackendFailed);
+        assert_eq!(startup.error.code, "backend_failed");
+        assert_eq!(
+            startup.error.message,
+            "The local model engine could not start. Check its installation and try again."
+        );
+    }
 
     #[derive(Clone)]
     struct HttpResponseSpec {
@@ -4864,8 +5187,15 @@ mod tests {
                 .build()
                 .unwrap();
             let result = runtime.block_on(async move {
-                flush_local_text_delta(&offer, "run-rejected", 1, &update_tx, &mut delta_buffer)
-                    .await
+                flush_local_text_delta(
+                    &offer,
+                    "run-rejected",
+                    1,
+                    &update_tx,
+                    &mut delta_buffer,
+                    None,
+                )
+                .await
             });
             result_tx.send(result).unwrap();
         });
@@ -5490,5 +5820,37 @@ mod tests {
         assert!(fault.unwrap_err().error.message.contains("paused"));
         TEST_EXTERNAL_HTTP_ALLOWED.with(|allowed| allowed.set(true));
         assert!(sink.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn current_backend_state_producers_fit_journal_reservation() {
+        let limit = crate::journal::MAX_RUN_BACKEND_STATE_BYTES as usize;
+        for cancel in [false, true] {
+            assert!(
+                serde_json::to_vec(&serialize_local_text_backend_state(cancel).unwrap())
+                    .unwrap()
+                    .len()
+                    <= limit
+            );
+        }
+        assert!(
+            serde_json::to_vec(&serialize_http_job_creating_backend_state().unwrap())
+                .unwrap()
+                .len()
+                <= limit
+        );
+        let state = HttpJobBackendState {
+            schema: HTTP_JOB_BACKEND_STATE_SCHEMA.into(),
+            phase: HTTP_JOB_BACKEND_STATE_ACTIVE.into(),
+            job_id: "\\".repeat(MAX_BACKEND_JOB_ID_BYTES),
+            next_poll_at_ms: u64::MAX,
+            cancel_requested: true,
+            cancel_sent: true,
+            cancel_deadline_ms: Some(u64::MAX),
+        };
+        validate_job_id(&state.job_id).unwrap();
+        let encoded = serialize_http_job_backend_state(&state).unwrap();
+        parse_http_job_backend_state(&encoded).unwrap();
+        assert!(serde_json::to_vec(&encoded).unwrap().len() <= limit);
     }
 }

@@ -205,6 +205,27 @@
     });
   }
 
+  // The shell's size class (`elastos:shell-layout`): phone means the shell's
+  // own title bar sits above the frame and no window controls overlay it, so
+  // elastos-ui.css drops the desktop chrome safe areas and capsules take
+  // their phone layout. Unknown values clear the attribute (desktop).
+  const FORM_FACTORS = ["phone", "tablet", "desktop"];
+  const POINTERS = ["coarse", "fine"];
+
+  function setOrClear(name, value, allowed) {
+    if (allowed.includes(value)) {
+      document.documentElement.setAttribute(name, value);
+    } else {
+      document.documentElement.removeAttribute(name);
+    }
+  }
+
+  function applyShellLayout(layout) {
+    const value = layout && typeof layout === "object" ? layout : {};
+    setOrClear("data-el-form-factor", value.formFactor, FORM_FACTORS);
+    setOrClear("data-el-pointer", value.pointer, POINTERS);
+  }
+
   // Opaque-sandboxed frames (no allow-same-origin) own no browser-profile
   // storage, so persistence stays with the host and the shell relays
   // preferences by message instead. Cross-frame updates arrive as
@@ -215,6 +236,10 @@
       return;
     }
     const message = event.data || {};
+    if (message.type === "elastos:shell-layout") {
+      applyShellLayout(message.layout);
+      return;
+    }
     if (message.type !== "elastos:ui-preference") {
       return;
     }

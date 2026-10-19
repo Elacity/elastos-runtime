@@ -2,7 +2,7 @@
 
 This map names stable responsibility areas in this source tree. Exact install
 membership comes from [`components.json`](../../components.json), current truth
-from [`state.md`](../../state.md), and supported contracts from the linked
+from [GitHub issues](https://github.com/Elacity/elastos-runtime/issues), and supported contracts from the linked
 documentation. This file must not be used as release evidence.
 
 The [layered C4 model](c4.md) owns the system diagrams. This file owns the path
@@ -13,8 +13,6 @@ index so the two do not drift into competing topology descriptions.
 | Path | Responsibility |
 | --- | --- |
 | `PRINCIPLES.md` | Stable decision constraints |
-| `state.md` | Verified current behavior and limitations |
-| `TASKS.md` | Open work |
 | `AGENTS.md` | Agent and operator process |
 | `components.json` | Install profiles and component artifacts |
 | `elastos/` | Trusted Runtime workspace, Bus contract, and host tools |
@@ -105,7 +103,7 @@ adapters under `elastos/tools/` and `elastos/crates/elastos-vz` or
 `elastos/crates/elastos-crosvm`.
 
 [Browser capsule](../BROWSER_CAPSULE.md), [Browser VM target](../BROWSER_VM_TARGET.md),
-and `state.md` define the contract and current proof level.
+define the contract; GitHub issues hold the current proof level.
 
 ## Private network path
 
@@ -119,7 +117,7 @@ Primary implementation areas are the Runtime capability and provider registry,
 `elastos-server/src/carrier.rs`, `capsules/net-provider`, and
 `capsules/exit-provider`. Source presence is not proof that the complete
 private-network product is implemented. See the
-[private network contract](../PRIVATE_NETWORK.md) and current `state.md`.
+[private network contract](../PRIVATE_NETWORK.md) and GitHub issues.
 
 ## Model path
 

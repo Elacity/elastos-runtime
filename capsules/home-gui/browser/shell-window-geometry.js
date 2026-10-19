@@ -11,6 +11,8 @@ import {
   clamp,
   endShellInteraction,
 } from "./shell-core.js?v=home-20260813a";
+import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
+import { registerStageGesture } from "./shell-popovers.js?v=home-20260813a";
 
 const WINDOW_MIN_VISIBLE_DRAG_WIDTH = 96;
 const WINDOW_MIN_VISIBLE_DRAG_HEIGHT = 32;
@@ -315,6 +317,12 @@ export function attachWindowDrag(windowNode, handle, focusWindow, onWindowGeomet
     if (event.target.closest("button")) {
       return;
     }
+    // Phone windows fill the stage: the title bar is a gesture surface, not
+    // a drag handle. Focus still follows the touch.
+    if (isPhone()) {
+      focusWindow(windowNode.dataset.windowId);
+      return;
+    }
     hideWindowSnapPreview();
     focusWindow(windowNode.dataset.windowId);
     const workspaceRect = desktop.getBoundingClientRect();
@@ -343,6 +351,9 @@ export function attachWindowDrag(windowNode, handle, focusWindow, onWindowGeomet
     };
     beginShellInteraction();
     handle.setPointerCapture(event.pointerId);
+    // One pointer drags or resizes at a time; a stage reset ends it as a cancel.
+    const pointerId = event.pointerId;
+    registerStageGesture("window-geometry", () => stopDrag({ type: "pointercancel", pointerId }));
   });
 
   handle.addEventListener("pointermove", (event) => {
@@ -410,7 +421,7 @@ export function attachWindowResize(windowNode, focusWindow, onWindowGeometryChan
     const directions = handle.dataset.resize || "";
 
     handle.addEventListener("pointerdown", (event) => {
-      if (windowNode.dataset.maximized === "true") {
+      if (windowNode.dataset.maximized === "true" || isPhone()) {
         return;
       }
       event.stopPropagation();
@@ -433,6 +444,8 @@ export function attachWindowResize(windowNode, focusWindow, onWindowGeometryChan
       };
       beginShellInteraction();
       handle.setPointerCapture(event.pointerId);
+      const pointerId = event.pointerId;
+      registerStageGesture("window-geometry", () => stopResize({ type: "pointercancel", pointerId }));
     });
 
     handle.addEventListener("pointermove", (event) => {

@@ -7,6 +7,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { PARENT_PIPE_ENV, parentPipeFd, forwardedParentPipeEnv } from "./browser-vm-control-service.mjs";
 
 const REQUEST_ENV = "ELASTOS_BROWSER_ENGINE_REQUEST";
 const CONTROL_SOCKET_ENV = "ELASTOS_BROWSER_VM_CONTROL_SOCKET";
@@ -302,6 +303,7 @@ function vmControlEnvFingerprintFields({ dataDir, platform, root }) {
 function vmControlConfigFingerprint({ config, controlService, dataDir, platform, root }) {
   return sha256Json({
     config,
+    owner: process.env[PARENT_PIPE_ENV] || null,
     env: vmControlEnvFingerprintFields({ dataDir, platform, root }),
     artifacts: {
       control_service: controlServiceArtifactFingerprints(controlService),
@@ -340,6 +342,19 @@ function applyRemoteVzControlDefaults(config) {
   return config;
 }
 
+function kvmStatus() {
+  let fd;
+  try {
+    fd = fs.openSync("/dev/kvm", fs.constants.O_RDWR);
+    if (!fs.fstatSync(fd).isCharacterDevice()) throw new Error("KVM device is not a character device");
+    return { ok: true, path: "/dev/kvm" };
+  } catch (error) {
+    return { ok: false, path: "/dev/kvm", reason: error.code || error.message };
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 function collectPreflight({ dataDir, platform }) {
   const rootfs = process.env.ELASTOS_BROWSER_VM_ROOTFS || path.join(dataDir, "browser-vm/rootfs.ext4");
   const controlSocket = process.env[CONTROL_SOCKET_ENV] || "";
@@ -356,7 +371,7 @@ function collectPreflight({ dataDir, platform }) {
     const crosvm = process.env.ELASTOS_BROWSER_VM_CROSVM_BIN || path.join(dataDir, "bin/crosvm");
     const kernel = process.env.ELASTOS_BROWSER_VM_KERNEL || path.join(dataDir, "bin/vmlinux");
     const local = {
-      kvm: { ok: fs.existsSync("/dev/kvm"), path: "/dev/kvm" },
+      kvm: kvmStatus(),
       crosvm: pathStatus(crosvm),
       kernel: pathStatus(kernel),
       rootfs: common.rootfs,
@@ -378,7 +393,7 @@ function collectPreflight({ dataDir, platform }) {
       reason: remoteReady
         ? "Browser VM control socket is available; local KVM/VZ is not required on this host."
         : localMissing.includes("kvm")
-          ? `Local crosvm Browser VM is unavailable because /dev/kvm is missing. This is acceptable for a gateway host if ${CONTROL_SOCKET_ENV} points at a remote/operator Browser VM provider.`
+          ? "Browser virtualization is unavailable to this Home user. Complete the installer host-access step, or choose another approved Engine."
           : "Browser VM launch is unavailable until a control socket is configured or the local substrate is provisioned.",
       kvm: local.kvm,
       crosvm: local.crosvm,
@@ -583,7 +598,7 @@ function sanitizedVmControlServiceEnv({ config, dataDir, root, platform }) {
   return serviceEnv;
 }
 
-function startLocalVmControlService({ controlSocket, dataDir, platform, root, expectedFingerprint }) {
+export function startLocalVmControlService({ controlSocket, dataDir, platform, root, expectedFingerprint }) {
   if (!localVmControlServiceAvailable({ dataDir, platform })) return false;
   const controlService = process.env[CONTROL_SERVICE_ENV] || path.join(dataDir, "bin/browser-vm-control-service");
   const launcher = localControlLauncherForPlatform({ dataDir, platform });
@@ -607,12 +622,15 @@ function startLocalVmControlService({ controlSocket, dataDir, platform, root, ex
     vmControlConfigFingerprint({ config, controlService, dataDir, platform, root });
   const logPath = process.env[CONTROL_SERVICE_LOG_ENV] || path.join(dataDir, "logs/browser-vm-control-service.log");
   fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
+  const ownerFd = parentPipeFd(true);
   const logFd = fs.openSync(logPath, "a");
   try {
     const child = spawn(controlService, [], {
       detached: true,
-      env: sanitizedVmControlServiceEnv({ config, dataDir, root, platform }),
-      stdio: ["ignore", logFd, logFd],
+      // A separate group preserves the VM flush budget across Runtime's TERM.
+      // The adapter lifetime pipe owns this group even after this launcher exits.
+      env: forwardedParentPipeEnv(sanitizedVmControlServiceEnv({ config, dataDir, root, platform })),
+      stdio: ["ignore", logFd, logFd, ownerFd],
     });
     child.on("error", (error) => {
       process.stderr.write(`Browser VM control service auto-start failed: ${error.message}\n`);
@@ -1038,4 +1056,4 @@ async function main() {
   fail(`Browser VM engine target is not launch-ready. ${preflight.reason} Set ${CONTROL_SOCKET_ENV} to a Browser VM control service; on no-KVM gateway hosts this should point at a remote/operator VM provider instead of requiring local KVM. Preflight: ${JSON.stringify(preflight)}`);
 }
 
-main().catch(fail);
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch(fail);

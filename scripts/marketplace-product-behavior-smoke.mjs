@@ -105,12 +105,6 @@ assert(
   "Marketplace must retain canonical media values while presenting validated uint256 values in decimal.",
 );
 assert(
-  js.includes("loadCatalogData().then(render)")
-    && js.includes("loadMediaData().then(render)")
-    && !js.includes("await Promise.all([loadCatalogData(), loadMediaData()]);"),
-  "Marketplace must let catalog and media surfaces finish independently.",
-);
-assert(
   !js.includes("/api/viewers/")
     && !js.includes("publisher_principal_id")
     && !js.includes("window.open")

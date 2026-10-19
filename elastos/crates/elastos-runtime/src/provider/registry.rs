@@ -18,7 +18,10 @@ use elastos_common::localhost::{parse_localhost_path, parse_localhost_uri};
 fn private_ipfs_operation(op: &str) -> bool {
     matches!(
         op,
-        "runtime_prepare_backend" | "runtime_hash_staged_directory" | "runtime_check_capacity"
+        "runtime_prepare_backend"
+            | "runtime_hash_staged_directory"
+            | "runtime_check_capacity"
+            | "runtime_add_local_object"
     )
 }
 
@@ -26,8 +29,8 @@ fn private_ipfs_unavailable() -> ProviderError {
     ProviderError::Provider("local content preparation unavailable".into())
 }
 
-fn private_model_configuration(target: &str, op: &str) -> bool {
-    target.eq_ignore_ascii_case("model") && op == "init"
+fn private_provider_configuration(target: &str, op: &str) -> bool {
+    (target.eq_ignore_ascii_case("model") || target.eq_ignore_ascii_case("ipfs")) && op == "init"
 }
 
 fn model_index_stream(invocation: &ProviderInvocation) -> bool {
@@ -55,19 +58,27 @@ struct LocalStagedDirectory<'a> {
     total_bytes: u64,
 }
 
+fn checked_local_root(root: &std::path::Path) -> Result<&str, ProviderError> {
+    let root = root.to_str().ok_or_else(private_ipfs_unavailable)?;
+    if !root.starts_with('/')
+        || root.len() > 4096
+        || root.contains('\0')
+        || root[1..].split('/').count() > 64
+        || root[1..].split('/').any(|p| matches!(p, "" | "." | ".."))
+    {
+        return Err(private_ipfs_unavailable());
+    }
+    Ok(root)
+}
+
 impl<'a> LocalStagedDirectory<'a> {
     fn checked(
         root: &'a std::path::Path,
         files: &'a [(String, u64)],
         total_bytes: u64,
     ) -> Result<Self, ProviderError> {
-        let root = root.to_str().ok_or_else(private_ipfs_unavailable)?;
-        if !root.starts_with('/')
-            || root.len() > 4096
-            || root.contains('\0')
-            || root[1..].split('/').count() > 64
-            || root[1..].split('/').any(|p| matches!(p, "" | "." | ".."))
-            || files.is_empty()
+        let root = checked_local_root(root)?;
+        if files.is_empty()
             || files.len() > 33
             || total_bytes == 0
             || total_bytes > 16 * 1024 * 1024 * 1024
@@ -119,10 +130,39 @@ impl<'a> LocalStagedDirectory<'a> {
     }
 }
 
+/// One complete local Content object directory: its manifest's files plus
+/// `_elastos_object.json`. The provider validates the full path shape.
+#[derive(serde::Serialize)]
+struct LocalObjectDirectory<'a> {
+    root: &'a str,
+    files: Vec<LocalStagedFile<'a>>,
+}
+
+const MAX_LOCAL_OBJECT_FILES: usize = 4096;
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalDirectoryHashResult {
     cid: String,
+}
+
+impl LocalDirectoryHashResult {
+    /// The wrapped directory root: a CIDv1 dag-pb sha2-256 in base32.
+    fn directory_cid(result: LocalIpfsResult<Self>) -> Result<String, ProviderError> {
+        match result {
+            LocalIpfsResult::Ok {
+                data: Some(Self { cid }),
+            } if cid.len() == 59
+                && cid.starts_with("bafybei")
+                && cid
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)) =>
+            {
+                Ok(cid)
+            }
+            _ => Err(private_ipfs_unavailable()),
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -255,6 +295,8 @@ pub enum ProviderError {
     Unavailable(String),
     /// IO error
     Io(std::io::Error),
+    /// A verified local volume cannot fit the requested bytes and shared reserve.
+    NotEnoughFreeSpace(elastos_common::NotEnoughFreeSpace),
 }
 
 /// Provider-to-provider invocation transfer contract.
@@ -564,6 +606,7 @@ impl std::fmt::Display for ProviderError {
             ProviderError::NoProvider(scheme) => write!(f, "no provider for scheme: {}", scheme),
             ProviderError::Unavailable(msg) => write!(f, "peer unavailable: {}", msg),
             ProviderError::Io(e) => write!(f, "IO error: {}", e),
+            ProviderError::NotEnoughFreeSpace(e) => std::fmt::Display::fmt(e, f),
         }
     }
 }
@@ -636,8 +679,14 @@ const RESERVED_SUB_NAMES: &[&str] = &[
 ];
 
 /// Reserved names for provider targets that only Runtime invocation can reach.
-const RESERVED_RUNTIME_PROVIDER_TARGETS: &[&str] =
-    &["protect", "media", "custody", "protected-content-decrypt"];
+const RESERVED_RUNTIME_PROVIDER_TARGETS: &[&str] = &[
+    "protect",
+    "media",
+    "custody",
+    "protected-content-decrypt",
+    "collaboration.history",
+    "collaboration.shared",
+];
 
 /// Registry of providers
 pub struct ProviderRegistry {
@@ -1309,6 +1358,7 @@ impl ProviderRegistry {
                 .await
                 .map_err(|_| unavailable())?
                 .map_err(|error| {
+                    tracing::info!("local model activation request failed");
                     tracing::debug!(?error, "private model activation failed");
                     unavailable()
                 })?;
@@ -1316,6 +1366,12 @@ impl ProviderRegistry {
         if response["status"] != "ok" {
             let code = response["code"].as_str().unwrap_or("");
             let message = response["message"].as_str().unwrap_or("");
+            let reason = match message {
+                "model activation pending" => "model activation pending",
+                "model activation closure unconfirmed" => "model activation closure unconfirmed",
+                _ => "model activation refused",
+            };
+            tracing::info!(reason, "local model activation refused");
             let detail = [code, message]
                 .into_iter()
                 .filter(|part| !part.is_empty())
@@ -1447,23 +1503,40 @@ impl ProviderRegistry {
                 &serde_json::json!({"op":"runtime_hash_staged_directory","directory":directory}),
             )
             .await?;
-        match result {
-            LocalIpfsResult::Ok {
-                data: Some(LocalDirectoryHashResult { cid }),
-            } if cid.len() == 59
-                && cid.starts_with("bafybei")
-                && cid
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)) =>
-            {
-                Ok(cid)
-            }
-            _ => Err(private_ipfs_unavailable()),
+        LocalDirectoryHashResult::directory_cid(result)
+    }
+
+    /// Stream one complete local Content object directory into the local Kubo,
+    /// unpinned, without loading its files. The provider opens the root below
+    /// its data root and every file without following links. Content compares
+    /// the returned CID before it pins; capsules and Carrier cannot reach this.
+    pub async fn add_local_ipfs_object(
+        &self,
+        root: &std::path::Path,
+        files: &[(String, u64)],
+    ) -> Result<String, ProviderError> {
+        let root = checked_local_root(root)?;
+        if files.is_empty() || files.len() > MAX_LOCAL_OBJECT_FILES {
+            return Err(private_ipfs_unavailable());
         }
+        let object = LocalObjectDirectory {
+            root,
+            files: files
+                .iter()
+                .map(|(path, size)| LocalStagedFile { path, size: *size })
+                .collect(),
+        };
+        let result = self
+            .send_local_ipfs_preparation(
+                &serde_json::json!({"op":"runtime_add_local_object","object":object}),
+            )
+            .await?;
+        LocalDirectoryHashResult::directory_cid(result)
     }
 
     /// Observe the actual Ready backend volume through the exact local provider.
     /// The inventory owns reservations; this result grants no retention or admission.
+    /// Content and model downloads keep the shared free-space reserve on the backend volume.
     pub async fn check_local_ipfs_capacity(
         &self,
         required_bytes: u64,
@@ -1486,13 +1559,14 @@ impl ProviderRegistry {
             || observation.capacity_bytes == 0
             || observation.available_bytes > observation.capacity_bytes
             || observation.required_bytes != required_bytes
-            || observation
-                .available_bytes
-                .checked_sub(required_bytes)
-                .is_none_or(|remaining| remaining < observation.capacity_bytes.div_ceil(10))
         {
             return Err(private_ipfs_unavailable());
         }
+        elastos_common::require_free_space(
+            u128::from(observation.available_bytes),
+            u128::from(required_bytes),
+        )
+        .map_err(ProviderError::NotEnoughFreeSpace)?;
         Ok(observation)
     }
 
@@ -1524,9 +1598,9 @@ impl ProviderRegistry {
         target: &str,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
-        if private_model_configuration(target, request["op"].as_str().unwrap_or_default()) {
+        if private_provider_configuration(target, request["op"].as_str().unwrap_or_default()) {
             return Err(ProviderError::Provider(
-                "model configuration is Runtime-owned".into(),
+                "provider configuration is Runtime-owned".into(),
             ));
         }
         if request
@@ -1566,9 +1640,9 @@ impl ProviderRegistry {
         request: &serde_json::Value,
         include_runtime_only: bool,
     ) -> Result<serde_json::Value, ProviderError> {
-        if private_model_configuration(scheme, request["op"].as_str().unwrap_or_default()) {
+        if private_provider_configuration(scheme, request["op"].as_str().unwrap_or_default()) {
             return Err(ProviderError::Provider(
-                "model configuration is Runtime-owned".into(),
+                "provider configuration is Runtime-owned".into(),
             ));
         }
         if request
@@ -1627,14 +1701,14 @@ impl ProviderRegistry {
         &self,
         invocation: ProviderInvocation,
     ) -> Result<serde_json::Value, ProviderError> {
-        if private_model_configuration(&invocation.target, &invocation.op)
-            || private_model_configuration(
+        if private_provider_configuration(&invocation.target, &invocation.op)
+            || private_provider_configuration(
                 &invocation.target,
                 invocation.request["op"].as_str().unwrap_or_default(),
             )
         {
             return Err(ProviderError::Provider(
-                "model configuration is Runtime-owned".into(),
+                "provider configuration is Runtime-owned".into(),
             ));
         }
         if private_ipfs_operation(&invocation.op)
@@ -2965,7 +3039,9 @@ mod tests {
                     serde_json::json!({"status":"ok","data":{"cid":"bafybeihgnsjhpoktqbyspaqv6moblyny3txs5nkjdxfx7wm346odxkhlrm"}})
                 }
                 "runtime_check_capacity" => serde_json::json!({"status":"ok","data":{
-                    "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":request["required_bytes"]
+                    "volume_id":7,"capacity_bytes":1_u64 << 40,
+                    "available_bytes":elastos_common::FREE_SPACE_RESERVE_BYTES + 110,
+                    "required_bytes":request["required_bytes"]
                 }}),
                 _ => panic!("unexpected operation"),
             })
@@ -3210,11 +3286,13 @@ mod tests {
         let carrier = Arc::new(MockCarrierInvoker::default());
         registry.set_carrier_invoker(carrier.clone()).await;
         for op in [
+            "init",
             "runtime_prepare_backend",
             "runtime_hash_staged_directory",
             "runtime_check_capacity",
+            "runtime_add_local_object",
         ] {
-            let request = serde_json::json!({"op":op,"directory":{"root":"/private/fixture"}});
+            let request = serde_json::json!({"op":op,"directory":{"root":"/private/fixture"}, "config":{"base_path":"/private/fixture", "extra":{"runtime_host_role":"gateway"}}});
             assert!(registry.send_raw("ipfs", &request).await.is_err());
             assert!(registry
                 .send_runtime_provider_target_raw("ipfs", &request)
@@ -3361,15 +3439,31 @@ mod tests {
                 observed.available_bytes,
                 observed.required_bytes
             ),
-            (7, 1000, 110, 10)
+            (
+                7,
+                1 << 40,
+                elastos_common::FREE_SPACE_RESERVE_BYTES + 110,
+                10
+            )
         );
         assert_eq!(
             provider.requests.lock().await.as_slice(),
             &[serde_json::json!({"op":"runtime_check_capacity","required_bytes":10})]
         );
-        assert!(registry.check_local_ipfs_capacity(11).await.is_err());
+        // Exactly the work plus the shared reserve fits; one byte less does not.
+        assert!(registry.check_local_ipfs_capacity(110).await.is_ok());
+        let refused = registry.check_local_ipfs_capacity(111).await.unwrap_err();
+        assert!(matches!(refused, ProviderError::NotEnoughFreeSpace(space) if space.needed == 111));
+        *provider.response.lock().await = Some(serde_json::json!({"status":"ok","data":{
+            "volume_id":7,"capacity_bytes":1000,"available_bytes":5,"required_bytes":10
+        }}));
+        assert!(
+            matches!(registry.check_local_ipfs_capacity(10).await.unwrap_err(),
+            ProviderError::NotEnoughFreeSpace(space) if space.needed == 10)
+        );
         let valid = serde_json::json!({"status":"ok","data":{
-            "volume_id":7,"capacity_bytes":1000,"available_bytes":110,"required_bytes":10
+            "volume_id":7,"capacity_bytes":1_u64 << 40,
+            "available_bytes":elastos_common::FREE_SPACE_RESERVE_BYTES + 110,"required_bytes":10
         }});
         let mut malformed = vec![
             serde_json::json!({"status":"ok"}),
@@ -3379,9 +3473,8 @@ mod tests {
             ("volume_id", serde_json::json!(0)),
             ("volume_id", serde_json::json!("private-repo-path")),
             ("capacity_bytes", serde_json::json!(0)),
-            ("capacity_bytes", serde_json::json!(1001)),
-            ("available_bytes", serde_json::json!(1001)),
-            ("available_bytes", serde_json::json!(9)),
+            ("capacity_bytes", serde_json::json!(109)),
+            ("available_bytes", serde_json::json!((1_u64 << 40) + 1)),
             ("required_bytes", serde_json::json!(11)),
             ("required_bytes", serde_json::json!(u64::MAX)),
             ("repo_path", serde_json::json!("private-repo-path")),
@@ -4537,7 +4630,14 @@ mod tests {
             .register_sub_provider("decrypt", Arc::new(RawMockProvider))
             .await
             .unwrap();
-        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+        for target in [
+            "protect",
+            "media",
+            "custody",
+            "protected-content-decrypt",
+            "collaboration.history",
+            "collaboration.shared",
+        ] {
             registry
                 .register_runtime_provider_target(target, Arc::new(RawMockProvider))
                 .await
@@ -4564,7 +4664,14 @@ mod tests {
         assert_eq!(registry.sub_provider_schemes().await, vec!["decrypt"]);
         assert!(!registry.has_ready_runtime_provider_target("decrypt").await);
         let registrations = registry.registrations().await;
-        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+        for target in [
+            "protect",
+            "media",
+            "custody",
+            "protected-content-decrypt",
+            "collaboration.history",
+            "collaboration.shared",
+        ] {
             let protected = registry
                 .invoke_provider(ProviderInvocation {
                     source: "runtime".to_string(),
@@ -4618,7 +4725,14 @@ mod tests {
             .register_sub_provider("decrypt", Arc::new(MockProvider::new()))
             .await
             .unwrap();
-        for target in ["protect", "media", "custody", "protected-content-decrypt"] {
+        for target in [
+            "protect",
+            "media",
+            "custody",
+            "protected-content-decrypt",
+            "collaboration.history",
+            "collaboration.shared",
+        ] {
             registry
                 .register_runtime_provider_target(target, Arc::new(RawMockProvider))
                 .await

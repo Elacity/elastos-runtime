@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { renderServiceSelection } from "./browser-service-selection.js";
+import { engineChoiceHidden, renderServiceSelection } from "./browser-service-selection.js";
 
 function selectElement() {
   return {
@@ -48,4 +48,16 @@ test("automatic selection stays with Runtime as the inventory changes", () => {
     });
     assert.equal(select.value, "");
   }
+});
+
+test("one engine that Automatic uses is not offered as a choice", () => {
+  const local = { id: "browser-vm-product", backing_substrate: "local_microvm" };
+  assert.equal(engineChoiceHidden([local], ""), true);
+  assert.equal(engineChoiceHidden([], ""), true);
+  assert.equal(engineChoiceHidden([local], "browser-vm-product"), false, "an explicit choice stays visible");
+  assert.equal(engineChoiceHidden([{ id: "mac-remote", backing_substrate: "remote_operator_vm" }], ""), false,
+    "Automatic skips remote VMs, so the remote engine stays choosable");
+  assert.equal(engineChoiceHidden([{ id: "remote-engine-aa", backing_substrate: "local_microvm" }], ""), false,
+    "a granted remote service is never picked by Automatic, so it stays choosable");
+  assert.equal(engineChoiceHidden([local, { id: "jetson", backing_substrate: "local_microvm" }], ""), false);
 });

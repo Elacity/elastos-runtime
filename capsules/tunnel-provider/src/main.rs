@@ -10,10 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
-    Some(version) => version,
-    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-};
+const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -291,10 +288,7 @@ impl TunnelProvider {
             return Ok(found);
         }
 
-        Err(
-            "cloudflared not found. Run: elastos setup --with cloudflared"
-                .to_string(),
-        )
+        Err("cloudflared not found. Run: elastos setup --with cloudflared".to_string())
     }
 }
 

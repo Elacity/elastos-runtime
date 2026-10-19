@@ -76,9 +76,10 @@ export function syncAgentSendButton(input = composerInput()) {
   }
   const hasText = hasMeaningfulComposerContent(input);
   btn.dataset.mode = "send";
-  btn.disabled = !hasText || !selectedLiveOffer();
+  const hasModel = Boolean(selectedLiveOffer());
+  btn.disabled = !hasText || !hasModel;
   btn.setAttribute("aria-label", "Send");
-  btn.title = hasText ? "Send" : "Enter a message to send";
+  btn.title = !hasModel ? "Get a model to start" : hasText ? "Send" : "Enter a message to send";
 }
 
 export function setAgentComposerProcessing(isProcessing) {
@@ -751,20 +752,19 @@ function toggleVoiceDictation() {
   startVoiceDictation();
 }
 
+// Home frames apps without the microphone permission, so dictation can only
+// work where the embedding page grants it.
+function microphoneAllowed() {
+  const policy = document.permissionsPolicy || document.featurePolicy;
+  return policy?.allowsFeature?.("microphone") === true;
+}
+
 function bindVoiceDictation() {
   const btn = micButton();
-  const Ctor = speechRecognitionCtor();
-  if (!btn) {
+  if (!btn || !speechRecognitionCtor() || !microphoneAllowed()) {
     return;
   }
-  if (!Ctor) {
-    btn.disabled = true;
-    btn.setAttribute("aria-disabled", "true");
-    btn.title = "Voice dictation needs speech recognition in this browser";
-    btn.setAttribute("aria-label", "Voice dictation unavailable");
-    btn.dataset.dictationState = "error";
-    return;
-  }
+  btn.hidden = false;
   btn.disabled = false;
   btn.removeAttribute("aria-disabled");
   setDictationState("idle");

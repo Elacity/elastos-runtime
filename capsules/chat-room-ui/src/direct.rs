@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub(super) const DIRECT_API_BASE: &str = "/api/apps/chat-room/direct";
@@ -15,6 +17,8 @@ pub(super) struct DirectUiState {
 #[serde(deny_unknown_fields)]
 pub(super) struct DirectConversationList {
     pub(super) conversations: Vec<DirectConversationView>,
+    #[serde(default)]
+    pub(super) community_unread: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -25,6 +29,9 @@ pub(super) struct DirectConversationView {
     /// The relationship ended. History stays readable; composing stops.
     #[serde(default)]
     pub(super) removed: bool,
+    /// A message arrived that this person has not opened yet.
+    #[serde(default)]
+    pub(super) unread: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -38,6 +45,8 @@ pub(super) struct DirectMessageList {
 #[serde(deny_unknown_fields)]
 pub(super) struct DirectMessageView {
     pub(super) message_id: String,
+    #[serde(default)]
+    pub(super) request_id: Option<String>,
     pub(super) direction: DirectMessageDirection,
     pub(super) text: String,
     pub(super) created_at: u64,
@@ -68,7 +77,7 @@ impl DirectDeliveryState {
             Self::Received => "Received",
             Self::Pending => "Sending",
             Self::ReceiptSettled => "Sent",
-            Self::Expired => "Not delivered",
+            Self::Expired => "Expired",
         }
     }
 }
@@ -78,6 +87,78 @@ pub(super) struct DirectSendInput<'a> {
     pub(super) request_id: &'a str,
     pub(super) conversation_id: &'a str,
     pub(super) text: &'a str,
+    pub(super) retry_existing: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct DirectSendFailure {
+    #[serde(skip)]
+    pub(super) status: u16,
+    #[serde(default)]
+    pub(super) code: Option<String>,
+}
+
+pub(super) fn terminal_retry_detail(code: Option<&str>) -> Option<&'static str> {
+    match code {
+        Some("retry_expired") => Some("The 24-hour delivery window ended. Delivery is unconfirmed. Send again creates a new message."),
+        Some("retry_unavailable") => Some("The original message is unavailable to retry. Delivery is unconfirmed. Send again creates a new message."),
+        _ => None,
+    }
+}
+
+/// How long an outgoing direct message stays "Sending" before Chat explains
+/// it. The Runtime retries pending envelopes every 15 seconds, up to four per
+/// pass (`DIRECT_SYNC_CADENCE_SECS`, `retry_pending`), so after a minute the
+/// first automatic retries have already failed.
+pub(super) const PENDING_NOTE_AFTER_MS: f64 = 60_000.0;
+
+/// Remembers when this Chat session first saw each outgoing message pending,
+/// on the browser's monotonic clock; the Runtime's `created_at` comes from
+/// another clock and is not compared with it. A message that is no longer
+/// pending is forgotten. Other conversations' entries are kept.
+pub(super) fn track_pending_since(
+    seen: &mut BTreeMap<String, f64>,
+    messages: &[DirectMessageView],
+    now_ms: f64,
+) {
+    for message in messages {
+        if message.direction == DirectMessageDirection::Outgoing
+            && message.delivery_state == DirectDeliveryState::Pending
+        {
+            seen.entry(message.message_id.clone()).or_insert(now_ms);
+        } else {
+            seen.remove(&message.message_id);
+        }
+    }
+}
+
+/// Milliseconds until a message first seen pending at `seen_at_ms` gets its
+/// note; zero once it is due.
+pub(super) fn pending_note_wait_ms(seen_at_ms: f64, now_ms: f64) -> f64 {
+    (seen_at_ms + PENDING_NOTE_AFTER_MS - now_ms).max(0.0)
+}
+
+/// The note under a pending outgoing direct message: once it is due, or after
+/// a manual Retry (with when it ran). The Runtime retries only messages to a
+/// current contact (`retry_pending`), so a removed conversation gets no retry
+/// claim. Chat cannot know whether the peer stored the message and only the
+/// receipt is missing, or why a peer is unreachable.
+pub(super) fn pending_delivery_note(
+    due: bool,
+    contact_current: bool,
+    retried_at: Option<&str>,
+) -> Option<String> {
+    if !due && retried_at.is_none() {
+        return None;
+    }
+    let mut note = String::from("Delivery unconfirmed.");
+    if contact_current {
+        note.push_str(" Your Home keeps trying while it is on, for up to 24 hours.");
+    }
+    if let Some(time) = retried_at {
+        note.push_str(&format!(" Tried again at {time}."));
+    }
+    Some(note)
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -232,6 +313,7 @@ mod tests {
             conversation_id: id.to_string(),
             display_name: name.to_string(),
             removed: false,
+            unread: false,
         }
     }
 
@@ -335,8 +417,7 @@ mod tests {
         );
         assert_eq!(state.messages[0].delivery_state.label(), "Sent");
 
-        // The terminal state parses and renders honestly: an abandoned
-        // message says "Not delivered", never "Sending".
+        // Without a receipt, expiry leaves delivery unconfirmed.
         let expired: DirectMessageList = serde_json::from_value(serde_json::json!({
             "conversation_id": "direct:one",
             "messages": [{
@@ -353,7 +434,109 @@ mod tests {
             state.messages[0].delivery_state,
             DirectDeliveryState::Expired
         );
-        assert_eq!(state.messages[0].delivery_state.label(), "Not delivered");
+        assert_eq!(state.messages[0].delivery_state.label(), "Expired");
+    }
+
+    #[test]
+    fn pending_note_waits_on_this_session_clock_not_created_at() {
+        let message = |id: &str, created_at: u64, state: &str| -> DirectMessageView {
+            serde_json::from_value(serde_json::json!({
+                "message_id": id, "request_id": format!("chat-message:{id}"),
+                "direction": "outgoing", "text": "hi", "created_at": created_at,
+                "delivery_state": state,
+            }))
+            .unwrap()
+        };
+        // One created_at far behind and one far ahead of the browser clock:
+        // both wait exactly the threshold from when this session saw them.
+        let mut seen = BTreeMap::new();
+        let first = 5_000.0;
+        let messages = [
+            message("old", 1, "pending"),
+            message("future", u64::MAX, "pending"),
+        ];
+        track_pending_since(&mut seen, &messages, first);
+        track_pending_since(&mut seen, &messages, first + 30_000.0);
+        for id in ["old", "future"] {
+            assert_eq!(seen[id], first, "first sight is kept");
+            assert_eq!(pending_note_wait_ms(seen[id], first), PENDING_NOTE_AFTER_MS);
+            assert_eq!(
+                pending_note_wait_ms(seen[id], first + PENDING_NOTE_AFTER_MS - 1.0),
+                1.0
+            );
+            assert_eq!(
+                pending_note_wait_ms(seen[id], first + PENDING_NOTE_AFTER_MS),
+                0.0
+            );
+        }
+        // Settled messages are forgotten; other conversations' are kept.
+        seen.insert("elsewhere".to_string(), 1.0);
+        track_pending_since(&mut seen, &[message("old", 1, "receipt_settled")], first);
+        assert!(!seen.contains_key("old") && seen.contains_key("elsewhere"));
+        let incoming: DirectMessageView = serde_json::from_value(serde_json::json!({
+            "message_id": "in", "direction": "incoming", "text": "hi", "created_at": 1,
+            "delivery_state": "received",
+        }))
+        .unwrap();
+        track_pending_since(&mut seen, &[incoming], first);
+        assert!(!seen.contains_key("in"));
+    }
+
+    #[test]
+    fn pending_note_claims_retries_only_for_a_current_contact() {
+        assert_eq!(pending_delivery_note(false, true, None), None);
+        assert_eq!(
+            pending_delivery_note(true, true, None).unwrap(),
+            "Delivery unconfirmed. Your Home keeps trying while it is on, for up to 24 hours."
+        );
+        // The Runtime does not retry a removed contact's messages.
+        assert_eq!(
+            pending_delivery_note(true, false, None).unwrap(),
+            "Delivery unconfirmed."
+        );
+        // A manual Retry shows when it ran, even before the threshold.
+        assert_eq!(
+            pending_delivery_note(false, true, Some("14:03")).unwrap(),
+            "Delivery unconfirmed. Your Home keeps trying while it is on, for up to 24 hours. Tried again at 14:03."
+        );
+    }
+
+    #[test]
+    fn retry_fields_are_opted_product_fields_and_terminal_codes_are_distinct() {
+        let messages: DirectMessageList = serde_json::from_value(serde_json::json!({
+            "conversation_id":"direct:one", "messages":[{
+                "message_id":"message:one", "request_id":"chat-message:one",
+                "direction":"outgoing", "text":"hello", "created_at":42, "delivery_state":"pending"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            messages.messages[0].request_id.as_deref(),
+            Some("chat-message:one")
+        );
+        assert_eq!(messages.messages[0].delivery_state.label(), "Sending");
+        let legacy: DirectConversationList =
+            serde_json::from_value(serde_json::json!({"conversations":[]})).unwrap();
+        assert_eq!(legacy.community_unread, None);
+        let current: DirectConversationList =
+            serde_json::from_value(serde_json::json!({"conversations":[],"community_unread":true}))
+                .unwrap();
+        assert_eq!(current.community_unread, Some(true));
+        assert!(terminal_retry_detail(Some("retry_expired"))
+            .unwrap()
+            .contains("24-hour"));
+        assert!(terminal_retry_detail(Some("retry_unavailable"))
+            .unwrap()
+            .contains("unavailable"));
+        assert!(terminal_retry_detail(Some("conflict")).is_none());
+        assert!(terminal_retry_detail(None).is_none());
+        let retry = DirectSendInput {
+            request_id: "old",
+            conversation_id: "direct:one",
+            text: "hello",
+            retry_existing: true,
+        };
+        assert_eq!(serde_json::to_value(retry).unwrap()["retry_existing"], true);
     }
 
     #[test]

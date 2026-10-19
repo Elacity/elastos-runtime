@@ -8,6 +8,7 @@
 pub mod auth_gateway;
 pub mod browser_capsules;
 pub mod browser_engine_protocol;
+mod browser_profile_reset;
 pub mod browser_sessions;
 pub(crate) mod capsule_inventory;
 // Runtime startup composition; this is not a capsule operation or HTTP route.
@@ -25,6 +26,8 @@ mod model_provider_config;
 pub mod model_provider_egress;
 #[cfg(unix)]
 mod model_provider_egress_decision;
+#[cfg(target_os = "macos")]
+pub use model_provider_config::model_provider_engine_bundle;
 #[cfg(test)]
 pub(crate) use model_provider_config::seed_model_provider_operator_offers_for_test;
 pub(crate) use model_provider_config::{

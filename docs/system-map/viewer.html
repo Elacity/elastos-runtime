@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="elastos-c4-sha256" content="8fd2490220023146c36152d3435e66500184aa0096e4ad1ab78f452ed2e2b2dc">
+  <meta name="elastos-c4-sha256" content="31d0f266b20ca2f54ebb5efab4cf49a572b6b58b864104cd85417d22c175bc19">
   <title>ElastOS C4 model</title>
   <style>
     :root {
@@ -258,7 +258,7 @@
         This is a hash-bound projection of
         <a href="c4.md">the canonical C4 document</a>. If they disagree, the
         Markdown is correct and this viewer is wrong. Current product proof
-        remains in <a href="../../state.md">state.md</a>.
+        lives in <a href="https://github.com/Elacity/elastos-runtime/issues">GitHub issues</a>.
       </div>
     </aside>
 
@@ -630,10 +630,10 @@
         {
           id: "deployment", group: "Deployment", number: "14", level: "C4 · Deployment",
           title: "One node and one peer", question: "Where do the Level 2 containers run on a local installation?",
-          note: "This is a generic deployment view. Assign target roles from verified host capabilities recorded in state.md.",
+          note: "This is a generic deployment view. Assign target roles from verified host capabilities recorded in the owning GitHub issue.",
           groups: [G(15, 25, 215, 670, "Person device · Deployment node"), G(250, 25, 720, 670, "ElastOS host machine · Deployment node")],
           nodes: [
-            N("browser", 35, 90, "Browser / installed PWA", "external", "Execution environment", "Loads Home. Runtime owns Browser display and engine selection; state.md records implementation evidence.", null, 175, 125),
+            N("browser", 35, 90, "Browser / installed PWA", "external", "Execution environment", "Loads Home. Runtime owns Browser display and engine selection.", null, 175, 125),
             N("home", 35, 285, "Home front door", "container", "Container instance", "Sign-in and shell lifecycle.", null, 175, 95),
             N("projections", 35, 490, "Shell + App projections", "container", "Container instances", "Product facts and narrow Runtime intents.", null, 175, 105),
             N("host", 300, 90, "elastos process", "container", "Container instance", "Gateway, Runtime, Carrier, and collaboration.", null, 220, 115),

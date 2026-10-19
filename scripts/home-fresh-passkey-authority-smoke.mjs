@@ -78,7 +78,7 @@ const freshOperations = [
   ["capsules/wallet/browser/wallet-requests.js", ["wallet.approve"], "headers"],
   ["capsules/system/browser/system.js", ["auth.full-recovery-bundle.export"], "headers"],
   [
-    "capsules/inbox/browser/index.html",
+    "capsules/inbox/browser/inbox.js",
     ["wallet.approve", "inspect.approve"],
     "inbox-action",
   ],

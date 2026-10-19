@@ -2,8 +2,7 @@
 
 Each top-level ledger has one job:
 
-- [state.md](../state.md): current verified behavior and known gaps
-- [TASKS.md](../TASKS.md): open work
+- [GitHub issues](https://github.com/Elacity/elastos-runtime/issues): current behavior, known gaps and open work
 - [ROADMAP.md](../ROADMAP.md): future direction
 - [elastos/CHANGELOG.md](../elastos/CHANGELOG.md): released history
 - [PRINCIPLES.md](../PRINCIPLES.md): decision constraints
@@ -73,8 +72,6 @@ Each top-level ledger has one job:
   topic membership, gossip operations, and trust limits
 - [Model provider](MODEL_PROVIDER.md): provider and model selection, streams,
   cancellation, recovery, and terminal outcomes
-- [Model package handoff](MODEL_PACKAGE_HANDOFF.md): signed model package inputs
-  and verification
 - [Chain provider](CHAIN_PROVIDER.md): typed chain reads, proofs, and transactions
 - [Wallet provider](WALLET_PROVIDER.md): account, proof, approval, and signing authority
 - [Protected content](PROTECTED_CONTENT.md): sealed object access sequence

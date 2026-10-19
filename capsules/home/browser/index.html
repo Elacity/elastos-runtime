@@ -14,7 +14,7 @@
     <link rel="manifest" href="./manifest.webmanifest?v=home-20260805a" />
     <link rel="icon" href="./elastos-home-icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./elastos-home-icon-192.png" />
-    <link rel="stylesheet" href="./style.css?v=home-20260726a" />
+    <link rel="stylesheet" href="./style.css?v=home-20261017a" />
   </head>
   <body data-home-status="booting" data-home-shell="resolving" data-home-gui="resolving">
     <div class="home-host-shell">
@@ -82,6 +82,9 @@
                 </span>
               </button>
               <p id="home-unlock-person-name" class="home-unlock-account-name" hidden></p>
+              <p id="home-unlock-face-status" class="home-unlock-face-status" data-tone="muted" role="status" aria-live="polite" hidden></p>
+              <button id="home-unlock-create" class="home-unlock-create" type="button" hidden>Create account</button>
+              <button id="home-recover-owner" class="home-unlock-recover" type="button">Recover this Home with your Recovery Kit</button>
             </div>
           </div>
         </div>
@@ -114,6 +117,8 @@
           <p id="home-unlock-name-hint" hidden>The name people will see. Discovery starts off.</p>
           <label id="home-owner-token-label" for="home-owner-token" hidden>Operator enrollment token</label>
           <input id="home-owner-token" class="home-unlock-input" type="password" maxlength="64" autocomplete="off" spellcheck="false" hidden />
+          <label id="home-owner-recovery-code-label" for="home-owner-recovery-code" hidden>Code from the terminal</label>
+          <input id="home-owner-recovery-code" class="home-unlock-input" type="password" maxlength="128" autocomplete="off" spellcheck="false" hidden />
           <div class="home-unlock-actions">
             <button id="home-unlock-primary" class="home-unlock-button" type="button">Use passkey</button>
             <button id="home-unlock-secondary" class="home-unlock-button home-unlock-button-secondary" type="button" hidden>Create guest account</button>
@@ -125,7 +130,7 @@
 
       <section
         id="home-clipboard-prompt"
-        class="home-clipboard-prompt"
+        class="home-prompt"
         role="dialog"
         aria-modal="true"
         aria-labelledby="home-clipboard-title"
@@ -133,21 +138,57 @@
         aria-hidden="true"
         hidden
       >
-        <div class="home-clipboard-card">
-          <p class="home-clipboard-eyebrow">ElastOS Clipboard</p>
+        <div class="home-prompt-card">
+          <p class="home-prompt-eyebrow">ElastOS Clipboard</p>
           <h1 id="home-clipboard-title">Clipboard request</h1>
           <p id="home-clipboard-copy"></p>
-          <div class="home-clipboard-actions">
+          <div class="home-prompt-actions">
             <button
               id="home-clipboard-allow"
-              class="home-clipboard-button"
+              class="home-prompt-button"
               type="button"
             >
               Continue
             </button>
             <button
               id="home-clipboard-cancel"
-              class="home-clipboard-button home-clipboard-button-secondary"
+              class="home-prompt-button home-prompt-button-secondary"
+              type="button"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section
+        id="home-link-prompt"
+        class="home-prompt"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="home-link-title"
+        aria-describedby="home-link-asker home-link-host home-link-address"
+        aria-hidden="true"
+        hidden
+      >
+        <div class="home-prompt-card">
+          <p class="home-prompt-eyebrow">Web link</p>
+          <h1 id="home-link-title">Open this link?</h1>
+          <p id="home-link-asker"><span id="home-link-app"></span> wants to open this address in your browser.</p>
+          <p id="home-link-host" class="home-link-host"></p>
+          <p id="home-link-address" class="home-link-address"></p>
+          <div class="home-prompt-actions">
+            <button
+              id="home-link-open"
+              class="home-prompt-button"
+              type="button"
+              disabled
+            >
+              Open link
+            </button>
+            <button
+              id="home-link-cancel"
+              class="home-prompt-button home-prompt-button-secondary"
               type="button"
             >
               Cancel
@@ -157,6 +198,6 @@
       </section>
     </div>
 
-    <script type="module" src="./home-shell-host.js?v=home-20260802a"></script>
+    <script type="module" src="./home-shell-host.js?v=home-update-20261017b"></script>
   </body>
 </html>

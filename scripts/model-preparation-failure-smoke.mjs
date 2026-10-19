@@ -9,8 +9,8 @@ for (const capsule of ["system", "marketplace"]) {
 }
 const context = { window: {} };
 vm.runInNewContext(source.replace("window.ElastosModelManagement = {",
-  "window.testFailure = { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT }; window.ElastosModelManagement = {"), context);
-const { parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT } = context.window.testFailure;
+  "window.testFailure = { capacityText, parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT, DISPATCH_UNAVAILABLE_TEXT }; window.ElastosModelManagement = {"), context);
+const { capacityText, parseRuntime, operationRuntime, failureText, catalogEntries, selectCatalogEntry, phaseOf, PHASE_TEXT, COMPACT_PHASE_TEXT, DISPATCH_UNAVAILABLE_TEXT } = context.window.testFailure;
 const cid = `bafybei${"a".repeat(52)}`;
 const preparation = { operation_id: "fixture", cid, state: "failed", total_bytes: 1024,
   completed_bytes: 512, cancel_requested: false, admitted: false, activation_pending: false };
@@ -18,7 +18,11 @@ const runtime = { admitted: false, kept: false, dispatch_ready: false, offer_id:
 for (const [code, message] of Object.entries({
   authorization_unavailable: "Preparation stopped. Open Models again to check access.",
   policy_unavailable: "Preparation stopped. Model policy is unavailable.",
-  capacity_unavailable: "Preparation stopped. Storage capacity is unavailable.",
+  capacity_unavailable: "Not enough free disk space for this model. Free some space, then Retry.",
+  download_interrupted: "The download stopped before it finished. Retry.",
+  storage_service_unavailable: "The storage service is unavailable. Retry when it is running.",
+  cache_budget_unavailable: "This model does not fit the local cache budget. Remove an unneeded model, choose a smaller model, or increase the budget, then Retry.",
+  memory_budget_unavailable: "This model exceeds the local model memory budget. Choose a smaller model or increase the budget, then Retry.",
   content_unavailable: "Preparation failed. Model content could not be read.",
   local_storage_unavailable: "Preparation failed. Local storage could not be written.",
   verification_failed: "Preparation failed. Model verification did not pass.",
@@ -37,11 +41,28 @@ for (const invalid of ["/private/provider?credential=secret", "__proto__", "cons
   preparation.failure_class = invalid;
   assert.throws(() => parseRuntime(runtime, cid), /Invalid model response/);
 }
+preparation.failure_class = null;
+const admitted = { ...preparation, state: "admitted", admitted: true, failure_class: null, activation_pending: true };
+const unavailable = { ...runtime, admitted: true, preparation: admitted };
+for (const reason of ["unsupported_host", "source_engine_required", "catalog_updated", "cache_budget_unavailable", "memory_budget_unavailable"]) {
+  const value = { ...unavailable, dispatch_unavailable_reason: reason };
+  assert.equal(parseRuntime(value, cid).dispatch_unavailable_reason, reason);
+  assert.equal(operationRuntime({ ...value, ...admitted }, cid).dispatch_unavailable_reason, reason);
+  assert.throws(() => parseRuntime({ ...value, dispatch_ready: true, offer_id: `model:${"b".repeat(64)}` }, cid), /Invalid model response/);
+  assert.throws(() => parseRuntime({ ...runtime, dispatch_unavailable_reason: reason }, cid), /Invalid model response/);
+}
+for (const invalid of ["/private/provider?credential=secret", "__proto__", "constructor", ["unsupported_host"], { toString: () => "unsupported_host" }, {}, 7]) {
+  assert.throws(() => parseRuntime({ ...unavailable, dispatch_unavailable_reason: invalid }, cid), /Invalid model response/);
+  assert.throws(() => operationRuntime({ ...unavailable, ...admitted, dispatch_unavailable_reason: invalid }, cid), /Invalid model response/);
+}
+assert.deepEqual(Object.keys(DISPATCH_UNAVAILABLE_TEXT).sort(), ["cache_budget_unavailable", "catalog_updated", "memory_budget_unavailable", "source_engine_required", "unsupported_host"],
+  "every Runtime dispatch_unavailable_reason class has copy");
+assert.equal(DISPATCH_UNAVAILABLE_TEXT.unsupported_host, "Local AI is not supported on this device.");
 const otherCid = `bafybei${"c".repeat(51)}e`;
 const catalogRow = (id, title) => ({
   name: title, title, role: "content", source: "signed-model-catalog", installed: false, launchable: false,
   cid: id, publisher_did: "did:key:zFixturePublisher", content_size_bytes: 1024,
-  signature_state: "catalog-signature-verified", model_runtime: {
+  signature_state: "catalog-signature-verified", model_memory_fit: "fits", model_runtime: {
     admitted: false, kept: false, dispatch_ready: false, offer_id: null, preparation: null,
   },
 });
@@ -62,6 +83,7 @@ const projection = (state, extra = {}) => ({ admitted: false, dispatch_ready: fa
 const phases = {
   absent: [projection(null), null], ready: [{ ...projection("admitted"), admitted: true, dispatch_ready: true, offer_id: `model:${"b".repeat(64)}` }, null],
   service_unavailable: [{ ...projection("admitted"), admitted: true }, null],
+  finishing: [{ ...projection("admitted", { activation_pending: true }), admitted: true }, null],
   cancelling: [projection("preparing", { cancel_requested: true }), null], capacity: [projection("capacity_pending"), null],
   settling: [projection("uncertain"), null], verifying: [projection("verifying"), null], preparing: [projection("preparing"), null],
   failed: [projection("failed", { failure_class: "verification_failed" }), null], reclaimed: [projection("reclaimed"), null],
@@ -79,13 +101,18 @@ const plain = table => Object.fromEntries(Object.entries(table));
 assert.deepEqual(plain(PHASE_TEXT), {
   unavailable: "Current status unavailable", ready: "Available on this device",
   service_unavailable: "Available on this device. Model service unavailable.",
-  cancelling: "Cancelling preparation…", capacity: "Waiting for local capacity…", settling: "Waiting for preparation to settle…",
+  finishing: "Finishing setup…",
+  cancelling: "Cancelling preparation…", settling: "Waiting for preparation to settle…",
   verifying: "Checking model files…", preparing: "Preparing local files…", absent: "Ready to prepare",
   reclaimed: "Model removed from local cache.", cancelled: "Preparation cancelled.", expired: "Preparation expired.",
 });
 assert.deepEqual(plain(COMPACT_PHASE_TEXT), { ...plain(PHASE_TEXT), absent: "Not on this device yet", preparing: "Getting the model…",
   reclaimed: "Removed from this device", cancelled: "Stopped before finishing", expired: "Not finished in time" });
-assert.deepEqual(Object.keys(PHASE_TEXT).sort(), Object.keys(phases).filter(name => name !== "failed").sort(), "every phase except failed reads its copy from the table");
+assert.deepEqual(Object.keys(PHASE_TEXT).sort(), Object.keys(phases).filter(name => !["failed", "capacity"].includes(name)).sort(), "every phase except failed and capacity reads its copy from the table");
+assert.equal(capacityText({ total_bytes: 3e9, completed_bytes: 1e9 }),
+  "Waiting for free space. This model needs 2 GB on this Home, plus 2 GB kept free. Free some space and it continues.");
+assert.equal(capacityText({ total_bytes: 3e9, completed_bytes: 1e9, failure_class: "cache_budget_unavailable" }),
+  "Waiting for room in the local cache budget. Remove an unneeded model or increase the budget and it continues.");
 console.log("PASS model preparation failure: safe classes, operation/catalog parity, unknown history, strict rejection, shared copies, explicit two-entry selection, phase copy tables");
 
 // Advance a pending operation beyond the former three-minute polling ceiling.
@@ -95,25 +122,26 @@ class FixtureNode {
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = nodes; }
   setAttribute() {}
-  addEventListener() {}
+  addEventListener(type, listener) { this[`on${type}`] = listener; }
   contains() { return false; }
   focus() {}
 }
-let nextTimer = 0, statusCalls = 0, settled = false;
+let nextTimer = 0, statusCalls = 0, absent = false, settled = false, catalogUpdated = false, activating = false, statusFails = false, clock = 0;
 const timers = new Map();
 const fixtureRoot = new FixtureNode("section");
 const fixtureRuntime = () => ({
-  admitted: settled, kept: false, dispatch_ready: settled,
-  offer_id: settled ? `model:${"b".repeat(64)}` : null,
-  preparation: { operation_id: "long-preparation", cid, state: settled ? "admitted" : "preparing",
+  admitted: settled, kept: false, dispatch_ready: settled && !catalogUpdated && !activating,
+  dispatch_unavailable_reason: catalogUpdated ? "catalog_updated" : null,
+  offer_id: settled && !catalogUpdated && !activating ? `model:${"b".repeat(64)}` : null,
+  preparation: absent ? null : { operation_id: "long-preparation", cid, state: settled ? "admitted" : "preparing",
     total_bytes: 1024, completed_bytes: settled ? 1024 : statusCalls,
-    cancel_requested: false, admitted: settled, activation_pending: false },
+    cancel_requested: false, admitted: settled, activation_pending: settled && activating },
 });
 const fixtureContext = {
   window: { addEventListener() {}, removeEventListener() {} },
   document: { hidden: false, activeElement: null, createElement: tag => new FixtureNode(tag),
     createTextNode: text => ({ textContent: text }), addEventListener() {}, removeEventListener() {} },
-  AbortController, crypto: { randomUUID: () => `poll-${statusCalls}` },
+  AbortController, crypto: { randomUUID: () => `poll-${statusCalls}` }, Date: { now: () => clock },
   setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
   clearTimeout: id => timers.delete(id),
   fetch: async (path, options) => {
@@ -126,10 +154,14 @@ const fixtureContext = {
       })) }, bindings: ["use", "status", "cancel", "retention", "reclaim"].map(operation => ({ method: `content.${operation}`, executable: true })) }] };
     else {
       const request = JSON.parse(options.body);
+      if (request.method === "content.use") return { ok: false, text: async () => JSON.stringify({
+        ...request, schema: "elastos.capsules.invoke-result/v1", status: "error", code: "not_enough_free_space",
+        message: "Not enough free disk space on this Home: this needs 3 GB plus 2 GB kept free. Free some space, then select Get again." }) };
       assert.equal(request.method, "content.status");
       assert.equal(request.input.operation_id, "long-preparation");
+      if (statusFails) return { ok: false, text: async () => "{}" };
       statusCalls++;
-      assert.ok(statusCalls <= 132, "fixture bounds the status requests");
+      assert.ok(statusCalls <= 140, "fixture bounds the status requests");
       const runtime = fixtureRuntime();
       result = { ...request, schema: "elastos.capsules.invoke-result/v1", status: "ok",
         output: { ...runtime, ...runtime.preparation, cid } };
@@ -162,6 +194,85 @@ assert.equal(timers.size, 0, "hidden controller releases timers");
 control.setVisible(true);
 await new Promise(setImmediate);
 assert.equal(pendingPolls().length, 1);
+// A failed status read during a pending preparation (for example a busy
+// inventory) keeps polling quietly with backoff, and the next read recovers.
+const onlyTimer = () => {
+  assert.equal(timers.size, 1, "one status poll stays scheduled");
+  return [...timers][0];
+};
+const fireTimer = async () => {
+  const [id, timer] = onlyTimer(); timers.delete(id); clock += timer.delay; await timer.callback();
+};
+statusFails = true;
+await fireTimer();
+assert.match(visibleText(fixtureRoot), /Checking status…/);
+assert.doesNotMatch(visibleText(fixtureRoot), /Status is unavailable/);
+assert.equal(onlyTimer()[1].delay, 3000, "first failure backs off");
+statusFails = false;
+const beforeRecovery = statusCalls;
+await fireTimer();
+assert.equal(statusCalls, beforeRecovery + 1);
+assert.doesNotMatch(visibleText(fixtureRoot), /Checking status…/);
+assert.equal(pendingPolls().length, 1, "a successful read restores the normal interval");
+// Only a long run of failures stops polling and asks for Refresh.
+statusFails = true;
+const failingFrom = clock, delays = [];
+while (!/Status is unavailable/.test(visibleText(fixtureRoot))) {
+  assert.ok(delays.length < 20, "polling gives up after a bounded run");
+  delays.push(onlyTimer()[1].delay);
+  await fireTimer();
+}
+assert.deepEqual(delays.slice(0, 5), [1500, 3000, 6000, 10000, 10000]);
+assert.ok(clock - failingFrom >= 60000 && delays.length >= 5, "gives up only after several failures over a minute");
+assert.equal(timers.size, 0, "gave up polling");
+statusFails = false;
+await control.refresh();
+assert.doesNotMatch(visibleText(fixtureRoot), /Status is unavailable|Checking status…/);
+assert.equal(pendingPolls().length, 1, "Refresh resumes polling");
+// An admitted model whose engine is still being set up finishes quietly, with
+// no Retry, until the setup deadline passes; then Retry is offered.
+const controlButton = name => (function find(node) {
+  if (node.dataset?.modelControl === name) return node;
+  for (const child of node.children || []) { const hit = find(child); if (hit) return hit; }
+  return null;
+})(fixtureRoot);
+settled = true; activating = true;
+await control.refresh();
+assert.match(visibleText(fixtureRoot), /Finishing setup…/);
+assert.equal(controlButton("use"), null, "finishing setup offers no Retry");
+// Each poll also advances the clock by its 1.5 s interval.
+clock += 117000;
+await fireTimer();
+assert.match(visibleText(fixtureRoot), /Finishing setup…/);
+await fireTimer();
+assert.match(visibleText(fixtureRoot), /Model service unavailable/);
+assert.equal(controlButton("use")?.textContent, "Retry", "a setup past its deadline offers Retry");
+assert.equal(pendingPolls().length, 1, "status keeps polling so a late finish still becomes ready");
+activating = false;
+await fireTimer();
+assert.match(visibleText(fixtureRoot), /Available on this device/);
+assert.doesNotMatch(visibleText(fixtureRoot), /Model service unavailable/);
+// An admission bound to an earlier catalogue head reads as a list update whose
+// next action is the Use button, not as a broken model service.
+settled = true; catalogUpdated = true;
+await control.refresh();
+const useButtonNode = () => (function find(node) {
+  if (node.dataset?.modelControl === "use") return node;
+  for (const child of node.children || []) { const hit = find(child); if (hit) return hit; }
+  return null;
+})(fixtureRoot);
+const useButton = useButtonNode();
+assert.equal(useButton?.textContent, "Use");
+assert.match(visibleText(fixtureRoot), /Model list updated\. Press Use to keep using this model\./);
+assert.doesNotMatch(visibleText(fixtureRoot), /Model service unavailable/);
+// A Get refused for disk space shows the Runtime's plain reason and size, and Get stays available.
+absent = true; settled = false; catalogUpdated = false;
+await control.refresh();
+useButtonNode().onclick();
+await new Promise(setImmediate);
+assert.match(visibleText(fixtureRoot), /Not enough free disk space on this Home: this needs 3 GB plus 2 GB kept free\. Free some space, then select Get again\./);
+assert.doesNotMatch(visibleText(fixtureRoot), /could not be confirmed|Current status unavailable/);
+assert.equal(useButtonNode().disabled, false, "a final refusal leaves Get available");
 control.destroy();
 assert.equal(timers.size, 0, "destroyed controller releases timers");
-console.log("PASS long model preparation: 131 bounded status reads, terminal render, hide and destroy cleanup");
+console.log("PASS long model preparation: 131 bounded status reads, quiet retry after failed reads, bounded give-up, terminal render, hide and destroy cleanup");

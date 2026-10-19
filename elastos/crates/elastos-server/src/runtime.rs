@@ -1,7 +1,7 @@
 //! Core runtime implementation
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 
@@ -28,6 +28,15 @@ pub struct RunningCapsuleInfo {
     pub handle: Option<CapsuleHandle>,
 }
 
+/// Which unsigned local capsules the Runtime admits.
+enum UnsignedCapsules {
+    /// A source or CI Home with `dev_mode = true`.
+    Allowed,
+    /// Only capsules setup installed from the signed release of the Home at this data dir.
+    InstalledRelease(PathBuf),
+    Refused,
+}
+
 /// The main ElastOS runtime
 pub struct Runtime {
     // Keep the storage provider alive for runtime/lifecycle ownership even
@@ -37,9 +46,8 @@ pub struct Runtime {
     compute_providers: Vec<Arc<dyn ComputeProvider>>,
     /// Signature verifier for capsule integrity
     signature_verifier: RwLock<SignatureVerifier>,
-    /// Dev/source mode allows unsigned local capsules. Release paths should set
-    /// this false and configure trusted keys.
-    signature_dev_mode: RwLock<bool>,
+    /// Unsigned capsule admission; signed capsules always use the verifier.
+    unsigned_capsules: RwLock<UnsignedCapsules>,
     /// Provider registry (optional, set when server mode is active)
     provider_registry: RwLock<Option<Arc<ProviderRegistry>>>,
     /// Registry of running capsules (for API queries)
@@ -57,7 +65,7 @@ impl Runtime {
             _storage: storage,
             compute_providers: vec![compute],
             signature_verifier: RwLock::new(SignatureVerifier::new()),
-            signature_dev_mode: RwLock::new(false),
+            unsigned_capsules: RwLock::new(UnsignedCapsules::Refused),
             provider_registry: RwLock::new(None),
             running_capsules: RwLock::new(HashMap::new()),
             component_provider: None,
@@ -74,7 +82,7 @@ impl Runtime {
             _storage: storage,
             compute_providers,
             signature_verifier: RwLock::new(SignatureVerifier::new()),
-            signature_dev_mode: RwLock::new(false),
+            unsigned_capsules: RwLock::new(UnsignedCapsules::Refused),
             provider_registry: RwLock::new(None),
             running_capsules: RwLock::new(HashMap::new()),
             component_provider,
@@ -158,53 +166,64 @@ impl Runtime {
                 .as_ref()
                 .map(|provider| provider.clone() as Arc<dyn ComputeProvider>);
         }
-        if manifest.capsule_type == CapsuleType::Wasm {
+        if matches!(
+            manifest.execution_type(),
+            CapsuleType::Wasm
+                | CapsuleType::WebProjection
+                | CapsuleType::NativeProvider
+                | elastos_common::CapsuleType::NativeHost
+        ) {
             return None;
         }
         self.get_provider(&manifest.capsule_type)
     }
 
-    /// Get mutable access to the signature verifier for configuration
-    pub async fn signature_verifier(&self) -> tokio::sync::RwLockWriteGuard<'_, SignatureVerifier> {
-        self.signature_verifier.write().await
-    }
-
-    /// Configure capsule manifest signature verification from runtime config.
+    /// Configure capsule admission for the Home at `data_dir`.
     ///
-    /// `dev_mode=true` is the source-home/dev escape hatch for unsigned local
-    /// capsules. With `dev_mode=false`, at least one trusted key is required
-    /// and unsigned capsules fail closed.
-    pub async fn configure_signature_verification(
+    /// An installed signed release always enforces signatures: its publisher
+    /// keys and `trusted_keys` verify signed capsules, and an unsigned capsule
+    /// is admitted only when setup installed it from that release by CID. Other
+    /// Homes admit unsigned capsules only with `dev_mode = true`, which source
+    /// and CI Homes set explicitly.
+    pub async fn configure_capsule_admission(
         &self,
+        data_dir: &Path,
         trusted_keys: &[String],
         dev_mode: bool,
     ) -> Result<()> {
+        let installed = crate::setup::installed_release_source(data_dir)
+            .map_err(|e| ElastosError::InvalidManifest(e.to_string()))?;
         let mut verifier = SignatureVerifier::new();
         for key in trusted_keys {
             verifier.add_trusted_key_hex(key)?;
         }
-
-        if !dev_mode && !verifier.is_enabled() {
-            return Err(ElastosError::InvalidManifest(
-                "Capsule signature enforcement requires trusted_keys; set dev_mode = true for source-home/dev unsigned capsules".into(),
-            ));
+        for did in installed.iter().flat_map(|source| &source.publisher_dids) {
+            let key = crate::crypto::decode_did_key(did)
+                .map_err(|e| ElastosError::InvalidManifest(e.to_string()))?;
+            verifier.add_trusted_key(key);
         }
-
         let trusted_key_count = verifier.trusted_key_count();
-        *self.signature_verifier.write().await = verifier;
-        *self.signature_dev_mode.write().await = dev_mode;
-
-        if dev_mode {
-            tracing::warn!(
+        let unsigned = match (installed, dev_mode) {
+            (Some(_), _) => UnsignedCapsules::InstalledRelease(data_dir.to_path_buf()),
+            (None, true) => UnsignedCapsules::Allowed,
+            (None, false) => UnsignedCapsules::Refused,
+        };
+        match &unsigned {
+            UnsignedCapsules::Allowed => tracing::warn!(
                 "Capsule signature verification running in dev_mode=true; unsigned local capsules are allowed"
-            );
-        } else {
-            tracing::info!(
-                "Capsule signature verification enforced with {} trusted key(s)",
+            ),
+            UnsignedCapsules::InstalledRelease(_) => tracing::info!(
+                "Capsule signatures enforced for the installed release with {} trusted key(s); unsigned capsules only from the signed release{}",
+                trusted_key_count,
+                if dev_mode { " (config.toml dev_mode does not apply)" } else { "" }
+            ),
+            UnsignedCapsules::Refused => tracing::info!(
+                "Capsule signatures enforced with {} trusted key(s)",
                 trusted_key_count
-            );
+            ),
         }
-
+        *self.signature_verifier.write().await = verifier;
+        *self.unsigned_capsules.write().await = unsigned;
         Ok(())
     }
 
@@ -334,23 +353,32 @@ impl Runtime {
         manifest: &CapsuleManifest,
         path: &Path,
     ) -> Result<()> {
-        let verifier = self.signature_verifier.read().await;
-
-        let dev_mode = *self.signature_dev_mode.read().await;
-
         if manifest.signature.is_none() {
-            if dev_mode {
-                tracing::warn!(
-                    "Unsigned capsule '{}' allowed because dev_mode=true",
+            return match &*self.unsigned_capsules.read().await {
+                UnsignedCapsules::Allowed => {
+                    tracing::warn!(
+                        "Unsigned capsule '{}' allowed because dev_mode=true",
+                        manifest.name
+                    );
+                    Ok(())
+                }
+                UnsignedCapsules::InstalledRelease(data_dir) => {
+                    crate::setup::verify_installed_release_capsule(data_dir, &manifest.name, path)
+                        .map_err(|e| {
+                            ElastosError::InvalidManifest(format!(
+                                "Capsule '{}' is unsigned and not from the installed signed release: {e:#}",
+                                manifest.name
+                            ))
+                        })
+                }
+                UnsignedCapsules::Refused => Err(ElastosError::InvalidManifest(format!(
+                    "Capsule '{}' is unsigned; only a source or development Home with dev_mode = true runs unsigned capsules",
                     manifest.name
-                );
-                return Ok(());
-            }
-
-            return Err(ElastosError::InvalidManifest(
-                "Capsule is unsigned and dev_mode=false".into(),
-            ));
+                ))),
+            };
         }
+
+        let verifier = self.signature_verifier.read().await;
 
         if !verifier.is_enabled() {
             return Err(ElastosError::InvalidManifest(
@@ -673,41 +701,161 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_signature_mode_requires_trusted_keys() {
-        let (runtime, _temp_dir) = test_runtime().await;
+    async fn home_without_installed_release_runs_unsigned_capsules_only_in_dev_mode() {
+        let (runtime, temp_dir) = test_runtime().await;
+        for dev_mode in [false, true] {
+            runtime
+                .configure_capsule_admission(temp_dir.path(), &[], dev_mode)
+                .await
+                .unwrap();
+            let result = runtime
+                .verify_capsule_signature(&unsigned_manifest(), temp_dir.path())
+                .await;
+            assert_eq!(result.is_ok(), dev_mode, "{result:?}");
+        }
+    }
 
-        let err = runtime
-            .configure_signature_verification(&[], false)
+    /// An installed Home whose config.toml still says `dev_mode = true` (the
+    /// earlier default) admits only its signed release's capsules and capsules
+    /// signed by the release publisher.
+    #[tokio::test]
+    async fn installed_release_refuses_unsigned_and_foreign_signed_local_capsules() {
+        let mut home = crate::installed_release::tests::Fixture::new();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/components/bus-v1");
+        let manifest_json = std::fs::read(fixture.join("capsule.json")).unwrap();
+        let manifest: CapsuleManifest = serde_json::from_slice(&manifest_json).unwrap();
+        let name = manifest.name.clone();
+        let entrypoint = b"component bytes";
+        let install = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("capsule.json"), &manifest_json).unwrap();
+            std::fs::write(dir.join(&manifest.entrypoint), entrypoint).unwrap();
+        };
+        let (cid, sha256) = ("bafkreirelease", "ab".repeat(32));
+        std::fs::write(
+            home.data.join("components.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "external": {(&name): {
+                    "install_path": format!("capsules/{name}"),
+                    "platforms": {(crate::setup::detect_platform()): {
+                        "cid": cid, "checksum": format!("sha256:{sha256}"),
+                        "extract_path": format!("capsules/{name}")
+                    }}
+                }},
+                "capsules": {(&name): {"cid": cid, "sha256": sha256}},
+                "profiles": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        home.bind_components();
+        let release_dir = home.data.join("capsules").join(&name);
+        install(&release_dir);
+        std::fs::write(release_dir.join(".elastos-cid"), cid).unwrap();
+        std::fs::write(release_dir.join(".elastos-artifact-sha256"), &sha256).unwrap();
+        let local_dir = home.data.join("local").join(&name);
+        install(&local_dir);
+
+        let (runtime, _storage) = test_runtime().await;
+        runtime
+            .configure_capsule_admission(&home.data, &[], true)
+            .await
+            .unwrap();
+        runtime
+            .verify_capsule_signature(&manifest, &release_dir)
+            .await
+            .unwrap();
+        let error = runtime
+            .verify_capsule_signature(&manifest, &local_dir)
             .await
             .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not from the installed signed release"),
+            "{error}"
+        );
 
-        assert!(err.to_string().contains("requires trusted_keys"));
+        let signed_by = |key: u8| {
+            let mut signed = manifest.clone();
+            elastos_runtime::signature::sign_capsule(
+                &elastos_runtime::signature::SigningKey::from_bytes(&[key; 32]),
+                &mut signed,
+                &hash_content(entrypoint),
+            )
+            .unwrap();
+            signed
+        };
+        // The fixture release is signed by key 71.
+        runtime
+            .verify_capsule_signature(&signed_by(71), &local_dir)
+            .await
+            .unwrap();
+        let error = runtime
+            .verify_capsule_signature(&signed_by(9), &local_dir)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("verification failed"), "{error}");
+
+        // A release capsule whose CID receipt no longer matches is refused too.
+        std::fs::write(release_dir.join(".elastos-cid"), "bafkreiother").unwrap();
+        assert!(runtime
+            .verify_capsule_signature(&manifest, &release_dir)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
-    async fn dev_signature_mode_allows_unsigned_capsules() {
-        let (runtime, temp_dir) = test_runtime().await;
+    async fn descriptive_execution_types_refuse_generic_compute() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            LocalFSProvider::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let loads = Arc::new(AtomicUsize::new(0));
+        let runtime = Runtime::new(
+            storage,
+            Arc::new(CountingComputeProvider {
+                loads: loads.clone(),
+            }),
+        );
         runtime
-            .configure_signature_verification(&[], true)
+            .configure_capsule_admission(temp_dir.path(), &[], true)
             .await
             .unwrap();
-
-        runtime
-            .verify_capsule_signature(&unsigned_manifest(), temp_dir.path())
-            .await
+        for source in [
+            include_str!("../../../../templates/capsules/web-app/capsule.json"),
+            include_str!("../../../../templates/capsules/provider-contract/capsule.json"),
+            include_str!("../../../../capsules/model-provider/capsule.json"),
+            include_str!("../../../../capsules/home/capsule.json"),
+            include_str!("../../../capsules/shell/capsule.json"),
+        ] {
+            let manifest: CapsuleManifest = serde_json::from_str(source).unwrap();
+            manifest.validate().unwrap();
+            let capsule_dir = temp_dir.path().join(&manifest.name);
+            std::fs::create_dir_all(
+                capsule_dir.join(std::path::Path::new(&manifest.entrypoint).parent().unwrap()),
+            )
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn strict_signature_mode_rejects_unsigned_capsules() {
-        let (runtime, temp_dir) = test_runtime().await;
-
-        let err = runtime
-            .verify_capsule_signature(&unsigned_manifest(), temp_dir.path())
-            .await
-            .unwrap_err();
-
-        assert!(err.to_string().contains("dev_mode=false"));
+            std::fs::write(
+                capsule_dir.join(&manifest.entrypoint),
+                b"untrusted artifact",
+            )
+            .unwrap();
+            std::fs::write(capsule_dir.join("capsule.json"), source).unwrap();
+            assert!(runtime.get_provider_for_manifest(&manifest).is_none());
+            let error = runtime
+                .run_local(&capsule_dir, Vec::new())
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("No compute provider supports"),
+                "{error}"
+            );
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -724,7 +872,7 @@ mod tests {
         });
         let runtime = Runtime::new(storage, compute);
         runtime
-            .configure_signature_verification(&[], true)
+            .configure_capsule_admission(temp_dir.path(), &[], true)
             .await
             .unwrap();
 
@@ -780,7 +928,7 @@ mod tests {
             Some(component_provider.clone()),
         ));
         runtime
-            .configure_signature_verification(&[], true)
+            .configure_capsule_admission(temp_dir.path(), &[], true)
             .await
             .unwrap();
 
