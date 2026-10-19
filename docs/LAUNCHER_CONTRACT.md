@@ -130,19 +130,28 @@ The gateway handles `SIGTERM` and `SIGINT` by signalling its process group,
 waiting, and then signalling that group again. Exit 75 comes from
 `std::process::exit` in the binary watch and skips that handler.
 
-While the gateway is running, the binary watch exits 75 when the installed
-binary is replaced, when its path changes, or when the watch cannot read it.
-The install transaction replaces that binary by renaming the staged file onto
-the installed path. On Linux that running path then ends in ` (deleted)`.
+While the gateway is running, a replaced installed binary or a changed binary
+hash makes that process exit 75. The install transaction replaces the binary
+by renaming the staged file onto the installed path. On Linux that running
+path then ends in ` (deleted)`, and the watch exits 75. A supervisor starts
+`elastos gateway --addr localhost:8090` again.
+
+A moved path, a path that cannot be read, and a file that could not be
+re-verified wait for one more sample. A replacement on that next sample exits
+75. A second sample with the same failure exits 1. A different failure on
+that next sample, or a move to a different path, waits for one more sample
+instead. The message names
+`elastos gateway --addr localhost:8090` as the recovery command. A supervisor
+leaves that process stopped.
 
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | 0 | The command finished. |
-| 1 | The command failed. A second host for the same data directory is one case. |
+| 1 | The command failed. This includes a second host for the same data directory and a binary watch that confirmed a move, an unreadable path, or a failed re-verify. A supervisor leaves the gateway stopped. |
 | 2 | The `elastos` command line is invalid. |
-| 75 | The running gateway's binary watch exited. |
+| 75 | The running gateway exited because the installed binary was replaced or its hash changed. A supervisor starts the gateway again. |
 
 A supervisor uses these exit codes. It does not parse English sentences from
 stdout. Exit 0 covers more than one successful update outcome. A later issue

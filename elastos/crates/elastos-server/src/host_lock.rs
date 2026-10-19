@@ -431,6 +431,29 @@ struct BinarySupersessionWatch {
     current_exe_path: PathBuf,
     current_exe_stamp: BinaryFileStamp,
     current_binary_sha256: String,
+    /// A move, an unreadable path, or a failed re-hash waits for one more sample.
+    /// Only the same failure on the next sample confirms it.
+    /// The install rename onto the running path is a replacement and does not wait.
+    pending_failure: Option<WatchFailure>,
+}
+
+/// A failed sample of the binary watch. A move names where the path now points,
+/// so moves to two different paths are two different failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchFailure {
+    PathUnreadable,
+    Moved(PathBuf),
+    Unverifiable,
+    ReverifyFailed,
+}
+
+const EXIT_LAUNCHER_RESTART: i32 = 75;
+const EXIT_LAUNCHER_STAYS_STOPPED: i32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Supersession {
+    reason: String,
+    exit_code: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,9 +491,9 @@ pub fn spawn_installed_binary_supersession_watch(data_dir: &Path, role: &str) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Some(reason) = watch.superseded_reason() {
-                eprintln!("[{}] {}", role, reason);
-                std::process::exit(75);
+            if let Some(event) = watch.superseded_reason() {
+                eprintln!("[{}] {}", role, event.reason);
+                std::process::exit(event.exit_code);
             }
         }
     });
@@ -489,19 +512,47 @@ impl BinarySupersessionWatch {
             current_exe_path: current_exe,
             current_exe_stamp: snapshot.stamp,
             current_binary_sha256: snapshot.sha256,
+            pending_failure: None,
         })
     }
 
-    fn superseded_reason(&mut self) -> Option<String> {
+    fn superseded_reason(&mut self) -> Option<Supersession> {
         self.superseded_reason_with(&RealBinarySnapshotReader)
     }
 
-    fn superseded_reason_with(&mut self, reader: &impl BinarySnapshotReader) -> Option<String> {
+    fn restart(&mut self, reason: String) -> Option<Supersession> {
+        self.pending_failure = None;
+        Some(Supersession {
+            reason,
+            exit_code: EXIT_LAUNCHER_RESTART,
+        })
+    }
+
+    /// A single failed sample can be the middle of an install rename.
+    /// The next sample decides. A replacement on that sample restarts.
+    /// A different failure on that sample waits again; only the same failure
+    /// on two samples in a row stops.
+    fn confirm_stop(&mut self, failure: WatchFailure, reason: String) -> Option<Supersession> {
+        if self.pending_failure.as_ref() != Some(&failure) {
+            self.pending_failure = Some(failure);
+            return None;
+        }
+        self.pending_failure = None;
+        Some(Supersession {
+            reason,
+            exit_code: EXIT_LAUNCHER_STAYS_STOPPED,
+        })
+    }
+
+    fn superseded_reason_with(
+        &mut self,
+        reader: &impl BinarySnapshotReader,
+    ) -> Option<Supersession> {
         let current_exe_raw = match reader.current_exe_path_raw() {
             Ok(path) => path,
             Err(err) => {
-                return Some(format!(
-                    "host executable path could not be read for {}: {err:#}. Exiting stale host.",
+                return self.confirm_stop(WatchFailure::PathUnreadable, format!(
+                    "host executable path could not be read for {}: {err:#}. Start `elastos gateway --addr localhost:8090` after the path can be read.",
                     self.current_exe_path.display()
                 ));
             }
@@ -510,15 +561,15 @@ impl BinarySupersessionWatch {
         let current_exe = normalize_deleted_exe_path(&current_exe_raw);
 
         if raw_text.ends_with(" (deleted)") {
-            return Some(format!(
+            return self.restart(format!(
                 "host executable {} was replaced on disk. Exiting stale host.",
                 self.current_exe_path.display()
             ));
         }
 
         if current_exe != self.current_exe_path {
-            return Some(format!(
-                "host executable moved from {} to {}. Exiting stale host.",
+            return self.confirm_stop(WatchFailure::Moved(current_exe.clone()), format!(
+                "host executable moved from {} to {}. Start `elastos gateway --addr localhost:8090` if this Home should run.",
                 self.current_exe_path.display(),
                 current_exe.display()
             ));
@@ -527,34 +578,36 @@ impl BinarySupersessionWatch {
         let current_stamp = match reader.metadata_stamp(&self.current_exe_path) {
             Ok(stamp) => stamp,
             Err(err) => {
-                return Some(format!(
-                    "host executable {} could not be verified on disk: {err:#}. Exiting stale host.",
+                return self.confirm_stop(WatchFailure::Unverifiable, format!(
+                    "host executable {} could not be verified on disk: {err:#}. Start `elastos gateway --addr localhost:8090` after the file can be read.",
                     self.current_exe_path.display()
                 ));
             }
         };
 
         if current_stamp == self.current_exe_stamp {
+            self.pending_failure = None;
             return None;
         }
 
         let current_snapshot = match reader.digest_snapshot(&self.current_exe_path) {
             Ok(snapshot) => snapshot,
             Err(err) => {
-                return Some(format!(
-                    "host executable {} changed on disk and could not be re-verified: {err:#}. Exiting stale host.",
+                return self.confirm_stop(WatchFailure::ReverifyFailed, format!(
+                    "host executable {} could not be re-verified: {err:#}. Start `elastos gateway --addr localhost:8090` after the file can be read.",
                     self.current_exe_path.display()
                 ));
             }
         };
         if current_snapshot.sha256 != self.current_binary_sha256 {
-            return Some(format!(
+            return self.restart(format!(
                 "host binary {} changed on disk. Exiting stale host so the newer binary can take over.",
                 self.current_exe_path.display()
             ));
         }
 
         self.current_exe_stamp = current_snapshot.stamp;
+        self.pending_failure = None;
         None
     }
 }
@@ -770,6 +823,8 @@ mod tests {
     struct TestBinarySnapshotReaderState {
         current_exe_raw: RefCell<PathBuf>,
         digest_reads: Cell<usize>,
+        metadata_failures: Cell<usize>,
+        digest_failures: Cell<usize>,
     }
 
     impl TestBinarySnapshotReader {
@@ -778,8 +833,18 @@ mod tests {
                 state: Rc::new(TestBinarySnapshotReaderState {
                     current_exe_raw: RefCell::new(path),
                     digest_reads: Cell::new(0),
+                    metadata_failures: Cell::new(0),
+                    digest_failures: Cell::new(0),
                 }),
             }
+        }
+
+        fn fail_metadata_once(&self) {
+            self.state.metadata_failures.set(1);
+        }
+
+        fn fail_digest(&self, times: usize) {
+            self.state.digest_failures.set(times);
         }
 
         fn set_current_exe_raw(&self, path: PathBuf) {
@@ -797,10 +862,20 @@ mod tests {
         }
 
         fn metadata_stamp(&self, path: &Path) -> anyhow::Result<BinaryFileStamp> {
+            let remaining = self.state.metadata_failures.get();
+            if remaining > 0 {
+                self.state.metadata_failures.set(remaining - 1);
+                anyhow::bail!("metadata unavailable during replace");
+            }
             metadata_stamp(path)
         }
 
         fn digest_snapshot(&self, path: &Path) -> anyhow::Result<BinarySnapshot> {
+            let remaining = self.state.digest_failures.get();
+            if remaining > 0 {
+                self.state.digest_failures.set(remaining - 1);
+                anyhow::bail!("digest unavailable during replace");
+            }
             self.state
                 .digest_reads
                 .set(self.state.digest_reads.get().saturating_add(1));
@@ -1217,8 +1292,9 @@ mod tests {
         let initial_reads = reader.digest_reads();
         write_file(&exe, b"changed content with a different length");
 
-        let reason = watch.superseded_reason_with(&reader).expect("superseded");
-        assert!(reason.contains("changed on disk"), "{reason}");
+        let event = watch.superseded_reason_with(&reader).expect("superseded");
+        assert_eq!(event.exit_code, EXIT_LAUNCHER_RESTART);
+        assert!(event.reason.contains("changed on disk"), "{}", event.reason);
         assert_eq!(reader.digest_reads(), initial_reads + 1);
     }
 
@@ -1234,8 +1310,9 @@ mod tests {
         write_file(&replacement, b"modified");
         fs::rename(&replacement, &exe).expect("replace file");
 
-        let reason = watch.superseded_reason_with(&reader).expect("superseded");
-        assert!(reason.contains("changed on disk"), "{reason}");
+        let event = watch.superseded_reason_with(&reader).expect("superseded");
+        assert_eq!(event.exit_code, EXIT_LAUNCHER_RESTART);
+        assert!(event.reason.contains("changed on disk"), "{}", event.reason);
         assert_eq!(reader.digest_reads(), initial_reads + 1);
     }
 
@@ -1249,9 +1326,15 @@ mod tests {
         let moved = temp.path().join("elastos-new");
         reader.set_current_exe_raw(moved.clone());
 
-        let reason = watch.superseded_reason_with(&reader).expect("superseded");
-        assert!(reason.contains("moved"), "{reason}");
-        assert!(reason.contains(&moved.display().to_string()), "{reason}");
+        assert!(watch.superseded_reason_with(&reader).is_none());
+        let event = watch.superseded_reason_with(&reader).expect("confirmed");
+        assert_eq!(event.exit_code, EXIT_LAUNCHER_STAYS_STOPPED);
+        assert!(event.reason.contains("moved"), "{}", event.reason);
+        assert!(
+            event.reason.contains(&moved.display().to_string()),
+            "{}",
+            event.reason
+        );
     }
 
     #[test]
@@ -1263,8 +1346,14 @@ mod tests {
         let (mut watch, reader) = test_watch(&exe);
         fs::remove_file(&exe).expect("remove file");
 
-        let reason = watch.superseded_reason_with(&reader).expect("superseded");
-        assert!(reason.contains("could not be verified on disk"), "{reason}");
+        assert!(watch.superseded_reason_with(&reader).is_none());
+        let event = watch.superseded_reason_with(&reader).expect("confirmed");
+        assert_eq!(event.exit_code, EXIT_LAUNCHER_STAYS_STOPPED);
+        assert!(
+            event.reason.contains("could not be verified on disk"),
+            "{}",
+            event.reason
+        );
     }
 
     #[test]
@@ -1276,7 +1365,143 @@ mod tests {
         let (mut watch, reader) = test_watch(&exe);
         reader.set_current_exe_raw(PathBuf::from(format!("{} (deleted)", exe.display())));
 
-        let reason = watch.superseded_reason_with(&reader).expect("superseded");
-        assert!(reason.contains("replaced on disk"), "{reason}");
+        let event = watch.superseded_reason_with(&reader).expect("superseded");
+        assert_eq!(event.exit_code, EXIT_LAUNCHER_RESTART);
+        assert!(
+            event.reason.contains("replaced on disk"),
+            "{}",
+            event.reason
+        );
+    }
+
+    #[test]
+    fn supersession_watch_retries_a_metadata_miss_then_restarts_for_new_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+        let (mut watch, reader) = test_watch(&exe);
+        reader.fail_metadata_once();
+        assert!(watch.superseded_reason_with(&reader).is_none());
+        write_file(&exe, b"replacement bytes");
+        let event = watch.superseded_reason_with(&reader).expect("replacement");
+        assert_eq!(event.exit_code, EXIT_LAUNCHER_RESTART);
+        assert!(event.reason.contains("changed on disk"), "{}", event.reason);
+    }
+
+    /// Only the same failure on two samples in a row exits 1. A different
+    /// failure on the next sample waits for one more sample.
+    #[test]
+    fn supersession_watch_confirms_only_the_same_failure_twice() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+        let (mut watch, reader) = test_watch(&exe);
+
+        reader.fail_metadata_once();
+        assert!(
+            watch.superseded_reason_with(&reader).is_none(),
+            "unreadable file waits"
+        );
+        let moved = temp.path().join("elastos-moved");
+        reader.set_current_exe_raw(moved.clone());
+        assert!(
+            watch.superseded_reason_with(&reader).is_none(),
+            "a move after an unreadable file is a different failure"
+        );
+        let moved_again = temp.path().join("elastos-moved-again");
+        reader.set_current_exe_raw(moved_again.clone());
+        assert!(
+            watch.superseded_reason_with(&reader).is_none(),
+            "a move to another path is a different failure"
+        );
+
+        let event = watch
+            .superseded_reason_with(&reader)
+            .expect("the same move on the next sample confirms");
+        assert_eq!(event.exit_code, EXIT_LAUNCHER_STAYS_STOPPED);
+        assert!(
+            event.reason.contains(&moved_again.display().to_string()),
+            "{}",
+            event.reason
+        );
+    }
+
+    #[test]
+    fn supersession_watch_confirms_a_failed_rehash_without_a_restart_word() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        write_file(&exe, b"original");
+        let (mut watch, reader) = test_watch(&exe);
+        let replacement = temp.path().join("replacement");
+        write_file(&replacement, b"different");
+        fs::rename(&replacement, &exe).expect("replace file");
+        reader.fail_digest(2);
+
+        assert!(watch.superseded_reason_with(&reader).is_none());
+        let event = watch.superseded_reason_with(&reader).expect("confirmed");
+        assert_eq!(event.exit_code, EXIT_LAUNCHER_STAYS_STOPPED);
+        assert!(
+            event.reason.contains("could not be re-verified"),
+            "{}",
+            event.reason
+        );
+        assert!(
+            !event.reason.contains("changed on disk"),
+            "{}",
+            event.reason
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_rename_onto_running_binary_exits_75() {
+        if std::env::var("ELASTOS_SUPERSESSION_CHILD").as_deref() == Ok("1") {
+            let ready = std::env::var("ELASTOS_SUPERSESSION_READY").expect("ready path");
+            let mut watch = BinarySupersessionWatch::from_data_dir(std::env::temp_dir().as_path())
+                .expect("child watch");
+            fs::write(&ready, b"ready").expect("ready");
+            for _ in 0..200 {
+                if let Some(event) = watch.superseded_reason() {
+                    std::process::exit(event.exit_code);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            std::process::exit(2);
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("elastos");
+        fs::copy(std::env::current_exe().expect("test binary"), &exe).expect("copy binary");
+        let ready = temp.path().join("ready");
+        let mut child = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("host_lock::tests::install_rename_onto_running_binary_exits_75")
+            .env("ELASTOS_SUPERSESSION_CHILD", "1")
+            .env("ELASTOS_SUPERSESSION_READY", &ready)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ready.exists() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("child did not become ready");
+            }
+            if let Some(status) = child.try_wait().expect("poll child") {
+                let mut err = String::new();
+                if let Some(stderr) = child.stderr.as_mut() {
+                    use std::io::Read as _;
+                    let _ = stderr.read_to_string(&mut err);
+                }
+                panic!("child exited before ready: {status}: {err}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let staged = temp.path().join("staged");
+        write_file(&staged, b"staged replacement");
+        fs::rename(&staged, &exe).expect("install rename");
+        let status = child.wait().expect("child exit");
+        assert_eq!(status.code(), Some(EXIT_LAUNCHER_RESTART));
     }
 }
