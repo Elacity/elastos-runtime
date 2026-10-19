@@ -25,7 +25,9 @@ impl EpochFileLock {
                 "Capability store refused: cannot acquire revocation epoch lock at {}: {error}. \
                  Stop all Runtime processes that share this data directory and preserve the capability store. \
                  Check directory ownership, permissions, and filesystem lock support. \
-                 Keep the epoch and lock files in place; retry after repairing access. \
+                 Preserve the epoch and any existing lock file. \
+                 If only the lock file is missing and the stored epoch is valid, restart Runtime to recreate the lock. \
+                 Otherwise repair access before restarting. \
                  If repair is uncertain, keep Runtime stopped and seek recovery help.",
                 path.join("epoch.lock").display()
             ))
@@ -754,19 +756,37 @@ mod tests {
                     "{message}"
                 );
                 assert!(
-                    message.contains("Keep the epoch and lock files in place"),
+                    message.contains("Preserve the epoch and any existing lock file"),
                     "{message}"
                 );
             }
             assert_eq!(store.current_epoch(), 1);
             assert_eq!(fs::read_to_string(&epoch_path).unwrap(), "1");
             assert_eq!(lock_path.exists(), !missing);
+            if missing {
+                drop(store);
+                let restarted = CapabilityStore::with_persistence(directory.path())
+                    .await
+                    .unwrap();
+                assert!(lock_path.is_file());
+                assert_eq!(fs::read_to_string(&epoch_path).unwrap(), "1");
+                assert_eq!(restarted.current_epoch(), 1);
+                assert!(!restarted.is_epoch_valid(0));
+                assert_eq!(restarted.advance_epoch().unwrap(), 2);
+            }
         }
     }
 
     #[tokio::test]
     async fn test_missing_or_invalid_epoch_fails_closed_until_repaired() {
-        for (missing, repaired_epoch) in [(true, 7_u64), (false, 7), (true, 9), (false, 9)] {
+        for (contents, missing_lock, repaired_epoch) in [
+            (None, false, 7_u64),
+            (Some("invalid"), false, 7),
+            (None, false, 9),
+            (Some("invalid"), false, 9),
+            (Some(""), true, 7),
+            (Some(""), true, 9),
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let store = CapabilityStore::with_persistence(directory.path())
                 .await
@@ -776,10 +796,14 @@ mod tests {
             }
             let epoch_path = directory.path().join("epoch");
             let trusted_epoch: u64 = fs::read_to_string(&epoch_path).unwrap().parse().unwrap();
-            if missing {
-                fs::remove_file(&epoch_path).unwrap();
+            if let Some(contents) = contents {
+                fs::write(&epoch_path, contents).unwrap();
             } else {
-                fs::write(&epoch_path, "invalid").unwrap();
+                fs::remove_file(&epoch_path).unwrap();
+            }
+            if missing_lock {
+                // Older stores can have an empty epoch without a lock file.
+                fs::remove_file(directory.path().join("epoch.lock")).unwrap();
             }
             assert!(!store.is_epoch_valid(7));
             assert!(store.advance_epoch().is_err());
@@ -790,7 +814,7 @@ mod tests {
                 .expect("startup must refuse unreadable durable state");
             assert_eq!(
                 error.kind(),
-                if missing {
+                if contents.is_none() {
                     std::io::ErrorKind::NotFound
                 } else {
                     std::io::ErrorKind::InvalidData
@@ -818,10 +842,10 @@ mod tests {
                 message.contains("keep Runtime stopped and seek recovery help"),
                 "{message}"
             );
-            if missing {
-                assert!(!epoch_path.exists());
+            if let Some(contents) = contents {
+                assert_eq!(fs::read_to_string(&epoch_path).unwrap(), contents);
             } else {
-                assert_eq!(fs::read_to_string(&epoch_path).unwrap(), "invalid");
+                assert!(!epoch_path.exists());
             }
             assert!(directory.path().join("epoch.lock").is_file());
             assert_eq!(store.current_epoch(), 7);

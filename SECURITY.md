@@ -75,14 +75,23 @@ key, so resolve signing-key warnings before relying on authority across restarts
 
 An established capability store requires a readable, valid epoch at startup.
 Capability validation also fails closed when that epoch is unavailable or
-invalid. For recovery, stop all Runtime processes using the affected data home and preserve
-the capability store. Restore a valid unsigned 64-bit epoch at or above the
-latest committed epoch established from trusted, current recovery data. A higher
+invalid. For recovery, stop all Runtime processes using the affected data home
+and preserve the capability store. Restore a valid unsigned 64-bit epoch at or
+above the latest committed epoch established from trusted, current recovery data. A higher
 epoch preserves committed revocations and can invalidate additional tokens; the
-maximum value leaves no room for another epoch advance. Keep the epoch and lock
-files; resetting the epoch or deleting the store can discard committed
-revocations. If the latest committed epoch cannot be established, obtain
-recovery assistance before starting Runtime.
+maximum value leaves no room for another epoch advance. Preserve the epoch and
+any existing lock file. If only `epoch.lock` is missing, stop every Runtime
+process using that data home, then restart Runtime to recreate the lock without
+changing the valid stored epoch. Resetting the epoch or deleting the store can
+discard committed revocations. If the latest committed epoch cannot be
+established, obtain recovery assistance before starting Runtime.
+
+Upgrade note: Older Runtime versions could start at epoch zero when a stored
+epoch was empty or malformed. Runtime now refuses that state; if an upgrade
+exposes it, preserve the store and use the recovery procedure above before
+restarting. A truncated value that still parses as a number cannot be detected
+from its syntax alone, so establish the recovery lower bound from trusted,
+current data.
 
 ## Open Findings
 
