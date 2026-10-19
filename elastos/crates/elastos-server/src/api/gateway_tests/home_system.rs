@@ -4285,6 +4285,66 @@ async fn existing_profile_setup_protects_root_without_claiming_recovery() {
 }
 
 #[tokio::test]
+async fn online_activation_refuses_over_limit_before_protection() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("Private account label"));
+    let principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
+            .unwrap();
+    let uri = format!("{}/Documents/large.bin", principal.localhost_root);
+    let path = elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &uri).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(17 * 1024 * 1024).unwrap();
+    drop(file);
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/people/profile")
+                .header("x-elastos-home-token", authority.people_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"display_name": "Confirmed public name"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains(
+            "Documents/large.bin is not encrypted and is 17 MiB. Home encrypts existing files \
+             of up to 16 MiB in place."
+        ),
+        "{body}"
+    );
+    assert!(crate::auth::load_principal_root_protection(
+        dir.path(),
+        &principal.principal_id,
+        &principal.localhost_root,
+    )
+    .unwrap()
+    .is_none());
+    let large = std::fs::read(&path).unwrap();
+    assert_eq!(large.len(), 17 * 1024 * 1024);
+    assert!(large.iter().all(|byte| *byte == 0), "file left unchanged");
+    assert!(!dir.path().join("backups").exists(), "no migration backup");
+}
+
+#[tokio::test]
 async fn test_recovery_readiness_does_not_claim_profile_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
@@ -4359,6 +4419,256 @@ async fn test_recovery_readiness_does_not_claim_profile_coverage() {
         let (status, payload) = home_test_get_json(&app, path, token, origin).await;
         assert_eq!(status, StatusCode::OK, "{path}");
         assert_recovery_setup_required_projection(&payload, "recovery_kit_outdated", path);
+    }
+}
+
+/// U14: the projection the periodic Home stream polls walks no folder. It
+/// reads the protection record and, with a Profile, opens only the Profile
+/// authority. The summaries around it start no scan (they still read their
+/// own Home state files).
+#[tokio::test]
+async fn realtime_readiness_walks_nothing_and_opens_only_the_profile_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("owner"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents = elastos_common::localhost::rooted_localhost_fs_path(
+        dir.path(),
+        &format!("{localhost_root}/Documents"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(&documents).unwrap();
+    for index in 0..1_100 {
+        std::fs::write(documents.join(format!("file-{index:04}.txt")), b"x").unwrap();
+    }
+    let readiness = || {
+        crate::api::auth_gateway::principal_root_recovery_readiness_for_verified_principal(
+            dir.path(),
+            &authority.principal_id,
+            &localhost_root,
+        )
+        .unwrap()
+    };
+    let opens_during =
+        |run: &dyn Fn() -> crate::api::auth_gateway::PrincipalRootRecoveryReadiness| {
+            let before = crate::auth::principal_root_object_opens(dir.path()).len();
+            let readiness = run();
+            let opens = crate::auth::principal_root_object_opens(dir.path())[before..].to_vec();
+            (readiness, opens)
+        };
+    let before = crate::auth::principal_root_scan_probes(dir.path());
+
+    // No Profile: the protection record only.
+    assert_eq!(
+        opens_during(&readiness),
+        (
+            crate::api::auth_gateway::PrincipalRootRecoveryReadiness::Ready,
+            Vec::new()
+        )
+    );
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_recovery_readiness_projection(&payload, "ready", path);
+    }
+    assert_eq!(crate::auth::principal_root_scan_probes(dir.path()), before);
+
+    // With a Profile: the protection record and the Profile authority. The
+    // 1,100 unencrypted files are moved aside while the Profile is set up,
+    // which would otherwise refuse them (more than 64 to encrypt).
+    let aside = dir.path().join("documents-aside");
+    std::fs::rename(&documents, &aside).unwrap();
+    let (status, _) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        authority.people_token.as_str(),
+        "null",
+        json!({ "display_name": "Owner" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    std::fs::rename(&aside, &documents).unwrap();
+    let before = crate::auth::principal_root_scan_probes(dir.path());
+    assert_eq!(
+        opens_during(&readiness),
+        (
+            crate::api::auth_gateway::PrincipalRootRecoveryReadiness::KitOutdated,
+            vec![
+                crate::collaboration_profile_authority::profile_authority_object_uri(
+                    &localhost_root
+                )
+            ]
+        )
+    );
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_recovery_setup_required_projection(&payload, "recovery_kit_outdated", path);
+    }
+    assert_eq!(crate::auth::principal_root_scan_probes(dir.path()), before);
+}
+
+async fn home_test_get_text(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+    origin: &'static str,
+) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", origin)
+                .uri(uri)
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// #444 FU2 interim: Home now starts with a Home state file whose label is
+/// damaged. The shell, the Home summary and the System summary still answer
+/// with the defaults, Recovery names the file, and a save over it is
+/// refused with the notice that names it.
+#[tokio::test]
+async fn damaged_home_state_file_leaves_shell_and_summaries_answering() {
+    for (file, save) in [
+        (
+            "active-shell.json",
+            Some((
+                "/api/apps/home/active-shell",
+                json!({ "active": HOME_GUI_SHELL_ID }),
+            )),
+        ),
+        ("browser-state.json", None),
+        ("services-state.json", None),
+        ("services-requests.json", None),
+        (
+            "Appearance/preferences.json",
+            Some((
+                "/api/apps/home/appearance/preferences",
+                json!({ "theme": "light" }),
+            )),
+        ),
+        ("Appearance/background-overlay.json", None),
+        // Read only where its absence is tolerated; its writers fail closed.
+        ("community-presence.json", None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let app = gateway_router(test_state(dir.path()));
+        let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+        crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+        let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+        let uri = format!("{localhost_root}/.AppData/ElastOS/Home/{file}");
+        let path = elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &uri).unwrap();
+        crate::auth::create_owner_only_dir_all(dir.path(), path.parent().unwrap()).unwrap();
+        crate::auth::write_principal_root_object(
+            dir.path(),
+            &authority.principal_id,
+            &localhost_root,
+            &uri,
+            &path,
+            b"{}",
+        )
+        .unwrap();
+        let mut damaged = std::fs::read(&path).unwrap();
+        damaged[9] = 0xff;
+        std::fs::write(&path, &damaged).unwrap();
+
+        for (endpoint, token, origin) in [
+            (
+                "/api/apps/home/active-shell",
+                authority.home_token.as_str(),
+                "http://localhost:61180",
+            ),
+            (
+                "/api/apps/home/summary",
+                authority.home_token.as_str(),
+                "http://localhost:61180",
+            ),
+            (
+                "/api/apps/system/summary",
+                authority.system_token.as_str(),
+                "null",
+            ),
+        ] {
+            let (status, body) = home_test_get_text(&app, endpoint, token, origin).await;
+            assert_eq!(status, StatusCode::OK, "{file} {endpoint}: {body}");
+        }
+
+        // Recovery names the file.
+        let status =
+            crate::api::auth_gateway::principal_root_recovery_status_for_verified_principal(
+                dir.path(),
+                &authority.principal_id,
+                &localhost_root,
+            )
+            .unwrap();
+        assert!(
+            status
+                .objects_needing_attention
+                .iter()
+                .any(|attention| attention.path == format!(".AppData/ElastOS/Home/{file}")),
+            "{file}: {status:?}"
+        );
+        if let Some((endpoint, body)) = save {
+            let response = app
+                .clone()
+                .oneshot(
+                    test_browser_request("localhost:61180", "http://localhost:61180")
+                        .method("POST")
+                        .uri(endpoint)
+                        .header("x-elastos-home-token", authority.home_token.as_str())
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&text);
+            assert!(!status.is_success(), "{file} {endpoint}: {text}");
+            assert!(
+                text.contains(&format!(
+                    ".AppData/ElastOS/Home/{file} does not carry the label"
+                )),
+                "{file} {endpoint}: {text}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), damaged, "{file}");
     }
 }
 

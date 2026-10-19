@@ -289,13 +289,13 @@ async function runScenario(name) {
   if (name === "community_left") {
     const environment = setupEnvironment(name, [summary("Retained Contact", discoverySummary({
       configured: true, enabled: false, status: "community_left",
-      statusMessage: "This Home left Community. Rejoin in System. Contacts, Direct messages and history remain available.",
+      statusMessage: "This Home left Community. Rejoin in System → Security, under Community. Contacts, Direct messages and history remain available.",
     }))]);
     await import("../capsules/people/browser/people.js");
     await settle();
     assert.equal(environment.nodes.get("discovery-toggle").disabled, true);
     assert.equal(environment.nodes.get("discovery-refresh").disabled, true);
-    assert.match(environment.nodes.get("discovery-status").textContent, /Rejoin in System/);
+    assert.match(environment.nodes.get("discovery-status").textContent, /Rejoin in System → Security, under Community\./);
     assert.match(environment.nodes.get("people-list").innerHTML, /Retained Contact/);
     assert.match(environment.nodes.get("people-list").innerHTML, /data-action="chat" data-conversation-id="direct:opaque:remote">Message/);
     assert.equal(environment.replies.length, 0);
