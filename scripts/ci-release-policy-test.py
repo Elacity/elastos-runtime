@@ -15,6 +15,7 @@ import sys
 import tarfile
 import tempfile
 import textwrap
+import time
 import unittest
 from unittest import mock
 
@@ -2161,14 +2162,15 @@ class InstalledJourneyTests(unittest.TestCase):
             (blocks / key[-3:-1]).mkdir()
             (blocks / key[-3:-1] / f"{key}.data").write_bytes(b"package root")
 
-    def execute(self, home, data, evidence, available=20 * 1024 ** 3, carrier=False, consumer_holds_root=False, memory_gib=0):
+    def execute(self, home, data, evidence, available=20 * 1024 ** 3, carrier=False, consumer_holds_root=False, memory_gib=0,
+                finite=None):
         journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
         child = mock.Mock(pid=12345)
         child.poll.return_value = None
         response = mock.MagicMock()
         response.__enter__.return_value.status = 200
         self.holder = mock.Mock(return_value=(mock.Mock(pid=23456), {"holder_did": "did:key:holder"}))
-        self.finite = mock.Mock()
+        self.finite = finite or mock.Mock()
 
         def node_journey(*args, **kwargs):
             if args[0][1] == "scripts/ci-model-package.mjs":
@@ -3231,6 +3233,23 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
                 self.assertEqual(self.journey["private_json"](owner.control / "stop.json"), {"stop": True})
         detail.__str__.assert_not_called()
 
+    def test_finite_observer_fixed_messages_and_phase_still_pass_redaction(self):
+        failure_of = self.journey["finite_observer_failure"]
+        # Every fixed message is readable after redact(), so it is saved as written.
+        for message in sorted(self.globals["FINITE_OBSERVER_MESSAGES"]):
+            with self.subTest(message=message):
+                self.assertEqual(failure_of("census", RuntimeError(message))["message"], message)
+        # A message or phase added later with a secret value or a path is still redacted.
+        added = 'finite journey control said {"token":"tq-41"} at /home/ci-person/x'
+        with mock.patch.dict(self.globals, {"FINITE_OBSERVER_MESSAGES": frozenset({added})}), \
+                mock.patch.dict(os.environ, {"HOME": "/home/ci-person"}):
+            failure = failure_of('stage_{"token":"pq-17"}', RuntimeError(added))
+        self.assertEqual(failure["message"], 'finite journey control said {"token":"<redacted>"} at <path>')
+        self.assertEqual(failure["phase"], 'stage_{"token":"<redacted>"}')
+        self.assertEqual(failure["type"], "RuntimeError")
+        for private in ("tq-41", "pq-17", "ci-person"):
+            self.assertNotIn(private, json.dumps(failure))
+
     def test_finite_observer_stage_phase_uses_only_validated_action_text(self):
         for action in ("engine_stopped", "private-action-Token1234567890"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as temp:
@@ -3267,6 +3286,206 @@ class FiniteInstalledJourneyTests(unittest.TestCase):
                 owner.action({"id": 1, "action": "engine_running"})
             self.assertEqual(owner.actions, [])
             self.assertFalse((owner.control / "response.json").exists())
+
+    def test_finite_observer_failure_names_its_phase_type_message_and_runtime_exit(self):
+        cases = (("census", RuntimeError("finite journey Runtime left its unit"), True),
+                 ("census", RuntimeError("finite journey child escaped its finite unit"), False),
+                 ("stage_engine_running", RuntimeError("finite journey engine stage deadline"), False))
+        for phase, error, exited in cases:
+            with self.subTest(phase=phase, error=str(error)), tempfile.TemporaryDirectory() as temp:
+                owner, _ = self.finite_owner(Path(temp))
+                owner.started, owner.fds = time.monotonic(), {100: 1100}
+                owner.observe_once = mock.Mock(side_effect=None if phase.startswith("stage") else error)
+                owner.action = mock.Mock(side_effect=error)
+                if phase.startswith("stage"):
+                    self.journey["private_json"](owner.control / "request.json", {"id": 1, "action": "engine_running"})
+                self.journey["private_json"](owner.control / "runtime-stopped.json", {"reaped": True})
+                with mock.patch.dict(self.globals, {"pidfd_exited": lambda fd: exited and fd == 1100}), \
+                        mock.patch.object(os, "close"):
+                    owner.observe()
+                    expected = {"phase": phase, "type": "RuntimeError", "message": str(error), "runtime_exited": exited}
+                    self.assertEqual(owner.failure, expected)
+                    self.assertEqual(owner.poll(), 1)
+                    # The same cause reaches the CI log line that used to end the job without it.
+                    with self.assertRaisesRegex(AssertionError, re.escape(f"exited before health ({phase}: RuntimeError: {error})")):
+                        self.journey["wait_healthy"](owner, "127.0.0.1:1", "Runtime")
+                    receipt = owner.finish()
+                self.assertEqual(receipt["status"], "failed")
+                self.assertEqual(receipt["observer_failure"], expected)
+                self.assertEqual(receipt.get("runtime_exited_before_cleanup"), True if exited else None)
+
+    def test_observer_failure_text_is_bounded_and_single_line(self):
+        cause = self.journey["observer_failure"]("census", OSError("first line\nsecond " + "x" * 2000))
+        self.assertEqual(cause["type"], "OSError")
+        self.assertNotIn("\n", cause["message"])
+        self.assertTrue(cause["message"].startswith("first line second x"))
+        self.assertLessEqual(len(cause["message"]), 483)
+
+    def test_finite_observer_failure_reaches_the_uploaded_installed_journey_receipt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            owner, _ = self.finite_owner(Path(temp) / "observer")
+            owner.started, owner.fds, owner.launch_requested = time.monotonic(), {}, False
+            owner.observe_once = mock.Mock(side_effect=RuntimeError("finite journey Runtime left its unit"))
+            owner.observe()
+            owner.start = mock.Mock(return_value=owner)
+            case = InstalledJourneyTests()
+            home, data, evidence, _ = case.fixture(Path(temp) / "journey", "linux")
+            # The unit helper creates the private log before start() returns.
+            (home / "journey-runtime.private.log").write_text("private Runtime log line\n")
+            factory = mock.Mock(return_value=owner)
+            with self.assertRaisesRegex(AssertionError, re.escape(
+                    "installed Runtime exited before health (census: RuntimeError: finite journey Runtime left its unit)")):
+                case.execute(home, data, evidence, memory_gib=4, finite=factory)
+            factory.assert_called_once()
+            record = json.loads((evidence / "installed-journeys.json").read_text())
+            self.assertEqual(record["finite_memory"]["observer_failure"]["message"], "finite journey Runtime left its unit")
+            self.assertEqual(record["finite_memory"]["observer_failure"]["phase"], "census")
+            self.assertEqual(record["results"]["finite_memory_boundary"], "failed")
+            self.assertNotIn("private Runtime log line", (evidence / "installed-journeys.json").read_text())
+
+    def test_observer_failure_redacts_home_paths_and_tokens_before_the_record_is_saved(self):
+        hexdigest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        did = "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+        private = ["/home/ci-person", "ci-person", "observer root", "Application Support", "/opt/build-cache",
+                   "eyJhbGciOiJFZERTQSJ9.payload-77", "s3cr3t-value", "hunter2pass", hexdigest, did,
+                   "QWxhZGRpbjpvcGVuIHNlc2FtZQ9xYz", "q-secret-9"]
+
+        def message(home, data):
+            return (f"[Errno 2] No such file or directory: '{data / 'finite-control/request.json'}' "
+                    f"after {home}/model-inputs and /home/ci-person/.config/elastos/keys and "
+                    f"/opt/build-cache/run-41/llama.bin and file:///home/ci-person/x; "
+                    "Authorization: Bearer eyJhbGciOiJFZERTQSJ9.payload-77 token=s3cr3t-value "
+                    f"password: hunter2pass digest {hexdigest} holder did:key:{did} "
+                    "blob QWxhZGRpbjpvcGVuIHNlc2FtZQ9xYz body {\"token\": \"q-secret-9\"}")
+
+        def assert_redacted(text, failure, finite=False):
+            for value in private:
+                self.assertNotIn(value, text)
+            if finite:
+                # The finite observer saves only its fixed harness messages.
+                self.assertEqual(failure["message"], "observer detail redacted")
+                return
+            self.assertIn("No such file or directory: '<path>/request.json'", failure["message"])
+            self.assertIn("did:key:<redacted>", failure["message"])
+            self.assertIn("Bearer <redacted>", failure["message"])
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, {"HOME": "/home/ci-person"}):
+            owner, _ = self.finite_owner(Path(temp) / "observer root")
+            owner.data = owner.home / "Library/Application Support/elastos"
+            owner.started, owner.fds, owner.launch_requested = time.monotonic(), {}, False
+            owner.observe_once = mock.Mock(side_effect=FileNotFoundError(message(owner.home, owner.data)))
+            owner.observe()
+            owner.start = mock.Mock(return_value=owner)
+            case = InstalledJourneyTests()
+            home, data, evidence, _ = case.fixture(Path(temp) / "journey", "linux")
+            (home / "journey-runtime.private.log").write_text("")
+            with self.assertRaisesRegex(AssertionError, "installed Runtime exited before health") as raised:
+                case.execute(home, data, evidence, memory_gib=4, finite=mock.Mock(return_value=owner))
+            saved = (evidence / "installed-journeys.json").read_text()
+            failure = json.loads(saved)["finite_memory"]["observer_failure"]
+            self.assertEqual((failure["phase"], failure["type"], failure["runtime_exited"]),
+                             ("census", "FileNotFoundError", False))
+            assert_redacted(saved, failure, finite=True)
+            # The CI log line carries the same redacted cause.
+            assert_redacted(str(raised.exception), failure, finite=True)
+
+            repair = self.journey["RepairRuntime"].__new__(self.journey["RepairRuntime"])
+            repair.home = owner.home
+            repair.data = owner.data
+            repair.control, repair.record = Path(temp) / "repair-control", {"actions": []}
+            repair.control.mkdir(mode=0o700)
+            repair.stop = mock.Mock()
+            repair.stop.wait.return_value = False
+            self.journey["private_json"](repair.control / "request.json", {"id": 1, "action": "engine_running"})
+            repair.engine_running = mock.Mock(side_effect=OSError(message(repair.home, repair.data)))
+            repair.observe()
+            self.assertEqual(repair.record["control_failure"]["phase"], "stage_engine_running")
+            assert_redacted(json.dumps(repair.record), repair.record["control_failure"])
+
+    def test_observer_failure_redacts_url_user_info_windows_network_paths_and_paths_with_spaces(self):
+        # Each case: the error text, the values that must not survive, and the
+        # cause that is saved. No case is under a known root, so only the
+        # general rules can catch it.
+        cases = (
+            ("GET http://ci-user:hunter9@127.0.0.1:8090/api failed", ("ci-user", "hunter9"),
+             "GET http://<redacted>@127.0.0.1:8090/api failed"),
+            ("proxy https://alice@proxy.corp.example:3128 refused", ("alice",),
+             "proxy https://<redacted>@proxy.corp.example:3128 refused"),
+            ("fetch ftp://bob:pw-77@files.example/x (timeout)", ("bob", "pw-77"),
+             "fetch ftp://<redacted>@files.example/x (timeout)"),
+            ("via socks5h://carol:p@ss@10.0.0.1:1080/", ("carol", "p@ss", "ss@"),
+             "via socks5h://<redacted>@10.0.0.1:1080/"),
+            (r"open \\fileserver\share$\ci person\keys.json: denied", ("fileserver", "share$", "person"),
+             "open <path>/keys.json: denied"),
+            ("open //fileserver/share/ci person/keys failed", ("fileserver", "share", "person"), "open <path>"),
+            (r"\\?\C:\Users\ci person\AppData\x.json missing", ("Users", "person", "AppData"), "<path>"),
+            (r"pipe \\.\pipe\elastos-ci-person busy", ("ci-person",), "pipe <path>"),
+            (r"C:\Program Files\ElastOS Person\bin\elastos.exe: not found", ("Program", "Person"),
+             "<path>: not found"),
+            ("C:/Users/ci person/AppData/Local/elastos/data failed", ("Users", "person"), "<path>"),
+            ("cannot read /srv/ci person/Shared Keys/vault: Permission denied", ("srv", "person", "Shared", "Keys"),
+             "cannot read <path>: Permission denied"),
+            ("No such file or directory: '/var/my folder/secret stuff/key.pem'", ("folder", "secret", "stuff"),
+             "No such file or directory: '<path>'"),
+            ("error at /Volumes/Backup Disk/ci-person (exit 2)", ("Volumes", "Backup", "Disk", "ci-person"),
+             "error at <path> (exit 2)"),
+        )
+        with mock.patch.dict(os.environ, {"HOME": "/home/runner"}):
+            for text, private, saved in cases:
+                with self.subTest(text=text):
+                    failure = self.journey["observer_failure"]("census", OSError(text))
+                    for value in private:
+                        self.assertNotIn(value, failure["message"])
+                    self.assertEqual(failure["message"], saved)
+            # The rules keep what carries no person: a plain URL, a quoted
+            # command's options and a cause with no path.
+            for text in ("GET http://127.0.0.1:8090/api/health returned 503", "Expecting value: line 1 column 1 (char 0)",
+                         "3/4 samples and/or a // b"):
+                with self.subTest(text=text):
+                    self.assertEqual(self.journey["observer_failure"]("census", OSError(text))["message"], text)
+
+    def test_observer_failure_redacts_secret_values_under_quoted_and_escaped_keys(self):
+        # Each case: the error text, the secret that must not survive, and the
+        # saved cause. The key and the names around it stay readable.
+        cases = (
+            # The reviewer's case: one letter, so only the exact saved text proves it.
+            ('{"token":"x"}', None, '{"token":"<redacted>"}'),
+            ('{"api_key": "abc9"}', "abc9", '{"api_key": "<redacted>"}'),
+            ("{'password': 'p4ss'}", "p4ss", "{'password': '<redacted>'}"),
+            ('cause "secret" :  "s-9 9" in census', "s-9", 'cause "secret" : "<redacted>" in census'),
+            (r'body {\"token\":\"xq7\"}', "xq7", r'body {\"token\":\"<redacted>\"}'),
+            ('{"access_token":"at1","phase":"stage_engine_running"}', "at1",
+             '{"access_token":"<redacted>","phase":"stage_engine_running"}'),
+            (r'{"token":"a\"b c","stage":"census"}', "b c", '{"token":"<redacted>","stage":"census"}'),
+            (r'{\"token\":\"a1\\\"b2\",\"phase\":\"census\"}', "b2",
+             r'{\"token\":\"<redacted>\",\"phase\":\"census\"}'),
+            ('"client_secret" = \'c c\' tail', "c c", '"client_secret" = \'<redacted>\' tail'),
+            ('token: "no closing quote', "closing", 'token: "<redacted>"'),
+            ("token = x9 then", "x9", "token = <redacted> then"),
+            ("{token:k5}", "k5", "{token:<redacted>}"),
+        )
+        with mock.patch.dict(os.environ, {"HOME": "/home/runner"}):
+            for text, secret, saved in cases:
+                with self.subTest(text=text):
+                    failure = self.journey["observer_failure"]("stage_engine_running", OSError(text))
+                    self.assertEqual(failure["message"], saved)
+                    if secret:
+                        self.assertNotIn(secret, failure["message"])
+
+    def test_repair_control_failure_reaches_its_record(self):
+        owner = self.journey["RepairRuntime"].__new__(self.journey["RepairRuntime"])
+        with tempfile.TemporaryDirectory() as temp:
+            owner.control, owner.record = Path(temp), {"actions": []}
+            owner.home, owner.data = Path(temp), Path(temp) / "data"
+            owner.control.chmod(0o700)
+            owner.stop = mock.Mock()
+            owner.stop.wait.return_value = False
+            self.journey["private_json"](owner.control / "request.json", {"id": 1, "action": "engine_running"})
+            owner.engine_running = mock.Mock(side_effect=RuntimeError("repair journey engine deadline"))
+            owner.observe()
+        self.assertEqual(owner.error, "installed_model_repair_control_failed")
+        self.assertEqual(owner.record["control_failure"], {"phase": "stage_engine_running", "type": "RuntimeError",
+                                                           "message": "repair journey engine deadline"})
 
     def test_finite_start_requires_actual_runtime_and_every_kernel_limit(self):
         for fault in (None, "launcher_pid", "wrong_parent", "unit_max", "swap", "tasks", "tighter_parent",
@@ -3876,6 +4095,50 @@ class InstalledModelTimingTests(unittest.TestCase):
                       str(data / "bin/model-provider") + " --internal-local-llama-guard extra"):
             with self.subTest(guard=guard):
                 self.assertEqual(list(observe({**rows, 3: (2, guard)}, 1, data)), [])
+
+
+class PinnedModelProofLicenseTests(unittest.TestCase):
+    """The proof copies the vendored license text only after its pin matches; it never downloads it."""
+    def proof(self, root, change=None):
+        tree = root / "tree"
+        (tree / "scripts/fixtures/licenses").mkdir(parents=True)
+        for name in ("pinned-model-consumer-proof.sh", "pinned-smollm2-fixture.json", "fixtures/licenses/Apache-2.0.txt"):
+            shutil.copy2(REPO / "scripts" / name, tree / "scripts" / name)
+        vendored = tree / "scripts/fixtures/licenses/Apache-2.0.txt"
+        if change:
+            vendored.write_bytes(change(vendored.read_bytes()))
+        tools = root / "tools"
+        tools.mkdir()
+        (tools / "curl").write_text("#!/bin/sh\ntouch \"$0.called\"\nexit 22\n")
+        (tools / "curl").chmod(0o700)
+        (root / "model.gguf").write_bytes(b"not the pinned model")
+        environment = {"PATH": f"{tools}:/usr/bin:/bin", "HOME": str(root),
+                       "ELASTOS_PROOF_MODEL_PATH": str(root / "model.gguf")}
+        result = subprocess.run(["bash", str(tree / "scripts/pinned-model-consumer-proof.sh"), str(root / "proof"),
+                                 "--fetch", "--check-inputs"], env=environment, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+        self.assertFalse((tools / "curl.called").exists(), "the license has no network source")
+        return result, root / "proof/inputs/LICENSE"
+
+    def test_vendored_license_matches_its_pin_and_is_copied_before_model_checks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result, copied = self.proof(Path(temp))
+            fixture = json.loads((REPO / "scripts/pinned-smollm2-fixture.json").read_text())["license"]
+            self.assertNotIn("url", fixture)
+            self.assertIn(f"vendored license verified: {fixture['size']} bytes sha256 {fixture['sha256']}", result.stdout)
+            self.assertEqual(hashlib.sha256(copied.read_bytes()).hexdigest(), fixture["sha256"])
+            # The dummy model is refused after the license step; nothing else runs.
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("model size", result.stdout)
+
+    def test_tampered_vendored_license_is_refused_before_copy_or_download(self):
+        for name, change in (("same size", lambda text: text.replace(b"Apache License", b"Apache Licanse", 1)),
+                             ("appended", lambda text: text + b"extra grant\n"), ("empty", lambda text: b"")):
+            with self.subTest(change=name), tempfile.TemporaryDirectory() as temp:
+                result, copied = self.proof(Path(temp), change)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertRegex(result.stdout, r"vendored license (sha256|size) .* differs from pinned")
+                self.assertFalse(copied.exists() or copied.is_symlink())
 
 
 if __name__ == "__main__":

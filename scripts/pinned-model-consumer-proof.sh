@@ -30,7 +30,8 @@ Arguments:
   <proof-root>    New or existing directory owned by this proof. It receives
                   home/ (isolated HOME with the installed engine), kubo/,
                   inputs/ (with --fetch) and proof/ (logs and receipt.json).
-  --fetch         Download the pinned model and license into <proof-root>/inputs
+  --fetch         Download the pinned model into <proof-root>/inputs and copy
+                  the vendored license text there after checking its pin,
                   when ELASTOS_PROOF_MODEL_PATH / _LICENSE_PATH are unset.
   --native-only   Skip the cold Content proof (no Kubo or ipfs-provider).
   --check-inputs  Verify pinned inputs and print the plan; run nothing else.
@@ -82,7 +83,7 @@ fields = {
     "url": fixture["model"]["url"],
     "bytes": fixture["model"]["size"],
     "sha256": fixture["model"]["sha256"],
-    "license_url": fixture["license"]["url"],
+    "license_path": fixture["license"]["path"],
     "license_bytes": fixture["license"]["size"],
     "license_sha256": fixture["license"]["sha256"],
     "env_prefix": fixture["proof"]["env_prefix"],
@@ -122,6 +123,18 @@ fetch_pinned() {
     if [[ ! -f "$dest" ]]; then
         echo "[pinned-model-proof] downloading $(basename "$dest")"
         curl -fsSL --retry 3 -o "${dest}.partial" "$url"
+        mv -f -- "${dest}.partial" "$dest"
+    fi
+    chmod 0400 "$dest"
+}
+
+# The license text lives in the repository beside its fixture pin and has no
+# network source. Its bytes are checked before they are copied.
+copy_vendored() {
+    local label="$1" source="$2" dest="$3" bytes="$4" sha="$5"
+    verify_pinned_file "vendored $label" "$source" "$bytes" "$sha"
+    if [[ ! -f "$dest" ]]; then
+        cp -- "$source" "${dest}.partial"
         mv -f -- "${dest}.partial" "$dest"
     fi
     chmod 0400 "$dest"
@@ -269,13 +282,16 @@ mkdir -p "${PROOF_ROOT}/proof" "${PROOF_ROOT}/inputs"
 MODEL_PATH="${ELASTOS_PROOF_MODEL_PATH:-}"
 LICENSE_PATH="${ELASTOS_PROOF_LICENSE_PATH:-}"
 if [[ "$FETCH" == "1" ]]; then
+    # The local license check runs first, so a changed copy stops the run
+    # before the model download starts.
+    [[ -n "$LICENSE_PATH" ]] || {
+        LICENSE_PATH="${PROOF_ROOT}/inputs/LICENSE"
+        copy_vendored "license" "${ROOT}/scripts/$(pinned_field "$MODEL" license_path)" "$LICENSE_PATH" \
+            "$(pinned_field "$MODEL" license_bytes)" "$(pinned_field "$MODEL" license_sha256)"
+    }
     [[ -n "$MODEL_PATH" ]] || {
         MODEL_PATH="${PROOF_ROOT}/inputs/$(pinned_field "$MODEL" file)"
         fetch_pinned "$(pinned_field "$MODEL" url)" "$MODEL_PATH"
-    }
-    [[ -n "$LICENSE_PATH" ]] || {
-        LICENSE_PATH="${PROOF_ROOT}/inputs/LICENSE"
-        fetch_pinned "$(pinned_field "$MODEL" license_url)" "$LICENSE_PATH"
     }
 fi
 [[ -n "$MODEL_PATH" && -n "$LICENSE_PATH" ]] \

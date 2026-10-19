@@ -4252,7 +4252,10 @@ fn preview_zip_archive_entry(
         let mut file = archive
             .by_index(index)
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?;
-        let raw_name = file.name().to_string();
+        let raw_name = file
+            .name()
+            .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?
+            .into_owned();
         let Ok(normalized) = normalized_archive_entry_path(Path::new(&raw_name)) else {
             continue;
         };
@@ -4470,7 +4473,10 @@ fn list_zip_archive_entries(bytes: Vec<u8>) -> anyhow::Result<(Vec<Value>, bool)
         let file = archive
             .by_index(index)
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?;
-        let raw_name = file.name().to_string();
+        let raw_name = file
+            .name()
+            .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?
+            .into_owned();
         let path = Path::new(&raw_name);
         let normalized = match normalized_archive_entry_path(path) {
             Ok(path) => path,
@@ -4952,7 +4958,10 @@ fn collect_selected_zip_writes(
         let mut file = archive
             .by_index(index)
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?;
-        let raw_name = file.name().to_string();
+        let raw_name = file
+            .name()
+            .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?
+            .into_owned();
         let normalized = match normalized_archive_entry_path(Path::new(&raw_name)) {
             Ok(path) => path,
             Err(err) => {
@@ -5442,8 +5451,10 @@ fn extract_zip_archive(
         let mut file = archive
             .by_index(index)
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?;
-        let entry_path = file
-            .enclosed_name()
+        let raw_name = file
+            .name()
+            .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?;
+        let entry_path = zip_entry_enclosed_path(&raw_name)
             .ok_or_else(|| anyhow!("library archive entry path must be relative and safe"))?;
         let entry_uri = archive_entry_uri(&destination.uri, &entry_path)?;
         if entry_uri == destination.uri {
@@ -5472,6 +5483,29 @@ fn extract_zip_archive(
         )?;
     }
     Ok(())
+}
+
+/// The path a whole-archive ZIP extract writes for an entry name, or `None`
+/// when the name holds a NUL byte, is absolute (a root or a drive prefix), or
+/// climbs above the archive root. `archive_entry_uri` then refuses any `..`
+/// that is left. This keeps the rule in the runtime: zip 9 `enclosed_name`
+/// strips a leading `/` or drive prefix and folds `..` instead, which would
+/// write entries that this extract refuses.
+fn zip_entry_enclosed_path(name: &str) -> Option<PathBuf> {
+    if name.contains('\0') {
+        return None;
+    }
+    let path = PathBuf::from(name);
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => return None,
+            Component::ParentDir => depth = depth.checked_sub(1)?,
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+        }
+    }
+    Some(path)
 }
 
 fn archive_entry_uri(destination_uri: &str, path: &Path) -> anyhow::Result<String> {
