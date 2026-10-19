@@ -57,7 +57,9 @@ the bootstrap and connection contract.
 The installer detects the platform (Linux `x86_64`/`aarch64` or
 macOS Apple silicon), verifies the signed release, installs Runtime, and
 fetches the Home profile from the trusted publisher. It
-starts Home at `http://localhost:8090/home/` and opens your browser. Keep the
+starts Home at `http://localhost:8090/home/` and opens your browser. The
+[launcher contract](LAUNCHER_CONTRACT.md#readiness-and-home-url) owns this
+address. Keep the
 terminal open while you use Home; Ctrl+C stops it. With no interactive terminal,
 setup completes and prints the full command for opening Home later. The installer
 uses the installed binary's full path, so editing PATH is optional.

@@ -1,3 +1,5 @@
+/// Supervised Home entry. `docs/LAUNCHER_CONTRACT.md` is the launcher
+/// interface. This entry does not open a browser.
 pub async fn run_gateway(
     addr: String,
     public: bool,
