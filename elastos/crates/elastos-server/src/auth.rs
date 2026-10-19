@@ -12308,6 +12308,98 @@ mod tests {
     }
 
     #[test]
+    fn principal_root_object_limited_read_refuses_stored_bytes_past_the_limit() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:limited-plain";
+        let localhost_root = principal_localhost_root(principal_id);
+        let object_uri = format!("{localhost_root}/Pictures/plain.png");
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"0123456789").unwrap();
+        let read = |limit| {
+            read_principal_root_object_limited(
+                data_dir.path(),
+                principal_id,
+                &localhost_root,
+                &object_uri,
+                &path,
+                limit,
+            )
+        };
+        assert_eq!(read(10).unwrap(), b"0123456789");
+        let err = read(9).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("larger than its read limit"),
+            "{err:#}"
+        );
+
+        // Under protection the limit is on the stored envelope bytes, and
+        // the protected read still refuses plaintext inside the limit.
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:limited-protected";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Pictures/secret.png", protection.localhost_root);
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        write_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            b"secret image",
+        )
+        .unwrap();
+        let stored = std::fs::metadata(&path).unwrap().len();
+        let read = |limit| {
+            read_principal_root_object_limited(
+                data_dir.path(),
+                principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                &path,
+                limit,
+            )
+        };
+        assert_eq!(read(stored).unwrap(), b"secret image");
+        let err = read(stored - 1).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("larger than its read limit"),
+            "{err:#}"
+        );
+        std::fs::write(&path, b"plain").unwrap();
+        let err = read(stored).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(PROTECTED_PRINCIPAL_ROOT_OBJECT_NOT_ENCRYPTED),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn principal_root_object_rest_read_refuses_a_file_that_grows_past_the_limit_after_open() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let (mut file, len) = open_principal_root_object_file(&path).unwrap();
+        assert_eq!(len, 10);
+        refuse_principal_root_object_over_limit(len, Some(10)).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[b'x'; 4096])
+            .unwrap();
+        let err =
+            read_principal_root_object_rest_limited(&mut file, Vec::new(), Some(10)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        // With no limit (every caller but the desktop background) the whole
+        // file is read, as on develop.
+        let all = read_principal_root_object_rest_limited(&mut file, Vec::new(), None).unwrap();
+        assert_eq!(all.len(), 10 + 4096);
+    }
+
+    #[test]
     fn principal_root_object_encrypts_when_root_is_protected() {
         let data_dir = tempfile::tempdir().unwrap();
         let principal_id = "person:local:protected-root";
