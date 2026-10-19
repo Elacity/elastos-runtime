@@ -16,6 +16,9 @@ export const MUTATING_PROVIDER_OPS = new Set([
   "share",
 ]);
 
+// Reuse locale setup across comparisons and folder refreshes.
+const nameCollator = new Intl.Collator(undefined, { sensitivity: "base" });
+
 export function createLibraryState({ queryParams, storage, perfTarget }) {
   const rawMode = queryParams.get("mode") || "";
   const state = {
@@ -30,6 +33,7 @@ export function createLibraryState({ queryParams, storage, perfTarget }) {
     currentUri: "",
     currentObject: null,
     objects: [],
+    objectsUri: "",
     objectsByUri: new Map(),
     objectsVersion: 0,
     visibleCacheKey: "",
@@ -49,6 +53,7 @@ export function createLibraryState({ queryParams, storage, perfTarget }) {
     showHidden: storage.getItem("library.showHidden") === "true",
     query: "",
     loading: false,
+    loadError: false,
     loadSeq: 0,
     eventSource: null,
     eventReconnectTimer: null,
@@ -151,7 +156,7 @@ export function visibleObjectsForState(state) {
     if (state.sort === "modified") result = Number(left.modified_at || 0) - Number(right.modified_at || 0);
     else if (state.sort === "size") result = Number(left.size || 0) - Number(right.size || 0);
     else if (state.sort === "type") result = String(left.mime || "").localeCompare(String(right.mime || ""));
-    else result = String(left.name || "").localeCompare(String(right.name || ""), undefined, { sensitivity: "base" });
+    else result = nameCollator.compare(String(left.name || ""), String(right.name || ""));
     return state.sortOrder === "desc" ? -result : result;
   });
   state.visibleCacheKey = cacheKey;
@@ -165,18 +170,23 @@ function invalidateVisibleCache(state) {
 }
 
 function folderListingSignature(objects) {
+  // A matching signature keeps the cached objects, including their action and
+  // viewer facts. Metadata can change independently of a content revision.
   return JSON.stringify((Array.isArray(objects) ? objects : []).map((object) => [
     object.uri,
     object.revision,
     object.kind,
     object.name,
+    object.mime,
     object.size,
+    object.created_at,
     object.modified_at,
     object.content_cid || "",
     object.published_cid || "",
     object.availability || "",
-    object.metadata?.visibility?.placement || "",
-    object.metadata?.visibility?.effective_access || "",
+    object.capabilities,
+    object.viewers,
+    object.metadata,
     object.published ? 1 : 0,
     object.shared ? 1 : 0,
     object.blocked_reason || "",

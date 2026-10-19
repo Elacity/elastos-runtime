@@ -34,4 +34,8 @@ if ! installed "$browser" playwright 1.60.0 || ! installed "$core" playwright-co
 fi
 export NODE_PATH="${browser}/node_modules"
 export BROWSER_OPERATOR_PLAYWRIGHT_CORE="${core}/node_modules/playwright-core"
+# Run large-folder timing checks before the concurrent suite so other browser
+# fixtures do not compete for the measured rendering budget.
+node scripts/library-performance-smoke.mjs
+node scripts/library-menu-smoke.mjs
 exec node --test --test-force-exit --test-timeout=60000 --test-reporter=spec elastos/esp/projections.test.mjs scripts/*.test.mjs scripts/build/*.test.mjs scripts/lib/*.test.mjs capsules/*/browser/*.test.mjs capsules/*/browser/src/*.test.mjs scripts/home-fixture-contracts-smoke.mjs scripts/documents-save-conflict-smoke.mjs scripts/gba-save-conflict-smoke.mjs scripts/assistant-shell-smoke.mjs scripts/model-preparation-failure-smoke.mjs scripts/model-management-browser-smoke.mjs

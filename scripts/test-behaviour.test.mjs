@@ -101,3 +101,33 @@ test("behaviour inputs reject a missing pinned installer binary instead of using
   assert.notEqual(result.status, 0, result.stderr);
   assert.match(result.stderr, /node\/bin\/node.*(?:No such file|not found)/);
 });
+
+for (const [failedScript, expectedScripts, exitCode] of [
+  ["scripts/library-performance-smoke.mjs", ["scripts/library-performance-smoke.mjs"], 73],
+  ["scripts/library-menu-smoke.mjs", ["scripts/library-performance-smoke.mjs", "scripts/library-menu-smoke.mjs"], 74],
+]) {
+  test(`behaviour runner stops before the Node suite when ${failedScript} fails`, t => {
+    const { env, log } = fixture(t);
+    // Keep the real package-version probes, then substitute only executed
+    // test processes. This exercises the runner without launching a browser.
+    const nodeShim = join(env.PATH.split(":")[0], "node");
+    writeFileSync(nodeShim, `#!${process.execPath}
+      const fs = require("node:fs"), childProcess = require("node:child_process");
+      const args = process.argv.slice(2);
+      if (args[0] === "-p") {
+        const result = childProcess.spawnSync(process.execPath, args, { stdio: "inherit" });
+        process.exit(result.status ?? 1);
+      }
+      fs.appendFileSync(process.env.INPUTS_LOG, JSON.stringify(args) + "\\n");
+      process.exit(args[0] === process.env.FAILED_SCRIPT ? Number(process.env.FAILED_EXIT) : 0);
+    `, { mode: 0o755 });
+    const result = spawnSync("bash", [script], {
+      env: { ...env, FAILED_SCRIPT: failedScript, FAILED_EXIT: String(exitCode) },
+      encoding: "utf8", timeout: 10_000,
+    });
+    assert.equal(result.status, exitCode, result.stderr);
+    const commands = readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
+    assert.deepEqual(commands, expectedScripts.map(name => [name]),
+      "a failed browser prelude must stop all subsequent checks");
+  });
+}

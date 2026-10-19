@@ -216,6 +216,14 @@ product-ui-source:
     node scripts/chat-room-product-behavior-smoke.mjs
     node --test scripts/chat-room-reconnect.test.mjs
 
+# Library behavior, large-folder responsiveness and concurrent uploads.
+# Browser setup and explicit overrides are documented in scripts/README.md.
+library-regression:
+    node --test scripts/library-state.test.mjs capsules/library/browser/src/*.test.mjs
+    node scripts/library-product-behavior-smoke.mjs
+    node scripts/library-performance-smoke.mjs
+    node scripts/library-menu-smoke.mjs
+
 product-ui-browser:
     node scripts/people-product-layout-smoke.mjs
     node scripts/inbox-product-layout-smoke.mjs
