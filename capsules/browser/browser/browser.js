@@ -117,8 +117,11 @@ let statusTimer = 0;
 let canGoBack = false;
 let canGoForward = false;
 let pageStatusTimer = 0;
+let pageStatusPollingRun = null;
 let pageStatusRefreshTimers = [];
+let pageStatusRefreshRun = null;
 let pageHeartbeatTimer = 0;
+let pageHeartbeatRun = null;
 let lastPageStatus = null;
 let unloadCleanupStarted = false;
 let recoverableDisplayAttachStarted = false;
@@ -398,12 +401,14 @@ function setLoading(loading) {
 }
 
 function stopPageStatusPolling() {
+  pageStatusPollingRun = null;
   window.clearTimeout(pageStatusTimer);
   pageStatusTimer = 0;
   stopPageStatusRefresh();
 }
 
 function stopPageStatusRefresh() {
+  pageStatusRefreshRun = null;
   for (const timer of pageStatusRefreshTimers) {
     window.clearTimeout(timer);
   }
@@ -411,6 +416,7 @@ function stopPageStatusRefresh() {
 }
 
 function stopPageHeartbeat() {
+  pageHeartbeatRun = null;
   window.clearTimeout(pageHeartbeatTimer);
   pageHeartbeatTimer = 0;
 }
@@ -1249,8 +1255,9 @@ async function fetchPageStatus({
   history = "replace",
   forceAddress = false,
   fast = false,
+  isCurrent = () => true,
 } = {}) {
-  if (!currentPage?.page_id) {
+  if (!isCurrent() || !currentPage?.page_id) {
     return null;
   }
   const owner = currentRuntimePageOwner();
@@ -1259,7 +1266,7 @@ async function fetchPageStatus({
     `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/status${query}`,
     { method: "GET" },
   );
-  if (!runtimeViewerOwnerActive(owner)) return null;
+  if (!isCurrent() || !runtimeViewerOwnerActive(owner)) return null;
   if (
     status?.schema !== "elastos.browser.page-status/v1" ||
     status.page_id !== currentPage.page_id
@@ -1414,12 +1421,16 @@ function schedulePageStatusRefresh({
     ),
   ];
   stopPageStatusRefresh();
+  const run = {};
+  pageStatusRefreshRun = run;
+  const isCurrent = () => pageStatusRefreshRun === run;
   pageStatusRefreshTimers = delays.map((nextDelay) => {
     const timer = window.setTimeout(async () => {
       pageStatusRefreshTimers = pageStatusRefreshTimers.filter(
         (candidate) => candidate !== timer,
       );
       if (
+        !isCurrent() ||
         unloadCleanupStarted ||
         !currentPage ||
         document.hidden ||
@@ -1429,9 +1440,9 @@ function schedulePageStatusRefresh({
       }
       const owner = currentRuntimePageOwner();
       try {
-        await fetchPageStatus({ history, forceAddress });
+        await fetchPageStatus({ history, forceAddress, isCurrent });
       } catch (error) {
-        await handlePageObservationFailure(error, owner);
+        if (isCurrent()) await handlePageObservationFailure(error, owner);
       }
     }, nextDelay);
     return timer;
@@ -1440,8 +1451,11 @@ function schedulePageStatusRefresh({
 
 function startPageStatusPolling() {
   stopPageStatusPolling();
+  const run = {};
+  pageStatusPollingRun = run;
+  const isCurrent = () => pageStatusPollingRun === run;
   const poll = async () => {
-    if (unloadCleanupStarted || !currentPage) {
+    if (!isCurrent() || unloadCleanupStarted || !currentPage) {
       return;
     }
     if (document.hidden) {
@@ -1454,11 +1468,12 @@ function startPageStatusPolling() {
     }
     const owner = currentRuntimePageOwner();
     try {
-      await fetchPageStatus({ fast: true });
+      await fetchPageStatus({ fast: true, isCurrent });
     } catch (error) {
-      await handlePageObservationFailure(error, owner);
+      if (isCurrent()) await handlePageObservationFailure(error, owner);
     } finally {
       if (
+        isCurrent() &&
         sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
         !unloadCleanupStarted &&
         !relaunchRequested &&
@@ -1473,8 +1488,11 @@ function startPageStatusPolling() {
 
 function startPageHeartbeat() {
   stopPageHeartbeat();
+  const run = {};
+  pageHeartbeatRun = run;
+  const isCurrent = () => pageHeartbeatRun === run;
   const beat = async () => {
-    if (unloadCleanupStarted || !currentPage?.page_id) {
+    if (!isCurrent() || unloadCleanupStarted || !currentPage?.page_id) {
       return;
     }
     const owner = currentRuntimePageOwner();
@@ -1485,9 +1503,10 @@ function startPageHeartbeat() {
         { method: "POST" },
       );
     } catch (error) {
-      if (await handlePageObservationFailure(error, owner)) nextDelay = PAGE_STATUS_INTERVAL_MS;
+      if (isCurrent() && await handlePageObservationFailure(error, owner)) nextDelay = PAGE_STATUS_INTERVAL_MS;
     } finally {
       if (
+        isCurrent() &&
         sameRuntimePageOwner(currentRuntimePageOwner(), owner) &&
         !unloadCleanupStarted &&
         !relaunchRequested &&
