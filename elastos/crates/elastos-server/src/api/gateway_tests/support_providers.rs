@@ -270,6 +270,30 @@ fn mock_protected_content_chain_mode() -> &'static std::sync::Mutex<MockProtecte
     MODE.get_or_init(|| std::sync::Mutex::new(MockProtectedContentChainMode::Success))
 }
 
+/// Runs once, the next time Runtime asks the mock Chain provider to describe
+/// the creator mint source. A protected publish asks this after Library
+/// starts the publish and before custody reads the source, so a test can
+/// change the source in exactly that gap.
+type MockCreatorMintSourceDescribeHook = Box<dyn FnOnce() + Send>;
+
+fn mock_creator_mint_source_describe_hook(
+) -> &'static std::sync::Mutex<Option<MockCreatorMintSourceDescribeHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<MockCreatorMintSourceDescribeHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn set_mock_creator_mint_source_describe_hook(hook: impl FnOnce() + Send + 'static) {
+    *mock_creator_mint_source_describe_hook().lock().unwrap() = Some(Box::new(hook));
+}
+
+fn run_mock_creator_mint_source_describe_hook() {
+    let hook = mock_creator_mint_source_describe_hook().lock().unwrap().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 fn reset_mock_protected_content_chain_mode() {
     *mock_protected_content_chain_mode().lock().unwrap() = MockProtectedContentChainMode::Success;
 }
@@ -716,26 +740,29 @@ impl Provider for MockChainProvider {
                     "evidence_rpc_sources": 2
                 }
             })),
-            Some("describe_protected_content_creator_mint_source") => Ok(json!({
-                "status": "ok",
-                "data": {
-                    "schema": "elastos.chain.protected-content-creator-mint-source/v1",
-                    "network": "base-mainnet",
-                    "chain_namespace": "eip155:8453",
-                    "ledger": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
-                    "pay_token": if mock_protected_content_purchase_fixture()
-                        .lock()
-                        .unwrap()
-                        .native_purchase
-                    {
-                        "0x0000000000000000000000000000000000000000"
-                    } else {
-                        MOCK_PROTECTED_CONTENT_PAY_TOKEN
-                    },
-                    "abi": "elacity_mint_v1",
-                    "function": "mint(string,uint16,bytes,bytes)"
-                }
-            })),
+            Some("describe_protected_content_creator_mint_source") => {
+                run_mock_creator_mint_source_describe_hook();
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.chain.protected-content-creator-mint-source/v1",
+                        "network": "base-mainnet",
+                        "chain_namespace": "eip155:8453",
+                        "ledger": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
+                        "pay_token": if mock_protected_content_purchase_fixture()
+                            .lock()
+                            .unwrap()
+                            .native_purchase
+                        {
+                            "0x0000000000000000000000000000000000000000"
+                        } else {
+                            MOCK_PROTECTED_CONTENT_PAY_TOKEN
+                        },
+                        "abi": "elacity_mint_v1",
+                        "function": "mint(string,uint16,bytes,bytes)"
+                    }
+                }))
+            }
             Some("resolve_protected_content_mint_receipt") => {
                 if *mock_protected_content_chain_mode().lock().unwrap()
                     == MockProtectedContentChainMode::ReceiptError

@@ -116,6 +116,13 @@ struct LibraryPublishRecord {
     availability: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     listing_uri: Option<String>,
+    /// `sha256:<hex>` of the object's bytes when it was protected. Protection
+    /// then follows the content: a copy, rename or move gets a new URI and no
+    /// record of its own, but its bytes still match this digest. Records
+    /// written before this field have none; see
+    /// `desktop_background::require_unprotected` for how they are handled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -656,6 +663,110 @@ pub(crate) fn handle_library_download_selection_bytes_with_format(
         mime: archive_format.mime().to_string(),
         bytes,
     })
+}
+
+mod desktop_background;
+mod plain_publish_cid;
+#[cfg(test)]
+pub(crate) use desktop_background::PROTECTION_CHECK_LEGACY_SOURCES;
+pub(crate) use desktop_background::{
+    keep_found_source_digests, read_library_object_for_desktop_background, DesktopBackgroundRead,
+    DesktopBackgroundSourceRefusal, FoundSourceDigest, ProtectionCheckBudget,
+};
+
+/// Test fixture: a publish record for `object_uri` with `content_security`.
+#[cfg(test)]
+pub(crate) fn write_test_publish_record(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+    content_security: Value,
+) {
+    write_test_publish_record_with_source(
+        data_dir,
+        principal_id,
+        object_uri,
+        content_security,
+        None,
+    );
+}
+
+/// Test fixture: a protected record written before records named their
+/// digest, whose CID is the one Library's plain publish gives `published`.
+#[cfg(test)]
+pub(crate) fn write_test_legacy_publish_record(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+    content_security: Value,
+    published: &[u8],
+) {
+    write_test_publish_record(data_dir, principal_id, object_uri, content_security);
+    let mut record = read_publish_record(data_dir, principal_id, object_uri).unwrap();
+    record.cid = plain_publish_cid::plain_publish_file_cid(published).unwrap();
+    write_publish_record(data_dir, principal_id, &record).unwrap();
+}
+
+/// Test probe: the source digest a publish record names, if any.
+#[cfg(test)]
+pub(crate) fn test_publish_record_source_sha256(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+) -> Option<String> {
+    read_publish_record(data_dir, principal_id, object_uri)
+        .unwrap()
+        .source_sha256
+}
+
+/// Test fixture: a publish record that also names the digest of the source
+/// bytes, the way a protected publish records it.
+#[cfg(test)]
+pub(crate) fn write_test_publish_record_with_source(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+    content_security: Value,
+    source_bytes: Option<&[u8]>,
+) {
+    let record = LibraryPublishRecord {
+        schema: "elastos.library.publish-record/v1".to_string(),
+        object_uri: object_uri.to_string(),
+        cid: "bafkreitestrecord".to_string(),
+        published_at: 1,
+        unpublished_at: None,
+        shared_at: None,
+        share_policy: None,
+        share_grants: Vec::new(),
+        content_security,
+        receipt: json!({}),
+        availability: json!({ "status": "pinned" }),
+        listing_uri: None,
+        source_sha256: source_bytes.map(content_sha256_label),
+    };
+    write_publish_record(data_dir, principal_id, &record).unwrap();
+}
+
+/// Test fixture: a publish record for `object_uri` whose contents cannot be parsed.
+#[cfg(test)]
+pub(crate) fn write_test_broken_publish_record(
+    data_dir: &Path,
+    principal_id: &str,
+    object_uri: &str,
+) {
+    let root = crate::auth::principal_localhost_root(principal_id);
+    let record_uri = publish_record_uri(&root, object_uri);
+    let record_path = rooted_localhost_fs_path(data_dir, &record_uri).unwrap();
+    fs::create_dir_all(record_path.parent().unwrap()).unwrap();
+    crate::auth::write_principal_root_object(
+        data_dir,
+        principal_id,
+        &root,
+        &record_uri,
+        &record_path,
+        b"{not a record",
+    )
+    .unwrap();
 }
 
 pub(crate) async fn handle_library_download_bytes_runtime(
@@ -2031,13 +2142,20 @@ async fn library_publish(
             price: loaded.price,
             source_storage,
         };
-        let facts = crate::api::gateway::runtime_custody_publish_via_gateway(
-            state,
-            authority,
-            registry,
-            runtime_input,
-        )
-        .await?;
+        // Custody returns the digest of the exact plaintext bytes it read and
+        // protected, from the same read, so the record names those bytes and
+        // not a second read of a source that may change in between. Protection
+        // then follows them through a copy, rename or move (see
+        // `LibraryPublishRecord::source_sha256`).
+        let (facts, source_object_digest) =
+            crate::api::gateway::runtime_custody_publish_via_gateway(
+                state,
+                authority,
+                registry,
+                runtime_input,
+            )
+            .await?;
+        let source_sha256 = digest32_sha256_label(source_object_digest);
         let record = LibraryPublishRecord {
             schema: "elastos.library.publish-record/v1".to_string(),
             object_uri: target.uri.clone(),
@@ -2051,6 +2169,7 @@ async fn library_publish(
             receipt: facts.receipt,
             availability: facts.availability,
             listing_uri: facts.listing_uri,
+            source_sha256: Some(source_sha256),
         };
         write_publish_record(data_dir, principal_id, &record)?;
         let object = library_object(data_dir, principal_id, &target.uri)?;
@@ -2142,6 +2261,7 @@ async fn library_publish(
         receipt,
         availability,
         listing_uri: None,
+        source_sha256: None,
     };
     write_publish_record(data_dir, principal_id, &record)?;
     let object = library_object(data_dir, principal_id, &target.uri)?;
@@ -4252,7 +4372,10 @@ fn preview_zip_archive_entry(
         let mut file = archive
             .by_index(index)
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?;
-        let raw_name = file.name().to_string();
+        let raw_name = file
+            .name()
+            .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?
+            .into_owned();
         let Ok(normalized) = normalized_archive_entry_path(Path::new(&raw_name)) else {
             continue;
         };
@@ -4470,7 +4593,10 @@ fn list_zip_archive_entries(bytes: Vec<u8>) -> anyhow::Result<(Vec<Value>, bool)
         let file = archive
             .by_index(index)
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?;
-        let raw_name = file.name().to_string();
+        let raw_name = file
+            .name()
+            .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?
+            .into_owned();
         let path = Path::new(&raw_name);
         let normalized = match normalized_archive_entry_path(path) {
             Ok(path) => path,
@@ -4952,7 +5078,10 @@ fn collect_selected_zip_writes(
         let mut file = archive
             .by_index(index)
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?;
-        let raw_name = file.name().to_string();
+        let raw_name = file
+            .name()
+            .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?
+            .into_owned();
         let normalized = match normalized_archive_entry_path(Path::new(&raw_name)) {
             Ok(path) => path,
             Err(err) => {
@@ -5442,8 +5571,10 @@ fn extract_zip_archive(
         let mut file = archive
             .by_index(index)
             .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?;
-        let entry_path = file
-            .enclosed_name()
+        let raw_name = file
+            .name()
+            .map_err(|err| anyhow!("invalid ZIP archive entry: {err}"))?;
+        let entry_path = zip_entry_enclosed_path(&raw_name)
             .ok_or_else(|| anyhow!("library archive entry path must be relative and safe"))?;
         let entry_uri = archive_entry_uri(&destination.uri, &entry_path)?;
         if entry_uri == destination.uri {
@@ -5472,6 +5603,29 @@ fn extract_zip_archive(
         )?;
     }
     Ok(())
+}
+
+/// The path a whole-archive ZIP extract writes for an entry name, or `None`
+/// when the name holds a NUL byte, is absolute (a root or a drive prefix), or
+/// climbs above the archive root. `archive_entry_uri` then refuses any `..`
+/// that is left. This keeps the rule in the runtime: zip 9 `enclosed_name`
+/// strips a leading `/` or drive prefix and folds `..` instead, which would
+/// write entries that this extract refuses.
+fn zip_entry_enclosed_path(name: &str) -> Option<PathBuf> {
+    if name.contains('\0') {
+        return None;
+    }
+    let path = PathBuf::from(name);
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => return None,
+            Component::ParentDir => depth = depth.checked_sub(1)?,
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+        }
+    }
+    Some(path)
 }
 
 fn archive_entry_uri(destination_uri: &str, path: &Path) -> anyhow::Result<String> {
@@ -6812,9 +6966,115 @@ fn remove_trash_record(data_dir: &Path, principal_id: &str, trash_uri: &str) -> 
     }
 }
 
+fn publish_records_dir_uri(localhost_root: &str) -> String {
+    format!("{localhost_root}/.AppData/LocalHost/.Runtime/Library/Published")
+}
+
 fn publish_record_uri(localhost_root: &str, object_uri: &str) -> String {
     let digest = hex::encode(Sha256::digest(object_uri.as_bytes()));
-    format!("{localhost_root}/.AppData/LocalHost/.Runtime/Library/Published/{digest}.json")
+    format!("{}/{digest}.json", publish_records_dir_uri(localhost_root))
+}
+
+/// `sha256:<hex>` of `bytes`.
+fn content_sha256_label(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+/// `sha256:<hex>` of a SHA-256 digest that custody already computed.
+fn digest32_sha256_label(digest: elastos_protected_content_contracts::Digest32) -> String {
+    format!("sha256:{}", hex::encode(digest.as_bytes()))
+}
+
+/// One publish record as stored, with the revision its bytes had when read,
+/// so a later write can replace it only if nothing changed it since.
+#[derive(Clone)]
+struct StoredPublishRecord {
+    record_uri: String,
+    record_path: PathBuf,
+    revision: String,
+    record: LibraryPublishRecord,
+}
+
+/// Every publish record `principal_id` holds. Fails when the record store
+/// cannot be listed, holds more than `limit` records, holds a record that
+/// cannot be read, or `deadline` passes. Staged writes (`.<name>.tmp`) and
+/// names that are not a record's are skipped, the same as
+/// `read_publish_record` never reads them.
+fn read_all_publish_records(
+    data_dir: &Path,
+    principal_id: &str,
+    limit: usize,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Vec<StoredPublishRecord>> {
+    let root = crate::auth::principal_localhost_root(principal_id);
+    let dir_uri = publish_records_dir_uri(&root);
+    let dir_path = rooted_localhost_fs_path(data_dir, &dir_uri)
+        .ok_or_else(|| anyhow!("invalid library publish record path"))?;
+    let entries = match fs::read_dir(&dir_path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        if std::time::Instant::now() >= deadline {
+            bail!("library publish records were not all read in time");
+        }
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let is_record_name = name.strip_suffix(".json").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        if !is_record_name {
+            continue;
+        }
+        if records.len() >= limit {
+            bail!("library holds more publish records than this check reads");
+        }
+        let record_uri = format!("{dir_uri}/{name}");
+        let record_path = entry.path();
+        let bytes = crate::auth::read_principal_root_object(
+            data_dir,
+            principal_id,
+            &root,
+            &record_uri,
+            &record_path,
+        )?;
+        let revision =
+            crate::auth::principal_root_object_revision(principal_id, &record_uri, &bytes);
+        records.push(StoredPublishRecord {
+            record: serde_json::from_slice(&bytes)?,
+            record_uri,
+            record_path,
+            revision,
+        });
+    }
+    Ok(records)
+}
+
+/// Writes `record` back with the digest of its source, only if the stored
+/// record is still the one read (same revision). A record changed since then
+/// is left as it is; the digest is found again on the next check.
+fn remember_publish_record_source_digest(
+    data_dir: &Path,
+    principal_id: &str,
+    stored: &StoredPublishRecord,
+    source_sha256: &str,
+) -> anyhow::Result<()> {
+    let mut record = stored.record.clone();
+    record.source_sha256 = Some(source_sha256.to_string());
+    let bytes = serde_json::to_vec_pretty(&record)?;
+    crate::auth::write_principal_root_object_if_revision(
+        data_dir,
+        principal_id,
+        &crate::auth::principal_localhost_root(principal_id),
+        &stored.record_uri,
+        &stored.record_path,
+        &bytes,
+        crate::auth::PrincipalRootObjectPrecondition::Revision(&stored.revision),
+    )
 }
 
 fn read_publish_record(

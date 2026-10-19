@@ -5,6 +5,7 @@ import {
   childUri,
   contentCid,
   decimalIntegerToHexQuantity,
+  desktopBackgroundRefusalMessage,
   hasCapability,
   inTrash,
   isArchiveObject,
@@ -35,6 +36,7 @@ export function createLibraryActions({
   providerApi,
   renderUploads,
   selectedObjects,
+  setDesktopBackground,
   setStatus,
   setUploadProgress,
   showMenuForObject,
@@ -264,6 +266,16 @@ export function createLibraryActions({
   async function downloadObject(object) {
     const data = await downloadObjectRaw({ uri: object.uri });
     saveDownloadBlob(data.blob, data.filename || object.name || "download");
+  }
+
+  async function setObjectAsDesktopBackground(object) {
+    setStatus("Setting desktop background...");
+    const result = await setDesktopBackground(object.uri);
+    if (result?.accepted) {
+      setStatus("Desktop background updated.");
+      return;
+    }
+    setStatus(desktopBackgroundRefusalMessage(result) || "Could not set this image as the desktop background.");
   }
 
   async function downloadObjectAsZip(object) {
@@ -731,6 +743,7 @@ export function createLibraryActions({
     restoreObject,
     restoreSelectedObjects,
     setClipboard,
+    setObjectAsDesktopBackground,
     shareObject,
     showStatusObject,
     trashObject,

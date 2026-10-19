@@ -8115,13 +8115,138 @@ fn parse_background_image_upload(
         "image/gif" => "background-image.gif",
         _ => anyhow::bail!("background image must be PNG, JPEG, WebP, or GIF"),
     };
-    if body.is_empty() {
-        anyhow::bail!("background image is empty");
-    }
-    if body.len() > HOME_BACKGROUND_IMAGE_MAX_BYTES {
-        anyhow::bail!("background image is larger than 5 MB");
+    validate_background_image_len(body.len())?;
+    // The declared type must match the bytes, and the declared canvas must be
+    // small enough to decode before anything is stored.
+    if require_bounded_background_image(body)? != file_name {
+        return Err(home_appearance_preference_request_error(
+            BACKGROUND_IMAGE_UNREADABLE,
+        ));
     }
     Ok((file_name, body.to_vec()))
+}
+
+// Typed so the Home route answers 400; the System route matches on the text.
+fn validate_background_image_len(len: usize) -> anyhow::Result<()> {
+    if len == 0 {
+        return Err(home_appearance_preference_request_error(
+            "background image is empty",
+        ));
+    }
+    if len > HOME_BACKGROUND_IMAGE_MAX_BYTES {
+        return Err(home_appearance_preference_request_error(
+            "background image is larger than 5 MB",
+        ));
+    }
+    Ok(())
+}
+
+const BACKGROUND_IMAGE_UNREADABLE: &str =
+    "background image must be a readable PNG, JPEG, WebP, or GIF";
+const BACKGROUND_IMAGE_TOO_LARGE: &str =
+    "background image is too large to show; use a picture of at most 8192 pixels per side and 24 million pixels";
+
+/// Reads the format and canvas size from the bytes, never from a caller's
+/// label, and refuses a canvas a browser should not decode. Returns the
+/// stored file name for that format.
+fn require_bounded_background_image(bytes: &[u8]) -> anyhow::Result<&'static str> {
+    use crate::image_bounds::{require_bounded_image, ImageBoundError, ImageFormat};
+    let header = require_bounded_image(bytes).map_err(|err| {
+        home_appearance_preference_request_error(match err {
+            ImageBoundError::Unreadable => BACKGROUND_IMAGE_UNREADABLE,
+            ImageBoundError::TooLarge => BACKGROUND_IMAGE_TOO_LARGE,
+        })
+    })?;
+    Ok(match header.format {
+        ImageFormat::Png => "background-image.png",
+        ImageFormat::Jpeg => "background-image.jpg",
+        ImageFormat::Gif => "background-image.gif",
+        ImageFormat::Webp => "background-image.webp",
+    })
+}
+
+// Protected objects are stored as base64 envelopes, so the on-disk size is
+// bounded to roughly this multiple of the plaintext limit before reading.
+const HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES: u64 =
+    (HOME_BACKGROUND_IMAGE_MAX_BYTES as u64) * 2;
+
+/// Longest a desktop background request waits for Library's read and
+/// protection check. The check stops itself earlier (its own budget); this
+/// bounds the wait if the disk itself stalls. The digests a timely check found
+/// are saved after it, before the handler answers.
+const HOME_BACKGROUND_IMAGE_SOURCE_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// Library's read, under Library's scope rules: the principal's own files,
+/// never Trash, Runtime-private areas, links, or protected content. It reads
+/// and hashes files, so it runs on a blocking thread, never on this handler's.
+/// Nothing is saved from a check that did not answer within the time limit.
+async fn read_desktop_background_source(
+    data_dir: std::path::PathBuf,
+    principal_id: String,
+    source_uri: String,
+) -> Result<Vec<u8>, Response> {
+    let check = {
+        let data_dir = data_dir.clone();
+        let principal_id = principal_id.clone();
+        move || {
+            crate::library::read_library_object_for_desktop_background(
+                &data_dir,
+                &principal_id,
+                &source_uri,
+                HOME_BACKGROUND_IMAGE_SOURCE_MAX_STORED_BYTES,
+                crate::library::ProtectionCheckBudget::for_request(std::time::Instant::now()),
+            )
+        }
+    };
+    read_desktop_background_source_within(
+        HOME_BACKGROUND_IMAGE_SOURCE_READ_TIMEOUT,
+        check,
+        move |found| crate::library::keep_found_source_digests(&data_dir, &principal_id, found),
+    )
+    .await
+}
+
+/// Runs `check` on a blocking thread and waits at most `timeout` for it.
+/// Neither the check nor its thread writes anything. Only when the check
+/// answers in time does this handler `keep` the digests it found, and it waits
+/// for that save before it answers, so a hash is never saved after the person
+/// was told the check did not finish. A check that answers late is dropped.
+pub(super) async fn read_desktop_background_source_within<F, K>(
+    timeout: std::time::Duration,
+    check: F,
+    keep: K,
+) -> Result<Vec<u8>, Response>
+where
+    F: FnOnce() -> crate::library::DesktopBackgroundRead + Send + 'static,
+    K: FnOnce(Vec<crate::library::FoundSourceDigest>) + Send + 'static,
+{
+    use crate::library::DesktopBackgroundSourceRefusal as Refusal;
+    let refused = |refusal: Refusal| {
+        (StatusCode::BAD_REQUEST, refusal.message().into_owned()).into_response()
+    };
+    let read = match tokio::time::timeout(timeout, tokio::task::spawn_blocking(check)).await {
+        Ok(Ok(read)) => read,
+        Ok(Err(_)) => return Err(refused(Refusal::Unreadable)),
+        Err(_) => return Err(refused(Refusal::CheckUnfinished)),
+    };
+    let crate::library::DesktopBackgroundRead { result, found } = read;
+    if !found.is_empty() {
+        // A few small record writes; a failed save only means a later check
+        // reads the file again, so its outcome does not change the answer.
+        let _ = tokio::task::spawn_blocking(move || keep(found)).await;
+    }
+    result.map_err(refused)
+}
+
+fn home_save_background_image_from_library_bytes(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+    bytes: Vec<u8>,
+) -> anyhow::Result<HomeAppearanceSummary> {
+    validate_background_image_len(bytes.len())?;
+    let file_name = require_bounded_background_image(&bytes)?;
+    home_save_background_image(data_dir, context, file_name, bytes)
 }
 
 fn update_profile_for_context(
@@ -8246,11 +8371,262 @@ pub(super) async fn system_background_overlay_update(
     }
 }
 
+/// One "set as desktop background" intent from Library. Library asks for it
+/// with its own launch token just before it messages Home, and Home carries
+/// only this ticket, never Library's launch token. A ticket is used once,
+/// lives [`DESKTOP_BACKGROUND_TICKET_TTL_SECS`], and names one object, person
+/// and session, so a captured request cannot be replayed and Home never holds
+/// a Library capability it could use again for another object.
+struct DesktopBackgroundTicket {
+    principal_id: String,
+    session_id: String,
+    source_uri: String,
+    expires_at: u64,
+}
+
+/// Library asks for the ticket and Home sends it on at once, so one minute is
+/// ample, and short enough that a ticket seen in transit is soon useless.
+pub(super) const DESKTOP_BACKGROUND_TICKET_TTL_SECS: u64 = 60;
+const DESKTOP_BACKGROUND_TICKETS_PER_SESSION: usize = 8;
+const DESKTOP_BACKGROUND_TICKETS_MAX: usize = 1024;
+const DESKTOP_BACKGROUND_TICKET_REFUSED: &str =
+    "this desktop background request is not valid any more; choose Set as Desktop Background in Library again";
+
+/// Pending tickets by the SHA-256 of the ticket, so the store never holds a
+/// usable ticket value. Held in memory only: a Runtime restart drops them,
+/// and the person chooses the action again.
+fn desktop_background_tickets() -> &'static Mutex<BTreeMap<String, DesktopBackgroundTicket>> {
+    static TICKETS: OnceLock<Mutex<BTreeMap<String, DesktopBackgroundTicket>>> = OnceLock::new();
+    TICKETS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn desktop_background_ticket_key(ticket: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(ticket.as_bytes()))
+}
+
+fn issue_desktop_background_ticket(
+    principal_id: &str,
+    session_id: &str,
+    source_uri: &str,
+    now: u64,
+) -> anyhow::Result<String> {
+    use base64::Engine as _;
+    use rand::RngCore as _;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let mut tickets = desktop_background_tickets()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("desktop background tickets are unavailable"))?;
+    tickets.retain(|_, pending| pending.expires_at > now);
+    let pending_for_session = tickets
+        .values()
+        .filter(|pending| pending.principal_id == principal_id && pending.session_id == session_id)
+        .count();
+    if pending_for_session >= DESKTOP_BACKGROUND_TICKETS_PER_SESSION
+        || tickets.len() >= DESKTOP_BACKGROUND_TICKETS_MAX
+    {
+        anyhow::bail!("too many desktop background requests are waiting; try again in a minute");
+    }
+    tickets.insert(
+        desktop_background_ticket_key(&ticket),
+        DesktopBackgroundTicket {
+            principal_id: principal_id.to_string(),
+            session_id: session_id.to_string(),
+            source_uri: source_uri.to_string(),
+            expires_at: now.saturating_add(DESKTOP_BACKGROUND_TICKET_TTL_SECS),
+        },
+    );
+    Ok(ticket)
+}
+
+/// Removes the ticket whatever the outcome, so it is used at most once, then
+/// accepts it only if it is in time and names this person, session and object.
+fn consume_desktop_background_ticket(
+    ticket: &str,
+    principal_id: &str,
+    session_id: &str,
+    source_uri: &str,
+    now: u64,
+) -> bool {
+    let Ok(mut tickets) = desktop_background_tickets().lock() else {
+        return false;
+    };
+    let Some(pending) = tickets.remove(&desktop_background_ticket_key(ticket)) else {
+        return false;
+    };
+    pending.expires_at > now
+        && pending.principal_id == principal_id
+        && pending.session_id == session_id
+        && pending.source_uri == source_uri
+}
+
+/// Test hook: moves a pending ticket's expiry into the past.
+#[cfg(test)]
+pub(super) fn expire_desktop_background_ticket_for_test(ticket: &str) {
+    if let Some(pending) = desktop_background_tickets()
+        .lock()
+        .unwrap()
+        .get_mut(&desktop_background_ticket_key(ticket))
+    {
+        pending.expires_at = 0;
+    }
+}
+
+/// Library asks for a desktop background ticket with its own launch token.
+/// The token must be Library's, launched by Home; the ticket is bound to that
+/// token's person and session and to the one object Library names.
+pub(super) async fn library_desktop_background_ticket(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<LibraryDesktopBackgroundTicketRequest>,
+) -> Response {
+    let library =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[LIBRARY_CAPSULE_ID]) {
+            Ok(library) => library,
+            Err(err) => return home_error_response(err),
+        };
+    if library.launch_context.executable_actor != LIBRARY_CAPSULE_ID
+        || library.launch_context.authority_actor != HOME_CAPSULE_ID
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "only Library opened from Home can ask for a desktop background",
+        )
+            .into_response();
+    }
+    let source_uri = req.source_uri.trim();
+    if source_uri.is_empty()
+        || source_uri.len() > 2048
+        || !source_uri.starts_with("localhost://Users/")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "background image source must be one of your own Library files",
+        )
+            .into_response();
+    }
+    match issue_desktop_background_ticket(
+        &library.context.principal_id,
+        &library.context.session_id,
+        source_uri,
+        now_ts(),
+    ) {
+        Ok(ticket) => Json(serde_json::json!({
+            "ticket": ticket,
+            "expires_in": DESKTOP_BACKGROUND_TICKET_TTL_SECS,
+        }))
+        .into_response(),
+        Err(err) => (StatusCode::TOO_MANY_REQUESTS, err.to_string()).into_response(),
+    }
+}
+
+/// Home arbitrates "set as desktop background" intents from Library. Two
+/// authorities must both be present, for the same person and session:
+/// Home's appearance authority (the caller), and Library's intent for this
+/// one object (a single-use ticket Library asked for with its own launch
+/// token, carried by Home). Home alone cannot read a Library object, and
+/// Library alone cannot change the desktop.
+pub(super) async fn home_background_image_set_from_object(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<HomeBackgroundImageSourceRequest>,
+) -> Response {
+    let context = match require_home_active_shell_token_context(&state.data_dir, &headers) {
+        Ok(context) => context,
+        Err(err) => return home_error_response(err),
+    };
+    let ticket = req.library_ticket.as_deref().map(str::trim).unwrap_or("");
+    if ticket.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            "missing Library request; use Set as Desktop Background in Library",
+        )
+            .into_response();
+    }
+    if !consume_desktop_background_ticket(
+        ticket,
+        &context.principal_id,
+        &context.session_id,
+        req.source_uri.trim(),
+        now_ts(),
+    ) {
+        return (StatusCode::FORBIDDEN, DESKTOP_BACKGROUND_TICKET_REFUSED).into_response();
+    }
+    let request_id = format!("object:desktop-background:{}", now_ts());
+    let audit = |event_type: &'static str, result: &'static str, reason: &'static str| {
+        append_provider_effect_audit(
+            &state.data_dir,
+            ProviderEffectAuditInput {
+                capsule_id: LIBRARY_CAPSULE_ID,
+                event_type,
+                principal_id: &context.principal_id,
+                session_id: &context.session_id,
+                request_id: &request_id,
+                result,
+                reason,
+            },
+        )
+    };
+    if let Err(err) = audit(
+        "object.provider.requested",
+        "requested",
+        "Home asked Library to read an object for the desktop background",
+    ) {
+        return home_error_response(anyhow::anyhow!("object provider audit failed: {err}"));
+    }
+    let bytes = match read_desktop_background_source(
+        state.data_dir.clone(),
+        home_browser_principal_id(&context),
+        req.source_uri.trim().to_string(),
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(response) => {
+            let _ = audit(
+                "object.provider.failed",
+                "failed",
+                "Library refused an object for the desktop background",
+            );
+            return response;
+        }
+    };
+    let saved = tokio::task::spawn_blocking({
+        let data_dir = state.data_dir.clone();
+        let context = context.clone();
+        move || home_save_background_image_from_library_bytes(&data_dir, &context, bytes)
+    })
+    .await
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("background image could not be saved")));
+    match saved {
+        Ok(summary) => {
+            let _ = audit(
+                "object.provider.completed",
+                "completed",
+                "Library read an object for the desktop background",
+            );
+            Json(summary).into_response()
+        }
+        Err(err) => {
+            let _ = audit(
+                "object.provider.failed",
+                "failed",
+                "Library refused an object for the desktop background",
+            );
+            home_error_response(err)
+        }
+    }
+}
+
 pub(super) async fn home_background_image(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
+    // The active shell renders the desktop, so it holds the same appearance
+    // authority it already uses to write preferences.
+    let context = match require_home_active_shell_token_context(&state.data_dir, &headers) {
         Ok(context) => context,
         Err(err) => return home_error_response(err),
     };
@@ -8268,16 +8644,49 @@ pub(super) async fn home_background_image(
         &entry.path,
     ) {
         Ok(bytes) => {
+            // A picture stored before this check, or written outside these
+            // routes, is not served if its canvas is too large or its bytes
+            // do not match its type. Home then shows the default desktop and
+            // System can still reset it.
+            match crate::image_bounds::require_bounded_image(&bytes) {
+                Ok(header) if header.format.content_type() == entry.content_type => {}
+                Err(crate::image_bounds::ImageBoundError::TooLarge) => {
+                    return (StatusCode::UNPROCESSABLE_ENTITY, BACKGROUND_IMAGE_TOO_LARGE)
+                        .into_response()
+                }
+                _ => {
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        BACKGROUND_IMAGE_UNREADABLE,
+                    )
+                        .into_response()
+                }
+            }
             let mut response = bytes.into_response();
-            response.headers_mut().insert(
+            let headers = response.headers_mut();
+            headers.insert(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static(entry.content_type),
+            );
+            // Home GUI renders the wallpaper from an opaque sandboxed frame under
+            // the gateway's COEP `require-corp`. Without this header the browser
+            // blocks the image even though the bytes were served.
+            headers.insert(
+                axum::http::HeaderName::from_static("cross-origin-resource-policy"),
+                HeaderValue::from_static(HOME_BACKGROUND_IMAGE_RESOURCE_POLICY),
+            );
+            headers.insert(
+                axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
             );
             response
         }
         Err(err) => home_error_response(anyhow::anyhow!(err)),
     }
 }
+
+/// Matches the capsule asset route so wallpaper bytes pass the same COEP check.
+pub(super) const HOME_BACKGROUND_IMAGE_RESOURCE_POLICY: &str = "cross-origin";
 
 #[cfg(test)]
 mod home_realtime_tests {

@@ -265,6 +265,56 @@ export function createLibraryRuntime({ getHomeToken }) {
     });
   }
 
+  // Library only expresses the intent; Home holds the appearance authority.
+  // Library first asks Runtime, with its own launch token, for a single-use
+  // ticket for this one object, and gives Home only that ticket, never its
+  // launch token. Resolves once Home has answered.
+  async function requestDesktopBackgroundTicket(uri, token) {
+    try {
+      const response = await fetch("/api/apps/library/desktop-background-ticket", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-elastos-home-token": token,
+        },
+        body: JSON.stringify({ source_uri: uri }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      return response.ok && typeof payload.ticket === "string" ? payload.ticket : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  // Resolves to { accepted, message }. `message` is Runtime's reason for a
+  // refusal as Home passed it on (the caller checks it before showing it),
+  // or "" when there is none.
+  async function setDesktopBackground(uri) {
+    const requestId = crypto.randomUUID();
+    const token = getHomeToken();
+    const ticket = await requestDesktopBackgroundTicket(uri, token);
+    if (!ticket) return { accepted: false, message: "" };
+    return new Promise((resolve) => {
+      const finish = (accepted, message = "") => {
+        window.clearTimeout(timer);
+        window.removeEventListener("message", receive);
+        resolve({ accepted, message: accepted ? "" : message });
+      };
+      const receive = (event) => {
+        if (event.source !== window.top || event.origin !== homeParentOrigin ||
+            event.data?.type !== "home:shell-response" || event.data.requestId !== requestId) return;
+        const sameSession = getHomeToken() === token;
+        finish(
+          sameSession && event.data.result?.accepted === true && !event.data.error,
+          sameSession && typeof event.data.result?.message === "string" ? event.data.result.message : "",
+        );
+      };
+      const timer = window.setTimeout(() => finish(false), 20_000);
+      window.addEventListener("message", receive);
+      if (!shellMessage({ type: "home:set-desktop-background", uri, requestId, ticket })) finish(false);
+    });
+  }
+
   function closeSelf() {
     return shellMessage({ type: "home:close-self" });
   }
@@ -276,6 +326,7 @@ export function createLibraryRuntime({ getHomeToken }) {
     openTarget,
     openPublishedUri,
     deliverToTarget,
+    setDesktopBackground,
     closeSelf,
   };
 }

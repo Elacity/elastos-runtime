@@ -5311,6 +5311,31 @@ pub fn read_principal_root_object(
     read_principal_root_object_locked(data_dir, principal_id, localhost_root, object_uri, path)
 }
 
+/// Same as [`read_principal_root_object`], but refuses a stored object larger
+/// than `max_stored_bytes` while reading it through the one open descriptor,
+/// so a file that grows after a size check cannot force an unbounded read.
+pub fn read_principal_root_object_limited(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    max_stored_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
+    let _guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    read_principal_root_object_locked_limited(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        Some(max_stored_bytes),
+    )
+}
+
 /// Reads only under current principal-root protection. Missing protection
 /// returns None before object bytes are read; each call loads fresh authority.
 pub(crate) fn read_protected_principal_root_object(
@@ -5347,22 +5372,50 @@ fn read_principal_root_object_locked(
     object_uri: &str,
     path: &Path,
 ) -> anyhow::Result<Vec<u8>> {
+    read_principal_root_object_locked_limited(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        None,
+    )
+}
+
+/// [`read_principal_root_object_locked`] with an optional limit on the stored
+/// bytes, enforced through the one open descriptor. Caller holds
+/// principal_root_object_mutation_lock.
+fn read_principal_root_object_locked_limited(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    max_stored_bytes: Option<u64>,
+) -> anyhow::Result<Vec<u8>> {
     let Some(protection) = load_principal_root_protection(data_dir, principal_id, localhost_root)?
     else {
-        let (mut file, _) = open_principal_root_object_file(path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .with_context(|| format!("failed to read {path:?}"))?;
-        return Ok(bytes);
+        let (mut file, len) = open_principal_root_object_file(path)?;
+        refuse_principal_root_object_over_limit(len, max_stored_bytes)?;
+        return read_principal_root_object_rest_limited(&mut file, Vec::new(), max_stored_bytes)
+            .with_context(|| format!("failed to read {path:?}"));
     };
-    read_protected_principal_root_object_file(
+    read_protected_principal_root_object_file_limited(
         data_dir,
         principal_id,
         localhost_root,
         object_uri,
         path,
         &protection,
+        max_stored_bytes,
     )
+}
+
+fn refuse_principal_root_object_over_limit(len: u64, max_bytes: Option<u64>) -> anyhow::Result<()> {
+    if max_bytes.is_some_and(|limit| len > limit) {
+        anyhow::bail!("principal-root object is larger than its read limit");
+    }
+    Ok(())
 }
 
 /// Opens a protected object under the root's protection. No byte of the file
@@ -5377,6 +5430,30 @@ fn read_protected_principal_root_object_file(
     path: &Path,
     protection: &PrincipalRootProtectionV1,
 ) -> anyhow::Result<Vec<u8>> {
+    read_protected_principal_root_object_file_limited(
+        data_dir,
+        principal_id,
+        localhost_root,
+        object_uri,
+        path,
+        protection,
+        None,
+    )
+}
+
+/// [`read_protected_principal_root_object_file`] with an optional limit on
+/// the stored (envelope) bytes: a file over the limit at open is refused
+/// before any byte is read, and one that grows later is refused at one byte
+/// past the limit.
+fn read_protected_principal_root_object_file_limited(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    path: &Path,
+    protection: &PrincipalRootProtectionV1,
+    max_stored_bytes: Option<u64>,
+) -> anyhow::Result<Vec<u8>> {
     #[cfg(test)]
     PRINCIPAL_ROOT_OBJECT_OPENS
         .lock()
@@ -5385,6 +5462,7 @@ fn read_protected_principal_root_object_file(
         .or_default()
         .push(object_uri.to_string());
     let (mut file, len) = open_principal_root_object_file(path)?;
+    refuse_principal_root_object_over_limit(len, max_stored_bytes)?;
     let expected = PrincipalRootObjectExpectation {
         principal_id,
         localhost_root,
@@ -5407,7 +5485,7 @@ fn read_protected_principal_root_object_file(
         PrincipalRootObjectFileClass::Damaged(damage) => damage,
     };
     let data_key = principal_root_data_key_from_protection(data_dir, protection)?;
-    let bytes = read_principal_root_object_rest(&mut file, probe.prefix)
+    let bytes = read_principal_root_object_rest_limited(&mut file, probe.prefix, max_stored_bytes)
         .with_context(|| format!("failed to read {path:?}"))?;
     decrypt_principal_root_object_envelope_bytes(&data_key, &expected, &bytes).map_err(|_| {
         principal_root_object_damaged_error(&PrincipalRootObjectNotice::new(
@@ -8088,12 +8166,33 @@ fn read_principal_root_object_tail(file: &mut File, len: u64) -> std::io::Result
     }
 }
 
-/// Reads the rest of the file after an already-read prefix.
-fn read_principal_root_object_rest(file: &mut File, prefix: Vec<u8>) -> std::io::Result<Vec<u8>> {
+/// Reads the rest of the file after an already-read prefix. With `max_bytes`,
+/// reads at most one byte past the limit and refuses a file whose whole
+/// bytes pass it, so a file that grows after open cannot force an unbounded
+/// read.
+fn read_principal_root_object_rest_limited(
+    file: &mut File,
+    prefix: Vec<u8>,
+    max_bytes: Option<u64>,
+) -> std::io::Result<Vec<u8>> {
     use std::io::{Seek, SeekFrom};
     let mut bytes = prefix;
     file.seek(SeekFrom::Start(bytes.len() as u64))?;
-    file.read_to_end(&mut bytes)?;
+    match max_bytes {
+        Some(limit) => {
+            let room = limit.saturating_add(1).saturating_sub(bytes.len() as u64);
+            Read::by_ref(file).take(room).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > limit {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "principal-root object is larger than its read limit",
+                ));
+            }
+        }
+        None => {
+            file.read_to_end(&mut bytes)?;
+        }
+    }
     Ok(bytes)
 }
 
@@ -12206,6 +12305,215 @@ mod tests {
             .unwrap(),
             b"plain body"
         );
+    }
+
+    #[test]
+    fn principal_root_object_limited_read_refuses_stored_bytes_past_the_limit() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:limited-plain";
+        let localhost_root = principal_localhost_root(principal_id);
+        let object_uri = format!("{localhost_root}/Pictures/plain.png");
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"0123456789").unwrap();
+        let read = |limit| {
+            read_principal_root_object_limited(
+                data_dir.path(),
+                principal_id,
+                &localhost_root,
+                &object_uri,
+                &path,
+                limit,
+            )
+        };
+        assert_eq!(read(10).unwrap(), b"0123456789");
+        let err = read(9).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("larger than its read limit"),
+            "{err:#}"
+        );
+
+        // Under protection the limit is on the stored envelope bytes, and
+        // the protected read still refuses plaintext inside the limit.
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:limited-protected";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Pictures/secret.png", protection.localhost_root);
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        write_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            b"secret image",
+        )
+        .unwrap();
+        let stored = std::fs::metadata(&path).unwrap().len();
+        let read = |limit| {
+            read_principal_root_object_limited(
+                data_dir.path(),
+                principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                &path,
+                limit,
+            )
+        };
+        assert_eq!(read(stored).unwrap(), b"secret image");
+        let err = read(stored - 1).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("larger than its read limit"),
+            "{err:#}"
+        );
+        std::fs::write(&path, b"plain").unwrap();
+        let err = read(stored).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(PROTECTED_PRINCIPAL_ROOT_OBJECT_NOT_ENCRYPTED),
+            "{err:#}"
+        );
+    }
+
+    /// A limit far above every file here, so the size limit never refuses.
+    #[cfg(unix)]
+    const LIMITED_READ_ROOMY_LIMIT: u64 = 1024 * 1024;
+
+    #[cfg(unix)]
+    #[test]
+    fn principal_root_object_limited_read_refuses_a_link_to_a_valid_protected_object() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:limited-link";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Pictures/linked.png", protection.localhost_root);
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        write_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            b"linked secret image",
+        )
+        .unwrap();
+        // The envelope stays bound to `object_uri`; only its place changes.
+        let held = outside.path().join("held.png");
+        std::fs::rename(&path, &held).unwrap();
+        symlink(&held, &path).unwrap();
+        let read = |at: &Path| {
+            read_principal_root_object_limited(
+                data_dir.path(),
+                principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                at,
+                LIMITED_READ_ROOMY_LIMIT,
+            )
+        };
+        // Read where it is, the envelope passes every check.
+        assert_eq!(read(&held).unwrap(), b"linked secret image");
+        // Read through the link at the object's path, it is refused.
+        let result = read(&path);
+        assert!(
+            result.is_err(),
+            "a link at the object path was followed: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn principal_root_object_limited_read_refuses_links_and_non_regular_objects() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:limited-non-regular";
+        let localhost_root = principal_localhost_root(principal_id);
+        let uri = |name: &str| format!("{localhost_root}/Pictures/{name}");
+        let fs_path = |name: &str| rooted_localhost_fs_path(data_dir.path(), &uri(name)).unwrap();
+        std::fs::create_dir_all(fs_path("plain.png").parent().unwrap()).unwrap();
+        let read = |name: &str, at: &Path| {
+            read_principal_root_object_limited(
+                data_dir.path(),
+                principal_id,
+                &localhost_root,
+                &uri(name),
+                at,
+                LIMITED_READ_ROOMY_LIMIT,
+            )
+        };
+        let outside_file = outside.path().join("outside.png");
+        std::fs::write(&outside_file, b"outside bytes").unwrap();
+        assert_eq!(
+            read("outside.png", &outside_file).unwrap(),
+            b"outside bytes"
+        );
+
+        let mut refused = Vec::new();
+        // A link to a regular file.
+        symlink(&outside_file, fs_path("to-file.png")).unwrap();
+        refused.push("to-file.png");
+        // A link to a character device that reads as empty.
+        symlink("/dev/null", fs_path("to-device.png")).unwrap();
+        refused.push("to-device.png");
+        // A directory.
+        std::fs::create_dir(fs_path("folder.png")).unwrap();
+        refused.push("folder.png");
+        // A character device at the object path itself (needs CAP_MKNOD).
+        let device = fs_path("device.png");
+        let device_c = std::ffi::CString::new(device.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mknod does not keep the pointer.
+        let made = unsafe {
+            libc::mknod(
+                device_c.as_ptr(),
+                libc::S_IFCHR | 0o600,
+                libc::makedev(1, 3),
+            )
+        };
+        if made == 0 {
+            refused.push("device.png");
+        } else {
+            eprintln!(
+                "skipping the device-node case: mknod: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let read_anyway: Vec<_> = refused
+            .into_iter()
+            .filter_map(|name| {
+                read(name, &fs_path(name))
+                    .ok()
+                    .map(|bytes| format!("{name} ({} bytes)", bytes.len()))
+            })
+            .collect();
+        assert!(read_anyway.is_empty(), "read anyway: {read_anyway:?}");
+    }
+
+    #[test]
+    fn principal_root_object_rest_read_refuses_a_file_that_grows_past_the_limit_after_open() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let (mut file, len) = open_principal_root_object_file(&path).unwrap();
+        assert_eq!(len, 10);
+        refuse_principal_root_object_over_limit(len, Some(10)).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[b'x'; 4096])
+            .unwrap();
+        let err =
+            read_principal_root_object_rest_limited(&mut file, Vec::new(), Some(10)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        // With no limit (every caller but the desktop background) the whole
+        // file is read, as on develop.
+        let all = read_principal_root_object_rest_limited(&mut file, Vec::new(), None).unwrap();
+        assert_eq!(all.len(), 10 + 4096);
     }
 
     #[test]

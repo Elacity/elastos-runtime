@@ -6,6 +6,7 @@ import {
   hasCapability,
   inTrash,
   isBlockedObject,
+  isDesktopBackgroundCandidate,
   isDirectory,
   isRuntimeCustodyProtectableVideo,
   isTrashRootUri,
@@ -27,6 +28,7 @@ import { createLibraryPreview } from "./preview.js";
 import { createLibraryRealtime } from "./realtime.js";
 import { createLibraryRenderer, iconPlaceholder } from "./render.js?v=library-20260711d";
 import { createLibrarySelection } from "./selection.js";
+import { createLibraryThumbnails } from "./thumbnails.js";
 import {
   MUTATING_PROVIDER_OPS,
   cacheFolderListing,
@@ -72,6 +74,7 @@ import {
       openTarget,
       openPublishedUri,
       deliverToTarget,
+      setDesktopBackground,
       closeSelf,
     } = createLibraryRuntime({ getHomeToken: () => state.homeToken });
 
@@ -145,6 +148,7 @@ import {
     let restoreObject = async () => {};
     let restoreSelectedObjects = async () => {};
     let setClipboard = () => {};
+    let setObjectAsDesktopBackground = async () => {};
     let shareObject = async () => {};
     let showStatusObject = async () => {};
     let trashObject = async () => {};
@@ -245,6 +249,10 @@ import {
       perf,
       selectedObjects,
       state,
+      thumbnails: createLibraryThumbnails({
+        readObjectBlob: (uri) => downloadObjectRaw({ uri }).then((result) => result.blob),
+        root: elements.content,
+      }),
       visibleObjects,
     }));
     ({
@@ -297,6 +305,7 @@ import {
       restoreObject,
       restoreSelectedObjects,
       setClipboard,
+      setObjectAsDesktopBackground,
       shareObject,
       showStatusObject,
       trashObject,
@@ -320,6 +329,7 @@ import {
       providerApi,
       renderUploads,
       selectedObjects,
+      setDesktopBackground,
       setStatus,
       setUploadProgress,
       showMenuForObject,
@@ -990,6 +1000,9 @@ import {
           actions.push(menuAction("Open With", null, {
             children: viewers.map((viewer) => menuAction(viewer.label || viewer.id, () => openWithViewer(object, viewer.id))),
           }));
+        }
+        if (!isAttachMode() && isDesktopBackgroundCandidate(object)) {
+          actions.push(menuAction("Set as Desktop Background", () => setObjectAsDesktopBackground(object)));
         }
       }
       if (hasCapability(object, "download")) {
