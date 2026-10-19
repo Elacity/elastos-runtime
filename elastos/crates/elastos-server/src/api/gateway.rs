@@ -182,13 +182,14 @@ use gateway_inspect_actions::*;
 use gateway_marketplace::*;
 use gateway_origin::*;
 use gateway_passkey_step_up::*;
+#[cfg(test)]
+pub(crate) use gateway_passkey_step_up::{
+    advance_passkey_step_up_clock_for_test, issue_passkey_step_up_token_at_for_test,
+    issue_passkey_step_up_token_for_test,
+};
 pub(super) use gateway_passkey_step_up::{
     consume_or_recover_passkey_step_up_effect, consume_passkey_step_up_token,
     require_hosted_step_up_launch,
-};
-#[cfg(test)]
-pub(crate) use gateway_passkey_step_up::{
-    issue_passkey_step_up_token_at_for_test, issue_passkey_step_up_token_for_test,
 };
 #[cfg(test)]
 pub(crate) use gateway_provider_proxy::runtime_custody_publish_creator_tail_for_test;

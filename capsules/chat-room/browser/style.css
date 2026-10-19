@@ -782,6 +782,17 @@ button.secondary {
   background: var(--accent-soft);
 }
 
+.link-body a,
+.message-link {
+  cursor: pointer;
+}
+
+.message-link {
+  color: inherit;
+  text-decoration: underline;
+  overflow-wrap: anywhere;
+}
+
 .attachment-card {
   padding: 0.55rem 0.6rem;
   border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);

@@ -36,7 +36,7 @@ const SOURCE_HOME_COLLABORATION_MODE_ENV: &str = "ELASTOS_COLLABORATION_STARTUP_
 const COMMUNITY_MEMBERSHIP_FILE: &str = "collaboration-community-membership-v1.json";
 const COMMUNITY_MEMBERSHIP_SCHEMA: &str = "elastos.collaboration.community-membership/v1";
 pub(crate) const COMMUNITY_LEFT_DETAIL: &str =
-    "This Home left Community. Rejoin in System. Contacts, Direct messages and history remain available.";
+    "This Home left Community. Rejoin in System → Security, under Community. Contacts, Direct messages and history remain available.";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

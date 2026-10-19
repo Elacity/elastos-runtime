@@ -2696,6 +2696,7 @@ const dockState = {
   tooltipShowTimer: 0,
   tooltipHideTimer: 0,
   tooltipAnchor: null,
+  restoringFocus: false,
 };
 
 function dockMagnifyEnabled() {
@@ -2895,6 +2896,21 @@ function hideDockTooltip() {
   }
 }
 
+/* Return focus to a dock item after a face or popover closes over it. The
+   label only ever answers the person's own hover or keyboard arrival, so this
+   focus — Home's, not theirs — is kept quiet. */
+function restoreDockFocus(item) {
+  if (!item) {
+    return;
+  }
+  dockState.restoringFocus = true;
+  try {
+    item.focus({ preventScroll: true });
+  } finally {
+    dockState.restoringFocus = false;
+  }
+}
+
 function startDockLaunchBounce(item) {
   if (dockReducedMotion()) {
     return;
@@ -2955,6 +2971,8 @@ function setupDock() {
 
   // Tooltips by delegation so they survive taskbar re-renders. Shown on hover
   // (after a delay) and on keyboard focus (immediately); Escape dismisses.
+  // Focus Home hands back itself (restoreDockFocus) is not the person
+  // arriving at the item, so it raises no label.
   taskbar.addEventListener("pointerover", (event) => {
     const item = event.target.closest(".taskbar-item");
     if (!item || (event.relatedTarget && item.contains(event.relatedTarget))) {
@@ -2971,7 +2989,7 @@ function setupDock() {
   });
   taskbar.addEventListener("focusin", (event) => {
     const item = event.target.closest(".taskbar-item");
-    if (item) {
+    if (item && !dockState.restoringFocus) {
       scheduleDockTooltip(item, 0);
     }
   });
@@ -3008,8 +3026,8 @@ export function bindShellSurfaceDom(options = {}) {
   desktopContextMenu?.addEventListener("keydown", handleContextMenuKeydown);
   bindAssistantFace({
     easeDockPillWidth,
+    restoreDockFocus,
     targetById,
-    mountGlyph,
     launchHomeTarget,
     iframeSandboxForLaunch,
     iframeAllowForLaunch,
