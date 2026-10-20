@@ -123,11 +123,11 @@ workspace's own `target/debug`.
 - Each capsule: `cd /src/capsules/<name> && cargo test`.
 - Tests that need the network, a running IPFS node, Kubo, a model or KVM are `#[ignore]`d. This image has no KVM, so
   crosvm and Browser VM paths fail closed. `crates/elastos-vz` needs macOS on Apple silicon.
-- Two groups of tests depend on the machine, not on the code. Storage, model and Browser image tests refuse to run
-  when the volume has less than 10% free space ("preparation requires ten percent free space"). Tests that inject a
-  write failure through file permissions pass only as a non-root user, because root ignores those permissions. Treat
-  these failures as environment results, not findings. Run the tests as a non-root user on a volume with free space
-  to get a clean baseline.
+- Two groups of tests depend on the machine, not on the code. Storage, model, publication and Browser image paths keep
+  a free-space reserve, so their tests fail on a nearly full volume (errors that say "not enough free space" or "more
+  free space"). Tests that inject a write failure through file permissions pass only as a non-root user, because root
+  ignores those permissions. Treat these failures as environment results, not findings. Run the tests as a non-root
+  user on a volume with free space to get a clean baseline.
 - Gateway handlers can be driven in process with `tower::ServiceExt::oneshot` from the helpers in
   `crates/elastos-server/src/api/gateway_tests/` (`mod.rs` has `test_state`, `support_runtime.rs` has
   `start_fake_runtime`). A new test there is the preferred reproducer for a gateway finding.
@@ -163,8 +163,8 @@ principal, a capsule, a Carrier peer, a malicious publisher or content source, o
 Findings against a release build with the default configuration weigh more than ones that need a non-default option.
 
 - **Critical**
-  - Code execution on the host from a network client, a Carrier peer or a capsule. This includes a sandbox escape from
-    a WASM component, a microVM guest or a provider sandbox.
+  - Code execution on the host from a network client, a Carrier peer or a capsule. This includes an escape from a WASM
+    Component's memory and fuel limits, from a microVM guest, or from the model provider's confinement.
   - Signing in, or getting a session or launch token, as a principal without that principal's passkey or credential.
   - Forging a capability token, or passing validation with a token that should fail any of the checks in
     `capability/manager.rs`.
@@ -210,9 +210,23 @@ report it.
 ## Anything to leave alone
 
 - The open findings in SECURITY.md are known: capability state and key rotation that are not restart safe, host-plane
-  Carrier providers that use Runtime admission, and request framing that is incompletely bounded (the Carrier request
-  line read and the I/O bridge line readers). Report a variant only when it reaches a new boundary or a higher
-  severity.
+  Carrier providers that use Runtime admission, I/O bridge line reads that are not bounded while reading, and
+  whole-object Carrier fetch replies that are not size-bounded. Report a variant only when it reaches a new boundary
+  or a higher severity.
+- SECURITY.md also states the current isolation boundary. These limits are known and have their own plans:
+  - Home can currently obtain every App's capability, so a compromised Home reaches those Apps' authority.
+  - WASM Components run inside the Runtime process, with separate linear memories but the same operating system
+    process as the Runtime keys.
+  - Providers and the trusted shell helper run as native processes with the Runtime user's rights. Only the model
+    provider is partly confined.
+  - An enabled web Terminal runs commands with the host user's rights. It needs host developer mode and closed guest
+    registration.
+  - Keys are stored next to the data they protect. The host operator and root can read hosted data, wallet keys and
+    recovery material, also while Home is locked.
+
+  A finding that only restates one of these limits is not new. A finding that gets past one of the stated
+  conditions is. Examples are a Terminal enabled without developer mode, a WASM Component that reads Runtime memory,
+  or an App that gets another App's capability without going through Home.
 - The temporary Mac operator model route described in docs/ARCHITECTURE.md bypasses Inbox decision and grant checks
   while an operator enables it. This is known.
 - Content routes serve public content by CID by design. A CID proves integrity only, so that fetched content is not
