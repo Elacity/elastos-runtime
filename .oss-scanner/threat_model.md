@@ -123,6 +123,11 @@ workspace's own `target/debug`.
 - Each capsule: `cd /src/capsules/<name> && cargo test`.
 - Tests that need the network, a running IPFS node, Kubo, a model or KVM are `#[ignore]`d. This image has no KVM, so
   crosvm and Browser VM paths fail closed. `crates/elastos-vz` needs macOS on Apple silicon.
+- Two groups of tests depend on the machine, not on the code. Storage, model and Browser image tests refuse to run
+  when the volume has less than 10% free space ("preparation requires ten percent free space"). Tests that inject a
+  write failure through file permissions pass only as a non-root user, because root ignores those permissions. Treat
+  these failures as environment results, not findings. Run the tests as a non-root user on a volume with free space
+  to get a clean baseline.
 - Gateway handlers can be driven in process with `tower::ServiceExt::oneshot` from the helpers in
   `crates/elastos-server/src/api/gateway_tests/` (`mod.rs` has `test_state`, `support_runtime.rs` has
   `start_fake_runtime`). A new test there is the preferred reproducer for a gateway finding.
