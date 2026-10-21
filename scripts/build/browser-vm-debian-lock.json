@@ -3,29 +3,29 @@
   "architecture": "arm64",
   "suite": "bookworm",
   "debian_snapshot": "20261008T203843Z",
-  "security_snapshot": "20261008T230243Z",
-  "security_index_sha256": "22fc508cdbda08d9a456263bb188dc89ac72fdf882d858cb95fdba40badb2774",
+  "security_snapshot": "20261021T125632Z",
+  "security_index_sha256": "3d713cbdb444da6fead27f3b7d023dd2e774edf450a30d2cd9f5891527ecc180",
   "packages": [
     {
       "name": "chromium",
-      "version": "154.0.8037.92-1~deb12u1",
-      "filename": "pool/updates/main/c/chromium/chromium_154.0.8037.92-1~deb12u1_arm64.deb",
-      "size": 70284016,
-      "sha256": "4ee18389861d6c2af9be00ae0a8b3ecdba20aed6c08ae41fcc310da1727dd1df"
+      "version": "155.0.8059.79-1~deb12u1",
+      "filename": "pool/updates/main/c/chromium/chromium_155.0.8059.79-1~deb12u1_arm64.deb",
+      "size": 70716644,
+      "sha256": "a723cceaff406cbd5e8436d2a70fb5f39291a2b79545384d2680e6303d8b5a55"
     },
     {
       "name": "chromium-common",
-      "version": "154.0.8037.92-1~deb12u1",
-      "filename": "pool/updates/main/c/chromium/chromium-common_154.0.8037.92-1~deb12u1_arm64.deb",
-      "size": 35817004,
-      "sha256": "338df7ca0323ad2e6c98f3d628381cfb762dca2d0bcc12dd7e5adcb4b005260c"
+      "version": "155.0.8059.79-1~deb12u1",
+      "filename": "pool/updates/main/c/chromium/chromium-common_155.0.8059.79-1~deb12u1_arm64.deb",
+      "size": 36592116,
+      "sha256": "262038be1e8a162e1ef8588379f1d95769232cbbe0af1e9ecde5175b98b020ef"
     },
     {
       "name": "chromium-sandbox",
-      "version": "154.0.8037.92-1~deb12u1",
-      "filename": "pool/updates/main/c/chromium/chromium-sandbox_154.0.8037.92-1~deb12u1_arm64.deb",
-      "size": 154400,
-      "sha256": "18b827aee52af82fdba80e3acf00e07e529b6077d925dd4351c95b1d4829eaee"
+      "version": "155.0.8059.79-1~deb12u1",
+      "filename": "pool/updates/main/c/chromium/chromium-sandbox_155.0.8059.79-1~deb12u1_arm64.deb",
+      "size": 158708,
+      "sha256": "61926d8f69e1729aed1da34a7aee5b74152c3632f20c614911407716d785825c"
     }
   ]
 }
