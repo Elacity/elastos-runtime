@@ -1571,21 +1571,21 @@
       }
     },
     "node": {
-      "version": "24.21.0",
+      "version": "24.22.1",
       "description": "Browser host JavaScript runtime from the signed release",
       "platforms": {
         "darwin-arm64": {
           "strategy": "source-build",
           "release_path": "node-darwin-arm64.tar.gz",
-          "extract_path": "node-v24.21.0-darwin-arm64",
-          "install_path": "libexec/browser/node/24.21.0/darwin-arm64",
+          "extract_path": "node-v24.22.1-darwin-arm64",
+          "install_path": "libexec/browser/node/24.22.1/darwin-arm64",
           "binary_path": "bin/node"
         },
         "linux-arm64": {
           "strategy": "source-build",
           "release_path": "node-linux-arm64.tar.gz",
-          "extract_path": "node-v24.21.0-linux-arm64",
-          "install_path": "libexec/browser/node/24.21.0/linux-arm64",
+          "extract_path": "node-v24.22.1-linux-arm64",
+          "install_path": "libexec/browser/node/24.22.1/linux-arm64",
           "binary_path": "bin/node"
         }
       }

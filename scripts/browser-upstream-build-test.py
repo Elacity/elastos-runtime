@@ -227,7 +227,7 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
         self.assertEqual(len({r["source"]["checksum"] for r in recipes}), 2)
         for recipe in recipes:
             upstream.validate_recipe(recipe)
-            self.assertTrue(recipe["source"]["url"].startswith("https://nodejs.org/download/release/v24.21.0/"))
+            self.assertTrue(recipe["source"]["url"].startswith("https://nodejs.org/download/release/v24.22.1/"))
             self.assertEqual(recipe["license"]["files"], [{"name": "LICENSE", "from_archive": "LICENSE"}])
             for field in ("checksum", "license"):
                 bad = copy.deepcopy(recipe)
