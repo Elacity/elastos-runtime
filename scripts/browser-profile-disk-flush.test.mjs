@@ -55,6 +55,22 @@ test("flush propagates a readMounts exception", () => {
   );
 });
 
+test("flush stops before unmount when sync fails", () => {
+  const commands = [];
+  assert.throws(
+    () =>
+      flushAndUnmountBrowserProfileDisk({
+        exec: (command, args = []) => {
+          commands.push([command, ...args]);
+          return { status: 1 };
+        },
+        readMounts: () => `/dev/vdb ${BROWSER_PROFILE_DISK_MOUNT} ext4 rw 0 0\n`,
+      }),
+    /Browser profile disk sync failed/,
+  );
+  assert.deepEqual(commands, [["sync"]]);
+});
+
 test("flush fails closed when umount fails", () => {
   assert.throws(
     () =>
@@ -105,78 +121,89 @@ test("guest writer discovery skips the control service pid", () => {
   assert.deepEqual(ids, [22]);
 });
 
-test("guest writer quit waits for Browser.close exit before TERM", async () => {
+for (const { name, processIds, exitsAt, elapsed } of [
+  { name: "skips grace when discovery is empty", processIds: [], exitsAt: 0, elapsed: 0 },
+  { name: "skips grace when writers already exited", processIds: ["9"], exitsAt: 0, elapsed: 0 },
+  { name: "ends grace when the writer exits", processIds: ["9"], exitsAt: 150, elapsed: 150 },
+]) {
+  test(`guest writer quit ${name}`, async () => {
+    const commands = [];
+    let now = 0;
+    const leftover = await quitGuestProfileDiskWriters({
+      exec: (command, args = []) => {
+        commands.push([command, ...args]);
+        return { status: 0 };
+      },
+      listProc: () => processIds,
+      readCmdline: () => "browser-native-proxy-engine\0",
+      pidAlive: () => now < exitsAt,
+      nowMs: () => now,
+      sleep: (ms) => { now += ms; },
+    });
+    assert.deepEqual(leftover, []);
+    assert.deepEqual(commands, []);
+    assert.equal(now, elapsed);
+  });
+}
+
+test("guest writer quit gives live writers the full grace before TERM", async () => {
   const commands = [];
+  let now = 0;
   const leftover = await quitGuestProfileDiskWriters({
     exec: (command, args = []) => {
-      commands.push([command, ...args]);
+      commands.push({ command: [command, ...args], at: now });
       return { status: 0 };
     },
     listProc: () => ["9"],
     readCmdline: () => "browser-native-proxy-engine\0",
-    pidAlive: () => false,
-    nowMs: (() => {
-      let now = 0;
-      return () => {
-        now += 10;
-        return now;
-      };
-    })(),
-    sleep: () => {},
-    graceMs: 4000,
-    timeoutMs: 1,
+    pidAlive: () => now < 4150,
+    nowMs: () => now,
+    sleep: (ms) => { now += ms; },
   });
   assert.deepEqual(leftover, []);
-  assert.deepEqual(commands, []);
+  assert.deepEqual(commands, [{ command: ["kill", "-TERM", "9"], at: 4000 }]);
+  assert.equal(now, 4150);
 });
 
-test("guest writer quit keeps the persist grace after writers already exited", async () => {
-  const sleeps = [];
+test("guest writer quit signals only writers still alive after grace", async () => {
+  const commands = [];
   let now = 0;
   const leftover = await quitGuestProfileDiskWriters({
-    exec: () => ({ status: 0 }),
-    listProc: () => ["9"],
-    readCmdline: () => "browser-native-proxy-engine\0",
-    pidAlive: () => false,
-    nowMs: () => now,
-    sleep: (ms) => {
-      sleeps.push(ms);
-      now += ms;
+    exec: (command, args = []) => {
+      commands.push({ command: [command, ...args], at: now });
+      return { status: 0 };
     },
-    graceMs: 4000,
-    timeoutMs: 1,
+    listProc: () => ["9", "10"],
+    readCmdline: () => "browser-native-proxy-engine\0",
+    pidAlive: (pid) => now < (pid === 9 ? 150 : 4150),
+    nowMs: () => now,
+    sleep: (ms) => { now += ms; },
   });
   assert.deepEqual(leftover, []);
-  assert.equal(sleeps.reduce((sum, value) => sum + value, 0), 4000);
-  assert.ok(now >= 4000);
+  assert.deepEqual(commands, [{ command: ["kill", "-TERM", "10"], at: 4000 }]);
+  assert.equal(now, 4150);
 });
 
 test("guest writer quit sends TERM then KILL for leftover pids", async () => {
   const commands = [];
+  let now = 0;
   const leftover = await quitGuestProfileDiskWriters({
     exec: (command, args = []) => {
-      commands.push([command, ...args]);
+      commands.push({ command: [command, ...args], at: now });
       return { status: 0 };
     },
     listProc: () => ["9"],
     readCmdline: () => "browser-native-proxy-engine\0",
     pidAlive: () => true,
-    nowMs: (() => {
-      let now = 0;
-      return () => {
-        now += 5000;
-        return now;
-      };
-    })(),
-    sleep: () => {},
-    graceMs: 0,
-    timeoutMs: 1,
+    nowMs: () => now,
+    sleep: (ms) => { now += ms; },
   });
   assert.deepEqual(leftover, [9]);
   assert.deepEqual(commands, [
-    ["kill", "-TERM", "9"],
-    ["kill", "-KILL", "9"],
+    { command: ["kill", "-TERM", "9"], at: 4000 },
+    { command: ["kill", "-KILL", "9"], at: 9000 },
   ]);
+  assert.equal(now, 9000);
   assert.deepEqual(
     browserProfileDiskDurability(
       { flushed: true, unmounted: true, already_absent: false },
@@ -192,3 +219,16 @@ test("guest writer quit sends TERM then KILL for leftover pids", async () => {
     },
   );
 });
+
+for (const flushed of [false, true]) {
+  for (const unmounted of [false, true]) {
+    test(`profile durability requires flush (${flushed}) and unmount (${unmounted})`, () => {
+      assert.deepEqual(browserProfileDiskDurability({ flushed, unmounted }), {
+        ok: flushed && unmounted,
+        profile_disk_flushed: flushed,
+        profile_disk_unmounted: unmounted,
+        leftover_writers_killed: false,
+      });
+    });
+  }
+}

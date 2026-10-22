@@ -5880,7 +5880,7 @@ export async function quitGuestProfileDiskWriters({
 } = {}) {
   const pids = guestProcessIdsHoldingProfileDisk({ listProc, readCmdline });
   const graceDeadline = nowMs() + Math.max(0, graceMs);
-  while (nowMs() < graceDeadline) {
+  while (pids.some((pid) => pidAlive(pid)) && nowMs() < graceDeadline) {
     sleep(Math.min(50, Math.max(0, graceDeadline - nowMs())));
   }
   let leftover = pids.filter((pid) => pidAlive(pid));
