@@ -15,10 +15,13 @@ python3 docs/testing/test-review-register/register.py summary
 python3 docs/testing/test-review-register/register.py find --path browser-clipboard
 python3 docs/testing/test-review-register/register.py find --finding JS-F002 --json
 python3 docs/testing/test-review-register/register.py find --provisional --path elastos-server
+python3 docs/testing/test-review-register/register.py find --followup --path browser-input
 python3 docs/testing/test-review-register/register.py verify
 ```
 
-To verify every source file against the pinned Git objects, add `--git-repo /path/to/repository` to `verify`. The repository must contain the manifest's candidate commit. This check reads that commit, so the current checkout may differ.
+To verify every source file against the pinned Git objects, add `--git-repo /path/to/repository` to `verify`. The repository must contain the main candidate and any separately pinned follow-up commits. This check reads those commits, so the current checkout may differ.
+
+The manifest's `source_followups` lists reviews of later candidates. Use `find --followup` to read those records. They preserve their own source hashes, counts and execution receipts and stay outside the main census totals.
 
 | Artifact | Contents |
 |---|---|
@@ -59,5 +62,7 @@ Rust source declarations precede compiler expansion, target selection and featur
 `body_read` records an attributed complete body read. The method, limitations and reviewer context describe the depth of helper and production review. Rule-assisted extraction remains provisional. File classifications identify the inventory method; they do not claim that every production file was reviewed line by line.
 
 The repeated central Node run had two readiness failures and nine expected cases missing from its event accounting. Those nine passed in a separate focused run. Other focused runs found stale fixtures and missing input prerequisites. The earlier passing suite remains separate evidence. [Execution records](execution.json) preserve these distinctions; a diagnostic rerun does not erase the original result.
+
+The artifact branch also had different completion counts in two runs of the same candidate. Its focused operator-client suite passed separately. The original missing completion records remain an open runner-accounting question; an aggregate pass alone does not resolve them.
 
 Source routes into CI establish selection intent. Compiler discovery, platform execution, installed recovery, Browser media and cross-device journeys retain their own gates. Continue from stable IDs and body hashes; changed bodies or helper contracts require reassessment. The live acceptance record remains [issue #194](https://github.com/Elacity/elastos-runtime/issues/194).

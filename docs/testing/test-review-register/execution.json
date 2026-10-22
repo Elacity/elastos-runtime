@@ -62,6 +62,33 @@
       "result": "13tests13pass",
       "source_modified": false,
       "diagnostic_modified_fixture": true
+    },
+    {
+      "receipt": "js-final3-batch-004-wallet-run.txt",
+      "scope": "Pinned I/O adapter; unchanged wallet assertion bodies; no network or persistent state",
+      "result": "13 assertions pass",
+      "source_modified": false,
+      "fixture_adapted_for_pinned_reads": true
+    },
+    {
+      "receipt": "js-final3-batch-005-inbox-run.txt",
+      "scope": "Pinned read-only file adapter with unchanged VM fixture/assertion bodies; no browser or network",
+      "result": "5 scenarios pass",
+      "source_modified": false,
+      "fixture_adapted_for_pinned_reads": true
+    },
+    {
+      "receipt": "js-final3-batch-008-people-run.txt",
+      "scope": "Pinned I/O/import adapter with unchanged fake-DOM scenario/assertion bodies; no network or installed data",
+      "result": "10 scenarios pass",
+      "source_modified": false,
+      "fixture_adapted_for_pinned_reads": true
+    },
+    {
+      "receipt": "root-mac-acceptance-consumer-probe.json",
+      "scope": "Both unmodified Mac manual-UX and acceptance-audit shell suites against pinned source in an owned temporary subset; fixtures removed.",
+      "result": "Both scripts exit0, 2560ms and4798ms. Their success does not prove installed media or human acceptance.",
+      "source_modified": false
     }
   ],
   "python_unselected_files": {
@@ -172,6 +199,40 @@
       "name": "Hosted Browser audio metadata",
       "scope": "Exact pure validator with synthetic metadata",
       "result": "audio=false is accepted; outer wrappers emit true literals. Propagate observed fields."
+    },
+    {
+      "name": "Roster validator rejects an empty result",
+      "scope": "Exact final inline validator from the pinned source with an empty JSON object; no network or live target.",
+      "result": "Empty input exits zero and prints pass. Require expected members, active participants and a positive scenario witness.",
+      "receipt": "root-shell-roster-empty-probe.json"
+    },
+    {
+      "name": "Installed provider manifest parsing",
+      "scope": "Exact pinned verification script with an owned malformed manifest and no installed binaries.",
+      "result": "jq reports a parse error but the script exits zero and reports zero verified components. Propagate parse failure and require the selected provider.",
+      "receipt": "root-provider-malformed-manifest-probe.json"
+    },
+    {
+      "name": "Mac handoff machine-failure exit",
+      "scope": "Unmodified pinned handoff and local audit helpers; synthetic authenticated fixtures; no network or installed effects.",
+      "result": "Valid control exits0 with handoff_ready=true. Missing performance checks and stale uptime each exit0 with handoff_ready=false and their exact machine criterion failing.",
+      "receipt": "root-mac-handoff-exit-probe.json"
+    },
+    {
+      "name": "Staged VM child result classification",
+      "scope": "Exact AST function with inert child and path results; no process or host effects.",
+      "result": "Valid ok:true passes; child exit42 with ok:true also passes; ok:\"false\" also passes; malformed JSON fails.",
+      "receipt": "root-artifact-child-verdict-probe.json"
+    },
+    {
+      "receipt": "root-mac-proof-validator-probe.json",
+      "scope": "Exact pinned status/audio predicates and shell status reader with inert dependencies. No installed Home or network.",
+      "result": "Valid controls pass; missing status counts and audio state also pass; curl exit42 is recorded as0."
+    },
+    {
+      "receipt": "root-mac-acceptance-consumer-probe.json",
+      "scope": "Exact pinned consumer with generated proof fixture; isolated local source subset, no Browser/VM/network.",
+      "result": "Legacy positive accepted without audio/transport sections; current engine-owned relay policy rejected; explicit failed audio/transport still accepted by the predicate."
     }
   ],
   "receipts": [
@@ -258,11 +319,127 @@
       "sha256": "4d25ff0c910294696ef5f197e18ec2b6e6e3d6e2a0570c165f71958c8ac99b4d",
       "bytes": 1095,
       "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-shell-roster-empty-probe.json",
+      "sha256": "4038c628d1422f1e4e68d83807a2d0a69ee028482ff30071c7e7cfe31779efa4",
+      "bytes": 555,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-provider-malformed-manifest-probe.json",
+      "sha256": "9dd92553a0b243bb9e2ad278476c3efe96bf7e1372b8574182df85156c82ce98",
+      "bytes": 552,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "js-final3-batch-004-wallet-run.txt",
+      "sha256": "6ae757b18ac0f98363565af078f7efcce8c8c9e17617fbdea6a69575a0e744ed",
+      "bytes": 217,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "js-final3-batch-005-inbox-run.txt",
+      "sha256": "46946af6c00ff54e02900521e6cfd4acf3090f051d7c9cfcb56e9b62b298cacd",
+      "bytes": 617,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "js-final3-batch-008-people-run.txt",
+      "sha256": "c9dd78bfe67f737887578e2d2f8e78b217f334a7db543b771f0984915b41f032",
+      "bytes": 973,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-register-prepush.log",
+      "sha256": "1e05e7538f741a254c55623aee91b059dd6aed517a59f6b0d3b9cb16a95fc332",
+      "bytes": 160039,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-mac-handoff-exit-probe.json",
+      "sha256": "1c4b7e8a29893578c31d836b22fd3befebd7b645bd37c104715413521dc38afb",
+      "bytes": 2024,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-mac-handoff-exit-probe-initial-control.json",
+      "sha256": "b69b405f05968e38a2212ab8e20e74e19b26ded251c0950fa4bb6d051b2f5353",
+      "bytes": 696,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-mac-handoff-exit-probe.py",
+      "sha256": "cd8aae4c9d9bd1509f40d0ea0d1cc2bb62755dff240387ae6ef5f1f534a7fb58",
+      "bytes": 4135,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-artifact-child-verdict-probe.json",
+      "sha256": "b451936317b9bc25fbd5f8b2c81ef72eb05d71841c878f96368dd1564c244fe8",
+      "bytes": 1195,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-mac-proof-validator-probe.json",
+      "sha256": "0e3fb7fac5219eb4a06fb5fca2c44427086506d302bdb2c3c3851b27ee4d2dce",
+      "bytes": 831,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-mac-proof-validator-probe.py",
+      "sha256": "b1e5b0629ef29ab418c06f063c48ecf5a37aa575664df6a24ed403c8e96c0c37",
+      "bytes": 2574,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-mac-acceptance-consumer-probe.json",
+      "sha256": "ed96c7ae8b8c935115da7df72c800a93b185e27e6ca3a6f83366622397786be3",
+      "bytes": 4679,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-mac-acceptance-consumer-probe.py",
+      "sha256": "f6903f8b3f8616d509510737682ecb8c445f3141cf78df64f7d3f7b9ad8ec477",
+      "bytes": 3476,
+      "access": "Raw evidence retained privately by the audit owner."
     }
   ],
   "limits": [
     "Diagnostic mutants and instrumentation are labeled and do not change repository source.",
     "A passing diagnostic does not supersede an earlier failure. Missing registrations, skipped prerequisites and unreachable CI cases remain explicit.",
     "Counts use test definitions, expanded registrations or reported runner cases as named; they are not one interchangeable denominator."
-  ]
+  ],
+  "artifact_branch_validation": {
+    "source_commit": "784d140363c9407cecd010ed59b2180bc15d941d",
+    "source_tree": "f98c54b8ed8a856114cc16571e4928828e66a777",
+    "base_commit": "3beb816438fd567145a8d725e22465bd83277cf0",
+    "result": "Mandatory pre-push gate passed; 1,739 behavior cases passed and source gate passed.",
+    "receipt": "root-register-prepush.log",
+    "scope": "This validates the published register branch based on develop. Its product test run does not execute the separately pinned audit candidate 460b1888."
+  },
+  "artifact_branch_count_discrepancy": {
+    "candidate": "1f403dfa475a2cb4c8184fae2f6221a8b82c6874",
+    "tree": "47f473cacd2beb466e56192719360923fa3a944d",
+    "scope": "Artifact branch validation, separate from the460b release-source census. This unpublished artifact candidate was withdrawn for a projection correction.",
+    "standalone_behavior": {
+      "tests": 1739,
+      "pass": 1739,
+      "log_sha256": "debc7b84bf93d6f00eeecfa5445f641dd5385fb7066bb0b814009730d223e9c0"
+    },
+    "push_hook_behavior": {
+      "tests": 1731,
+      "pass": 1731,
+      "log_sha256": "648f54fda4c1c6f7b7a4c956c11d83be9c64303b9657c2e41b92e386c461f1af",
+      "overall_hook_result": "Interrupted intentionally before publication during source checks."
+    },
+    "focused_operator_client": {
+      "tests": 46,
+      "pass": 46,
+      "elapsed_ms": 418.604458,
+      "node_version": "v26.5.0"
+    },
+    "reconciliation_receipt_sha256": "a0c436cb702a3ef45e6890bc2816c33833b45336c291cc99dfd20e5de15d7161",
+    "limit": "Eight operator-client completion records are absent in the second full run. A case-start record exists for the first missing case. The cause remains unresolved; the focused pass does not replace full-run coverage."
+  }
 }
