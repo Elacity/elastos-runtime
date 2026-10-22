@@ -1,0 +1,566 @@
+{
+  "schema": "elastos.test-review-register/v2",
+  "owner": "https://github.com/Elacity/elastos-runtime/issues/194",
+  "source": {
+    "candidate": "460b1888d344f52cebd1c25866be88ff4085f035",
+    "tree": "17aeaf23c640e2dec8f653fd16f3771f95a55b9c",
+    "baseline": "3beb816438fd567145a8d725e22465bd83277cf0",
+    "baseline_relation": {
+      "behind": 0,
+      "ahead": 141
+    },
+    "candidate_publication": "Unpublished when reviewed; paths and hashes identify pinned Git objects."
+  },
+  "artifact_kind": "Evidence snapshot; semantic review remains incomplete.",
+  "counts": {
+    "tracked_files": 1926,
+    "register_rows": 9359,
+    "body_read_rows": 3375,
+    "provisional_body_rows": 5984,
+    "findings": 188
+  },
+  "partitions": [
+    {
+      "name": "rust-server",
+      "file": "rust-server.jsonl",
+      "rows": 3351,
+      "body_read_rows": 419,
+      "kinds": {
+        "tokio-test": 1734,
+        "rust-test": 1613,
+        "rustdoc-compile_fail": 4
+      },
+      "dispositions": {
+        "retain": 3221,
+        "improve": 130
+      }
+    },
+    {
+      "name": "rust-other",
+      "file": "rust-other.jsonl",
+      "rows": 2412,
+      "body_read_rows": 1180,
+      "kinds": {
+        "unit": 2209,
+        "integration": 195,
+        "doctest": 8
+      },
+      "dispositions": {
+        "retain": 2102,
+        "improve": 295,
+        "replace": 8,
+        "consolidate": 7
+      }
+    },
+    {
+      "name": "javascript",
+      "file": "javascript.jsonl",
+      "rows": 2620,
+      "body_read_rows": 857,
+      "kinds": {
+        "node-test-registration": 1930,
+        "assertion-helper": 526,
+        "standalone-entrypoint": 61,
+        "module-load-assertion": 16,
+        "audit-criterion": 38,
+        "custom-verdict-entrypoint": 11,
+        "policy-fixture-data": 1,
+        "standalone-scenario": 37
+      },
+      "dispositions": {
+        "retain": 2310,
+        "improve": 310
+      }
+    },
+    {
+      "name": "python",
+      "file": "python.jsonl",
+      "rows": 849,
+      "body_read_rows": 847,
+      "kinds": {
+        "python-unittest": 823,
+        "python-standalone-scenario": 14,
+        "python-function": 10,
+        "python-assertion-helper": 2
+      },
+      "dispositions": {
+        "retain": 638,
+        "improve": 208,
+        "consolidate": 1,
+        "replace": 2
+      }
+    },
+    {
+      "name": "shell",
+      "file": "shell.jsonl",
+      "rows": 116,
+      "body_read_rows": 68,
+      "kinds": {
+        "verification-suite": 1,
+        "verification-or-fixture-tool": 3,
+        "shell-entrypoint": 84,
+        "suite-wrapper": 14,
+        "acceptance-orchestrator": 2,
+        "installed-acceptance-suite": 3,
+        "fixture-preflight": 1,
+        "artifact-verification": 3,
+        "host-preflight": 1,
+        "installed-acceptance-orchestrator": 1,
+        "shell-self-test": 1,
+        "runtime-acceptance-suite": 1,
+        "source-drift-verification": 1
+      },
+      "dispositions": {
+        "retain": 66,
+        "improve": 50
+      }
+    },
+    {
+      "name": "other",
+      "file": "other.jsonl",
+      "rows": 3,
+      "body_read_rows": 3,
+      "kinds": {
+        "compiled-test-fixture": 2,
+        "standalone-c-design-proof": 1
+      },
+      "dispositions": {
+        "improve": 3
+      }
+    },
+    {
+      "name": "embedded",
+      "file": "embedded.jsonl",
+      "rows": 8,
+      "body_read_rows": 1,
+      "kinds": {
+        "workflow-inline-python-acceptance-suite": 1,
+        "python-acceptance-scenario": 6,
+        "python-acceptance-verdict": 1
+      },
+      "dispositions": {
+        "improve": 7,
+        "retain": 1
+      }
+    }
+  ],
+  "count_rules": [
+    "Rust rows are source declarations plus labeled documentation fences, before Cargo/rustc expansion and target/feature selection.",
+    "Node static registrations include resolved table cases. Helper, scenario and policy rows are distinct units.",
+    "Python definitions do not count individual unittest subTest iterations. Standalone scenario records can share helper bodies.",
+    "Shell entrypoints and embedded checks can delegate whole suites. Counts must not be added to produce an executed-test total.",
+    "Body read means an attributed full-body source read. Per-row scope records helper/production review limits. Proposed dispositions remain scoped.",
+    "Aggregate historical runs do not supply missing per-case receipts. Source routes into CI do not prove execution.",
+    "Body hashes follow each language extractor; file SHA-256 and pinned Git tree provide common independently verifiable identity."
+  ],
+  "coverage_limits": [
+    "All 1926 tracked files are inventoried. Compiler-generated Rust tests and arbitrary dynamic registrations require target discovery before claiming a complete runtime census.",
+    "The requested exhaustive semantic review remains open. Provisional rows identify remaining body/helper/contract work.",
+    "Installed, hardware, media, recovery and cross-device acceptance require separate exact-candidate journey evidence.",
+    "No test or product source was changed by this artifact. Detailed sensitive evidence remains in private storage."
+  ],
+  "inputs": {
+    "extra-tests.jsonl": {
+      "sha256": "4ba9a88bb47b51bad57c50ed83f1c52c0618caba79785038728052adae8663a2",
+      "bytes": 49228
+    },
+    "hyper-python-final-460b1888-review-01-coverage.json": {
+      "sha256": "f5fa7b7fa2a371c1ff532cda956e373fc5290a8a5d62476feb460c9c5320f8eb",
+      "bytes": 190863
+    },
+    "hyper-python-final-460b1888-review-01-findings.json": {
+      "sha256": "c9b18cf42b0c2bb0c6cd461ed4e0f52f070b6f3a9849fd418daf5c9306f20de6",
+      "bytes": 30423
+    },
+    "hyper-python-final-460b1888-review-01-register.jsonl": {
+      "sha256": "d9096f8c617ca60379b6d1196f3dc00419f5295ee460d5749fd633f8282698d4",
+      "bytes": 5495295
+    },
+    "hyper-root-final-attestation.json": {
+      "sha256": "ff1757342c7de4eedb85f6597ad643155c89bf4c9e64369f5f472627af007bd6",
+      "bytes": 31310
+    },
+    "hyper-root-final-other-tests.jsonl": {
+      "sha256": "9775c29cb878fc96b7fb828cea3e2e443f4ead63c8596327092510f54cfb7ff8",
+      "bytes": 4205
+    },
+    "hyper-root-final-shell-manual-review.json": {
+      "sha256": "dac2e76e98718076adfac13e310fb5b5dce6ced21d49843f97030a1494350837",
+      "bytes": 22287
+    },
+    "hyper-root-final-shell-tests.jsonl": {
+      "sha256": "7d7b19778c30f00fd0b99e32c49c7ac71e177412f02390f276eed4f232c08008",
+      "bytes": 168779
+    },
+    "js-final2-file-coverage.json": {
+      "sha256": "e827a76292992929d81bed2fdc4de90f0917441e76ead6caf270cabfca9028f9",
+      "bytes": 388069
+    },
+    "js-final2-findings.json": {
+      "sha256": "6ba08f11a4a2a8d8a0486251a62495c97bb882be9d62050d6f52c96b7dcc3a2d",
+      "bytes": 23001
+    },
+    "js-final2-tests.jsonl": {
+      "sha256": "183a366004d60aa5de73d3d929606c4b28125cc0e47c077b2de05d030a7bfbd8",
+      "bytes": 23387561
+    },
+    "js-final3-batch-001-findings.json": {
+      "sha256": "98cb73d58962dac271db8abb1ee552f518a977681ef5fba37b1138dcdff5b382",
+      "bytes": 4225
+    },
+    "js-final3-batch-001-manifest.json": {
+      "sha256": "ef7bc53d8798141a9c3d8f1e43aab3d3b50fbc8a0baf4d8d3c9cca2c952be8a6",
+      "bytes": 1492
+    },
+    "js-final3-batch-001-register.jsonl": {
+      "sha256": "53352036b5a7435c868cba4d9f3831e00d57c4d86c00415ac27df673cb10eb88",
+      "bytes": 444273
+    },
+    "js-final3-batch-002-findings.json": {
+      "sha256": "efd19230745da351b7de9d7308a64da53c145f74a044c58ccc210df880c92c8e",
+      "bytes": 2973
+    },
+    "js-final3-batch-002-manifest.json": {
+      "sha256": "6ce65393e944a3945b0295cc392c09c667fcf5cde48aa826087383fc42ae1401",
+      "bytes": 1651
+    },
+    "js-final3-batch-002-register.jsonl": {
+      "sha256": "73150ccd266fd0880bb50b0e0484079c8443b2224f8a9f21164c2351c915bbc6",
+      "bytes": 256340
+    },
+    "js-python-final3-findings.json": {
+      "sha256": "c50b0786be73eb3d2b670bede7cb719f544dd5c204c899490d10921f3f1b9c38",
+      "bytes": 5654
+    },
+    "js-python-final3-installer-sandbox-consumers.json": {
+      "sha256": "698f7d2266fc69e4e991de1e62b57ea77e40e6af8e5234adcde4f35c0b5eb38e",
+      "bytes": 22274
+    },
+    "js-python-final3-manifest.json": {
+      "sha256": "9865629042458654e9f73508adc3b19087843a6f550b7d2281e73642c2d2d88d",
+      "bytes": 1728
+    },
+    "js-python-final3-register.jsonl": {
+      "sha256": "079938814bcf27fc28ebc3b3fa8cd5ca33900c5f65b7065810ec4105882baacc",
+      "bytes": 1541196
+    },
+    "ps-final2-audit-method-review.json": {
+      "sha256": "74454cadc38ff9774faf876a2321ded753c875120dd23259e8ee647cf8a1712d",
+      "bytes": 20063
+    },
+    "ps-final2-rust-server-files.json": {
+      "sha256": "b6b1a1cd3c22d63bec955c2785103bec3ace5caa84cefbc8621c60bf32d4e756",
+      "bytes": 1215391
+    },
+    "ps-final2-rust-server-findings.json": {
+      "sha256": "aa435ac74037f511f32dd436770c9ab0f4f15f8152f8a0bd389e8cad9b9b7fe8",
+      "bytes": 78890
+    },
+    "ps-final2-rust-server.jsonl": {
+      "sha256": "a0e37722fe1af4e58c3be9b1de65f5835ce20d0e987fa08f6a2871b8175a9d1e",
+      "bytes": 28173943
+    },
+    "ps-final2-shell-file-manifest.json": {
+      "sha256": "f3845cd601e1dfcfef32c6a0182dd73b3cc4884d56f39158867e73b3edbaf67b",
+      "bytes": 101461
+    },
+    "ps-final2-supplemental-inline-proof-records.jsonl": {
+      "sha256": "25e3313889cfd4b61fa6a2fcc2d8b9a769181a80da18da9d127927f699f43404",
+      "bytes": 55023
+    },
+    "ps-final2-supplemental-shell-records.jsonl": {
+      "sha256": "e9af6d175c7b18918ee40d7e96ed7e211642c240d00badf792d5561f650764ad",
+      "bytes": 73447
+    },
+    "ps-server-batch-001-sha256.json": {
+      "sha256": "50a84da00140c63e170ec6c173d3b6ee81ef675171537768db96d0d0903f7e8a",
+      "bytes": 839
+    },
+    "ps-server-batch-001.jsonl": {
+      "sha256": "7cb41f594c4290c463e5869a4c97f4bd213732a402e8a0abed804d5c340f2765",
+      "bytes": 111987
+    },
+    "ps-server-batch-002-sha256.json": {
+      "sha256": "036366ac32debadd06e98989eb648096cea630473c674f1da87264926f38cc98",
+      "bytes": 693
+    },
+    "ps-server-batch-002.jsonl": {
+      "sha256": "74969212eab0e4cfeb59f1cb55cf4529f49a6f4677485e6bd44d273d17bab975",
+      "bytes": 83777
+    },
+    "ps-server-batch-003-sha256.json": {
+      "sha256": "1ac664c736d2ec815301bf9cd525fd174c5f10682513a8fc9537835d657bc3bd",
+      "bytes": 839
+    },
+    "ps-server-batch-003.jsonl": {
+      "sha256": "87e3be3d87950951dc2aa592cae2eb9488c828a61ecd37610df41e2a5279445d",
+      "bytes": 82436
+    },
+    "ps-server-batch-004-sha256.json": {
+      "sha256": "a940c5c6c3490334326581f453054264ee693d4713b6286007400af4cf2842ca",
+      "bytes": 692
+    },
+    "ps-server-batch-004.jsonl": {
+      "sha256": "f86557cbde62580d760bdd377455712bdbd601323fb99d538f5963c6d1a479b6",
+      "bytes": 68652
+    },
+    "ps-server-batch-005-sha256.json": {
+      "sha256": "37728f8d0011f55feff4a35dad528d8c8996e0068523257ffc28e8cf9e0d2440",
+      "bytes": 692
+    },
+    "ps-server-batch-005.jsonl": {
+      "sha256": "3ef61dbafdea7462b1d70d198e47c687ab764f0d577d8e6eb66f29db151dbe4f",
+      "bytes": 82973
+    },
+    "ps-server-batch-006-sha256.json": {
+      "sha256": "9bb5bb7c6871673f740095358a4c86ca640e1173aaa3da9130b645a15201a3f4",
+      "bytes": 839
+    },
+    "ps-server-batch-006.jsonl": {
+      "sha256": "c1ff296edff6e58bfe7f1e28728859cf1bca23940dacf045c11815daefc13776",
+      "bytes": 111126
+    },
+    "ps-server-batch-007-sha256.json": {
+      "sha256": "caa1459e427b2cf274be93dffec01d998b76bab8b90bb8d364ca3b5baa87973e",
+      "bytes": 693
+    },
+    "ps-server-batch-007.jsonl": {
+      "sha256": "3ed3a90bd7f5ccb8c4b5c5dc4f51a41efc01555c25c1135bc3faa2742ce219ff",
+      "bytes": 91234
+    },
+    "ps-server-batch-008-sha256.json": {
+      "sha256": "135e7904f836bd4215423b05719be90d1bc2a6b6e2a57d176f21a018ce265791",
+      "bytes": 838
+    },
+    "ps-server-batch-008.jsonl": {
+      "sha256": "300572ae198ae6e6a4b606bcfd887d13e7dc9ad8f263b758a7901665ccfe68c0",
+      "bytes": 60839
+    },
+    "ps-server-batch-009-sha256.json": {
+      "sha256": "2d369254f4234e32d082b1c24085b19fcc66e51e783e94250bee49795dcc8bda",
+      "bytes": 838
+    },
+    "ps-server-batch-009.jsonl": {
+      "sha256": "c0e0becd6967443e69654a2c7f46339a2d462d3532bef006b60c08a684feb986",
+      "bytes": 43963
+    },
+    "ps-server-batch-010-sha256.json": {
+      "sha256": "d9d9a216a07bf2e07ca71acf89a6ca208e4d3fce3b86b1ab2197493e63e0f791",
+      "bytes": 840
+    },
+    "ps-server-batch-010.jsonl": {
+      "sha256": "947700af344762eec6a013e1ca1c2cfcdc6ba940c4bc7ca1a5f38dd5c63de8c5",
+      "bytes": 202385
+    },
+    "ps-server-batch-011-sha256.json": {
+      "sha256": "46e168c0ad3f5e7ea808f9a65fc521508ce5cd0c74eee400d091d1d15874b11d",
+      "bytes": 821
+    },
+    "ps-server-batch-011.jsonl": {
+      "sha256": "77863cf0b33774cc8682ce97333f6729d0b48b4793129b0a5ff7344467f61d7f",
+      "bytes": 7348
+    },
+    "ps-server-batch-012-sha256.json": {
+      "sha256": "23e42bcaacdb3d8be8037a6423b2e95e54d048ec1bec7cd1d5781a007b863e7d",
+      "bytes": 840
+    },
+    "ps-server-batch-012.jsonl": {
+      "sha256": "d1d8e2ae8cbcf3882245b75128b922608ab0faefe46696307e77f8ecd3af1384",
+      "bytes": 103911
+    },
+    "ps-server-batch-013-sha256.json": {
+      "sha256": "37e997cf44eaa1105e70a7f193bb90b19b2c8e6a9eb48a783e36ba2c5c59217c",
+      "bytes": 838
+    },
+    "ps-server-batch-013.jsonl": {
+      "sha256": "02684e8c2ef619de4957930583f12a705642253fa1880df90b24389c77f1d17e",
+      "bytes": 74366
+    },
+    "ps-server-batch-014-sha256.json": {
+      "sha256": "8d74872f293f5235ce14593219fd3d2d2fa2a5b2e7bcd94a05fce41b013f7c84",
+      "bytes": 838
+    },
+    "ps-server-batch-014.jsonl": {
+      "sha256": "41e3f0443a59fbeabfd9bf2a4252169fdcdf069e7c6e81258b291c40275ca5d7",
+      "bytes": 101213
+    },
+    "ps-server-batch-015-sha256.json": {
+      "sha256": "180f1dca3e7a425e4871f3a8085b358e3a24679f679f1ed5402dcc37568dd453",
+      "bytes": 693
+    },
+    "ps-server-batch-015.jsonl": {
+      "sha256": "8f5f11586b7a4c40a352c393009bbcac5f0b681d4be76b6683db9228201e6de9",
+      "bytes": 122265
+    },
+    "ps-server-batch-016-sha256.json": {
+      "sha256": "066addb8b99b1205ed1033262f33d2ba19d5b1ea0872546c8254e79af039dd8a",
+      "bytes": 838
+    },
+    "ps-server-batch-016.jsonl": {
+      "sha256": "53c0b5be02d7dbce86392b5c79f996ba1c9475a6187dceed5173adbebb71f470",
+      "bytes": 97596
+    },
+    "ro-final2-coverage.json": {
+      "sha256": "d9baf62a42288ac7cf296b6d179bfe9780603f04da83fd96d537851eed78f9e4",
+      "bytes": 735308
+    },
+    "ro-final2-findings.json": {
+      "sha256": "f07147f0489914e9fe87a34042a890f9ebfaa7d51713d516b76c026f0307d92b",
+      "bytes": 189014
+    },
+    "ro-final2-rust-other.jsonl": {
+      "sha256": "ae6afadd53cdfd65c56427d4a620ada4646ba49231a2b09c6791f4e520cfb085",
+      "bytes": 11986452
+    },
+    "ro-onboarding-final-supplemental-python-shell-review.json": {
+      "sha256": "563990ada2690d3e3a5e1a1e578b3593d4f3326c1472865ca411ae57e35e84b7",
+      "bytes": 48309
+    },
+    "ro-python-final3-findings.json": {
+      "sha256": "351844bb7618657bdd3a0e53db6547f2eae49ea913a48fcaaabf48a02ab24266",
+      "bytes": 5752
+    },
+    "ro-python-final3-manifest.json": {
+      "sha256": "14081ca915ae6393bf138706a6f89f04a9a95a979a66c4c3261a0d5720a89ce9",
+      "bytes": 743
+    },
+    "ro-python-final3-register.jsonl": {
+      "sha256": "0a9cc25b4cd05b9d2cc874a6065c5388b884f57daf77494e790af112ee8b2861",
+      "bytes": 224995
+    },
+    "ro-rust-final3-batch001-findings.json": {
+      "sha256": "e568107572ded3c3f060ec64dc7a4d7939171c89b4dbd93747ac7d498f56274d",
+      "bytes": 2176
+    },
+    "ro-rust-final3-batch001-manifest.json": {
+      "sha256": "0044446a064f374272588012c7a0cf975c20d0c3934cb4f5b970daa9ea434606",
+      "bytes": 780
+    },
+    "ro-rust-final3-batch001-register.jsonl": {
+      "sha256": "57e1612f2e11632b89074a74870af3066b26a7cda88d5b3e5c1f30b196c334ba",
+      "bytes": 49676
+    },
+    "ro-rust-final3-batch002-findings.json": {
+      "sha256": "36d99f38ce116e533560f124b20b29b4e0365114a52e647b711e7cfabec11c72",
+      "bytes": 1992
+    },
+    "ro-rust-final3-batch002-manifest.json": {
+      "sha256": "d52a4f2c801c2c75084244a106c7f202c965d47c6a1ed9ff1643eba0f0159322",
+      "bytes": 781
+    },
+    "ro-rust-final3-batch002-register.jsonl": {
+      "sha256": "b49e6742b546bfad06c47158953e9c826c93489604fa3a96bfa3f6a89cfd1164",
+      "bytes": 53692
+    },
+    "ro-rust-final3-batch003-findings.json": {
+      "sha256": "82d2f38b5af361d8622d80e81d718f0df6bb4c19d501fc386a47aeadaacf90cd",
+      "bytes": 145
+    },
+    "ro-rust-final3-batch003-manifest.json": {
+      "sha256": "cba660064c6f7dffbeb97acc21a424505381091e5fd15c1233031b68d3cdf8ef",
+      "bytes": 779
+    },
+    "ro-rust-final3-batch003-register.jsonl": {
+      "sha256": "b8978008e6f2631013c83b13d8dc672218b6eca235fc830b38e16ca922282f8d",
+      "bytes": 22466
+    },
+    "ro-rust-final3-batch004-findings.json": {
+      "sha256": "73c0d2867b31542ff63344e4ecad7ba3668e0520364f90108ac9ac3b8eef0a9f",
+      "bytes": 2827
+    },
+    "ro-rust-final3-batch004-manifest.json": {
+      "sha256": "ed98a001edd21aa37e50143c99ca2a2cc5a9789c90ccad52ba61f4b0b71fd4e7",
+      "bytes": 781
+    },
+    "ro-rust-final3-batch004-register.jsonl": {
+      "sha256": "60f8ad4fea2e061b738fa910a3b1f30309f473022c7d3db7eb9713e381edec57",
+      "bytes": 54439
+    },
+    "ro-rust-final3-batch005-findings.json": {
+      "sha256": "f06920e7ad9069b60a334478160883390e05203e565b933f43d1edf6db74855a",
+      "bytes": 1146
+    },
+    "ro-rust-final3-batch005-manifest.json": {
+      "sha256": "b4f86731a20b8c9c696021516aae2372dc6761c236a35e371765f14979f1698b",
+      "bytes": 780
+    },
+    "ro-rust-final3-batch005-register.jsonl": {
+      "sha256": "43d3156b84f2d908050c795c59606667a5ee8d00d6ab3ef64471910ec2bfc8e0",
+      "bytes": 37218
+    },
+    "root-shell-batch-001.json": {
+      "sha256": "954f7e03e9ab6d8308693deb991651f25444fd2bae5394d427a8f984f27ac906",
+      "bytes": 10182
+    },
+    "root-update-hop-review-v1.json": {
+      "sha256": "93f476642a89f3c1a63259c61bb7b4cf6bdab7560bd2cb36c66faf6003cd3e94",
+      "bytes": 207848
+    },
+    "tracked-files.json": {
+      "sha256": "a3cff0154d59d9ca935846e2c8ab4e04776a21e6329f73f4b2e5549ae444129e",
+      "bytes": 98719
+    }
+  },
+  "artifacts": {
+    "README.md": {
+      "sha256": "69a6ade7fce97d1bf1179d2768bd7bfe55d090139a97125355f3ea95ec46e6c9",
+      "bytes": 6253
+    },
+    "embedded.jsonl": {
+      "sha256": "3ea5b6a37ecb7cb652be873fdec68315f942a1e7c66003934d109f58edf9c938",
+      "bytes": 40554
+    },
+    "execution.json": {
+      "sha256": "d0233ec7f6df6d2c5423ca9f8ced058bb3438ef8f5d4129fe5791edc8a605efc",
+      "bytes": 9641
+    },
+    "files.jsonl": {
+      "sha256": "a099f227b27967943781dec8e50b6ed6b3050e6ca22e9fc5bf850bd249a60eab",
+      "bytes": 1764767
+    },
+    "findings.json": {
+      "sha256": "53bad15dcc31e3a97ab0e6db354aeeac5689417701897a56087b72920dbe9517",
+      "bytes": 429666
+    },
+    "identity-aliases.json": {
+      "sha256": "f5bb971263f239278cd685597ebdbdbb1edd212d088ef0ead159ee7cba206070",
+      "bytes": 5300
+    },
+    "javascript.jsonl": {
+      "sha256": "8d5f58324c554605e4c95251f66db1eabf639ced01482c680d5b60d0592bdcb9",
+      "bytes": 11746353
+    },
+    "method-review.json": {
+      "sha256": "74454cadc38ff9774faf876a2321ded753c875120dd23259e8ee647cf8a1712d",
+      "bytes": 20063
+    },
+    "other.jsonl": {
+      "sha256": "93555d7ede6238f2c07460b36aec4eb053d7113cb94f891f5a7df17f0d9cda15",
+      "bytes": 5742
+    },
+    "profiles.json": {
+      "sha256": "9e61211aa04db221687436dc4828bf920ac6c817d3bf99c458362b3cc95fd287",
+      "bytes": 1379703
+    },
+    "python.jsonl": {
+      "sha256": "0ecab4e29c5e397caa5a533ea579633f4d01df8b9d452439d06f10280a791092",
+      "bytes": 4362944
+    },
+    "register.py": {
+      "sha256": "a8cc2f91b189ab00a825b67aaf5216c5b419f8b3d518c993e4e6ca0e69d0ed3c",
+      "bytes": 7526
+    },
+    "rust-other.jsonl": {
+      "sha256": "d523772c44fae06f418259e55c63f0adbfd8c3928ed86be78dc35e9ac5592aed",
+      "bytes": 8545158
+    },
+    "rust-server.jsonl": {
+      "sha256": "0f577b7fe052f4ccef13599810cd4fa0f95fd6797f003644826512600fe46eaa",
+      "bytes": 13433888
+    },
+    "shell.jsonl": {
+      "sha256": "205e82b28f4c4f419335202011478fda7bc66d5226c6eedfffade059c09c83da",
+      "bytes": 271283
+    }
+  }
+}

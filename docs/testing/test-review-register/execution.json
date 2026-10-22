@@ -1,0 +1,268 @@
+{
+  "schema": "elastos.test-audit.execution-summary/v1",
+  "source_commit": "460b1888d344f52cebd1c25866be88ff4085f035",
+  "source_tree": "17aeaf23c640e2dec8f653fd16f3771f95a55b9c",
+  "owner": "https://github.com/Elacity/elastos-runtime/issues/194",
+  "central_node_repeat": {
+    "type": "test:summary",
+    "success": false,
+    "counts": {
+      "tests": 1810,
+      "failed": 2,
+      "passed": 1808,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "topLevel": 1769,
+      "suites": 6
+    },
+    "duration_ms": 940608.152083
+  },
+  "separate_nine_tail_cases": {
+    "tests": 9,
+    "pass": 9,
+    "duration_ms": 78498.258333
+  },
+  "node_focused_runs": [
+    {
+      "receipt": "unwired-js-smokes.txt",
+      "scope": "five isolated fixture suites",
+      "result": "98reported96pass2fail0skip",
+      "source_modified": false
+    },
+    {
+      "receipt": "browser-picker-after-source-guard-diagnostic.txt",
+      "scope": "private in-memory removal of obsolete module source guard only",
+      "result": "16cases15pass1fail plus post-test rejection",
+      "source_modified": false,
+      "diagnostic_modified_fixture": true
+    },
+    {
+      "receipt": "readiness-serial-repeat.txt",
+      "scope": "readiness file serial normal spec noforceexit",
+      "result": "21tests20pass1fail",
+      "source_modified": false
+    },
+    {
+      "receipt": "readiness-instrumented.txt",
+      "scope": "private copy adds subprocess exception logging only",
+      "result": "21tests21pass",
+      "source_modified": false,
+      "diagnostic_modified_fixture": true
+    },
+    {
+      "receipt": "release-community-tail-repeat.txt",
+      "scope": "nine Community tail cases normal spec noforceexit",
+      "result": "9tests9pass",
+      "source_modified": false
+    },
+    {
+      "receipt": "clipboard-limit-mutant.txt",
+      "scope": "exact-source data-URL guard mutant",
+      "result": "13tests13pass",
+      "source_modified": false,
+      "diagnostic_modified_fixture": true
+    }
+  ],
+  "python_unselected_files": {
+    "definition_cases": 71,
+    "passed": 68,
+    "stale_oracle_errors": 1,
+    "missing_pinned_input_errors": 2,
+    "file_runs": [
+      {
+        "file": "scripts/browser-input-writer-gate.test.py",
+        "exit": 0,
+        "seconds": 2.335
+      },
+      {
+        "file": "scripts/browser-rootfs-pool-lifetime.test.py",
+        "exit": 0,
+        "seconds": 10.083
+      },
+      {
+        "file": "scripts/build-and-setup-source-home-test.py",
+        "exit": 0,
+        "seconds": 4.179
+      },
+      {
+        "file": "scripts/build/browser-audio-queue-diagnostic.test.py",
+        "exit": 0,
+        "seconds": 0.088
+      },
+      {
+        "file": "scripts/build/browser-gst-python-smoke.test.py",
+        "exit": 1,
+        "seconds": 0.048
+      },
+      {
+        "file": "scripts/build/browser-vz-ice-lifetime-repro.test.py",
+        "exit": 0,
+        "seconds": 0.066
+      },
+      {
+        "file": "scripts/build/browser-webrtc-send-diagnostic.test.py",
+        "exit": 1,
+        "seconds": 0.116
+      },
+      {
+        "file": "scripts/discover-source-bootstrap-test.py",
+        "exit": 0,
+        "seconds": 0.076
+      },
+      {
+        "file": "scripts/package-browser-vm-image-test.py",
+        "exit": 0,
+        "seconds": 0.49
+      },
+      {
+        "file": "scripts/install-source-home-runtime-smoke.py",
+        "exit": 0,
+        "seconds": 2.132
+      }
+    ],
+    "additional_file": "scripts/browser-helper-parent-lifetime.test.py: 4 passed; separate receipt included."
+  },
+  "python_standalone": [
+    {
+      "path": "scripts/source-home-capsule-inventory-smoke.py",
+      "exit": 0,
+      "seconds": 0.16764225000000002
+    },
+    {
+      "path": "scripts/source-home-provider-inventory-smoke.py",
+      "exit": 1,
+      "seconds": 0.23583016600000004
+    },
+    {
+      "path": "scripts/protected-content-installed-static-audit-smoke.py",
+      "exit": 0,
+      "seconds": 12.233488083
+    }
+  ],
+  "prior_audit_summary": {
+    "source_gate": "Passed all four sections on the pinned candidate.",
+    "node_behavior": "1819 passed in the preceding audit; aggregate evidence, separate from the later repeat.",
+    "product_ui": "12 product UI commands passed with matched Chromium; WebKit unavailable. An earlier Brave attempt failed and remains in raw evidence.",
+    "rust_tests": "No Rust test execution in this audit; source extraction and formatting only.",
+    "installed_and_hardware": "These source/fixture checks do not establish installed recovery, Browser media, hardware or cross-device acceptance."
+  },
+  "controlled_probes": [
+    {
+      "name": "Refusal exit classification",
+      "scope": "Actual helper with inert process results",
+      "result": "Some abnormal exits can satisfy the text refusal oracle; add normal-exit and signal controls."
+    },
+    {
+      "name": "Custody fixture cleanup",
+      "scope": "Inert docker/rm substitutes",
+      "result": "Cleanup failures can retain a success exit; aggregate teardown/restoration failures."
+    },
+    {
+      "name": "Installer sourcing invariant",
+      "scope": "Exact source fixture plus changed-global negative control",
+      "result": "Both exit zero because later shell commands mask the unchecked invariant."
+    },
+    {
+      "name": "Installed harness census failure",
+      "scope": "Actual pinned AST with inert process/census/signal objects",
+      "result": "Initial census failure can leave the known child unsignalled; retain its failed receipt and ensure direct-child cleanup."
+    },
+    {
+      "name": "Hosted Browser audio metadata",
+      "scope": "Exact pure validator with synthetic metadata",
+      "result": "audio=false is accepted; outer wrappers emit true literals. Propagate observed fields."
+    }
+  ],
+  "receipts": [
+    {
+      "evidence": "node-execution-events.jsonl",
+      "sha256": "f85c42f1a04cde9e3362e30daa1317b16645e37f454e23161edb336b178fae03",
+      "bytes": 601165,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "unwired-js-smokes.txt",
+      "sha256": "9dcb8287581f87b9cb7d11f7c362ba69f4060a69d3abc6968c8c48c35239f2d3",
+      "bytes": 9301,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "browser-picker-after-source-guard-diagnostic.txt",
+      "sha256": "ec199ed42551a41a1541116fa2b687ee9e571ef7614dfeedb803b0e9c8b4d2f9",
+      "bytes": 36370,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "readiness-serial-repeat.txt",
+      "sha256": "b66e7475baa38f24e444aab9e9fe45d1ce008a3f92a572824f29ed4ef19e1877",
+      "bytes": 2822,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "readiness-instrumented.txt",
+      "sha256": "e4467a6a9397d9ede9395e35d2339931341680a4caceaa38d6e77fcdd0696c3a",
+      "bytes": 1790,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "release-community-tail-repeat.txt",
+      "sha256": "75135ba82c7498cfdf0275b27d764530d20be734a66d49da782ed87e0aae09a2",
+      "bytes": 1083,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "clipboard-limit-mutant.txt",
+      "sha256": "02032ff31557a821f8392e9467bbf858bebb98050833f2b1f4e2e13e9920aa7a",
+      "bytes": 1156,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "python-unwired-runs.json",
+      "sha256": "e0fbafaab854a5b420eec3e78442da0851844a6d3bc55e5e6ab72ee125c916d7",
+      "bytes": 1067,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "python-standalone-runs.json",
+      "sha256": "75ffc5ac8327c650b65d1c6b3e1efa808ff99821d353da36f3b58e08bb1e87d6",
+      "bytes": 371,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "run-browser-helper-parent-lifetime.test.py.json",
+      "sha256": "40628ee4cc29ebcceab3ec5e693f0704879a0315db946659262e56f490d9237b",
+      "bytes": 3896,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "ro-onboarding-final-supplemental-python-shell-probes.json",
+      "sha256": "56fc871fd1c755ba431539be1167086e3b949e9816cead99c6e828d4751a251c",
+      "bytes": 1335,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "js-python-final3-sourcing-oracle-probe.json",
+      "sha256": "caca344cee0160c569c3ab5a36b9993b21ec63f19875f3f8ce5f15f53e9e0d2e",
+      "bytes": 1328,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "ro-python-final3-cleanup-probe.json",
+      "sha256": "72039a3c74c3e809a1fb64e5193518d9f92eba8723a69d5682c4900949f821c3",
+      "bytes": 1375,
+      "access": "Raw evidence retained privately by the audit owner."
+    },
+    {
+      "evidence": "root-shell-audio-verdict-probe.json",
+      "sha256": "4d25ff0c910294696ef5f197e18ec2b6e6e3d6e2a0570c165f71958c8ac99b4d",
+      "bytes": 1095,
+      "access": "Raw evidence retained privately by the audit owner."
+    }
+  ],
+  "limits": [
+    "Diagnostic mutants and instrumentation are labeled and do not change repository source.",
+    "A passing diagnostic does not supersede an earlier failure. Missing registrations, skipped prerequisites and unreachable CI cases remain explicit.",
+    "Counts use test definitions, expanded registrations or reported runner cases as named; they are not one interchangeable denominator."
+  ]
+}

@@ -1,0 +1,105 @@
+[
+  {
+    "earlier_id": "scripts/components-release-integrity-check.py::run_self_test",
+    "current_ids": [
+      "scripts/components-release-integrity-check.py::scenario::self-test"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/ci-installed-journeys.py::run",
+    "current_ids": [
+      "scripts/ci-installed-journeys.py::scenario::engine-absent-home",
+      "scripts/ci-installed-journeys.py::scenario::finite-1gib-refusal",
+      "scripts/ci-installed-journeys.py::scenario::finite-4gib-lifecycle",
+      "scripts/ci-installed-journeys.py::scenario::model-repair",
+      "scripts/ci-installed-journeys.py::scenario::repeat-fresh-home",
+      "scripts/ci-installed-journeys.py::scenario::ordinary-model-reply"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/ci-installed-journeys.py::repeat",
+    "current_ids": [
+      "scripts/ci-installed-journeys.py::scenario::repeat-fresh-home"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/holder-idle-ci.py::main",
+    "current_ids": [
+      "scripts/holder-idle-ci.py::scenario::holder-idle"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/ci-rust-cache-smoke.py::probe",
+    "current_ids": [
+      "scripts/ci-rust-cache-smoke.py::scenario::probe"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/source-home-capsule-inventory-smoke.py::assert_source_archive_overlay",
+    "current_ids": [
+      "scripts/source-home-capsule-inventory-smoke.py::scenario::capsule-inventory"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/source-home-capsule-inventory-smoke.py::assert_setup_order",
+    "current_ids": [
+      "scripts/source-home-capsule-inventory-smoke.py::scenario::capsule-inventory"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/source-home-capsule-inventory-smoke.py::run_smoke",
+    "current_ids": [
+      "scripts/source-home-capsule-inventory-smoke.py::scenario::capsule-inventory"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/source-home-provider-inventory-smoke.py::assert_external_metadata",
+    "current_ids": [
+      "scripts/source-home-provider-inventory-smoke.py::scenario::provider-inventory"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/source-home-provider-inventory-smoke.py::run_integrity_smoke",
+    "current_ids": [
+      "scripts/source-home-provider-inventory-smoke.py::scenario::provider-inventory"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/source-home-provider-inventory-smoke.py::run_retained_provider_stamp_smoke",
+    "current_ids": [
+      "scripts/source-home-provider-inventory-smoke.py::scenario::provider-inventory"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/protected-content-installed-static-audit-smoke.py::main",
+    "current_ids": [
+      "scripts/protected-content-installed-static-audit-smoke.py::scenario::static-audit"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/build/browser-gst-python-smoke.py::verify",
+    "current_ids": [
+      "scripts/build/browser-gst-python-smoke.py::scenario::native-verify"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "scripts/install-source-home-runtime-smoke.py::assert_setup_orchestration",
+    "current_ids": [
+      "scripts/install-source-home-runtime-smoke.py::scenario::setup-orchestration"
+    ],
+    "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  }
+]
