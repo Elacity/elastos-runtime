@@ -1382,6 +1382,7 @@ class ReleasePolicyTests(unittest.TestCase):
         # files they package; the step itself reaches the workflow and the shell script.
         for entry in ("scripts/release-upstream-input.py", "scripts/release-upstream-recipes.json",
                       "scripts/browser-upstream-build.py", "scripts/build/licenses/libcap-LICENSE.txt",
+                      "scripts/build/crosvm-lifecycle-fds.patch",
                       "scripts/release-host-prerequisites.sh", ".github/workflows/ci.yml"):
             with self.subTest(removed=entry):
                 self.assertIn(entry, upstream)
