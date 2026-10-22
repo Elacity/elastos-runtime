@@ -1,0 +1,1770 @@
+//! Linux substrate for the shared Browser transport/lifecycle supervisor.
+//! Only this module launches crosvm. The parent owns bootstrap, streams, TURN
+//! policy, profile durability and the exact terminal settlement.
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU8, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use elastos_common::{CapsuleId, CapsuleManifest};
+use elastos_compute::CapsuleHandle;
+use elastos_vz::{VmConfig, VzConfig};
+
+const LOADED: u8 = 0;
+const RUNNING: u8 = 1;
+const STOPPED: u8 = 2;
+const INDETERMINATE: u8 = 3;
+const STARTING: u8 = 4;
+const SETUP_ROOT: &str = "/run/elastos-browser";
+const SETUP_STATE: &str = "/var/lib/elastos-browser";
+const SETUP_HELPER: &str = "/usr/local/lib/elastos/browser-vm-linux-network.py";
+const CONNECT_BUDGET: Duration = Duration::from_millis(200);
+
+#[derive(Clone, Debug)]
+enum Transport {
+    Kernel,
+    Userspace { binary: PathBuf, sandbox: PathBuf },
+}
+
+impl Transport {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Kernel => "kernel-vsock",
+            Self::Userspace { .. } => "userspace-vsock",
+        }
+    }
+}
+
+fn trusted_root_path(path: &Path) -> Result<(), String> {
+    for entry in path.ancestors() {
+        let metadata = fs::symlink_metadata(entry).map_err(|e| e.to_string())?;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 || metadata.file_type().is_symlink()
+        {
+            return Err("Browser host setup requires an intact root-owned path".into());
+        }
+    }
+    Ok(())
+}
+
+fn executable(path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        return Err("Browser host program must be an executable regular file".into());
+    }
+    Ok(())
+}
+
+fn trusted_program(path: &Path) -> Result<PathBuf, String> {
+    // Distribution Python and bwrap may have a root-owned symlink at the leaf.
+    if let Some(parent) = path.parent() {
+        trusted_root_path(parent)?;
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if metadata.uid() != 0 || (!metadata.file_type().is_symlink() && metadata.mode() & 0o022 != 0) {
+        return Err("Browser host setup program requires root ownership".into());
+    }
+    let resolved = fs::canonicalize(path).map_err(|e| e.to_string())?;
+    trusted_root_path(&resolved)?;
+    executable(&resolved)?;
+    Ok(resolved)
+}
+
+fn setup_json(path: &Path) -> Result<serde_json::Value, String> {
+    trusted_root_path(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err("Browser host setup receipt must be a root-owned regular file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(65537)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 65536 {
+        return Err("Browser host setup receipt is too large".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "Browser host setup receipt is invalid".into())
+}
+
+fn setup_transport() -> Result<Transport, String> {
+    let uid = unsafe { libc::getuid() };
+    if uid == 0 {
+        return Err("Run Browser as its ordinary Home user".into());
+    }
+    let receipt = setup_json(&Path::new(SETUP_ROOT).join(format!("{uid}.json")))?;
+    let state = setup_json(&Path::new(SETUP_STATE).join(format!("{uid}.json")))?;
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|e| e.to_string())?;
+    transport_for_mode(Some(setup_mode(&receipt, &state, uid, boot.trim())?))
+}
+
+fn setup_mode<'a>(
+    receipt: &'a serde_json::Value,
+    state: &serde_json::Value,
+    uid: u32,
+    boot: &str,
+) -> Result<&'a str, String> {
+    let mode = receipt.get("transport").and_then(serde_json::Value::as_str);
+    if receipt.get("uid").and_then(serde_json::Value::as_u64) != Some(uid as u64)
+        || receipt.get("boot_id").and_then(serde_json::Value::as_str) != Some(boot)
+        || mode != state.get("transport").and_then(serde_json::Value::as_str)
+    {
+        return Err("Browser host setup receipt requires repair for this user and boot".into());
+    }
+    match mode {
+        Some("kernel-vsock" | "userspace-vsock") => Ok(mode.expect("checked setup mode")),
+        _ => Err(
+            "Repeat Browser host setup with an explicit kernel-vsock or userspace-vsock selection"
+                .into(),
+        ),
+    }
+}
+
+fn transport_for_mode(mode: Option<&str>) -> Result<Transport, String> {
+    match mode {
+        Some("kernel-vsock") => Ok(Transport::Kernel),
+        Some("userspace-vsock") => Ok(Transport::Userspace {
+            binary: super::env_path("ELASTOS_BROWSER_VM_VHOST_DEVICE_VSOCK_BIN")
+                .unwrap_or_else(|| super::default_data_dir().join("bin/vhost-device-vsock")),
+            sandbox: trusted_program(Path::new("/usr/bin/bwrap"))?,
+        }),
+        _ => Err("Browser host setup must select kernel-vsock or userspace-vsock".into()),
+    }
+}
+
+fn setup_check() -> Result<(), String> {
+    trusted_root_path(Path::new(SETUP_HELPER))?;
+    let python = trusted_program(Path::new("/usr/bin/python3"))?;
+    let mut command = Command::new(python);
+    command
+        .args(["-I", SETUP_HELPER, "check"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    run_setup_check(command, Duration::from_secs(5))
+}
+
+fn run_setup_check(mut command: Command, budget: Duration) -> Result<(), String> {
+    own_process_group(&mut command, Vec::new());
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let pgid = child.id() as i32;
+    let deadline = Instant::now() + budget;
+    let timed_out = loop {
+        if observe_exit(pgid).unwrap_or(false) {
+            break false;
+        }
+        if Instant::now() >= deadline {
+            break true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+    // The caller awaits this operation in the shared startup owner. If kernel
+    // retirement remains unresolved, that owner keeps this child and any held
+    // slot lease instead of reporting absence from the readiness deadline.
+    loop {
+        if reap_owned_group_workers(Path::new("/proc"), pgid).unwrap_or(false)
+            && observe_exit(pgid).unwrap_or(false)
+        {
+            if let Ok(status) = child.wait() {
+                return if timed_out {
+                    Err("Browser host setup check timed out".into())
+                } else if status.success() {
+                    Ok(())
+                } else {
+                    Err("Browser host setup check failed; repair the selected host setup".into())
+                };
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn acquire_slot(transport: &Transport) -> Result<File, String> {
+    setup_check()?;
+    let uid = unsafe { libc::getuid() };
+    let root = Path::new(SETUP_ROOT);
+    trusted_root_path(root)?;
+    for slot in 0..4 {
+        let path = root.join(format!("ebv{uid:x}s{slot}.lock"));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != uid
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err("Browser host slot requires a private regular lease file".into());
+        }
+        if !super::try_lock_exclusive(&file)? {
+            continue;
+        }
+        // Setup and removal acquire every slot. Recheck after acquiring this
+        // one so a replaced setup cannot leave a lease on an old inode.
+        setup_check()?;
+        let current = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if current.dev() != metadata.dev()
+            || current.ino() != metadata.ino()
+            || !current.is_file()
+            || current.nlink() != 1
+            || current.uid() != uid
+            || current.mode() & 0o077 != 0
+            || setup_transport()?.name() != transport.name()
+        {
+            return Err("Browser host setup changed while acquiring its slot".into());
+        }
+        // A legacy TAP guest may outlive its old launcher. The canonical check
+        // proves this TAP's identity and policy; observe its occupancy while we
+        // hold the corresponding slot lease.
+        if carrier_active(fs::read_to_string(format!(
+            "/sys/class/net/ebv{uid:x}s{slot}/carrier"
+        )))? {
+            continue;
+        }
+        let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    Err("All four Browser host slots are in use. Close a Browser session and retry.".into())
+}
+
+fn carrier_active(observation: io::Result<String>) -> Result<bool, String> {
+    match observation {
+        Ok(value) if value.trim() == "0" => Ok(false),
+        Ok(value) if value.trim() == "1" => Ok(true),
+        // Linux returns EINVAL for an unattached TAP. The setup check above
+        // already requires this exact link to be UP.
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(false),
+        _ => Err("Browser host slot carrier observation is unavailable".into()),
+    }
+}
+
+pub(super) fn host_supported() -> bool {
+    host_unavailable_reason().is_none()
+}
+
+#[derive(Clone, Copy)]
+enum KvmStatus {
+    Missing,
+    Inaccessible,
+    Unsupported,
+    Ready,
+}
+
+fn kvm_status() -> KvmStatus {
+    match fs::metadata("/dev/kvm") {
+        Ok(metadata) if metadata.file_type().is_char_device() => {}
+        Ok(_) => return KvmStatus::Unsupported,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return KvmStatus::Missing,
+        Err(_) => return KvmStatus::Inaccessible,
+    }
+    let Ok(kvm) = OpenOptions::new().read(true).write(true).open("/dev/kvm") else {
+        return KvmStatus::Inaccessible;
+    };
+    if unsafe {
+        libc::ioctl(
+            kvm.as_raw_fd(),
+            0xAE00,
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    } == 12
+    {
+        KvmStatus::Ready
+    } else {
+        KvmStatus::Unsupported
+    }
+}
+
+fn capability_reason(kvm: KvmStatus, prepared: bool) -> Option<&'static str> {
+    match kvm {
+        KvmStatus::Missing | KvmStatus::Unsupported => Some("host_unsupported"),
+        KvmStatus::Inaccessible => Some("preparation_required"),
+        KvmStatus::Ready if !prepared => Some("preparation_required"),
+        KvmStatus::Ready => None,
+    }
+}
+
+pub(super) fn host_unavailable_reason() -> Option<&'static str> {
+    capability_reason(
+        kvm_status(),
+        setup_transport().is_ok_and(|transport| transport_ready(&transport)),
+    )
+}
+
+fn transport_ready(transport: &Transport) -> bool {
+    match transport {
+        Transport::Kernel => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/vhost-vsock")
+            .and_then(|file| file.metadata())
+            .is_ok_and(|metadata| metadata.file_type().is_char_device()),
+        Transport::Userspace { binary, sandbox } => {
+            executable(binary).is_ok() && executable(sandbox).is_ok()
+        }
+    }
+}
+
+fn host_supports_transport(transport: &Transport) -> bool {
+    capability_reason(kvm_status(), transport_ready(transport)).is_none()
+}
+
+struct Vm {
+    config: VmConfig,
+    cid: u32,
+    transport: Transport,
+    socket_dir: PathBuf,
+    state: AtomicU8,
+    stop: AtomicBool,
+    writer_locks: Mutex<Vec<File>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+pub(super) struct CrosvmBrowserProvider {
+    config: VzConfig,
+    binary: PathBuf,
+    socket_dir: PathBuf,
+    transport: Transport,
+    vms: Mutex<BTreeMap<String, Arc<Vm>>>,
+}
+
+impl CrosvmBrowserProvider {
+    pub(super) fn new(config: VzConfig, socket_dir: PathBuf) -> Result<Self, String> {
+        let data = super::default_data_dir();
+        let binary = super::env_path("ELASTOS_BROWSER_VM_CROSVM_BIN")
+            .unwrap_or_else(|| data.join("bin/crosvm"));
+        let transport = setup_transport()?;
+        if executable(&binary).is_err() || !host_supports_transport(&transport) {
+            return Err(
+                "Browser requires admitted host programs and access to its selected KVM transport"
+                    .into(),
+            );
+        }
+        Ok(Self {
+            config,
+            binary,
+            socket_dir,
+            transport,
+            vms: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    pub(super) async fn init(&self) -> Result<(), String> {
+        fs::create_dir_all(&self.config.state_dir).map_err(|e| e.to_string())?;
+        // Adopt this supervisor's orphaned workers so terminal proof can reap
+        // the owned process group, rather than treating its first PID as the VM.
+        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+
+    pub(super) async fn load_with_vm_config(
+        &self,
+        config: VmConfig,
+        manifest: CapsuleManifest,
+    ) -> Result<CapsuleHandle, String> {
+        let transport = self.transport.clone();
+        let lease = tokio::task::spawn_blocking(move || acquire_slot(&transport))
+            .await
+            .map_err(|error| error.to_string())??;
+        self.load_reserved_vm(config, manifest, lease)
+    }
+
+    fn load_reserved_vm(
+        &self,
+        config: VmConfig,
+        manifest: CapsuleManifest,
+        lease: File,
+    ) -> Result<CapsuleHandle, String> {
+        if !config.network_disabled
+            || config.network.is_some()
+            || config.carrier_socket_path.is_some()
+            || config.interactive_stdio
+            || config.rootfs_readonly
+        {
+            return Err(
+                "Browser crosvm uses fixed vsock channels and zero guest network devices".into(),
+            );
+        }
+        let id = CapsuleId::new(format!("browser-crosvm-{}", uuid::Uuid::new_v4()));
+        let bytes = *uuid::Uuid::new_v4().as_bytes();
+        let cid = (u32::from_ne_bytes(bytes[..4].try_into().expect("four CID bytes"))
+            & 0x7fff_ffff)
+            .max(3);
+        // Kernel registration refuses duplicate CIDs; userspace has one backend
+        // per owned VM. Both use a nonreserved CID for the guest device.
+        let vm = Arc::new(Vm {
+            config,
+            cid,
+            transport: self.transport.clone(),
+            socket_dir: self.socket_dir.clone(),
+            state: AtomicU8::new(LOADED),
+            stop: AtomicBool::new(false),
+            writer_locks: Mutex::new(vec![lease]),
+            worker: Mutex::new(None),
+        });
+        self.vms
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(id.0.clone(), vm);
+        Ok(CapsuleHandle {
+            id,
+            manifest,
+            args: vec![],
+        })
+    }
+
+    fn vm(&self, handle: &CapsuleHandle) -> Result<Arc<Vm>, String> {
+        self.vms
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(&handle.id.0)
+            .cloned()
+            .ok_or_else(|| "Browser crosvm ownership record is absent".into())
+    }
+
+    pub(super) fn retain_writer_locks(
+        &self,
+        handle: &CapsuleHandle,
+        locks: Vec<File>,
+    ) -> Result<(), String> {
+        let vm = self.vm(handle)?;
+        if vm.state.load(Ordering::Acquire) != LOADED {
+            return Err("Browser writer locks must precede crosvm start".into());
+        }
+        let mut retained = Vec::new();
+        for lock in locks {
+            // Keep source descriptors outside the child handoff range. dup2
+            // then cannot overwrite the next lock's source descriptor.
+            let fd = unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            retained.push(unsafe { File::from_raw_fd(fd) });
+        }
+        vm.writer_locks
+            .lock()
+            .map_err(|e| e.to_string())?
+            .extend(retained);
+        Ok(())
+    }
+
+    pub(super) async fn start(&self, handle: &CapsuleHandle) -> Result<(), String> {
+        let vm = self.vm(handle)?;
+        let binary = self.binary.clone();
+        let socket = self.socket_dir.join("v.sock");
+        let state_dir = self.config.state_dir.join(&vm.config.vm_id);
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let owned = Arc::clone(&vm);
+        {
+            let mut worker = vm.worker.lock().map_err(|e| e.to_string())?;
+            if worker.is_some() || vm.state.load(Ordering::Acquire) != LOADED {
+                return Err("Browser crosvm has already started".into());
+            }
+            vm.state.store(STARTING, Ordering::Release);
+            let result = thread::Builder::new()
+                .name("browser-crosvm-owner".into())
+                .spawn(move || {
+                    run_owned_vm(owned, binary, socket, state_dir, ready);
+                });
+            match result {
+                Ok(thread) => *worker = Some(thread),
+                Err(error) => {
+                    vm.state.store(STOPPED, Ordering::Release);
+                    return Err(error.to_string());
+                }
+            }
+        }
+        started.await.map_err(|e| e.to_string())?
+    }
+
+    pub(super) async fn stop(&self, handle: &CapsuleHandle) -> Result<(), String> {
+        let vm = self.vm(handle)?;
+        vm.stop.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(vm.state.load(Ordering::Acquire), STARTING | RUNNING)
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if vm.state.load(Ordering::Acquire) == STOPPED {
+            Ok(())
+        } else {
+            Err("Browser crosvm writer retirement remains unresolved".into())
+        }
+    }
+
+    pub(super) async fn guest_state_label(&self, handle: &CapsuleHandle) -> String {
+        match self.vm(handle).map(|vm| vm.state.load(Ordering::Acquire)) {
+            Ok(LOADED) => "Stopped", // load has no process or writer effects.
+            Ok(STARTING | RUNNING) => "Running",
+            Ok(STOPPED) => "Stopped",
+            _ => "Error",
+        }
+        .into()
+    }
+
+    pub(super) async fn wait_for_guest_exit(&self, handle: &CapsuleHandle) -> String {
+        loop {
+            let state = self.guest_state_label(handle).await;
+            if state != "Running" {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub(super) async fn release_terminal_native_vm(&self, handle: &CapsuleHandle) -> bool {
+        let Ok(vm) = self.vm(handle) else {
+            return false;
+        };
+        if !matches!(vm.state.load(Ordering::Acquire), LOADED | STOPPED) {
+            return false;
+        }
+        let worker = match vm.worker.lock() {
+            Ok(mut worker) => worker.take(),
+            Err(_) => return false,
+        };
+        if let Some(worker) = worker {
+            if !matches!(
+                tokio::task::spawn_blocking(move || worker.join()).await,
+                Ok(Ok(()))
+            ) {
+                return false;
+            }
+        }
+        match self.vms.lock() {
+            Ok(mut vms) => {
+                vms.remove(&handle.id.0);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub(super) async fn vsock_connect(
+        &self,
+        handle: &CapsuleHandle,
+        port: u32,
+    ) -> Result<OwnedFd, String> {
+        let vm = self.vm(handle)?;
+        if vm.state.load(Ordering::Acquire) != RUNNING {
+            return Err("Browser crosvm is not running".into());
+        }
+        let cid = vm.cid;
+        tokio::task::spawn_blocking(move || match &vm.transport {
+            Transport::Kernel => connect_vsock(cid, port),
+            Transport::Userspace { .. } => connect_userspace(&vm.socket_dir.join("u/h.sock"), port),
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+}
+
+fn command(
+    vm: &Vm,
+    binary: PathBuf,
+    socket: PathBuf,
+    state_dir: PathBuf,
+) -> Result<Command, String> {
+    let config = &vm.config;
+    let root = socket
+        .parent()
+        .ok_or("Browser crosvm state root is absent")?;
+    let pivot = root.join("empty");
+    fs::create_dir_all(&pivot).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&state_dir).map_err(|e| e.to_string())?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(state_dir.join("crosvm.log"))
+        .map_err(|e| e.to_string())?;
+    let mut command = Command::new(binary);
+    command
+        .args(["run", "--socket"])
+        .arg(&socket)
+        .arg("--mem")
+        .arg(config.mem_size_mib.to_string())
+        .arg("--cpus")
+        .arg(config.vcpu_count.to_string())
+        .args(["--serial", "type=stdout,hardware=serial,num=1"])
+        .arg("--block")
+        .arg(format!(
+            "path={},root=true,lock=true",
+            config.rootfs_path.display()
+        ))
+        .arg("--pivot-root")
+        .arg(&pivot);
+    match &vm.transport {
+        Transport::Kernel => {
+            command
+                .arg("--vsock")
+                .arg(format!("cid={},device=/dev/vhost-vsock", vm.cid));
+        }
+        Transport::Userspace { .. } => {
+            command
+                .arg("--vhost-user")
+                .arg(format!(
+                    "type=vsock,socket={}",
+                    vm.socket_dir.join("u/v.sock").display()
+                ))
+                .args(["--vhost-user-connect-timeout-ms", "2000"]);
+        }
+    }
+    if let Some(profile) = &config.data_disk_path {
+        command
+            .arg("--block")
+            .arg(format!("path={},lock=true", profile.display()));
+    }
+    if let Some(initrd) = &config.initramfs_path {
+        command.arg("--initrd").arg(initrd);
+    }
+    command
+        .arg("-p")
+        .arg(&config.boot_args)
+        .arg(&config.kernel_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
+        .stderr(Stdio::from(log));
+    own_command(&mut command, vm)?;
+    Ok(command)
+}
+
+fn own_command(command: &mut Command, vm: &Vm) -> Result<(), String> {
+    let locks = vm
+        .writer_locks
+        .lock()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(AsRawFd::as_raw_fd)
+        .collect::<Vec<_>>();
+    own_process_group(command, locks);
+    Ok(())
+}
+
+fn own_process_group(command: &mut Command, locks: Vec<i32>) {
+    let parent = unsafe { libc::getpid() };
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0
+                || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                return Err(io::Error::other("Browser supervisor exited during spawn"));
+            }
+            for (index, fd) in locks.iter().enumerate() {
+                if libc::dup2(*fd, 3 + index as i32) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+fn backend_command(vm: &Vm, state_dir: &Path) -> Result<Option<Command>, String> {
+    let Transport::Userspace { binary, sandbox } = &vm.transport else {
+        return Ok(None);
+    };
+    let sockets = vm.socket_dir.join("u");
+    fs::create_dir(&sockets).map_err(|e| e.to_string())?;
+    fs::set_permissions(&sockets, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    fs::create_dir_all(state_dir).map_err(|e| e.to_string())?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(state_dir.join("vsock-backend.log"))
+        .map_err(|e| e.to_string())?;
+    if vm
+        .writer_locks
+        .lock()
+        .map_err(|e| e.to_string())?
+        .is_empty()
+    {
+        return Err("Browser backend requires its slot lease before launch".into());
+    }
+    let mut command = Command::new(sandbox);
+    command
+        .env_clear()
+        .args([
+            "--unshare-all",
+            "--die-with-parent",
+            "--clearenv",
+            "--cap-drop",
+            "ALL",
+        ])
+        .args(["--ro-bind"])
+        .arg(binary)
+        .arg("/backend")
+        .args(["--bind"])
+        .arg(sockets)
+        .arg("/s")
+        .args(["--proc", "/proc", "--dev", "/dev", "--chdir", "/s"])
+        // own_command puts the slot lease first, at FD 3. Bubblewrap's
+        // sandbox init retains --sync-fd until every sandbox process exits;
+        // the backend receives the remaining writer locks at FD 4 onward.
+        // Its children keep the outer session/group created by own_command.
+        .args(["--sync-fd", "3"])
+        .args(["--", "/backend", "--guest-cid"])
+        .arg(vm.cid.to_string())
+        .args(["--socket", "/s/v.sock", "--uds-path", "/s/h.sock"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
+        .stderr(Stdio::from(log));
+    own_command(&mut command, vm)?;
+    Ok(Some(command))
+}
+
+fn run_owned_vm(
+    vm: Arc<Vm>,
+    binary: PathBuf,
+    socket: PathBuf,
+    state_dir: PathBuf,
+    ready: tokio::sync::oneshot::Sender<Result<(), String>>,
+) {
+    let backend = backend_command(&vm, &state_dir).and_then(|command| {
+        command
+            .map(|mut command| command.spawn().map_err(|e| e.to_string()))
+            .transpose()
+    });
+    let mut backend = match backend {
+        Ok(child) => child,
+        Err(error) => {
+            vm.state.store(STOPPED, Ordering::Release);
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    let child = command(&vm, binary, socket, state_dir)
+        .and_then(|mut command| command.spawn().map_err(|e| e.to_string()));
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(backend) = backend.as_mut() {
+                let pgid = backend.id() as i32;
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+                retire_owned_child(&vm, backend, Duration::from_secs(5), || {
+                    reap_owned_group_workers(Path::new("/proc"), pgid)
+                });
+            }
+            vm.state.store(STOPPED, Ordering::Release);
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    let pgid = child.id() as i32;
+    let backend_pgid = backend.as_ref().map(|child| child.id() as i32);
+    vm.state.store(RUNNING, Ordering::Release);
+    let _ = ready.send(Ok(()));
+    let mut stop_at = None;
+    loop {
+        // WNOWAIT keeps the exact leader PID reserved. Group signaling never
+        // follows a reap that could expose this numeric PGID to reuse.
+        match observe_exit(pgid) {
+            Ok(true) => break,
+            Err(_) => {
+                vm.state.store(INDETERMINATE, Ordering::Release);
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            Ok(false) => {}
+        }
+        if let Some(backend_pgid) = backend_pgid {
+            match observe_exit(backend_pgid) {
+                Ok(true) => break,
+                Err(_) => vm.state.store(INDETERMINATE, Ordering::Release),
+                Ok(false) => {}
+            }
+        }
+        if vm.stop.load(Ordering::Acquire) {
+            let start = *stop_at.get_or_insert_with(|| {
+                unsafe {
+                    libc::kill(-pgid, libc::SIGTERM);
+                    if let Some(backend_pgid) = backend_pgid {
+                        libc::kill(-backend_pgid, libc::SIGTERM);
+                    }
+                }
+                Instant::now()
+            });
+            if start.elapsed() >= Duration::from_secs(2) {
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                    if let Some(backend_pgid) = backend_pgid {
+                        libc::kill(-backend_pgid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+        if let Some(backend_pgid) = backend_pgid {
+            libc::kill(-backend_pgid, libc::SIGKILL);
+        }
+    }
+    retire_owned_child(&vm, &mut child, Duration::from_secs(5), || {
+        reap_owned_group_workers(Path::new("/proc"), pgid)
+    });
+    if let (Some(backend), Some(backend_pgid)) = (backend.as_mut(), backend_pgid) {
+        retire_owned_child(&vm, backend, Duration::from_secs(5), || {
+            reap_owned_group_workers(Path::new("/proc"), backend_pgid)
+        });
+    }
+    vm.state.store(STOPPED, Ordering::Release);
+}
+
+fn retire_owned_child(
+    vm: &Vm,
+    child: &mut std::process::Child,
+    observation_budget: Duration,
+    mut reap_workers: impl FnMut() -> io::Result<bool>,
+) {
+    let deadline = Instant::now() + observation_budget;
+    loop {
+        // A timeout changes the observed state; it does not abandon this
+        // reserved leader or the writer locks. Delayed workers can still settle.
+        match reap_workers() {
+            Ok(true)
+                if observe_exit(child.id() as i32).unwrap_or(false) && child.wait().is_ok() =>
+            {
+                return;
+            }
+            Err(_) => vm.state.store(INDETERMINATE, Ordering::Release),
+            _ if Instant::now() >= deadline => {
+                vm.state.store(INDETERMINATE, Ordering::Release);
+            }
+            _ => {}
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn observe_exit(pid: i32) -> io::Result<bool> {
+    let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as _,
+            &mut information,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { information.si_pid() } == pid)
+}
+
+/// Proves no process but the unreaped leader remains in `pgid`. `proc_root`
+/// only lists candidate PIDs: with hidepid=1 another user's entry stays listed
+/// while its records refuse reads, so membership comes from getpgid, which
+/// needs no access to those records.
+fn reap_owned_group_workers(proc_root: &Path, pgid: i32) -> io::Result<bool> {
+    let mut others = false;
+    for entry in fs::read_dir(proc_root)? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == pgid || process_group(pid)? != Some(pgid) {
+            continue;
+        }
+        // Only this supervisor reaps its exited child, so that PID still names
+        // the same group member when checked again; the still-unreaped leader
+        // keeps the group ID from reuse.
+        if observe_exit(pid).unwrap_or(false) && process_group(pid)? == Some(pgid) {
+            let mut status = 0;
+            if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+                continue;
+            }
+        }
+        others = true;
+    }
+    Ok(!others)
+}
+
+/// The process group of `pid`, or None once no such process exists.
+fn process_group(pid: i32) -> io::Result<Option<i32>> {
+    let group = unsafe { libc::getpgid(pid) };
+    if group >= 0 {
+        return Ok(Some(group));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+fn connect_vsock(cid: u32, port: u32) -> Result<OwnedFd, String> {
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_VSOCK,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let address = libc::sockaddr_vm {
+        svm_family: libc::AF_VSOCK as _,
+        svm_reserved1: 0,
+        svm_port: port,
+        svm_cid: cid,
+        svm_zero: [0; 4],
+    };
+    let connected = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&address as *const libc::sockaddr_vm).cast(),
+            std::mem::size_of_val(&address) as _,
+        )
+    };
+    if connected != 0 {
+        if io::Error::last_os_error().raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut poll, 1, 200) } <= 0 {
+            return Err("Browser vsock connection attempt timed out".into());
+        }
+        let mut error: i32 = 0;
+        let mut length = std::mem::size_of_val(&error) as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut error as *mut i32).cast(),
+                &mut length,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error).to_string());
+        }
+    }
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    Ok(fd)
+}
+
+fn wait_socket(fd: i32, events: i16, deadline: Instant) -> Result<(), String> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("Browser userspace vsock connection attempt timed out".into());
+        }
+        let mut poll = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let millis = remaining
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        let result = unsafe { libc::poll(&mut poll, 1, millis) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err(io::Error::last_os_error().to_string());
+        }
+    }
+}
+
+fn connect_userspace(path: &Path, port: u32) -> Result<OwnedFd, String> {
+    connect_userspace_with_budget(path, port, CONNECT_BUDGET)
+}
+
+fn connect_userspace_with_budget(
+    path: &Path,
+    port: u32,
+    budget: Duration,
+) -> Result<OwnedFd, String> {
+    let deadline = Instant::now() + budget;
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) || port == 0
+    {
+        return Err("Browser userspace vsock endpoint is invalid".into());
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as _;
+    }
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let result = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            std::mem::size_of_val(&address) as _,
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(error.to_string());
+        }
+        wait_socket(fd.as_raw_fd(), libc::POLLOUT, deadline)?;
+        let mut error: i32 = 0;
+        let mut length = std::mem::size_of_val(&error) as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut error as *mut i32).cast(),
+                &mut length,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error).to_string());
+        }
+    }
+    let mut stream = UnixStream::from(fd);
+    let request = format!("CONNECT {port}\n");
+    let mut pending = request.as_bytes();
+    while !pending.is_empty() {
+        wait_socket(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
+        match stream.write(pending) {
+            Ok(0) => return Err("Browser userspace vsock request closed".into()),
+            Ok(count) => pending = &pending[count..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    // One byte at a time keeps an immediately following guest payload in the
+    // stream. An exact response also bounds the line to at most 14 bytes.
+    for expected in format!("OK {port}\n").bytes() {
+        let mut byte = [0];
+        loop {
+            wait_socket(stream.as_raw_fd(), libc::POLLIN, deadline)?;
+            match stream.read(&mut byte) {
+                Ok(1) if byte[0] == expected => break,
+                Ok(_) => return Err("Browser userspace vsock receipt is invalid".into()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+    Ok(stream.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture(root: &std::path::Path) -> (CrosvmBrowserProvider, VmConfig) {
+        let config = VzConfig {
+            state_dir: root.join("state"),
+            ..VzConfig::default()
+        };
+        let provider = CrosvmBrowserProvider {
+            config,
+            binary: root.join("fake-crosvm"),
+            socket_dir: root.join("sockets"),
+            transport: Transport::Kernel,
+            vms: Mutex::new(BTreeMap::new()),
+        };
+        let manifest = super::super::browser_vm_manifest(2048, 2);
+        let mut vm = VmConfig::from_manifest(&manifest, root, &root.join("kernel"));
+        vm.vm_id = "test-vm".into();
+        vm.rootfs_path = root.join("root.ext4");
+        vm.data_disk_path = Some(root.join("profile.ext4"));
+        vm.initramfs_path = Some(root.join("initrd"));
+        vm.boot_args =
+            "console=ttyS0 root=/dev/vda elastos.browser_width=1920 elastos.browser_height=1080"
+                .into();
+        vm.network_disabled = true;
+        (provider, vm)
+    }
+
+    fn load_fixture(provider: &CrosvmBrowserProvider, config: VmConfig) -> CapsuleHandle {
+        fs::create_dir_all(&provider.socket_dir).unwrap();
+        let lease =
+            super::super::open_lifetime_lock(&provider.socket_dir.join("slot.lock"), true).unwrap();
+        assert!(super::super::try_lock_exclusive(&lease).unwrap());
+        let fd = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+        assert!(fd >= 64);
+        provider
+            .load_reserved_vm(config, super::super::browser_vm_manifest(2048, 2), unsafe {
+                File::from_raw_fd(fd)
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn crosvm_command_has_locked_disks_and_only_fixed_vsock() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, config) = fixture(root.path());
+        let handle = load_fixture(&provider, config);
+        let vm = provider.vm(&handle).unwrap();
+        let command = command(
+            &vm,
+            provider.binary.clone(),
+            root.path().join("sockets/v.sock"),
+            root.path().join("state/test-vm"),
+        )
+        .unwrap();
+        let args = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .iter()
+            .any(|a| a.ends_with("root.ext4,root=true,lock=true")));
+        assert!(args.iter().any(|a| a.ends_with("profile.ext4,lock=true")));
+        assert!(args.contains(&"--vsock".into()));
+        assert!(args.iter().any(|a| a.ends_with("device=/dev/vhost-vsock")));
+        assert!(args
+            .iter()
+            .all(|a| !a.contains("tap") && !a.contains("--net") && !a.contains("netns")));
+        assert!(provider.release_terminal_native_vm(&handle).await);
+        assert!(!provider.release_terminal_native_vm(&handle).await);
+    }
+
+    #[tokio::test]
+    async fn owned_crosvm_exit_reaps_worker_before_releasing_writer_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, config) = fixture(root.path());
+        fs::write(&provider.binary, "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > \"$3.child\"\nprintf '%s' \"$$\" > \"$3.pid\"\nwait\n").unwrap();
+        fs::set_permissions(&provider.binary, fs::Permissions::from_mode(0o700)).unwrap();
+        provider.init().await.unwrap();
+        let handle = load_fixture(&provider, config);
+        let lock_path = root.path().join("writer.lock");
+        let lock = super::super::open_lifetime_lock(&lock_path, true).unwrap();
+        assert!(super::super::try_lock_exclusive(&lock).unwrap());
+        provider.retain_writer_locks(&handle, vec![lock]).unwrap();
+        provider.start(&handle).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid_file = provider.socket_dir.join("v.sock.pid");
+        while !pid_file.is_file() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let leader: i32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        let worker: i32 = fs::read_to_string(provider.socket_dir.join("v.sock.child"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(!provider.release_terminal_native_vm(&handle).await);
+        let contender = super::super::open_lifetime_lock(&lock_path, false).unwrap();
+        assert!(!super::super::try_lock_exclusive(&contender).unwrap());
+        // A different process group survives exact cleanup of this child.
+        let mut unrelated_command = Command::new("/bin/sleep");
+        unrelated_command.arg("30");
+        unsafe {
+            unrelated_command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut unrelated = unrelated_command.spawn().unwrap();
+        unsafe {
+            libc::kill(leader, libc::SIGKILL);
+        }
+        assert_eq!(provider.wait_for_guest_exit(&handle).await, "Stopped");
+        assert!(provider.release_terminal_native_vm(&handle).await);
+        assert_eq!(unsafe { libc::kill(worker, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        assert_eq!(unsafe { libc::kill(leader, 0) }, -1);
+        assert!(unrelated.try_wait().unwrap().is_none());
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        assert!(super::super::try_lock_exclusive(&contender).unwrap());
+    }
+
+    #[test]
+    fn exit_observation_keeps_leader_identity_until_final_reap() {
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !observe_exit(pid).unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(observe_exit(pid).unwrap());
+        // A second WNOWAIT sees the same zombie; cleanup still owns this PID.
+        assert!(observe_exit(pid).unwrap());
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        child.wait().unwrap();
+        assert!(observe_exit(pid).is_err());
+    }
+
+    #[test]
+    fn group_cleanup_skips_unreadable_foreign_entries_and_reaps_owned_workers() {
+        let proc_root = tempfile::tempdir().unwrap();
+        // A worker can join only a group in its own session.
+        let mut leader = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = leader.id() as i32;
+        // Cleanup, not std, reaps this worker.
+        let worker = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(pgid)
+            .spawn()
+            .unwrap()
+            .id() as i32;
+        // With hidepid=1, another user's live (PID 1) or exited (i32::MAX)
+        // process stays listed while its records refuse reads.
+        for pid in [pgid, worker, 1, i32::MAX] {
+            fs::create_dir(proc_root.path().join(pid.to_string())).unwrap();
+        }
+        for pid in [1, i32::MAX] {
+            let record = proc_root.path().join(format!("{pid}/stat"));
+            fs::write(&record, b"permission denied").unwrap();
+            fs::set_permissions(&record, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        assert!(!reap_owned_group_workers(proc_root.path(), pgid).unwrap());
+        unsafe {
+            libc::kill(worker, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !reap_owned_group_workers(proc_root.path(), pgid).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "the exited owned worker stays unproven"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The worker is reaped; the leader keeps its identity for the caller.
+        assert_eq!(unsafe { libc::kill(worker, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        assert!(leader.try_wait().unwrap().is_none());
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_retirement_keeps_owner_and_writer_lock_until_settlement() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, config) = fixture(root.path());
+        let handle = load_fixture(&provider, config);
+        let vm = provider.vm(&handle).unwrap();
+        let lock_path = root.path().join("writer.lock");
+        let lock = super::super::open_lifetime_lock(&lock_path, true).unwrap();
+        assert!(super::super::try_lock_exclusive(&lock).unwrap());
+        provider.retain_writer_locks(&handle, vec![lock]).unwrap();
+        vm.state.store(RUNNING, Ordering::Release);
+        let settle = Arc::new(AtomicBool::new(false));
+        let ready = settle.clone();
+        let owned = vm.clone();
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        *vm.worker.lock().unwrap() = Some(thread::spawn(move || {
+            retire_owned_child(&owned, &mut child, Duration::ZERO, || {
+                if ready.load(Ordering::Acquire) {
+                    Ok(true)
+                } else {
+                    Err(io::Error::other("temporary worker observation failure"))
+                }
+            });
+            owned.state.store(STOPPED, Ordering::Release);
+        }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vm.state.load(Ordering::Acquire) != INDETERMINATE {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!provider.release_terminal_native_vm(&handle).await);
+        let contender = super::super::open_lifetime_lock(&lock_path, false).unwrap();
+        assert!(!super::super::try_lock_exclusive(&contender).unwrap());
+        let slot = super::super::open_lifetime_lock(&provider.socket_dir.join("slot.lock"), false)
+            .unwrap();
+        assert!(!super::super::try_lock_exclusive(&slot).unwrap());
+        settle.store(true, Ordering::Release);
+        while vm.state.load(Ordering::Acquire) != STOPPED {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(provider.release_terminal_native_vm(&handle).await);
+        drop(vm);
+        assert!(super::super::try_lock_exclusive(&contender).unwrap());
+        assert!(super::super::try_lock_exclusive(&slot).unwrap());
+    }
+
+    #[test]
+    fn setup_mode_requires_matching_explicit_user_boot_and_saved_transport() {
+        for mode in ["kernel-vsock", "userspace-vsock"] {
+            let receipt =
+                serde_json::json!({"uid": 1000, "boot_id": "this-boot", "transport": mode});
+            let state = serde_json::json!({"transport": mode});
+            assert_eq!(
+                setup_mode(&receipt, &state, 1000, "this-boot").unwrap(),
+                mode
+            );
+            assert!(setup_mode(&receipt, &state, 1001, "this-boot").is_err());
+            assert!(setup_mode(&receipt, &state, 1000, "old-boot").is_err());
+            assert!(setup_mode(&receipt, &serde_json::json!({}), 1000, "this-boot").is_err());
+        }
+        for mode in [
+            serde_json::Value::Null,
+            serde_json::json!("automatic"),
+            serde_json::json!("unknown"),
+        ] {
+            let receipt =
+                serde_json::json!({"uid": 1000, "boot_id": "this-boot", "transport": mode});
+            let state = serde_json::json!({"transport": mode});
+            assert!(setup_mode(&receipt, &state, 1000, "this-boot").is_err());
+        }
+    }
+
+    #[test]
+    fn slot_occupancy_rejects_unreadable_or_malformed_carrier() {
+        assert!(!carrier_active(Ok("0\n".into())).unwrap());
+        assert!(carrier_active(Ok("1\n".into())).unwrap());
+        assert!(!carrier_active(Err(io::Error::from_raw_os_error(libc::EINVAL))).unwrap());
+        for value in ["", "2", "unavailable", "1 0"] {
+            assert!(carrier_active(Ok(value.into())).is_err());
+        }
+        assert!(carrier_active(Err(io::Error::from_raw_os_error(libc::EACCES))).is_err());
+        assert!(carrier_active(Err(io::Error::from_raw_os_error(libc::ENOENT))).is_err());
+    }
+
+    #[test]
+    fn host_capability_separates_host_support_from_preparation() {
+        for prepared in [false, true] {
+            assert_eq!(
+                capability_reason(KvmStatus::Missing, prepared),
+                Some("host_unsupported")
+            );
+            assert_eq!(
+                capability_reason(KvmStatus::Unsupported, prepared),
+                Some("host_unsupported")
+            );
+            assert_eq!(
+                capability_reason(KvmStatus::Inaccessible, prepared),
+                Some("preparation_required")
+            );
+        }
+        assert_eq!(
+            capability_reason(KvmStatus::Ready, false),
+            Some("preparation_required")
+        );
+        assert_eq!(capability_reason(KvmStatus::Ready, true), None);
+    }
+
+    #[tokio::test]
+    async fn hanging_setup_check_reaps_its_exact_group_at_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let (provider, _) = fixture(root.path());
+        provider.init().await.unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 &\nprintf '%s' \"$!\" > \"$1/worker\"\nprintf '%s' \"$$\" > \"$1/leader\"\nwait", "fixture"])
+            .arg(root.path()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let start = Instant::now();
+        assert!(run_setup_check(command, Duration::from_millis(500))
+            .unwrap_err()
+            .contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(3));
+        for name in ["leader", "worker"] {
+            let pid: i32 = fs::read_to_string(root.path().join(name))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
+    }
+
+    #[tokio::test]
+    async fn userspace_command_confines_backend_and_keeps_crosvm_guest_network_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut provider, config) = fixture(root.path());
+        provider.transport = Transport::Userspace {
+            binary: root.path().join("backend"),
+            sandbox: PathBuf::from("/usr/bin/bwrap"),
+        };
+        let handle = load_fixture(&provider, config);
+        let vm = provider.vm(&handle).unwrap();
+        let command = command(
+            &vm,
+            provider.binary.clone(),
+            provider.socket_dir.join("v.sock"),
+            root.path().join("state/test-vm"),
+        )
+        .unwrap();
+        let args = command
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.contains(&"--vhost-user".into()));
+        assert!(args
+            .iter()
+            .any(|s| s.starts_with("type=vsock,socket=") && s.ends_with("/u/v.sock")));
+        assert!(args.iter().all(|s| !s.contains("vhost-vsock")
+            && s != "--vsock"
+            && !s.contains("tap")
+            && !s.contains("--net")));
+        let backend = backend_command(&vm, &root.path().join("state/test-vm"))
+            .unwrap()
+            .unwrap();
+        let args = backend
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for flag in [
+            "--unshare-all",
+            "--die-with-parent",
+            "--clearenv",
+            "--cap-drop",
+            "--sync-fd",
+        ] {
+            assert!(args.contains(&flag.into()), "missing {flag}");
+        }
+        assert!(args.windows(2).any(|p| p == ["--socket", "/s/v.sock"]));
+        assert!(args.windows(2).any(|p| p == ["--uds-path", "/s/h.sock"]));
+        assert!(args.windows(2).any(|p| p == ["--sync-fd", "3"]));
+        assert!(args.iter().all(|s| !s.contains("auth_secret")
+            && !s.contains("turn:")
+            && !s.contains("--share-net")
+            && s != "--preserve-fds"
+            && s != "--new-session"));
+        assert_eq!(args.iter().filter(|s| s.as_str() == "--bind").count(), 1);
+        assert!(provider.release_terminal_native_vm(&handle).await);
+    }
+
+    #[tokio::test]
+    async fn real_bwrap_retains_locks_and_one_group_until_sandbox_exit() {
+        let sandbox = PathBuf::from("/usr/bin/bwrap");
+        if !sandbox.exists() {
+            eprintln!("real Bubblewrap lifecycle fixture requires /usr/bin/bwrap");
+            return;
+        }
+        // Keep cleanup active through every assertion, including failures in
+        // sandbox setup. An installed bwrap with unusable namespaces fails.
+        struct ChildCleanup(Option<std::process::Child>);
+        impl Drop for ChildCleanup {
+            fn drop(&mut self) {
+                let Some(child) = self.0.as_mut() else {
+                    return;
+                };
+                let pgid = child.id() as i32;
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    if reap_owned_group_workers(Path::new("/proc"), pgid).unwrap_or(false)
+                        && observe_exit(pgid).unwrap_or(false)
+                    {
+                        let _ = child.wait();
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (mut provider, config) = fixture(root.path());
+        let binary = root.path().join("backend");
+        fs::write(&binary, "#!/bin/sh\n[ ! -e /proc/self/fd/3 ] || exit 10\n[ -e /proc/self/fd/4 ] || exit 11\nsleep 30 &\nprintf ready > /s/ready\nwait\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        provider.transport = Transport::Userspace { binary, sandbox };
+        provider.init().await.unwrap();
+        let handle = load_fixture(&provider, config);
+        let disk_path = root.path().join("writer.lock");
+        let disk = super::super::open_lifetime_lock(&disk_path, true).unwrap();
+        assert!(super::super::try_lock_exclusive(&disk).unwrap());
+        provider.retain_writer_locks(&handle, vec![disk]).unwrap();
+        let vm = provider.vm(&handle).unwrap();
+        let production = backend_command(&vm, &root.path().join("state/test-vm"))
+            .unwrap()
+            .unwrap();
+        let args = production.get_args().collect::<Vec<_>>();
+        let split = args.iter().position(|arg| *arg == "--").unwrap();
+        let mut command = Command::new(production.get_program());
+        command.env_clear().args(&args[..split]);
+        // This fixture uses the host shell instead of a static backend. Only
+        // its executable/library roots supplement the production arguments.
+        for path in ["/usr", "/bin", "/lib", "/lib64"] {
+            if Path::new(path).exists() {
+                command.args(["--ro-bind", path, path]);
+            }
+        }
+        command.args(&args[split..]).stdin(Stdio::null());
+        own_command(&mut command, &vm).unwrap();
+        let mut child = ChildCleanup(Some(command.spawn().unwrap()));
+        let pgid = child.0.as_ref().unwrap().id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !provider.socket_dir.join("u/ready").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "Bubblewrap backend did not start"
+            );
+            assert!(
+                !observe_exit(pgid).unwrap(),
+                "Bubblewrap exited during setup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut descendants = vec![pgid];
+        let mut index = 0;
+        while index < descendants.len() {
+            let pid = descendants[index];
+            let children = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap();
+            descendants.extend(
+                children
+                    .split_whitespace()
+                    .map(|pid| pid.parse::<i32>().unwrap()),
+            );
+            index += 1;
+        }
+        assert!(
+            descendants.len() >= 4,
+            "monitor, init, backend and worker must exist"
+        );
+        for pid in &descendants {
+            assert_eq!(process_group(*pid).unwrap(), Some(pgid));
+        }
+        // Simulate loss of every supervisor-held descriptor: only the real
+        // sandbox init/backend can now keep these two flock leases alive.
+        vm.writer_locks.lock().unwrap().clear();
+        let slot = super::super::open_lifetime_lock(&provider.socket_dir.join("slot.lock"), false)
+            .unwrap();
+        let disk = super::super::open_lifetime_lock(&disk_path, false).unwrap();
+        assert!(!super::super::try_lock_exclusive(&slot).unwrap());
+        assert!(!super::super::try_lock_exclusive(&disk).unwrap());
+        unsafe { libc::kill(pgid, libc::SIGKILL) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !reap_owned_group_workers(Path::new("/proc"), pgid).unwrap()
+            || !observe_exit(pgid).unwrap()
+        {
+            assert!(Instant::now() < deadline, "sandbox outlived its monitor");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        child.0.take().unwrap().wait().unwrap();
+        for pid in descendants {
+            assert_eq!(process_group(pid).unwrap(), None);
+        }
+        assert!(super::super::try_lock_exclusive(&slot).unwrap());
+        assert!(super::super::try_lock_exclusive(&disk).unwrap());
+        assert!(provider.release_terminal_native_vm(&handle).await);
+    }
+
+    fn uds_fixture(
+        reply: Vec<u8>,
+        byte_delay: Duration,
+    ) -> (tempfile::TempDir, PathBuf, thread::JoinHandle<Vec<u8>>) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("h.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = vec![0; b"CONNECT 5001\n".len()];
+            stream.read_exact(&mut request).unwrap();
+            if byte_delay.is_zero() {
+                let _ = stream.write_all(&reply);
+            } else {
+                for byte in reply {
+                    thread::sleep(byte_delay);
+                    if stream.write_all(&[byte]).is_err() {
+                        break;
+                    }
+                }
+            }
+            request
+        });
+        (root, path, thread)
+    }
+
+    #[test]
+    fn userspace_handshake_checks_port_and_preserves_guest_payload() {
+        let (_root, path, server) = uds_fixture(b"OK 5001\nguest payload".to_vec(), Duration::ZERO);
+        let fd = connect_userspace(&path, 5001).unwrap();
+        let mut stream = File::from(fd);
+        let mut payload = String::new();
+        stream.read_to_string(&mut payload).unwrap();
+        assert_eq!(payload, "guest payload");
+        assert_eq!(server.join().unwrap(), b"CONNECT 5001\n");
+        for response in [
+            b"OK 5002\n".as_slice(),
+            b"OK 5001".as_slice(),
+            b"OK 5001111111111111111111111\n".as_slice(),
+            b"OK -1\n".as_slice(),
+        ] {
+            let (_root, path, server) = uds_fixture(response.to_vec(), Duration::ZERO);
+            assert!(connect_userspace(&path, 5001).is_err());
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn userspace_handshake_has_one_deadline_for_slow_reply() {
+        let (_root, path, server) = uds_fixture(b"OK 5001\n".to_vec(), Duration::from_millis(40));
+        let start = Instant::now();
+        let error =
+            connect_userspace_with_budget(&path, 5001, Duration::from_millis(100)).unwrap_err();
+        assert!(error.contains("timed out"));
+        assert!(start.elapsed() < Duration::from_millis(250));
+        server.join().unwrap();
+    }
+
+    async fn wait_pid(path: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = fs::read_to_string(path) {
+                if let Ok(pid) = text.parse() {
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned child did not report its PID"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn either_userspace_child_exit_retires_both_groups_before_releasing_slot() {
+        for exit_backend in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut provider, config) = fixture(root.path());
+            let sandbox = root.path().join("fake-sandbox");
+            fs::write(&sandbox, "#!/bin/sh\nfor arg do\ncase \"$arg\" in --new-session|--preserve-fds) exit 90;; esac\ndone\ncase \" $* \" in *' --sync-fd 3 '*) ;; *) exit 91;; esac\nwhile [ \"$1\" != '--bind' ]; do shift; done\nprintf 'single-group sync-fd=3\\n' > \"$2/ownership\"\nsleep 30 &\nprintf '%s' \"$!\" > \"$2/worker.pid\"\nprintf '%s' \"$$\" > \"$2/owner.pid\"\nwait\n").unwrap();
+            fs::set_permissions(&sandbox, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(&provider.binary, "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > \"$3.child\"\nprintf '%s' \"$$\" > \"$3.pid\"\nwait\n").unwrap();
+            fs::set_permissions(&provider.binary, fs::Permissions::from_mode(0o700)).unwrap();
+            provider.transport = Transport::Userspace {
+                binary: root.path().join("unused-backend"),
+                sandbox,
+            };
+            provider.init().await.unwrap();
+            let handle = load_fixture(&provider, config);
+            provider.start(&handle).await.unwrap();
+            let vm = wait_pid(&provider.socket_dir.join("v.sock.pid")).await;
+            let vm_worker = wait_pid(&provider.socket_dir.join("v.sock.child")).await;
+            let backend = wait_pid(&provider.socket_dir.join("u/owner.pid")).await;
+            let backend_worker = wait_pid(&provider.socket_dir.join("u/worker.pid")).await;
+            assert_eq!(
+                fs::read_to_string(provider.socket_dir.join("u/ownership")).unwrap(),
+                "single-group sync-fd=3\n"
+            );
+            assert_eq!(process_group(backend_worker).unwrap(), Some(backend));
+            let slot =
+                super::super::open_lifetime_lock(&provider.socket_dir.join("slot.lock"), false)
+                    .unwrap();
+            assert!(!super::super::try_lock_exclusive(&slot).unwrap());
+            unsafe {
+                libc::kill(if exit_backend { backend } else { vm }, libc::SIGKILL);
+            }
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    provider.wait_for_guest_exit(&handle)
+                )
+                .await
+                .unwrap(),
+                "Stopped"
+            );
+            assert!(provider.release_terminal_native_vm(&handle).await);
+            for pid in [vm, vm_worker, backend, backend_worker] {
+                assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            }
+            assert!(super::super::try_lock_exclusive(&slot).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_crosvm_spawn_settles_backend_before_releasing_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut provider, config) = fixture(root.path());
+        provider.transport = Transport::Userspace {
+            binary: PathBuf::from("/unused"),
+            sandbox: PathBuf::from("/bin/sleep"),
+        };
+        provider.init().await.unwrap();
+        let handle = load_fixture(&provider, config);
+        let slot = super::super::open_lifetime_lock(&provider.socket_dir.join("slot.lock"), false)
+            .unwrap();
+        assert!(provider.start(&handle).await.is_err());
+        assert_eq!(provider.guest_state_label(&handle).await, "Stopped");
+        assert!(!super::super::try_lock_exclusive(&slot).unwrap());
+        assert!(provider.release_terminal_native_vm(&handle).await);
+        assert!(super::super::try_lock_exclusive(&slot).unwrap());
+    }
+}
