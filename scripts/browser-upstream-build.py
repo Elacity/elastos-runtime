@@ -475,7 +475,8 @@ def build_browser_native(recipe, payload, cache, upstream):
                             '--target', target, '--no-default-features', '--features', 'net',
                             '--bin', 'crosvm', '-j', jobs], cwd=source, env=env, check=True)
             subprocess.run(['cargo', '+1.91.0', 'test', '--locked', '--offline', '--release',
-                            '--target', target, '-p', 'device_virtio_block', '--lib', 'lifecycle_',
+                            '--target', target, '-p', 'device_virtio_block', '--features',
+                            'devices/test-util', '--lib', 'lifecycle_',
                             '-j', jobs, '--', '--nocapture'], cwd=source, env=env, check=True)
             binaries['crosvm'] = source / 'target' / target / 'release/crosvm'
         audit_records = []

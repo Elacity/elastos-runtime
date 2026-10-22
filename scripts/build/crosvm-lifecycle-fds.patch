@@ -139,7 +139,7 @@
  
          keep_rds
      }
-@@ -1958,6 +2014,73 @@
+@@ -1958,6 +2014,71 @@
          assert_eq!(b.worker_threads.len(), 2, "2 threads should be spawned.");
      }
  
@@ -170,9 +170,7 @@
 +        let options = DiskOption {
 +            lifecycle_fds: vec![fd],
 +            multiple_workers: true,
-+            async_executor: Some(ExecutorKind::Sys(
-+                cros_async::sys::linux::ExecutorKindSys::Epoll,
-+            )),
++            async_executor: Some(cros_async::sys::linux::ExecutorKindSys::Fd.into()),
 +            ..Default::default()
 +        };
 +        let mut block = BlockAsync::new(0, Box::new(disk), &options, None, None, None).unwrap();

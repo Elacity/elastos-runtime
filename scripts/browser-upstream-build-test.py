@@ -613,8 +613,8 @@ class BrowserUpstreamBuildTest(unittest.TestCase):
                     os.link(binary, binary.parent / 'deps/crosvm-0123456789abcdef')
                 if args[:3] == ['cargo', '+1.91.0', 'test']:
                     self.assertEqual(args, ['cargo', '+1.91.0', 'test', '--locked', '--offline', '--release',
-                        '--target', 'aarch64-unknown-linux-musl', '-p', 'device_virtio_block', '--lib',
-                        'lifecycle_', '-j', last_build['jobs'], '--', '--nocapture'])
+                        '--target', 'aarch64-unknown-linux-musl', '-p', 'device_virtio_block', '--features',
+                        'devices/test-util', '--lib', 'lifecycle_', '-j', last_build['jobs'], '--', '--nocapture'])
                     self.assertEqual(kwargs['cwd'], last_build['cwd'])
                     self.assertEqual(kwargs['env'], last_build['env'])
                     self.assertTrue(kwargs['check'])
