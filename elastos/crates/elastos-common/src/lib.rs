@@ -9,6 +9,8 @@ pub mod host_memory;
 pub mod localhost;
 mod manifest;
 #[cfg(unix)]
+pub mod owned_removal;
+#[cfg(unix)]
 pub mod process_lifetime;
 pub mod protected_content;
 pub mod timestamp;
