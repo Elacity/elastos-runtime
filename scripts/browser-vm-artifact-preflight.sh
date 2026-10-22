@@ -463,7 +463,9 @@ def verify_image_set():
     receipt = rootfs_contract["build_receipt"]
     default_initrd = "bin/initrd" if platform == "darwin-arm64" else "browser-vm/initrd"
     initrd_key = "ELASTOS_BROWSER_VM_INITRAMFS" if platform == "darwin-arm64" else "ELASTOS_BROWSER_VM_INITRD"
-    initrd = os.environ.get(initrd_key) or str(pathlib.Path(data_dir) / default_initrd)
+    # Native adapters share INITRAMFS; image projection also accepts Linux INITRD.
+    initrd = (os.environ.get("ELASTOS_BROWSER_VM_INITRAMFS") or os.environ.get(initrd_key)
+              or str(pathlib.Path(data_dir) / default_initrd))
     try:
         for name, artifact in [("kernel", kernel), ("initrd", initrd)]:
             entry = receipt.get(name)
@@ -495,7 +497,7 @@ control = {
 if platform.startswith("linux-"):
     substrate = {
         "kind": "crosvm",
-        "kvm": path_stat("/dev/kvm"),
+        "vz_supervisor": path_stat(vz_supervisor, executable=True),
         "crosvm": path_stat(crosvm, executable=True),
         "kernel": path_stat(kernel),
         "rootfs_contract": {"ok": rootfs_contract["ok"], "path": rootfs},
@@ -536,14 +538,16 @@ if mode == "--host-readiness":
         message = "This computer uses an approved remote Browser Engine. The local guest requires ARM64 virtualization."
     elif platform != host_id:
         reason = "host_unsupported"
-    elif platform.startswith("linux-") and not os.path.exists("/dev/kvm"):
-        reason = "host_unsupported"
-        message = "Browser needs KVM virtualization. This host has no /dev/kvm device."
+    elif pathlib.Path(vz_supervisor).name.startswith(("browser-vm-local-crosvm-launcher", "browser-vm-remote-vz-launcher")):
+        reason = "readiness_unsupported"
     elif image_reason := verify_image_set():
         reason = image_reason
     elif not local_substrate_artifacts_ready:
         reason = "preparation_required"
-    elif platform == "darwin-arm64" and not (
+    elif not (os.path.isabs(vz_supervisor) and os.path.isfile(vz_supervisor)
+              and os.access(vz_supervisor, os.X_OK)):
+        reason = "preparation_required"
+    elif not (
         os.path.isabs(turn_program := os.environ.get("ELASTOS_BROWSER_VM_TURN_PROGRAM", ""))
         and os.path.isfile(turn_program)
         and os.access(turn_program, os.X_OK)
@@ -551,28 +555,15 @@ if mode == "--host-readiness":
         reason = "preparation_required"
     else:
         try:
-            if reason is None and platform == "darwin-arm64":
-                probe = subprocess.run([vz_supervisor, "--host-capabilities"],
-                                       capture_output=True, text=True, timeout=2, check=True)
-                host = json.loads(probe.stdout)
-                if host.get("schema") != "elastos.browser.vm-host-capabilities/v1":
-                    reason = "readiness_unsupported"
-                elif host.get("available") is not True:
-                    reason = ("preparation_required" if host.get("reason") == "preparation_required"
-                              else "host_unsupported")
-            elif reason is None and platform in {"linux-arm64", "linux-amd64"}:
-                network = subprocess.run([sys.executable, str(pathlib.Path(data_dir) / "scripts/browser-vm-linux-network.py"), "check"],
-                                         capture_output=True, text=True, timeout=5)
-                if network.returncode:
-                    reason = "preparation_required"
-                    message = network.stderr.strip()
-                import fcntl
-                if reason is None:
-                    with open("/dev/kvm", "r+b", buffering=0) as kvm:
-                        if fcntl.ioctl(kvm.fileno(), 0xAE00, 0) != 12:
-                            reason = "host_unsupported"
-            elif reason is None:
-                reason = "host_unsupported"
+            # The native owner checks its platform and selected transport.
+            probe = subprocess.run([vz_supervisor, "--host-capabilities"],
+                                   capture_output=True, text=True, timeout=2, check=True)
+            host = json.loads(probe.stdout)
+            if host.get("schema") != "elastos.browser.vm-host-capabilities/v1":
+                reason = "readiness_unsupported"
+            elif host.get("available") is not True:
+                reason = ("preparation_required" if host.get("reason") == "preparation_required"
+                          else "host_unsupported")
         except (ValueError, subprocess.SubprocessError, AttributeError):
             reason = "readiness_unsupported"
         except OSError:

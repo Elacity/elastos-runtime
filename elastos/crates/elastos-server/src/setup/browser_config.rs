@@ -11,6 +11,7 @@ const CONFIG_FILES: [&str; 4] = [
     "browser-vz-vsock-transport.json",
     "browser-engine-adapter.json",
 ];
+const RETIRED_SELECTION: &[u8] = b"{\"adapters\": []}\n";
 
 /// Opening Browser admits its host support files from the installed signed release.
 /// The base Home profile stays small; each helper keeps the normal checksum gate.
@@ -56,8 +57,13 @@ pub(super) async fn ensure_host_components(
     // can repair helper bytes, but needs setup/restart for its first selection.
     if matches!(context, super::FirstPartyCarrierContext::Runtime) {
         anyhow::ensure!(
-            data.join("config/browser-engine-adapter.json").exists()
-                || std::env::var_os("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG").is_some(),
+            read_engine_selection(
+                data,
+                std::env::var("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG")
+                    .ok()
+                    .as_deref(),
+            )?
+            .is_some(),
             "Browser helpers are ready. Close Home, run elastos setup, then start Home again."
         );
         return Ok(());
@@ -151,6 +157,7 @@ fn read_engine_selection(
     }
     let path = data.join("config/browser-engine-adapter.json");
     match fs::read(&path) {
+        Ok(bytes) if bytes == RETIRED_SELECTION => Ok(None),
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound && path.symlink_metadata().is_err() =>
@@ -161,10 +168,96 @@ fn read_engine_selection(
     }
 }
 
-/// Browser runs only on hosts with a local Engine. Linux hosts keep their
-/// Engine machinery but stay hidden until their Browser path is released.
+/// Platforms with a Browser Engine implementation. Each Linux Home also
+/// requires its selected native Engine and host capability proof.
 pub fn browser_available(platform: &str) -> bool {
-    platform == "darwin-arm64"
+    matches!(platform, "darwin-arm64" | "linux-arm64")
+}
+
+pub fn home_browser_available(data: &Path, platform: &str) -> bool {
+    home_browser_available_with_probe(
+        data,
+        platform,
+        std::env::var("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG")
+            .ok()
+            .as_deref(),
+        || native_host_available(data).is_ok(),
+    )
+}
+
+fn home_browser_available_with_probe(
+    data: &Path,
+    platform: &str,
+    inline: Option<&str>,
+    native_available: impl FnOnce() -> bool,
+) -> bool {
+    // Apple Silicon retains its existing local and approved remote Engines.
+    if platform == "darwin-arm64" {
+        return true;
+    }
+    if platform != "linux-arm64" {
+        return false;
+    }
+    let Ok(Some(config)) = read_engine_selection(data, inline) else {
+        return false;
+    };
+    let native = data.join("bin/browser-vz-engine-supervisor");
+    config["adapters"].as_array().is_some_and(|adapters| {
+        adapters.iter().any(|adapter| {
+            let supervisor = &adapter["supervisor"];
+            let launcher = supervisor["env"]["ELASTOS_BROWSER_VM_CONTROL_LAUNCHER"]
+                .as_str()
+                .or_else(|| supervisor["program"].as_str());
+            adapter["kind"] == "chromium_microvm" && launcher == native.to_str()
+        })
+    }) && native_available()
+}
+
+fn native_host_available(data: &Path) -> anyhow::Result<()> {
+    let program = data.join("bin/browser-vz-engine-supervisor");
+    super::verify_installed_component_binary(data, "browser-vz-engine-supervisor", &program)?;
+    probe_native_host(&program, data, std::time::Duration::from_secs(2))
+}
+
+fn probe_native_host(
+    program: &Path,
+    data: &Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(program)
+        .arg("--host-capabilities")
+        .env_clear()
+        .env("ELASTOS_BROWSER_VM_DATA_DIR", data)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("Browser native host capability check did not complete");
+            }
+        }
+    }
+    let output = child.wait_with_output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Browser native host capability check failed"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    anyhow::ensure!(
+        result["schema"] == "elastos.browser.vm-host-capabilities/v1"
+            && result["available"] == true,
+        "Browser requires its admitted native Engine and access to the selected KVM transport"
+    );
+    Ok(())
 }
 
 fn local_vm_selected_with_override(
@@ -233,8 +326,14 @@ fn require_kvm(path: &Path) -> anyhow::Result<()> {
         file.metadata()?.file_type().is_char_device(),
         "Browser virtualization requires a KVM character device"
     );
-    // KVM_GET_API_VERSION has no pointer argument and returns the stable API version.
-    let version = unsafe { libc::ioctl(file.as_raw_fd(), 0xAE00) };
+    // KVM_GET_API_VERSION requires a zero argument and returns the stable API version.
+    let version = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            0xAE00,
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
     anyhow::ensure!(
         version == 12,
         "Browser virtualization requires an accessible KVM API (version 12)"
@@ -270,6 +369,7 @@ pub(super) async fn prepare_home(
                 #[cfg(target_os = "linux")]
                 if platform == "linux-arm64" {
                     require_kvm(Path::new("/dev/kvm"))?;
+                    native_host_available(data)?;
                 }
                 println!("Preparing Browser Engine image...");
                 super::ensure_browser_vm_image_in_context(
@@ -302,10 +402,17 @@ fn retire_host(data: &Path, manifest: &super::ComponentsManifest) -> anyhow::Res
     let selection = data.join("config/browser-engine-adapter.json");
     if browser_installed || selection.symlink_metadata().is_ok() {
         fs::create_dir_all(data.join("config"))?;
-        super::atomic_write_file(&selection, b"{\"adapters\": []}\n")?;
+        super::atomic_write_file(&selection, RETIRED_SELECTION)?;
     }
     // Exact release paths, relative to the data directory.
-    let mut paths = vec![PathBuf::from(super::browser_vm_image::INSTALL_PATH)];
+    let mut paths = vec![
+        PathBuf::from(super::browser_vm_image::INSTALL_PATH),
+        // Exact launcher and pool paths retained by older release manifests.
+        PathBuf::from("bin/browser-vm-local-crosvm-launcher"),
+        PathBuf::from("bin/browser-vm-local-crosvm-launcher.mjs"),
+        PathBuf::from("bin/browser-vm-prepare-rootfs-pool"),
+        PathBuf::from("scripts/browser-vm-prepare-rootfs-pool.mjs"),
+    ];
     if let Some(profile) = manifest.profiles.get("browser-host") {
         for name in &profile.components {
             let shared = manifest
@@ -329,22 +436,32 @@ fn retire_host(data: &Path, manifest: &super::ComponentsManifest) -> anyhow::Res
     }
     let mut removed = false;
     for relative in paths {
-        if !parents_are_real_directories(data, &relative) {
-            println!(
+        // Never through a linked folder; a link itself is removed, its target never followed.
+        let expected = if matches!(
+            relative.to_str(),
+            Some(
+                "bin/browser-vm-local-crosvm-launcher"
+                    | "bin/browser-vm-local-crosvm-launcher.mjs"
+                    | "bin/browser-vm-prepare-rootfs-pool"
+                    | "scripts/browser-vm-prepare-rootfs-pool.mjs"
+            )
+        ) {
+            match data.join(&relative).symlink_metadata() {
+                Ok(info) => Some(elastos_common::owned_removal::FileIdentity::of(&info)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        match elastos_common::owned_removal::remove_owned(data, &relative, expected) {
+            Ok(found) => removed |= found,
+            Err(elastos_common::owned_removal::RemovalError::LinkedParent(_)) => println!(
                 "Kept {}: a folder on its path is a link, so removing it could reach files outside the data directory.",
                 relative.display()
-            );
-            continue;
-        }
-        let path = data.join(&relative);
-        // A link is removed itself; its target is never followed.
-        match path.symlink_metadata() {
-            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path)?,
-            Ok(_) => fs::remove_file(&path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            ),
             Err(error) => return Err(error.into()),
         }
-        removed = true;
     }
     if removed {
         println!("Removed the Browser host files an earlier release installed.");
@@ -355,28 +472,6 @@ fn retire_host(data: &Path, manifest: &super::ComponentsManifest) -> anyhow::Res
     Ok(())
 }
 
-/// True when the data directory and every folder from it down to `relative`'s
-/// parent are real directories, so a removal stays inside the data directory.
-fn parents_are_real_directories(data: &Path, relative: &Path) -> bool {
-    if !data.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
-        return false;
-    }
-    let mut current = data.to_path_buf();
-    for component in relative.parent().into_iter().flat_map(Path::components) {
-        let std::path::Component::Normal(part) = component else {
-            return false;
-        };
-        current.push(part);
-        match current.symlink_metadata() {
-            Ok(meta) if meta.is_dir() => {}
-            // A missing folder holds nothing to remove.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
-            _ => return false,
-        }
-    }
-    true
-}
-
 pub(super) fn configure(data: &Path, platform: &str, release_image: bool) -> anyhow::Result<()> {
     if !data.join("capsules/browser").is_dir() {
         return Ok(());
@@ -384,13 +479,12 @@ pub(super) fn configure(data: &Path, platform: &str, release_image: bool) -> any
     let config = data.join("config");
     ensure_viewer_ingress(data)?;
     // Existing Engine/Exit selection belongs to the Home owner, including a
-    // remote Engine. Setup initializes a fresh selection only.
-    if let Some(existing) = read_engine_selection(
-        data,
-        std::env::var("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG")
-            .ok()
-            .as_deref(),
-    )? {
+    // remote Engine. Setup can replace its exact retired/default local selection.
+    let inline = std::env::var("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG").ok();
+    let mut replace_selection = inline.is_none()
+        && fs::read(config.join("browser-engine-adapter.json"))
+            .is_ok_and(|bytes| bytes == RETIRED_SELECTION);
+    if let Some(existing) = read_engine_selection(data, inline.as_deref())? {
         if existing["adapters"].as_array().is_some_and(|adapters| {
             adapters
                 .iter()
@@ -398,12 +492,25 @@ pub(super) fn configure(data: &Path, platform: &str, release_image: bool) -> any
         }) {
             println!("The selected Browser Engine is retired. Select the VM Engine or an approved remote Engine. Your Browser profile remains with its owner.");
         }
-        return Ok(());
+        replace_selection = inline.is_none()
+            && platform == "linux-arm64"
+            && existing["adapters"].as_array().is_some_and(|adapters| {
+                adapters.len() == 1
+                    && adapters[0]["kind"] == "chromium_microvm"
+                    && adapters[0]["supervisor"]["program"].as_str()
+                        == data.join("bin/browser-vm-engine-supervisor").to_str()
+                    && adapters[0]["supervisor"]["env"]["ELASTOS_BROWSER_VM_CONTROL_LAUNCHER"]
+                        .as_str()
+                        == data.join("bin/browser-vm-local-crosvm-launcher").to_str()
+            });
+        if !replace_selection {
+            return Ok(());
+        }
     }
     if !browser_available(platform) {
         super::atomic_write_file(
             &config.join("browser-engine-adapter.json"),
-            b"{\"adapters\": []}\n",
+            RETIRED_SELECTION,
         )?;
         println!("Browser is not available on this computer yet.");
         return Ok(());
@@ -416,19 +523,9 @@ pub(super) fn configure(data: &Path, platform: &str, release_image: bool) -> any
         "bin/browser-vm-control-service",
         "scripts/browser-vm-artifact-preflight.sh",
     ];
-    if platform == "darwin-arm64" {
-        required.push("bin/browser-vz-engine-supervisor");
-    } else if platform.starts_with("linux-") {
-        required.extend([
-            "bin/crosvm",
-            "bin/browser-vm-local-crosvm-launcher",
-            "bin/browser-vm-local-crosvm-launcher.mjs",
-            "bin/browser-vm-prepare-rootfs-pool",
-            "scripts/browser-vm-prepare-rootfs-pool.mjs",
-            "scripts/browser-vm-linux-network.py",
-        ]);
-    } else {
-        return Ok(());
+    required.push("bin/browser-vz-engine-supervisor");
+    if platform == "linux-arm64" {
+        required.extend(["bin/crosvm", "scripts/browser-vm-linux-network.py"]);
     }
     let mut missing: Vec<_> = required
         .into_iter()
@@ -460,15 +557,17 @@ pub(super) fn configure(data: &Path, platform: &str, release_image: bool) -> any
         println!("Browser local Engine setup needs host helpers: {}. Use a release that supplies these helpers, then run elastos setup again, or select a remote Engine.", missing.join(", "));
         return Ok(());
     }
-    generate(
+    generate_with_migration(
         data,
         platform,
         release_image,
         &node.unwrap(),
         &turn.unwrap(),
+        replace_selection,
     )
 }
 
+#[cfg(test)]
 fn generate(
     data: &Path,
     platform: &str,
@@ -476,10 +575,18 @@ fn generate(
     node: &Path,
     turn: &Path,
 ) -> anyhow::Result<()> {
+    generate_with_migration(data, platform, release_image, node, turn, false)
+}
+
+fn generate_with_migration(
+    data: &Path,
+    platform: &str,
+    release_image: bool,
+    node: &Path,
+    turn: &Path,
+    replace_selection: bool,
+) -> anyhow::Result<()> {
     fs::create_dir_all(data.join("config"))?;
-    if platform.starts_with("linux-") {
-        ensure_linux_turn_credentials(data)?;
-    }
     let staged = tempfile::tempdir_in(data.join("config"))?;
     let mut command = Command::new(node);
     command
@@ -509,7 +616,10 @@ fn generate(
     );
     for name in CONFIG_FILES {
         let source = staged.path().join(name);
-        if source.exists() && !data.join("config").join(name).exists() {
+        if source.exists()
+            && (!data.join("config").join(name).exists()
+                || (replace_selection && name == "browser-engine-adapter.json"))
+        {
             super::atomic_write_file(&data.join("config").join(name), &fs::read(&source)?)?;
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(
@@ -522,49 +632,114 @@ fn generate(
     Ok(())
 }
 
-/// Linux Browser media uses a session TURN server on the leased host slot. Its
-/// per-Home credential stays in an owner-only file that the generator copies
-/// into the owner-only Engine configuration; an existing file is kept.
-fn ensure_linux_turn_credentials(data: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    let dir = data.join("runtime-turn");
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
-    let path = dir.join("turn-credentials.env");
-    if path.exists() {
-        return Ok(());
-    }
-    let mut credential = [0_u8; 24];
-    getrandom::getrandom(&mut credential)?;
-    let servers = serde_json::json!([{
-        "urls": [
-            "turn:{host_ip}:{turn_port}?transport=udp",
-            "turn:{host_ip}:{turn_port}?transport=tcp",
-        ],
-        "username": "elastos-browser",
-        "credential": hex::encode(credential),
-    }]);
-    // A new temporary file is owner-only; persisting it never replaces a file.
-    let mut file = tempfile::NamedTempFile::new_in(&dir)?;
-    write!(
-        file,
-        "ELASTOS_BROWSER_VM_ICE_SERVERS_JSON={servers}\nELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY=relay\n"
-    )?;
-    file.as_file().sync_all()?;
-    match file.persist_noclobber(&path) {
-        Ok(_) => Ok(()),
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error.error.into()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Value;
     use sha2::Digest;
+
+    #[test]
+    fn arm_browser_requires_its_selected_managed_native_host() {
+        let data = Path::new("/fixture/elastos");
+        let selected = |program: &str| {
+            serde_json::json!({"adapters":[{
+                "kind":"chromium_microvm", "supervisor":{"env":{
+                    "ELASTOS_BROWSER_VM_CONTROL_LAUNCHER": program
+                }}
+            }]})
+            .to_string()
+        };
+        let native = selected("/fixture/elastos/bin/browser-vz-engine-supervisor");
+        assert!(home_browser_available_with_probe(
+            data,
+            "linux-arm64",
+            Some(&native),
+            || true
+        ));
+        assert!(!home_browser_available_with_probe(
+            data,
+            "linux-arm64",
+            Some(&native),
+            || false
+        ));
+        for platform in ["linux-amd64", "darwin-amd64", "linux-riscv64"] {
+            assert!(!home_browser_available_with_probe(
+                data,
+                platform,
+                Some(&native),
+                || true
+            ));
+        }
+        for program in [
+            "/other/browser-vz-engine-supervisor",
+            "/fixture/elastos/bin/browser-vm-local-crosvm-launcher",
+            "/fixture/elastos/bin/browser-vm-remote-vz-launcher",
+        ] {
+            assert!(!home_browser_available_with_probe(
+                data,
+                "linux-arm64",
+                Some(&selected(program)),
+                || true
+            ));
+        }
+        for raw in ["invalid", r#"{"adapters":[]}"#] {
+            assert!(!home_browser_available_with_probe(
+                data,
+                "linux-arm64",
+                Some(raw),
+                || true
+            ));
+        }
+        let remote = selected("/fixture/elastos/bin/browser-vm-remote-vz-launcher");
+        assert!(home_browser_available_with_probe(
+            data,
+            "darwin-arm64",
+            Some(&remote),
+            || false
+        ));
+    }
+
+    #[test]
+    fn native_host_probe_requires_its_contract_and_has_a_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("probe");
+        for (output, accepted) in [
+            (
+                r#"{"schema":"elastos.browser.vm-host-capabilities/v1","available":true}"#,
+                true,
+            ),
+            (
+                r#"{"schema":"elastos.browser.vm-host-capabilities/v1","available":false}"#,
+                false,
+            ),
+            (r#"{"schema":"other","available":true}"#, false),
+            ("invalid", false),
+        ] {
+            fs::write(&program, format!("#!/bin/sh\n[ \"$1\" = --host-capabilities ] || exit 2\nprintf '%s\\n' '{output}'\n")).unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                probe_native_host(&program, temp.path(), Duration::from_secs(1)).is_ok(),
+                accepted
+            );
+        }
+        fs::write(&program, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        assert!(
+            probe_native_host(&program, temp.path(), Duration::from_millis(20))
+                .unwrap_err()
+                .to_string()
+                .contains("did not complete")
+        );
+        // Admission precedes execution even when the named file is executable.
+        fs::create_dir(temp.path().join("bin")).unwrap();
+        fs::rename(
+            &program,
+            temp.path().join("bin/browser-vz-engine-supervisor"),
+        )
+        .unwrap();
+        assert!(native_host_available(temp.path()).is_err());
+    }
 
     fn fixture_node() -> PathBuf {
         let output = Command::new("node")
@@ -812,24 +987,23 @@ mod tests {
             .components
             .iter()
             .any(|name| name == "browser-vm-linux-network"));
-        for platform in ["linux-arm64", "linux-amd64"] {
-            assert!(!browser_available(platform));
-            let temp = tempfile::tempdir().unwrap();
-            let data = temp.path();
-            fs::create_dir_all(data.join("capsules/browser")).unwrap();
-            prepare_home(data, &manifest, platform, true).await;
-            assert!(!local_vm_selected(data, platform).unwrap());
-            // install.sh asks for sudo only when this helper exists.
-            assert!(!data.join("scripts/browser-vm-linux-network.py").exists());
-            assert!(!data.join("scripts").exists());
-            assert!(!data.join("bin").exists());
-            assert!(!data.join("browser-vm").exists());
-            let config: Value = serde_json::from_slice(
-                &fs::read(data.join("config/browser-engine-adapter.json")).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(config["adapters"], serde_json::json!([]));
-        }
+        let platform = "linux-amd64";
+        assert!(!browser_available(platform));
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        fs::create_dir_all(data.join("capsules/browser")).unwrap();
+        prepare_home(data, &manifest, platform, true).await;
+        assert!(!local_vm_selected(data, platform).unwrap());
+        // install.sh asks for sudo only when this helper exists.
+        assert!(!data.join("scripts/browser-vm-linux-network.py").exists());
+        assert!(!data.join("scripts").exists());
+        assert!(!data.join("bin").exists());
+        assert!(!data.join("browser-vm").exists());
+        let config: Value = serde_json::from_slice(
+            &fs::read(data.join("config/browser-engine-adapter.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["adapters"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -846,13 +1020,17 @@ mod tests {
             },
         );
         let temp = tempfile::tempdir().unwrap();
-        let data = temp.path();
+        let canonical = temp.path().canonicalize().unwrap();
+        let data = canonical.as_path();
         let crosvm = "libexec/browser/crosvm/0.1.0-2ac141082d17/linux-arm64";
         let removed = [
             "scripts/browser-vm-linux-network.py",
             "bin/browser-vm-control-service",
             "bin/browser-vm-control-service.mjs",
             "bin/browser-vm-local-crosvm-launcher",
+            "bin/browser-vm-local-crosvm-launcher.mjs",
+            "bin/browser-vm-prepare-rootfs-pool",
+            "scripts/browser-vm-prepare-rootfs-pool.mjs",
             "browser-vm/image-set/rootfs.ext4",
             "libexec/browser/crosvm/0.1.0-2ac141082d17/linux-arm64/bin/crosvm",
         ];
@@ -883,7 +1061,7 @@ mod tests {
             r#"{"adapters":[{"kind":"chromium_microvm","supervisor":{"program":"/vm/local"}}]}"#,
         )
         .unwrap();
-        prepare_home(data, &manifest, "linux-arm64", true).await;
+        prepare_home(data, &manifest, "linux-amd64", true).await;
         for name in removed {
             assert!(!data.join(name).exists(), "{name}");
         }
@@ -907,7 +1085,8 @@ mod tests {
         let manifest: super::super::ComponentsManifest =
             serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let (data, outside) = (temp.path().join("elastos"), temp.path().join("outside"));
+        let base = temp.path().canonicalize().unwrap();
+        let (data, outside) = (base.join("elastos"), base.join("outside"));
         let kept = [
             data.join("Users/owner/image-set/profile.ext4"),
             outside.join("browser-vm-control-service"),
@@ -921,7 +1100,7 @@ mod tests {
         symlink(&outside, data.join("bin")).unwrap();
         fs::create_dir_all(data.join("scripts")).unwrap();
         fs::write(data.join("scripts/browser-vm-linux-network.py"), b"helper").unwrap();
-        prepare_home(&data, &manifest, "linux-arm64", true).await;
+        prepare_home(&data, &manifest, "linux-amd64", true).await;
         for path in &kept {
             assert_eq!(fs::read(path).unwrap(), b"owner data", "{}", path.display());
         }
@@ -938,13 +1117,46 @@ mod tests {
     #[test]
     fn removal_never_goes_through_a_linked_data_directory() {
         use std::os::unix::fs::symlink;
+        let manifest: super::super::ComponentsManifest =
+            serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let (real, linked) = (temp.path().join("real"), temp.path().join("elastos"));
-        fs::create_dir_all(real.join("browser-vm")).unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (real, linked) = (base.join("real"), base.join("elastos"));
+        let image = real.join(super::super::browser_vm_image::INSTALL_PATH);
+        fs::create_dir_all(&image).unwrap();
+        fs::write(image.join("rootfs.ext4"), b"owner data").unwrap();
         symlink(&real, &linked).unwrap();
-        let relative = Path::new("browser-vm/image-set");
-        assert!(parents_are_real_directories(&real, relative));
-        assert!(!parents_are_real_directories(&linked, relative));
+        retire_host(&linked, &manifest).unwrap();
+        assert_eq!(fs::read(image.join("rootfs.ext4")).unwrap(), b"owner data");
+        retire_host(&real, &manifest).unwrap();
+        assert!(!image.exists());
+    }
+
+    #[test]
+    fn retirement_keeps_launchers_under_a_linked_data_ancestor() {
+        use std::os::unix::fs::symlink;
+        let manifest: super::super::ComponentsManifest =
+            serde_json::from_str(include_str!("../../../../../components.json")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let real = base.join("real");
+        let data = real.join("elastos");
+        let names = [
+            "bin/browser-vm-local-crosvm-launcher",
+            "bin/browser-vm-local-crosvm-launcher.mjs",
+            "bin/browser-vm-prepare-rootfs-pool",
+            "scripts/browser-vm-prepare-rootfs-pool.mjs",
+        ];
+        for name in names {
+            let path = data.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"kept helper").unwrap();
+        }
+        symlink(&real, base.join("linked")).unwrap();
+        retire_host(&base.join("linked/elastos"), &manifest).unwrap();
+        for name in names {
+            assert_eq!(fs::read(data.join(name)).unwrap(), b"kept helper");
+        }
     }
 
     #[test]
@@ -957,9 +1169,15 @@ mod tests {
         let file = data.join("config/browser-engine-adapter.json");
         fs::write(&file, local).unwrap();
         assert!(local_vm_selected_with_override(data, "darwin-arm64", None).unwrap());
-        for platform in ["linux-arm64", "linux-amd64"] {
-            assert!(!local_vm_selected_with_override(data, platform, None).unwrap());
-            assert!(!local_vm_selected_with_override(data, platform, Some(local)).unwrap());
+        for (platform, selected) in [("linux-arm64", true), ("linux-amd64", false)] {
+            assert_eq!(
+                local_vm_selected_with_override(data, platform, None).unwrap(),
+                selected
+            );
+            assert_eq!(
+                local_vm_selected_with_override(data, platform, Some(local)).unwrap(),
+                selected
+            );
         }
         for inline in [
             r#"{"adapters":[]}"#,
@@ -1021,99 +1239,43 @@ mod tests {
     }
 
     #[test]
-    fn fresh_linux_setup_supplies_turn_the_launcher_accepts() {
-        use std::os::unix::fs::PermissionsExt;
-        const LAUNCHER: &str =
-            include_str!("../../../../../scripts/browser-vm-local-crosvm-launcher.mjs");
-        // Runs the launcher's own TURN gate against the generated Engine env.
-        const HARNESS: &str = r#"
-            const vm = require("node:vm");
-            const source = require("node:fs").readFileSync(0, "utf8");
-            const slice = (from, to) => source.slice(source.indexOf(from), source.indexOf(to, source.indexOf(from)));
-            const context = vm.createContext({ Buffer, process: { env: JSON.parse(process.argv[1]) } });
-            const { turn } = vm.runInContext(`${slice("const OPEN_REQUEST_ENV", "\nconst children")}
-                ${slice("function isIpv4(", "\nfunction sessionSuffix(")}
-                linuxSessionTurn({ hostIp: "192.168.200.1", guestIp: "192.168.200.2", turnPort: 41000 })`, context);
-            process.stdout.write(JSON.stringify(turn));
-        "#;
+    fn fresh_linux_setup_uses_private_bound_session_transport() {
+        let platform = "linux-arm64";
         let node = fixture_node();
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path();
-        generate(
-            data,
-            "linux-arm64",
-            true,
-            &node,
-            Path::new("/host/turnserver"),
-        )
-        .unwrap();
-        let credentials = data.join("runtime-turn/turn-credentials.env");
-        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&credentials), 0o600);
-        assert_eq!(mode(&data.join("runtime-turn")), 0o700);
-        let adapter: Value = serde_json::from_slice(
-            &fs::read(data.join("config/browser-engine-adapter.json")).unwrap(),
-        )
-        .unwrap();
-        let env = &adapter["adapters"][0]["supervisor"]["env"];
-        let run = |env: &Value| {
-            let mut child = Command::new(&node)
-                .args(["-e", HARNESS, &env.to_string()])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(LAUNCHER.as_bytes())
-                .unwrap();
-            child.wait_with_output().unwrap()
+        generate(data, platform, true, &node, Path::new("/host/turnserver")).unwrap();
+        let read = |name: &str| -> Value {
+            serde_json::from_slice(&fs::read(data.join("config").join(name)).unwrap()).unwrap()
         };
-        let output = run(env);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+        let adapter = read("browser-engine-adapter.json");
+        let env = &adapter["adapters"][0]["supervisor"]["env"];
+        assert_eq!(
+            env["ELASTOS_BROWSER_VM_CONTROL_LAUNCHER"],
+            data.join("bin/browser-vz-engine-supervisor")
+                .to_str()
+                .unwrap()
         );
-        let turn: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(turn["host"], "192.168.200.1");
-        assert_eq!(turn["port"], 41000);
-        assert_eq!(turn["username"], "elastos-browser");
-        assert_eq!(turn["credential"].as_str().unwrap().len(), 48);
-        // The credential belongs to this Home and survives a repeated setup.
-        let issued = fs::read(&credentials).unwrap();
-        fs::remove_file(data.join("config/browser-engine-adapter.json")).unwrap();
-        generate(
-            data,
-            "linux-arm64",
-            true,
-            &node,
-            Path::new("/host/turnserver"),
-        )
-        .unwrap();
-        assert_eq!(fs::read(&credentials).unwrap(), issued);
-        let other = tempfile::tempdir().unwrap();
-        generate(
-            other.path(),
-            "linux-arm64",
-            true,
-            &node,
-            Path::new("/host/turnserver"),
-        )
-        .unwrap();
-        assert_ne!(
-            fs::read(other.path().join("runtime-turn/turn-credentials.env")).unwrap(),
+        assert_eq!(env["ELASTOS_BROWSER_VM_TURN_PROGRAM"], "/host/turnserver");
+        assert!(env
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with("ELASTOS_BROWSER_VM_ICE_")));
+        assert!(env.get("ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE").is_none());
+        let transport = read("browser-vz-vsock-transport.json");
+        assert_eq!(transport["enabled"], true);
+        assert_eq!(transport["turn_advertised_host"], "127.0.0.1");
+        let issued = fs::read(data.join("config/browser-vz-vsock-transport.json")).unwrap();
+        generate(data, platform, true, &node, Path::new("/host/turnserver")).unwrap();
+        assert_eq!(
+            fs::read(data.join("config/browser-vz-vsock-transport.json")).unwrap(),
             issued
         );
-        // Without credentials the launcher refuses, as a fresh Home did before.
-        let mut bare = env.clone();
-        bare.as_object_mut()
-            .unwrap()
-            .retain(|key, _| !key.starts_with("ELASTOS_BROWSER_VM_ICE_"));
-        assert!(String::from_utf8_lossy(&run(&bare).stderr).contains("requires session-local TURN"));
+        // Runtime issues credentials for each launch authority. The setup
+        // configuration owns port policy, rather than a reusable secret.
+        assert!(transport.get("auth_secret").is_none());
+        assert!(transport.get("credential").is_none());
     }
 
     #[test]
@@ -1163,6 +1325,67 @@ mod tests {
         configure(data, "darwin-arm64", true).unwrap();
         assert_eq!(fs::read(selection).unwrap(), owner_selection);
         assert!(!data.join("config/exit-provider.json").exists());
+    }
+
+    #[test]
+    fn arm_setup_migrates_only_its_retired_or_default_local_selection() {
+        use std::os::unix::{fs::symlink, fs::PermissionsExt};
+        let node = fixture_node();
+        for selection in ["retired", "legacy", "owner-off", "remote"] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path();
+            for directory in ["capsules/browser", "config", "bin", "scripts"] {
+                fs::create_dir_all(data.join(directory)).unwrap();
+            }
+            for name in [
+                "bin/browser-engine-adapter",
+                "bin/exit-provider",
+                "bin/browser-local-exit",
+                "bin/browser-vm-engine-supervisor",
+                "bin/browser-vm-control-service",
+                "bin/browser-vm-engine-supervisor.mjs",
+                "bin/browser-vm-control-service.mjs",
+                "bin/browser-vz-engine-supervisor",
+                "bin/crosvm",
+                "bin/turnserver",
+                "scripts/browser-vm-artifact-preflight.sh",
+                "scripts/browser-vm-linux-network.py",
+            ] {
+                fs::write(data.join(name), b"presence fixture").unwrap();
+                fs::set_permissions(data.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            symlink(&node, data.join("bin/node")).unwrap();
+            let bytes = match selection {
+                "retired" => RETIRED_SELECTION.to_vec(),
+                "owner-off" => br#"{"adapters":[]}"#.to_vec(),
+                _ => serde_json::to_vec(&serde_json::json!({"adapters":[{
+                    "kind":"chromium_microvm", "supervisor":{
+                        "program":data.join("bin/browser-vm-engine-supervisor"),
+                        "env":{"ELASTOS_BROWSER_VM_CONTROL_LAUNCHER": data.join("bin").join(
+                            if selection == "legacy" { "browser-vm-local-crosvm-launcher" }
+                            else { "browser-vm-remote-vz-launcher" })}
+                    }
+                }]}))
+                .unwrap(),
+            };
+            let file = data.join("config/browser-engine-adapter.json");
+            fs::write(&file, &bytes).unwrap();
+            configure(data, "linux-arm64", true).unwrap();
+            let after = fs::read(&file).unwrap();
+            if matches!(selection, "retired" | "legacy") {
+                let config: Value = serde_json::from_slice(&after).unwrap();
+                assert_eq!(
+                    config["adapters"][0]["supervisor"]["env"]
+                        ["ELASTOS_BROWSER_VM_CONTROL_LAUNCHER"],
+                    data.join("bin/browser-vz-engine-supervisor")
+                        .to_str()
+                        .unwrap()
+                );
+                assert!(!data.join("runtime-turn/turn-credentials.env").exists());
+            } else {
+                assert_eq!(after, bytes, "{selection}");
+            }
+        }
     }
 
     #[test]

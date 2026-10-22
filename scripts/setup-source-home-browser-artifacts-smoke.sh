@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec python3 - "$repo_root" <<'PY'
+exec python3 - "$repo_root" "$@" <<'PY'
 import copy
 import hashlib
 import json
@@ -16,6 +16,9 @@ import tempfile
 from unittest import mock
 
 repo = Path(sys.argv[1])
+if sys.argv[2:] not in ([], ["--projection-only"]):
+    raise SystemExit("usage: setup-source-home-browser-artifacts-smoke.sh [--projection-only]")
+projection_only = sys.argv[2:] == ["--projection-only"]
 checks = []
 # This is an artifact ownership fixture. Real ext4 inspection is covered by
 # browser-vm-artifact-preflight-smoke.sh; these bytes are never launched.
@@ -84,15 +87,49 @@ with tempfile.TemporaryDirectory(prefix="browser-image-ownership-") as temp:
         if platform.startswith("linux-"):
             assert not (managed / "bin/initrd").exists(), "Linux setup uses its own initrd path"
         assert run(platform + " repeated setup", managed, platform=platform)["linked"] == 0
-        initrd_key = "ELASTOS_BROWSER_VM_INITRAMFS" if platform == "darwin-arm64" else "ELASTOS_BROWSER_VM_INITRD"
-        foreign_key = "ELASTOS_BROWSER_VM_INITRD" if platform == "darwin-arm64" else "ELASTOS_BROWSER_VM_INITRAMFS"
+        initrd = managed / ("bin/initrd" if platform == "darwin-arm64" else "browser-vm/initrd")
         checked = subprocess.run([str(repo / "scripts/browser-vm-artifact-preflight.sh"), "--verify-image-set"],
             env={**env, "ELASTOS_BROWSER_VM_DATA_DIR": str(managed), "ELASTOS_BROWSER_VM_PLATFORM": platform,
-                 foreign_key: str(root / "wrong-host-initrd")}, capture_output=True, text=True, timeout=15)
+                 "ELASTOS_BROWSER_VM_INITRAMFS": str(initrd),
+                 "ELASTOS_BROWSER_VM_INITRD": str(root / "wrong-host-initrd")},
+            capture_output=True, text=True, timeout=15)
         assert checked.returncode == 0, (platform, checked.stdout, checked.stderr)
-        checks.append(platform + " launcher initrd path")
+        checks.append(platform + " canonical launcher initrd overrides inherited legacy path")
 
         assert all(sha(source / rel) == digest for rel,digest in before.items()), "shared source changed"
+
+    # Both aliases are ambient input to the projector. Verification must bind
+    # the exact planned file that the projector will link into the destination.
+    conflicts = []
+    for platform in ["darwin-arm64", "linux-arm64", "linux-amd64"]:
+        for corrupt_plan in (False, True):
+            name = platform + (" corrupt plan with valid ambient initrd" if corrupt_plan
+                               else " valid plan with corrupt ambient initrd")
+            source = root / ("conflict-source-" + platform + str(corrupt_plan))
+            make_set(source, "linux-amd64" if platform == "linux-amd64" else "linux-arm64")
+            planned = source / ("bin/initrd" if platform == "darwin-arm64" else "browser-vm/initrd")
+            original = planned.read_bytes()
+            ambient = root / ("ambient-" + platform + str(corrupt_plan))
+            ambient.write_bytes(original if corrupt_plan else b"corrupt ambient initrd")
+            if corrupt_plan:
+                planned.write_bytes(b"X" + original[1:])
+            destination = root / ("conflict-destination-" + platform + str(corrupt_plan))
+            process = subprocess.run([str(script), "--data-dir", str(destination), "--platform", platform,
+                "--artifact-data-dir", str(source)],
+                env={**env, "ELASTOS_BROWSER_VM_INITRAMFS": str(ambient),
+                     "ELASTOS_BROWSER_VM_INITRD": str(ambient)},
+                capture_output=True, text=True, timeout=20)
+            result = json.loads(process.stdout)
+            if corrupt_plan:
+                if process.returncode == 0 or destination.exists():
+                    conflicts.append((name, "must reject before creating links", result))
+            elif process.returncode != 0 or not result["image_set_verified"]:
+                conflicts.append((name, "must admit the planned file", result))
+            else:
+                relative = "bin/initrd" if platform == "darwin-arm64" else "browser-vm/initrd"
+                assert (destination / relative).resolve() == planned.resolve(), name
+            checks.append(name)
+    assert not conflicts, conflicts
 
     source = root / "darwin-arm64"
     manifest = source / "browser-vm/browser-vm-rootfs-manifest.json"
@@ -124,6 +161,11 @@ with tempfile.TemporaryDirectory(prefix="browser-image-ownership-") as temp:
     unavailable = run("no local image permits a viewer Runtime", root / "viewer")
     assert unavailable["missing"] == 4 and not unavailable["image_set_verified"]
     assert unavailable["image_preparation"] == "required" and "browser-vm-image" in unavailable["detail"]
+
+    if projection_only:
+        print(json.dumps({"schema": "elastos.setup-source-home.browser-artifacts-smoke/v1", "ok": True,
+                          "checks": checks, "count": len(checks)}))
+        raise SystemExit(0)
 
     # Package only tiny fixture bytes, then inspect the release component overlay.
     # The parent-owned production image store is outside this test's scope.

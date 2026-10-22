@@ -59,7 +59,7 @@ Options:
   --vm-supervisor <path>          Default: <data-dir>/bin/browser-vm-engine-supervisor
   --vm-control-socket <path>      Default: /tmp/elastos-browser-<platform>-<data-dir-hash>-vm-control.sock
   --vm-control-launcher <path>    Optional launcher used to auto-start the VM control socket.
-                                  Linux default: <data-dir>/bin/browser-vm-local-crosvm-launcher
+                                  Linux default: <data-dir>/bin/browser-vz-engine-supervisor
                                   Darwin default: <data-dir>/bin/browser-vz-engine-supervisor
   --release-image                Use the atomic Browser image set supplied by the signed release
   --vm-rootfs <path>              Optional Browser VM rootfs path
@@ -390,13 +390,13 @@ function browserVzTransportConfig(
 ) {
   if (
     !vzControlLauncher ||
-    (platform !== "darwin-arm64" && !remoteVzControlLauncher)
+    (platform !== "darwin-arm64" && platform !== "linux-arm64" && !remoteVzControlLauncher)
   ) {
     return null;
   }
   const advertisedHost = String(
     env.ELASTOS_BROWSER_VZ_TURN_ADVERTISED_HOST ||
-      (platform === "darwin-arm64" && !remoteVzControlLauncher
+      ((platform === "darwin-arm64" || platform === "linux-arm64") && !remoteVzControlLauncher
         ? "127.0.0.1"
         : ""),
   ).trim();
@@ -592,7 +592,7 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = nul
     (args.platform === "darwin-arm64"
       ? path.join(args.dataDir, "bin/browser-vz-engine-supervisor")
       : args.platform.startsWith("linux-")
-        ? path.join(args.dataDir, "bin/browser-vm-local-crosvm-launcher")
+        ? path.join(args.dataDir, "bin/browser-vz-engine-supervisor")
         : "");
   const remoteVzControlLauncher = isRemoteVzControlLauncher(controlLauncher);
   const supervisorConfig = {
@@ -667,19 +667,22 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = nul
     validateAbsolute("--vm-rootfs", args.vmRootfs);
     env.ELASTOS_BROWSER_VM_ROOTFS = args.vmRootfs;
   }
-  if (args.platform.startsWith("linux-") && !remoteVzControlLauncher) {
+  if (args.platform.startsWith("linux-") && !remoteVzControlLauncher && !vzTransport) {
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR = path.join(args.dataDir, "browser-vm/rootfs-pool");
     env.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE = "pool-required";
     // Keep one spare image so a closed Browser leaves room for update staging.
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_COUNT = "1";
     env.ELASTOS_BROWSER_VM_ROOTFS_POOL_REFILL_SCRIPT = path.join(args.dataDir, "bin/browser-vm-prepare-rootfs-pool");
   }
+  if (args.platform === "linux-arm64" && !remoteVzControlLauncher && vzTransport) {
+    env.ELASTOS_BROWSER_VM_INITRAMFS = path.join(args.dataDir, "browser-vm/initrd");
+  }
   if (args.releaseImage) {
     const image = path.join(args.dataDir, "browser-vm/image-set");
     env.ELASTOS_BROWSER_VM_ROOTFS = path.join(image, "rootfs.ext4");
     env.ELASTOS_BROWSER_VM_ROOTFS_MANIFEST = path.join(image, "browser-vm-rootfs-manifest.json");
     env.ELASTOS_BROWSER_VM_KERNEL = path.join(image, "vmlinux");
-    env[args.platform === "darwin-arm64" ? "ELASTOS_BROWSER_VM_INITRAMFS" : "ELASTOS_BROWSER_VM_INITRD"] = path.join(image, "initrd");
+    env[vzTransport ? "ELASTOS_BROWSER_VM_INITRAMFS" : "ELASTOS_BROWSER_VM_INITRD"] = path.join(image, "initrd");
   }
   supervisorConfig.env = env;
   return {
@@ -729,7 +732,7 @@ function main() {
       (args.platform === "darwin-arm64"
         ? path.join(args.dataDir, "bin/browser-vz-engine-supervisor")
         : args.platform.startsWith("linux-")
-          ? path.join(args.dataDir, "bin/browser-vm-local-crosvm-launcher")
+          ? path.join(args.dataDir, "bin/browser-vz-engine-supervisor")
           : "");
     const vzTransport = browserVzTransportConfig(
       args.platform,

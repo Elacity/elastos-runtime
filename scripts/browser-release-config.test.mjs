@@ -8,6 +8,50 @@ import { test } from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
 
+test("local ARM Linux binds the projected initramfs while Mac keeps its native default", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "browser-projected-config-"));
+  try {
+    for (const platform of ["linux-arm64", "darwin-arm64"]) {
+      const data = path.join(temp, platform);
+      execFileSync(process.execPath, [path.join(root, "scripts/browser-source-home-config.mjs"),
+        "--data-dir", data, "--platform", platform], { env: {} });
+      const config = JSON.parse(fs.readFileSync(path.join(data, "config/browser-engine-adapter.json")));
+      const env = config.adapters[0].supervisor.env;
+      assert.equal(env.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER, path.join(data, "bin/browser-vz-engine-supervisor"));
+      assert.equal(env.ELASTOS_BROWSER_VM_INITRAMFS,
+        platform === "linux-arm64" ? path.join(data, "browser-vm/initrd") : undefined);
+      assert.equal(env.ELASTOS_BROWSER_VM_INITRD, undefined);
+    }
+  } finally { fs.rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("ARM Linux selects the managed native owner with private session transport", () => {
+  const data = fs.mkdtempSync(path.join(os.tmpdir(), "browser-native-arm-config-"));
+  try {
+    execFileSync(process.execPath, [path.join(root, "scripts/browser-source-home-config.mjs"),
+      "--data-dir", data, "--platform", "linux-arm64", "--release-image"], { env: {
+        ELASTOS_BROWSER_VM_TURN_PROGRAM: path.join(data, "bin/turnserver"),
+        ELASTOS_BROWSER_VM_ICE_SERVERS_JSON: '[{"urls":["turn:old.invalid"],"credential":"old-secret"}]',
+      } });
+    const read = name => JSON.parse(fs.readFileSync(path.join(data, "config", name)));
+    const env = read("browser-engine-adapter.json").adapters[0].supervisor.env;
+    assert.equal(env.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER, path.join(data, "bin/browser-vz-engine-supervisor"));
+    assert.equal(env.ELASTOS_BROWSER_VM_TURN_PROGRAM, path.join(data, "bin/turnserver"));
+    assert.equal(env.ELASTOS_BROWSER_VM_INITRAMFS, path.join(data, "browser-vm/image-set/initrd"));
+    assert.equal(env.ELASTOS_BROWSER_VM_ROOTFS_COPY_MODE, undefined);
+    assert.equal(env.ELASTOS_BROWSER_VM_ROOTFS_POOL_DIR, undefined);
+    assert.equal(env.ELASTOS_BROWSER_VM_HIBERNATION, undefined);
+    assert.ok(Object.keys(env).every(key => !key.startsWith("ELASTOS_BROWSER_VM_ICE_")));
+    const transport = read("browser-vz-vsock-transport.json");
+    assert.equal(transport.schema, "elastos.browser.vz-transport-config/v1");
+    assert.equal(transport.enabled, true);
+    assert.equal(transport.turn_advertised_host, "127.0.0.1");
+    assert.equal(transport.auth_secret, undefined);
+    assert.equal(transport.credential, undefined);
+    assert.equal(fs.statSync(path.join(data, "config/browser-vz-vsock-transport.json")).mode & 0o077, 0);
+  } finally { fs.rmSync(data, { recursive: true, force: true }); }
+});
+
 test("release configuration binds every host to the image set and Runtime profile", () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "browser-release-config-"));
   try {
@@ -22,7 +66,7 @@ test("release configuration binds every host to the image set and Runtime profil
       const env = adapter.adapters[0].supervisor.env;
       for (const [key, name] of [["ROOTFS", "rootfs.ext4"], ["KERNEL", "vmlinux"],
         ["ROOTFS_MANIFEST", "browser-vm-rootfs-manifest.json"],
-        [platform === "darwin-arm64" ? "INITRAMFS" : "INITRD", "initrd"]]) {
+        ["INITRAMFS", "initrd"]]) {
         assert.equal(env[`ELASTOS_BROWSER_VM_${key}`], path.join(data, "browser-vm/image-set", name));
       }
       assert.equal(adapter.adapters[0].network_mode, "runtime_net_only");

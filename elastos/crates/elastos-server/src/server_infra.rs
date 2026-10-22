@@ -1224,8 +1224,10 @@ async fn setup_server_infrastructure_impl(
 
     // Retained Browser helpers from an earlier release stay stopped where
     // Browser is unavailable.
-    let browser_available =
-        elastos_server::setup::browser_available(&elastos_server::setup::detect_platform());
+    let browser_available = elastos_server::setup::home_browser_available(
+        &data_dir,
+        &elastos_server::setup::detect_platform(),
+    );
     if let Some(local_exit_config) = browser_available
         .then(|| browser_local_exit_config_from_env(&data_dir))
         .flatten()

@@ -135,9 +135,9 @@ if ((fs.statSync(process.argv[2]).mode & 0o077) !== 0) {
 NODE
 
 if [[ -e "$data_dir/runtime-turn/turn-credentials.env" ]]; then
-  echo "setup-source-home should use the explicit shared runtime TURN env instead of creating a local one" >&2
+  echo "setup-source-home must keep TURN credentials with the selected native owner" >&2
   exit 1
 fi
-grep -q "use existing Browser runtime TURN env" "$repo_root/scripts/setup-source-home.sh"
+grep -q "configure launch-owned Browser TURN" "$repo_root/scripts/setup-source-home.sh"
 
 printf '%s\n' '{"schema":"elastos.setup-source-home.browser-config-smoke/v1","ok":true}'
