@@ -224,7 +224,7 @@ class NativeSourceHomeTest(unittest.TestCase):
 
     def test_whole_setup_retains_and_rechecks_node_and_transport_pins(self):
         previous = {'external': {}}
-        for bundle in ('node', 'vhost-device-vsock'):
+        for bundle in ('node', 'vhost-device-vsock', 'crosvm'):
             info = {'strategy': 'source-build', 'install_path': f'libexec/browser/{bundle}/pin',
                     'release_path': f'{bundle}-{PLATFORM}.tar.gz', 'extract_path': bundle + '-pin', 'binary_path': 'bin/' + bundle}
             self.manifest['external'][bundle] = {'version': 'pin', 'platforms': {PLATFORM: info}}

@@ -1023,6 +1023,16 @@ mod tests {
         let canonical = temp.path().canonicalize().unwrap();
         let data = canonical.as_path();
         let crosvm = "libexec/browser/crosvm/0.1.0-2ac141082d17/linux-arm64";
+        // This Home supplies the manifest of the earlier installed release.
+        // Keep its exact path independent of the current producer version.
+        manifest
+            .external
+            .get_mut("crosvm")
+            .unwrap()
+            .platforms
+            .get_mut("linux-arm64")
+            .unwrap()
+            .install_path = Some(crosvm.into());
         let removed = [
             "scripts/browser-vm-linux-network.py",
             "bin/browser-vm-control-service",

@@ -11,6 +11,14 @@ import tarfile
 import tempfile
 
 
+CROSVM_PATCH = 'sources/crosvm-lifecycle-fds.patch'
+CROSVM_PATCHED_FILES = (
+    'devices/device_virtio_block/src/lib.rs',
+    'devices/device_virtio_block/src/asynchronous.rs',
+    'src/crosvm/cmdline.rs',
+)
+
+
 def source_header(member):
     member.uid = member.gid = member.mtime = 0
     member.uname = member.gname = ''
@@ -37,6 +45,8 @@ def validate(recipe, upstream):
                 or not {'licenses/minijail.txt', 'licenses/libcap.txt'} <= {
                     f['name'] for f in recipe['license']['files']}):
             raise ValueError('crosvm requires its Linux ARM64 recipe and dependency licences')
+        if component == 'crosvm' and sum(n['name'] == CROSVM_PATCH for n in recipe.get('notices', [])) != 1:
+            raise ValueError('crosvm requires its pinned block lifecycle patch')
         if component == 'vhost-device-vsock' and (recipe['platform'] != 'linux-arm64'
                 or not {'LICENSE', 'LICENSE-APACHE', 'LICENSE-BSD-3-Clause'} <= {
                     f['name'] for f in recipe['license']['files']}):
@@ -97,6 +107,38 @@ def retain_linux_uapi(archive, root, uapi):
     with tarfile.open(headers, 'x:gz', format=tarfile.GNU_FORMAT) as sources:
         sources.add(uapi, arcname='linux-uapi', filter=source_header)
     archive.add(headers, arcname=root + '/sources/' + headers.name)
+
+
+def apply_crosvm_patch(source, recipe, cache, upstream):
+    notice = next(n for n in recipe['notices'] if n['name'] == CROSVM_PATCH)
+    patch = upstream.cached_input(notice['source'], cache, upstream.METADATA_BYTES)
+    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    # Extracted sources are intentionally outside Git. Check the complete patch
+    # before changing any file, then apply without consulting a parent checkout.
+    for operation in (['--check'], []):
+        subprocess.run(['git', 'apply', '--no-index', *operation, str(patch)],
+                       cwd=source, env=env, check=True, capture_output=True, text=True)
+    return notice['source']['checksum']
+
+
+def retain_crosvm_patched_sources(archive, recipe, source, work, patch_checksum, upstream):
+    """Retain the final modified files beside the immutable original archives."""
+    files = (*CROSVM_PATCHED_FILES, 'third_party/minijail/rust/minijail-sys/build.rs', '.cargo/config.toml')
+    provenance = {
+        'schema': 'elastos.crosvm-patched-source/v1',
+        'source': recipe['source']['checksum'],
+        'patch': patch_checksum,
+        'files': {name: 'sha256:' + upstream.digest(source / name) for name in files},
+    }
+    overlay = work / 'patched-source-overlay.tar.gz'
+    with tarfile.open(overlay, 'x:gz', format=tarfile.GNU_FORMAT) as patched:
+        for name in files:
+            patched.add(source / name, arcname=recipe['root'] + '/' + name, filter=source_header)
+        data = upstream.canonical(provenance)
+        member = tarfile.TarInfo(recipe['root'] + '/PATCHED-SOURCE.json')
+        member.size, member.mode = len(data), 0o644
+        patched.addfile(member, io.BytesIO(data))
+    archive.add(overlay, arcname=recipe['root'] + '/sources/' + overlay.name)
 
 
 def audit_libraries(text, darwin):
@@ -378,6 +420,7 @@ def build_browser_native(recipe, payload, cache, upstream):
                            cwd=source, env=env, check=True)
             binaries['vhost-device-vsock'] = source / 'target' / target / 'release/vhost-device-vsock'
         else:
+            patch_checksum = apply_crosvm_patch(source, recipe, cache, upstream)
             dependency_root, dependency = inputs[1]
             minijail = extract(dependency, dependency_root, work / 'dependencies', upstream)
             destination = source / 'third_party/minijail'
@@ -431,6 +474,9 @@ def build_browser_native(recipe, payload, cache, upstream):
             subprocess.run(['cargo', '+1.91.0', 'build', '--locked', '--offline', '--release',
                             '--target', target, '--no-default-features', '--features', 'net',
                             '--bin', 'crosvm', '-j', jobs], cwd=source, env=env, check=True)
+            subprocess.run(['cargo', '+1.91.0', 'test', '--locked', '--offline', '--release',
+                            '--target', target, '-p', 'device_virtio_block', '--lib', 'lifecycle_',
+                            '-j', jobs, '--', '--nocapture'], cwd=source, env=env, check=True)
             binaries['crosvm'] = source / 'target' / target / 'release/crosvm'
         audit_records = []
         for name, binary in binaries.items():
@@ -472,5 +518,7 @@ def build_browser_native(recipe, payload, cache, upstream):
             if recipe['component'] in ('crosvm', 'vhost-device-vsock'):
                 archive.add(vendor_sources, arcname=recipe['root'] + '/sources/cargo-vendor.tar.gz')
                 archive.add(source / 'Cargo.lock', arcname=recipe['root'] + '/sources/Cargo.lock')
+            if recipe['component'] == 'crosvm':
+                retain_crosvm_patched_sources(archive, recipe, source, work, patch_checksum, upstream)
         os.link(staged, output)
         return output

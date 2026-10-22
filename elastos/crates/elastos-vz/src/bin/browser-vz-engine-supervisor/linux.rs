@@ -597,6 +597,16 @@ fn command(
     state_dir: PathBuf,
 ) -> Result<Command, String> {
     let config = &vm.config;
+    let lock_count = vm.writer_locks.lock().map_err(|e| e.to_string())?.len();
+    if !(2..=3).contains(&lock_count) {
+        return Err("Browser crosvm requires its slot and profile leases before launch".into());
+    }
+    // The managed block devices retain these descriptors in their sandboxed
+    // workers, including after the crosvm leader or this supervisor exits.
+    let lifecycle_fds = (3..3 + lock_count)
+        .map(|fd| fd.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let root = socket
         .parent()
         .ok_or("Browser crosvm state root is absent")?;
@@ -620,7 +630,7 @@ fn command(
         .args(["--serial", "type=stdout,hardware=serial,num=1"])
         .arg("--block")
         .arg(format!(
-            "path={},root=true,lock=true",
+            "path={},root=true,lock=true,lifecycle-fds=[{lifecycle_fds}]",
             config.rootfs_path.display()
         ))
         .arg("--pivot-root")
@@ -642,9 +652,10 @@ fn command(
         }
     }
     if let Some(profile) = &config.data_disk_path {
-        command
-            .arg("--block")
-            .arg(format!("path={},lock=true", profile.display()));
+        command.arg("--block").arg(format!(
+            "path={},lock=true,lifecycle-fds=[{lifecycle_fds}]",
+            profile.display()
+        ));
     }
     if let Some(initrd) = &config.initramfs_path {
         command.arg("--initrd").arg(initrd);
@@ -1164,11 +1175,19 @@ mod tests {
         assert!(super::super::try_lock_exclusive(&lease).unwrap());
         let fd = unsafe { libc::fcntl(lease.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
         assert!(fd >= 64);
-        provider
+        let handle = provider
             .load_reserved_vm(config, super::super::browser_vm_manifest(2048, 2), unsafe {
                 File::from_raw_fd(fd)
             })
-            .unwrap()
+            .unwrap();
+        let profile =
+            super::super::open_lifetime_lock(&provider.socket_dir.join("profile.lock"), true)
+                .unwrap();
+        assert!(super::super::try_lock_exclusive(&profile).unwrap());
+        provider
+            .retain_writer_locks(&handle, vec![profile])
+            .unwrap();
+        handle
     }
 
     #[tokio::test]
@@ -1190,8 +1209,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(args
             .iter()
-            .any(|a| a.ends_with("root.ext4,root=true,lock=true")));
-        assert!(args.iter().any(|a| a.ends_with("profile.ext4,lock=true")));
+            .any(|a| a.ends_with("root.ext4,root=true,lock=true,lifecycle-fds=[3,4]")));
+        assert!(args
+            .iter()
+            .any(|a| a.ends_with("profile.ext4,lock=true,lifecycle-fds=[3,4]")));
         assert!(args.contains(&"--vsock".into()));
         assert!(args.iter().any(|a| a.ends_with("device=/dev/vhost-vsock")));
         assert!(args
@@ -1199,6 +1220,48 @@ mod tests {
             .all(|a| !a.contains("tap") && !a.contains("--net") && !a.contains("netns")));
         assert!(provider.release_terminal_native_vm(&handle).await);
         assert!(!provider.release_terminal_native_vm(&handle).await);
+    }
+
+    #[tokio::test]
+    async fn crosvm_command_binds_optional_rootfs_lease_and_refuses_incomplete_or_excess_leases() {
+        for count in [0, 1, 3, 4] {
+            let root = tempfile::tempdir().unwrap();
+            let (provider, config) = fixture(root.path());
+            let handle = load_fixture(&provider, config);
+            let vm = provider.vm(&handle).unwrap();
+            for index in 2..count {
+                let lock = super::super::open_lifetime_lock(
+                    &root.path().join(format!("extra-{index}.lock")),
+                    true,
+                )
+                .unwrap();
+                assert!(super::super::try_lock_exclusive(&lock).unwrap());
+                provider.retain_writer_locks(&handle, vec![lock]).unwrap();
+            }
+            vm.writer_locks.lock().unwrap().truncate(count);
+            let result = command(
+                &vm,
+                provider.binary.clone(),
+                root.path().join("sockets/v.sock"),
+                root.path().join("state/test-vm"),
+            );
+            if count == 3 {
+                let command = result.unwrap();
+                let args = command.get_args().collect::<Vec<_>>();
+                let blocks = args
+                    .windows(2)
+                    .filter(|pair| pair[0] == "--block")
+                    .map(|pair| pair[1].to_string_lossy())
+                    .collect::<Vec<_>>();
+                assert_eq!(blocks.len(), 2);
+                assert!(blocks
+                    .iter()
+                    .all(|block| block.ends_with(",lifecycle-fds=[3,4,5]")));
+            } else {
+                assert!(result.unwrap_err().contains("slot and profile leases"));
+            }
+            assert!(provider.release_terminal_native_vm(&handle).await);
+        }
     }
 
     #[tokio::test]
@@ -1577,18 +1640,13 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let mut descendants = vec![pgid];
-        let mut index = 0;
-        while index < descendants.len() {
-            let pid = descendants[index];
-            let children = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap();
-            descendants.extend(
-                children
-                    .split_whitespace()
-                    .map(|pid| pid.parse::<i32>().unwrap()),
-            );
-            index += 1;
-        }
+        // Jetson kernels can omit task/PID/children. The unreaped leader
+        // reserves this group, which is also the production cleanup boundary.
+        let descendants = fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(|entry| entry.unwrap().file_name().to_str()?.parse::<i32>().ok())
+            .filter(|pid| process_group(*pid).unwrap() == Some(pgid))
+            .collect::<Vec<_>>();
         assert!(
             descendants.len() >= 4,
             "monitor, init, backend and worker must exist"

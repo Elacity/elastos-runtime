@@ -397,7 +397,7 @@
           "name": "sources/browser-upstream-build.py",
           "source": {
             "path": "scripts/browser-upstream-build.py",
-            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3",
+            "checksum": "sha256:9a55441cf6d0d5d2b5cad1d3c8c63eb71e5d11df4b2a511feb61b0510c2a85d6",
             "max_bytes": 1048576
           }
         }
@@ -488,7 +488,7 @@
           "name": "sources/browser-upstream-build.py",
           "source": {
             "path": "scripts/browser-upstream-build.py",
-            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3",
+            "checksum": "sha256:9a55441cf6d0d5d2b5cad1d3c8c63eb71e5d11df4b2a511feb61b0510c2a85d6",
             "max_bytes": 1048576
           }
         }
@@ -622,7 +622,7 @@
           "source": {
             "path": "scripts/browser-upstream-build.py",
             "max_bytes": 1048576,
-            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3"
+            "checksum": "sha256:9a55441cf6d0d5d2b5cad1d3c8c63eb71e5d11df4b2a511feb61b0510c2a85d6"
           }
         }
       ]
@@ -692,7 +692,7 @@
           "source": {
             "path": "scripts/browser-upstream-build.py",
             "max_bytes": 1048576,
-            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3"
+            "checksum": "sha256:9a55441cf6d0d5d2b5cad1d3c8c63eb71e5d11df4b2a511feb61b0510c2a85d6"
           }
         }
       ]
@@ -737,7 +737,7 @@
           "source": {
             "path": "scripts/browser-upstream-build.py",
             "max_bytes": 1048576,
-            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3"
+            "checksum": "sha256:9a55441cf6d0d5d2b5cad1d3c8c63eb71e5d11df4b2a511feb61b0510c2a85d6"
           }
         }
       ]
@@ -782,7 +782,7 @@
           "source": {
             "path": "scripts/browser-upstream-build.py",
             "max_bytes": 1048576,
-            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3"
+            "checksum": "sha256:9a55441cf6d0d5d2b5cad1d3c8c63eb71e5d11df4b2a511feb61b0510c2a85d6"
           }
         }
       ]
@@ -796,7 +796,7 @@
       "root": "crosvm-2ac141082d171e76a39cdabf98f6e48a377a126b",
       "entrypoint": "bin/crosvm",
       "extract_path": "crosvm-2ac141082d171e76a39cdabf98f6e48a377a126b",
-      "install_path": "libexec/browser/crosvm/0.1.0-2ac141082d17/linux-arm64",
+      "install_path": "libexec/browser/crosvm/0.1.0-2ac141082d17.elastos.1/linux-arm64",
       "binary_path": "bin/crosvm",
       "build": {
         "kind": "crosvm-static-v1",
@@ -853,7 +853,7 @@
       "schema": "elastos.release-upstream-input/v1",
       "component": "crosvm",
       "platform": "linux-arm64",
-      "version": "0.1.0-2ac141082d17",
+      "version": "0.1.0-2ac141082d17.elastos.1",
       "format": "tar.gz",
       "max_unpacked_bytes": 2147483648,
       "notices": [
@@ -862,7 +862,15 @@
           "source": {
             "path": "scripts/browser-upstream-build.py",
             "max_bytes": 1048576,
-            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3"
+            "checksum": "sha256:9a55441cf6d0d5d2b5cad1d3c8c63eb71e5d11df4b2a511feb61b0510c2a85d6"
+          }
+        },
+        {
+          "name": "sources/crosvm-lifecycle-fds.patch",
+          "source": {
+            "path": "scripts/build/crosvm-lifecycle-fds.patch",
+            "checksum": "sha256:d9e8b4cda1a63b6a7d8f7bfce6b4fdd108c1db02f86895771af26d32c86dc88c",
+            "max_bytes": 1048576
           }
         }
       ]
@@ -922,7 +930,7 @@
           "name": "sources/browser-upstream-build.py",
           "source": {
             "path": "scripts/browser-upstream-build.py",
-            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3",
+            "checksum": "sha256:9a55441cf6d0d5d2b5cad1d3c8c63eb71e5d11df4b2a511feb61b0510c2a85d6",
             "max_bytes": 1048576
           }
         }
