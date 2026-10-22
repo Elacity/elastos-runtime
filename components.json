@@ -1285,7 +1285,7 @@
     },
     "gba-nonogram": {
       "install_path": "capsules/gba-nonogram",
-      "description": "Nonogram Advance — MIT homebrew cartridge for the browser GBA viewer",
+      "description": "Nonogram Advance \u2014 MIT homebrew cartridge for the browser GBA viewer",
       "platforms": {
         "*": {
           "cid": "",
@@ -1491,46 +1491,6 @@
         }
       }
     },
-    "browser-vm-local-crosvm-launcher": {
-      "install_path": "bin/browser-vm-local-crosvm-launcher",
-      "platforms": {
-        "linux-arm64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-host-node-launcher.sh",
-          "release_path": "browser-vm-local-crosvm-launcher-linux-arm64"
-        }
-      }
-    },
-    "browser-vm-local-crosvm-launcher-module": {
-      "install_path": "bin/browser-vm-local-crosvm-launcher.mjs",
-      "platforms": {
-        "linux-arm64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-vm-local-crosvm-launcher.mjs",
-          "release_path": "browser-vm-local-crosvm-launcher-module-linux-arm64"
-        }
-      }
-    },
-    "browser-vm-prepare-rootfs-pool": {
-      "install_path": "bin/browser-vm-prepare-rootfs-pool",
-      "platforms": {
-        "linux-arm64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-host-node-launcher.sh",
-          "release_path": "browser-vm-prepare-rootfs-pool-linux-arm64"
-        }
-      }
-    },
-    "browser-vm-prepare-rootfs-pool-module": {
-      "install_path": "scripts/browser-vm-prepare-rootfs-pool.mjs",
-      "platforms": {
-        "linux-arm64": {
-          "strategy": "source-build",
-          "source": "scripts/browser-vm-prepare-rootfs-pool.mjs",
-          "release_path": "browser-vm-prepare-rootfs-pool-module-linux-arm64"
-        }
-      }
-    },
     "browser-vm-linux-network": {
       "install_path": "scripts/browser-vm-linux-network.py",
       "platforms": {
@@ -1547,8 +1507,13 @@
         "darwin-arm64": {
           "strategy": "source-build",
           "release_path": "browser-vz-engine-supervisor-darwin-arm64"
+        },
+        "linux-arm64": {
+          "strategy": "source-build",
+          "release_path": "browser-vz-engine-supervisor-linux-arm64"
         }
-      }
+      },
+      "description": "Native host supervisor for the shared Browser VM transport and lifecycle"
     },
     "turnserver": {
       "version": "4.13.1",
@@ -1629,6 +1594,19 @@
           "binary_path": "bin/debugfs"
         }
       }
+    },
+    "vhost-device-vsock": {
+      "version": "0.3.0",
+      "description": "Browser Linux userspace vsock backend from the signed release",
+      "platforms": {
+        "linux-arm64": {
+          "strategy": "source-build",
+          "release_path": "vhost-device-vsock-linux-arm64.tar.gz",
+          "extract_path": "vhost-device-4fe41e353a005b1b7163f3f38efde3523f3b160c",
+          "install_path": "libexec/browser/vhost-device-vsock/0.3.0/linux-arm64",
+          "binary_path": "bin/vhost-device-vsock"
+        }
+      }
     }
   },
   "profiles": {
@@ -1685,16 +1663,13 @@
         "browser-vm-control-service-module",
         "browser-vm-artifact-preflight",
         "browser-selkies-control-service",
-        "browser-vm-local-crosvm-launcher",
-        "browser-vm-local-crosvm-launcher-module",
-        "browser-vm-prepare-rootfs-pool",
-        "browser-vm-prepare-rootfs-pool-module",
         "browser-vm-linux-network",
         "browser-vz-engine-supervisor",
         "turnserver",
         "python3",
         "debugfs",
-        "crosvm"
+        "crosvm",
+        "vhost-device-vsock"
       ]
     }
   },

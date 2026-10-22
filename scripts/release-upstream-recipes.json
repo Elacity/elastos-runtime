@@ -397,7 +397,7 @@
           "name": "sources/browser-upstream-build.py",
           "source": {
             "path": "scripts/browser-upstream-build.py",
-            "checksum": "sha256:71964492d547125c1bcd7103bc62eae832041722b097bc611cb1cce173166c0e",
+            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3",
             "max_bytes": 1048576
           }
         }
@@ -488,7 +488,7 @@
           "name": "sources/browser-upstream-build.py",
           "source": {
             "path": "scripts/browser-upstream-build.py",
-            "checksum": "sha256:71964492d547125c1bcd7103bc62eae832041722b097bc611cb1cce173166c0e",
+            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3",
             "max_bytes": 1048576
           }
         }
@@ -622,7 +622,7 @@
           "source": {
             "path": "scripts/browser-upstream-build.py",
             "max_bytes": 1048576,
-            "checksum": "sha256:71964492d547125c1bcd7103bc62eae832041722b097bc611cb1cce173166c0e"
+            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3"
           }
         }
       ]
@@ -692,7 +692,7 @@
           "source": {
             "path": "scripts/browser-upstream-build.py",
             "max_bytes": 1048576,
-            "checksum": "sha256:71964492d547125c1bcd7103bc62eae832041722b097bc611cb1cce173166c0e"
+            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3"
           }
         }
       ]
@@ -737,7 +737,7 @@
           "source": {
             "path": "scripts/browser-upstream-build.py",
             "max_bytes": 1048576,
-            "checksum": "sha256:71964492d547125c1bcd7103bc62eae832041722b097bc611cb1cce173166c0e"
+            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3"
           }
         }
       ]
@@ -782,7 +782,7 @@
           "source": {
             "path": "scripts/browser-upstream-build.py",
             "max_bytes": 1048576,
-            "checksum": "sha256:71964492d547125c1bcd7103bc62eae832041722b097bc611cb1cce173166c0e"
+            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3"
           }
         }
       ]
@@ -862,7 +862,68 @@
           "source": {
             "path": "scripts/browser-upstream-build.py",
             "max_bytes": 1048576,
-            "checksum": "sha256:71964492d547125c1bcd7103bc62eae832041722b097bc611cb1cce173166c0e"
+            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3"
+          }
+        }
+      ]
+    },
+    {
+      "schema": "elastos.release-upstream-input/v1",
+      "component": "vhost-device-vsock",
+      "platform": "linux-arm64",
+      "version": "0.3.0",
+      "source": {
+        "url": "https://codeload.github.com/rust-vmm/vhost-device/tar.gz/4fe41e353a005b1b7163f3f38efde3523f3b160c",
+        "checksum": "sha256:be673089defc9c9af5c873f0d71fea655ca512b5cf9e251fb9867c1ff5008b5e",
+        "max_bytes": 1048576
+      },
+      "format": "tar.gz",
+      "root": "vhost-device-4fe41e353a005b1b7163f3f38efde3523f3b160c",
+      "entrypoint": "bin/vhost-device-vsock",
+      "extract_path": "vhost-device-4fe41e353a005b1b7163f3f38efde3523f3b160c",
+      "install_path": "libexec/browser/vhost-device-vsock/0.3.0/linux-arm64",
+      "binary_path": "bin/vhost-device-vsock",
+      "max_unpacked_bytes": 2147483648,
+      "build": {
+        "kind": "vhost-device-vsock-static-v1",
+        "dependencies": []
+      },
+      "license": {
+        "spdx_id": "(Apache-2.0 OR BSD-3-Clause) AND LicenseRef-Vhost-Device-Vendored-Closure",
+        "files": [
+          {
+            "name": "LICENSE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/rust-vmm/vhost-device/4fe41e353a005b1b7163f3f38efde3523f3b160c/LICENSE-APACHE",
+              "checksum": "sha256:cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-APACHE",
+            "source": {
+              "url": "https://raw.githubusercontent.com/rust-vmm/vhost-device/4fe41e353a005b1b7163f3f38efde3523f3b160c/LICENSE-APACHE",
+              "checksum": "sha256:cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+              "max_bytes": 1048576
+            }
+          },
+          {
+            "name": "LICENSE-BSD-3-Clause",
+            "source": {
+              "url": "https://raw.githubusercontent.com/rust-vmm/vhost-device/4fe41e353a005b1b7163f3f38efde3523f3b160c/LICENSE-BSD-3-Clause",
+              "checksum": "sha256:a408ca693a3359c5d56de80ee73db9b62ca4a179adb12e131230c10e915b05f2",
+              "max_bytes": 1048576
+            }
+          }
+        ]
+      },
+      "notices": [
+        {
+          "name": "sources/browser-upstream-build.py",
+          "source": {
+            "path": "scripts/browser-upstream-build.py",
+            "checksum": "sha256:b44a4edd2a7f8860ab39a3bede55c59a809921f1a61d5f030e6dd042e95536c3",
+            "max_bytes": 1048576
           }
         }
       ]
