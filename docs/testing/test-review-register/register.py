@@ -117,6 +117,7 @@ def verify(manifest, repo):
     if len(files) != len(file_rows) or len(finding_ids) != len(findings):
         errors.append("duplicate file or finding identity")
     seen = set()
+    finding_members = collections.defaultdict(set)
     byfile = collections.Counter()
     body_reads = 0
     for part in manifest["partitions"]:
@@ -125,6 +126,8 @@ def verify(manifest, repo):
             errors.append("partition counts: " + part["name"])
         if dict(collections.Counter(r["kind"] for r in rows)) != part["kinds"]:
             errors.append("partition kinds: " + part["name"])
+        if dict(collections.Counter(r["review"]["disposition"] for r in rows)) != part["dispositions"]:
+            errors.append("partition dispositions: " + part["name"])
         for row in rows:
             identity, source, review = row["id"], row["source"], row["review"]
             if identity in seen:
@@ -147,12 +150,16 @@ def verify(manifest, repo):
                 errors.append("missing review reason/action: " + identity)
             if set(row["finding_ids"]) - finding_ids:
                 errors.append("unresolved finding: " + identity)
+            for finding_id in row["finding_ids"]:
+                finding_members[finding_id].add(identity)
             for field in profiles:
                 if row[field].get("profile") not in profiles[field]:
                     errors.append("unresolved profile: " + identity + ":" + field)
     for finding in findings:
         if set(finding["affected_ids"]) - seen:
             errors.append("unresolved affected record: " + finding["id"])
+        if set(finding["affected_ids"]) != finding_members[finding["id"]]:
+            errors.append("finding membership: " + finding["id"])
     for path, row in files.items():
         if byfile[path] != row["register_rows"]:
             errors.append("file record count: " + path)
@@ -198,7 +205,7 @@ def main():
         verify(manifest, args.git_repo)
         return
     if args.command == "summary":
-        result = {key: manifest[key] for key in ("source", "artifact_kind", "counts", "partitions", "count_rules")}
+        result = {key: manifest[key] for key in ("source", "artifact_kind", "counts", "review_depth", "partitions", "count_rules")}
         result["source_followups"] = manifest.get("source_followups", [])
         print(json.dumps(result, indent=2))
         return

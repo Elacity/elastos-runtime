@@ -2,7 +2,7 @@
 
 This artifact preserves the test review for [issue #194](https://github.com/Elacity/elastos-runtime/issues/194). The issue owns current status, acceptance and decisions. The user approved a versioned register because the individual records exceed an issue body.
 
-**This is an incomplete evidence snapshot.** The tracked-file census is complete for the pinned source. Direct body review, helper and production review, runtime discovery, and installed acceptance have separate limits. A proposed `retain` decision on a provisional row means preserve it while review continues.
+**Source review and release acceptance have separate gates.** The tracked-file census is complete for the pinned source. The manifest records body review and named local-contract review separately from runtime discovery and installed acceptance. Each disposition is a proposal with its own evidence and limits.
 
 The [manifest](manifest.json) identifies the source commit, Git tree, comparison base, counts and artifact hashes. Each record also binds its source path, line range, complete file hash and extracted-body hash. Review uses pinned Git objects even when a working checkout moves. The artifact branch contains the register; it does not publish the separately owned release candidate.
 
@@ -14,6 +14,7 @@ Run these commands from the repository root. The reader uses the Python standard
 python3 docs/testing/test-review-register/register.py summary
 python3 docs/testing/test-review-register/register.py find --path browser-clipboard
 python3 docs/testing/test-review-register/register.py find --finding JS-F002 --json
+python3 docs/testing/test-review-register/register.py find --disposition replace
 python3 docs/testing/test-review-register/register.py find --provisional --path elastos-server
 python3 docs/testing/test-review-register/register.py find --followup --path browser-input
 python3 docs/testing/test-review-register/register.py verify
@@ -59,7 +60,11 @@ Serialization, protocol-vector and source-policy tests retain their purpose when
 
 Rust source declarations precede compiler expansion, target selection and feature conditions. Node table registrations can share one body. Python definitions can contain many `subTest` iterations. Shell wrappers can invoke whole suites. Helpers and standalone acceptance operations are separate kinds. Adding all record counts does not produce an executed-test total.
 
-`body_read` records an attributed complete body read. The method, limitations and reviewer context describe the depth of helper and production review. Rule-assisted extraction remains provisional. The server partition has 3,351 attributed body reads; 199 baseline-only reads still need explicit review of their named local contracts. In the other-Rust partition, 2,179 records have attributed body reads, while 1,383 of its 2,412 declarations have a separate attestation for complete-body and named local-contract review. The remaining 1,029 declarations are outside that deeper census: 796 body-only records and 233 awaiting body review. Neither count proves full transitive review or installed acceptance. Other partitions retain their per-row scope; there is no inferred whole-repository deep-review total. File classifications identify the inventory method; they do not claim that every production file was reviewed line by line.
+The JavaScript census also tracks incomplete machine-readable input values. A known registration can contain an inner table or fixture payload that the extractor cannot fully expand. That flag concerns input values; runtime registration, completion and skip accounting have separate evidence.
+
+`body_read` records an attributed complete body read. The method, limitations and reviewer context identify the helpers and production contracts assessed with that body. The summary command shows the manifest's separate `review_depth` census. Where present, `local_contract_review` links a row to its exact reconciliation receipt. These fields describe the named source scope; transitive dependencies and installed behavior retain separate acceptance. Other partitions keep their per-row scope. File classifications identify the inventory method and do not claim line-by-line review of every production file.
+
+`retain` preserves a useful test within its stated scope. `improve` names a missing or weak check. `replace` calls for a test that exercises the intended behavior, and `consolidate` identifies overlap or a fixture role. A `remove-candidate` decision requires its recorded reason and replacement evidence before removal. The register itself changes no product test.
 
 The repeated central Node run had two readiness failures and nine expected cases missing from its event accounting. Those nine passed in a separate focused run. Other focused runs found stale fixtures and missing input prerequisites. The earlier passing suite remains separate evidence. [Execution records](execution.json) preserve these distinctions; a diagnostic rerun does not erase the original result.
 

@@ -101,5 +101,12 @@
       "scripts/install-source-home-runtime-smoke.py::scenario::setup-orchestration"
     ],
     "reason": "Earlier function group is represented by explicitly typed scenario records; count these as related identities, not additional executed tests."
+  },
+  {
+    "earlier_id": "build/stage-browser-vm-target-smoke.sh::entrypoint",
+    "current_ids": [
+      "scripts/build/stage-browser-vm-target-smoke.sh::entrypoint"
+    ],
+    "reason": "Historical shell finding omitted the scripts/ prefix; the pinned file census and current row provide the canonical identity. This is an alias, not an additional test."
   }
 ]
