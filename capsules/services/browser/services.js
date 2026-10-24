@@ -106,18 +106,19 @@ function bindNavigation() {
   }
 }
 
-function activateServicesSection(target, options = {}) {
+function activateServicesSection(target) {
   const targetId = readText(target);
   if (!targetId) {
     return;
   }
-  document.getElementById(targetId)?.scrollIntoView({
-    block: "start",
-    behavior: options.behavior || "smooth",
-  });
   for (const item of document.querySelectorAll("[data-section-target]")) {
-    item.classList.toggle("active", item.getAttribute("data-section-target") === targetId);
+    const sectionId = item.getAttribute("data-section-target");
+    const selected = sectionId === targetId;
+    item.classList.toggle("active", selected);
+    item.setAttribute("aria-pressed", String(selected));
+    document.getElementById(sectionId).hidden = !selected;
   }
+  document.querySelector(".settings-content-container").scrollTop = 0;
 }
 
 function bindActions() {
@@ -194,7 +195,7 @@ async function refreshServices() {
         .find(node => node.dataset.serviceOfferId === offerId
           || node.dataset.modelCatalog === offerId || node.dataset.modelRequest === offerId);
       if (button) {
-        activateServicesSection("other-services", { behavior: "instant" });
+        activateServicesSection("other-services");
         button.scrollIntoView({ block: "center" });
         button.focus();
         showStatus("Review this service, then choose its action. Access changes only after your choice.", "muted");
