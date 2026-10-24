@@ -488,6 +488,59 @@ async function assertNoHorizontalOverflow(page, label) {
   }
 }
 
+async function assertDraftFeedback(browser, port, phone) {
+  documents.clear();
+  const page = await browser.newPage({ viewport: phone ? PHONE_VIEWPORT : { width: 1280, height: 900 } });
+  const size = phone ? "390x844" : "1280x900";
+  try {
+    await page.goto(`http://127.0.0.1:${port}/apps/documents/?doc=missing&home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
+    await page.waitForFunction(() => document.getElementById("status-text")?.textContent?.startsWith("Document not found:"));
+    if (phone) {
+      await setPhoneFormFactor(page, true);
+      await page.locator("#more-button").click();
+    }
+    for (const id of ["publish-button", "delete-button"]) {
+      assert(!await page.locator(`#${id}`).isVisible(), `${id} must be absent with no document`);
+    }
+    const emptyShot = `/tmp/documents-empty-${size}.png`;
+    await page.screenshot({ path: emptyShot });
+    if (phone) await page.keyboard.press("Escape");
+    await page.locator("#mode-read").click();
+    if (phone) await page.locator('[data-el-drawer-toggle="documents-sidebar"]').click();
+    await page.locator("#new-document").click();
+    await page.waitForFunction(() => document.activeElement?.id === "title-input");
+    assert(await page.locator("#editor").isVisible(), "New document must reveal the editor from Read view");
+    const draft = page.locator('.document-list-item.active[data-doc-did=""]');
+    assert(await draft.count() === 1 && (await draft.textContent()).includes("Untitled document"), "New document must select its draft row");
+    if (phone) {
+      await page.waitForTimeout(DRAWER_SETTLE_MS);
+      await page.locator('[data-el-drawer-toggle="documents-sidebar"]').click();
+    }
+    assert(await draft.isVisible(), "Selected draft must appear in the list");
+    const draftShot = `/tmp/documents-new-draft-${size}.png`;
+    await page.screenshot({ path: draftShot });
+    if (phone) await draft.click();
+    await page.locator("#title-input").fill("Draft feedback");
+    await page.locator("#editor").fill("A new document.");
+    await page.locator("#save-button").click();
+    await page.waitForFunction(() => !!document.querySelector(".document-list-item.active")?.dataset.docDid);
+    assert(await page.locator('.document-list-item[data-doc-did=""]').count() === 0, "Saved draft must become one persisted row");
+    if (phone) await page.locator("#more-button").click();
+    assert(await page.locator("#publish-button").isVisible(), "Saved document must restore Publish");
+    await page.locator("#delete-button").click();
+    await page.locator("#confirm-action").click();
+    await page.waitForFunction(() => document.getElementById("status-text")?.textContent === "Deleted.");
+    if (phone) await page.locator("#more-button").click();
+    for (const id of ["publish-button", "delete-button"]) {
+      assert(!await page.locator(`#${id}`).isVisible(), `${id} must hide after deletion`);
+    }
+    console.log(`Documents draft feedback ${size}: PASS; screenshots: ${emptyShot}, ${draftShot}`);
+  } finally {
+    await page.close();
+    resetDocumentsFixture();
+  }
+}
+
 async function run() {
   resetDocumentsFixture();
   const server = createAppServer();
@@ -496,6 +549,8 @@ async function run() {
   let browser;
   try {
     browser = await chromium.launch({ headless: true, executablePath: brave });
+    await assertDraftFeedback(browser, port, false);
+    await assertDraftFeedback(browser, port, true);
     const consoleErrors = [];
     const pageErrors = [];
     const failedRequests = [];
@@ -519,7 +574,7 @@ async function run() {
     assert(initial.writePressed === "true", "Documents must default to Write view.");
     assert(initial.statusHidden, "Documents idle status row must start hidden.");
 
-    await page.locator(".document-list-item").first().click();
+    await page.locator('.document-list-item[data-doc-did="doc-alpha"]').click();
     await page.waitForFunction(() => document.getElementById("title-input")?.value === "Alpha");
     const selected = await page.evaluate(() => ({
       copyHidden: document.getElementById("copy-published-link")?.classList.contains("hidden") || false,
@@ -530,7 +585,7 @@ async function run() {
     assert(selected.copyText === "", "Copy Published Link must stay icon-only.");
     assert(selected.titleValue === "Alpha", "Documents layout fixture must load the selected document.");
 
-    await page.locator(".document-list-item").first().click({ button: "right" });
+    await page.locator('.document-list-item[data-doc-did="doc-alpha"]').click({ button: "right" });
     await page.locator("#context-menu:not(.hidden)").waitFor();
     const contextItems = await page.locator("#context-menu .context-menu-item").evaluateAll((nodes) =>
       nodes.map((node) => node.textContent?.trim() || ""),
@@ -540,7 +595,7 @@ async function run() {
       `Documents published row context menu must stay item-aware. Got ${JSON.stringify(contextItems)}`,
     );
     await page.evaluate(() => {
-      const item = document.querySelector(".document-list-item");
+      const item = document.querySelector('.document-list-item[data-doc-did="doc-alpha"]');
       if (!(item instanceof HTMLElement)) {
         throw new Error("document row missing");
       }

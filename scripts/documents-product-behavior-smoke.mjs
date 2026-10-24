@@ -2,6 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import vm from "node:vm";
 
 function assert(condition, message) {
   if (!condition) {
@@ -134,5 +135,52 @@ assert(
     !source.includes("IndexedDB"),
   "Documents must keep trusted Home Clipboard only and avoid browser storage authority.",
 );
+
+// Execute the production draft/list/action paths without a browser server.
+const documentsSource = readFileSync(resolve("capsules/documents/browser/documents.js"), "utf8");
+const node = () => ({
+  value: "", placeholder: "Untitled document", disabled: false, children: [], dataset: {},
+  classList: { toggle() {} },
+  set innerHTML(value) { this.markup = value; this.children = []; },
+  get innerHTML() { return this.markup || ""; },
+  appendChild(child) { this.children.push(child); },
+  addEventListener(type, handler) { this[type] = handler; },
+  focus() { focused = this; },
+});
+let focused;
+const elements = Object.fromEntries(["saveButton", "saveAsButton", "publishButton", "unpublishButton", "deleteButton", "titleInput", "editor", "documentsList"].map(name => [name, node()]));
+const state = { current: null, documents: [], dirty: false, filterQuery: "", workspaceView: "read" };
+const context = vm.createContext({
+  state, elements,
+  window: { document: { createElement: node }, setTimeout: callback => callback() },
+  replaceCurrentDocument: document => { state.current = document; },
+  renderCurrentDocument: () => { elements.titleInput.value = ""; context.setDirty(false); },
+  clearStatus() {}, setStatus() {},
+  setWorkspaceView: view => { state.workspaceView = view; },
+  escapeHtml: value => value, formatTime: () => "", selectDocument() {},
+  confirmInCapsule: async () => false,
+});
+for (const name of ["isLibraryFileProjection", "isDraftDocument", "createDraftDocument", "renderDocumentsList", "setDirty", "startDraftDocument", "createDocument"]) {
+  vm.runInContext(documentsSource.match(new RegExp(`^(?:async )?function ${name}\\([\\s\\S]*?^}`, "m"))[0], context);
+}
+context.setDirty(false);
+assert(elements.publishButton.hidden && elements.deleteButton.hidden, "Publish and Delete must be hidden with no document");
+await context.createDocument("");
+assert(state.workspaceView === "write", "New document must open Write view");
+assert(focused === elements.titleInput, "New document must focus the title");
+assert(elements.documentsList.children.length === 1 && elements.documentsList.children[0].className.includes("active"), "New draft must have a selected list row");
+assert(elements.documentsList.children[0].innerHTML.includes("Untitled document"), "Draft must reuse the existing title placeholder");
+assert(elements.publishButton.hidden && elements.deleteButton.hidden, "Empty unsaved draft must hide unavailable actions");
+state.filterQuery = "unmatched search";
+elements.titleInput.value = "New title";
+context.setDirty(true);
+assert(elements.documentsList.children[0].innerHTML.includes("New title"), "Current draft must remain visible while a search is active");
+assert(!elements.publishButton.hidden && elements.deleteButton.hidden, "Edited draft can publish; Delete needs a saved document");
+state.current = { doc_did: "saved", latest_published_cid: null };
+context.setDirty(false);
+assert(!elements.publishButton.hidden && !elements.deleteButton.hidden && !elements.deleteButton.disabled, "Saved document must restore its actions");
+state.current = null;
+context.setDirty(false);
+assert(elements.publishButton.hidden && elements.deleteButton.hidden, "Clearing selection must hide document actions again");
 
 console.log("documents-product-behavior-smoke: OK");
