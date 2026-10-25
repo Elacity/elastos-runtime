@@ -20,12 +20,12 @@
   <main id="services-shell" class="settings-container hidden" aria-label="Services">
     <div class="settings">
       <aside class="settings-sidebar" aria-label="Service sections">
-        <button class="settings-sidebar-item active" type="button" data-section-target="mine-services">
+        <button class="settings-sidebar-item active" type="button" data-section-target="mine-services" aria-controls="mine-services" aria-pressed="true">
           <span class="settings-sidebar-icon settings-sidebar-icon-mine" aria-hidden="true"></span>
           <span class="settings-sidebar-text">This device</span>
           <strong id="mine-count">0</strong>
         </button>
-        <button class="settings-sidebar-item" type="button" data-section-target="other-services">
+        <button class="settings-sidebar-item" type="button" data-section-target="other-services" aria-controls="other-services" aria-pressed="false">
           <span class="settings-sidebar-icon settings-sidebar-icon-others" aria-hidden="true"></span>
           <span class="settings-sidebar-text">From People</span>
           <strong id="others-count">0</strong>
@@ -45,7 +45,7 @@
             <div id="mine-services-list" class="services-list"></div>
           </section>
 
-          <section id="other-services" class="pc2-section" aria-labelledby="other-services-title">
+          <section id="other-services" class="pc2-section" hidden aria-labelledby="other-services-title">
             <h2 id="other-services-title" class="pc2-section-title">Available from People</h2>
             <div id="other-services-list" class="services-list"></div>
           </section>

@@ -1050,8 +1050,10 @@ function setDirty(dirty) {
   const isLibraryFile = isLibraryFileProjection(state.current);
   elements.saveButton.disabled = !hasCurrent || !state.dirty;
   elements.saveAsButton.disabled = !hasPersistedCurrent || isLibraryFile;
+  elements.publishButton.hidden = !hasCurrent || (isDraftDocument(state.current) && !state.dirty);
   elements.publishButton.disabled = !hasCurrent || isLibraryFile;
   elements.unpublishButton.disabled = !hasPersistedCurrent || isLibraryFile || !state.current.latest_published_cid;
+  elements.deleteButton.hidden = !hasPersistedCurrent;
   elements.deleteButton.disabled = !hasPersistedCurrent || isLibraryFile;
   if (hasCurrent && state.dirty) {
     setStatus("Unsaved local changes.", "warning");
@@ -1190,6 +1192,9 @@ function renderDocumentsList() {
     }
     return item.title.toLowerCase().includes(query) || item.file_name.toLowerCase().includes(query);
   });
+  if (isDraftDocument(state.current)) {
+    visibleDocuments.unshift({ ...state.current, title: elements.titleInput.value || elements.titleInput.placeholder });
+  }
   if (!visibleDocuments.length) {
     elements.documentsList.innerHTML = '<div class="sidebar-note">' + (query ? "No documents match this search." : "No documents yet.") + "</div>";
     return;
@@ -1215,7 +1220,14 @@ function renderDocumentsList() {
       '<span class="document-list-title-row"><span class="document-list-title">' + escapeHtml(item.title) + "</span>" + publishedIcon + "</span>" +
       '<span class="document-list-meta">' + escapeHtml(item.file_name + dirtyMarker) + "</span>" +
       '<span class="document-list-row"><span class="document-list-updated">' + escapeHtml(formatTime(item.updated_at)) + '</span></span>';
-    button.addEventListener("click", () => selectDocument(item.doc_did));
+    button.addEventListener("click", () => {
+      if (item.doc_did) {
+        void selectDocument(item.doc_did);
+      } else {
+        setWorkspaceView("write");
+        elements.titleInput.focus();
+      }
+    });
     elements.documentsList.appendChild(button);
   });
 }
@@ -1519,6 +1531,7 @@ async function createDocument(title) {
       return;
     }
   }
+  setWorkspaceView("write");
   startDraftDocument({ focusTitle: !title, focusEditor: !!title });
   if (title) {
     elements.titleInput.value = title;

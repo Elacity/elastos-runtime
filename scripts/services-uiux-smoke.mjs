@@ -11,7 +11,8 @@ const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const servicesRoot = join(repoRoot, "capsules/services/browser");
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
-const { chromium } = require("playwright");
+const sourceTestOnly = process.argv.includes("--source-test");
+const { chromium } = sourceTestOnly ? {} : require("playwright");
 
 const TOKEN = "services-token";
 
@@ -417,7 +418,7 @@ async function assertNoTokenLocked(page, server, diagnostics) {
   assert(diagnostics.requestFailures.length === 0, "locked launch had request failures", diagnostics.requestFailures);
 }
 
-async function bootLaunchedPage(page, server) {
+async function bootLaunchedPage(page, server, counts = ["1", "2"]) {
   await page.goto(`${server.baseUrl}/fixture?scenario=launched`, { waitUntil: "networkidle" });
   const frame = await waitForServicesFrame(page);
   await page.waitForFunction(
@@ -431,11 +432,12 @@ async function bootLaunchedPage(page, server) {
     TOKEN,
   );
   await frame.waitForFunction(
-    () =>
+    (counts) =>
       document.getElementById("locked-shell")?.classList.contains("hidden") === true &&
       document.getElementById("services-shell")?.classList.contains("hidden") === false &&
-      document.getElementById("mine-count")?.textContent === "1" &&
-      document.getElementById("others-count")?.textContent === "2",
+      document.getElementById("mine-count")?.textContent === counts[0] &&
+      document.getElementById("others-count")?.textContent === counts[1],
+    counts,
   );
   return frame;
 }
@@ -504,6 +506,7 @@ async function assertSelectAvailableOffer(page, server) {
     && requestable.status === "Ask owner"
     && requestable.copy?.includes("The owner must share their Browser Engine in Services and approve in Inbox before Browser can use it."),
   "an unapproved contact Engine must show the Share and approval steps", requestable);
+  await frame.click('[data-section-target="other-services"]');
   await frame.click('[data-service-offer-id="request-browser-engine"]');
   await frame.waitForFunction(
     () =>
@@ -588,6 +591,34 @@ async function assertFailedUpdate(page, server) {
     "failed update must keep the last selected state and show a clear error",
     failureState,
   );
+}
+
+async function assertEmptyNavigation(page, server, width, outputDir) {
+  await page.setViewportSize({ width, height: 900 });
+  await page.route("**/api/apps/services/summary", route => route.fulfill({
+    contentType: "application/json",
+    headers: { "access-control-allow-origin": "null" },
+    body: JSON.stringify({ local_offers: [], remote_offers: [], available_local_offers: [], available_remote_offers: [] }),
+  }));
+  const frame = await bootLaunchedPage(page, server, ["0", "0"]);
+  for (const [id, emptyText] of [
+    ["other-services", "No Services from others are subscribed."],
+    ["mine-services", "No Services are shared."],
+  ]) {
+    const button = frame.locator(`[data-section-target="${id}"]`);
+    await button.focus();
+    await button.press("Enter");
+    assert(await button.getAttribute("aria-pressed") === "true", "Zero counter must expose its selected state");
+    assert(await frame.locator(`#${id}`).isVisible(), "Selected zero-count section must be visible");
+    assert(await frame.getByText(emptyText, { exact: true }).isVisible(), "Selected section must show its existing empty state");
+    const otherId = id === "mine-services" ? "other-services" : "mine-services";
+    assert(!await frame.locator(`#${otherId}`).isVisible(), "Other section must be hidden");
+    const toolbar = await frame.locator(".services-toolbar").boundingBox();
+    assert(toolbar && toolbar.y >= 0 && toolbar.y + toolbar.height <= 900, "Zero counter must keep toolbar in view", toolbar);
+    const screenshot = join(outputDir, `services-empty-${id}-${width}x900.png`);
+    await page.screenshot({ path: screenshot });
+    console.log(`screenshot: ${screenshot}`);
+  }
 }
 
 async function assertRectWithinBounds(name, rect, bounds, details) {
@@ -734,6 +765,41 @@ async function runScenario(callback) {
   }
 }
 
+async function assertSectionNavigationSource() {
+  const { default: vm } = await import("node:vm");
+  const source = await readFile(join(servicesRoot, "services.js"), "utf8");
+  const sections = Object.fromEntries(["mine-services", "other-services"].map(id => [id, {
+    hidden: false,
+    scrollIntoView() { throw new Error("Section navigation must keep the toolbar in view"); },
+  }]));
+  const buttons = Object.keys(sections).map(id => ({
+    active: false, attributes: { "data-section-target": id },
+    getAttribute(name) { return this.attributes[name]; },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    classList: { toggle(_name, active) { buttons.find(button => button.attributes["data-section-target"] === id).active = active; } },
+  }));
+  const content = { scrollTop: 100 };
+  const context = vm.createContext({
+    readText: value => value.trim(),
+    document: {
+      getElementById: id => sections[id],
+      querySelectorAll: () => buttons,
+      querySelector: () => content,
+    },
+  });
+  vm.runInContext(source.match(/^function activateServicesSection\([\s\S]*?^}/m)[0], context);
+  for (const id of ["other-services", "mine-services", "other-services"]) {
+    context.activateServicesSection(id);
+    for (const button of buttons) {
+      const selected = button.getAttribute("data-section-target") === id;
+      assert(button.active === selected && button.attributes["aria-pressed"] === String(selected), "Counters must expose the selected section");
+      assert(sections[button.getAttribute("data-section-target")].hidden === !selected, "Only the selected Services section must be visible");
+    }
+    assert(content.scrollTop === 0, "Section navigation must reset only the content scroll");
+  }
+  console.log("services-uiux-smoke source navigation: PASS");
+}
+
 async function main() {
   const tmpOutputDir = join(tmpdir(), "services-uiux-smoke");
   await mkdir(tmpOutputDir, { recursive: true });
@@ -750,6 +816,9 @@ async function main() {
   await runScenario(({ page, server }) =>
     assertFailedUpdate(page, server));
 
+  for (const width of [1280, 640]) {
+    await runScenario(({ page, server }) => assertEmptyNavigation(page, server, width, tmpOutputDir));
+  }
   await assertLayoutScenario(1280, 900, desktopShot);
   await assertLayoutScenario(640, 900, narrowShot);
   await writeFile(
@@ -762,7 +831,7 @@ async function main() {
   console.log(`services-uiux-smoke: PASS\nscreenshots:\n${desktopShot}\n${narrowShot}`);
 }
 
-main().catch((error) => {
+(sourceTestOnly ? assertSectionNavigationSource() : main()).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

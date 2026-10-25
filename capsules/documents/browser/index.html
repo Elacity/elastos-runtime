@@ -170,7 +170,8 @@ a {
   background: var(--bg);
 }
 
-.hidden {
+.hidden,
+.action-icon-button[hidden] {
   display: none !important;
 }
 
@@ -1548,7 +1549,7 @@ a {
                 <button id="save-as-button" class="action-secondary action-icon-button" type="button" aria-label="Save as" title="Save as">
                   <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h9l3 3v9H8z"></path><path d="M4 4h9v3"></path><path d="M4 4v12h4"></path><path d="M13 12v5"></path><path d="M10.5 14.5h5"></path></svg>
                 </button>
-                <button id="publish-button" class="action-secondary action-icon-button" type="button" aria-label="Publish" title="Publish">
+                <button id="publish-button" class="action-secondary action-icon-button" type="button" hidden aria-label="Publish" title="Publish">
                   <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"></path><path d="m7 9 5-5 5 5"></path><path d="M5 16v4h14v-4"></path></svg>
                 </button>
                 <button id="unpublish-button" class="action-secondary action-icon-button" type="button" aria-label="Unpublish" title="Unpublish">
@@ -1559,7 +1560,7 @@ a {
                 <button id="copy-published-link" class="action-secondary action-icon-button copy-link-button hidden" type="button" aria-label="Copy Published Link" title="Copy Published Link" disabled>
                   <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path></svg>
                 </button>
-                <button id="delete-button" class="action-secondary action-danger action-icon-button" type="button" aria-label="Delete" title="Delete">
+                <button id="delete-button" class="action-secondary action-danger action-icon-button" type="button" hidden aria-label="Delete" title="Delete">
                   <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14"></path><path d="M9 7V5h6v2"></path><path d="M8 7l1 13h6l1-13"></path><path d="M10.5 11v5"></path><path d="M13.5 11v5"></path></svg>
                 </button>
               </div>
