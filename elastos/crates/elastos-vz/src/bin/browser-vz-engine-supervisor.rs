@@ -5418,7 +5418,7 @@ mod tests {
     #[test]
     fn guest_control_brief_error_omits_urls_secrets_and_call_logs() {
         for cause in [
-            "page.goto: net::ERR_NAME_NOT_RESOLVED at http://user:private-password@localhost/main?home_token=private-token\nCall log:\ncredential=private-credential",
+            "page.goto: net::ERR_NAME_NOT_RESOLVED at http://user:private-password@localhost/main?home_token=private-token\nCall log:\ncredential=private-credential", // gitleaks:allow test fixture: placeholder password on a localhost URL
             "page.goto: net::ERR_NAME_NOT_RESOLVED\r\nDevTools listening on ws://127.0.0.1:9222/private-control-id",
         ] {
             let response = format!("HTTP/1.1 503 Error\r\n\r\n{}", json!({ "error": cause }));
