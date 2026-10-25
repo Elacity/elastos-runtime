@@ -1,0 +1,90 @@
+# gitleaks configuration (assurance plan, BASE-SEC-01/-09): the default rule set plus rules for the
+# secret shapes found in Elacity repositories (RPC URLs with embedded vendor keys, connection URIs
+# with passwords, EVM private keys, mnemonics, content-key literals).
+# Allow-list policy: every allow-list here and every entry in .gitleaksignore must state why the
+# match is safe (checked in CI by .github/scripts/check-gitleaks-allowlist.py). A real credential is
+# never allow-listed: rotate it at the vendor, remove it, then let the scan pass.
+title = "elacity gitleaks config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "elacity-rpc-url-embedded-key"
+description = "RPC vendor URL with an access key in the path or host"
+regex = '''(?i)(?:https?|wss?)://[a-z0-9.\-]*(?:tenderly\.co|blockpi\.network|infura\.io|alchemy(?:api)?\.(?:com|io)|quiknode\.pro|ankr\.com|chainstack\.com|drpc\.(?:org|live)|getblock\.io|nodereal\.io)/[a-z0-9_\-/]*?([a-z0-9]{20,64})(?:\b|/|"|'|`|\s|$)'''
+secretGroup = 1
+keywords = ["tenderly", "blockpi", "infura", "alchemy", "quiknode", "ankr", "chainstack", "drpc", "getblock", "nodereal"]
+[[rules.allowlists]]
+description = "documentation placeholders and template variables, not keys"
+regexTarget = "match"
+regexes = ['''(?i)(YOUR[_-]?(API[_-]?)?KEY|<[^>]+>|\$\{[^}]+\}|example|xxxx|placeholder)''']
+
+[[rules]]
+id = "elacity-uri-embedded-password"
+description = "Connection URI with an embedded user:password"
+regex = '''(?i)\b(postgres(?:ql)?|mongodb(?:\+srv)?|mysql|mariadb|redis|rediss|amqps?|nats|https?)://[a-z0-9_.\-]{1,64}:([^@\s'"`<>{}$]{4,128})@[a-z0-9.\-]+'''
+secretGroup = 2
+keywords = ["postgres://", "postgresql://", "mongodb://", "mongodb+srv://", "mysql://", "mariadb://", "redis://", "rediss://", "amqp://", "amqps://", "nats://", "http://", "https://"]
+[[rules.allowlists]]
+description = "well-known placeholder passwords in examples, not credentials"
+regexTarget = "secret"
+regexes = ['''(?i)^(pass(word)?|secret|changeme|user|test|example|xxx+|\*+|redacted|your[_-]?pass(word)?)$''']
+
+[[rules]]
+id = "elacity-evm-private-key-assignment"
+description = "64-hex value assigned to a private-key or signer-style name"
+regex = '''(?i)(private[_-]?key|priv[_-]?key|eth[_-]?pk|royalty[_-]?pk|signer[_-]?key|deployer[_-]?key|mnemonic|seed[_-]?phrase|secret[_-]?key)["']?\s*[:=]\s*["']?(?:0x)?([0-9a-f]{64})\b'''
+secretGroup = 2
+keywords = ["private", "priv_key", "privkey", "eth_pk", "royalty_pk", "signer", "deployer", "mnemonic", "seed", "secret_key"]
+
+[[rules]]
+id = "elacity-mnemonic-assignment"
+description = "BIP-39 style 12 to 24 word phrase assigned to a mnemonic or seed name"
+regex = '''(?i)(mnemonic|seed[_-]?phrase|recovery[_-]?phrase)["']?\s*[:=]\s*["']([a-z]{3,8}(?:\s+[a-z]{3,8}){11,23})["']'''
+secretGroup = 2
+keywords = ["mnemonic", "seed", "recovery"]
+
+[[rules]]
+id = "elacity-cek-hex-assignment"
+description = "32-hex or 64-hex literal assigned to a content-key style name"
+regex = '''(?i)\b(cek|content[_-]?key|contentkey|encryption[_-]?key|enc[_-]?key|aes[_-]?key|kek|master[_-]?key)["']?\s*[:=]\s*["'](?:0x)?([0-9a-f]{32}|[0-9a-f]{64})["']'''
+secretGroup = 2
+keywords = ["cek", "content_key", "contentkey", "encryption_key", "enc_key", "aes_key", "kek", "master_key"]
+
+[[rules]]
+id = "elacity-env-fallback-literal-secret"
+description = "Literal fallback for a key-like environment variable (fails open when the variable is unset)"
+regex = '''(?i)process\.env\.[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|INFURA_ID|PROJECT_ID)[A-Z0-9_]*\s*(?:\|\||\?\?)\s*["'`]([A-Za-z0-9_\-]{16,})["'`]'''
+secretGroup = 1
+keywords = ["process.env"]
+[[rules.allowlists]]
+description = "an EVM address fallback (e.g. a token contract) is public, not a secret"
+regexTarget = "secret"
+regexes = ['''^0x[0-9a-fA-F]{40}$''']
+
+[[allowlists]]
+description = "lockfiles (integrity hashes) and dependency or build output directories: noise, never source"
+paths = [
+  '''(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|go\.sum|foundry\.lock)$''',
+  '''(^|/)node_modules/''',
+  '''(^|/)target/''',
+]
+
+[[allowlists]]
+description = "EVM addresses (0x + 40 hex) are public identifiers, never secrets; applies to the generic rule only"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^(0x)?[0-9a-fA-F]{40}$''']
+
+[[allowlists]]
+description = "did:key identifiers encode public keys and are public by definition; applies to the generic rule only"
+targetRules = ["generic-api-key"]
+regexTarget = "line"
+regexes = ['''did:key:z[A-Za-z0-9_-]{4,}''']
+
+[[allowlists]]
+description = "secret_type labels name a kind of secret, they are not a value; applies to the generic rule only"
+targetRules = ["generic-api-key"]
+regexTarget = "line"
+regexes = ['''"secret_type"\s*:\s*"[a-z0-9_]+"''']

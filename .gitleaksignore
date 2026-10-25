@@ -1,0 +1,3 @@
+# gitleaks fingerprint allow-list: <file>:<rule>:<line>. Each entry needs a reason comment
+# directly above it (checked by .github/scripts/check-gitleaks-allowlist.py). Never list a real
+# credential here: rotate it, remove it, and let the scan pass.
