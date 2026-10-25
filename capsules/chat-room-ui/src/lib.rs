@@ -51,6 +51,9 @@ const SHELL_SESSION_LOST_DETAIL: &str =
     "The conversation session ended. Choose Reconnect to continue; your unsent text stays.";
 const SHELL_ACCESS_UNAVAILABLE_DETAIL: &str =
     "This device is not part of this conversation yet. Join from an invite or connect it first.";
+const DRAFT_API_URL: &str = "/api/apps/chat-room/drafts";
+const DRAFT_SCHEMA: &str = "elastos.chat.drafts/v1";
+const DRAFT_PERSIST_DEBOUNCE_MS: u32 = 400;
 const EMOJI_BUTTON_IDS: [(&str, &str); 12] = [
     ("emoji-wave", "👋"),
     ("emoji-thumbsup", "👍"),
@@ -159,6 +162,9 @@ struct AppState {
     /// Unsent text of the conversations the composer does not show, with the
     /// revision it had when it left the composer.
     drafts: BTreeMap<Option<String>, (String, u64)>,
+    /// Server-side draft persistence state.
+    server_draft_revision: u64,
+    server_draft_save_pending: bool,
     /// Names the composer's current content; every change gets a new one from
     /// `composer_edits`. A finished send clears only the revision it sent, so
     /// newer typing, even identical text, and a repeated response leave it.
@@ -624,6 +630,20 @@ struct AttachmentUploadStartInput<'a> {
 struct AttachmentUploadStartResponse {
     upload_id: String,
     chunk_size_bytes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DraftsPersistenceResponse {
+    schema: String,
+    revision: u64,
+    drafts: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DraftsPersistenceRequest {
+    schema: String,
+    if_revision: u64,
+    drafts: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1399,6 +1419,8 @@ impl App {
                 }) {
                     state.direct.pending_send = None;
                 }
+                drop(state);
+                edit_app.save_drafts_to_server();
                 return;
             }
             if state
@@ -1408,6 +1430,8 @@ impl App {
             {
                 state.pending_chat_send = None;
             }
+            drop(state);
+            edit_app.save_drafts_to_server();
         }));
         self.message_input
             .add_event_listener_with_callback("input", message_edit.as_ref().unchecked_ref())?;
@@ -2113,6 +2137,7 @@ impl App {
                         return;
                     }
                     app.schedule_attachment_downloads();
+                    app.load_drafts_from_server();
                     let _ = app.render();
                 }
                 Err(err) if is_session_error(&err) => {}
@@ -2169,6 +2194,102 @@ impl App {
                 let _ = app.render();
             }
             app.state.borrow_mut().attachment_downloads_running = false;
+        });
+    }
+
+    fn load_drafts_from_server(self: &Rc<Self>) {
+        let app = Rc::clone(self);
+        let request_token = self.home_token();
+        spawn_local(async move {
+            let headers = app.room_request_headers();
+            let result: Result<DraftsPersistenceResponse, String> =
+                api_get_json_with_headers(DRAFT_API_URL, &headers).await;
+
+            if request_token != app.home_token() {
+                return;
+            }
+
+            match result {
+                Ok(response) => {
+                    let mut state = app.state.borrow_mut();
+                    state.server_draft_revision = response.revision;
+
+                    // Only restore drafts if we have none locally yet
+                    if state.drafts.is_empty() && !response.drafts.is_empty() {
+                        state.drafts = drafts_from_server_format(
+                            response.drafts,
+                            state.composer_edits,
+                        );
+
+                        // If the current composer is empty and we have a draft for it,
+                        // restore it
+                        if let Some((draft_text, revision)) =
+                            state.drafts.get(&state.composer_conversation).cloned()
+                        {
+                            state.composer_revision = revision;
+                            drop(state);
+                            app.set_composer_text(&draft_text);
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Silently ignore errors - drafts are not critical
+                }
+            }
+        });
+    }
+
+    fn save_drafts_to_server(self: &Rc<Self>) {
+        let app = Rc::clone(self);
+        let request_token = app.home_token();
+
+        spawn_local(async move {
+            // Small delay to debounce rapid changes
+            TimeoutFuture::new(DRAFT_PERSIST_DEBOUNCE_MS).await;
+
+            if request_token != app.home_token() {
+                return;
+            }
+
+            let (current_revision, server_drafts) = {
+                let state = app.state.borrow();
+                if state.server_draft_save_pending {
+                    // Another save is already queued
+                    return;
+                }
+                (
+                    state.server_draft_revision,
+                    drafts_to_server_format(&state.drafts),
+                )
+            };
+
+            app.state.borrow_mut().server_draft_save_pending = true;
+
+            let headers = app.room_request_headers();
+            let request = DraftsPersistenceRequest {
+                schema: DRAFT_SCHEMA.to_string(),
+                if_revision: current_revision,
+                drafts: server_drafts,
+            };
+
+            let result: Result<DraftsPersistenceResponse, String> =
+                api_post_json_with_headers(DRAFT_API_URL, &request, &headers, Some(REQUEST_DEADLINE_MS)).await;
+
+            if request_token != app.home_token() {
+                return;
+            }
+
+            match result {
+                Ok(response) => {
+                    let mut state = app.state.borrow_mut();
+                    state.server_draft_revision = response.revision;
+                    state.server_draft_save_pending = false;
+                }
+                Err(_) => {
+                    // On error, allow retry
+                    app.state.borrow_mut().server_draft_save_pending = false;
+                }
+            }
         });
     }
 
@@ -2758,7 +2879,7 @@ impl App {
         Ok(())
     }
 
-    async fn send_message(&self) -> Result<(), String> {
+    async fn send_message(self: &Rc<Self>) -> Result<(), String> {
         if self.is_direct_mode() {
             return self.send_direct_message().await;
         }
@@ -2797,11 +2918,12 @@ impl App {
             if clear {
                 self.set_composer_text("");
             }
+            self.save_drafts_to_server();
         }
         Ok(())
     }
 
-    async fn send_direct_message(&self) -> Result<(), String> {
+    async fn send_direct_message(self: &Rc<Self>) -> Result<(), String> {
         if self.state.borrow().reconnect_needed || self.state.borrow().reconnecting {
             return Ok(());
         }
@@ -2913,6 +3035,7 @@ impl App {
         if clear {
             self.set_composer_text("");
         }
+        self.save_drafts_to_server();
         if self.selection_guard_is_current(&selection_guard) {
             let _ = self
                 .refresh_direct_messages_for_guard(&selection_guard)
@@ -3295,6 +3418,7 @@ impl App {
             }
         };
         let _ = self.render();
+        self.save_drafts_to_server();
         if choice == "shared" {
             self.publish_home_navigation(&selection_guard);
         }
@@ -5076,6 +5200,42 @@ fn settle_sent_draft(
     false
 }
 
+/// Convert local draft format (Option<String> -> (text, local_revision))
+/// to server format (String -> text) where "community" is the key for None.
+fn drafts_to_server_format(
+    drafts: &BTreeMap<Option<String>, (String, u64)>,
+) -> BTreeMap<String, String> {
+    drafts
+        .iter()
+        .map(|(conversation, (text, _))| {
+            let key = conversation
+                .as_ref()
+                .map(|s| s.clone())
+                .unwrap_or_else(|| "community".to_string());
+            (key, text.clone())
+        })
+        .collect()
+}
+
+/// Convert server draft format (String -> text) to local format
+/// (Option<String> -> (text, local_revision)) where "community" maps to None.
+fn drafts_from_server_format(
+    server_drafts: BTreeMap<String, String>,
+    local_revision: u64,
+) -> BTreeMap<Option<String>, (String, u64)> {
+    server_drafts
+        .into_iter()
+        .map(|(key, text)| {
+            let conversation = if key == "community" {
+                None
+            } else {
+                Some(key)
+            };
+            (conversation, (text, local_revision))
+        })
+        .collect()
+}
+
 fn current_selection_guard(state: &AppState) -> SelectionGuard {
     SelectionGuard {
         generation: state.selection_generation,
@@ -5910,6 +6070,8 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         reconnecting: false,
         pending_direct_launch: None,
         drafts: BTreeMap::new(),
+        server_draft_revision: 0,
+        server_draft_save_pending: false,
         composer_revision: 0,
         composer_edits: 0,
         held_direct_sends: BTreeMap::new(),

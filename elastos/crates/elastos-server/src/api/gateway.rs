@@ -54,6 +54,8 @@ pub(crate) use gateway_browser::gateway_browser_remote::invoke as invoke_remote_
 pub(crate) use gateway_browser::gateway_browser_remote::provider_transport_ready as browser_remote_provider_transport_ready;
 #[path = "gateway_capsule_catalog.rs"]
 mod gateway_capsule_catalog;
+#[path = "gateway_chat_drafts.rs"]
+mod gateway_chat_drafts;
 #[path = "gateway_collaboration_presence.rs"]
 mod gateway_collaboration_presence;
 #[path = "gateway_esp.rs"]
@@ -127,6 +129,8 @@ pub(crate) fn principal_root_protected_object_inventory(
     let mut inventory =
         gateway_assistant::principal_root_protected_object_inventory(localhost_root);
     inventory.extend(gateway_home_agent::principal_root_protected_object_inventory(localhost_root));
+    inventory
+        .extend(gateway_chat_drafts::principal_root_protected_object_inventory(localhost_root));
     inventory
         .extend(gateway_home_system::principal_root_protected_object_inventory(localhost_root));
     inventory.extend(
@@ -754,6 +758,12 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
                 .layer(DefaultBodyLimit::max(
                     gateway_home_agent::HOME_AGENT_WORKSPACE_MAX_BYTES,
                 )),
+        )
+        .route(
+            "/api/apps/chat-room/drafts",
+            get(gateway_chat_drafts::get)
+                .put(gateway_chat_drafts::put)
+                .layer(DefaultBodyLimit::max(gateway_chat_drafts::MAX_BYTES)),
         )
         .route(
             "/api/apps/system/summary",
