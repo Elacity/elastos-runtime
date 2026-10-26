@@ -1,7 +1,9 @@
 //! Policy evaluation service
 //!
 //! Wraps a `PolicyVerifier` and emits audit events on every grant/deny.
-//! Wedge-1: observational only — does not change grant/deny outcomes.
+//! `evaluate` returns the primary verifier's decision. Callers enforce that
+//! decision. A shadow verifier, when configured, is audited and does not
+//! change the returned decision.
 
 use std::sync::Arc;
 
