@@ -393,6 +393,8 @@ function assertUsersSelfReferencesAreApproved() {
     "elastos/crates/elastos-server/src/api/gateway_tests/mod.rs",
     "elastos/crates/elastos-server/src/api/gateway_tests/support_providers.rs",
     "elastos/crates/elastos-server/src/api/gateway_tests/support_runtime.rs",
+    // HTTP provider proxy rewrites this alias onto the authenticated session owner.
+    "elastos/crates/elastos-server/src/api/handlers/provider.rs",
     "elastos/crates/elastos-server/src/api/handlers/storage.rs",
     "elastos/crates/elastos-server/src/api/viewer_gateway.rs",
     "elastos/crates/elastos-server/src/resource_bridge.rs",
@@ -1492,6 +1494,9 @@ const supervisorCore = read("elastos/crates/elastos-server/src/supervisor.rs");
 const serveCmd = read("elastos/crates/elastos-server/src/serve_cmd.rs");
 const storageHandler = read(
   "elastos/crates/elastos-server/src/api/handlers/storage.rs",
+);
+const providerHandler = read(
+  "elastos/crates/elastos-server/src/api/handlers/provider.rs",
 );
 const identityHandler = read(
   "elastos/crates/elastos-server/src/api/handlers/identity.rs",
@@ -4632,6 +4637,16 @@ assert(
     "localhost://Users roots must use Users/self or the active principal root",
   ),
   "Capsule-kernel bridge must reject explicit foreign principal roots",
+);
+assert(
+  providerHandler.includes("scope_localhost_provider_request") &&
+    providerHandler.includes("scope_current_user_alias") &&
+    providerHandler.includes("principal_localhost_root") &&
+    providerHandler.includes(
+      "user_a_cannot_read_or_write_user_b_localhost_paths",
+    ) &&
+    providerHandler.includes("user_a_can_read_and_write_own_localhost_paths"),
+  "HTTP /api/provider/localhost must bind Users paths to the session owner and refuse another user's root",
 );
 assert(
   gatewayApi.includes("let principal_id = context.principal_id.clone()") &&

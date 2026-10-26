@@ -668,7 +668,7 @@ fn serialize_bridge_response(response: serde_json::Value) -> Vec<u8> {
     bytes
 }
 
-fn scope_current_user_alias(
+pub(crate) fn scope_current_user_alias(
     uri_or_resource: &str,
     principal_id: Option<&str>,
 ) -> Result<String, String> {
