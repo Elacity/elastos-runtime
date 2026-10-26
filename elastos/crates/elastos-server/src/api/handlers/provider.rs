@@ -12,9 +12,12 @@ use axum::{
 };
 use serde_json::Value;
 
+use crate::auth::principal_localhost_root;
 use crate::provider_resource::{
     build_capability_resource, ensure_generic_wallet_capability, provider_operation_action,
 };
+use crate::resource_bridge::scope_current_user_alias;
+use elastos_common::localhost::rooted_localhost_uri;
 use elastos_runtime::capability::{Action, CapabilityManager, CapabilityToken, ResourceId};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::Session;
@@ -46,6 +49,14 @@ pub async fn provider_proxy(
     };
     request["op"] = Value::String(op.clone());
 
+    // The localhost provider stores every caller's path in one filesystem.
+    // Bind Users homes to the authenticated session before any capability
+    // check or provider dispatch. A shell session otherwise skips the token
+    // check, and a `localhost://Users/*` grant matches every user directory.
+    if scheme == "localhost" {
+        scope_localhost_provider_request(&session, &mut request)?;
+    }
+
     // Build capability resource
     let resource = build_capability_resource(&scheme, &op, &request)
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
@@ -61,7 +72,7 @@ pub async fn provider_proxy(
         request = serde_json::json!({"op": "status"});
     }
 
-    enforce_capability(&state, &session, &headers, &resource, required_action).await?;
+    authorize_provider_request(&state, &session, &headers, &resource, required_action).await?;
     attach_localhost_provider_wire_token(&scheme, &op, &headers, &mut request);
 
     // Forward to provider
@@ -106,6 +117,104 @@ fn attach_localhost_provider_wire_token(
     if let Some(object) = request.as_object_mut() {
         object.insert("token".to_string(), Value::String(token.to_string()));
     }
+}
+
+fn session_principal_id(session: &Session) -> Option<&str> {
+    session.owner.as_deref().filter(|owner| !owner.is_empty())
+}
+
+fn localhost_path_escapes(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|segment| segment == "." || segment == "..")
+}
+
+fn is_users_home(path: &str) -> bool {
+    path == "localhost://Users" || path.starts_with("localhost://Users/")
+}
+
+fn scope_localhost_provider_request(
+    session: &Session,
+    request: &mut Value,
+) -> Result<(), (StatusCode, String)> {
+    let Some(path) = request
+        .get("path")
+        .and_then(|value| value.as_str())
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(());
+    };
+    if localhost_path_escapes(path) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "localhost path escapes the caller space".to_string(),
+        ));
+    }
+    let Some(rooted) = rooted_localhost_uri(path) else {
+        return Ok(());
+    };
+    if !is_users_home(&rooted) {
+        return Ok(());
+    }
+
+    let principal_id = session_principal_id(session);
+    let scoped = scope_current_user_alias(&rooted, principal_id)
+        .map_err(|message| (StatusCode::FORBIDDEN, message))?;
+    if localhost_path_escapes(&scoped) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "localhost path escapes the caller space".to_string(),
+        ));
+    }
+    let Some(principal_id) = principal_id else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "localhost://Users requires a principal-scoped launch context".to_string(),
+        ));
+    };
+    let root = principal_localhost_root(principal_id);
+    if scoped != root && !scoped.starts_with(&format!("{root}/")) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "localhost://Users roots must use Users/self or the active principal root".to_string(),
+        ));
+    }
+    if let Some(object) = request.as_object_mut() {
+        object.insert("path".to_string(), Value::String(scoped));
+    }
+    Ok(())
+}
+
+fn caller_self_alias(session: &Session, resource: &str) -> Option<String> {
+    let root = principal_localhost_root(session_principal_id(session)?);
+    if resource == root {
+        return Some("localhost://Users/self".to_string());
+    }
+    let rest = resource.strip_prefix(&format!("{root}/"))?;
+    if rest.is_empty() || localhost_path_escapes(rest) {
+        return None;
+    }
+    Some(format!("localhost://Users/self/{rest}"))
+}
+
+/// Accept the caller's concrete home and the `Users/self` alias of that same path.
+///
+/// Grants minted for `localhost://Users/self/...` stay valid after the proxy
+/// rewrites the path into the session owner's directory.
+async fn authorize_provider_request(
+    state: &ProviderProxyState,
+    session: &Session,
+    headers: &HeaderMap,
+    resource: &str,
+    required_action: Action,
+) -> Result<(), (StatusCode, String)> {
+    if let Err(error) = enforce_capability(state, session, headers, resource, required_action).await
+    {
+        let Some(alias) = caller_self_alias(session, resource) else {
+            return Err(error);
+        };
+        return enforce_capability(state, session, headers, &alias, required_action).await;
+    }
+    Ok(())
 }
 
 /// Validate that the session has permission for this provider operation.
@@ -744,6 +853,244 @@ mod tests {
         assert_eq!(
             *provider.requests.lock().await,
             vec![serde_json::json!({ "op": "publish" })]
+        );
+    }
+
+    fn owned_session(owner: &str, session_type: SessionType) -> Session {
+        Session::with_owner(session_type, None, owner.to_string())
+    }
+
+    fn capability_manager() -> Arc<CapabilityManager> {
+        Arc::new(CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        ))
+    }
+
+    fn token_headers(token: &elastos_runtime::capability::CapabilityToken) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Capability-Token",
+            HeaderValue::from_str(&token.to_base64().unwrap()).unwrap(),
+        );
+        headers
+    }
+
+    async fn dispatch_localhost(
+        session: Session,
+        op: &str,
+        body: Value,
+        headers: HeaderMap,
+        capability_manager: Option<Arc<CapabilityManager>>,
+    ) -> (Vec<Value>, Result<Json<Value>, (StatusCode, String)>) {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(CapturingSchemeProvider::new("localhost"));
+        registry.register(provider.clone()).await;
+        let state = ProviderProxyState {
+            registry,
+            capability_manager,
+        };
+        let result = provider_proxy(
+            State(state),
+            Extension(session),
+            Path(("localhost".to_string(), op.to_string())),
+            headers,
+            body.to_string(),
+        )
+        .await;
+        let requests = provider.requests.lock().await.clone();
+        (requests, result)
+    }
+
+    fn assert_localhost_refused(
+        op: &str,
+        requests: &[Value],
+        result: Result<Json<Value>, (StatusCode, String)>,
+        message: &str,
+    ) {
+        let error = result.expect_err(op);
+        assert_eq!(error.0, StatusCode::FORBIDDEN, "{op}: {}", error.1);
+        assert!(
+            error.1.contains(message),
+            "{op}: {} should mention {message}",
+            error.1
+        );
+        assert!(requests.is_empty(), "{op} reached the provider");
+    }
+
+    fn assert_localhost_scoped(
+        op: &str,
+        requests: &[Value],
+        result: Result<Json<Value>, (StatusCode, String)>,
+        expected_path: &str,
+    ) {
+        let response = result.expect(op);
+        assert_eq!(response.0["status"], "ok", "{op}");
+        assert_eq!(requests.len(), 1, "{op}");
+        assert_eq!(requests[0]["op"], op);
+        assert_eq!(requests[0]["path"], expected_path);
+    }
+
+    #[tokio::test]
+    async fn user_a_cannot_read_or_write_user_b_localhost_paths() {
+        let owner_a = "user-a";
+        let owner_b = "user-b";
+        let root_a = crate::auth::principal_localhost_root(owner_a);
+        let root_b = crate::auth::principal_localhost_root(owner_b);
+        assert_ne!(root_a, root_b);
+        let foreign_file = format!("{root_b}/Documents/secret.txt");
+        let manager = capability_manager();
+        let foreign_message =
+            "localhost://Users roots must use Users/self or the active principal root";
+
+        for op in ["read", "write"] {
+            let shell = owned_session(owner_a, SessionType::Shell);
+            let body = match op {
+                "write" => serde_json::json!({"path": foreign_file, "content": "from-a"}),
+                _ => serde_json::json!({"path": foreign_file}),
+            };
+            let (requests, result) =
+                dispatch_localhost(shell, op, body, HeaderMap::new(), Some(manager.clone())).await;
+            assert_localhost_refused(op, &requests, result, foreign_message);
+
+            let app = owned_session(owner_a, SessionType::Capsule);
+            let action = if op == "write" {
+                Action::Write
+            } else {
+                Action::Read
+            };
+            let token = manager.grant(
+                app.id.as_str(),
+                ResourceId::new("localhost://Users/*"),
+                action,
+                TokenConstraints::default(),
+                None,
+            );
+            let body = match op {
+                "write" => serde_json::json!({"path": foreign_file, "content": "from-a"}),
+                _ => serde_json::json!({"path": foreign_file}),
+            };
+            let (requests, result) =
+                dispatch_localhost(app, op, body, token_headers(&token), Some(manager.clone()))
+                    .await;
+            assert_localhost_refused(op, &requests, result, foreign_message);
+        }
+
+        let unowned = Session::new(SessionType::Shell, None);
+        for (op, path) in [
+            ("read", foreign_file.as_str()),
+            ("write", foreign_file.as_str()),
+            ("read", "localhost://Users/self/Documents/secret.txt"),
+            ("write", "Users/self/Documents/secret.txt"),
+        ] {
+            let body = if op == "write" {
+                serde_json::json!({"path": path, "content": "shared"})
+            } else {
+                serde_json::json!({"path": path})
+            };
+            let (requests, result) =
+                dispatch_localhost(unowned.clone(), op, body, HeaderMap::new(), None).await;
+            assert_localhost_refused(op, &requests, result, "principal-scoped launch context");
+        }
+
+        let foreign_segment = root_b.trim_start_matches("localhost://Users/");
+        let climber = format!("localhost://Users/self/../{foreign_segment}/Documents/secret.txt");
+        let (requests, result) = dispatch_localhost(
+            owned_session(owner_a, SessionType::Shell),
+            "read",
+            serde_json::json!({"path": climber}),
+            HeaderMap::new(),
+            Some(manager.clone()),
+        )
+        .await;
+        assert_localhost_refused("read", &requests, result, "escapes the caller space");
+
+        let (requests, result) = dispatch_localhost(
+            owned_session(owner_a, SessionType::Shell),
+            "read",
+            serde_json::json!({"path": "localhost://Users"}),
+            HeaderMap::new(),
+            Some(manager),
+        )
+        .await;
+        assert_localhost_refused("read", &requests, result, foreign_message);
+    }
+
+    #[tokio::test]
+    async fn user_a_can_read_and_write_own_localhost_paths() {
+        let owner_a = "user-a";
+        let root_a = crate::auth::principal_localhost_root(owner_a);
+        let own_file = format!("{root_a}/Documents/note.txt");
+        let manager = capability_manager();
+
+        for (op, path) in [
+            ("read", "localhost://Users/self/Documents/note.txt"),
+            ("write", "localhost://Users/self/Documents/note.txt"),
+            ("read", own_file.as_str()),
+            ("write", own_file.as_str()),
+            ("read", "Users/self/Documents/note.txt"),
+        ] {
+            let body = if op == "write" {
+                serde_json::json!({"path": path, "content": "mine"})
+            } else {
+                serde_json::json!({"path": path})
+            };
+            let (requests, result) = dispatch_localhost(
+                owned_session(owner_a, SessionType::Shell),
+                op,
+                body,
+                HeaderMap::new(),
+                Some(manager.clone()),
+            )
+            .await;
+            assert_localhost_scoped(op, &requests, result, &own_file);
+            if op == "write" {
+                assert_eq!(requests[0]["content"], "mine");
+            }
+        }
+
+        for op in ["read", "write"] {
+            let app = owned_session(owner_a, SessionType::Capsule);
+            let action = if op == "write" {
+                Action::Write
+            } else {
+                Action::Read
+            };
+            let token = manager.grant(
+                app.id.as_str(),
+                ResourceId::new("localhost://Users/self/Documents/*"),
+                action,
+                TokenConstraints::default(),
+                None,
+            );
+            let body = if op == "write" {
+                serde_json::json!({
+                    "path": "localhost://Users/self/Documents/note.txt",
+                    "content": "mine"
+                })
+            } else {
+                serde_json::json!({"path": "localhost://Users/self/Documents/note.txt"})
+            };
+            let (requests, result) =
+                dispatch_localhost(app, op, body, token_headers(&token), Some(manager.clone()))
+                    .await;
+            assert_localhost_scoped(op, &requests, result, &own_file);
+        }
+
+        let (requests, result) = dispatch_localhost(
+            owned_session(owner_a, SessionType::Shell),
+            "read",
+            serde_json::json!({"path": "localhost://Local/Shared/note.txt"}),
+            HeaderMap::new(),
+            Some(manager),
+        )
+        .await;
+        assert_localhost_scoped(
+            "read",
+            &requests,
+            result,
+            "localhost://Local/Shared/note.txt",
         );
     }
 }
