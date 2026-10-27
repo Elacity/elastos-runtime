@@ -2316,6 +2316,23 @@ fn people_identity_for_full_bundle(
             .expect("people identity is an object")
             .insert("contact_store_state".to_string(), contact_store_state);
     }
+    // Contacts added by DID live in a sibling file; it travels beside the v1
+    // state so a recovered Home keeps them.
+    if let Some(profile_contact_store_state) =
+        crate::collaboration_contact_store::export_profile_contact_store_state_for_recovery(
+            data_dir,
+            principal_id,
+            localhost_root,
+        )?
+    {
+        people_identity
+            .as_object_mut()
+            .expect("people identity is an object")
+            .insert(
+                "profile_contact_store_state".to_string(),
+                profile_contact_store_state,
+            );
+    }
     Ok(Some(people_identity))
 }
 
@@ -2444,6 +2461,15 @@ fn restore_people_identity_inner(
         }
         None => false,
     };
+    if let Some(state) = people_identity.get("profile_contact_store_state") {
+        crate::collaboration_contact_store::restore_profile_contact_store_state_for_recovery(
+            data_dir,
+            principal_id,
+            localhost_root,
+            state,
+            &profile_did,
+        )?;
+    }
     let (_, device_did) = elastos_identity::load_or_create_did(data_dir)?;
     let rebound_device = if restored.authorizes_endpoint(&device_did) {
         false

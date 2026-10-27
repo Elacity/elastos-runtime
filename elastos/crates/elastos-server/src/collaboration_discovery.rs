@@ -300,6 +300,10 @@ impl VerifiedCollaborationDiscoveryAdvertisement {
         &self.profile.document().display_name
     }
 
+    pub(crate) fn profile(&self) -> &VerifiedCollaborationProfileDocument {
+        &self.profile
+    }
+
     pub(crate) fn handle(&self) -> Option<&str> {
         self.profile.document().handle.as_deref()
     }
@@ -360,6 +364,10 @@ impl VerifiedCollaborationContactRequest {
 
     pub(crate) fn advertisement_envelope_sha256(&self) -> &str {
         &self.payload.advertisement_envelope_sha256
+    }
+
+    pub(crate) fn profile(&self) -> &VerifiedCollaborationProfileDocument {
+        &self.profile
     }
 
     pub(crate) fn requester_profile_did(&self) -> &str {
