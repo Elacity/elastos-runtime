@@ -3394,6 +3394,12 @@ impl App {
         if self.participant_card_for(participant_ref).is_none() {
             return;
         }
+        // The card lives in the People drawer; a name on a message opens it too.
+        let drawer_closed =
+            !std::mem::replace(&mut self.state.borrow_mut().show_participants, true);
+        if drawer_closed {
+            let _ = self.render();
+        }
         self.participant_card_opening
             .set(self.participant_card_opening.get().wrapping_add(1));
         *self.participant_card_opener.borrow_mut() =

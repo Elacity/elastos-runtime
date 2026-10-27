@@ -315,6 +315,13 @@ function startServer(scenario) {
           can_add_contact: !trace.peerAccepted && !trace.contactRequested, active_now: true,
         },
       });
+      if (scenario === "contact-acceptance-from-message") {
+        poll.objects = [{
+          ...historyMessage(1, "hello from Fixture Friend", "2026-03-09T12:00:00Z"),
+          sender_ref: "participant:fixture-friend",
+        }];
+        poll.latest_seq = 1;
+      }
     }
     return poll;
   }
@@ -1501,6 +1508,23 @@ async function runScenario(scenario) {
       return;
     }
 
+    if (scenario === "contact-acceptance-from-message") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "message name bootstrap");
+      const sender = frame.locator('#message-list [data-participant-ref="participant:fixture-friend"]');
+      await sender.waitFor({ state: "visible" });
+      assert(await frame.locator("#participant-card").isHidden(), "the profile card opened before a name was chosen");
+      await sender.click();
+      await frame.waitForFunction(() => document.querySelector("#participant-card")?.dataset.participantRef
+        === "participant:fixture-friend");
+      const box = await frame.locator("#participant-card").boundingBox();
+      assert(box && box.width > 0 && box.height > 0 && await frame.locator("#participant-card-close").isVisible(),
+        `a name on a Community message must open a visible profile card. Got ${JSON.stringify(box)}`);
+      assert(await frame.locator("#participant-card-action").innerText() === "Add contact",
+        "the card opened from a message lost its contact action");
+      assert(await frame.evaluate(() => document.activeElement?.id) === "participant-card-close",
+        "the card opened from a message did not take focus");
+      return;
+    }
     if (scenario.startsWith("contact-acceptance")) {
       await waitForConfiguredChatWithoutLegacyFlash(frame, "contact acceptance bootstrap");
       const draft = "Keep this draft while a contact is accepted";
@@ -1986,6 +2010,7 @@ async function main() {
     "shared-attachment-retry",
     "contact-acceptance",
     "contact-acceptance-held-request",
+    "contact-acceptance-from-message",
     "history-status-order-calendar",
     "direct-unread",
     "shell-layout-visibility",

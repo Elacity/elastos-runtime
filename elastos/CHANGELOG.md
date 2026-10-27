@@ -43,6 +43,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Archive's file list is readable in the dark theme.
 - Marketplace no longer lists WalletConnect while it is not set up on this
   Home, as Home and Wallet already hide it.
+- In Chat, clicking a person's name on a Community post opens their profile
+  card. Before, nothing appeared unless the People list was open.
 - In Assistant, Copy now copies: on a message (also while a reply is still
   arriving), on a code block and in the pasted-text editor. Before, it did
   nothing. Home asks you to confirm, then copies the text you sent, the reply as
