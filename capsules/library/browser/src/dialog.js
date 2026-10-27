@@ -234,7 +234,7 @@ export function createLibraryDialog({
       return { label: "Blocked", tone: "readonly" };
     }
     if (visibility.placement === "public_folder") {
-      return { label: "Private until published", tone: "staged" };
+      return { label: "Private", tone: "staged" };
     }
     if (identity.publishedId && identity.publishedId !== "-") {
       return object.shared
@@ -263,14 +263,14 @@ export function createLibraryDialog({
       return {
         label: visibility.placement_label || "Public folder",
         tone: "staged",
-        policy: "Placement only; publish creates the public content link.",
+        policy: "Placement only; items here stay private.",
       };
     }
     if (placement === "trash") {
       return {
         label: "Trash",
         tone: "readonly",
-        policy: "Trash is not public and cannot publish until restored.",
+        policy: "Trash is not public.",
       };
     }
     if (placement === "runtime_private") {
@@ -283,7 +283,7 @@ export function createLibraryDialog({
     return {
       label: visibility.placement_label || "Private folder",
       tone: "private",
-      policy: "Private until you publish it.",
+      policy: "Private to you.",
     };
   }
 

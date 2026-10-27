@@ -15,7 +15,6 @@ function makeActions(overrides = {}) {
     loadCurrentFolder: async () => {},
     loadRoots: async () => {},
     navigate: async () => {},
-    openPublishedUri() {},
     openTarget: () => false,
     previewObject: async () => {},
     providerApi: {},
@@ -245,27 +244,32 @@ test("Library protect and list sends the exact runtime custody publish shape", a
   assert.deepEqual(reloads, ["reload"]);
 });
 
-test("Library plain publish stays unchanged", async () => {
-  const requests = [];
+test("Library opens a published file from its local copy", async () => {
+  const launches = [];
   const actions = makeActions({
-    async providerApi(op, payload) {
-      requests.push({ op, payload });
-      return {};
+    openTarget(target, query) {
+      launches.push({ target, query });
+      return true;
     },
   });
 
-  await actions.publishObject({
+  await actions.openObject({
     uri: "localhost://Users/test/Documents/guide.md",
-    revision: "rev:guide",
     name: "guide.md",
+    mime: "text/markdown",
+    published: true,
+    published_cid: "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+    viewers: [{ id: "documents", label: "Documents" }],
   });
 
-  assert.deepEqual(requests, [
+  assert.deepEqual(launches, [
     {
-      op: "publish",
-      payload: {
+      target: "documents",
+      query: {
+        objectUri: "localhost://Users/test/Documents/guide.md",
         uri: "localhost://Users/test/Documents/guide.md",
-        if_revision: "rev:guide",
+        name: "guide.md",
+        mime: "text/markdown",
       },
     },
   ]);

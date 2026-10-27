@@ -235,10 +235,6 @@ export function createLibraryRuntime({ getHomeToken }) {
     return shellMessage({ type: "home:open-target", target, query: query || {} });
   }
 
-  function openPublishedUri(uri, preferredViewer) {
-    return shellMessage({ type: "home:open-uri", uri, preferredViewer: preferredViewer || "documents" });
-  }
-
   function deliverToTarget(target, payload) {
     if (!pickerId || pickerDelivery) return Promise.resolve(false);
     const requestId = crypto.randomUUID();
@@ -274,7 +270,6 @@ export function createLibraryRuntime({ getHomeToken }) {
     uploadObject,
     downloadObjectRaw,
     openTarget,
-    openPublishedUri,
     deliverToTarget,
     closeSelf,
   };

@@ -69,7 +69,6 @@ import {
       uploadObject,
       downloadObjectRaw,
       openTarget,
-      openPublishedUri,
       deliverToTarget,
       closeSelf,
     } = createLibraryRuntime({ getHomeToken: () => state.homeToken });
@@ -138,8 +137,6 @@ import {
     let openWithViewer = () => false;
     let pasteClipboardTo = async () => {};
     let protectAndListObject = async () => {};
-    let publishObject = async () => {};
-    let publishSelectedObjects = async () => {};
     let repairObject = async () => {};
     let restoreObject = async () => {};
     let restoreSelectedObjects = async () => {};
@@ -294,8 +291,6 @@ import {
       openWithViewer,
       pasteClipboardTo,
       protectAndListObject,
-      publishObject,
-      publishSelectedObjects,
       repairObject,
       restoreObject,
       restoreSelectedObjects,
@@ -316,7 +311,6 @@ import {
       loadCurrentFolder,
       loadRoots,
       navigate,
-      openPublishedUri,
       openTarget,
       previewObject,
       providerApi,
@@ -1020,11 +1014,8 @@ import {
               if (hasCapability(object, "repair")) actions.push(menuAction("Repair", () => repairObject(object)));
               if (object.shared) actions.push(menuAction("Check My Access", () => checkMyAccess(object)));
               if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
-          } else if (hasCapability(object, "publish")) {
-            actions.push(menuAction("Publish", () => publishObject(object)));
-            if (isRuntimeCustodyProtectableVideo(object)) {
-              actions.push(menuAction("Protect and List...", () => protectAndListObject(object)));
-            }
+          } else if (isRuntimeCustodyProtectableVideo(object)) {
+            actions.push(menuAction("Protect and List...", () => protectAndListObject(object)));
           }
         }
         actions.push("-");
@@ -1095,7 +1086,6 @@ import {
       const actions = [];
       const objects = selectedObjects();
       const files = objects.filter((object) => !isDirectory(object) && !inTrash(object) && !isBlockedObject(object));
-      const unpublished = files.filter((object) => !object.published);
       const published = files.filter((object) => object.published);
       const trash = objects.filter(inTrash);
       const active = objects.filter((object) => !inTrash(object) && !isBlockedObject(object));
@@ -1113,7 +1103,6 @@ import {
       ) {
         actions.push(menuAction("Compress Selected to ZIP", compressSelectedObjectsToZip));
       }
-      if (unpublished.some((object) => hasCapability(object, "publish"))) actions.push(menuAction("Publish Selected", publishSelectedObjects));
       if (published.some((object) => hasCapability(object, "unpublish"))) actions.push(menuAction("Unpublish Selected", unpublishSelectedObjects));
       if (active.length) actions.push("-");
       if (active.some((object) => hasCapability(object, "move"))) actions.push(menuAction("Cut", () => setClipboard("move", active)));

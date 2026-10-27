@@ -1300,11 +1300,6 @@ async function main() {
         previewWidth: doc.querySelector(".preview-pane")?.getBoundingClientRect().width || 0,
         editorHeaderHeight: doc.querySelector(".editor-pane .pane-header")?.getBoundingClientRect().height || 0,
         inspectorHeaderHeight: doc.querySelector(".inspector-pane .pane-header")?.getBoundingClientRect().height || 0,
-        historyInside: (() => {
-          const history = doc.querySelector("#pane-history")?.getBoundingClientRect();
-          const pane = doc.querySelector(".inspector-pane .pane-header")?.getBoundingClientRect();
-          return !!history && !!pane && history.right <= pane.right + 1;
-        })(),
         hasDocumentPill: !!doc.querySelector("#object-uri-pill"),
         hasPublishedPill: !!doc.querySelector("#published-pill"),
         hasLocalStateChip: !!doc.querySelector("#local-state-chip"),
@@ -1315,7 +1310,6 @@ async function main() {
         editorDisabled: !!doc.querySelector("#editor")?.disabled,
         saveDisabled: !!doc.querySelector("#save-button")?.disabled,
         saveAsDisabled: !!doc.querySelector("#save-as-button")?.disabled,
-        unpublishDisabled: !!doc.querySelector("#unpublish-button")?.disabled,
         activeDocDid: doc.querySelector(".document-list-item.active")?.dataset.docDid || "",
       })`);
       assert(viewer.ok, "documents frame was not reachable", viewer);
@@ -1323,7 +1317,7 @@ async function main() {
       assert(viewer.currentTitle === "", "Documents launcher open should not silently select a document", viewer);
       assert(viewer.activeDocDid === "", "Documents launcher open should not leave an active document selected", viewer);
       assert(!viewer.titleDisabled && !viewer.editorDisabled, "Documents launcher open should start an editable unsaved draft", viewer);
-      assert(viewer.saveDisabled && viewer.saveAsDisabled && viewer.unpublishDisabled, "Empty Documents draft should not expose persisted-document actions", viewer);
+      assert(viewer.saveDisabled && viewer.saveAsDisabled, "Empty Documents draft should not expose persisted-document actions", viewer);
       assert(!viewer.hasDocumentPill && !viewer.hasPublishedPill, "Documents toolbar should not render duplicate document/published pills", viewer);
       assert(!viewer.hasLocalStateChip && !viewer.hasUpdatedText, "Documents title area should not render duplicate draft or last-saved text", viewer);
       assert(!viewer.toolbarText.includes("localhost://Users/self/Documents/"), "documents foregrounded raw working-copy storage", viewer);
@@ -1332,15 +1326,14 @@ async function main() {
       assert(viewer.hasSidebarControls && viewer.newButtonText === "+" && viewer.newButtonLabel === "New document", "Documents sidebar should use compact create control beside search", viewer);
       assert(!viewer.sidebarMetaExists && !viewer.documentsCountExists, "Documents sidebar should not duplicate collection labels or counts", viewer);
       assert(viewer.hasWriteMode && viewer.hasSplitMode && viewer.hasReadMode, "documents workspace mode controls are incomplete", viewer);
-      assert(viewer.hasOutlineTab && viewer.hasHistoryTab, "documents inspector tabs are incomplete", viewer);
+      assert(viewer.hasOutlineTab && !viewer.hasHistoryTab, "documents inspector tabs must be Preview and Outline only", viewer);
       assert(viewer.workspaceView === "split", "documents should default to split view on desktop shell", viewer);
       assert(!viewer.sidebarTitleExists && !viewer.sidebarSubtitleExists, "Documents sidebar should not duplicate title copy", viewer);
-      assert(viewer.actionLabels.join("|") === "Save|Save as|Publish|Unpublish|Delete|Hide list", "Documents toolbar actions drifted", viewer);
-      assert(viewer.actionCount === 6, "Documents toolbar actions should be compact icon buttons", viewer);
+      assert(viewer.actionLabels.join("|") === "Save|Save as|Delete|Hide list", "Documents toolbar actions drifted", viewer);
+      assert(viewer.actionCount === 4, "Documents toolbar actions should be compact icon buttons", viewer);
       assert(viewer.actionLabels.at(-1) === "Hide list", "Documents Hide list control should stay at the far right of toolbar actions", viewer);
       assert(Math.abs(viewer.editorWidth - viewer.previewWidth) <= 2, "Documents split view should be even", viewer);
       assert(Math.abs(viewer.editorHeaderHeight - viewer.inspectorHeaderHeight) <= 2, "Documents inspector tabs should not make the header taller than Write", viewer);
-      assert(viewer.historyInside, "Documents History tab overflowed the inspector header", viewer);
     });
 
     await runCase("elastos-document-uri-opens-documents-viewer", async (tabId) => {
@@ -1389,10 +1382,9 @@ async function main() {
         return {
           ok: true,
           saveDisabled: doc.querySelector("#save-button")?.disabled ?? true,
-          publishDisabled: doc.querySelector("#publish-button")?.disabled ?? true,
         };
       })()`);
-      assert(drafted.ok && !drafted.saveDisabled && !drafted.publishDisabled, "Documents draft was not ready to save and publish", drafted);
+      assert(drafted.ok && !drafted.saveDisabled, "Documents draft was not ready to save", drafted);
 
       const saved = await clickInFrame(tabId, "documents", "#save-button");
       assert(saved.ok, "Documents Save action was not clickable", saved);
@@ -1408,24 +1400,28 @@ async function main() {
       }, 12000, 500);
       assert(savedDocument?.activeDocDid, "Documents did not expose the saved document DID", savedDocument);
 
-      const published = await clickInFrame(tabId, "documents", "#publish-button");
-      assert(published.ok, "Documents Publish action was not clickable", published);
-      let publishState = null;
-      const publishResolved = await waitFor(async () => {
-        publishState = await frameState(tabId, "documents", `({
-          ok: true,
-          status: doc.querySelector("#status-text")?.textContent?.trim() || "",
-          published: !!doc.querySelector(".document-list-item.active.published"),
-        })`);
-        return isDocumentPublished(publishState) || isDocumentPublishUnavailable(publishState);
-      }, 45_000, 1000);
+      // Documents offers no Publish control; publish through the provider so the
+      // receiving path for documents published earlier stays covered.
+      const publishState = await frameState(tabId, "documents", `(async () => {
+        const homeToken = new URLSearchParams(win.location.hash.replace(/^#/, "")).get("home_token") || "";
+        const response = await fetch("/api/provider/documents/publish", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-elastos-home-token": homeToken,
+          },
+          body: JSON.stringify({ doc_did: ${JSON.stringify(savedDocument.activeDocDid)} }),
+        });
+        const body = await response.json().catch(() => null);
+        return { ok: true, published: response.ok && body?.status !== "error", status: body?.message || "" };
+      })()`);
       if (isDocumentPublishUnavailable(publishState)) {
         const deletedLocal = await deleteDocumentWorkingCopy(tabId, savedDocument.activeDocDid);
         assert(deletedLocal.ok, "Documents smoke could not remove its local working copy", deletedLocal);
         assert(!REQUIRE_DOCUMENT_PUBLISH, "Documents publishing is unavailable in strict publish mode", publishState);
         throw new SkipCase("document publishing is unavailable on this device", publishState);
       }
-      assert(publishResolved && isDocumentPublished(publishState), "Documents did not publish a revision", publishState);
+      assert(isDocumentPublished(publishState), "Documents did not publish a revision", publishState);
 
       const publishedRecord = await frameState(tabId, "documents", `(async () => {
         const homeToken = new URLSearchParams(win.location.hash.replace(/^#/, "")).get("home_token") || "";

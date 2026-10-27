@@ -406,8 +406,9 @@ async function assertPhoneMoreMenu(page) {
   const ids = open.items.map((item) => item.id);
   assert(
     open.menuOpen && open.menuOnTop && open.expanded === "true" && open.menuInViewport
-      && ["save-as-button", "publish-button", "unpublish-button", "delete-button"].every((id) => ids.includes(id)),
-    `Documents phone: More must open on screen with Save as, Publish, Unpublish and Delete. Got ${JSON.stringify(open)}`,
+      && ["save-as-button", "delete-button"].every((id) => ids.includes(id))
+      && !ids.some((id) => ["publish-button", "unpublish-button"].includes(id)),
+    `Documents phone: More must open on screen with Save as and Delete, and no Publish or Unpublish. Got ${JSON.stringify(open)}`,
   );
   assert(
     open.items.every((item) => item.height >= PHONE_TOUCH_TARGET_PX && item.label.length > 0),
@@ -523,9 +524,11 @@ async function run() {
     await page.waitForFunction(() => document.getElementById("title-input")?.value === "Alpha");
     const selected = await page.evaluate(() => ({
       copyButton: !!document.getElementById("copy-published-link"),
+      publishControls: !!document.querySelector("#publish-button, #unpublish-button, #pane-history, #history-panel, .document-list-published-icon"),
       titleValue: document.getElementById("title-input")?.value || "",
     }));
     assert(!selected.copyButton, "Published documents must not offer Copy Published Link.");
+    assert(!selected.publishControls, "Documents must not show Publish, Unpublish, History or the Published icon.");
     assert(selected.titleValue === "Alpha", "Documents layout fixture must load the selected document.");
 
     await page.locator(".document-list-item").first().click({ button: "right" });

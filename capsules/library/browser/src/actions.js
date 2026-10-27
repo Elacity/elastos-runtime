@@ -29,7 +29,6 @@ export function createLibraryActions({
   loadCurrentFolder,
   loadRoots,
   navigate,
-  openPublishedUri,
   openTarget,
   previewObject,
   providerApi,
@@ -112,11 +111,6 @@ export function createLibraryActions({
 
   function openWithViewer(object, viewer) {
     if (!viewer) return false;
-    const cid = publishedCid(object);
-    if (object.published && cid) {
-      openPublishedUri("elastos://" + cid, viewer);
-      return true;
-    }
     const query = {
       objectUri: object.uri,
       uri: object.uri,
@@ -349,13 +343,6 @@ export function createLibraryActions({
     URL.revokeObjectURL(url);
   }
 
-  async function publishObject(object) {
-    setStatus(`Publishing ${object.name}...`);
-    await providerApi("publish", { uri: object.uri, if_revision: object.revision });
-    setStatus(`Published ${object.name}.`);
-    await loadCurrentFolder();
-  }
-
   async function protectAndListObject(object) {
     if (!isRuntimeCustodyProtectableVideo(object)) return;
     const operationKey = String(object.uri || "");
@@ -491,14 +478,6 @@ export function createLibraryActions({
     clearSelection(false);
     setStatus(`${label} ${list.length} item${list.length === 1 ? "" : "s"}.`);
     await loadCurrentFolder();
-  }
-
-  async function publishSelectedObjects() {
-    const objects = selectedObjects().filter((object) => !isDirectory(object) && !inTrash(object) && !object.published && hasCapability(object, "publish"));
-    await runBatchAction("Published", objects, (object) => providerApi("publish", {
-      uri: object.uri,
-      if_revision: object.revision,
-    }));
   }
 
   async function unpublishSelectedObjects() {
@@ -712,8 +691,6 @@ export function createLibraryActions({
     openWithViewer,
     pasteClipboardTo,
     protectAndListObject,
-    publishObject,
-    publishSelectedObjects,
     repairObject,
     restoreObject,
     restoreSelectedObjects,

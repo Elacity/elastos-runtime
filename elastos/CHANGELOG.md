@@ -26,7 +26,9 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   Documents no longer offers Copy Published Link or Copy link on a revision. In
   the default Community mode, posts and direct messages show `elastos://` links
   as plain text, so the person you send one to cannot open it in Home yet.
-  Publish and Unpublish still work.
+  Library and Documents no longer offer Publish, and Documents drops its
+  History tab and Published icon. A file published earlier opens from this
+  Home's own copy and can still be unpublished from its menu.
 - In this release the seed accepts no new copies of a Home's files; copies it
   already holds stay. Your own devices accept new copies of a Home's files only
   when you allow it: on each device, run

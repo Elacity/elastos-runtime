@@ -2137,7 +2137,6 @@ async function run() {
       "Open",
       "Download",
       "Compress to ZIP",
-      "Publish",
       "Cut",
       "Copy",
       "Delete",
@@ -2145,12 +2144,11 @@ async function run() {
       "Copy Content CID",
       "Properties",
     ], "file menu");
-    excludesAll(await openItemMenu(page, "Readme.md"), ["Open With", "Copy Published Link"], "file menu without installed viewer or published link");
+    excludesAll(await openItemMenu(page, "Readme.md"), ["Open With", "Publish", "Copy Published Link"], "file menu without Publish, installed viewer or published link");
     includesAll(await openItemMenu(page, "Clip.mp4"), [
       "Open",
       "Download",
       "Compress to ZIP",
-      "Publish",
       "Protect and List...",
       "Properties",
     ], "protected publish video menu");
@@ -2210,20 +2208,20 @@ async function run() {
     await page.locator(".place").filter({ hasText: "Public" }).first().click();
     await page.locator(".item").filter({ hasText: "Public Draft.md" }).first().waitFor();
     await page.locator(".item").filter({ hasText: "Public Draft.md" }).filter({ hasText: "Public folder" }).first().waitFor();
-    includesAll(await openItemMenu(page, "Public Draft.md"), ["Publish", "Properties"], "public folder unpublished file menu");
-    excludesAll(await openItemMenu(page, "Public Draft.md"), ["Copy Published Link"], "public folder unpublished file menu");
+    includesAll(await openItemMenu(page, "Public Draft.md"), ["Properties"], "public folder unpublished file menu");
+    excludesAll(await openItemMenu(page, "Public Draft.md"), ["Publish", "Copy Published Link"], "public folder unpublished file menu");
     await clickMenu(page, "Properties");
     await page.locator(".window-item-properties").filter({ hasText: "Public Draft.md properties" }).first().waitFor();
     await page.locator(".item-props-tbl").filter({ hasText: "Placement" }).filter({ hasText: "Public folder" }).first().waitFor();
-    await page.locator(".item-props-tbl").filter({ hasText: "Visibility" }).filter({ hasText: "Private until published" }).first().waitFor();
+    await page.locator(".item-props-tbl").filter({ hasText: "Visibility" }).filter({ hasText: "Private" }).first().waitFor();
     await page.locator(".item-props-tab-btn").filter({ hasText: "Technical" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Placement only; publish creates the public content link." }).first().waitFor();
+    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Placement only; items here stay private." }).first().waitFor();
     await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     await page.locator(".place").filter({ hasText: "Documents" }).first().click();
     await page.locator(".item").filter({ hasText: "Readme.md" }).first().waitFor();
 
-    includesAll(await openItemMenu(page, "Viewer.md"), ["Open", "Open With", "Download", "Publish"], "viewer file menu");
+    includesAll(await openItemMenu(page, "Viewer.md"), ["Open", "Open With", "Download"], "viewer file menu");
     includesAll(await submenuRows(page, "Open With"), ["Documents"], "Open With submenu");
 
     await clickMenu(page, "Copy");
@@ -2339,6 +2337,12 @@ async function run() {
     await clickMenu(page, "Repair");
     assert((await repaired).ok(), "Repair response must succeed");
     assert(ops.some((entry) => entry.op === "repair" && entry.payload.uri.endsWith("/Published.md")), "Repair must call repair");
+    // An item published before Publish was hidden can still be unpublished.
+    await openItemMenu(page, "Published.md");
+    await clickMenu(page, "Unpublish");
+    await waitForOp((entry) => entry.op === "unpublish" && entry.payload.uri.endsWith("/Published.md"), "Unpublish must call unpublish");
+    await page.waitForFunction(() => !document.querySelector(".badge-published"));
+    excludesAll(await openItemMenu(page, "Published.md"), ["Publish", "Unpublish"], "unpublished file menu");
 
     includesAll(await openItemMenu(page, "Bundle.tar.gz"), ["Open", "Download", "Extract Here", "Cut", "Copy", "Delete", "Rename", "Properties"], "archive file menu");
     excludesAll(await openItemMenu(page, "Readme.md"), ["Extract Here"], "non-archive file menu");
@@ -2597,13 +2601,7 @@ async function run() {
       "Alt-drag/drop copy must call copy with the destination folder",
     );
 
-    await openItemMenu(page, "Guide.md");
-    await clickMenu(page, "Publish");
-    await page.waitForFunction(() => document.querySelector("#footer-left")?.textContent?.includes("item"));
-    assert(ops.some((entry) => entry.op === "publish" && entry.payload.uri.endsWith("/Guide.md")), "Publish must call publish");
-    const guidePublishedRows = await openItemMenu(page, "Guide.md");
-    includesAll(guidePublishedRows, ["Status", "Repair", "Unpublish", "Copy Content CID"], "published Guide menu");
-    excludesAll(guidePublishedRows, ["Share", "Copy Published Link"], "published Guide menu");
+    excludesAll(await openItemMenu(page, "Guide.md"), ["Publish", "Publish Selected"], "Guide menu");
 
     await openItemMenu(page, "Guide.md");
     await clickMenu(page, "Copy Content CID");
@@ -2617,9 +2615,6 @@ async function run() {
         "resource.identifier",
       "Copy Content CID must use the identifier Clipboard purpose",
     );
-    await openItemMenu(page, "Guide.md");
-    await clickMenu(page, "Unpublish");
-    await waitForOp((entry) => entry.op === "unpublish" && entry.payload.uri.endsWith("/Guide.md"), "Unpublish must call unpublish");
 
     await openItemMenu(page, "Guide.md");
     await clickMenu(page, "Delete");

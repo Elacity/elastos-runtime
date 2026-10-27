@@ -36,6 +36,14 @@ assert(
   "Documents must not offer to copy a published link while a recipient cannot open it in Home.",
 );
 assert(
+  !source.includes('id="publish-button"') &&
+    !source.includes('id="unpublish-button"') &&
+    !source.includes('id="pane-history"') &&
+    !source.includes("document-list-published-icon") &&
+    !source.includes("function publishCurrent("),
+  "Documents must not offer Publish, a toolbar Unpublish, the History tab or the Published icon while a recipient cannot open a published document in Home.",
+);
+assert(
   source.includes('id="status-row" class="status-row hidden"') &&
     source.includes('function clearStatus()') &&
     source.includes('elements.statusRow.classList.add("hidden");') &&
@@ -59,7 +67,7 @@ assert(
     source.includes('cmd: "file-new-document"') &&
     source.includes('cmd: "file-save"') &&
     source.includes('cmd: "file-save-as"') &&
-    source.includes('cmd: "file-publish"') &&
+    !source.includes('cmd: "file-publish"') &&
     source.includes('cmd: "file-delete-document"') &&
     source.includes('cmd: "__close-window"') &&
     source.includes('cmd: "view-write"') &&
@@ -82,7 +90,7 @@ assert(
   source.includes('contextMenuDocDid = docDid || "";') &&
     source.includes('{ action: "new", label: "New note" }') &&
     source.includes('{ action: "duplicate", label: "Duplicate" }') &&
-    source.includes('{ action: "publish", label: "Publish" }') &&
+    !source.includes('{ action: "publish", label: "Publish" }') &&
     source.includes('{ action: "unpublish", label: "Unpublish" }') &&
     source.includes('{ action: "delete", label: "Delete", danger: true }') &&
     !source.includes("set_pin") &&

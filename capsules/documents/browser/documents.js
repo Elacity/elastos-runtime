@@ -40,8 +40,6 @@ const elements = {
   sidebarToggle: document.getElementById("sidebar-toggle"),
   saveButton: document.getElementById("save-button"),
   saveAsButton: document.getElementById("save-as-button"),
-  publishButton: document.getElementById("publish-button"),
-  unpublishButton: document.getElementById("unpublish-button"),
   deleteButton: document.getElementById("delete-button"),
   statusRow: document.getElementById("status-row"),
   statusText: document.getElementById("status-text"),
@@ -56,7 +54,6 @@ const elements = {
   preview: document.getElementById("preview"),
   previewPanel: document.getElementById("preview-panel"),
   outlinePanel: document.getElementById("outline-panel"),
-  historyPanel: document.getElementById("history-panel"),
   newButton: document.getElementById("new-document"),
   modeWrite: document.getElementById("mode-write"),
   modeSplit: document.getElementById("mode-split"),
@@ -65,7 +62,6 @@ const elements = {
   modeRead: document.getElementById("mode-read"),
   panePreview: document.getElementById("pane-preview"),
   paneOutline: document.getElementById("pane-outline"),
-  paneHistory: document.getElementById("pane-history"),
   shareShell: document.getElementById("share-shell"),
   shareSidebar: document.getElementById("share-sidebar"),
   shareSidebarMeta: document.getElementById("share-sidebar-meta"),
@@ -552,7 +548,6 @@ function buildHomeMenuManifest() {
           { label: "New Document", cmd: "file-new-document" },
           { label: "Save", cmd: "file-save" },
           { label: "Save As", cmd: "file-save-as" },
-          { label: "Publish", cmd: "file-publish" },
           { label: "Delete Document", cmd: "file-delete-document" },
           { label: "Close Window", cmd: "__close-window" },
         ],
@@ -707,8 +702,6 @@ function openContextMenu(x, y, docDid) {
     actions.push({ action: "duplicate", label: "Duplicate" });
     if (documentItem.latest_published_cid) {
       actions.push({ action: "unpublish", label: "Unpublish" });
-    } else {
-      actions.push({ action: "publish", label: "Publish" });
     }
     actions.push({ action: "delete", label: "Delete", danger: true });
   }
@@ -1010,13 +1003,11 @@ function setSidebarCollapsed(collapsed) {
 }
 
 function setInspectorView(view) {
-  state.inspectorView = view === "outline" ? "outline" : view === "history" ? "history" : "preview";
+  state.inspectorView = view === "outline" ? "outline" : "preview";
   elements.previewPanel.classList.toggle("hidden", state.inspectorView !== "preview");
   elements.outlinePanel.classList.toggle("hidden", state.inspectorView !== "outline");
-  elements.historyPanel.classList.toggle("hidden", state.inspectorView !== "history");
   elements.panePreview.classList.toggle("active", state.inspectorView === "preview");
   elements.paneOutline.classList.toggle("active", state.inspectorView === "outline");
-  elements.paneHistory.classList.toggle("active", state.inspectorView === "history");
   if (!elements.findBar.classList.contains("hidden")) {
     updateFindMatches({ preserveIndex: true });
   }
@@ -1039,8 +1030,6 @@ function setDirty(dirty) {
   const isLibraryFile = isLibraryFileProjection(state.current);
   elements.saveButton.disabled = !hasCurrent || !state.dirty;
   elements.saveAsButton.disabled = !hasPersistedCurrent || isLibraryFile;
-  elements.publishButton.disabled = !hasCurrent || isLibraryFile;
-  elements.unpublishButton.disabled = !hasPersistedCurrent || isLibraryFile || !state.current.latest_published_cid;
   elements.deleteButton.disabled = !hasPersistedCurrent || isLibraryFile;
   if (hasCurrent && state.dirty) {
     setStatus("Unsaved local changes.", "warning");
@@ -1048,26 +1037,6 @@ function setDirty(dirty) {
     clearStatus();
   }
   renderDocumentsList();
-}
-
-function renderHistory() {
-  elements.historyPanel.innerHTML = "";
-  const revisions = state.current && Array.isArray(state.current.publish_history)
-    ? [...state.current.publish_history].reverse()
-    : [];
-  if (!revisions.length) {
-    elements.historyPanel.innerHTML = '<div class="sidebar-note">No published revisions yet.</div>';
-    return;
-  }
-  revisions.forEach((revision, index) => {
-    const item = window.document.createElement("div");
-    item.className = "history-item";
-    item.innerHTML =
-      '<span class="history-kicker">Revision ' + escapeHtml(String(revisions.length - index)) + "</span>" +
-      '<span class="history-title">' + escapeHtml(shortCid(revision.cid)) + "</span>" +
-      '<span class="history-meta">' + escapeHtml(formatTime(revision.published_at)) + "</span>";
-    elements.historyPanel.appendChild(item);
-  });
 }
 
 function renderOutline(outline) {
@@ -1108,7 +1077,6 @@ function renderCurrentDocument() {
     elements.editor.value = "";
     elements.editor.disabled = true;
     elements.preview.innerHTML = '<div class="empty-state">Create or open a document.</div>';
-    renderHistory();
     renderOutline([]);
     setStatus("No document selected.");
     setDirty(false);
@@ -1121,7 +1089,6 @@ function renderCurrentDocument() {
   elements.editor.value = state.current.body;
   refreshPreviewFromEditor();
 
-  renderHistory();
   clearStatus();
   setDirty(false);
 }
@@ -1144,20 +1111,14 @@ function renderDocumentsList() {
     const button = window.document.createElement("button");
     button.type = "button";
     const classes = ["document-list-item"];
-    if (item.latest_published_cid) {
-      classes.push("published");
-    }
     if (state.current && state.current.doc_did === item.doc_did) {
       classes.push("active");
     }
     button.className = classes.join(" ");
     button.dataset.docDid = item.doc_did;
     const dirtyMarker = state.current && state.current.doc_did === item.doc_did && state.dirty ? " • unsaved" : "";
-    const publishedIcon = item.latest_published_cid
-      ? '<span class="document-list-published-icon" aria-label="Published" title="Published"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10"></path><path d="m7 9 5-5 5 5"></path><path d="M5 16v4h14v-4"></path></svg></span>'
-      : "";
     button.innerHTML =
-      '<span class="document-list-title-row"><span class="document-list-title">' + escapeHtml(item.title) + "</span>" + publishedIcon + "</span>" +
+      '<span class="document-list-title-row"><span class="document-list-title">' + escapeHtml(item.title) + "</span></span>" +
       '<span class="document-list-meta">' + escapeHtml(item.file_name + dirtyMarker) + "</span>" +
       '<span class="document-list-row"><span class="document-list-updated">' + escapeHtml(formatTime(item.updated_at)) + '</span></span>';
     button.addEventListener("click", () => selectDocument(item.doc_did));
@@ -1497,7 +1458,6 @@ function applySavedDocumentState(persistedDocument, saveTarget, requestedTitle, 
   updateDocumentsNavigation(persistedDocument);
   if (changedDuringSave) {
     refreshPreviewFromEditor();
-    renderHistory();
     setDirty(true);
     scheduleAutosave();
     return;
@@ -1872,34 +1832,6 @@ async function saveAsCurrent(title, fileName) {
   scheduleStatusClear();
 }
 
-async function publishCurrent() {
-  if (!state.current) {
-    return;
-  }
-  if (isLibraryFileProjection(state.current)) {
-    setStatus("Publish Library files from Library.", "warning");
-    return;
-  }
-  try {
-    if (state.dirty || isDraftDocument(state.current)) {
-      await saveCurrent();
-    }
-    if (isDraftDocument(state.current)) {
-      throw new Error("Save the document before publishing.");
-    }
-    setStatus("Publishing…");
-    await documentsProviderApi("publish", {
-      doc_did: state.current.doc_did,
-    });
-    await selectDocument(state.current.doc_did, { force: true });
-    setStatus("Published.");
-    scheduleStatusClear();
-  } catch (error) {
-    console.error("documents publish failed", error);
-    setStatus(readableDocumentsError(error, "Publish failed."), "warning");
-  }
-}
-
 async function unpublishCurrent() {
   if (
     !state.current ||
@@ -1992,10 +1924,6 @@ async function runContextMenuAction(action) {
     await saveAsCurrent((current.title || "Untitled document") + " copy", suggestedDuplicateFileName(current));
     return;
   }
-  if (action === "publish") {
-    await publishCurrent();
-    return;
-  }
   if (action === "unpublish") {
     await unpublishCurrent();
     return;
@@ -2017,9 +1945,6 @@ function handleHomeMenuCommand(command) {
       break;
     case "file-save-as":
       openSaveAsModal();
-      break;
-    case "file-publish":
-      void publishCurrent();
       break;
     case "file-delete-document":
       void requestDeleteCurrent();
@@ -2071,8 +1996,6 @@ function wireShellEvents() {
     });
   });
   elements.saveAsButton.addEventListener("click", openSaveAsModal);
-  elements.publishButton.addEventListener("click", publishCurrent);
-  elements.unpublishButton.addEventListener("click", unpublishCurrent);
   elements.deleteButton.addEventListener("click", requestDeleteCurrent);
   elements.sidebarToggle.addEventListener("click", () => setSidebarCollapsed(!state.sidebarCollapsed));
   wireMoreMenu();
@@ -2089,7 +2012,6 @@ function wireShellEvents() {
   elements.findClose.addEventListener("click", closeFindBar);
   elements.panePreview.addEventListener("click", () => setInspectorView("preview"));
   elements.paneOutline.addEventListener("click", () => setInspectorView("outline"));
-  elements.paneHistory.addEventListener("click", () => setInspectorView("history"));
   elements.preview.addEventListener("change", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement) || !target.classList.contains("task-checkbox")) {
@@ -2467,7 +2389,7 @@ function loadLockedMode() {
   elements.shareTitle.textContent = "Open Documents from Home";
   elements.shareSubtitle.textContent = "Documents needs a Home launch to edit local markdown.";
   elements.sharePreview.innerHTML =
-    '<div class="empty-document"><h2>Documents is ready.</h2><p>Open it from Home to create, edit, or publish documents.</p></div>';
+    '<div class="empty-document"><h2>Documents is ready.</h2><p>Open it from Home to create or edit documents.</p></div>';
 }
 
 (async function init() {

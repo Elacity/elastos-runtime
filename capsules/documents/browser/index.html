@@ -60,8 +60,7 @@
 
 :root[data-el-theme="light"] .document-list-item:hover,
 :root[data-el-theme="light"] .share-doc-link:hover,
-:root[data-el-theme="light"] .outline-item:hover,
-:root[data-el-theme="light"] .history-item:hover {
+:root[data-el-theme="light"] .outline-item:hover {
   background: var(--el-lift);
 }
 
@@ -76,19 +75,6 @@
 .workspace-tab[aria-pressed="true"] {
   background: var(--accent-soft);
   border-color: rgba(95, 118, 216, 0.18);
-}
-
-:root[data-el-theme="light"] .document-list-item.published {
-  background: color-mix(in srgb, var(--el-accent-soft) 70%, transparent);
-}
-
-:root[data-el-theme="light"] .document-list-item.published:hover,
-:root[data-el-theme="light"] .document-list-item.published.active {
-  background: var(--el-lift-strong);
-}
-
-:root[data-el-theme="light"] .document-list-published-icon {
-  background: rgba(95, 118, 216, 0.14);
 }
 
 :root[data-el-theme="light"] .action-danger {
@@ -467,15 +453,6 @@ a {
   font-weight: 600;
 }
 
-.document-list-item.published {
-  background: color-mix(in srgb, var(--el-accent-soft) 55%, transparent);
-}
-
-.document-list-item.published:hover,
-.document-list-item.published.active {
-  background: var(--el-lift-strong);
-}
-
 .document-list-title-row {
   display: flex;
   align-items: center;
@@ -515,28 +492,6 @@ a {
 .document-list-updated {
   color: var(--sidebar-muted);
   font-size: 0.77rem;
-}
-
-.document-list-published-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.35rem;
-  min-width: 1.35rem;
-  height: 1.35rem;
-  border-radius: 999px;
-  background: rgba(125, 149, 240, 0.2);
-  color: var(--accent-deep);
-}
-
-.document-list-published-icon svg {
-  width: 0.86rem;
-  height: 0.86rem;
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 2.2;
 }
 
 .sidebar-note {
@@ -923,23 +878,20 @@ a {
   padding: 1rem;
 }
 
-.outline-list,
-.history-list {
+.outline-list {
   display: flex;
   flex-direction: column;
   gap: 0.55rem;
 }
 
-.outline-item,
-.history-item {
+.outline-item {
   padding: 0.8rem 0.9rem;
   border-radius: var(--radius-md);
   background: var(--panel-strong);
   border: 1px solid rgba(255, 255, 255, 0.07);
 }
 
-.outline-item:hover,
-.history-item:hover {
+.outline-item:hover {
   background: rgba(255, 255, 255, 0.08);
   border-color: var(--line);
 }
@@ -950,8 +902,7 @@ a {
   color: var(--text);
 }
 
-.outline-kicker,
-.history-kicker {
+.outline-kicker {
   display: block;
   color: var(--muted);
   font-size: 0.74rem;
@@ -960,19 +911,11 @@ a {
   text-transform: uppercase;
 }
 
-.outline-title,
-.history-title {
+.outline-title {
   display: block;
   margin-top: 0.18rem;
   font-size: 0.92rem;
   font-weight: 600;
-}
-
-.history-meta {
-  display: block;
-  margin-top: 0.22rem;
-  color: var(--muted);
-  font-size: 0.8rem;
 }
 
 .outline-link:hover {
@@ -1519,12 +1462,6 @@ a {
                 <button id="save-as-button" class="action-secondary action-icon-button" type="button" aria-label="Save as" title="Save as">
                   <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h9l3 3v9H8z"></path><path d="M4 4h9v3"></path><path d="M4 4v12h4"></path><path d="M13 12v5"></path><path d="M10.5 14.5h5"></path></svg>
                 </button>
-                <button id="publish-button" class="action-secondary action-icon-button" type="button" aria-label="Publish" title="Publish">
-                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"></path><path d="m7 9 5-5 5 5"></path><path d="M5 16v4h14v-4"></path></svg>
-                </button>
-                <button id="unpublish-button" class="action-secondary action-icon-button" type="button" aria-label="Unpublish" title="Unpublish">
-                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12"></path><path d="m7 11 5 5 5-5"></path><path d="M5 20h14"></path></svg>
-                </button>
               </div>
               <div class="toolbar-group">
                 <button id="delete-button" class="action-secondary action-danger action-icon-button" type="button" aria-label="Delete" title="Delete">
@@ -1576,14 +1513,12 @@ a {
             <div class="pane-tabs">
               <button id="pane-preview" class="pane-tab active" type="button">Preview</button>
               <button id="pane-outline" class="pane-tab" type="button">Outline</button>
-              <button id="pane-history" class="pane-tab" type="button">History</button>
             </div>
           </div>
           <div id="preview-panel" class="preview-scroll">
             <article id="preview" class="markdown-body"></article>
           </div>
           <div id="outline-panel" class="inspector-scroll hidden"></div>
-          <div id="history-panel" class="inspector-scroll hidden"></div>
         </section>
       </div>
     </main>
