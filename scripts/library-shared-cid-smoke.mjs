@@ -51,14 +51,14 @@ const port = server.address().port;
 const browser = await chromium.launch({ ...(process.env.ELASTOS_BROWSER_EXECUTABLE ? { executablePath: process.env.ELASTOS_BROWSER_EXECUTABLE } : {}), headless: true });
 const cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
 try {
-for (const [label, query] of [["legacy query {cid,uri}", `cid=${cid}&uri=${encodeURIComponent(`elastos://${cid}`)}`], ["cid only", `cid=${cid}`], ["folder failure", `cid=${cid}`], ["named file", `cid=${cid}&fileName=report.pdf`]]) {
+for (const [label, query] of [["legacy query {cid,uri}", `cid=${cid}&uri=${encodeURIComponent(`elastos://${cid}`)}`], ["cid only", `cid=${cid}`], ["folder failure", `cid=${cid}`], ["sender filename ignored", `cid=${cid}&fileName=report.pdf`]]) {
   listed.length = 0;
   failFolder = label === "folder failure";
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${port}/apps/library/?${query}&home_origin=${encodeURIComponent("https://home.example")}#home_token=t`);
   await page.locator("#dialog:not(.hidden) a[download]").waitFor();
   assert.equal(await page.locator("#dialog a[download]").getAttribute("href"), `/content/${cid}`);
-  assert.equal(await page.locator("#dialog a[download]").getAttribute("download"), label === "named file" ? "report.pdf" : cid);
+  assert.equal(await page.locator("#dialog a[download]").getAttribute("download"), cid);
   assert.ok(listed.length > 0);
   assert.ok(listed.every(uri => uri.startsWith("localhost://")));
   const r = await page.evaluate(() => ({ content: document.getElementById("content")?.textContent.trim().slice(0, 80), dialog: document.getElementById("dialog")?.classList.contains("hidden") ? "(hidden)" : document.getElementById("dialog")?.textContent.replace(/\s+/g, " ").trim().slice(0, 120) }));

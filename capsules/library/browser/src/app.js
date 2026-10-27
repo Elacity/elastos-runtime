@@ -1306,7 +1306,7 @@ import {
       } finally {
         const sharedCid = queryParams.get("cid");
         if (state.mode === "browse" && sharedCid) {
-          elements.dialog.innerHTML = sharedFileMarkup(sharedCid, queryParams.get("fileName"));
+          elements.dialog.innerHTML = sharedFileMarkup(sharedCid);
           elements.dialog.classList.remove("hidden");
           setStatus("Shared file is ready to download.");
         }

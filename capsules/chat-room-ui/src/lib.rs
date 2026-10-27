@@ -1808,7 +1808,6 @@ impl App {
             match link_app.open_elastos_uri_from_shell(
                 &uri,
                 anchor.get_attribute("data-message-ref").as_deref(),
-                anchor.get_attribute("data-file-name").as_deref(),
             ) {
                 Ok(true) => event.prevent_default(),
                 Ok(false) => {}
@@ -1846,7 +1845,6 @@ impl App {
                     let _ = key_app.open_elastos_uri_from_shell(
                         &uri,
                         link.get_attribute("data-message-ref").as_deref(),
-                        link.get_attribute("data-file-name").as_deref(),
                     );
                 } else if let Some(url) = link.get_attribute("data-open-external") {
                     key_app.activate_external_link(&event, &url);
@@ -3240,13 +3238,11 @@ impl App {
         &self,
         uri: &str,
         message_ref: Option<&str>,
-        file_name: Option<&str>,
     ) -> Result<bool, JsValue> {
         if !self.is_shell_mode() {
             return Ok(false);
         }
-        let Some(message) =
-            shared_file_request(self.home_token().as_deref(), uri, message_ref, file_name)
+        let Some(message) = shared_file_request(self.home_token().as_deref(), uri, message_ref)
         else {
             return Ok(false);
         };
@@ -5110,9 +5106,6 @@ impl App {
                                 if let Some(message_ref) = &message_ref {
                                     anchor.set_attribute("data-message-ref", message_ref)?;
                                 }
-                                if valid_shared_file_name(&link.title) {
-                                    anchor.set_attribute("data-file-name", &link.title)?;
-                                }
                             }
                             anchor
                         } else {
@@ -5501,7 +5494,6 @@ fn shared_file_request(
     home_token: Option<&str>,
     uri: &str,
     message_ref: Option<&str>,
-    file_name: Option<&str>,
 ) -> Option<serde_json::Value> {
     let home_token = home_token.filter(|token| !token.is_empty())?;
     if !is_shared_file_uri(uri) {
@@ -5516,9 +5508,6 @@ fn shared_file_request(
         }
         request["source"] =
             serde_json::json!({"conversation_id": conversation_id, "message_id": message_id});
-    }
-    if let Some(file_name) = file_name.filter(|name| valid_shared_file_name(name)) {
-        request["fileName"] = file_name.into();
     }
     Some(request)
 }
@@ -5543,31 +5532,6 @@ enum MessageTextNode<'a> {
     },
 }
 
-fn valid_shared_file_name(name: &str) -> bool {
-    !name.trim().is_empty()
-        && name.len() <= 255
-        && !name
-            .chars()
-            .any(|c| c.is_control() || c == '/' || c == '\\')
-}
-
-fn shared_post_file_name<'a>(text: &'a str, uri: &str) -> Option<&'a str> {
-    let prefix = text.trim().strip_suffix(uri)?.strip_suffix(" · ")?;
-    let (name, size) = prefix.rsplit_once(" · ")?;
-    let (number, unit) = size.split_once(' ')?;
-    if unit == "bytes" {
-        number.parse::<u64>().ok()?;
-    } else if matches!(unit, "KB" | "MB" | "GB") {
-        let size = number.parse::<f64>().ok()?;
-        if !size.is_finite() || size < 0.0 {
-            return None;
-        }
-    } else {
-        return None;
-    }
-    valid_shared_file_name(name).then_some(name)
-}
-
 /// The nodes a message body renders as, for room Text and direct messages.
 fn message_text_nodes(text: &str, shell_mode: bool) -> Vec<MessageTextNode<'_>> {
     split_text_links(text)
@@ -5577,11 +5541,7 @@ fn message_text_nodes(text: &str, shell_mode: bool) -> Vec<MessageTextNode<'_>> 
             TextSegment::Link(url) => MessageTextNode::Link {
                 text: url,
                 attributes: if url.starts_with("elastos://") {
-                    let mut attributes = shared_file_attributes(url);
-                    if let Some(name) = shared_post_file_name(text, url) {
-                        attributes.push(("data-file-name", name.to_string()));
-                    }
-                    attributes
+                    shared_file_attributes(url)
                 } else {
                     external_link_attributes(url, None, shell_mode)
                 },
@@ -7605,7 +7565,6 @@ mod tests {
                     Some("launch"),
                     uri,
                     row.message_reference().as_deref(),
-                    None,
                 )
                 .unwrap();
                 assert_eq!(
@@ -7666,18 +7625,17 @@ mod tests {
     }
 
     #[test]
-    fn shared_file_post_preserves_its_download_name() {
+    fn shared_file_post_uses_only_the_cid_for_its_link() {
         let uri = "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
         let post = format!("report.pdf · 1.0 MB · {uri}");
         let nodes = message_text_nodes(&post, true);
         let MessageTextNode::Link { attributes, .. } = nodes.last().unwrap() else {
             panic!("file link missing")
         };
-        assert!(attributes.contains(&("data-file-name", "report.pdf".to_string())));
+        assert_eq!(*attributes, super::shared_file_attributes(uri));
         assert_eq!(
-            super::shared_file_request(Some("launch"), uri, None, Some("report.pdf")).unwrap()
-                ["fileName"],
-            "report.pdf"
+            super::shared_file_request(Some("launch"), uri, None).unwrap(),
+            serde_json::json!({"type": "home:open-uri", "uri": uri, "homeToken": "launch"})
         );
         for post in [
             uri.to_string(),
@@ -7698,7 +7656,7 @@ mod tests {
         for conversation in ["file-community", "direct:sha256:conversation"] {
             let reference = format!("{conversation}/sha256:message");
             assert_eq!(
-                super::shared_file_request(Some("launch"), uri, Some(&reference), None),
+                super::shared_file_request(Some("launch"), uri, Some(&reference)),
                 Some(serde_json::json!({
                     "type": "home:open-uri", "uri": uri, "homeToken": "launch",
                     "source": { "conversation_id": conversation, "message_id": "sha256:message" },
@@ -7709,23 +7667,14 @@ mod tests {
             "seq": 7, "message_id": "sha256:message", "sender": "Alma", "kind": "text", "body": uri, "created_at": 1,
         })).unwrap();
         assert_eq!(row.message_id.as_deref(), Some("sha256:message"));
-        assert!(super::shared_file_request(Some("launch"), uri, None, None)
+        assert!(super::shared_file_request(Some("launch"), uri, None)
             .unwrap()
             .get("source")
             .is_none());
-        assert!(
-            super::shared_file_request(None, uri, Some("file-community/message"), None).is_none()
-        );
-        assert!(
-            super::shared_file_request(Some("launch"), uri, Some("file-community/"), None)
-                .is_none()
-        );
-        assert!(
-            super::shared_file_request(Some("launch"), &format!(" {uri}"), None, None).is_none()
-        );
-        assert!(
-            super::shared_file_request(Some("launch"), &format!("{uri} "), None, None).is_none()
-        );
+        assert!(super::shared_file_request(None, uri, Some("file-community/message")).is_none());
+        assert!(super::shared_file_request(Some("launch"), uri, Some("file-community/")).is_none());
+        assert!(super::shared_file_request(Some("launch"), &format!(" {uri}"), None).is_none());
+        assert!(super::shared_file_request(Some("launch"), &format!("{uri} "), None).is_none());
         let nodes = message_text_nodes(uri, true);
         assert_eq!(
             nodes,
