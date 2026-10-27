@@ -33,6 +33,13 @@ class FakeElement {
   closest() {
     return this;
   }
+
+  focus() {
+    this.focusCount = (this.focusCount || 0) + 1;
+    document.activeElement = this;
+  }
+
+  scrollIntoView() {}
 }
 
 function response(status, payload) {
@@ -195,7 +202,8 @@ function setupEnvironment(name, replies) {
     top: parentFrame,
     parent: parentFrame,
     addEventListener(type, callback) {
-      listeners.set(type, callback);
+      const previous = listeners.get(type);
+      listeners.set(type, (event) => { previous?.(event); callback(event); });
     },
     setInterval(callback, delay) {
       timerId += 1;
@@ -299,11 +307,97 @@ async function triggerMenuCommand(environment, cmd, {
   await settle();
 }
 
+const launchDid = "did:key:z6Mka1b2c3";
+const didLaunchValues = [launchDid, "did:key:z", "did:key:z0OIl", `${launchDid}/path`,
+  `${launchDid}?q=1`, `${launchDid}#key`, ` ${launchDid}`, `${launchDid} `,
+  `${launchDid}\n`, `hello ${launchDid}`, "https://example.com"];
+
 async function runScenario(name) {
+  if (name.startsWith("did_launch_")) {
+    const value = didLaunchValues[Number(name.slice("did_launch_".length))];
+    const environment = setupEnvironment(name, [response(200, { profile_id: "did:key:zLocal" })]);
+    window.location.search += `&${new URLSearchParams({ did: value })}`;
+    await loadPeople();
+    await settle();
+    const input = environment.nodes.get("add-contact-id");
+    assert.equal(input.value, value === launchDid ? launchDid : "");
+    assert.equal(input.focusCount || 0, value === launchDid ? 1 : 0);
+    assert.equal(environment.calls.length, 1, "Launch navigation sends only the summary GET");
+    assert.equal(environment.calls[0].path, "/api/apps/people/summary");
+    return;
+  }
+  if (name === "did_navigation") {
+    const environment = setupEnvironment(name, [response(200, {})]);
+    await loadPeople();
+    await settle();
+    const input = environment.nodes.get("add-contact-id");
+    input.value = "draft";
+    const data = { type: "elastos.people.navigate/v1", homeToken: "people-test-token", query: { did: launchDid } };
+    const event = { source: environment.parentFrame, origin: "null", data };
+    const navigate = (message) => environment.listeners.get("message")(message);
+    const invalidEvents = [
+      { ...event, source: {} }, { ...event, origin: "https://foreign.example" },
+      { ...event, data: { ...data, homeToken: "wrong" } },
+      { ...event, data: { ...data, query: { did: launchDid, send: true } } },
+      ...didLaunchValues.slice(1).map(did => ({ ...event, data: { ...data, query: { did } } })),
+    ];
+    for (const invalid of invalidEvents) {
+      navigate(invalid);
+      assert.equal(input.value, "draft");
+      assert.equal(input.focusCount || 0, 0);
+    }
+    navigate(event);
+    assert.equal(input.value, "draft", "Navigation waits for Profile creation");
+    environment.replies.push(response(200, { profile_id: "did:key:zLocal" }));
+    await triggerMenuCommand(environment, "refresh");
+    assert.equal(input.value, launchDid);
+    assert.equal(input.focusCount, 1);
+    input.value = "edited draft";
+    for (const invalid of invalidEvents) {
+      navigate(invalid);
+      assert.equal(input.value, "edited draft");
+      assert.equal(input.focusCount, 1);
+    }
+    environment.replies.push(response(200, { profile_id: "did:key:zLocal" }));
+    await triggerMenuCommand(environment, "refresh");
+    assert.equal(input.value, "edited draft");
+    assert.equal(input.focusCount, 1);
+    navigate(event);
+    assert.equal(input.value, launchDid);
+    assert.equal(input.focusCount, 2);
+    assert(environment.calls.every(({ options }) => !options.method || options.method === "GET"), "Navigation sent a request");
+    assertRequestAuthority(environment);
+    return;
+  }
+  if (name === "home_people_navigation") {
+    const environment = setupEnvironment(name, []);
+    window.location.href = "http://localhost:61180/";
+    const version = "home-20260813a";
+    const { shellState } = await import(`../capsules/home-gui/browser/shell-core.js?v=${version}`);
+    const { openTarget } = await import(`../capsules/home-gui/browser/shell-windows.js?v=${version}`);
+    const sent = [];
+    const frame = { dataset: { route: "/apps/people/#home_token=current" },
+      contentWindow: { postMessage: (...args) => sent.push(args) } };
+    const entry = { id: "people-window", kind: "browser", targetId: "people",
+      node: { style: {}, querySelector: () => frame } };
+    shellState.currentSummary = { targets: [{ target: "people", window_policy: "single" }] };
+    shellState.windows.set(entry.id, entry);
+    openTarget("people", { query: { did: launchDid }, restoredPlacement: {} });
+    await settle();
+    assert.deepEqual(sent, [[{ type: "elastos.people.navigate/v1", homeToken: "current", query: { did: launchDid } }, "*"]]);
+    assert.equal(shellState.windows.size, 1, "DID navigation reuses the People window");
+    frame.dataset.route = "/apps/people/";
+    openTarget("people", { query: { did: "did:key:z6Mkd4e5f6" }, restoredPlacement: {} });
+    await settle();
+    assert.equal(sent.length, 1, "Navigation requires the current frame authority");
+    assert.equal(environment.calls.length, 0);
+    return;
+  }
   if (name === "request_delivery_detail") {
     const detail = "Contact requests can't be delivered right now.";
     const contacts = [
-      { contact_id: "contact:waiting", display_name: "Name not known yet", relationship: "requested", delivery_detail: detail },
+      { contact_id: "contact:waiting", display_name: "Name not known yet", relationship: "requested", delivery_detail: detail,
+        remote_profile_did: "did:key:z6Mka1b2c3" },
       { contact_id: "contact:normal", display_name: "Alma", relationship: "requested" },
       { contact_id: "contact:connected", display_name: "Bea", relationship: "connected", delivery_detail: detail },
       { contact_id: "contact:escaped", display_name: "Cy", relationship: "requested", delivery_detail: '<script>alert("fixture")</script>' },
@@ -315,6 +409,9 @@ async function runScenario(name) {
     const cards = markup.match(/<article[\s\S]*?<\/article>/g);
     assert.equal(cards.length, 4);
     assert.ok(cards[0].includes("Contact requests can&#039;t be delivered right now."), "Requested row lost its delivery detail");
+    assert.ok(cards[0].includes("Request sent"));
+    assert.match(cards[0], />Name not known yet</, "Unknown rows use the name supplied by Runtime");
+    assert.doesNotMatch(cards[0], /a1b2c3|…/, "Unknown rows must ignore unpublished DID fields");
     assert.ok(cards[1].includes("Request sent"));
     assert.ok(!cards[1].includes("delivered"), "Normal requested row invented a delivery failure");
     assert.ok(!cards[2].includes("delivered"), "Delivery detail belongs only to requested rows");
@@ -359,11 +456,16 @@ async function runScenario(name) {
       assert.equal(request.path, "/api/apps/people/contacts/request");
       assert.deepEqual(JSON.parse(request.options.body), { profile_id: "did:key:zRemoteProfile" });
     }
-    environment.replies.push(response(200, { status: "requested", display_name: "Name not known yet" }), ready());
-    node("add-contact-id").value = "did:key:zUnknown";
-    node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
-    await settle();
-    assert.equal(node("add-contact-result").textContent, "Name not known yet. Request sent. They'll see it in Inbox when their Home is online.");
+    for (const [status, ending] of [
+      ["requested", "They'll see it in Inbox when their Home is online."],
+      ["already_requested", "Waiting for them to accept."],
+    ]) {
+      environment.replies.push(response(200, { status, display_name: "Name not known yet" }), ready());
+      node("add-contact-id").value = "did:key:zUnknown";
+      node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
+      await settle();
+      assert.equal(node("add-contact-result").textContent, `Request sent. Name not known yet. ${ending}`);
+    }
     for (const [status, message] of [
       [400, "That isn't a DID. A DID starts with did:key:z."],
       [400, "That's this Home's device DID. Use the DID shown in People."],
@@ -379,6 +481,19 @@ async function runScenario(name) {
       assert.equal(node("add-contact-id").value, "bad input");
       assert.equal(node("add-contact-submit").disabled, false);
     }
+    for (const reply of [
+      { ok: false, status: 500, text: async () => "database secret" },
+      { ok: false, status: 401, text: async () => "launch token expired" },
+      () => { throw new Error("Failed to fetch"); },
+    ]) {
+      environment.replies.push(reply);
+      node("add-contact-id").value = "did:key:zRemote";
+      node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
+      await settle();
+      assert.equal(node("add-contact-result").textContent, "Could not send the request. Try again.");
+      assert.equal(node("add-contact-id").value, "did:key:zRemote");
+      assert.equal(node("add-contact-submit").disabled, false);
+    }
     let finish;
     environment.replies.push(() => new Promise(resolve => { finish = resolve; }), ready());
     node("add-contact-id").value = "did:key:zRemote";
@@ -387,9 +502,16 @@ async function runScenario(name) {
     node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
     assert.equal(environment.calls.length, count, "Two submits queued duplicate requests");
     assert.equal(node("add-contact-submit").disabled, true);
+    const nextDid = "did:key:z6Mkd4e5f6";
+    environment.listeners.get("message")({ source: environment.parentFrame, origin: "null", data: {
+      type: "elastos.people.navigate/v1", homeToken: "people-test-token", query: { did: nextDid },
+    } });
     finish(response(200, { status: "requested", display_name: "Alma" }));
     await settle();
     assert.equal(node("add-contact-submit").disabled, false);
+    assert.equal(node("add-contact-id").value, nextDid, "A DID opened during a send stays ready for a separate request");
+    assert.equal(environment.calls.length, count + 1, "Navigation sent an extra request");
+    assert.deepEqual(JSON.parse(environment.calls.at(-2).options.body), { profile_id: "did:key:zRemote" });
     assertRequestAuthority(environment);
     return;
   }
@@ -909,6 +1031,14 @@ async function runScenario(name) {
     assert.equal(environment.nodes.get("profile-name").disabled, false);
     assert.equal(environment.nodes.get("profile-submit").disabled, false);
     assertNoRawIdentityLeak(environment.nodes.get("people-status").textContent, "profile failure");
+    environment.replies.push(summary(null, discoverySummary(), {
+      profile: { display_name: "Saved Profile" },
+    }, "ready"));
+    await triggerMenuCommand(environment, "refresh");
+    environment.replies.push(response(500, { message: "Invalid did:key:zPrivate" }));
+    environment.nodes.get("profile-name").value = "Edited Profile";
+    await triggerProfileSubmit(environment);
+    assert.equal(environment.nodes.get("people-status").textContent, "Could not save your Profile. Try again.");
     return;
   }
 
@@ -983,6 +1113,9 @@ if (!scenario) {
   assert.match(peopleHtml, /id="profile-description">Your Profile is your signed identity for People and Chat\./);
   assert.match(peopleHtml, /id="profile-submit" type="submit">Create Profile/);
   for (const childScenario of [
+    ...didLaunchValues.map((_, index) => `did_launch_${index}`),
+    "did_navigation",
+    "home_people_navigation",
     "add_by_did",
     "request_delivery_detail",
     "configured",

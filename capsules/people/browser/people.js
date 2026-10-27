@@ -619,11 +619,7 @@ function reachabilityLabel(contact) {
 }
 
 function contactMarkup(contact) {
-  const displayName = readText(contact?.display_name);
-  const did = readText(contact?.remote_profile_did);
-  const name = displayName === "Name not known yet" && did
-    ? `${displayName} (…${did.slice(-6)})`
-    : displayName;
+  const name = readText(contact?.display_name);
   const relationship = relationshipLabel(contact?.relationship);
   const handle = readText(contact?.handle);
   const deliveryDetail = contact?.relationship === "requested" ? readText(contact.delivery_detail) : "";
