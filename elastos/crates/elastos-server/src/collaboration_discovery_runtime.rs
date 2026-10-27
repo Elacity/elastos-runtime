@@ -5757,6 +5757,265 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
+    /// Refreshes until this Home's relationship with `remote_profile_did`
+    /// becomes `expected`.
+    async fn wait_for_relationship(
+        service: &CollaborationDiscoveryService,
+        store: &CollaborationContactStore,
+        profile: &VerifiedCollaborationProfileDocument,
+        remote_profile_did: &str,
+        expected: CollaborationContactRelationship,
+    ) {
+        for _ in 0..30 {
+            let now = current_timestamp();
+            service.refresh(store, profile, now).await.unwrap();
+            let relationship = store
+                .read_only_snapshot()
+                .unwrap()
+                .relationship_with(remote_profile_did, now)
+                .unwrap();
+            if relationship == expected {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        panic!("timed out waiting for relationship {expected:?}");
+    }
+
+    /// Two Homes with Discovery off add each other by Profile DID through
+    /// the Community relay: a Decline cools the requester down but not the
+    /// decliner, whose reverse request is accepted. The relay restarts twice,
+    /// once with a request and once with a decision in flight.
+    #[tokio::test]
+    async fn contact_by_profile_did_with_discovery_off_declines_cools_down_and_reverses() {
+        let temp = tempfile::tempdir().unwrap();
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let seed_registry = Arc::new(ProviderRegistry::new());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
+        let seed_node = start_carrier_node_with_registry(
+            &seed_key,
+            &seed_did,
+            temp.path().join("seed"),
+            Some(Arc::downgrade(&seed_registry)),
+        )
+        .await
+        .unwrap();
+        seed_registry
+            .set_carrier_invoker(Arc::new(
+                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(
+                    seed_node.endpoint.clone(),
+                ),
+            ))
+            .await;
+        seed_registry
+            .register_sub_provider(
+                "peer",
+                Arc::new(CarrierGossipProvider::new(seed_node.gossip_state.clone())),
+            )
+            .await
+            .unwrap();
+        let seed_ticket = ticket_from_peer_provider(&seed_registry).await;
+        let seed_profile = signed_profile(NETWORK, &trusted, vec![seed_ticket.clone()]);
+        // Each (re)start is a fresh in-memory relay, as after a seed restart.
+        let start_relay = || {
+            let relay = Arc::new(CollaborationDiscoveryRelayProvider::new(
+                seed_profile.clone(),
+            ));
+            let registry = seed_registry.clone();
+            async move {
+                registry.register(relay.clone() as Arc<dyn Provider>).await;
+                relay
+            }
+        };
+        let relay = start_relay().await;
+
+        let (_a_registry, a_service, a_store, _a_node) = discovery_service(
+            &temp.path().join("a"),
+            &trusted,
+            &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
+            vec![seed_ticket.clone()],
+        )
+        .await;
+        let (_b_registry, b_service, b_store, _b_node) = discovery_service(
+            &temp.path().join("b"),
+            &trusted,
+            &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
+            vec![seed_ticket],
+        )
+        .await;
+        let a_profile = service_profile(&a_service, "Alma", Some("alma"));
+        let b_profile = service_profile(&b_service, "Bo", Some("bo"));
+        let a_did = a_profile.document().profile_did.clone();
+        let b_did = b_profile.document().profile_did.clone();
+        assert!(!a_store.discovery_enabled().unwrap());
+        assert!(!b_store.discovery_enabled().unwrap());
+
+        // Alma asks Bo by DID; the relay restarts before Bo reads it, and
+        // Alma's outbox delivers it again.
+        assert_eq!(
+            a_service
+                .send_profile_contact_request(&a_store, &b_did, &a_profile, current_timestamp())
+                .await
+                .unwrap(),
+            ProfileContactRequestOutcome::Requested
+        );
+        a_service
+            .refresh(&a_store, &a_profile, current_timestamp())
+            .await
+            .unwrap();
+        assert_eq!(
+            relay
+                .state
+                .lock()
+                .unwrap()
+                .profile_request_mailboxes
+                .get(&b_did)
+                .map(Vec::len),
+            Some(1)
+        );
+        let relay = start_relay().await;
+        a_service
+            .refresh(&a_store, &a_profile, current_timestamp())
+            .await
+            .unwrap();
+        let requests = wait_for_incoming_request(&b_service, &b_store, &b_profile, "Alma").await;
+        assert_eq!(requests.len(), 1);
+
+        // Bo declines; both sides see Declined.
+        b_service
+            .submit_contact_decision(
+                &b_store,
+                &b_profile,
+                requests[0].request_hash(),
+                CollaborationContactDecision::Declined,
+                current_timestamp(),
+            )
+            .await
+            .unwrap();
+        wait_for_relationship(
+            &b_service,
+            &b_store,
+            &b_profile,
+            &a_did,
+            CollaborationContactRelationship::Declined,
+        )
+        .await;
+        wait_for_relationship(
+            &a_service,
+            &a_store,
+            &a_profile,
+            &b_did,
+            CollaborationContactRelationship::Declined,
+        )
+        .await;
+
+        // Alma may ask again, and the relay delivers it once the device
+        // interval passes, but Bo's Home drops it during the cool-down.
+        assert_eq!(
+            a_service
+                .send_profile_contact_request(&a_store, &b_did, &a_profile, current_timestamp())
+                .await
+                .unwrap(),
+            ProfileContactRequestOutcome::Requested
+        );
+        let again = a_store
+            .outgoing_pending_requests(current_timestamp())
+            .unwrap()
+            .into_iter()
+            .find(|request| request.addressed_by_did && request.recipient_profile_did == b_did)
+            .unwrap()
+            .request_hash;
+        let mut delivered = false;
+        for _ in 0..100 {
+            a_service
+                .refresh(&a_store, &a_profile, current_timestamp())
+                .await
+                .unwrap();
+            delivered = relay
+                .state
+                .lock()
+                .unwrap()
+                .profile_request_mailboxes
+                .get(&b_did)
+                .is_some_and(|mailbox| mailbox.contains(&again));
+            if delivered {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(delivered, "the relay never received the second request");
+        let status = b_service
+            .refresh(&b_store, &b_profile, current_timestamp())
+            .await
+            .unwrap();
+        assert!(status.incoming_requests().is_empty());
+        let now = current_timestamp();
+        assert_eq!(
+            b_store
+                .read_only_snapshot()
+                .unwrap()
+                .relationship_with(&a_did, now)
+                .unwrap(),
+            CollaborationContactRelationship::Declined
+        );
+        assert_eq!(
+            a_store
+                .read_only_snapshot()
+                .unwrap()
+                .relationship_with(&b_did, now)
+                .unwrap(),
+            CollaborationContactRelationship::Requested
+        );
+
+        // The decliner is not cooled down: Bo asks Alma, Alma accepts, and
+        // the relay restarts while that decision waits in Alma's outbox.
+        assert_eq!(
+            b_service
+                .send_profile_contact_request(&b_store, &a_did, &b_profile, current_timestamp())
+                .await
+                .unwrap(),
+            ProfileContactRequestOutcome::Requested
+        );
+        b_service
+            .refresh(&b_store, &b_profile, current_timestamp())
+            .await
+            .unwrap();
+        let requests = wait_for_incoming_request(&a_service, &a_store, &a_profile, "Bo").await;
+        assert_eq!(requests.len(), 1);
+        a_service
+            .submit_contact_decision(
+                &a_store,
+                &a_profile,
+                requests[0].request_hash(),
+                CollaborationContactDecision::Accepted,
+                current_timestamp(),
+            )
+            .await
+            .unwrap();
+        let relay = start_relay().await;
+        a_service
+            .refresh(&a_store, &a_profile, current_timestamp())
+            .await
+            .unwrap();
+        let b_contacts = wait_for_contact_count(&b_service, &b_store, &b_profile, 1).await;
+        let a_contacts = a_store.snapshot().unwrap();
+        assert_eq!(a_contacts.contacts().len(), 1);
+        assert_eq!(
+            a_contacts.contacts()[0].conversation_id(),
+            b_contacts.contacts()[0].conversation_id()
+        );
+        assert_eq!(a_contacts.contacts()[0].remote_display_name(), "Bo");
+        assert_eq!(b_contacts.contacts()[0].remote_display_name(), "Alma");
+
+        // Discovery stayed off throughout: nobody was ever listed.
+        assert!(!a_store.discovery_enabled().unwrap());
+        assert!(!b_store.discovery_enabled().unwrap());
+        let state = relay.state.lock().unwrap();
+        assert!(state.advertisements.is_empty());
+        assert!(state.requests.is_empty());
+    }
+
         seed_registry
             .set_carrier_invoker(Arc::new(
                 crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(
