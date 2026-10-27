@@ -40,6 +40,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Marketplace keeps its title clear of Home window controls in narrow windows.
   Phone detail controls have full touch targets, and Tab skips closed detail
   content.
+- Archive's file list is readable in the dark theme.
 - In Assistant, Copy now copies: on a message (also while a reply is still
   arriving), on a code block and in the pasted-text editor. Before, it did
   nothing. Home asks you to confirm, then copies the text you sent, the reply as

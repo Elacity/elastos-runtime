@@ -22,6 +22,12 @@ assert(
   letterSpacingValues.length === 5 && letterSpacingValues.every((value) => value === "0"),
   "Archive UIUX must keep every letter-spacing declaration at 0.",
 );
+const styleBlock = source.match(/<style>([\s\S]*?)<\/style>/)?.[1] || "";
+assert(
+  styleBlock.includes("--panel: var(--el-surface-raised);") &&
+    !/#[0-9a-fA-F]{3,8}\b|\brgba?\(|\bwhite\b(?!-space)/.test(styleBlock),
+  "Archive styles must take every colour from the theme variables so the dark theme stays readable.",
+);
 assert(
   source.includes('const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";') &&
     !source.includes('params.get("home_token")'),
