@@ -8,6 +8,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Changed
 
+- Setup tries a component download once more, 5 seconds later, when the
+  source stops answering, so one stalled download no longer ends the install.
+  A download whose bytes fail their check is not tried again.
+
 - The app catalog is called Marketplace again everywhere: its Home title,
   window, menu and Assistant hints. Marketplace lists models in the same rows
   as other items: catalog models first, then models shared with you and

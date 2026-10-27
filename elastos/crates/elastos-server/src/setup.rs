@@ -4160,9 +4160,15 @@ fn first_party_carrier_bind_addr(
     )
 }
 
+/// The wait before the one retry of a component fetch that found the source
+/// unresponsive. Unit tests use a short wait.
+const FIRST_PARTY_FETCH_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 100 } else { 5_000 });
+
 /// The bytes of one admitted release row from the trusted source over Carrier,
 /// checked against the row's signed checksum and size. Component bytes are
-/// fetched only through an admitted row.
+/// fetched only through an admitted row. A failed transfer is retried once;
+/// bytes that fail the check are not.
 pub(crate) async fn fetch_first_party_component_via_carrier(
     data_dir: &Path,
     row: &crate::capsule_record::AdmittedRow,
@@ -4175,15 +4181,27 @@ pub(crate) async fn fetch_first_party_component_via_carrier(
         .cloned()
         .ok_or_else(missing_trusted_source_error)?;
     let bind_addr = first_party_carrier_bind_addr(data_dir, context)?;
-    let bytes = crate::carrier::fetch_file_from_trusted_source_bound(
-        &source,
-        info.cid.as_deref().filter(|cid| !cid.is_empty()),
-        release_path,
-        15,
-        bind_addr,
-        elastos_common::MAX_WHOLE_CONTENT_BYTES,
-    )
-    .await?;
+    let fetch = || {
+        crate::carrier::fetch_file_from_trusted_source_bound(
+            &source,
+            info.cid.as_deref().filter(|cid| !cid.is_empty()),
+            release_path,
+            15,
+            bind_addr,
+            elastos_common::MAX_WHOLE_CONTENT_BYTES,
+        )
+    };
+    let bytes = match fetch().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "  Download of {name} failed; retrying in {} s ({error:#})",
+                FIRST_PARTY_FETCH_RETRY_DELAY.as_secs_f32()
+            );
+            tokio::time::sleep(FIRST_PARTY_FETCH_RETRY_DELAY).await;
+            fetch().await?
+        }
+    };
     verify_release_bytes(name, &bytes, info)?;
     Ok(bytes)
 }

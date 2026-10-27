@@ -11629,6 +11629,81 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn setup_fetch_retries_once_after_a_stalled_pass() {
+        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .alpns(vec![CARRIER_ALPN.to_vec()])
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let address = wait_for_direct_endpoint_addr(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = TrustedSource {
+            name: "fixture".into(),
+            publisher_dids: vec![],
+            channel: "stable".into(),
+            discovery_uri: String::new(),
+            connect_ticket: encode_ticket_for(address),
+            gateways: vec![],
+            install_path: String::new(),
+            installed_version: String::new(),
+            head_cid: String::new(),
+            publisher_node_id: server.id().to_string(),
+            ipns_name: String::new(),
+        };
+        let mut sources = crate::sources::TrustedSourcesConfig::empty();
+        sources.default_source = source.name.clone();
+        sources.sources.push(source);
+        crate::sources::save_trusted_sources(dir.path(), &sources).unwrap();
+        let row = crate::capsule_record::AdmittedRow::for_test(
+            "artifact",
+            &serde_json::from_value(serde_json::json!({
+                "release_path": "artifact", "size": 7,
+                "checksum": format!("sha256:{:x}", Sha256::digest(b"fixture")),
+            }))
+            .unwrap(),
+        );
+
+        // One pass dials the ticket route, then the direct route. Both stall
+        // after the length header, past the idle deadline; the retry is served.
+        const STALLED: usize = 2;
+        let server_endpoint = server.clone();
+        let serving = tokio::spawn(async move {
+            for index in 0..=STALLED {
+                let conn = server_endpoint.accept().await.unwrap().await.unwrap();
+                tokio::spawn(async move {
+                    let (mut send, recv) = conn.accept_bi().await.unwrap();
+                    let mut request = String::new();
+                    BufReader::new(recv).read_line(&mut request).await.unwrap();
+                    let _ = send.write_all(&7u64.to_be_bytes()).await;
+                    if index == STALLED {
+                        send.write_all(b"fixture").await.unwrap();
+                        send.finish().unwrap();
+                    }
+                    conn.closed().await;
+                });
+            }
+        });
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::setup::fetch_first_party_component_via_carrier(
+                dir.path(),
+                &row,
+                crate::setup::FirstPartyCarrierContext::Setup,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes, b"fixture");
+        serving.await.unwrap();
+        server.close().await;
+    }
+
+    #[tokio::test]
     async fn carrier_terminal_install_fetches_signed_cid_before_release_name() {
         use sha2::Digest;
         let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
