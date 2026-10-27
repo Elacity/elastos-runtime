@@ -12814,6 +12814,22 @@ pub(crate) mod tests {
             }) {
                 return Err(ProviderError::Provider("fixture holder read failed".into()));
             }
+            // A whole read, as Home's shared-file get asks: the file when it
+            // fits the request's bound, as ipfs-provider answers.
+            if request["op"] == "cat" && request.get("whole_max_bytes").is_some() {
+                let path = request["path"].as_str().unwrap_or_default();
+                let max = request["whole_max_bytes"].as_u64().unwrap_or(0);
+                return Ok(match self.files.get(path) {
+                    Some(file) if file.len() as u64 <= max => serde_json::json!({
+                        "status": "ok",
+                        "data": { "data": base64::engine::general_purpose::STANDARD.encode(file) }
+                    }),
+                    Some(_) => serde_json::json!({"status":"error","code":"too_large",
+                        "message":"fixture file exceeds whole_max_bytes"}),
+                    None => serde_json::json!({"status":"error","code":"not_found",
+                        "message":"fixture path missing"}),
+                });
+            }
             if request["op"] != "cat" || request["bounded_read"] != true {
                 return Ok(serde_json::json!({"status":"error","code":"unbounded",
                     "message":"fixture holder serves bounded reads only"}));
@@ -12983,6 +12999,18 @@ pub(crate) mod tests {
         requests: Arc<StdMutex<Vec<serde_json::Value>>>,
         behavior: HolderBehavior,
     ) -> HolderRuntime {
+        let (sk, did) = elastos_identity::derive_did(&[seed; 32]);
+        start_content_holder_runtime_as(sk, did, files, requests, behavior).await
+    }
+
+    /// As `start_slow_content_holder_runtime`, under the device key `sk`.
+    pub(crate) async fn start_content_holder_runtime_as(
+        sk: ed25519_dalek::SigningKey,
+        did: String,
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+        requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+        behavior: HolderBehavior,
+    ) -> HolderRuntime {
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(ProviderRegistry::new());
         registry
@@ -13012,7 +13040,6 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let (sk, did) = elastos_identity::derive_did(&[seed; 32]);
         let node = start_isolated_carrier_node_with_registry(
             &sk,
             &did,
@@ -14383,6 +14410,286 @@ pub(crate) mod tests {
         let refused = invoke().await.unwrap_err().to_string();
         assert!(refused.ends_with(CARRIER_PEER_REFUSED), "{refused}");
         assert_eq!(recorded_content_ops(&fixture.remote_requests), ["fetch"]);
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    /// A receiving Home's kubo stand-in: `add_bytes` derives the CID from the
+    /// bytes it is given (CIDv1, raw, sha2-256); `pin` pins only an added CID.
+    #[derive(Default)]
+    pub(crate) struct ReceiverIpfs {
+        pub(crate) added: StdMutex<std::collections::BTreeMap<String, Vec<u8>>>,
+        pub(crate) pinned: StdMutex<std::collections::BTreeSet<String>>,
+    }
+
+    pub(crate) fn raw_bytes_cid(bytes: &[u8]) -> String {
+        cid::Cid::new_v1(
+            0x55,
+            cid::multihash::Multihash::<64>::wrap(0x12, Sha256::digest(bytes).as_slice()).unwrap(),
+        )
+        .to_string()
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ReceiverIpfs {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("raw operations only".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+        fn name(&self) -> &'static str {
+            "receiver-ipfs"
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            let cid = request["cid"].as_str().unwrap_or_default().to_string();
+            Ok(match request["op"].as_str() {
+                Some("add_bytes") => {
+                    assert_eq!(request["pin"], false, "an import adds unpinned first");
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(request["data"].as_str().unwrap())
+                        .unwrap();
+                    let cid = raw_bytes_cid(&bytes);
+                    self.added.lock().unwrap().insert(cid.clone(), bytes);
+                    serde_json::json!({ "status": "ok", "data": { "cid": cid } })
+                }
+                Some("pin") if self.added.lock().unwrap().contains_key(&cid) => {
+                    self.pinned.lock().unwrap().insert(cid);
+                    serde_json::json!({ "status": "ok", "data": {} })
+                }
+                Some("pin_status") => serde_json::json!({ "status": "ok", "data": {
+                    "pinned": self.pinned.lock().unwrap().contains(&cid)
+                }}),
+                _ => serde_json::json!({ "status": "error", "code": "unsupported",
+                    "message": "receiver fixture" }),
+            })
+        }
+    }
+
+    /// Makes `registry` a receiving Home: real Content over [`ReceiverIpfs`].
+    pub(crate) async fn register_shared_content_receiver(
+        registry: &Arc<ProviderRegistry>,
+        data_dir: &std::path::Path,
+    ) -> Arc<ReceiverIpfs> {
+        let ipfs = Arc::new(ReceiverIpfs::default());
+        registry
+            .register_sub_provider(
+                "content",
+                Arc::new(crate::content::ContentProvider::new(
+                    data_dir.to_path_buf(),
+                    Arc::downgrade(registry),
+                )),
+            )
+            .await
+            .unwrap();
+        registry
+            .register_sub_provider("ipfs", ipfs.clone())
+            .await
+            .unwrap();
+        ipfs
+    }
+
+    /// A sender's Home holding one file, reachable from `fixture`'s local node.
+    async fn shared_file_holder(
+        seed: u8,
+        fixture: &PeerDidRouteFixture,
+        bytes: Vec<u8>,
+        behavior: HolderBehavior,
+    ) -> (HolderRuntime, Arc<StdMutex<Vec<serde_json::Value>>>) {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let holder = start_slow_content_holder_runtime(
+            seed,
+            std::collections::BTreeMap::from([(String::new(), bytes)]),
+            requests.clone(),
+            behavior,
+        )
+        .await;
+        fixture
+            .local_node
+            .memory_lookup
+            .add_endpoint_info(holder.addr.clone());
+        (holder, requests)
+    }
+
+    #[tokio::test]
+    async fn home_get_shared_content_round_trips_one_mib_and_pins_its_exact_cid() {
+        let fixture = peer_did_route_fixture(190, 191).await;
+        let receiver =
+            register_shared_content_receiver(&fixture.local_registry, fixture._local_dir.path())
+                .await;
+        // 1 MiB crosses Carrier as 16 provider stream chunks of 64 KiB.
+        let bytes: Vec<u8> = (0..1u32 << 20)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let cid = raw_bytes_cid(&bytes);
+        let (holder, served) =
+            shared_file_holder(192, &fixture, bytes.clone(), HolderBehavior::default()).await;
+
+        let got = crate::content::get_shared_content_from_peer(
+            &fixture.local_registry,
+            &holder.did,
+            &cid,
+            "notes.bin",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(got, crate::content::SharedContentGet::Local);
+        let served = served.lock().unwrap().clone();
+        assert_eq!(served.len(), 1, "one whole read: {served:?}");
+        assert_eq!(served[0]["op"], "cat");
+        assert_eq!(served[0]["_runtime_invocation"]["transfer"], "stream");
+        assert_eq!(
+            served[0]["whole_max_bytes"],
+            crate::content::HOME_SHARED_CONTENT_MAX_BYTES
+        );
+        // The receiver's add reproduced the link's CID from the bytes it got.
+        assert_eq!(receiver.added.lock().unwrap().get(&cid), Some(&bytes));
+        assert!(receiver.pinned.lock().unwrap().contains(&cid));
+        assert!(crate::content::content_pinned_here(&fixture.local_registry, &cid).await);
+        shutdown_test_carrier_node(holder.node).await;
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn home_get_shared_content_pins_nothing_when_the_bytes_miss_the_cid() {
+        let fixture = peer_did_route_fixture(193, 194).await;
+        let receiver =
+            register_shared_content_receiver(&fixture.local_registry, fixture._local_dir.path())
+                .await;
+        let cid = raw_bytes_cid(b"the file the link names");
+        let (holder, _) = shared_file_holder(
+            195,
+            &fixture,
+            b"other bytes under that CID".to_vec(),
+            HolderBehavior::default(),
+        )
+        .await;
+
+        let got = crate::content::get_shared_content_from_peer(
+            &fixture.local_registry,
+            &holder.did,
+            &cid,
+            "notes.bin",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(got, crate::content::SharedContentGet::Mismatch);
+        assert!(receiver.pinned.lock().unwrap().is_empty());
+        assert!(!receiver.added.lock().unwrap().contains_key(&cid));
+        assert!(!crate::content::content_pinned_here(&fixture.local_registry, &cid).await);
+        shutdown_test_carrier_node(holder.node).await;
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn home_get_shared_content_reports_an_offline_sender_within_its_connect_budget() {
+        let fixture = peer_did_route_fixture(196, 197).await;
+        let receiver =
+            register_shared_content_receiver(&fixture.local_registry, fixture._local_dir.path())
+                .await;
+        // The sender's Home was reachable at this address and has stopped.
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        let cid = raw_bytes_cid(b"a file on a stopped Home");
+
+        let started = std::time::Instant::now();
+        let got = crate::content::get_shared_content_from_peer(
+            &fixture.local_registry,
+            &fixture.remote_did,
+            &cid,
+            "notes.bin",
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(got, crate::content::SharedContentGet::SenderOffline);
+        assert!(
+            elapsed < Duration::from_millis(6_500),
+            "offline is reported at the 5 s connect budget, not the reply wait: {elapsed:?}"
+        );
+        assert!(receiver.added.lock().unwrap().is_empty());
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn home_get_shared_content_times_out_at_its_reply_wait() {
+        let fixture = peer_did_route_fixture(198, 199).await;
+        let receiver =
+            register_shared_content_receiver(&fixture.local_registry, fixture._local_dir.path())
+                .await;
+        let bytes = b"a file its sender's Home is slow to read".to_vec();
+        let cid = raw_bytes_cid(&bytes);
+        let (holder, _) = shared_file_holder(
+            200,
+            &fixture,
+            bytes,
+            HolderBehavior {
+                delay: Duration::from_secs(4),
+                ..HolderBehavior::default()
+            },
+        )
+        .await;
+
+        let started = std::time::Instant::now();
+        let got = crate::content::get_shared_content_from_peer(
+            &fixture.local_registry,
+            &holder.did,
+            &cid,
+            "notes.bin",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(got, crate::content::SharedContentGet::Timeout);
+        assert!(
+            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_millis(3_000),
+            "the answer wait ends at 1 s: {elapsed:?}"
+        );
+        assert!(receiver.added.lock().unwrap().is_empty());
+        shutdown_test_carrier_node(holder.node).await;
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn home_get_shared_content_is_not_shared_once_the_sender_unpins() {
+        let fixture = peer_did_route_fixture(201, 202).await;
+        let receiver =
+            register_shared_content_receiver(&fixture.local_registry, fixture._local_dir.path())
+                .await;
+        fixture
+            .remote_pinned
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let cid = raw_bytes_cid(b"an unpublished file");
+
+        let got = crate::content::get_shared_content_from_peer(
+            &fixture.local_registry,
+            &fixture.remote_did,
+            &cid,
+            "notes.bin",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(got, crate::content::SharedContentGet::NotShared);
+        assert!(recorded_content_ops(&fixture.remote_requests).is_empty());
+        assert!(receiver.added.lock().unwrap().is_empty());
         shutdown_test_carrier_node(fixture.remote_node).await;
         shutdown_test_carrier_node(fixture.local_node).await;
     }

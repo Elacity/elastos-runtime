@@ -2914,6 +2914,151 @@ async fn test_chat_room_configured_send_asks_a_fast_sender_to_slow_down() {
     assert_eq!(replay.status(), StatusCode::OK);
 }
 
+/// This Home's Content: records each request and publishes under one CID.
+struct RecordingPublishContent {
+    requests: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for RecordingPublishContent {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider("raw requests only".into()))
+    }
+    fn schemes(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+    fn name(&self) -> &'static str {
+        "recording-publish-content"
+    }
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        self.requests.lock().unwrap().push(request.clone());
+        Ok(json!({ "status": "ok", "data": {
+            "cid": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+        }}))
+    }
+}
+
+#[tokio::test]
+async fn community_upload_finish_pins_the_file_here_then_posts_its_link() {
+    const CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_profile(dir.path(), "owner");
+    let port = crate::collaboration_product::test_chat_product_port(
+        dir.path(),
+        "file-network",
+        "file-community",
+    );
+    let content = Arc::new(RecordingPublishContent {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("content", content.clone())
+        .await
+        .unwrap();
+    let mut state = test_state(dir.path());
+    state.collaboration_chat_product_port = Some(port.clone());
+    state.provider_registry = Some(registry);
+    let app = gateway_router(state);
+    let token =
+        projection_launch_token_for_authority_context(dir.path(), CHAT_ROOM_CAPSULE_ID, &authority);
+    let call = |uri: String, body: Body, offset: Option<&'static str>| {
+        let mut request = test_browser_request("localhost:61180", "null")
+            .method("POST")
+            .uri(uri)
+            .header("x-elastos-home-token", token.as_str());
+        if let Some(offset) = offset {
+            request = request.header("x-elastos-upload-offset", offset);
+        } else {
+            request = request.header(CONTENT_TYPE, "application/json");
+        }
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request.body(body).unwrap()).await.unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        }
+    };
+
+    let (status, body) = call(
+        "/api/apps/chat-room/upload/start".into(),
+        Body::from(r#"{"file_name":"notes\n.txt","mime_type":"text/plain","size_bytes":4}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let upload_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["upload_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) = call(
+        format!("/api/apps/chat-room/upload/{upload_id}/chunk"),
+        Body::from("abcd"),
+        Some("0"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(content.requests.lock().unwrap().is_empty());
+
+    let finish = || {
+        call(
+            format!("/api/apps/chat-room/upload/{upload_id}/finish"),
+            Body::empty(),
+            None,
+        )
+    };
+    let (status, body) = finish().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        json!({ "cid": CID, "name": "notes.txt", "size_bytes": 4 })
+    );
+    // Published once, pinned on this Home only, as this principal.
+    let requests = content.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0]["op"], "publish");
+    assert_eq!(requests[0]["pin"], true);
+    assert_eq!(
+        requests[0]["availability_policy"],
+        crate::content::LOCAL_PIN_AVAILABILITY_POLICY
+    );
+    assert_eq!(requests[0]["data"], "YWJjZA==");
+    assert_eq!(
+        requests[0]["publisher_did"],
+        authority.principal_id.as_str()
+    );
+
+    // The link is posted as one ordinary Text message.
+    let (status, body) = call(
+        "/api/apps/chat-room/poll".into(),
+        Body::from(r#"{"since":0}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let poll: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let objects = poll["objects"].as_array().unwrap();
+    assert_eq!(objects.len(), 1, "{objects:?}");
+    assert_eq!(objects[0]["kind"], "text");
+    assert_eq!(
+        objects[0]["body"],
+        format!("notes.txt · 4 bytes · elastos://{CID}")
+    );
+    assert!(objects[0].get("attachment").is_none_or(|a| a.is_null()));
+    assert_eq!(port.test_live_unresolved_outgoing().unwrap(), 1);
+
+    // The staged bytes are gone: the same upload cannot post twice.
+    let (status, _) = finish().await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(content.requests.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn configured_inbox_refuses_legacy_room_decisions_before_mutation() {
     let dir = tempfile::tempdir().unwrap();

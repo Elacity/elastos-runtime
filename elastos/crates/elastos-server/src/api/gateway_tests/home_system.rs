@@ -13068,3 +13068,228 @@ async fn home_external_link_names_the_launched_app_and_the_exact_address() {
         home_external_link_raw(&app, "http://localhost:61180", &home_token, extra).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+/// Posts as the Home shell (Home's own origin) and parses a JSON answer.
+async fn home_shared_content_post(
+    app: &axum::Router,
+    home_token: &str,
+    route: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri(route)
+                .header("x-elastos-home-token", home_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body)),
+    )
+}
+
+/// Alice's Home gets a file her contact Bob linked in Community, straight
+/// from Bob's Home over Carrier: check, then one get per check id, under
+/// Home-shell authority only, and only the exact bytes of the linked CID.
+#[tokio::test]
+async fn home_shared_content_check_then_get_fetches_a_contacts_linked_file_once() {
+    const CHECK: &str = "/api/apps/home/shared-content/check";
+    const GET: &str = "/api/apps/home/shared-content/get";
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice =
+        services_contact_fixture(alice_dir.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(bob_dir.path(), "Bob", bus.clone(), network).await;
+    accept_services_contact_pair(&alice, &bob);
+
+    // Bob's Home holds the file; Alice's Home reaches it by Bob's device DID.
+    let bytes = vec![7u8; 1024];
+    let cid = crate::carrier::tests::raw_bytes_cid(&bytes);
+    let (_, bob_device_did) = elastos_identity::load_or_create_did(bob_dir.path()).unwrap();
+    let bob_home = crate::carrier::tests::start_content_holder_runtime_as(
+        ed25519_dalek::SigningKey::from_bytes(&bob.device_key.to_bytes()),
+        bob_device_did,
+        std::collections::BTreeMap::from([(String::new(), bytes.clone())]),
+        Arc::new(std::sync::Mutex::new(Vec::new())),
+        crate::carrier::tests::HolderBehavior::default(),
+    )
+    .await;
+    let alice_node_dir = tempfile::tempdir().unwrap();
+    let (alice_sk, alice_did) = elastos_identity::derive_did(&[203; 32]);
+    let alice_node = crate::carrier::start_isolated_carrier_node_with_registry(
+        &alice_sk,
+        &alice_did,
+        alice_node_dir.path().to_path_buf(),
+        Some(Arc::downgrade(&alice.registry)),
+    )
+    .await
+    .unwrap();
+    alice
+        .registry
+        .set_carrier_invoker(Arc::new(
+            crate::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                alice_node.endpoint.clone(),
+                Arc::downgrade(&alice.registry),
+            ),
+        ))
+        .await;
+    alice_node
+        .memory_lookup
+        .add_endpoint_info(bob_home.addr.clone());
+    let received =
+        crate::carrier::tests::register_shared_content_receiver(&alice.registry, alice_dir.path())
+            .await;
+
+    // Community rows on Alice's Home: Bob links three files, Carol (not a
+    // contact) links one.
+    let port = crate::collaboration_product::test_chat_product_port(
+        alice_dir.path(),
+        "file-network",
+        "file-community",
+    );
+    let card =
+        |profile: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument| {
+            crate::room_service::RoomProfileCardView {
+                schema: "elastos.profile-card/v1".to_string(),
+                profile_id: profile.document().profile_did.clone(),
+                display_name: profile.document().display_name.clone(),
+                handle: None,
+                updated_at: profile.document().updated_at,
+            }
+        };
+    let carol = port.test_person_profile("Carol", None);
+    let post = |n: u8, sender: &crate::room_service::RoomProfileCardView, body: &str| {
+        crate::room_service::project_collaboration_text(
+            alice_dir.path(),
+            ("file-network", "file-community"),
+            &format!("sha256:{}", hex::encode([n; 32])),
+            sender,
+            body,
+            now_ts(),
+            crate::room_service::CollaborationTextOrigin::Incoming,
+        )
+        .unwrap()
+        .message_id
+        .unwrap()
+    };
+    let other_cid = crate::carrier::tests::raw_bytes_cid(b"a file Bob never had");
+    let shared = post(
+        1,
+        &card(&bob.profile),
+        &format!("notes.bin · 1.0 KB · elastos://{cid}"),
+    );
+    let expiring = post(
+        2,
+        &card(&bob.profile),
+        &format!("old.bin · 20 bytes · elastos://{other_cid}"),
+    );
+    let from_carol = post(3, &card(&carol), &format!("see elastos://{cid}"));
+
+    let mut state = test_state(alice_dir.path());
+    state.collaboration_discovery_service = Some(alice.discovery_service.clone());
+    state.provider_registry = Some(alice.registry.clone());
+    state.collaboration_chat_product_port = Some(port);
+    let app = gateway_router(state);
+    let home_token = alice.authority.home_token.clone();
+    let chat_token = projection_launch_token_for_authority_context(
+        alice_dir.path(),
+        CHAT_ROOM_CAPSULE_ID,
+        &alice.authority,
+    );
+    let check = |cid: &str, message_id: &str| {
+        json!({
+            "schema": "elastos.home.shared-content.check/v1",
+            "app_token": chat_token,
+            "uri": format!("elastos://{cid}"),
+            "source": { "conversation_id": "file-community", "message_id": message_id },
+        })
+    };
+
+    // A message from someone who is not a contact: nothing to get.
+    let (status, body) =
+        home_shared_content_post(&app, &home_token, CHECK, check(&cid, &from_carol)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "not_contact");
+    assert_eq!(body["sender_display_name"], "Carol");
+    assert!(body.get("check_id").is_none());
+
+    // A CID the cited message does not carry is refused.
+    let (status, body) =
+        home_shared_content_post(&app, &home_token, CHECK, check(&other_cid, &shared)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Bob is a contact. With no presence record the check says so, and get is
+    // still allowed.
+    let (status, body) =
+        home_shared_content_post(&app, &home_token, CHECK, check(&cid, &shared)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "sender_offline");
+    assert_eq!(body["sender_display_name"], "Bob");
+    assert_eq!(body["size_bytes"], 1024);
+    let check_id = body["check_id"].as_str().unwrap().to_string();
+
+    // Get is Home-shell authority only: the app's own token is refused, and
+    // the refusal does not spend the check.
+    let get = json!({ "check_id": check_id });
+    let (status, _) = home_shared_content_post(&app, &chat_token, GET, get.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(received.added.lock().unwrap().is_empty());
+
+    let (status, body) = home_shared_content_post(&app, &home_token, GET, get.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "state": "local" }));
+    assert_eq!(received.added.lock().unwrap().get(&cid), Some(&bytes));
+    assert!(received.pinned.lock().unwrap().contains(&cid));
+
+    // The check id is single-use.
+    let (status, _) = home_shared_content_post(&app, &home_token, GET, get).await;
+    assert_eq!(status, StatusCode::GONE);
+    // Now the file is here.
+    let (status, body) =
+        home_shared_content_post(&app, &home_token, CHECK, check(&cid, &shared)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "local");
+    assert!(body.get("check_id").is_none());
+
+    // A check id lasts 120 s.
+    let fresh_check = |app: axum::Router| {
+        let (home_token, request) = (home_token.clone(), check(&other_cid, &expiring));
+        async move {
+            let (status, body) = home_shared_content_post(&app, &home_token, CHECK, request).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["check_id"].as_str().unwrap().to_string()
+        }
+    };
+    let expired = fresh_check(app.clone()).await;
+    super::super::gateway_home_shared_content::age_shared_content_check_for_test(&expired, 120);
+    let (status, _) =
+        home_shared_content_post(&app, &home_token, GET, json!({ "check_id": expired })).await;
+    assert_eq!(status, StatusCode::GONE);
+    let live = fresh_check(app.clone()).await;
+    super::super::gateway_home_shared_content::age_shared_content_check_for_test(&live, 118);
+    // Redeemed: Bob's Home answers with bytes that are not this CID, so
+    // nothing is kept.
+    let (status, body) =
+        home_shared_content_post(&app, &home_token, GET, json!({ "check_id": live })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "state": "mismatch" }));
+    assert!(!received.pinned.lock().unwrap().contains(&other_cid));
+
+    crate::carrier::tests::shutdown_test_carrier_node(bob_home.node).await;
+    crate::carrier::tests::shutdown_test_carrier_node(alice_node).await;
+}

@@ -79,6 +79,18 @@ fn redeem_check(
         .then_some(check)
 }
 
+/// Moves one open check `secs` closer to its expiry, as if that much time had
+/// passed since `check` issued it.
+#[cfg(test)]
+pub(super) fn age_shared_content_check_for_test(check_id: &str, secs: u64) {
+    let mut checks = open_checks().lock().unwrap_or_else(|err| err.into_inner());
+    for (id, check) in checks.iter_mut() {
+        if id == check_id {
+            check.expires_at -= secs;
+        }
+    }
+}
+
 /// One `get` at a time per Home; dropping the guard (also on cancel) frees it.
 struct GetInFlight(std::path::PathBuf);
 
