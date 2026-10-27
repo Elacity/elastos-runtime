@@ -95,7 +95,7 @@ function directConversation() {
 
 function historyMessage(seq, text, createdAt) {
   return {
-    seq, message_id: `sha256:message-${seq}`, sender: "Fixture Friend", sender_profile_verified: true,
+    seq, conversation_id: "test-conversation", message_id: `sha256:message-${seq}`, sender: "Fixture Friend", sender_profile_verified: true,
     from_current_session: false, kind: "text", body: text,
     created_at: Math.floor(Date.parse(createdAt) / 1000),
   };
@@ -1027,7 +1027,7 @@ async function runScenario(scenario) {
       const link = frame.locator('[data-seq="1"] a[data-open-uri]');
       await link.waitFor({ timeout: 5000 });
       assert(await link.getAttribute('href') === null, "shared link navigates Chat");
-      assert(await link.getAttribute('data-message-ref') === 'shared/sha256:message-1', "message reference missing");
+      assert(await link.getAttribute('data-message-ref') === 'test-conversation/sha256:message-1', "message reference missing");
       for (const gesture of ['click', 'Enter', ' ']) {
         if (gesture === 'click') await link.click(); else { await link.focus(); await link.press(gesture); }
         await page.locator('#shared-sheet').waitFor({ state: 'visible' });
@@ -1039,7 +1039,7 @@ async function runScenario(scenario) {
       }
       assert(trace.sharedChecks.every(check => check.token === 'home-authority'
         && JSON.stringify(check.body) === JSON.stringify({ schema: 'elastos.home.shared-content.check/v1', app_token: 'test-token', uri: sharedUri,
-          source: { conversation_id: 'shared', message_id: 'sha256:message-1' } })), "check contract differs", trace.sharedChecks);
+          source: { conversation_id: 'test-conversation', message_id: 'sha256:message-1' } })), "check contract differs", trace.sharedChecks);
       await frame.locator('[data-seq="2"] a[data-open-uri]').click();
       await page.locator('#shared-sheet').waitFor({ state: 'visible' });
       await page.waitForTimeout(600); await page.locator('#open').click();
@@ -1049,7 +1049,7 @@ async function runScenario(scenario) {
       const dm = frame.locator('a[data-open-uri]'); await dm.waitFor();
       await dm.press('Enter'); await page.locator('#shared-sheet').waitFor({ state: 'visible' });
       const dmSource = trace.sharedChecks.at(-1).body.source;
-      assert(dmSource.conversation_id === 'direct:sha256:fixture-conversation' && !!dmSource.message_id, "DM reference missing", dmSource);
+      assert(dmSource.conversation_id === 'direct:sha256:fixture-conversation' && dmSource.message_id === 'message:fixture-direct', "DM reference missing", dmSource);
       assert(await frame.locator('#attach-button').isDisabled(), "DM Attach is enabled");
       return;
     }

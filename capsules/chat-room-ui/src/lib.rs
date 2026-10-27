@@ -343,6 +343,8 @@ struct ConversationObjectView {
     seq: u64,
     #[serde(default)]
     message_id: Option<String>,
+    #[serde(default)]
+    conversation_id: Option<String>,
     sender: String,
     /// Opaque reference to the sender's profile card, when Runtime has one.
     #[serde(default)]
@@ -362,6 +364,16 @@ struct ConversationObjectView {
     created_at: u64,
     #[serde(default)]
     delivery_state: Option<CommunityDeliveryState>,
+}
+
+impl ConversationObjectView {
+    fn message_reference(&self) -> Option<String> {
+        Some(format!(
+            "{}/{}",
+            self.conversation_id.as_deref()?,
+            self.message_id.as_deref()?
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -3127,7 +3139,7 @@ impl App {
             return Err("Open a new Library picker in the current conversation.".to_string());
         }
         validate_attachment_size(bytes.len() as u64)?;
-        let configured = self.state.borrow().transport.configured;
+        let configured = self.state.borrow().collaboration_configured;
         let headers = self.room_request_headers();
         let start: AttachmentUploadStartResponse = api_post_session_json(
             &self.room_api_url("/upload/start"),
@@ -4268,8 +4280,8 @@ impl App {
         set_hidden(&self.attach_button, !direct_mode && !controls.show_attach)?;
         if let Some(public_note) = self.document.get_element_by_id("community-files-public") {
             set_hidden(
-                &public_note,
-                direct_mode || !state.transport.configured || !controls.show_attach,
+                &public_note.dyn_into::<HtmlElement>()?,
+                direct_mode || !state.collaboration_configured || !controls.show_attach,
             )?;
         }
         self.attach_button
@@ -5024,10 +5036,7 @@ impl App {
             self.append_day_separator_if_new(&mut last_day, object.created_at)?;
             let item = self.document.create_element("li")?;
             item.set_attribute("data-seq", &object.seq.to_string())?;
-            let message_ref = object
-                .message_id
-                .as_deref()
-                .map(|id| format!("shared/{id}"));
+            let message_ref = object.message_reference();
             if let Some(message_ref) = &message_ref {
                 item.set_attribute("data-message-ref", message_ref)?;
             }
@@ -6548,6 +6557,7 @@ mod tests {
         use super::CommunityDeliveryState::{Accepted, Expired, Sending, Unknown};
         let object = |seq, is_own| ConversationObjectView {
             message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq,
             sender: if is_own { "Local" } else { "Peer" }.into(),
@@ -6825,6 +6835,7 @@ mod tests {
     fn attachment_object(seq: u64, attachment_id: Option<&str>) -> ConversationObjectView {
         ConversationObjectView {
             message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq,
             created_at: 100 + seq,
@@ -6932,6 +6943,7 @@ mod tests {
     fn recovered_history_changes_display_order_without_rewinding_poll_cursor() {
         let object = |seq, created_at| ConversationObjectView {
             message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq,
             created_at,
@@ -7001,6 +7013,7 @@ mod tests {
         state.session_active = true;
         state.objects.push(ConversationObjectView {
             message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq: 1,
             created_at: 100,
@@ -7195,6 +7208,7 @@ mod tests {
     fn a_late_community_send_does_not_move_a_direct_reader() {
         let sent = || ConversationObjectView {
             message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq: 7,
             sender: "Me".into(),
@@ -7223,6 +7237,7 @@ mod tests {
     fn a_shared_send_keeps_the_poll_cursor_until_intervening_peer_rows_arrive() {
         let object = |seq, sender: &str| ConversationObjectView {
             message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq,
             sender: sender.into(),
@@ -7263,6 +7278,7 @@ mod tests {
     fn a_late_community_receipt_keeps_one_object_and_the_newer_poll_cursor() {
         let object = |seq, sender: &str, body: &str| ConversationObjectView {
             message_id: None,
+            conversation_id: None,
             delivery_state: None,
             seq,
             sender: sender.into(),
@@ -7520,9 +7536,58 @@ mod tests {
     }
 
     #[test]
+    fn community_link_cites_the_conversation_from_its_row() {
+        let uri = "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+        for conversation in ["file-community", "another-community"] {
+            let poll = serde_json::json!({
+                "room_slug": "chat-room", "display_name": "Me", "latest_seq": 7,
+                "objects": [{
+                    "seq": 7, "conversation_id": conversation, "message_id": "sha256:message",
+                    "sender": "Alma", "kind": "text", "body": uri, "created_at": 1,
+                }],
+            });
+            let polled: super::RoomPollView = serde_json::from_value(poll.clone()).unwrap();
+            let started: super::ShellSessionStartOutput =
+                serde_json::from_value(serde_json::json!({ "poll": poll })).unwrap();
+            for row in [&polled.objects[0], &started.poll.objects[0]] {
+                let request = super::shared_file_request(
+                    Some("launch"),
+                    uri,
+                    row.message_reference().as_deref(),
+                )
+                .unwrap();
+                assert_eq!(
+                    request["source"],
+                    serde_json::json!({
+                        "conversation_id": conversation, "message_id": "sha256:message",
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_and_incomplete_rows_do_not_invent_a_message_reference() {
+        for ids in [
+            serde_json::json!({}),
+            serde_json::json!({ "message_id": "sha256:message" }),
+            serde_json::json!({ "conversation_id": "file-community" }),
+        ] {
+            let mut row = serde_json::json!({
+                "seq": 7, "sender": "Alma", "kind": "text", "body": "Hello", "created_at": 1,
+            });
+            row.as_object_mut()
+                .unwrap()
+                .extend(ids.as_object().unwrap().clone());
+            let row: ConversationObjectView = serde_json::from_value(row).unwrap();
+            assert_eq!(row.message_reference(), None);
+        }
+    }
+
+    #[test]
     fn shared_file_request_keeps_the_server_message_reference() {
         let uri = "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
-        for conversation in ["shared", "direct:sha256:conversation"] {
+        for conversation in ["file-community", "direct:sha256:conversation"] {
             let reference = format!("{conversation}/sha256:message");
             assert_eq!(
                 super::shared_file_request(Some("launch"), uri, Some(&reference)),
@@ -7540,8 +7605,8 @@ mod tests {
             .unwrap()
             .get("source")
             .is_none());
-        assert!(super::shared_file_request(None, uri, Some("shared/message")).is_none());
-        assert!(super::shared_file_request(Some("launch"), uri, Some("shared/")).is_none());
+        assert!(super::shared_file_request(None, uri, Some("file-community/message")).is_none());
+        assert!(super::shared_file_request(Some("launch"), uri, Some("file-community/")).is_none());
         assert!(super::shared_file_request(Some("launch"), &format!(" {uri}"), None).is_none());
         assert!(super::shared_file_request(Some("launch"), &format!("{uri} "), None).is_none());
         let nodes = message_text_nodes(uri, true);
@@ -8097,6 +8162,7 @@ mod tests {
 
         let object = ConversationObjectView {
             message_id: None,
+            conversation_id: None,
             delivery_state: None,
             sender_ref: None,
             seq: 1,
@@ -8167,6 +8233,7 @@ mod tests {
             objects: vec![
                 ConversationObjectView {
                     message_id: None,
+                    conversation_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 1,
@@ -8182,6 +8249,7 @@ mod tests {
                 },
                 ConversationObjectView {
                     message_id: None,
+                    conversation_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 2,
@@ -8197,6 +8265,7 @@ mod tests {
                 },
                 ConversationObjectView {
                     message_id: None,
+                    conversation_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 3,
@@ -8212,6 +8281,7 @@ mod tests {
                 },
                 ConversationObjectView {
                     message_id: None,
+                    conversation_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 4,

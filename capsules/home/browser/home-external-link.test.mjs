@@ -120,7 +120,7 @@ test('web links keep their existing guarded synchronous opening', () => {
 const { requestHomeSharedContent } = await import('./home-external-link.js');
 const context = { kind: 'app-frame', targetId: 'chat-room', homeToken: 'launch' };
 const message = () => ({ type: 'home:open-uri', uri, homeToken: 'launch',
-  source: { conversation_id: 'shared', message_id: 'sha256:message' } });
+  source: { conversation_id: 'file-community', message_id: 'sha256:message' } });
 test('the Home handoff checks the exact source with launch authority and gets with Home authority', async () => {
   const h = harness(), calls = [];
   const fetchJson = async (route, init) => { calls.push({ route, ...init, body: JSON.parse(init.body) });
@@ -143,7 +143,7 @@ test('the Home handoff refuses extra fields, malformed source and unauthorized a
     [context, { ...message(), preferredViewer: 'documents' }],
     [context, { ...message(), source: { ...message().source, cid } }],
     [context, { ...message(), source: null }], [context, { ...message(), source: [] }],
-    [context, { ...message(), source: { conversation_id: 'shared', message_id: '' } }],
+    [context, { ...message(), source: { conversation_id: 'file-community', message_id: '' } }],
     [context, { ...message(), homeToken: 'wrong' }],
     [{ ...context, targetId: 'documents' }, message()],
     [{ ...context, targetId: 'wallet' }, message()], [{ ...context, kind: 'shell-frame' }, message()],
