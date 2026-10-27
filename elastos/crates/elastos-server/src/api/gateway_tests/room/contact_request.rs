@@ -1,27 +1,103 @@
 use super::super::home_system::{
-    configured_discovery_network_profile_for_test, home_test_post_json,
+    configured_discovery_network_profile_for_test, home_test_get_json, home_test_post_json,
     signed_discovery_message_for_test, TestCollaborationMessageScope,
 };
 use super::*;
 use elastos_runtime::signature::{generate_keypair, SigningKey};
 
 const NETWORK: &str = "gateway-chat-contact-request";
+const CONVERSATION: &str = "community";
 const CONTACT_REQUEST_PATH: &str = "/api/apps/chat-room/contacts/request";
+const PROFILE_ID_PATH: &str = "/api/apps/chat-room/contacts/profile-id";
+const PEOPLE_REQUEST_PATH: &str = "/api/apps/people/contacts/request";
+const NOT_LISTED: &str = "This person is no longer listed in Community.";
 
-/// A Home with a Profile, a Discovery service and a remote Profile whose
-/// signed advertisement the tests can make visible. No relay is reachable.
+/// A Home with a Profile, a Discovery service and configured Chat, in whose
+/// Community a remote person has posted, so Chat lists them. Their signed
+/// Discovery advertisement can be made visible. No relay is reachable.
 struct ContactRequestHome {
     dir: tempfile::TempDir,
     app: Router,
     authority: TestPasskeyAuthority,
     service: crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    chat: crate::collaboration_product::CollaborationChatProductPort,
     store: crate::collaboration_contact_store::CollaborationContactStore,
     local_profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
-    remote_profile_did: String,
-    remote_advertisement: Vec<u8>,
+    remote: RemotePerson,
     chat_context: HomeLaunchTokenContext,
     chat_token: String,
     now: u64,
+}
+
+/// A person on another Home. Their Profile authorizes that Home's Chat
+/// device and a second device that signs their Discovery advertisement.
+struct RemotePerson {
+    dir: tempfile::TempDir,
+    chat: crate::collaboration_product::CollaborationChatProductPort,
+    profile: crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+    advertisement: Vec<u8>,
+}
+
+impl RemotePerson {
+    fn new(display_name: &str, now: u64) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let chat =
+            crate::collaboration_product::test_chat_product_port(dir.path(), NETWORK, CONVERSATION);
+        let (device_key, _) = generate_keypair();
+        let device_key = SigningKey::from_bytes(&device_key.to_bytes());
+        let (profile_key, _) = generate_keypair();
+        let profile = crate::collaboration_profile_authority::signed_profile_document_for_test(
+            &SigningKey::from_bytes(&profile_key.to_bytes()),
+            display_name,
+            None,
+            1,
+            None,
+            now,
+            vec![
+                chat.test_core().test_local_device_did(),
+                crate::crypto::encode_signing_key_did(&device_key),
+            ],
+        )
+        .unwrap();
+        let advertisement = signed_discovery_message_for_test(
+            &device_key,
+            &profile.document().profile_did,
+            TestCollaborationMessageScope {
+                network_id: NETWORK,
+                conversation_id:
+                    crate::collaboration_discovery::COLLABORATION_DISCOVERY_DIRECTORY_ID,
+            },
+            elastos_common::collaboration_protocol::CollaborationRecipient {
+                kind:
+                    elastos_common::collaboration_protocol::CollaborationRecipientKind::Conversation,
+                id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_DIRECTORY_ID
+                    .to_string(),
+            },
+            crate::collaboration_discovery::COLLABORATION_DISCOVERY_ADVERTISEMENT_PAYLOAD_TYPE,
+            serde_json::to_value(
+                crate::collaboration_discovery::CollaborationDiscoveryAdvertisementPayload {
+                    signed_profile: profile.signed_envelope().clone(),
+                },
+            )
+            .unwrap(),
+            now..now
+                + crate::collaboration_discovery::COLLABORATION_DISCOVERY_ADVERTISEMENT_TTL_SECS,
+        );
+        Self {
+            dir,
+            chat,
+            profile,
+            advertisement,
+        }
+    }
+
+    fn did(&self) -> &str {
+        &self.profile.document().profile_did
+    }
+
+    fn participant_ref(&self) -> String {
+        home_people_contact_id(self.did())
+    }
 }
 
 impl ContactRequestHome {
@@ -48,9 +124,9 @@ impl ContactRequestHome {
         )
         .await
         .unwrap();
-        let mut state = test_state(dir.path());
-        state.collaboration_discovery_service = Some(service.clone());
-        let app = gateway_router(state);
+        let chat =
+            crate::collaboration_product::test_chat_product_port(dir.path(), NETWORK, CONVERSATION);
+        let app = contact_request_router(dir.path(), &service, &chat);
 
         let (status, _) = home_test_post_json(
             &app,
@@ -83,7 +159,7 @@ impl ContactRequestHome {
         )
         .unwrap();
 
-        let (remote_profile_did, remote_advertisement) = remote_advertisement("Remote", now);
+        let remote = RemotePerson::new("Remote", now);
         let chat_context = HomeLaunchTokenContext {
             principal_id: authority.principal_id.clone(),
             session_id: authority.session_id.clone(),
@@ -97,18 +173,60 @@ impl ContactRequestHome {
             &chat_context,
         )
         .unwrap();
-        Self {
+        let home = Self {
             dir,
             app,
             authority,
             service,
+            chat,
             store,
             local_profile,
-            remote_profile_did,
-            remote_advertisement,
+            remote,
             chat_context,
             chat_token,
             now,
+        };
+        home.post_in_community(&home.remote);
+        home
+    }
+
+    /// `remote` posts in this Home's Community: their Home signs a message
+    /// that this Home ingests and projects, so Chat lists them as verified.
+    fn post_in_community(&self, remote: &RemotePerson) {
+        let body = format!("hello from {}", remote.profile.document().display_name);
+        let prepared = remote
+            .chat
+            .prepare_message(
+                crate::collaboration_product::chat_message_request_binding(
+                    "chat-message:contact-request-test",
+                    "remote-principal",
+                    &body,
+                    &remote.profile,
+                )
+                .unwrap(),
+                &body,
+                &remote.profile,
+                self.now,
+            )
+            .unwrap();
+        remote
+            .chat
+            .project_prepared_message(remote.dir.path(), &prepared, None)
+            .unwrap();
+        let outgoing = remote.chat.test_core().pending_outgoing(self.now).unwrap();
+        let frame = remote
+            .chat
+            .test_core()
+            .prepare_transport_frame(outgoing[0].envelope_bytes())
+            .unwrap();
+        self.chat
+            .test_core()
+            .ingest_transport_frame(&frame, self.now)
+            .unwrap();
+        for handoff in self.chat.pending_messages().unwrap() {
+            self.chat
+                .project_handoff(self.dir.path(), &handoff)
+                .unwrap();
         }
     }
 
@@ -155,11 +273,10 @@ impl ContactRequestHome {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    fn outgoing_requests(&self) -> usize {
-        self.store
-            .outgoing_pending_requests(self.now)
-            .unwrap()
-            .len()
+    fn outgoing_requests(
+        &self,
+    ) -> Vec<crate::collaboration_contact_store::CollaborationOutgoingContactRequest> {
+        self.store.outgoing_pending_requests(self.now).unwrap()
     }
 
     fn incoming_request(&self) -> String {
@@ -220,51 +337,26 @@ impl ContactRequestHome {
     }
 }
 
-/// A remote person's signed Discovery advertisement and Profile DID.
-fn remote_advertisement(display_name: &str, now: u64) -> (String, Vec<u8>) {
-    let (device_key, _) = generate_keypair();
-    let device_key = SigningKey::from_bytes(&device_key.to_bytes());
-    let device_did = crate::crypto::encode_signing_key_did(&device_key);
-    let (profile_key, _) = generate_keypair();
-    let profile = crate::collaboration_profile_authority::signed_profile_document_for_test(
-        &SigningKey::from_bytes(&profile_key.to_bytes()),
-        display_name,
-        None,
-        1,
-        None,
-        now,
-        vec![device_did],
-    )
-    .unwrap();
-    let profile_did = profile.document().profile_did.clone();
-    let advertisement = signed_discovery_message_for_test(
-        &device_key,
-        &profile_did,
-        TestCollaborationMessageScope {
-            network_id: NETWORK,
-            conversation_id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_DIRECTORY_ID,
-        },
-        elastos_common::collaboration_protocol::CollaborationRecipient {
-            kind: elastos_common::collaboration_protocol::CollaborationRecipientKind::Conversation,
-            id: crate::collaboration_discovery::COLLABORATION_DISCOVERY_DIRECTORY_ID.to_string(),
-        },
-        crate::collaboration_discovery::COLLABORATION_DISCOVERY_ADVERTISEMENT_PAYLOAD_TYPE,
-        serde_json::to_value(
-            crate::collaboration_discovery::CollaborationDiscoveryAdvertisementPayload {
-                signed_profile: profile.signed_envelope().clone(),
-            },
-        )
-        .unwrap(),
-        now..now + crate::collaboration_discovery::COLLABORATION_DISCOVERY_ADVERTISEMENT_TTL_SECS,
-    );
-    (profile_did, advertisement)
+fn contact_request_router(
+    data_dir: &std::path::Path,
+    service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    chat: &crate::collaboration_product::CollaborationChatProductPort,
+) -> Router {
+    let mut state = test_state(data_dir);
+    state.collaboration_discovery_service = Some(service.clone());
+    state.collaboration_chat_product_port = Some(chat.clone());
+    gateway_router(state)
+}
+
+fn json(body: &str) -> serde_json::Value {
+    serde_json::from_str(body).unwrap()
 }
 
 #[tokio::test]
 async fn test_chat_contact_request_refuses_callers_without_a_chat_session() {
     let home = ContactRequestHome::new().await;
-    home.show(vec![home.remote_advertisement.clone()]);
-    let participant_ref = home_people_contact_id(&home.remote_profile_did);
+    home.show(vec![home.remote.advertisement.clone()]);
+    let participant_ref = home.remote.participant_ref();
 
     let (status, body) = home.request(None, &participant_ref).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -285,54 +377,221 @@ async fn test_chat_contact_request_refuses_callers_without_a_chat_session() {
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
-    assert_eq!(home.outgoing_requests(), 0);
+    assert!(home.outgoing_requests().is_empty());
 }
 
 #[tokio::test]
-async fn test_chat_contact_request_refuses_a_person_not_visible_in_discovery() {
+async fn test_chat_contact_request_queues_a_request_by_did_with_discovery_off() {
     let home = ContactRequestHome::new().await;
-    let participant_ref = home_people_contact_id(&home.remote_profile_did);
+    assert!(!home.store.discovery_enabled().unwrap());
 
-    // Nobody is visible yet.
-    let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
+    // Someone Chat does not list cannot be asked through a card.
+    let stranger = RemotePerson::new("Stranger", home.now);
+    let (status, body) = home
+        .request(Some(&home.chat_token), &stranger.participant_ref())
+        .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains("turn on Discovery"), "{body}");
+    assert_eq!(body, NOT_LISTED);
+    assert!(home.outgoing_requests().is_empty());
 
-    // Someone else is visible, not this person.
-    let (_, other_advertisement) = remote_advertisement("Other", home.now);
-    home.show(vec![other_advertisement]);
-    let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-
-    // The person is visible, but this Home turned Discovery off.
-    home.show(vec![home.remote_advertisement.clone()]);
-    home.store.set_discovery_enabled(false, home.now).unwrap();
-    let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(!body.contains("did:key:"), "{body}");
-
-    assert_eq!(home.outgoing_requests(), 0);
-}
-
-#[tokio::test]
-async fn test_chat_contact_request_queues_one_request_for_a_visible_person() {
-    let home = ContactRequestHome::new().await;
-    home.show(vec![home.remote_advertisement.clone()]);
-    let participant_ref = home_people_contact_id(&home.remote_profile_did);
-
+    // A person who posted in Community is asked by their DID.
+    let participant_ref = home.remote.participant_ref();
     let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
-        serde_json::json!({ "status": "requested" })
+        json(&body),
+        serde_json::json!({
+            "status": "requested",
+            "display_name": crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN,
+        })
     );
     assert!(!body.contains("did:key:"), "{body}");
-    assert_eq!(home.outgoing_requests(), 1);
+    let outgoing = home.outgoing_requests();
+    assert_eq!(outgoing.len(), 1);
+    assert!(outgoing[0].addressed_by_did);
+    assert_eq!(outgoing[0].recipient_profile_did, home.remote.did());
+
+    // Asking again reuses the waiting request.
+    let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["status"], "already_requested");
+    assert_eq!(home.outgoing_requests().len(), 1);
+    assert!(!home.store.discovery_enabled().unwrap());
+}
+
+#[tokio::test]
+async fn test_chat_contact_request_binds_to_the_listing_of_a_person_visible_in_discovery() {
+    let home = ContactRequestHome::new().await;
+    home.show(vec![home.remote.advertisement.clone()]);
+    let participant_ref = home.remote.participant_ref();
+
+    // The v1 request an alpha.25 Home can still receive.
+    let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        json(&body),
+        serde_json::json!({ "status": "requested", "display_name": "Remote" })
+    );
+    let outgoing = home.outgoing_requests();
+    assert_eq!(outgoing.len(), 1);
+    assert!(!outgoing[0].addressed_by_did);
 
     // Asking again reuses the stored request.
     let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(home.outgoing_requests(), 1);
+    assert_eq!(json(&body)["status"], "already_requested");
+    assert_eq!(home.outgoing_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn test_chat_profile_id_is_released_only_for_a_listed_person() {
+    let home = ContactRequestHome::new().await;
+    let participant_ref = home.remote.participant_ref();
+    let body = serde_json::json!({ "participant_ref": participant_ref });
+
+    let (status, _) = home.post(PROFILE_ID_PATH, None, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, response) = home
+        .post(
+            PROFILE_ID_PATH,
+            Some(&home.authority.people_token),
+            body.clone(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{response}");
+    assert!(!response.contains("did:key:"), "{response}");
+
+    let stranger = RemotePerson::new("Stranger", home.now);
+    let (status, response) = home
+        .post(
+            PROFILE_ID_PATH,
+            Some(&home.chat_token),
+            serde_json::json!({ "participant_ref": stranger.participant_ref() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(response, NOT_LISTED);
+
+    let (status, response) = home
+        .post(PROFILE_ID_PATH, Some(&home.chat_token), body)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        json(&response),
+        serde_json::json!({ "profile_id": home.remote.did() })
+    );
+    // Copying a DID asks nobody anything.
+    assert!(home.outgoing_requests().is_empty());
+}
+
+#[tokio::test]
+async fn test_people_contact_request_by_did_answers_each_status_without_echoing_the_did() {
+    let home = ContactRequestHome::new().await;
+    let token = home.authority.people_token.clone();
+    let ask = |token: Option<String>, profile_id: String| {
+        let home = &home;
+        async move {
+            home.post(
+                PEOPLE_REQUEST_PATH,
+                token.as_deref(),
+                serde_json::json!({ "profile_id": profile_id }),
+            )
+            .await
+        }
+    };
+    let remote_did = home.remote.did().to_string();
+
+    // Only People's own launch token may ask.
+    for other in [None, Some(home.chat_token.clone())] {
+        let (status, body) = ask(other, remote_did.clone()).await;
+        assert!(status.is_client_error(), "{status} {body}");
+        assert!(!body.contains("did:key:"), "{body}");
+    }
+    assert!(home.outgoing_requests().is_empty());
+
+    // Not a DID, or this Home's device DID: refused without an echo.
+    let device_did =
+        crate::collaboration_profile_authority::load_existing_device_did(home.dir.path())
+            .unwrap()
+            .unwrap();
+    for (profile_id, expected) in [
+        (
+            "did:key:not-a-key".to_string(),
+            "That isn't a DID. A DID starts with did:key:z.",
+        ),
+        (
+            device_did,
+            "That's this Home's device DID. Use the DID shown in People.",
+        ),
+    ] {
+        let (status, body) = ask(Some(token.clone()), profile_id).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body, expected);
+    }
+
+    // Your own DID is answered, not sent.
+    let own = home.local_profile.document().profile_did.clone();
+    let (status, body) = ask(Some(token.clone()), own).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["status"], "own_profile");
+    assert!(home.outgoing_requests().is_empty());
+
+    // Anyone else's DID is queued once, whatever Discovery says.
+    let (status, body) = ask(Some(token.clone()), format!("  {remote_did}  ")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        json(&body),
+        serde_json::json!({
+            "status": "requested",
+            "display_name": crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN,
+        })
+    );
+    assert!(!body.contains("did:key:"), "{body}");
+    let (status, body) = ask(Some(token.clone()), remote_did.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["status"], "already_requested");
+    assert_eq!(home.outgoing_requests().len(), 1);
+
+    // People shows the waiting row, and says when the Community node cannot
+    // deliver requests by DID.
+    let requested_row = || async {
+        let (status, summary) =
+            home_test_get_json(&home.app, "/api/apps/people/summary", &token, "null").await;
+        assert_eq!(status, StatusCode::OK, "{summary}");
+        assert_eq!(
+            summary["profile_id"],
+            home.local_profile.document().profile_did.as_str()
+        );
+        assert!(!summary.to_string().contains(home.remote.did()));
+        summary["people"]["contacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["relationship"] == "requested")
+            .cloned()
+            .unwrap()
+    };
+    let row = requested_row().await;
+    assert_eq!(
+        row["display_name"],
+        crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN
+    );
+    assert!(row.get("delivery_detail").is_none(), "{row}");
+    home.service.set_profile_relay_refusals_for_test(3);
+    let row = requested_row().await;
+    assert_eq!(
+        row["delivery_detail"],
+        crate::collaboration_discovery_runtime::PROFILE_CONTACT_UNDELIVERABLE_DETAIL
+    );
+    // A new request is refused while that lasts.
+    let stranger = RemotePerson::new("Stranger", home.now);
+    let (status, body) = ask(Some(token.clone()), stranger.did().to_string()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body,
+        "Contact requests can't be delivered right now. Try again later."
+    );
+    assert_eq!(home.outgoing_requests().len(), 1);
 }
 
 #[tokio::test]
@@ -346,14 +605,12 @@ async fn left_home_refuses_new_contact_intent_and_both_inbox_decisions_without_m
         .service
         .clone()
         .with_community_membership(membership.clone());
-    let mut state = test_state(home.dir.path());
-    state.collaboration_discovery_service = Some(home.service.clone());
-    home.app = gateway_router(state);
-    home.show(vec![home.remote_advertisement.clone()]);
-    let participant_ref = home_people_contact_id(&home.remote_profile_did);
+    home.app = contact_request_router(home.dir.path(), &home.service, &home.chat);
+    home.show(vec![home.remote.advertisement.clone()]);
+    let participant_ref = home.remote.participant_ref();
     let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(home.outgoing_requests(), 1);
+    assert_eq!(home.outgoing_requests().len(), 1);
     let incoming = home.incoming_request();
     let inbox_token = issue_home_projection_launch_token_with_context(
         home.dir.path(),
@@ -373,7 +630,7 @@ async fn left_home_refuses_new_contact_intent_and_both_inbox_decisions_without_m
 
     let advertisement_id =
         elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(
-            &home.remote_advertisement,
+            &home.remote.advertisement,
         );
     let (status, body) = home
         .post(
@@ -405,7 +662,7 @@ async fn left_home_refuses_new_contact_intent_and_both_inbox_decisions_without_m
             .is_none());
     }
     assert!(home.store.discovery_enabled().unwrap());
-    assert_eq!(home.outgoing_requests(), 1);
+    assert_eq!(home.outgoing_requests().len(), 1);
 
     membership.set_joined(true).unwrap();
     let (status, body) = home
@@ -423,19 +680,17 @@ async fn left_home_refuses_new_contact_intent_and_both_inbox_decisions_without_m
         .unwrap()
         .is_some());
     assert_eq!(home.store.snapshot().unwrap().contacts().len(), 1);
-    assert_eq!(home.outgoing_requests(), 1);
+    assert_eq!(home.outgoing_requests().len(), 1);
 }
 
 #[tokio::test]
 async fn community_presence_choice_is_the_callers_own_and_separate_from_discovery() {
     let mut home = ContactRequestHome::new().await;
-    let chat =
-        crate::collaboration_product::test_chat_product_port(home.dir.path(), NETWORK, "community");
     let mut state = test_state(home.dir.path());
     state.collaboration_discovery_service = Some(home.service.clone());
     state.collaboration_presence_product_port = Some(
         crate::collaboration_presence::CollaborationPresenceProductPort::new(
-            chat.test_core().clone(),
+            home.chat.test_core().clone(),
         )
         .unwrap()
         .with_presence_authority(crate::collaboration_presence_grant::test_authority()),

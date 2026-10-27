@@ -577,6 +577,7 @@ pub(super) async fn people_summary(
             (discovery_service.as_ref(), contact_authority.as_ref())
         {
             let snapshot = authority.store.read_only_snapshot()?;
+            stamp_undeliverable_requests(&mut people, &snapshot, service, now)?;
             configured_people_discovery_summary(
                 &service.read_only_status_from_snapshot(&snapshot, &authority.profile, now)?,
                 &contact_relationships(&snapshot, now),
@@ -850,7 +851,9 @@ pub(super) async fn send_profile_contact_request_response(
         Err(err) => return room_service_error_response(err),
     };
     if let Err(err) = register_configured_contact_sync_for_context(service, context, authority, now)
-        .and_then(|()| service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now))
+        .and_then(|()| {
+            service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now)
+        })
     {
         return room_service_error_response(err);
     }
@@ -904,6 +907,7 @@ fn configured_people_summary_from_snapshot(
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         })
         .collect::<Vec<_>>();
     // The complete People states, each projected from signed truth. Precedence
@@ -934,6 +938,7 @@ fn configured_people_summary_from_snapshot(
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         });
     }
     for removed in snapshot.removed() {
@@ -957,6 +962,7 @@ fn configured_people_summary_from_snapshot(
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         });
     }
     for declined in read.declined_relationships()? {
@@ -976,6 +982,7 @@ fn configured_people_summary_from_snapshot(
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         });
     }
     Ok(HomePeopleSummary {
@@ -994,8 +1001,9 @@ pub(super) struct ConfiguredContactAuthority {
 }
 
 /// Profile DID to (`contact` | `requested` | `pending`, direct conversation)
-/// from this principal's signed contact store. People absent from the map
-/// have no relationship yet; a store that cannot be read yields none.
+/// from this principal's signed contact store, over both request kinds. A
+/// removed or declined pair is absent like a stranger, because a new request
+/// may be sent to it; a store that cannot be read yields none.
 pub(super) type ContactRelationships =
     std::collections::HashMap<String, (&'static str, Option<String>)>;
 
@@ -1003,29 +1011,24 @@ pub(super) fn contact_relationships(
     store: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
     now: u64,
 ) -> ContactRelationships {
-    let mut relationships = ContactRelationships::new();
-    if let Ok(requests) = store.pending_incoming_requests() {
-        for request in requests {
-            relationships.insert(
-                request.requester_profile_did().to_string(),
-                ("pending", None),
-            );
-        }
-    }
-    if let Ok(requests) = store.outgoing_pending_requests(now) {
-        for request in requests {
-            relationships.insert(request.recipient_profile_did, ("requested", None));
-        }
-    }
-    if let Ok(snapshot) = store.snapshot() {
-        for contact in snapshot.contacts() {
-            relationships.insert(
-                contact.remote_profile_did().to_string(),
-                ("contact", Some(contact.conversation_id().to_string())),
-            );
-        }
-    }
+    use crate::collaboration_contact_store::CollaborationContactRelationship as Relationship;
+    let Ok(relationships) = store.relationships(now) else {
+        return ContactRelationships::new();
+    };
     relationships
+        .into_iter()
+        .filter_map(|(profile_did, relationship)| {
+            let conversation_id = match &relationship {
+                Relationship::Contact { conversation_id } => Some(conversation_id.clone()),
+                Relationship::PendingFromThem { .. } | Relationship::Requested => None,
+                Relationship::None
+                | Relationship::OwnProfile
+                | Relationship::Removed { .. }
+                | Relationship::Declined => return None,
+            };
+            Some((profile_did, (relationship.as_str(), conversation_id)))
+        })
+        .collect()
 }
 
 /// Adds this principal's durable pending contact requests to one Home/Inbox
@@ -2274,6 +2277,7 @@ mod discovery_summary_tests {
                 profile_card: None,
                 last_seen_at: None,
                 reachable: None,
+                delivery_detail: None,
             }],
             service_offer_count: 0,
             service_offers: Vec::new(),
@@ -2306,6 +2310,39 @@ fn stamp_contact_reachability(
                 record.sender_profile_did() == profile_did && record.expires_at() > now
             }));
     }
+}
+
+/// While the Community node refuses the Profile-contact operations (it runs
+/// a release older than 0.8.0), each waiting request by DID says it can't
+/// be delivered. Requests bound to a Discovery listing use the v1 operations
+/// and keep their plain row. The outbox keeps retrying either way.
+fn stamp_undeliverable_requests(
+    people: &mut HomePeopleSummary,
+    read: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
+    service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    now: u64,
+) -> anyhow::Result<()> {
+    if !service.profile_contact_delivery_unavailable() {
+        return Ok(());
+    }
+    let waiting = read
+        .outgoing_pending_requests(now)?
+        .into_iter()
+        .filter(|request| request.addressed_by_did)
+        .map(|request| request.recipient_profile_did)
+        .collect::<std::collections::HashSet<_>>();
+    for contact in &mut people.contacts {
+        if contact.relationship == "requested"
+            && contact
+                .remote_profile_did
+                .as_deref()
+                .is_some_and(|did| waiting.contains(did))
+        {
+            contact.delivery_detail =
+                Some(crate::collaboration_discovery_runtime::PROFILE_CONTACT_UNDELIVERABLE_DETAIL);
+        }
+    }
+    Ok(())
 }
 
 fn apply_profile_people_authority(
@@ -2375,6 +2412,7 @@ fn apply_services_peer_authority_from_snapshot(
                 profile_card: None,
                 last_seen_at: None,
                 reachable: None,
+                delivery_detail: None,
             })
         })
         .collect::<Vec<_>>();
@@ -5800,6 +5838,10 @@ async fn home_realtime_snapshot(
         {
             people_signature.push(home_discovery_realtime_signature(&status));
         }
+        // Waiting requests by DID change their row text when this flips.
+        if service.profile_contact_delivery_unavailable() {
+            people_signature.push("profile-contact-undeliverable".to_string());
+        }
     }
     let services_signature = home_services_realtime_signature(&home_state.services);
     HomeRealtimeSnapshot {
@@ -8645,6 +8687,7 @@ mod home_realtime_tests {
             profile_card: None,
             last_seen_at: None,
             reachable: None,
+            delivery_detail: None,
         };
         let mut people = HomePeopleSummary {
             contact_count: 3,
@@ -8688,6 +8731,7 @@ mod home_realtime_tests {
                 profile_card: None,
                 last_seen_at: Some(20),
                 reachable: Some(true),
+                delivery_detail: None,
             }],
             ..HomePeopleSummary::default()
         };
@@ -8720,6 +8764,7 @@ mod home_realtime_tests {
                 profile_card: None,
                 last_seen_at: None,
                 reachable: None,
+                delivery_detail: None,
             }],
             ..HomePeopleSummary::default()
         };

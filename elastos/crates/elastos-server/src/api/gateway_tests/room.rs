@@ -2551,10 +2551,8 @@ fn test_participant_cards_project_relationships_without_dids() {
     directory
         .relationships
         .insert("did:key:zPending".to_string(), ("pending", None));
-    // A contact who is also visible in Discovery is still only a contact.
-    for visible in ["did:key:zVisible", "did:key:zContact"] {
-        directory.discoverable.insert(visible.to_string());
-    }
+    // Anyone listed with no relationship yet can be added, with or without
+    // Discovery.
     directory.present.insert(
         "did:key:zContact".to_string(),
         PresentMember {
@@ -2604,7 +2602,7 @@ fn test_participant_cards_project_relationships_without_dids() {
             Some(("requested", None, false)),
             Some(("pending", None, false)),
             Some(("none", None, true)),
-            Some(("none", None, false)),
+            Some(("none", None, true)),
             None,
         ]
     );

@@ -205,13 +205,20 @@ impl std::fmt::Display for ProfileContactRequestRefusal {
             Self::CommunityLeft => {
                 formatter.write_str(crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL)
             }
-            Self::Undeliverable => formatter
-                .write_str("Contact requests can't be delivered right now. Try again later."),
+            Self::Undeliverable => write!(
+                formatter,
+                "{PROFILE_CONTACT_UNDELIVERABLE_DETAIL} Try again later."
+            ),
         }
     }
 }
 
 impl std::error::Error for ProfileContactRequestRefusal {}
+
+/// What People shows on a waiting request by DID while the Community node
+/// refuses the Profile-contact operations; the outbox keeps retrying.
+pub(crate) const PROFILE_CONTACT_UNDELIVERABLE_DETAIL: &str =
+    "Contact requests can't be delivered right now.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveryVisiblePerson {
@@ -1465,6 +1472,14 @@ impl CollaborationDiscoveryService {
         self.profile_relay_refusals
             .load(std::sync::atomic::Ordering::SeqCst)
             >= PROFILE_RELAY_REFUSALS_BEFORE_UNDELIVERABLE
+    }
+
+    /// As if the Community node had refused `refusals` profile-contact
+    /// operations in a row.
+    #[cfg(test)]
+    pub(crate) fn set_profile_relay_refusals_for_test(&self, refusals: usize) {
+        self.profile_relay_refusals
+            .store(refusals, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Counts a relay answer to a profile-contact operation: only an

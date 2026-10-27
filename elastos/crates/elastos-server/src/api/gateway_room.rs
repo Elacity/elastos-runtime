@@ -813,9 +813,7 @@ pub(super) async fn chat_room_session_start(
             );
             apply_profile_attribution_to_room_poll(&mut poll, &names);
             cards = Some(participant_card_directory(
-                authority.as_ref(),
                 read_snapshot.as_ref(),
-                discovery_service.as_ref(),
                 presence_snapshot.as_ref(),
                 local_identity.as_ref().map(|(did, _)| did.as_str()),
             ));
@@ -1553,14 +1551,10 @@ fn room_local_profile_identity(
 }
 
 /// Collects the relationship facts behind Community profile cards from this
-/// principal's signed contact store and current Discovery view.
+/// principal's signed contact store.
 fn participant_card_directory(
-    authority: Option<&gateway_home_system::ConfiguredContactAuthority>,
     read_snapshot: Option<
         &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
-    >,
-    discovery_service: Option<
-        &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     >,
     presence_snapshot: Option<&crate::collaboration_presence::CollaborationPresenceSnapshot>,
     local_profile_did: Option<&str>,
@@ -1593,24 +1587,57 @@ fn participant_card_directory(
                 });
         }
     }
-    let Some(authority) = authority else {
-        return directory;
-    };
-    let Some(store) = read_snapshot else {
-        return directory;
-    };
-    directory.relationships = gateway_home_system::contact_relationships(store, now);
-    if let Some(service) = discovery_service {
-        if let Ok(status) = service.read_only_status_from_snapshot(store, &authority.profile, now) {
-            directory.discoverable = status
-                .visible_people()
-                .iter()
-                .map(|person| person.profile_did().to_string())
-                .collect();
-        }
+    if let Some(store) = read_snapshot {
+        directory.relationships = gateway_home_system::contact_relationships(store, now);
     }
     directory
 }
+
+/// The Profile DID behind a card's opaque reference, among the people the
+/// card directory lists: verified posters in this Community and members
+/// whose Home announced presence. Any other reference resolves to nothing,
+/// so Chat acts only on people it shows.
+async fn resolve_participant_ref(
+    state: &GatewayState,
+    participant_ref: &str,
+) -> anyhow::Result<Option<String>> {
+    let now = now_ts();
+    let mut members = match state.collaboration_presence_product_port.as_ref() {
+        Some(port) => port
+            .authorized_snapshot(now)
+            .await
+            .map(|snapshot| {
+                snapshot
+                    .records()
+                    .iter()
+                    .filter(|record| record.expires_at() > now)
+                    .map(|record| record.sender_profile_did().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if let Some(port) = state.collaboration_chat_product_port.as_ref() {
+        let (network_id, conversation_id) = port.history_scope();
+        let (network_id, conversation_id) = (network_id.to_string(), conversation_id.to_string());
+        let data_dir = state.data_dir.clone();
+        members.extend(
+            tokio::task::spawn_blocking(move || {
+                crate::room_service::collaboration_verified_member_dids(
+                    &data_dir,
+                    &network_id,
+                    &conversation_id,
+                )
+            })
+            .await??,
+        );
+    }
+    Ok(members
+        .into_iter()
+        .find(|member_did| home_people_contact_id(member_did) == participant_ref))
+}
+
+const PARTICIPANT_NOT_LISTED: &str = "This person is no longer listed in Community.";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1619,15 +1646,17 @@ pub(super) struct ChatRoomContactRequestBody {
 }
 
 /// Sends a contact request to a Community participant chosen on their
-/// profile card. The request binds to that person's signed Discovery
-/// advertisement, and they accept or decline it in Inbox.
+/// profile card, with or without Discovery, and answers like People's
+/// request by DID: `{status, display_name}`. They accept or decline it in
+/// Inbox. A person visible in Discovery gets the request bound to their
+/// listing, which an alpha.25 Home can still receive.
 pub(super) async fn chat_room_contact_request(
     State(state): State<GatewayState>,
     headers: HeaderMap,
     Json(body): Json<ChatRoomContactRequestBody>,
 ) -> Response {
     // The Chat session comes first, so a refused caller learns nothing about
-    // this Home's Discovery setup.
+    // this Home's contacts.
     let context =
         match require_home_launch_token_context(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
             Ok(context) => context,
@@ -1665,28 +1694,70 @@ pub(super) async fn chat_room_contact_request(
             crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
         ));
     }
-    let Some(advertisement_id) = status
+    let member_did = match resolve_participant_ref(&state, &body.participant_ref).await {
+        Ok(Some(member_did)) => member_did,
+        Ok(None) => return (StatusCode::CONFLICT, PARTICIPANT_NOT_LISTED).into_response(),
+        Err(err) => return room_service_error_response(err),
+    };
+    let addable =
+        matches!(
+        authority
+            .store
+            .read_only_snapshot()
+            .and_then(|read| read.relationship_with(&member_did, now)),
+        Ok(crate::collaboration_contact_store::CollaborationContactRelationship::None
+            | crate::collaboration_contact_store::CollaborationContactRelationship::Removed { .. }
+            | crate::collaboration_contact_store::CollaborationContactRelationship::Declined)
+    );
+    let listed = status
         .visible_people()
         .iter()
-        .find(|person| home_people_contact_id(person.profile_did()) == body.participant_ref)
-        .map(|person| person.advertisement_id().to_string())
-    else {
-        return (
-            StatusCode::CONFLICT,
-            "Ask them to turn on Discovery, then try again. Both of you need Discovery on to add a contact.",
-        )
-            .into_response();
-    };
-    match service
-        .send_contact_request(
-            authority.store.as_ref(),
-            &advertisement_id,
-            &authority.profile,
-            now,
-        )
-        .await
+        .find(|person| person.profile_did() == member_did);
+    if let (true, Some(person)) = (addable, listed) {
+        return match service
+            .send_contact_request(
+                authority.store.as_ref(),
+                person.advertisement_id(),
+                &authority.profile,
+                now,
+            )
+            .await
+        {
+            Ok(()) => Json(serde_json::json!({
+                "status": crate::collaboration_discovery_runtime::ProfileContactRequestOutcome::Requested.status(),
+                "display_name": person.display_name(),
+            }))
+            .into_response(),
+            Err(err) => room_service_error_response(err),
+        };
+    }
+    gateway_home_system::send_profile_contact_request_response(
+        &service,
+        &context,
+        &authority,
+        &member_did,
+    )
+    .await
+}
+
+/// `POST /api/apps/chat-room/contacts/profile-id {participant_ref}` →
+/// `{profile_id}`: the DID of a person Chat lists, released only when
+/// someone asks to copy it from that person's card.
+pub(super) async fn chat_room_contact_profile_id(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatRoomContactRequestBody>,
+) -> Response {
+    if let Err(err) =
+        require_home_launch_token_context(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID)
     {
-        Ok(()) => Json(serde_json::json!({ "status": "requested" })).into_response(),
+        return room_service_error_response(err);
+    }
+    match resolve_participant_ref(&state, &body.participant_ref).await {
+        Ok(Some(profile_id)) => {
+            Json(serde_json::json!({ "profile_id": profile_id })).into_response()
+        }
+        Ok(None) => (StatusCode::CONFLICT, PARTICIPANT_NOT_LISTED).into_response(),
         Err(err) => room_service_error_response(err),
     }
 }
@@ -1958,9 +2029,7 @@ pub(super) async fn room_service_poll(
             );
             apply_profile_attribution_to_room_poll(&mut poll, &names);
             cards = Some(participant_card_directory(
-                authority.as_ref(),
                 read_snapshot.as_ref(),
-                discovery_service.as_ref(),
                 presence_snapshot.as_ref(),
                 local_identity.as_ref().map(|(did, _)| did.as_str()),
             ));

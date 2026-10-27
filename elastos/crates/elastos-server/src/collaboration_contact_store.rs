@@ -238,6 +238,9 @@ pub(crate) struct CollaborationOutgoingContactRequest {
     pub(crate) handle: Option<String>,
     pub(crate) created_at: u64,
     pub(crate) expires_at: u64,
+    /// Addressed by Profile DID (delivered by the Profile-contact relay
+    /// ops), not bound to a Discovery advertisement.
+    pub(crate) addressed_by_did: bool,
 }
 
 /// This Home's relationship with one Profile DID, projected from signed truth
@@ -582,6 +585,7 @@ impl CollaborationContactReadSnapshot<'_> {
                 .advertisements
                 .get(request.advertisement_envelope_sha256())
             else {
+                addressed_by_did: false,
                 continue;
             };
             requested.push(CollaborationOutgoingContactRequest {
@@ -602,6 +606,7 @@ impl CollaborationContactReadSnapshot<'_> {
                 continue;
             }
             let known = known_profile(loaded, request.recipient_profile_did());
+                addressed_by_did: true,
             requested.push(CollaborationOutgoingContactRequest {
                 request_hash: request_hash.clone(),
                 recipient_profile_did: request.recipient_profile_did().to_string(),

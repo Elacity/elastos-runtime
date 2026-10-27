@@ -729,6 +729,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(chat_room_contact_request),
         )
         .route(
+            "/api/apps/chat-room/contacts/profile-id",
+            post(chat_room_contact_profile_id),
+        )
+        .route(
             "/api/apps/chat-room/community-presence/request",
             post(chat_room_community_presence_request),
         )

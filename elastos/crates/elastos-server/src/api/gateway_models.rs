@@ -185,6 +185,10 @@ struct HomePeopleContactSummary {
     /// realtime signature, like `last_seen_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reachable: Option<bool>,
+    /// Set on a waiting request by DID while the Community node refuses the
+    /// Profile-contact operations, so People says why it waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_detail: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1132,9 +1136,6 @@ struct GatewayParticipantCard {
 pub(super) struct ParticipantCardDirectory {
     pub(super) local_profile_did: Option<String>,
     pub(super) relationships: gateway_home_system::ContactRelationships,
-    /// Profile DIDs visible in Discovery right now, so a request can bind to
-    /// their signed advertisement.
-    pub(super) discoverable: std::collections::HashSet<String>,
     /// Unexpired Community presence by Profile DID: the signed Profile's
     /// display name and when the Home last announced it.
     pub(super) present: std::collections::HashMap<String, PresentMember>,
@@ -1168,7 +1169,7 @@ impl ParticipantCardDirectory {
             participant_ref,
             relationship,
             conversation_id,
-            can_add_contact: relationship == "none" && self.discoverable.contains(member_did),
+            can_add_contact: relationship == "none",
             active_now: self.present.contains_key(member_did),
         }
     }

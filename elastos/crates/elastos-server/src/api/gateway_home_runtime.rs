@@ -1101,6 +1101,7 @@ fn home_people_summary(
                 // Room membership rows have no presence basis of their own; a
                 // room participant with an active session is the signal here.
                 reachable: None,
+                delivery_detail: None,
             }
         })
         .collect::<Vec<_>>();
