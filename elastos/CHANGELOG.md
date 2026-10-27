@@ -69,6 +69,11 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Developer detail
 
+- System no longer calls `/api/auth/passkey/status`. From its sandboxed frame
+  the call carried no Home token, so the gateway refused it (a CORS error in
+  the console) and System fell back to "Not set" beside Passkeys. The account
+  list, read with the Home token, already shows each account's passkeys. The
+  System behavior smoke now fails on any Runtime call without the Home token.
 - Library writes and archive extraction keep the start check's folder rule
   (#449): a write that would put a folder 16 or more folders below a protected
   root is refused by name (write, upload, new folder, copy, move, rename,

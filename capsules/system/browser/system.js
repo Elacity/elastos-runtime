@@ -115,7 +115,6 @@ let technicalSelectedId = "";
 let registeredProviderSchemes = new Set();
 let currentAccess = {};
 let currentProfileName = "";
-let passkeyAuthorityActive = false;
 let pendingRecoveryImport = null;
 let activeShellName = "";
 let activeShellBusy = false;
@@ -1420,9 +1419,6 @@ function configurePasskeyAccess() {
     showPasskeyStatus("Not supported", "muted");
     return;
   }
-  refreshPasskeyStatus().catch(() => {
-    showPasskeyStatus("Not set", "muted");
-  });
   if (accountListNode) {
     accountListNode.addEventListener("click", onAccountListClick);
   }
@@ -2836,17 +2832,6 @@ function showCapsuleCatalogStatus(message, tone) {
   capsuleCatalogStatusNode.dataset.tone = tone;
 }
 
-async function refreshPasskeyStatus() {
-  if (!passkeyStatusNode || !window.PublicKeyCredential) {
-    return;
-  }
-  if (passkeyAuthorityActive) {
-    return;
-  }
-  const status = await fetchJson("/api/auth/passkey/status");
-  showPasskeyStatus(status.registered ? "" : "Not set", status.registered ? "muted" : "muted");
-}
-
 async function refreshAccountList() {
   if (!accountListNode || !hasShellAccess()) {
     return;
@@ -3039,12 +3024,10 @@ async function onAccountListClick(event) {
     });
     if (!promote && revokingCurrent) {
       apiHomeToken = "";
-      passkeyAuthorityActive = false;
       renderAccounts([]);
       showPasskeyStatus("Removed. Open Home to sign in.", "muted");
     } else {
       await refreshAccountList();
-      await refreshPasskeyStatus();
       showPasskeyStatus(promote || demote ? "Updated" : "Removed", "success");
     }
     notifyHomeSummaryChanged();
@@ -4028,7 +4011,6 @@ function setPasskeyAuthority(authority) {
   if (!proofBinding || !proofBinding.startsWith("proof:passkey:")) {
     return;
   }
-  passkeyAuthorityActive = true;
   showPasskeyStatus("", "muted");
 }
 

@@ -121,9 +121,6 @@ export function inertSystemApiResponse(pathname) {
       ],
     };
   }
-  if (pathname === "/api/auth/passkey/status") {
-    return { registered: true };
-  }
   if (pathname === "/api/auth/passkeys") {
     return { passkeys: [] };
   }

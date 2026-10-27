@@ -274,6 +274,9 @@ async function main() {
   const appearanceRequests = [];
   const appearancePlans = [];
   const requestOrder = [];
+  // The gateway answers an opaque-origin app only when it sends its Home
+  // token; a call without it fails CORS in Home (/api/auth/passkey/status).
+  const tokenlessRequests = [];
   let heldRecoveryStatus = null;
   let heldChainNetworks = null;
   let heldCapsuleCatalog = null;
@@ -322,6 +325,9 @@ async function main() {
       }
       const url = new URL(request.url());
       requestOrder.push(url.pathname);
+      if (!request.headers()["x-elastos-home-token"]) {
+        tokenlessRequests.push(url.pathname);
+      }
       if (url.pathname === "/api/apps/system/summary") {
         summaryTrace.push({
           count: summaryTrace.length + 1,
@@ -494,7 +500,15 @@ async function main() {
         document.querySelector(".settings-sidebar-item.active")?.dataset.settings === "security"
         && document.activeElement?.id === "recovery-download",
     );
+    // Chain networks is held, so its read is in flight, never answered, here.
+    for (let tries = 0; tries < 250 && !requestOrder.includes("/api/provider/chain/networks"); tries += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
     const securityFocusOrder = [...requestOrder];
+    assert(
+      await frame.evaluate(() => document.activeElement?.id === "recovery-download"),
+      "System should keep Recovery focused while later reads run",
+    );
     assert(
       securityFocusOrder.indexOf("/api/auth/recovery/status") >= 0
         && securityFocusOrder.indexOf("/api/provider/chain/networks") >= 0
@@ -576,6 +590,11 @@ async function main() {
         startup.errorText.length === 0,
       "System startup diagnostic failed",
       startup,
+    );
+    assert(
+      tokenlessRequests.length === 0,
+      "System must send its Home token on every Runtime call",
+      tokenlessRequests,
     );
     await activateTab(frame, "personalization");
 

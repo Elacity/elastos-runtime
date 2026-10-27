@@ -111,7 +111,6 @@ try {
           exports += 1;
           body = {schema:'elastos.full-recovery-bundle/v1', included:{people_identity:true}, bundle:{items:[]}};
         } else if (url.pathname === "/api/apps/home/active-shell") body = {active:'home-gui', candidates:[]};
-        else if (url.pathname === "/api/auth/passkey/status") body = {registered:true};
         else if (url.pathname === "/api/auth/passkeys") body = {passkeys:[]};
         else if (url.pathname === "/api/capsules/catalog") body = {capsules:[]};
         else if (url.pathname === "/api/capsules/interfaces") body = {interfaces:[]};
