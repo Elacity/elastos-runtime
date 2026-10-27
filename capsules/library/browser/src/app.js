@@ -827,6 +827,7 @@ import {
         button.dataset.uri = root.uri;
         button.dataset.rootId = rootKey(root);
         button.dataset.active = active ? "true" : "false";
+        button.hidden = placeHidden(root, active);
         button.draggable = true;
         button.title = "Drag to reorder";
         button.innerHTML = `
@@ -877,7 +878,14 @@ import {
         const active = activeRoot?.uri === uri;
         button.className = active ? "place window-sidebar-item window-sidebar-item-active" : "place window-sidebar-item";
         button.dataset.active = active ? "true" : "false";
+        button.hidden = placeHidden(state.roots.find((root) => root.uri === uri), active);
       }
+    }
+
+    // Library offers no Publish, so an empty Public place would only suggest
+    // sharing: it shows while it holds items or is open.
+    function placeHidden(root, active) {
+      return root?.id === "public" && root.metadata?.empty !== false && !active;
     }
 
     function syncRouteChrome() {

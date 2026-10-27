@@ -28,7 +28,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   text, so the person you send one to cannot open it in Home yet.
   Library and Documents no longer offer Publish, and Documents drops its
   History tab and Published icon. A file published earlier opens from this
-  Home's own copy and can still be unpublished from its menu.
+  Home's own copy and can still be unpublished from its menu. Library's
+  sidebar shows the Public place only while it holds items.
 - Archive no longer has a Home launcher tile, desktop shortcut or Marketplace
   Open button. Double-click a ZIP in Library, or use Open With, to open it in
   Archive; Library's Compress and Extract are unchanged. An Archive window saved

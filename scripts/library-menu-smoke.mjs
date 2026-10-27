@@ -656,18 +656,19 @@ function objectsFor(parent) {
   return folders.get(parent);
 }
 
-function rootsWithTrashState() {
-  const trashObjects = objectsFor(`${principalRoot}/.Trash`);
-  return roots.map((root) => root.id === "trash"
-    ? {
+function rootsWithItemState() {
+  return roots.map((root) => {
+    if (root.id !== "trash" && root.id !== "public") return root;
+    const objects = objectsFor(root.uri);
+    return {
       ...root,
       metadata: {
         ...(root.metadata || {}),
-        empty: trashObjects.length === 0,
-        item_count: trashObjects.length,
+        empty: objects.length === 0,
+        item_count: objects.length,
       },
-    }
-    : root);
+    };
+  });
 }
 
 function findObject(uri) {
@@ -820,7 +821,7 @@ async function serveStatic(req, res) {
 
 function handleProvider(op, payload, res) {
   ops.push({ op, payload });
-  if (op === "roots") return sendJson(res, 200, ok({ roots: rootsWithTrashState() }));
+  if (op === "roots") return sendJson(res, 200, ok({ roots: rootsWithItemState() }));
   if (op === "list") return sendJson(res, 200, ok({
     objects: folders.get(payload.uri) || [],
     object: findObject(payload.uri) || null,
@@ -2721,10 +2722,17 @@ async function run() {
 
     excludesAll(await openItemMenu(page, "Guide.md"), ["Publish", "Publish Selected", "Copy Content CID"], "Guide menu");
 
+    // An empty Public place leaves the sidebar the next time the places load.
+    assert(await page.locator('.place[data-root-id="public"]').isVisible(), "Public must show in the sidebar while it holds items");
+    objectsFor(publicUri).splice(0);
     await openItemMenu(page, "Guide.md");
     await clickMenu(page, "Delete");
     await page.waitForFunction(() => !Array.from(document.querySelectorAll(".item")).some((item) => item.textContent.includes("Guide.md")));
     assert(ops.some((entry) => entry.op === "trash" && entry.payload.uri.endsWith("/Guide.md")), "Delete must move the object to Trash");
+    await page.locator('.place[data-root-id="public"]').waitFor({ state: "hidden" });
+    await page.locator(".place").filter({ hasText: "Documents" }).first().click();
+    await page.locator(".crumb-current").filter({ hasText: "Documents" }).first().waitFor();
+    assert(!(await page.locator('.place[data-root-id="public"]').isVisible()), "An empty Public place must stay out of the sidebar");
 
     const readsBeforeViewerOpen = ops.filter((entry) => entry.op === "read" && entry.payload.uri.endsWith("/Viewer.md")).length;
     await page.goto(`http://127.0.0.1:${port}/host.html`);

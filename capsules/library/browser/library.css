@@ -335,6 +335,10 @@
       backface-visibility: hidden;
     }
 
+    .place[hidden] {
+      display: none;
+    }
+
     .place[draggable="true"]:hover {
       cursor: grab;
     }

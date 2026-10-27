@@ -1399,6 +1399,56 @@ async fn test_gateway_provider_proxy_rejects_predeclared_runtime_metadata() {
 }
 
 #[tokio::test]
+async fn test_library_public_root_reports_whether_it_holds_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let public_root = |roots: &serde_json::Value| {
+        roots["data"]["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "public")
+            .cloned()
+            .expect("public Library root")
+    };
+
+    let (status, roots) = post_library(app.clone(), &token, "roots", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let public = public_root(&roots);
+    assert_eq!(public["uri"], format!("{root}/Public"));
+    assert_eq!(public["metadata"]["empty"], true, "{public}");
+    assert_eq!(public["metadata"]["item_count"], 0, "{public}");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({ "parent_uri": root, "name": "Public" }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let (write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": format!("{root}/Public/draft.txt"),
+            "mime": "text/plain",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"draft"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    let (_, roots) = post_library(app.clone(), &token, "roots", json!({})).await;
+    let public = public_root(&roots);
+    assert_eq!(public["metadata"]["empty"], false, "{public}");
+    assert_eq!(public["metadata"]["item_count"], 1, "{public}");
+}
+
+#[tokio::test]
 async fn test_library_provider_object_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(library_test_state(dir.path()).await);

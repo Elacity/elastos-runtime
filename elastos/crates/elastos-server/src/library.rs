@@ -7160,17 +7160,29 @@ fn library_roots(data_dir: &Path, principal_id: &str) -> Vec<LibraryRoot> {
         ),
     ]
     .into_iter()
-    .map(|(id, label, uri, kind)| LibraryRoot {
-        schema: LIBRARY_ROOT_SCHEMA,
-        id,
-        label,
-        uri,
-        kind,
-        metadata: None,
+    .map(|(id, label, uri, kind)| {
+        // Library offers no Publish, so it lists the Public place only while
+        // it holds items; the root says whether it does.
+        let metadata = (id == "public").then(|| {
+            let (empty, item_count) = root_item_state(data_dir, principal_id, &uri);
+            json!({
+                "schema": "elastos.library.public-root/v1",
+                "empty": empty,
+                "item_count": item_count,
+            })
+        });
+        LibraryRoot {
+            schema: LIBRARY_ROOT_SCHEMA,
+            id,
+            label,
+            uri,
+            kind,
+            metadata,
+        }
     })
     .collect();
     let trash_uri = format!("{root}/.Trash");
-    let (empty, item_count) = trash_root_state(data_dir, principal_id, &trash_uri);
+    let (empty, item_count) = root_item_state(data_dir, principal_id, &trash_uri);
     roots.push(LibraryRoot {
         schema: LIBRARY_ROOT_SCHEMA,
         id: "trash",
@@ -7186,8 +7198,8 @@ fn library_roots(data_dir: &Path, principal_id: &str) -> Vec<LibraryRoot> {
     roots
 }
 
-fn trash_root_state(data_dir: &Path, principal_id: &str, trash_uri: &str) -> (bool, usize) {
-    let Ok(target) = library_target(data_dir, principal_id, trash_uri) else {
+fn root_item_state(data_dir: &Path, principal_id: &str, uri: &str) -> (bool, usize) {
+    let Ok(target) = library_target(data_dir, principal_id, uri) else {
         return (true, 0);
     };
     let Ok(entries) = fs::read_dir(&target.path) else {
