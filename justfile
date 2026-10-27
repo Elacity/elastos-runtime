@@ -213,7 +213,6 @@ product-ui-source:
     node scripts/documents-product-behavior-smoke.mjs
     node --test scripts/documents-markdown.test.mjs
     node scripts/library-product-behavior-smoke.mjs
-    node scripts/library-shared-cid-smoke.mjs
     node scripts/chat-room-product-behavior-smoke.mjs
     node --test scripts/chat-room-reconnect.test.mjs
 
@@ -225,6 +224,7 @@ product-ui-browser:
     node scripts/isolation-ui-truth-browser-smoke.mjs
     node scripts/documents-product-layout-smoke.mjs
     node scripts/library-product-layout-smoke.mjs
+    node scripts/library-shared-cid-smoke.mjs
     node scripts/browser-product-layout-smoke.mjs
     node scripts/system-uiux-layout-smoke.mjs
     node scripts/system-window-policy-browser-smoke.mjs

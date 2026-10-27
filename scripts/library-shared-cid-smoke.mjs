@@ -5,9 +5,12 @@ import { fileURLToPath } from "node:url";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
+import { createRequire } from "node:module";
 import path from "node:path";
 const repo = fileURLToPath(new URL("../", import.meta.url));
-const { chromium } = await import(process.env.ELASTOS_PLAYWRIGHT_MODULE);
+const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
+const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
+const { chromium } = require("playwright");
 const capsuleRoot = path.join(repo, "capsules/library/browser");
 const principalRoot = "localhost://Users/repro";
 const documentsUri = `${principalRoot}/Documents`;
@@ -48,7 +51,7 @@ const server = createServer(async (req, res) => {
 });
 await new Promise(r => server.listen(0, "127.0.0.1", r));
 const port = server.address().port;
-const browser = await chromium.launch({ ...(process.env.ELASTOS_BROWSER_EXECUTABLE ? { executablePath: process.env.ELASTOS_BROWSER_EXECUTABLE } : {}), headless: true });
+const browser = await chromium.launch({ headless: true, executablePath: brave });
 const cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
 try {
 for (const [label, query] of [["legacy query {cid,uri}", `cid=${cid}&uri=${encodeURIComponent(`elastos://${cid}`)}`], ["cid only", `cid=${cid}`], ["folder failure", `cid=${cid}`], ["sender filename ignored", `cid=${cid}&fileName=report.pdf`]]) {
