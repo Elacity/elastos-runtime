@@ -111,6 +111,9 @@ const PROFILE_RELAY_REFUSALS_BEFORE_UNDELIVERABLE: usize = 3;
 const UNSUPPORTED_RELAY_OPERATION: &str = "unsupported collaboration discovery operation";
 /// A signed Profile beside a decision larger than this is refused unparsed.
 const MAX_RELAY_SIGNED_PROFILE_BYTES: usize = 64 * 1024;
+/// Requests by DID sent per pass: the relay admits one new request per device
+/// per `PROFILE_REQUEST_DEVICE_INTERVAL_SECS`, so a second would be refused.
+const MAX_PROFILE_REQUEST_SENDS_PER_SYNC: usize = 1;
 
 #[derive(Clone)]
 pub struct CollaborationDiscoveryService {
@@ -127,6 +130,89 @@ pub struct CollaborationDiscoveryService {
     /// Consecutive relay refusals of profile-contact operations ("unsupported
     /// operation" from a Community node older than 0.8.0); reset by success.
     profile_relay_refusals: Arc<std::sync::atomic::AtomicUsize>,
+    /// What the Community relay has accepted from this Home's Profile-contact
+    /// outbox, so delivered items leave it and the rest rotate.
+    profile_outbox: Arc<Mutex<ProfileContactOutbox>>,
+}
+
+/// In-memory delivery record of the Profile-contact outbox. The store keeps
+/// every request and decision to send until it expires; this records which
+/// ones the relay has accepted, under the relay epoch that accepted them. A
+/// new epoch means the relay restarted and lost them, so they are due again;
+/// a Home restart forgets the record and sends everything once more, which
+/// the relay accepts as replays.
+#[derive(Default)]
+struct ProfileContactOutbox {
+    relay_epoch: Option<String>,
+    /// Outbox item key to its delivery mark, per local Profile DID.
+    marks: HashMap<String, HashMap<String, ProfileOutboxMark>>,
+    /// Monotonic attempt counter: the least recently attempted goes first.
+    attempts: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProfileOutboxMark {
+    delivered: bool,
+    attempted: u64,
+}
+
+impl ProfileContactOutbox {
+    /// Every relay answer names its epoch; a different one voids every
+    /// delivered mark.
+    fn observe_relay_epoch(&mut self, relay_epoch: &str) {
+        if self.relay_epoch.as_deref() == Some(relay_epoch) {
+            return;
+        }
+        for marks in self.marks.values_mut() {
+            for mark in marks.values_mut() {
+                mark.delivered = false;
+            }
+        }
+        self.relay_epoch = Some(relay_epoch.to_string());
+    }
+
+    /// Up to `limit` of `items` the relay does not hold, least recently
+    /// attempted first, so each is tried within `ceil(due / limit)` passes.
+    /// Marks for items no longer in the store's outbox are dropped.
+    fn due<T>(
+        &mut self,
+        profile_did: &str,
+        items: Vec<(String, T)>,
+        live: &HashSet<String>,
+        limit: usize,
+    ) -> Vec<(String, T)> {
+        let marks = self.marks.entry(profile_did.to_string()).or_default();
+        marks.retain(|key, _| live.contains(key));
+        let mut due = items
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (key, _))| !marks.get(key).is_some_and(|mark| mark.delivered))
+            .map(|(order, item)| {
+                let attempted = marks.get(&item.0).map_or(0, |mark| mark.attempted);
+                (attempted, order, item)
+            })
+            .collect::<Vec<_>>();
+        due.sort_by_key(|(attempted, order, _)| (*attempted, *order));
+        due.into_iter()
+            .take(limit)
+            .map(|(_, _, item)| item)
+            .collect()
+    }
+
+    fn record_attempt(&mut self, profile_did: &str, key: &str, delivered: bool) {
+        self.attempts += 1;
+        let attempted = self.attempts;
+        self.marks
+            .entry(profile_did.to_string())
+            .or_default()
+            .insert(
+                key.to_string(),
+                ProfileOutboxMark {
+                    delivered,
+                    attempted,
+                },
+            );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,14 +384,16 @@ struct DiscoveryProviderStatusResponse {
 // stay byte-for-byte unchanged, because alpha.25 clients deny unknown fields.
 //
 // `{"op":"send_profile_contact_request","request":<b64 signed request>}`
-//   → `{"status":"ok","data":{}}`
+//   → `{"status":"ok","data":{"relay_epoch":<hex>}}`
 // `{"op":"poll_profile_mailbox","poll":<b64 signed poll>}`
-//   → `{"status":"ok","data":{"requests":[<b64>],"decisions":[{"receipt":<b64>,"recipient_profile":<b64>}]}}`
+//   → `{"status":"ok","data":{"requests":[<b64>],"decisions":[{"receipt":<b64>,"recipient_profile":<b64>}],"relay_epoch":<hex>}}`
 //   (only the list named by the poll's `mailbox_kind` is non-empty)
 // `{"op":"submit_profile_contact_decision","request":<b64>,"receipt":<b64>,"recipient_profile":<b64>}`
-//   → `{"status":"ok","data":{}}`
+//   → `{"status":"ok","data":{"relay_epoch":<hex>}}`
 // The decision op carries the request so the relay can verify it after a
 // restart has lost the request; the stored decision entry is self-contained.
+// `relay_epoch` is random per relay start: a Home that sees it change sends
+// again what the restarted relay no longer holds.
 const PROFILE_CONTACT_SEND_OP: &str = "send_profile_contact_request";
 const PROFILE_CONTACT_POLL_OP: &str = "poll_profile_mailbox";
 const PROFILE_CONTACT_DECISION_OP: &str = "submit_profile_contact_decision";
@@ -317,6 +405,19 @@ struct DiscoveryProviderProfileDecisionRequest {
     request: String,
     receipt: String,
     recipient_profile: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryProviderProfileAcceptedResponse {
+    status: String,
+    data: DiscoveryProviderProfileAcceptedData,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryProviderProfileAcceptedData {
+    relay_epoch: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +432,7 @@ struct DiscoveryProviderProfileMailboxResponse {
 struct DiscoveryProviderProfileMailboxData {
     requests: Vec<String>,
     decisions: Vec<DiscoveryProviderProfileDecisionEntry>,
+    relay_epoch: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,6 +537,8 @@ struct CollaborationMessageTiming {
 struct CollaborationDiscoveryRelayProvider {
     profile: VerifiedCollaborationNetworkProfile,
     state: Mutex<DiscoveryRelayState>,
+    /// Random per start; Profile-contact answers carry it.
+    epoch: String,
 }
 
 struct DiscoveryRelayState {
@@ -518,6 +622,7 @@ impl CollaborationDiscoveryService {
             direct_messages,
             profile_updates,
             profile_relay_refusals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            profile_outbox: Arc::new(Mutex::new(ProfileContactOutbox::default())),
         })
     }
 
@@ -1499,9 +1604,12 @@ impl CollaborationDiscoveryService {
     }
 
     /// One pass of the Profile-contact plane, run on every joined pass
-    /// whatever the Discovery setting: send queued requests and decisions,
-    /// then read this Profile's mailboxes. A bad mailbox entry is logged and
-    /// skipped; it never stops the rest.
+    /// whatever the Discovery setting: read this Profile's mailboxes, then
+    /// send what the relay does not hold yet. Reading first lets a restarted
+    /// relay's new epoch put delivered items back in this same pass. Items
+    /// rotate, least recently attempted first, and leave the outbox once the
+    /// relay accepts them. A bad mailbox entry is logged and skipped; it never
+    /// stops the rest.
     async fn sync_profile_contacts(
         &self,
         store: &CollaborationContactStore,
@@ -1509,49 +1617,6 @@ impl CollaborationDiscoveryService {
         now: u64,
     ) -> anyhow::Result<()> {
         let mut first_failure: Option<anyhow::Error> = None;
-        for request in store.resendable_outgoing_profile_contact_requests(
-            now,
-            MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC,
-        )? {
-            let sent = self
-                .invoke_bootstrap(
-                    PROFILE_CONTACT_SEND_OP,
-                    serde_json::to_value(DiscoveryProviderContactRequest {
-                        op: PROFILE_CONTACT_SEND_OP.to_string(),
-                        request: encode_bytes(&request),
-                    })?,
-                )
-                .await
-                .and_then(|response| {
-                    require_discovery_provider_success(response, "contact request submission")
-                });
-            self.note_profile_relay_result(&sent);
-            if let Err(err) = sent {
-                first_failure.get_or_insert(err);
-            }
-        }
-        for decision in
-            store.resendable_profile_contact_decisions(now, MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC)?
-        {
-            let sent = self
-                .invoke_bootstrap(
-                    PROFILE_CONTACT_DECISION_OP,
-                    serde_json::to_value(DiscoveryProviderProfileDecisionRequest {
-                        op: PROFILE_CONTACT_DECISION_OP.to_string(),
-                        request: encode_bytes(&decision.request),
-                        receipt: encode_bytes(&decision.receipt),
-                        recipient_profile: encode_bytes(&decision.recipient_profile),
-                    })?,
-                )
-                .await
-                .and_then(|response| {
-                    require_discovery_provider_success(response, "contact decision submission")
-                });
-            self.note_profile_relay_result(&sent);
-            if let Err(err) = sent {
-                first_failure.get_or_insert(err);
-            }
-        }
         for kind in [
             CollaborationDiscoveryMailboxKind::Requests,
             CollaborationDiscoveryMailboxKind::Decisions,
@@ -1562,9 +1627,124 @@ impl CollaborationDiscoveryService {
                 first_failure.get_or_insert(err);
             }
         }
+        let profile_did = profile.document().profile_did.as_str();
+        let outbox_key = |kind: &str, request: &[u8]| {
+            format!(
+                "{kind}:{}",
+                elastos_common::collaboration_protocol::collaboration_message_envelope_sha256(
+                    request
+                )
+            )
+        };
+        let requests = store
+            .resendable_outgoing_profile_contact_requests(now)?
+            .into_iter()
+            .map(|request| (outbox_key("request", &request), request))
+            .collect::<Vec<_>>();
+        let decisions = store
+            .resendable_profile_contact_decisions(now)?
+            .into_iter()
+            .map(|decision| (outbox_key("decision", &decision.request), decision))
+            .collect::<Vec<_>>();
+        let live = requests
+            .iter()
+            .map(|(key, _)| key.clone())
+            .chain(decisions.iter().map(|(key, _)| key.clone()))
+            .collect::<HashSet<_>>();
+        let (requests, decisions) = {
+            let mut outbox = self.lock_profile_outbox()?;
+            (
+                outbox.due(
+                    profile_did,
+                    requests,
+                    &live,
+                    MAX_PROFILE_REQUEST_SENDS_PER_SYNC,
+                ),
+                outbox.due(
+                    profile_did,
+                    decisions,
+                    &live,
+                    MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC,
+                ),
+            )
+        };
+        for (key, request) in requests {
+            let sent = self
+                .submit_profile_contact_operation(
+                    PROFILE_CONTACT_SEND_OP,
+                    serde_json::to_value(DiscoveryProviderContactRequest {
+                        op: PROFILE_CONTACT_SEND_OP.to_string(),
+                        request: encode_bytes(&request),
+                    })?,
+                )
+                .await;
+            if let Err(err) = self.record_profile_outbox_attempt(profile_did, &key, sent) {
+                first_failure.get_or_insert(err);
+            }
+        }
+        for (key, decision) in decisions {
+            let sent = self
+                .submit_profile_contact_operation(
+                    PROFILE_CONTACT_DECISION_OP,
+                    serde_json::to_value(DiscoveryProviderProfileDecisionRequest {
+                        op: PROFILE_CONTACT_DECISION_OP.to_string(),
+                        request: encode_bytes(&decision.request),
+                        receipt: encode_bytes(&decision.receipt),
+                        recipient_profile: encode_bytes(&decision.recipient_profile),
+                    })?,
+                )
+                .await;
+            if let Err(err) = self.record_profile_outbox_attempt(profile_did, &key, sent) {
+                first_failure.get_or_insert(err);
+            }
+        }
         match first_failure {
             Some(err) => Err(err),
             None => Ok(()),
+        }
+    }
+
+    fn lock_profile_outbox(
+        &self,
+    ) -> anyhow::Result<std::sync::MutexGuard<'_, ProfileContactOutbox>> {
+        self.profile_outbox
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Profile contact outbox lock is poisoned"))
+    }
+
+    /// Sends one Profile-contact operation; the relay's epoch on success.
+    async fn submit_profile_contact_operation(
+        &self,
+        op: &str,
+        request: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        let response = self.invoke_bootstrap(op, request).await?;
+        match serde_json::from_value::<DiscoveryProviderProfileAcceptedResponse>(response) {
+            Ok(accepted) if accepted.status == "ok" => Ok(accepted.data.relay_epoch),
+            _ => anyhow::bail!("Profile contact relay did not accept {op}"),
+        }
+    }
+
+    /// Records one outbox attempt: accepted items leave the outbox until the
+    /// relay's epoch changes; a refusal is returned for the pass result.
+    fn record_profile_outbox_attempt(
+        &self,
+        profile_did: &str,
+        key: &str,
+        sent: anyhow::Result<String>,
+    ) -> anyhow::Result<()> {
+        self.note_profile_relay_result(&sent);
+        let mut outbox = self.lock_profile_outbox()?;
+        match sent {
+            Ok(relay_epoch) => {
+                outbox.observe_relay_epoch(&relay_epoch);
+                outbox.record_attempt(profile_did, key, true);
+                Ok(())
+            }
+            Err(err) => {
+                outbox.record_attempt(profile_did, key, false);
+                Err(err)
+            }
         }
     }
 
@@ -1592,6 +1772,8 @@ impl CollaborationDiscoveryService {
         if response.status != "ok" {
             anyhow::bail!("Profile contact mailbox returned an error");
         }
+        self.lock_profile_outbox()?
+            .observe_relay_epoch(&response.data.relay_epoch);
         for request in response.data.requests {
             let recorded = decode_bytes(&request, "Profile contact request")
                 .and_then(|bytes| store.record_incoming_profile_contact_request(&bytes, now));
@@ -2898,8 +3080,11 @@ impl CollaborationDiscoveryAuthority {
 
 impl CollaborationDiscoveryRelayProvider {
     fn new(profile: VerifiedCollaborationNetworkProfile) -> Self {
+        let mut epoch = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut epoch);
         Self {
             profile,
+            epoch: hex::encode(epoch),
             state: Mutex::new(DiscoveryRelayState {
                 advertisements: HashMap::new(),
                 requests: HashMap::new(),
@@ -2999,11 +3184,18 @@ fn relay_error(err: impl std::fmt::Display) -> ProviderError {
     ProviderError::Provider(err.to_string())
 }
 
-fn relay_ok() -> serde_json::Value {
-    serde_json::json!({"status":"ok","data":{}})
-}
-
 impl CollaborationDiscoveryRelayProvider {
+    /// An accepted Profile-contact operation, naming this relay's epoch.
+    fn accepted(&self) -> serde_json::Value {
+        serde_json::to_value(DiscoveryProviderProfileAcceptedResponse {
+            status: "ok".to_string(),
+            data: DiscoveryProviderProfileAcceptedData {
+                relay_epoch: self.epoch.clone(),
+            },
+        })
+        .expect("Profile contact relay answer is serializable")
+    }
+
     /// Admits one request addressed by Profile DID into the recipient's
     /// Profile mailbox. Only the signing device may submit it; a replay is
     /// accepted; a newer request from the same sender to the same recipient
@@ -3028,7 +3220,7 @@ impl CollaborationDiscoveryRelayProvider {
         let sender = verified.requester_profile_did().to_string();
         let recipient = verified.recipient_profile_did().to_string();
         if state.profile_requests.contains_key(&request_hash) {
-            return Ok(relay_ok());
+            return Ok(self.accepted());
         }
         // Already answered: the decision entry stands in for the request.
         if state
@@ -3040,7 +3232,7 @@ impl CollaborationDiscoveryRelayProvider {
                     .any(|entry| entry.request_hash == request_hash)
             })
         {
-            return Ok(relay_ok());
+            return Ok(self.accepted());
         }
         if state
             .profile_request_sent_at
@@ -3104,7 +3296,7 @@ impl CollaborationDiscoveryRelayProvider {
             },
         );
         state.profile_request_sent_at.insert(signer_did, now);
-        Ok(relay_ok())
+        Ok(self.accepted())
     }
 
     /// Returns the polling Profile's requests or decision entries. The poll
@@ -3126,7 +3318,10 @@ impl CollaborationDiscoveryRelayProvider {
                 .map_err(relay_error)?;
         require_signing_endpoint(&source_endpoint_did, verified.polling_endpoint_did())?;
         let profile_did = verified.profile_did();
-        let mut data = DiscoveryProviderProfileMailboxData::default();
+        let mut data = DiscoveryProviderProfileMailboxData {
+            relay_epoch: self.epoch.clone(),
+            ..DiscoveryProviderProfileMailboxData::default()
+        };
         match verified.mailbox_kind() {
             CollaborationDiscoveryMailboxKind::Requests => {
                 if let Some(mailbox) = state.profile_request_mailboxes.get(profile_did) {
@@ -3262,7 +3457,7 @@ impl CollaborationDiscoveryRelayProvider {
         state
             .profile_request_mailboxes
             .retain(|_, mailbox| !mailbox.is_empty());
-        Ok(relay_ok())
+        Ok(self.accepted())
     }
 }
 
@@ -5782,6 +5977,242 @@ pub(crate) mod tests {
         panic!("timed out waiting for relationship {expected:?}");
     }
 
+    /// A seed whose Carrier node serves the Community relay, for Homes made
+    /// with `discovery_service` and `vec![seed.ticket.clone()]`.
+    struct ProfileRelaySeed {
+        registry: Arc<ProviderRegistry>,
+        _node: crate::carrier::CarrierNode,
+        ticket: CollaborationBootstrapPeer,
+        network: VerifiedCollaborationNetworkProfile,
+    }
+
+    impl ProfileRelaySeed {
+        async fn start(root: &Path, trusted: &SigningKey) -> Self {
+            let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+            let registry = Arc::new(ProviderRegistry::new());
+            let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
+            let node = start_carrier_node_with_registry(
+                &seed_key,
+                &seed_did,
+                root.join("seed"),
+                Some(Arc::downgrade(&registry)),
+            )
+            .await
+            .unwrap();
+            registry
+                .set_carrier_invoker(Arc::new(
+                    crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(
+                        node.endpoint.clone(),
+                    ),
+                ))
+                .await;
+            registry
+                .register_sub_provider(
+                    "peer",
+                    Arc::new(CarrierGossipProvider::new(node.gossip_state.clone())),
+                )
+                .await
+                .unwrap();
+            let ticket = ticket_from_peer_provider(&registry).await;
+            let network = signed_profile(NETWORK, trusted, vec![ticket.clone()]);
+            Self {
+                registry,
+                _node: node,
+                ticket,
+                network,
+            }
+        }
+
+        /// A fresh in-memory relay, as after a seed (re)start.
+        async fn restart_relay(&self) -> Arc<CollaborationDiscoveryRelayProvider> {
+            let relay = Arc::new(CollaborationDiscoveryRelayProvider::new(
+                self.network.clone(),
+            ));
+            self.registry
+                .register(relay.clone() as Arc<dyn Provider>)
+                .await;
+            relay
+        }
+    }
+
+    fn relay_decision_count(relay: &CollaborationDiscoveryRelayProvider) -> usize {
+        relay
+            .state
+            .lock()
+            .unwrap()
+            .profile_decision_mailboxes
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// Refreshes until `done` holds, at most `passes` times; the passes used.
+    async fn refresh_until(
+        service: &CollaborationDiscoveryService,
+        store: &CollaborationContactStore,
+        profile: &VerifiedCollaborationProfileDocument,
+        passes: usize,
+        mut between: impl FnMut(),
+        mut done: impl FnMut() -> bool,
+    ) -> Option<usize> {
+        for pass in 1..=passes {
+            let _ = service.refresh(store, profile, current_timestamp()).await;
+            if done() {
+                return Some(pass);
+            }
+            between();
+        }
+        None
+    }
+
+    /// Six answers decided at once all reach the relay within two passes
+    /// (four per pass), leave the outbox once accepted, and are sent again
+    /// within two passes after the relay restarts.
+    #[tokio::test]
+    async fn profile_answers_rotate_leave_the_outbox_and_return_after_a_relay_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let seed = ProfileRelaySeed::start(temp.path(), &trusted).await;
+        let relay = seed.restart_relay().await;
+        let (_registry, service, store, _node) = discovery_service(
+            &temp.path().join("home"),
+            &trusted,
+            &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
+            vec![seed.ticket.clone()],
+        )
+        .await;
+        let profile = service_profile(&service, "Bo", Some("bo"));
+        let did = profile.document().profile_did.clone();
+        const ASKERS: usize = 6;
+        for index in 0..ASKERS {
+            let asker = ProfileContactParty::new(&seed.network, &format!("Asker {index}"));
+            relay
+                .send_raw(&profile_send(
+                    &asker.request_to(&did, current_timestamp()),
+                    &asker.device_did(),
+                ))
+                .await
+                .unwrap();
+        }
+        let status = service
+            .refresh(&store, &profile, current_timestamp())
+            .await
+            .unwrap();
+        assert_eq!(status.incoming_requests().len(), ASKERS);
+        for request in status.incoming_requests() {
+            service
+                .submit_contact_decision(
+                    &store,
+                    &profile,
+                    request.request_hash(),
+                    CollaborationContactDecision::Accepted,
+                    current_timestamp(),
+                )
+                .await
+                .unwrap();
+        }
+        let bound = ASKERS.div_ceil(MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC);
+        let passes = refresh_until(
+            &service,
+            &store,
+            &profile,
+            bound,
+            || {},
+            || relay_decision_count(&relay) == ASKERS,
+        )
+        .await;
+        assert!(passes.is_some(), "not every answer reached the relay");
+
+        // Accepted answers leave the outbox: a pass sends none of them again.
+        relay
+            .state
+            .lock()
+            .unwrap()
+            .profile_decision_mailboxes
+            .clear();
+        service
+            .refresh(&store, &profile, current_timestamp())
+            .await
+            .unwrap();
+        assert_eq!(relay_decision_count(&relay), 0);
+
+        // A restarted relay has a new epoch, and every answer comes back.
+        let relay = seed.restart_relay().await;
+        let passes = refresh_until(
+            &service,
+            &store,
+            &profile,
+            bound,
+            || {},
+            || relay_decision_count(&relay) == ASKERS,
+        )
+        .await;
+        assert!(
+            passes.is_some(),
+            "the restarted relay did not get every answer"
+        );
+    }
+
+    /// Six requests by DID queued at once all reach the relay, one per pass
+    /// as its device interval allows, instead of the oldest few forever.
+    #[tokio::test]
+    async fn profile_requests_rotate_until_each_reaches_the_relay() {
+        let temp = tempfile::tempdir().unwrap();
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let seed = ProfileRelaySeed::start(temp.path(), &trusted).await;
+        let relay = seed.restart_relay().await;
+        let (_registry, service, store, _node) = discovery_service(
+            &temp.path().join("home"),
+            &trusted,
+            &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
+            vec![seed.ticket.clone()],
+        )
+        .await;
+        let profile = service_profile(&service, "Alma", Some("alma"));
+        const REQUESTS: usize = 6;
+        for _ in 0..REQUESTS {
+            let recipient = ProfileContactParty::new(&seed.network, "Recipient");
+            assert_eq!(
+                service
+                    .send_profile_contact_request(
+                        &store,
+                        &recipient.did(),
+                        &profile,
+                        current_timestamp()
+                    )
+                    .await
+                    .unwrap(),
+                ProfileContactRequestOutcome::Requested
+            );
+        }
+        let relayed = || relay.state.lock().unwrap().profile_requests.len();
+        // Each pass is as if the device interval had passed since the last.
+        let passes = refresh_until(
+            &service,
+            &store,
+            &profile,
+            REQUESTS,
+            || relay.state.lock().unwrap().profile_request_sent_at.clear(),
+            || relayed() == REQUESTS,
+        )
+        .await;
+        assert_eq!(
+            passes,
+            Some(REQUESTS),
+            "{} of {REQUESTS} relayed",
+            relayed()
+        );
+
+        // Delivered requests leave the outbox until the relay restarts.
+        relay.state.lock().unwrap().profile_requests.clear();
+        relay.state.lock().unwrap().profile_request_sent_at.clear();
+        service
+            .refresh(&store, &profile, current_timestamp())
+            .await
+            .unwrap();
+        assert_eq!(relayed(), 0);
+    }
+
     /// Two Homes with Discovery off add each other by Profile DID through
     /// the Community relay: a Decline cools the requester down but not the
     /// decliner, whose reverse request is accepted. The relay restarts twice,
@@ -5790,58 +6221,21 @@ pub(crate) mod tests {
     async fn contact_by_profile_did_with_discovery_off_declines_cools_down_and_reverses() {
         let temp = tempfile::tempdir().unwrap();
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
-        let seed_node = start_carrier_node_with_registry(
-            &seed_key,
-            &seed_did,
-            temp.path().join("seed"),
-            Some(Arc::downgrade(&seed_registry)),
-        )
-        .await
-        .unwrap();
-        seed_registry
-            .set_carrier_invoker(Arc::new(
-                crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(
-                    seed_node.endpoint.clone(),
-                ),
-            ))
-            .await;
-        seed_registry
-            .register_sub_provider(
-                "peer",
-                Arc::new(CarrierGossipProvider::new(seed_node.gossip_state.clone())),
-            )
-            .await
-            .unwrap();
-        let seed_ticket = ticket_from_peer_provider(&seed_registry).await;
-        let seed_profile = signed_profile(NETWORK, &trusted, vec![seed_ticket.clone()]);
-        // Each (re)start is a fresh in-memory relay, as after a seed restart.
-        let start_relay = || {
-            let relay = Arc::new(CollaborationDiscoveryRelayProvider::new(
-                seed_profile.clone(),
-            ));
-            let registry = seed_registry.clone();
-            async move {
-                registry.register(relay.clone() as Arc<dyn Provider>).await;
-                relay
-            }
-        };
-        let relay = start_relay().await;
+        let seed = ProfileRelaySeed::start(temp.path(), &trusted).await;
+        let relay = seed.restart_relay().await;
 
         let (_a_registry, a_service, a_store, _a_node) = discovery_service(
             &temp.path().join("a"),
             &trusted,
             &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
-            vec![seed_ticket.clone()],
+            vec![seed.ticket.clone()],
         )
         .await;
         let (_b_registry, b_service, b_store, _b_node) = discovery_service(
             &temp.path().join("b"),
             &trusted,
             &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
-            vec![seed_ticket],
+            vec![seed.ticket.clone()],
         )
         .await;
         let a_profile = service_profile(&a_service, "Alma", Some("alma"));
@@ -5874,7 +6268,7 @@ pub(crate) mod tests {
                 .map(Vec::len),
             Some(1)
         );
-        let relay = start_relay().await;
+        let relay = seed.restart_relay().await;
         a_service
             .refresh(&a_store, &a_profile, current_timestamp())
             .await
@@ -5993,7 +6387,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let relay = start_relay().await;
+        let relay = seed.restart_relay().await;
         a_service
             .refresh(&a_store, &a_profile, current_timestamp())
             .await
@@ -8102,6 +8496,7 @@ pub(crate) mod tests {
             intent_mutex: local_service.intent_mutex.clone(),
             direct_messages: local_service.direct_messages.clone(),
             profile_relay_refusals: local_service.profile_relay_refusals.clone(),
+            profile_outbox: local_service.profile_outbox.clone(),
         };
         let error = bad_service
             .invoke_bootstrap(
@@ -8319,6 +8714,7 @@ pub(crate) mod tests {
             intent_mutex: service.intent_mutex.clone(),
             direct_messages: service.direct_messages.clone(),
             profile_relay_refusals: service.profile_relay_refusals.clone(),
+            profile_outbox: service.profile_outbox.clone(),
         };
         let error = mismatched
             .invoke_bootstrap(

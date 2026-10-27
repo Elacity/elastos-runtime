@@ -2900,10 +2900,11 @@ impl CollaborationContactStore {
     }
 
     /// This Profile's undecided requests by DID to (re)send, oldest first.
+    /// The runtime picks which to send each pass, so this lists them all; the
+    /// waiting cap bounds the list.
     pub(crate) fn resendable_outgoing_profile_contact_requests(
         &self,
         now: u64,
-        limit: usize,
     ) -> anyhow::Result<Vec<Vec<u8>>> {
         let Some(loaded) = self.load_state()? else {
             return Ok(Vec::new());
@@ -2928,7 +2929,6 @@ impl CollaborationContactStore {
         resendable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
         resendable
             .into_iter()
-            .take(limit)
             .map(|(_, _, request)| {
                 canonical_signed_collaboration_message_bytes(request.message().envelope())
                     .map_err(anyhow::Error::from)
@@ -2937,11 +2937,11 @@ impl CollaborationContactStore {
     }
 
     /// Decisions this Profile made on requests by DID, resent until each
-    /// request expires, oldest first.
+    /// request expires, oldest first. The runtime picks which to send each
+    /// pass, so this lists them all; the store's request cap bounds the list.
     pub(crate) fn resendable_profile_contact_decisions(
         &self,
         now: u64,
-        limit: usize,
     ) -> anyhow::Result<Vec<ResendableProfileContactDecision>> {
         let Some(loaded) = self.load_state()? else {
             return Ok(Vec::new());
@@ -2976,7 +2976,6 @@ impl CollaborationContactStore {
         resendable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         Ok(resendable
             .into_iter()
-            .take(limit)
             .map(|(_, _, decision)| decision)
             .collect())
     }
