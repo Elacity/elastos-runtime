@@ -100,6 +100,7 @@ const canonicalClientImports = Object.freeze({
   "capsules/wallet-walletconnect/browser/wallet-walletconnect.js":
     "targetId: CONNECTOR_ID",
   "capsules/library/browser/src/app.js": 'targetId: "library"',
+  "capsules/people/browser/people.js": 'targetId: "people"',
   "capsules/system/browser/system.js": 'targetId: "system"',
   "capsules/chat-room/browser/chat-room.js": 'targetId: "chat-room"',
   "capsules/assistant/browser/home-agent.js": 'targetId: "assistant"',
@@ -170,6 +171,13 @@ assert(
   protocolSource.includes('"identity.did"') &&
     hostSource.includes('"system:identity.did:write"'),
   "System device DID copies must use the canonical bounded identifier Clipboard policy",
+);
+assert(
+  protocolSource.includes('"profile.id"') &&
+    hostSource.includes('"people:profile.id:write"') &&
+    hostSource.includes('"chat-room:profile.id:write"') &&
+    chatRoomUiSource.includes('JsValue::from_str("elastosChatCopyProfileId")'),
+  "Profile DID copies must use the canonical bounded identifier Clipboard policy",
 );
 assert(
   protocolSource.includes(

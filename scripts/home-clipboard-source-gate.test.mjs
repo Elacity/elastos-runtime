@@ -24,6 +24,7 @@ const files = [
   "capsules/library/browser/src/actions.js",
   "capsules/library/browser/src/dialog.js",
   "capsules/system/browser/system.js",
+  "capsules/people/browser/people.js",
   "capsules/assistant/browser/home-agent.js",
   chat,
   "capsules/chat-room-ui/src/lib.rs",

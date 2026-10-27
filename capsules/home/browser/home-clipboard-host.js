@@ -258,6 +258,16 @@ export function createHomeClipboardPrompt({
       "Continue to copy this bounded technical device identifier to this device clipboard.",
       "Copy identifier",
     ],
+    "people:profile.id:write": [
+      "Copy your DID?",
+      "Continue to copy your DID to this device clipboard so people can add you.",
+      "Copy",
+    ],
+    "chat-room:profile.id:write": [
+      "Copy DID?",
+      "Continue to copy this person's DID to this device clipboard.",
+      "Copy",
+    ],
     "chat-room:conversation.invite:write": [
       "Copy conversation invite?",
       "Continue to copy this short-lived conversation invite to this device clipboard.",

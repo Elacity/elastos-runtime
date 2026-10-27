@@ -203,6 +203,8 @@ test("visible Home action gates exact Browser write and read", async () => {
 
 test("closed target and purpose policy accepts only approved writes", async () => {
   const cases = [
+    ["people", "profile.id", "did:key:zProfile"],
+    ["chat-room", "profile.id", "did:key:zProfile"],
     ["wallet", "wallet.address", "0x1234"],
     ["wallet", "wallet.recovery-key", '{\n  "schema": "elastos.wallet.recovery-key/v1"\n}'],
     ["wallet-metamask", "wallet.address", "0x2345"],

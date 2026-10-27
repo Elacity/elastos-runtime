@@ -194,6 +194,8 @@ test("only Browser can read and exact matching text/plain result settles it", as
 
 test("client accepts the closed first-party write purposes", async () => {
   const cases = [
+    ["people", "profile.id", "did:key:zProfile"],
+    ["chat-room", "profile.id", "did:key:zProfile"],
     ["wallet", "wallet.address", "0x1234"],
     ["wallet", "wallet.recovery-key", '{"secret":"bounded"}'],
     ["wallet-metamask", "wallet.address", "0x2345"],
