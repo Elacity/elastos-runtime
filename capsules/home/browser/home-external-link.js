@@ -72,7 +72,7 @@ function validatedSharedResult(result, uri) {
     || result.schema !== SHARED_RESULT_SCHEMA || result.uri !== uri
     || typeof result.cid !== "string" || !result.cid || uri !== `elastos://${result.cid}`
     || !CHECK_STATES.includes(result.state)
-    || (result.state === "available" && (typeof result.check_id !== "string" || !result.check_id))
+    || (["available", "sender_offline"].includes(result.state) && (typeof result.check_id !== "string" || !result.check_id))
     || (result.sender_display_name !== undefined && typeof result.sender_display_name !== "string")
     || (result.size_bytes !== undefined && (!Number.isSafeInteger(result.size_bytes) || result.size_bytes < 0))) return null;
   return result;
@@ -93,8 +93,7 @@ export function requestHomeSharedContent({ context, data, prompt, fetchJson }) {
       || ![source.conversation_id, source.message_id].every(value => typeof value === "string" && value.length > 0)))) return false;
   const check = signal => fetchJson("/api/apps/home/shared-content/check", {
     method: "POST", signal,
-    headers: { "x-elastos-home-token": context.homeToken },
-    body: JSON.stringify({ schema: "elastos.home.shared-content.check/v1", uri: data.uri,
+    body: JSON.stringify({ schema: "elastos.home.shared-content.check/v1", app_token: context.homeToken, uri: data.uri,
       ...(source === undefined ? {} : { source }) }),
   });
   const get = (check_id, signal) => fetchJson("/api/apps/home/shared-content/get", {
@@ -105,6 +104,37 @@ export function requestHomeSharedContent({ context, data, prompt, fetchJson }) {
   if (!requestId) return false;
   check().then(result => prompt.show(requestId, result)).catch(() => prompt.checkFailed(requestId));
   return true;
+}
+
+// Read only the verified local gateway after the person chooses Open/Get.
+// Raw CID responses use application/octet-stream, so inspect a bounded sample.
+export async function openHomeSharedFile({ cid, uri }, { openTarget, fetchLocal = globalThis.fetch, signal } = {}) {
+  const response = await fetchLocal(`/content/${encodeURIComponent(cid)}`, { cache: "no-store", signal });
+  if (!response.ok) throw new Error("Could not read the local file");
+  const reader = response.body.getReader();
+  const sample = new Uint8Array(4096);
+  let length = 0, complete = false;
+  try {
+    while (length < sample.length) {
+      const { value, done } = await reader.read();
+      if (done) { complete = true; break; }
+      const part = value.subarray(0, sample.length - length);
+      sample.set(part, length);
+      length += part.length;
+    }
+  } finally {
+    await reader.cancel();
+  }
+  const bytes = sample.subarray(0, length);
+  let text = false;
+  try {
+    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes, { stream: !complete });
+    text = !/[\x00-\x08\x0b\x0e-\x1f\x7f]/.test(decoded) && !decoded.startsWith("%PDF-");
+  } catch (_) { /* Binary content opens in Library. */ }
+  if (signal?.aborted) return;
+  return openTarget(text ? "documents" : "library", {
+    query: { cid, uri, ...(text ? { view: "read" } : {}) },
+  });
 }
 
 export function createHomeExternalLinkPrompt({
@@ -172,7 +202,7 @@ export function createHomeExternalLinkPrompt({
     appName.textContent = value?.sender_display_name || "";
     asker.textContent = value?.sender_display_name ? " shared this in Chat." : "";
     host.textContent = value?.sender_display_name
-      ? `From: ${name}${state === "available" ? " · online" : state === "sender_offline" ? " · offline" : ""}` : "";
+      ? `From: ${name}${state === "available" && value.state === "available" ? " · online" : state === "sender_offline" ? " · offline" : ""}` : "";
     address.textContent = request.uri;
     if (linkLabel) linkLabel.hidden = false;
     size.hidden = false;
@@ -203,7 +233,7 @@ export function createHomeExternalLinkPrompt({
     const current = () => active === request && isLive(request.homeToken) && !request.controller.signal.aborted;
     try {
       if (state === "local") {
-        await openSharedFile(request.result);
+        await openSharedFile(request.result, request.controller.signal);
         if (current()) close();
         return;
       }
@@ -215,7 +245,7 @@ export function createHomeExternalLinkPrompt({
         if (!result || !hasExactKeys(result, ["state"]) || !GET_STATES.includes(result.state)) throw new Error("Invalid file result");
         request.state = result.state;
         if (result.state === "local") {
-          await openSharedFile(request.result);
+          await openSharedFile(request.result, request.controller.signal);
           if (current()) close();
           return;
         }
@@ -224,7 +254,7 @@ export function createHomeExternalLinkPrompt({
         if (!current()) return;
         if (!result) throw new Error("Invalid file check");
         request.result = result;
-        request.state = result.state;
+        request.state = result.state === "sender_offline" ? "available" : result.state;
       }
     } catch (_error) {
       if (!current()) return;
@@ -375,7 +405,7 @@ export function createHomeExternalLinkPrompt({
       active.shownAt = now();
       if (active.kind === "shared") {
         active.result = checked;
-        active.state = checked.state;
+        active.state = checked.state === "sender_offline" ? "available" : checked.state;
         renderShared(active);
       } else {
         active.href = checked.href;

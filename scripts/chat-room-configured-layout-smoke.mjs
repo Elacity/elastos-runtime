@@ -383,9 +383,16 @@ function startServer(scenario) {
         const body = JSON.parse(raw);
         if (url.pathname.endsWith("/check")) {
           trace.sharedChecks.push({ body, token: request.headers['x-elastos-home-token'] });
+          assert(request.headers['x-elastos-home-token'] === 'home-authority', 'check requires Home authority');
+          assert(body.app_token === 'test-token', 'check requires app_token in its body');
+          assert(Object.keys(body).every(key => ['schema', 'app_token', 'uri', 'source'].includes(key)), 'unknown check field');
           json(response, { schema: "elastos.home.shared-content.result/v1", cid: sharedCid, uri: sharedUri,
-            sender_display_name: "Alma", size_bytes: 30, state: "available", check_id: "file-check" });
-        } else { trace.sharedGets.push(body); json(response, { state: "local" }); }
+            sender_display_name: "Alma", size_bytes: 30, state: "sender_offline", check_id: "file-check" });
+        } else {
+          assert(request.headers['x-elastos-home-token'] === 'home-authority', 'get requires Home authority');
+          assert(JSON.stringify(body) === JSON.stringify({ check_id: 'file-check' }), 'get body differs');
+          trace.sharedGets.push(body); json(response, { state: "local" });
+        }
         return;
       }
       if (url.pathname.startsWith("/api/apps/chat-room/upload/")) {
@@ -450,7 +457,8 @@ function startServer(scenario) {
             if (data.type === 'home:open-uri') {
               window.fixtureSharedMessages.push(data);
               requestHomeSharedContent({ context: { kind: 'app-frame', targetId: 'chat-room', homeToken: 'test-token' },
-                data, prompt, fetchJson: async (url, init) => (await fetch(url, init)).json() });
+                data, prompt, fetchJson: async (url, init) => (await fetch(url, { ...init,
+                  headers: { 'content-type': 'application/json', 'x-elastos-home-token': 'home-authority', ...init.headers } })).json() });
             }
             if (data.type === 'home:open-target' && data.target === 'library') {
               event.source.postMessage({ type: 'chat-room:attach-library-item', requestId: data.requestId,
@@ -1024,13 +1032,13 @@ async function runScenario(scenario) {
         if (gesture === 'click') await link.click(); else { await link.focus(); await link.press(gesture); }
         await page.locator('#shared-sheet').waitFor({ state: 'visible' });
         assert(await page.locator('#address').innerText() === sharedUri, "sheet changed the address");
-        assert(await page.locator('#host').innerText() === 'From: Alma · online', "sheet sender missing");
+        assert(await page.locator('#host').innerText() === 'From: Alma', "presence hint must not report offline");
         assert(trace.sharedGets.length === 0, "link fetched before Get");
         await page.locator('#cancel').click();
         await page.waitForTimeout(3100);
       }
-      assert(trace.sharedChecks.every(check => check.token === 'test-token'
-        && JSON.stringify(check.body) === JSON.stringify({ schema: 'elastos.home.shared-content.check/v1', uri: sharedUri,
+      assert(trace.sharedChecks.every(check => check.token === 'home-authority'
+        && JSON.stringify(check.body) === JSON.stringify({ schema: 'elastos.home.shared-content.check/v1', app_token: 'test-token', uri: sharedUri,
           source: { conversation_id: 'shared', message_id: 'sha256:message-1' } })), "check contract differs", trace.sharedChecks);
       await frame.locator('[data-seq="2"] a[data-open-uri]').click();
       await page.locator('#shared-sheet').waitFor({ state: 'visible' });

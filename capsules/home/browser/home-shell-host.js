@@ -50,6 +50,7 @@ import { createHomeLinkStatus } from "./home-link-status.js?v=home-20260924a";
 import {
   createHomeExternalLinkPrompt,
   requestHomeSharedContent,
+  openHomeSharedFile,
   EXTERNAL_LINK_REQUEST_SCHEMA,
   HOME_OPEN_EXTERNAL_TYPE,
   MAX_EXTERNAL_LINK_LENGTH,
@@ -154,7 +155,7 @@ const homeExternalLinkPrompt = createHomeExternalLinkPrompt({
   size: document.querySelector("#home-link-size"),
   status: document.querySelector("#home-link-status"),
   linkLabel: document.querySelector("#home-link-label"),
-  openSharedFile: ({ cid, uri }) => openTargetFromHomeGui("documents", { query: { cid, uri, view: "read" } }),
+  openSharedFile: (file, signal) => openHomeSharedFile(file, { openTarget: openTargetFromHomeGui, signal }),
   isLive: externalLinkSenderIsLive,
   otherSheetShown: () => !homeClipboardPromptRoot.hidden,
 });

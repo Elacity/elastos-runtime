@@ -69,7 +69,7 @@ for (const [state, copy, retry] of [
   ['timeout', 'took too long', true],
 ]) test(`shared file state ${state} has clear copy and action`, async () => {
   const h = harness();
-  if (['sender_offline', 'not_contact', 'not_here'].includes(state)) h.prompt.show(h.begin(), result(state));
+  if (['not_contact', 'not_here'].includes(state)) h.prompt.show(h.begin(), result(state));
   else { h.prompt.show(h.begin({ get: async () => ({ state }) }), result()); h.tick(); h.click(); await settle(); }
   assert.ok(h.status.textContent.includes(copy), h.status.textContent);
   assert.equal(h.openButton.disabled, !retry);
@@ -78,7 +78,9 @@ for (const [state, copy, retry] of [
 
 test('retry checks again before redeeming a fresh check id', async () => {
   const h = harness(); let checks = 0;
-  h.prompt.show(h.begin({ check: async () => { checks++; return { ...result(), check_id: 'check-2' }; } }), result('sender_offline'));
+  h.prompt.show(h.begin({ get: async (id) => { h.gets.push({ id }); return { state: 'sender_offline' }; },
+    check: async () => { checks++; return { ...result(), check_id: 'check-2' }; } }), result());
+  h.tick(); h.click(); await settle(); h.gets.length = 0;
   h.tick(); h.click(); await settle(); assert.equal(checks, 1); assert.equal(h.gets.length, 0);
   h.click(); assert.equal(h.gets.length, 0); h.tick(); h.click(); await settle();
   assert.equal(h.gets[0].id, 'check-2');
@@ -125,8 +127,8 @@ test('the Home handoff checks the exact source with launch authority and gets wi
     return route.endsWith('/check') ? result() : { state: 'local' }; };
   assert.equal(requestHomeSharedContent({ context, data: message(), prompt: h.prompt, fetchJson }), true);
   await settle();
-  assert.deepEqual(calls[0].body, { schema: 'elastos.home.shared-content.check/v1', uri, source: message().source });
-  assert.deepEqual(calls[0].headers, { 'x-elastos-home-token': 'launch' });
+  assert.deepEqual(calls[0].body, { schema: 'elastos.home.shared-content.check/v1', app_token: 'launch', uri, source: message().source });
+  assert.equal(calls[0].headers, undefined);
   assert.equal(calls[0].route, '/api/apps/home/shared-content/check');
   assert.equal(h.gets.length, 0);
   h.tick(); h.click(); await settle();
@@ -168,9 +170,10 @@ test('shared get uses the Home shell token while check keeps the app launch bind
     const calls = [];
     globalThis.fetch = async (route, init) => { calls.push({ route, init }); return { ok: true, json: async () => ({}) }; };
     await fetchJson('/api/apps/home/shared-content/get', { method: 'POST', body: JSON.stringify({ check_id: 'checked' }) });
-    await fetchJson('/api/apps/home/shared-content/check', { method: 'POST', headers: { 'x-elastos-home-token': 'app-launch' } });
+    await fetchJson('/api/apps/home/shared-content/check', { method: 'POST', body: JSON.stringify({ app_token: 'app-launch' }) });
     assert.equal(calls[0].init.headers['x-elastos-home-token'], 'home-authority');
-    assert.equal(calls[1].init.headers['x-elastos-home-token'], 'app-launch');
+    assert.equal(calls[1].init.headers['x-elastos-home-token'], 'home-authority');
+    assert.equal(JSON.parse(calls[1].init.body).app_token, 'app-launch');
     clearHomeAuthorityToken();
   } finally { globalThis.document = previousDocument; globalThis.fetch = previousFetch; }
 });
@@ -180,4 +183,41 @@ test('Tab keeps focus on Cancel when the shared file has no available action', (
   const h = harness(); h.prompt.show(h.begin(), result('not_contact'));
   h.windowRef.fire('keydown', { key: 'Tab', preventDefault() {} });
   assert.equal(h.document.activeElement, h.cancelButton);
+});
+
+test('stale presence still offers Get and only a failed Get reports offline', async () => {
+  const h = harness();
+  assert.equal(h.prompt.show(h.begin(), result('sender_offline')), true);
+  assert.equal(h.openButton.textContent, 'Get and open');
+  assert.equal(h.openButton.disabled, false);
+  assert.equal(h.host.textContent, 'From: Alma');
+  assert.equal(h.status.textContent, '');
+  h.tick(); h.click(); await settle();
+  assert.equal(h.gets.length, 1);
+  assert.equal(h.opened.length, 1);
+});
+
+test('an offline presence hint requires a redeemable check id', () => {
+  const h = harness();
+  assert.equal(h.prompt.show(h.begin(), { ...result('sender_offline'), check_id: undefined }), false);
+});
+
+for (const [label, bytes, target] of [
+  ['text', new TextEncoder().encode('Hello Alma'), 'documents'],
+  ['PNG', Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10), 'library'],
+  ['PDF', new TextEncoder().encode('%PDF-1.7\n'), 'library'],
+  ['binary controls', Uint8Array.of(1, 2, 3), 'library'],
+]) test(`local ${label} opens in ${target}`, async () => {
+  const { openHomeSharedFile } = await import('./home-external-link.js');
+  assert.equal(typeof openHomeSharedFile, 'function');
+  const opens = [], reads = [];
+  await openHomeSharedFile(result('local'), {
+    fetchLocal: async (path, options) => {
+      reads.push({ path, options });
+      return new Response(bytes, { headers: { 'content-type': 'application/octet-stream' } });
+    },
+    openTarget: async (...args) => opens.push(args),
+  });
+  assert.equal(reads[0].path, `/content/${cid}`);
+  assert.deepEqual(opens, [[target, { query: { cid, uri, ...(target === 'documents' ? { view: 'read' } : {}) } }]]);
 });

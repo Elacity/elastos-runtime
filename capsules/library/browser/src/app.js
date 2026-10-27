@@ -1,3 +1,4 @@
+import { sharedFileMarkup } from "./shared-file.js";
 import {
   archiveLibraryObjectPayload,
   escapeHtml,
@@ -1297,6 +1298,12 @@ import {
         await loadRoots();
         installBrowserHistory();
         await loadCurrentFolder();
+        const sharedCid = queryParams.get("cid");
+        if (state.mode === "browse" && sharedCid) {
+          elements.dialog.innerHTML = sharedFileMarkup(sharedCid);
+          elements.dialog.classList.remove("hidden");
+          setStatus("Shared file is ready to download.");
+        }
         scheduleRootPrefetch();
         startLibraryEventStream();
       } catch (error) {
