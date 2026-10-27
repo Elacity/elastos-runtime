@@ -294,7 +294,8 @@ button:disabled {
   font-weight: 600;
 }
 
-.profile-form input {
+.profile-form input,
+.add-contact-form input {
   width: 100%;
   min-height: 36px;
   border: 1px solid var(--el-hairline-strong);
@@ -303,7 +304,8 @@ button:disabled {
   color: var(--el-text);
 }
 
-.profile-form input:focus {
+.profile-form input:focus,
+.add-contact-form input:focus {
   border-color: var(--el-hairline-strong);
   outline: 2px solid var(--el-accent-faint);
   outline-offset: 1px;
@@ -572,10 +574,36 @@ button:disabled {
 /* Phone stage: every control is a full touch target. Person rows already
    stand above 48 px (38 px avatar plus padding). */
 :root[data-el-form-factor="phone"] button,
-:root[data-el-form-factor="phone"] .profile-form input {
+:root[data-el-form-factor="phone"] .profile-form input,
+:root[data-el-form-factor="phone"] .add-contact-form input {
   min-height: var(--el-touch-target);
 }
 
-:root[data-el-form-factor="phone"] .profile-form input {
+:root[data-el-form-factor="phone"] .profile-form input,
+:root[data-el-form-factor="phone"] .add-contact-form input {
   font-size: 16px; /* below 16 px iOS Safari zooms the page on focus */
+}
+
+.profile-id {
+  min-width: 0;
+}
+
+.profile-id code {
+  display: block;
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.add-contact-form input {
+  width: 100%;
+  min-width: 0;
+}
+
+#add-contact-result {
+  overflow-wrap: anywhere;
+}
+
+#add-contact-result:empty {
+  display: none;
 }

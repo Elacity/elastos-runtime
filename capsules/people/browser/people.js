@@ -1,3 +1,5 @@
+import { createHomeClipboardClient } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+
 const lockedShell = document.getElementById("locked-shell");
 const peopleShell = document.getElementById("people-shell");
 const statusNode = document.getElementById("people-status");
@@ -6,6 +8,14 @@ const profileInput = document.getElementById("profile-name");
 const profileTitle = document.getElementById("profile-title");
 const profileDescription = document.getElementById("profile-description");
 const profileSubmit = document.getElementById("profile-submit");
+const profileIdSection = document.getElementById("profile-id");
+const profileIdValue = document.getElementById("profile-id-value");
+const profileIdCopy = document.getElementById("profile-id-copy");
+const addContactForm = document.getElementById("add-contact-form");
+const addContactInput = document.getElementById("add-contact-id");
+const addContactSubmit = document.getElementById("add-contact-submit");
+const addContactResult = document.getElementById("add-contact-result");
+const addContactInbox = document.getElementById("add-contact-inbox");
 const peopleList = document.getElementById("people-list");
 const discoveryList = document.getElementById("discovery-list");
 const discoveryRequestsList = document.getElementById("discovery-requests-list");
@@ -25,6 +35,13 @@ const SECTION_TITLES = {
   discovery: "Discovery",
 };
 
+const homeClipboard = createHomeClipboardClient({
+  targetId: "people",
+  homeOrigin: homeParentOrigin,
+  homeToken,
+});
+let localProfileId = "";
+let sendingContact = false;
 let refreshGeneration = 0;
 let profileDraftDirty = false;
 let profileDraftValue = "";
@@ -48,6 +65,7 @@ async function boot() {
   }
   lockedShell?.classList.add("hidden");
   peopleShell?.classList.remove("hidden");
+  homeClipboard.start();
   await refreshPeople();
 }
 
@@ -104,6 +122,22 @@ function activateSection(targetId) {
 }
 
 function bindActions() {
+  profileIdCopy?.addEventListener("click", async () => {
+    if (!localProfileId || profileIdCopy.disabled) return;
+    profileIdCopy.disabled = true;
+    try {
+      await homeClipboard.writeText(localProfileId, { purpose: "profile.id" });
+      showStatus("DID copied.", "ok");
+    } catch (_error) {
+      showStatus("DID could not be copied. Try again.", "error");
+    } finally {
+      profileIdCopy.disabled = false;
+    }
+  });
+  addContactForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    sendContactRequest();
+  });
   profileForm?.addEventListener("submit", (event) => {
     event.preventDefault();
     saveProfile().catch((error) => showStatus(profileSaveFailureMessage(error), "error"));
@@ -257,8 +291,59 @@ function renderSummary(summary) {
   const identity = objectValue(summary?.identity);
   const people = objectValue(summary?.people);
   renderProfile(identity);
+  renderProfileId(summary?.profile_id);
   renderPeople(people);
   renderDiscovery(summary?.discovery);
+}
+
+function renderProfileId(profileId) {
+  localProfileId = readText(profileId);
+  if (profileIdValue) profileIdValue.textContent = localProfileId;
+  if (profileIdSection) profileIdSection.hidden = !localProfileId;
+  if (addContactForm) addContactForm.hidden = !localProfileId;
+}
+
+function contactRequestMessage(result) {
+  const name = readText(result?.display_name) || "Name not known yet";
+  const unknown = name === "Name not known yet";
+  switch (result?.status) {
+    case "requested": return unknown
+      ? "Name not known yet. Request sent. They'll see it in Inbox when their Home is online."
+      : `Request sent. ${name} sees it in Inbox when their Home is online.`;
+    case "already_requested": return unknown
+      ? "Name not known yet. Request sent. Waiting for them to accept."
+      : `Request sent. Waiting for ${name} to accept.`;
+    case "already_contact": return `${name} is already a contact.`;
+    case "pending_from_them": return `${name} already asked to connect. Open Inbox to answer.`;
+    case "own_profile": return "That's your own DID.";
+    default: throw new Error("Could not confirm the request. Try again.");
+  }
+}
+
+async function sendContactRequest() {
+  const profileId = readText(addContactInput?.value);
+  if (!localProfileId || sendingContact || !profileId) return;
+  sendingContact = true;
+  addContactSubmit.disabled = true;
+  addContactInput.disabled = true;
+  addContactInbox.hidden = true;
+  addContactResult.textContent = "Sending request…";
+  try {
+    const result = await fetchJson("/api/apps/people/contacts/request", {
+      method: "POST", body: JSON.stringify({ profile_id: profileId }),
+    });
+    addContactResult.textContent = contactRequestMessage(result);
+    addContactInbox.hidden = result.status !== "pending_from_them";
+    addContactInput.value = "";
+    // A refresh failure does not change the confirmed request outcome.
+    await refreshPeople({ quiet: true }).catch(() => {});
+  } catch (error) {
+    addContactResult.textContent = error.message || "Could not send the request. Try again.";
+  } finally {
+    sendingContact = false;
+    addContactSubmit.disabled = false;
+    addContactInput.disabled = false;
+  }
 }
 
 function renderProfile(identity) {
@@ -511,7 +596,8 @@ function contactMarkup(contact) {
   const name = readText(contact?.display_name);
   const relationship = relationshipLabel(contact?.relationship);
   const handle = readText(contact?.handle);
-  const details = [relationship, reachabilityLabel(contact), handle && handle !== name ? handle : ""]
+  const deliveryDetail = contact?.relationship === "requested" ? readText(contact.delivery_detail) : "";
+  const details = [relationship, deliveryDetail, reachabilityLabel(contact), handle && handle !== name ? handle : ""]
     .filter(Boolean)
     .map((value) => `<span>${escapeHtml(value)}</span>`)
     .join("");
@@ -624,7 +710,7 @@ function profileSaveFailureMessage(error) {
     ? "Could not save your Profile. Try again."
     : "Could not create your Profile. Try again.";
   const message = readText(error?.message);
-  if (!message || /\b(did:|device|endpoint|route|provider|carrier|schema|projection|launch token|unauthorized|forbidden|[45]\d\d)\b/i.test(message)) {
+  if (!message || /\b(device|endpoint|route|provider|carrier|schema|projection|launch token|unauthorized|forbidden|[45]\d\d)\b/i.test(message)) {
     return fallback;
   }
   return message;

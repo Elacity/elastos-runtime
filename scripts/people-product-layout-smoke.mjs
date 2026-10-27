@@ -82,6 +82,7 @@ function summary({
   discovery,
 }) {
   return {
+    profile_id: readinessStatus === "ready" ? "did:key:z6MkLocalProfileFixture111111111111111111111111111" : null,
     identity: {
       ...(profileName ? { profile: { display_name: profileName } } : {}),
       ...(setupSuggestion ? { profile_setup_display_name: setupSuggestion } : {}),
@@ -290,6 +291,12 @@ function startServer() {
         return;
       }
 
+      if (["/apps/home/home-clipboard-client.js", "/apps/home/home-clipboard-protocol.js"].includes(url.pathname)) {
+        const body = await readFile(join(repoRoot, "capsules/home/browser", url.pathname.split("/").at(-1)));
+        response.writeHead(200, { "access-control-allow-origin": "null", "content-type": "text/javascript" });
+        response.end(body);
+        return;
+      }
       if (url.pathname.startsWith("/apps/people/")) {
         await serveFile(response, url.pathname);
         return;
@@ -326,6 +333,16 @@ function startServer() {
         const body = await readJson(request);
         assert(body.advertisement_id === "ad-visible-1", "People request used the wrong advertisement selector", body);
         return json(response, scenarioSummary(state).discovery);
+      }
+      if (url.pathname === "/api/apps/people/contacts/request" && request.method === "POST") {
+        const { profile_id } = await readJson(request);
+        if (profile_id === "invalid") {
+          response.writeHead(400, { "access-control-allow-origin": "null", "content-type": "text/plain" });
+          response.end("That isn't a DID. A DID starts with did:key:z.");
+          return;
+        }
+        assert(profile_id === "did:key:zRemote", "DID request body differs");
+        return json(response, { status: "requested", display_name: "Name not known yet" });
       }
       if (url.pathname === "/api/apps/people/contacts/remove" && request.method === "POST") {
         const body = await readJson(request);
@@ -508,10 +525,12 @@ async function assertVisible(frame, selectors, label) {
 }
 
 async function assertNoIdentityLeak(frame, label) {
-  const pageState = await frame.evaluate(() => ({
-    text: document.body.innerText,
-    html: document.documentElement.outerHTML,
-  }));
+  const pageState = await frame.evaluate(() => {
+    const body = document.body.cloneNode(true);
+    body.querySelector("#profile-id-value")?.remove();
+    body.querySelector("#add-contact-id")?.remove();
+    return { text: body.textContent, html: body.innerHTML };
+  });
   const textChecks = [
     /did:key:/i,
     /\bendpoint\b/i,
@@ -584,6 +603,8 @@ async function assertFirstRunScenario(frame, width) {
   assert(state.value === "Suggested Profile Name", "first run should prefill the suggested profile name", state);
   assert(state.placeholder === "Your name", "first run should keep a stable editable placeholder", state);
   assert(state.submit === "Create Profile", "first run should offer explicit Profile creation", state);
+  assert(await frame.locator("#profile-id").isHidden(), "Your DID appeared before Profile creation");
+  assert(await frame.locator("#add-contact-form").isHidden(), "Add appeared before Profile creation");
   await assertNoIdentityLeak(frame, `first run at ${width}px`);
 }
 
@@ -596,6 +617,36 @@ async function assertReadyOffScenario(frame, page, width) {
     "#profile-name",
     "#profile-submit",
   ], `ready/off profile at ${width}px`);
+  await assertVisible(frame, ["#profile-id-value", "#profile-id-copy", "#add-contact-id", "#add-contact-submit"], "DID controls");
+  await page.evaluate(() => {
+    const child = document.querySelector("iframe").contentWindow;
+    const homeToken = new URLSearchParams(new URL(document.querySelector("iframe").src).hash.slice(1)).get("home_token");
+    child.postMessage({ type: "home:clipboard-ready", schema: "elastos.home.clipboard.ready/v1",
+      targetId: "people", homeToken, parentOrigin: location.origin, generation: "fixture:1" }, "*");
+    window.peopleCopies = [];
+    window.addEventListener("message", (event) => {
+      const data = event.data;
+      if (event.source !== child || data?.type !== "home:clipboard-request") return;
+      window.peopleCopies.push(data);
+      child.postMessage({ type: "home:clipboard-result", schema: "elastos.home.clipboard.result/v1",
+        requestId: data.requestId, targetId: "people", homeToken, parentOrigin: location.origin,
+        generation: "fixture:1", operation: "write", purpose: "profile.id", ok: true }, "*");
+    });
+  });
+  await frame.locator("#profile-id-copy").click();
+  await waitForStatus(frame, "DID copied.");
+  const copies = await page.evaluate(() => window.peopleCopies);
+  assert(copies.length === 1 && copies[0].purpose === "profile.id"
+    && copies[0].text === await frame.locator("#profile-id-value").innerText(), "Copy lost the Profile DID", copies);
+  await frame.locator("#add-contact-id").fill("invalid");
+  await frame.locator("#add-contact-submit").click();
+  await frame.waitForFunction(() => document.querySelector("#add-contact-result").textContent === "That isn't a DID. A DID starts with did:key:z.");
+  assert(await frame.locator("#add-contact-id").inputValue() === "invalid", "Refusal cleared the input");
+  await frame.locator("#add-contact-id").fill("did:key:zRemote");
+  await frame.locator("#add-contact-id").press("Enter");
+  await frame.waitForFunction(() => document.querySelector("#add-contact-result").textContent.startsWith("Name not known yet. Request sent."));
+  assert(await frame.locator("#add-contact-id").inputValue() === "", "Sent request kept the input");
+  await assertNoOverflow(frame, `DID request at ${width}px`);
   await openDiscovery(frame);
   await assertNoOverflow(frame, `ready/off discovery at ${width}px`);
   await assertVisible(frame, [

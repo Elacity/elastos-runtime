@@ -50,7 +50,20 @@
                 <input id="profile-name" type="text" maxlength="32" autocomplete="nickname" placeholder="Your name">
                 <button id="profile-submit" type="submit">Create Profile</button>
               </form>
+              <div id="profile-id" class="profile-id" hidden>
+                <h3>Your DID</h3>
+                <code id="profile-id-value"></code>
+                <button id="profile-id-copy" type="button">Copy</button>
+                <p>Share it so people can add you. It doesn't let anyone read your messages.</p>
+              </div>
             </section>
+            <form id="add-contact-form" class="profile-card add-contact-form" hidden>
+              <label for="add-contact-id">Add by DID</label>
+              <input id="add-contact-id" type="text" placeholder="Paste a DID" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+              <button id="add-contact-submit" type="submit">Send request</button>
+              <p id="add-contact-result" role="status"></p>
+              <button id="add-contact-inbox" type="button" data-action="open-inbox" hidden>Open Inbox</button>
+            </form>
             <div class="people-section-head">
               <h3 id="people-list-title">Contacts</h3>
               <span id="people-count" class="people-section-count" aria-live="polite">0 contacts</span>
@@ -61,7 +74,7 @@
           <section id="discovery" class="people-section" aria-label="Discovery" hidden>
             <div class="discovery-header">
               <div>
-                <p>Choose whether other people can find you and send connection requests.</p>
+                <p>Choose whether other people can find you in Discovery. Anyone with your DID can send a contact request.</p>
               </div>
               <div class="discovery-actions">
                 <button id="discovery-toggle" type="button" data-action="discovery-toggle">Turn On</button>

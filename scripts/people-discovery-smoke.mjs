@@ -147,6 +147,12 @@ function setupEnvironment(name, replies) {
     ["discovery-requests-count", new FakeElement()],
     ["people-page-title", new FakeElement()],
   ]);
+  for (const id of ["profile-id", "profile-id-value", "profile-id-copy", "add-contact-form", "add-contact-id", "add-contact-submit", "add-contact-result", "add-contact-inbox"]) nodes.set(id, new FakeElement());
+  const copies = [];
+  globalThis.createClipboardFixture = (options) => ({
+    start() { assert.equal(options.targetId, "people"); },
+    async writeText(text, options) { copies.push({ text, ...options }); },
+  });
   const listeners = new Map();
   const documentListeners = new Map();
   const timers = new Map();
@@ -212,6 +218,7 @@ function setupEnvironment(name, replies) {
   };
 
   return {
+    copies,
     calls,
     listeners,
     documentListeners,
@@ -222,6 +229,13 @@ function setupEnvironment(name, replies) {
     messages,
     parentFrame,
   };
+}
+
+async function loadPeople() {
+  const source = readFileSync(new URL("../capsules/people/browser/people.js", import.meta.url), "utf8")
+    .replace(/import \{ createHomeClipboardClient \} from [^;]+;/,
+      "const createHomeClipboardClient = globalThis.createClipboardFixture;");
+  await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 }
 
 async function settle() {
@@ -286,12 +300,105 @@ async function triggerMenuCommand(environment, cmd, {
 }
 
 async function runScenario(name) {
+  if (name === "request_delivery_detail") {
+    const detail = "Contact requests can't be delivered right now.";
+    const contacts = [
+      { contact_id: "contact:waiting", display_name: "Name not known yet", relationship: "requested", delivery_detail: detail },
+      { contact_id: "contact:normal", display_name: "Alma", relationship: "requested" },
+      { contact_id: "contact:connected", display_name: "Bea", relationship: "connected", delivery_detail: detail },
+      { contact_id: "contact:escaped", display_name: "Cy", relationship: "requested", delivery_detail: '<script>alert("fixture")</script>' },
+    ];
+    const environment = setupEnvironment(name, [response(200, { people: { contacts } })]);
+    await loadPeople();
+    await settle();
+    const markup = environment.nodes.get("people-list").innerHTML;
+    const cards = markup.match(/<article[\s\S]*?<\/article>/g);
+    assert.equal(cards.length, 4);
+    assert.ok(cards[0].includes("Contact requests can&#039;t be delivered right now."), "Requested row lost its delivery detail");
+    assert.ok(cards[1].includes("Request sent"));
+    assert.ok(!cards[1].includes("delivered"), "Normal requested row invented a delivery failure");
+    assert.ok(!cards[2].includes("delivered"), "Delivery detail belongs only to requested rows");
+    assert.ok(cards[3].includes("&lt;script&gt;"), "Runtime detail must remain text");
+    assert.ok(!cards[3].includes("<script>"));
+    return;
+  }
+  if (name === "add_by_did") {
+    const ready = () => response(200, {
+      profile_id: "did:key:zLocalProfile",
+      identity: { profile: { display_name: "Local" }, profile_readiness: { schema: "elastos.profile.readiness/v1", status: "ready" } },
+      people: { contacts: [{ contact_id: "contact:unknown", display_name: "Name not known yet", relationship: "requested" }] },
+      discovery: discoverySummary({ configured: true, enabled: false }),
+    });
+    const environment = setupEnvironment(name, [ready()]);
+    await loadPeople();
+    await settle();
+    const node = (id) => environment.nodes.get(id);
+    assert.equal(node("profile-id-value").textContent, "did:key:zLocalProfile");
+    assert.equal(node("profile-id").hidden, false);
+    assert.match(node("people-list").innerHTML, /Name not known yet/);
+    await node("profile-id-copy").listeners.get("click")();
+    await settle();
+    assert.deepEqual(environment.copies, [{ text: "did:key:zLocalProfile", purpose: "profile.id" }]);
+    const expected = {
+      requested: "Request sent. Alma sees it in Inbox when their Home is online.",
+      already_requested: "Request sent. Waiting for Alma to accept.",
+      already_contact: "Alma is already a contact.",
+      pending_from_them: "Alma already asked to connect. Open Inbox to answer.",
+      own_profile: "That's your own DID.",
+    };
+    for (const [status, message] of Object.entries(expected)) {
+      environment.replies.push(response(200, { status, display_name: "Alma" }), ready());
+      node("add-contact-id").value = "  did:key:zRemoteProfile  ";
+      node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
+      await settle();
+      assert.equal(node("add-contact-result").textContent, message);
+      assert.equal(node("add-contact-inbox").hidden, status !== "pending_from_them");
+      assert.equal(node("add-contact-submit").disabled, false);
+      assert.equal(node("add-contact-id").value, "");
+      const request = environment.calls.at(-2);
+      assert.equal(request.path, "/api/apps/people/contacts/request");
+      assert.deepEqual(JSON.parse(request.options.body), { profile_id: "did:key:zRemoteProfile" });
+    }
+    environment.replies.push(response(200, { status: "requested", display_name: "Name not known yet" }), ready());
+    node("add-contact-id").value = "did:key:zUnknown";
+    node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
+    await settle();
+    assert.equal(node("add-contact-result").textContent, "Name not known yet. Request sent. They'll see it in Inbox when their Home is online.");
+    for (const [status, message] of [
+      [400, "That isn't a DID. A DID starts with did:key:z."],
+      [400, "That's this Home's device DID. Use the DID shown in People."],
+      [409, "You have 16 requests waiting. Wait for answers before sending more."],
+      [409, "Contact requests can't be delivered right now. Try again later."],
+      [409, "This Home left Community. Rejoin in System → Security, under Community. Contacts, Direct messages and history remain available."],
+    ]) {
+      environment.replies.push({ ok: false, status, text: async () => message });
+      node("add-contact-id").value = "bad input";
+      node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
+      await settle();
+      assert.equal(node("add-contact-result").textContent, message);
+      assert.equal(node("add-contact-id").value, "bad input");
+      assert.equal(node("add-contact-submit").disabled, false);
+    }
+    let finish;
+    environment.replies.push(() => new Promise(resolve => { finish = resolve; }), ready());
+    node("add-contact-id").value = "did:key:zRemote";
+    node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
+    const count = environment.calls.length;
+    node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
+    assert.equal(environment.calls.length, count, "Two submits queued duplicate requests");
+    assert.equal(node("add-contact-submit").disabled, true);
+    finish(response(200, { status: "requested", display_name: "Alma" }));
+    await settle();
+    assert.equal(node("add-contact-submit").disabled, false);
+    assertRequestAuthority(environment);
+    return;
+  }
   if (name === "community_left") {
     const environment = setupEnvironment(name, [summary("Retained Contact", discoverySummary({
       configured: true, enabled: false, status: "community_left",
       statusMessage: "This Home left Community. Rejoin in System → Security, under Community. Contacts, Direct messages and history remain available.",
     }))]);
-    await import("../capsules/people/browser/people.js");
+    await loadPeople();
     await settle();
     assert.equal(environment.nodes.get("discovery-toggle").disabled, true);
     assert.equal(environment.nodes.get("discovery-refresh").disabled, true);
@@ -308,7 +415,7 @@ async function runScenario(name) {
     removedBody.people.contacts[0].relationship = "removed";
     removedBody.people.contacts[0].can_message = false;
     const environment = setupEnvironment(name, [connected]);
-    await import("../capsules/people/browser/people.js");
+    await loadPeople();
     await settle();
     const markup = () => environment.nodes.get("people-list").innerHTML;
     const removals = () => environment.calls.filter(({ path }) => path === "/api/apps/people/contacts/remove");
@@ -427,7 +534,7 @@ async function runScenario(name) {
         profile: { display_name: "Mac Profile" },
       }, "ready"),
     ]);
-    await import("../capsules/people/browser/people.js");
+    await loadPeople();
     await settle();
 
     assert.deepEqual(environment.messages.slice(0, 2), [
@@ -630,7 +737,7 @@ async function runScenario(name) {
         profile_setup_display_name: "Must not become setup input",
       }, "unavailable"),
     ]);
-    await import("../capsules/people/browser/people.js");
+    await loadPeople();
     await settle();
     assert.equal(environment.nodes.get("profile-name").value, "");
     assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
@@ -653,7 +760,7 @@ async function runScenario(name) {
         profile: { display_name: "Suggested Profile Name" },
       }, "ready"),
     ]);
-    await import("../capsules/people/browser/people.js");
+    await loadPeople();
     await settle();
     assert.equal(environment.nodes.get("profile-name").value, "Suggested Profile Name");
     assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
@@ -728,7 +835,7 @@ async function runScenario(name) {
         profile: { display_name: "Ready Profile" },
       }, "ready"),
     ]);
-    await import("../capsules/people/browser/people.js");
+    await loadPeople();
     await settle();
 
     assert.equal(environment.nodes.get("discovery-status").textContent, "Discovery is off.");
@@ -769,7 +876,7 @@ async function runScenario(name) {
         profile: { display_name: "Ready Profile" },
       }, "ready"),
     ]);
-    await import("../capsules/people/browser/people.js");
+    await loadPeople();
     await settle();
 
     assert.equal(environment.nodes.get("discovery-status").textContent, "Discovery is off.");
@@ -790,7 +897,7 @@ async function runScenario(name) {
         message: "provider route failed for did:key:zExample endpoint device-1",
       }),
     ]);
-    await import("../capsules/people/browser/people.js");
+    await loadPeople();
     await settle();
     environment.nodes.get("profile-name").value = "New Profile";
     await triggerProfileSubmit(environment);
@@ -816,7 +923,7 @@ async function runScenario(name) {
         profile: { display_name: "Recovered Profile" },
       }, "ready"),
     ]);
-    await import("../capsules/people/browser/people.js");
+    await loadPeople();
     await settle();
     assert.equal(environment.calls.filter(({ path }) => path === "/api/apps/people/profile").length, 0,
       "suggestion is editable presentation until explicitly confirmed");
@@ -843,7 +950,7 @@ async function runScenario(name) {
   const environment = setupEnvironment(name, [
     summary(),
   ]);
-  await import("../capsules/people/browser/people.js");
+  await loadPeople();
   await settle();
   assert.equal(environment.timers.size, 0);
   assert.match(environment.nodes.get("discovery-list").innerHTML, /Discovery unavailable/);
@@ -876,6 +983,8 @@ if (!scenario) {
   assert.match(peopleHtml, /id="profile-description">Your Profile is your signed identity for People and Chat\./);
   assert.match(peopleHtml, /id="profile-submit" type="submit">Create Profile/);
   for (const childScenario of [
+    "add_by_did",
+    "request_delivery_detail",
     "configured",
     "community_left",
     "remove_confirmation",
