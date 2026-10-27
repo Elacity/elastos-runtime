@@ -2730,6 +2730,30 @@ for (const target of ["people", "inbox"]) sendChildMessage("null", chatFrameWind
   { type: "home:open-target", homeToken: freshChatToken, target, query: {} });
 await new Promise(resolve => setTimeout(resolve, 0));
 assert(openCommands() === beforeProfileActions + 2, "Profile card did not open its exact People and Inbox targets", shellMessages);
+const contactDid = "did:key:z6Mka1b2c3";
+const contactIntent = { type: "home:open-target", homeToken: freshChatToken,
+  target: "people", query: { did: contactDid } };
+const beforeDidActions = openCommands();
+for (const query of [
+  null, [], "did", { did: 42 }, { did: "" }, { did: "did:key:z" },
+  { did: "did:key:z0OIl" }, { did: `${contactDid}/path` }, { did: `${contactDid}?q=1` },
+  { did: `${contactDid}#key` }, { did: ` ${contactDid}` }, { did: `${contactDid}\n` },
+  { did: `did:key:z${"1".repeat(504)}` }, { did: contactDid, send: true },
+]) sendChildMessage("null", chatFrameWindow, { ...contactIntent, query });
+sendChildMessage("null", chatFrameWindow, { ...contactIntent, target: "inbox" });
+sendChildMessage("null", chatFrameWindow, { ...contactIntent, extra: true });
+sendChildMessage("null", chatFrameWindow, { ...contactIntent, homeToken: "wrong" });
+sendChildMessage("null", {}, contactIntent);
+await new Promise(resolve => setTimeout(resolve, 0));
+assert(openCommands() === beforeDidActions, "Chat forwarded an invalid DID action", shellMessages);
+for (const did of [contactDid, `did:key:z${"1".repeat(503)}`]) {
+  sendChildMessage("null", chatFrameWindow, { ...contactIntent, query: { did } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const opened = shellMessages.filter(m => m.payload?.command === "open-target").at(-1).payload;
+  assert(opened.target === "people" && opened.query.did === did,
+    "Home dropped the Chat DID before it reached People", opened);
+}
+assert(openCommands() === beforeDidActions + 2, "Home did not forward each valid DID once");
 // Stale result inside one app: the old authority's Runtime check is still in
 // flight when the reconnect retires it and the new authority asks. The old
 // result arrives first and is dropped; only the new request shows and opens.

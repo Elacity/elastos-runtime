@@ -2066,10 +2066,16 @@ window.addEventListener("message", (event) => {
     console.warn("home ignored unauthorized open-target message", context.targetId, target);
     return;
   }
-  if (context.targetId === "chat-room" && ["people", "inbox"].includes(target)
-    && (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])
-      || !data.query || typeof data.query !== "object" || Array.isArray(data.query)
-      || Object.keys(data.query).length !== 0)) return;
+  if (context.targetId === "chat-room" && ["people", "inbox"].includes(target)) {
+    if (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])
+      || !data.query || typeof data.query !== "object" || Array.isArray(data.query)) return;
+    const keys = Object.keys(data.query);
+    const peopleDid = target === "people" && keys.length === 1 && keys[0] === "did"
+      && typeof data.query.did === "string" && data.query.did.length <= 512
+      && data.query.did === data.query.did.trim()
+      && /^did:key:z[1-9A-HJ-NP-Za-km-z]+$/.test(data.query.did);
+    if (keys.length !== 0 && !peopleDid) return;
+  }
   if (["assistant", "home-agent"].includes(context.targetId)) {
     if (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])) return;
     const marketplace = data.target === "marketplace" && assistantModelsMarketplaceQuery(data.query);
