@@ -3050,6 +3050,11 @@ async fn community_upload_finish_pins_the_file_here_then_posts_its_link() {
         objects[0]["body"],
         format!("notes.txt · 4 bytes · elastos://{CID}")
     );
+    // A link opened from the row cites it by these two ids.
+    assert!(objects[0]["message_id"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("sha256:")));
+    assert_eq!(objects[0]["conversation_id"], "file-community");
     assert!(objects[0].get("attachment").is_none_or(|a| a.is_null()));
     assert_eq!(port.test_live_unresolved_outgoing().unwrap(), 1);
 

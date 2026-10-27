@@ -179,6 +179,7 @@ fn room_attribution_name_map_never_upgrades_false_or_none_rows_after_reopen() {
             sender_profile_verified,
             seq,
             message_id: None,
+            conversation_id: None,
             sender: sender.to_string(),
             sender_member_did: member_did,
             from_current_session: false,

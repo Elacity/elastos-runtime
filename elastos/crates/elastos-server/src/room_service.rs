@@ -153,6 +153,10 @@ pub struct ConversationObjectView {
     /// Community rows; local-room rows have no envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+    /// The Community conversation the row belongs to; a link opened from the
+    /// row cites it with `message_id`. Present only on Community rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
     pub sender: String,
     /// Profile attribution for collaboration senders. `Some(true)`: the
     /// sender's verified device is bound to an accepted signed Profile head
@@ -4768,15 +4772,19 @@ fn object_view_from_record(
             session.member_did.is_some() && session.member_did == object.sender_member_did
         })
         .and(object.delivery_state);
-    let message_id = object
-        .collaboration_scope
-        .is_some()
-        .then(|| object.event_id.clone());
+    let (message_id, conversation_id) = match &object.collaboration_scope {
+        Some(scope) => (
+            Some(object.event_id.clone()),
+            Some(scope.conversation_id.clone()),
+        ),
+        None => (None, None),
+    };
     ConversationObjectView {
         delivery_state,
         sender_profile_verified,
         seq: object.seq,
         message_id,
+        conversation_id,
         sender: verified_sender_profile
             .map(|profile| profile.display_name.clone())
             .unwrap_or(object.sender),
@@ -8139,6 +8147,10 @@ mod tests {
             second_feed.objects[0].message_id.as_deref(),
             Some(second_hash.as_str())
         );
+        assert_eq!(
+            second_feed.objects[0].conversation_id.as_deref(),
+            Some("conversation-two")
+        );
         assert_eq!(second_feed.objects[0].sender_profile_verified, Some(true));
         assert_eq!(second_feed.objects[0].sender, "Remote");
         assert_eq!(second_feed.participants.len(), 1);
@@ -8155,7 +8167,7 @@ mod tests {
         assert!(legacy_feed
             .objects
             .iter()
-            .all(|object| object.message_id.is_none()));
+            .all(|object| object.message_id.is_none() && object.conversation_id.is_none()));
         assert!(legacy_feed
             .objects
             .iter()
