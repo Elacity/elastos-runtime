@@ -13233,6 +13233,23 @@ async fn home_shared_content_check_then_get_fetches_a_contacts_linked_file_once(
         home_shared_content_post(&app, &home_token, CHECK, check(&other_cid, &shared)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
+    // A pin that failed leaves a `repair_needed` receipt and no bytes here.
+    // That is not "local": check and get still go to Bob's Home.
+    let ensured = alice
+        .registry
+        .send_raw("content", &json!({ "op": "ensure", "cid": cid }))
+        .await
+        .unwrap();
+    let receipt = alice
+        .registry
+        .send_raw("content", &json!({ "op": "status", "cid": cid }))
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["data"]["availability"]["status"], "repair_needed",
+        "{ensured} {receipt}"
+    );
+
     // Bob is a contact. With no presence record the check says so, and get is
     // still allowed.
     let (status, body) =

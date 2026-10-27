@@ -2958,19 +2958,11 @@ impl SharedContentGet {
     }
 }
 
-/// Whether this Home's latest content receipt shows `cid` pinned here.
+/// Whether `cid` is pinned on this Home's backend now, the same evidence a
+/// peer read is admitted on. A receipt alone is not enough: a failed pin can
+/// leave a `repair_needed` receipt with no bytes here.
 pub(crate) async fn content_pinned_here(registry: &ProviderRegistry, cid: &str) -> bool {
-    let Ok(response) = registry
-        .send_raw("content", &json!({ "op": "status", "cid": cid }))
-        .await
-    else {
-        return false;
-    };
-    response.get("status").and_then(Value::as_str) == Some("ok")
-        && response
-            .pointer("/data/availability/status")
-            .and_then(Value::as_str)
-            .is_some_and(|status| status != "local_unpinned")
+    crate::carrier::local_cid_pinned(registry, cid).await == Some(true)
 }
 
 /// Gets `cid` from the Home at `peer_did` with its existing local-only
