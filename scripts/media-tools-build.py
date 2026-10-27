@@ -12,6 +12,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import urllib.request
 
 X264_COMMIT = "b35605ace3ddf7c1a5d67a2eb553f034aef41d55"
@@ -56,8 +57,19 @@ def fetch_source(archive, url, digest):
                                               f"--prefix=x264-{X264_COMMIT}/", X264_COMMIT])
             archive.write_bytes(bz2.compress(source))
     else:
-        with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as dest:
-            shutil.copyfileobj(response, dest)
+        # The pinned digest below authenticates the bytes, so retrying a failed
+        # transfer is safe. GitHub runners saw TLS handshake timeouts from this
+        # host on 26-27 Oct; four bounded attempts ride out a short outage.
+        for attempt in range(1, 5):
+            try:
+                with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as dest:
+                    shutil.copyfileobj(response, dest)
+                break
+            except OSError as error:
+                if attempt == 4:
+                    raise
+                print(f"source fetch attempt {attempt}/4 failed: {error}", flush=True)
+                time.sleep(15 * attempt)
     if sha(archive) != digest:
         raise ValueError(f"Source checksum mismatch: {archive.name}")
 
