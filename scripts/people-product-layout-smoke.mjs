@@ -409,7 +409,7 @@ async function peopleFrame(page) {
 }
 
 async function openPeople(page, port, scenario, width) {
-  await page.setViewportSize({ width, height: 900 });
+  await page.setViewportSize({ width, height: width === 375 ? 1400 : 900 });
   await page.goto(`http://127.0.0.1:${port}/fixture?scenario=${encodeURIComponent(scenario)}`, {
     waitUntil: "domcontentloaded",
   });
