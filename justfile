@@ -213,6 +213,7 @@ product-ui-source:
     node scripts/documents-product-behavior-smoke.mjs
     node --test scripts/documents-markdown.test.mjs
     node scripts/library-product-behavior-smoke.mjs
+    node scripts/library-shared-cid-smoke.mjs
     node scripts/chat-room-product-behavior-smoke.mjs
     node --test scripts/chat-room-reconnect.test.mjs
 
