@@ -1458,9 +1458,9 @@ impl CollaborationDiscoveryService {
         {
             return Err(ProfileContactRequestRefusal::TooManyWaiting.into());
         }
-        let request = self
-            .authority
-            .prepare_profile_contact_request(recipient_profile_did, profile, now)?;
+        let request =
+            self.authority
+                .prepare_profile_contact_request(recipient_profile_did, profile, now)?;
         store.record_outgoing_profile_contact_request(&request, now)?;
         Ok(ProfileContactRequestOutcome::Requested)
     }
@@ -1509,9 +1509,10 @@ impl CollaborationDiscoveryService {
         now: u64,
     ) -> anyhow::Result<()> {
         let mut first_failure: Option<anyhow::Error> = None;
-        for request in store
-            .resendable_outgoing_profile_contact_requests(now, MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC)?
-        {
+        for request in store.resendable_outgoing_profile_contact_requests(
+            now,
+            MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC,
+        )? {
             let sent = self
                 .invoke_bootstrap(
                     PROFILE_CONTACT_SEND_OP,
@@ -1602,8 +1603,8 @@ impl CollaborationDiscoveryService {
             }
         }
         for decision in response.data.decisions {
-            let recorded = decode_bytes(&decision.receipt, "Profile contact decision")
-                .and_then(|receipt| {
+            let recorded =
+                decode_bytes(&decision.receipt, "Profile contact decision").and_then(|receipt| {
                     let recipient_profile =
                         decode_bytes(&decision.recipient_profile, "Profile contact decision")?;
                     store.record_profile_contact_decision(&receipt, &recipient_profile, now)
@@ -2968,9 +2969,9 @@ impl CollaborationDiscoveryRelayProvider {
             .retain(|_, mailbox| !mailbox.is_empty());
         // Requests by DID expire on their own lifetime; decision entries carry
         // their own expiry and never depend on the request still being here.
-        state.profile_requests.retain(|_, request| {
-            request.verified.message().envelope().payload.expires_at > now
-        });
+        state
+            .profile_requests
+            .retain(|_, request| request.verified.message().envelope().payload.expires_at > now);
         for mailbox in state.profile_request_mailboxes.values_mut() {
             mailbox.retain(|request_hash| state.profile_requests.contains_key(request_hash));
         }
@@ -3033,14 +3034,20 @@ impl CollaborationDiscoveryRelayProvider {
         if state
             .profile_decision_mailboxes
             .get(&sender)
-            .is_some_and(|mailbox| mailbox.iter().any(|entry| entry.request_hash == request_hash))
+            .is_some_and(|mailbox| {
+                mailbox
+                    .iter()
+                    .any(|entry| entry.request_hash == request_hash)
+            })
         {
             return Ok(relay_ok());
         }
         if state
             .profile_request_sent_at
             .get(&signer_did)
-            .is_some_and(|sent_at| now < sent_at.saturating_add(PROFILE_REQUEST_DEVICE_INTERVAL_SECS))
+            .is_some_and(|sent_at| {
+                now < sent_at.saturating_add(PROFILE_REQUEST_DEVICE_INTERVAL_SECS)
+            })
         {
             return Err(relay_error(
                 "Profile contact request rate limit reached for this Home",
@@ -3114,8 +3121,9 @@ impl CollaborationDiscoveryRelayProvider {
             parse_discovery_provider_request(request, "Profile contact mailbox poll")?;
         let envelope_bytes =
             decode_bytes(&request.poll, "Profile contact mailbox poll").map_err(relay_error)?;
-        let verified = verify_collaboration_profile_mailbox_poll(&envelope_bytes, &self.profile, now)
-            .map_err(relay_error)?;
+        let verified =
+            verify_collaboration_profile_mailbox_poll(&envelope_bytes, &self.profile, now)
+                .map_err(relay_error)?;
         require_signing_endpoint(&source_endpoint_did, verified.polling_endpoint_did())?;
         let profile_did = verified.profile_did();
         let mut data = DiscoveryProviderProfileMailboxData::default();
@@ -3141,11 +3149,13 @@ impl CollaborationDiscoveryRelayProvider {
                 }
             }
         }
-        Ok(serde_json::to_value(DiscoveryProviderProfileMailboxResponse {
-            status: "ok".to_string(),
-            data,
-        })
-        .expect("Profile contact mailbox response is serializable"))
+        Ok(
+            serde_json::to_value(DiscoveryProviderProfileMailboxResponse {
+                status: "ok".to_string(),
+                data,
+            })
+            .expect("Profile contact mailbox response is serializable"),
+        )
     }
 
     /// Records a decision on a request by DID as a self-contained entry for
@@ -3165,9 +3175,8 @@ impl CollaborationDiscoveryRelayProvider {
             decode_bytes(&request.request, "Profile contact request").map_err(relay_error)?;
         let receipt_bytes =
             decode_bytes(&request.receipt, "contact decision receipt").map_err(relay_error)?;
-        let profile_bytes =
-            decode_bytes(&request.recipient_profile, "contact decision Profile")
-                .map_err(relay_error)?;
+        let profile_bytes = decode_bytes(&request.recipient_profile, "contact decision Profile")
+            .map_err(relay_error)?;
         if receipt_bytes.len() > MAX_COLLABORATION_CONTACT_DECISION_RECEIPT_BYTES
             || profile_bytes.len() > MAX_RELAY_SIGNED_PROFILE_BYTES
         {
@@ -3181,7 +3190,9 @@ impl CollaborationDiscoveryRelayProvider {
         let signed_profile: crate::collaboration_profile_authority::SignedCollaborationProfileDocument =
             serde_json::from_slice(&profile_bytes).map_err(relay_error)?;
         if serde_json::to_vec(&signed_profile).map_err(relay_error)? != profile_bytes {
-            return Err(relay_error("contact decision Profile is not canonical JSON"));
+            return Err(relay_error(
+                "contact decision Profile is not canonical JSON",
+            ));
         }
         let recipient_profile =
             crate::collaboration_profile_authority::verify_signed_profile_document(&signed_profile)
@@ -3199,7 +3210,11 @@ impl CollaborationDiscoveryRelayProvider {
         let existing = state
             .profile_decision_mailboxes
             .get(&requester)
-            .and_then(|mailbox| mailbox.iter().find(|entry| entry.request_hash == request_hash));
+            .and_then(|mailbox| {
+                mailbox
+                    .iter()
+                    .find(|entry| entry.request_hash == request_hash)
+            });
         match existing {
             Some(entry) if entry.receipt_bytes != receipt_bytes => {
                 return Err(relay_error(
@@ -5742,21 +5757,6 @@ pub(crate) mod tests {
         assert_eq!(local_contacts.contacts()[0].remote_display_name(), "Remote");
     }
 
-    #[tokio::test]
-    async fn bilateral_removal_can_readd_the_same_profile_contact_with_one_stable_conversation() {
-        let temp = tempfile::tempdir().unwrap();
-        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
-        let seed_node = start_carrier_node_with_registry(
-            &seed_key,
-            &seed_did,
-            temp.path().join("seed"),
-            Some(Arc::downgrade(&seed_registry)),
-        )
-        .await
-        .unwrap();
     /// Refreshes until this Home's relationship with `remote_profile_did`
     /// becomes `expected`.
     async fn wait_for_relationship(
@@ -6016,6 +6016,21 @@ pub(crate) mod tests {
         assert!(state.requests.is_empty());
     }
 
+    #[tokio::test]
+    async fn bilateral_removal_can_readd_the_same_profile_contact_with_one_stable_conversation() {
+        let temp = tempfile::tempdir().unwrap();
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let seed_registry = Arc::new(ProviderRegistry::new());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
+        let seed_node = start_carrier_node_with_registry(
+            &seed_key,
+            &seed_did,
+            temp.path().join("seed"),
+            Some(Arc::downgrade(&seed_registry)),
+        )
+        .await
+        .unwrap();
         seed_registry
             .set_carrier_invoker(Arc::new(
                 crate::carrier::CarrierProviderInvoker::with_carrier_endpoint(
@@ -10157,295 +10172,6 @@ pub(crate) mod tests {
         assert!(request_mailbox.contains(&overflow_request_hash));
     }
 
-    #[test]
-    fn decode_response_is_stably_ordered_across_input_permutations() {
-        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
-        let device_a = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let device_b = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let device_c = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let authority_a = CollaborationDiscoveryAuthority::new(
-            SigningKey::from_bytes(&device_a.to_bytes()),
-            network_profile.clone(),
-        );
-        let authority_b = CollaborationDiscoveryAuthority::new(
-            SigningKey::from_bytes(&device_b.to_bytes()),
-            network_profile.clone(),
-        );
-        let authority_c = CollaborationDiscoveryAuthority::new(
-            SigningKey::from_bytes(&device_c.to_bytes()),
-            network_profile.clone(),
-        );
-        let ad_a = cached_advertisement(
-            &authority_a,
-            &verified_discovery_profile(&device_a, "Alpha", Some("alpha")),
-            100,
-        );
-        let ad_b = cached_advertisement(
-            &authority_b,
-            &verified_discovery_profile(&device_b, "Beta", Some("beta")),
-            101,
-        );
-        let ad_c = cached_advertisement(
-            &authority_c,
-            &verified_discovery_profile(&device_c, "Gamma", Some("gamma")),
-            99,
-        );
-        let ordered_ids = |ads: &[CachedAdvertisement]| -> Vec<String> {
-            decode_advertisement_response(
-                &network_profile,
-                &DiscoveryProviderAdvertisementResponse {
-                    status: "ok".to_string(),
-                    data: DiscoveryProviderAdvertisementData {
-                        advertisements: ads
-                            .iter()
-                            .map(|ad| encode_bytes(&ad.envelope_bytes))
-                            .collect(),
-                    },
-                },
-                101,
-            )
-            .unwrap()
-            .into_iter()
-            .map(|ad| ad.verified.message().envelope_sha256().to_string())
-            .collect()
-        };
-        let expected = ordered_ids(&[ad_a.clone(), ad_b.clone(), ad_c.clone()]);
-        assert_eq!(
-            ordered_ids(&[ad_c.clone(), ad_a.clone(), ad_b.clone()]),
-            expected
-        );
-        assert_eq!(ordered_ids(&[ad_b, ad_c, ad_a]), expected);
-    }
-
-    #[test]
-    fn decode_response_deduplicates_same_profile_revision_from_multiple_devices() {
-        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
-        let shared_profile_signer = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let device_a = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let device_b = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let shared_profile = signed_profile_document_for_test(
-            &shared_profile_signer,
-            "Shared Person",
-            Some("shared"),
-            1,
-            None,
-            10,
-            vec![
-                crate::crypto::encode_signing_key_did(&device_a),
-                crate::crypto::encode_signing_key_did(&device_b),
-            ],
-        )
-        .unwrap();
-        let authority_a = CollaborationDiscoveryAuthority::new(
-            SigningKey::from_bytes(&device_a.to_bytes()),
-            network_profile.clone(),
-        );
-        let authority_b = CollaborationDiscoveryAuthority::new(
-            SigningKey::from_bytes(&device_b.to_bytes()),
-            network_profile.clone(),
-        );
-        let ad_a = cached_advertisement(&authority_a, &shared_profile, 100);
-        let ad_b = cached_advertisement(&authority_b, &shared_profile, 100);
-        let expected = if compare_cached_advertisements(&ad_a, &ad_b).is_gt() {
-            ad_a.verified.message().envelope_sha256().to_string()
-        } else {
-            ad_b.verified.message().envelope_sha256().to_string()
-        };
-        let response = DiscoveryProviderAdvertisementResponse {
-            status: "ok".to_string(),
-            data: DiscoveryProviderAdvertisementData {
-                advertisements: vec![
-                    encode_bytes(&ad_a.envelope_bytes),
-                    encode_bytes(&ad_b.envelope_bytes),
-                ],
-            },
-        };
-
-        let advertisements =
-            decode_advertisement_response(&network_profile, &response, 100).unwrap();
-        assert_eq!(advertisements.len(), 1);
-        assert_eq!(
-            advertisements[0].verified.profile_did(),
-            shared_profile.document().profile_did
-        );
-        assert_eq!(
-            advertisements[0].verified.message().envelope_sha256(),
-            expected
-        );
-    }
-
-    #[test]
-    fn decode_response_accepts_exact_duplicate_advertisements_idempotently() {
-        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
-        let device = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let authority = CollaborationDiscoveryAuthority::new(
-            SigningKey::from_bytes(&device.to_bytes()),
-            network_profile.clone(),
-        );
-        let advertisement = cached_advertisement(
-            &authority,
-            &verified_discovery_profile(&device, "Shared Person", Some("shared")),
-            100,
-        );
-        let response = DiscoveryProviderAdvertisementResponse {
-            status: "ok".to_string(),
-            data: DiscoveryProviderAdvertisementData {
-                advertisements: vec![
-                    encode_bytes(&advertisement.envelope_bytes),
-                    encode_bytes(&advertisement.envelope_bytes),
-                ],
-            },
-        };
-
-        let advertisements =
-            decode_advertisement_response(&network_profile, &response, 100).unwrap();
-        assert_eq!(advertisements.len(), 1);
-        assert_eq!(
-            advertisements[0].verified.message().envelope_sha256(),
-            advertisement.verified.message().envelope_sha256()
-        );
-    }
-
-    #[test]
-    fn decode_response_keeps_same_display_name_for_distinct_profiles_separate() {
-        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
-        let device_a = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let device_b = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let authority_a = CollaborationDiscoveryAuthority::new(
-            SigningKey::from_bytes(&device_a.to_bytes()),
-            network_profile.clone(),
-        );
-        let authority_b = CollaborationDiscoveryAuthority::new(
-            SigningKey::from_bytes(&device_b.to_bytes()),
-            network_profile.clone(),
-        );
-        let ad_a = cached_advertisement(
-            &authority_a,
-            &verified_discovery_profile(&device_a, "Same Name", Some("one")),
-            100,
-        );
-        let ad_b = cached_advertisement(
-            &authority_b,
-            &verified_discovery_profile(&device_b, "Same Name", Some("two")),
-            101,
-        );
-        let response = DiscoveryProviderAdvertisementResponse {
-            status: "ok".to_string(),
-            data: DiscoveryProviderAdvertisementData {
-                advertisements: vec![
-                    encode_bytes(&ad_a.envelope_bytes),
-                    encode_bytes(&ad_b.envelope_bytes),
-                ],
-            },
-        };
-
-        let advertisements =
-            decode_advertisement_response(&network_profile, &response, 101).unwrap();
-        assert_eq!(advertisements.len(), 2);
-        assert_eq!(
-            advertisements
-                .iter()
-                .filter(|ad| ad.verified.display_name() == "Same Name")
-                .count(),
-            2
-        );
-        assert_ne!(
-            advertisements[0].verified.profile_did(),
-            advertisements[1].verified.profile_did()
-        );
-    }
-
-    #[test]
-    fn decode_response_rejects_raw_cardinality_over_limit_before_decoding() {
-        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
-        let response = DiscoveryProviderAdvertisementResponse {
-            status: "ok".to_string(),
-            data: DiscoveryProviderAdvertisementData {
-                advertisements: vec![
-                    "not-even-base64".to_string();
-                    MAX_DISCOVERY_QUERY_RESULTS + 1
-                ],
-            },
-        };
-
-        let error = match decode_advertisement_response(&network_profile, &response, 100) {
-            Ok(_) => panic!("expected raw advertisement cardinality rejection"),
-            Err(error) => error,
-        };
-        assert!(error
-            .to_string()
-            .contains("discovery query returned too many advertisements"));
-    }
-
-    #[test]
-    fn observed_profile_heads_prevent_downgrade_after_visibility_gap() {
-        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
-        let profile_signer = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let device = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let authority = CollaborationDiscoveryAuthority::new(
-            SigningKey::from_bytes(&device.to_bytes()),
-            network_profile,
-        );
-        let revision_one = cached_advertisement(
-            &authority,
-            &verified_discovery_profile_with(
-                &profile_signer,
-                &device,
-                "Downgrade Test",
-                Some("v1"),
-                1,
-                None,
-                10,
-            ),
-            10,
-        );
-        let revision_two = cached_advertisement(
-            &authority,
-            &verified_discovery_profile_with(
-                &profile_signer,
-                &device,
-                "Downgrade Test",
-                Some("v2"),
-                2,
-                Some(&revision_one.verified.profile_envelope_sha256().unwrap()),
-                20,
-            ),
-            20,
-        );
-        let mut state = DiscoveryClientState {
-            current_advertisement: None,
-            visible_advertisements: BTreeMap::new(),
-            observed_profile_heads: BTreeMap::new(),
-            remote_visibility_may_remain_until: None,
-            transport_available: false,
-            connecting: false,
-        };
-
-        apply_decoded_advertisements(&mut state, vec![revision_two.clone()], true).unwrap();
-        assert_eq!(state.visible_advertisements.len(), 1);
-        apply_decoded_advertisements(&mut state, Vec::new(), true).unwrap();
-        assert!(state.visible_advertisements.is_empty());
-        apply_decoded_advertisements(&mut state, vec![revision_one], true).unwrap();
-        assert!(state.visible_advertisements.is_empty());
-        let head = state
-            .observed_profile_heads
-            .get(revision_two.verified.profile_did())
-            .unwrap();
-        assert_eq!(head.revision, 2);
-        assert_eq!(
-            head.profile_envelope_sha256,
-            revision_two.verified.profile_envelope_sha256().unwrap()
-        );
-    }
-
-    #[test]
-    fn observed_profile_head_pruning_evicts_deterministically() {
     /// One Home device and its Profile, as the relay sees a party to a
     /// request by Profile DID.
     struct ProfileContactParty {
@@ -10981,6 +10707,295 @@ pub(crate) mod tests {
         assert_eq!(polled.decisions.len(), 1);
     }
 
+    #[test]
+    fn decode_response_is_stably_ordered_across_input_permutations() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
+        let device_a = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let device_b = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let device_c = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let authority_a = CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&device_a.to_bytes()),
+            network_profile.clone(),
+        );
+        let authority_b = CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&device_b.to_bytes()),
+            network_profile.clone(),
+        );
+        let authority_c = CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&device_c.to_bytes()),
+            network_profile.clone(),
+        );
+        let ad_a = cached_advertisement(
+            &authority_a,
+            &verified_discovery_profile(&device_a, "Alpha", Some("alpha")),
+            100,
+        );
+        let ad_b = cached_advertisement(
+            &authority_b,
+            &verified_discovery_profile(&device_b, "Beta", Some("beta")),
+            101,
+        );
+        let ad_c = cached_advertisement(
+            &authority_c,
+            &verified_discovery_profile(&device_c, "Gamma", Some("gamma")),
+            99,
+        );
+        let ordered_ids = |ads: &[CachedAdvertisement]| -> Vec<String> {
+            decode_advertisement_response(
+                &network_profile,
+                &DiscoveryProviderAdvertisementResponse {
+                    status: "ok".to_string(),
+                    data: DiscoveryProviderAdvertisementData {
+                        advertisements: ads
+                            .iter()
+                            .map(|ad| encode_bytes(&ad.envelope_bytes))
+                            .collect(),
+                    },
+                },
+                101,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|ad| ad.verified.message().envelope_sha256().to_string())
+            .collect()
+        };
+        let expected = ordered_ids(&[ad_a.clone(), ad_b.clone(), ad_c.clone()]);
+        assert_eq!(
+            ordered_ids(&[ad_c.clone(), ad_a.clone(), ad_b.clone()]),
+            expected
+        );
+        assert_eq!(ordered_ids(&[ad_b, ad_c, ad_a]), expected);
+    }
+
+    #[test]
+    fn decode_response_deduplicates_same_profile_revision_from_multiple_devices() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
+        let shared_profile_signer = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let device_a = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let device_b = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let shared_profile = signed_profile_document_for_test(
+            &shared_profile_signer,
+            "Shared Person",
+            Some("shared"),
+            1,
+            None,
+            10,
+            vec![
+                crate::crypto::encode_signing_key_did(&device_a),
+                crate::crypto::encode_signing_key_did(&device_b),
+            ],
+        )
+        .unwrap();
+        let authority_a = CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&device_a.to_bytes()),
+            network_profile.clone(),
+        );
+        let authority_b = CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&device_b.to_bytes()),
+            network_profile.clone(),
+        );
+        let ad_a = cached_advertisement(&authority_a, &shared_profile, 100);
+        let ad_b = cached_advertisement(&authority_b, &shared_profile, 100);
+        let expected = if compare_cached_advertisements(&ad_a, &ad_b).is_gt() {
+            ad_a.verified.message().envelope_sha256().to_string()
+        } else {
+            ad_b.verified.message().envelope_sha256().to_string()
+        };
+        let response = DiscoveryProviderAdvertisementResponse {
+            status: "ok".to_string(),
+            data: DiscoveryProviderAdvertisementData {
+                advertisements: vec![
+                    encode_bytes(&ad_a.envelope_bytes),
+                    encode_bytes(&ad_b.envelope_bytes),
+                ],
+            },
+        };
+
+        let advertisements =
+            decode_advertisement_response(&network_profile, &response, 100).unwrap();
+        assert_eq!(advertisements.len(), 1);
+        assert_eq!(
+            advertisements[0].verified.profile_did(),
+            shared_profile.document().profile_did
+        );
+        assert_eq!(
+            advertisements[0].verified.message().envelope_sha256(),
+            expected
+        );
+    }
+
+    #[test]
+    fn decode_response_accepts_exact_duplicate_advertisements_idempotently() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
+        let device = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let authority = CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&device.to_bytes()),
+            network_profile.clone(),
+        );
+        let advertisement = cached_advertisement(
+            &authority,
+            &verified_discovery_profile(&device, "Shared Person", Some("shared")),
+            100,
+        );
+        let response = DiscoveryProviderAdvertisementResponse {
+            status: "ok".to_string(),
+            data: DiscoveryProviderAdvertisementData {
+                advertisements: vec![
+                    encode_bytes(&advertisement.envelope_bytes),
+                    encode_bytes(&advertisement.envelope_bytes),
+                ],
+            },
+        };
+
+        let advertisements =
+            decode_advertisement_response(&network_profile, &response, 100).unwrap();
+        assert_eq!(advertisements.len(), 1);
+        assert_eq!(
+            advertisements[0].verified.message().envelope_sha256(),
+            advertisement.verified.message().envelope_sha256()
+        );
+    }
+
+    #[test]
+    fn decode_response_keeps_same_display_name_for_distinct_profiles_separate() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
+        let device_a = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let device_b = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let authority_a = CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&device_a.to_bytes()),
+            network_profile.clone(),
+        );
+        let authority_b = CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&device_b.to_bytes()),
+            network_profile.clone(),
+        );
+        let ad_a = cached_advertisement(
+            &authority_a,
+            &verified_discovery_profile(&device_a, "Same Name", Some("one")),
+            100,
+        );
+        let ad_b = cached_advertisement(
+            &authority_b,
+            &verified_discovery_profile(&device_b, "Same Name", Some("two")),
+            101,
+        );
+        let response = DiscoveryProviderAdvertisementResponse {
+            status: "ok".to_string(),
+            data: DiscoveryProviderAdvertisementData {
+                advertisements: vec![
+                    encode_bytes(&ad_a.envelope_bytes),
+                    encode_bytes(&ad_b.envelope_bytes),
+                ],
+            },
+        };
+
+        let advertisements =
+            decode_advertisement_response(&network_profile, &response, 101).unwrap();
+        assert_eq!(advertisements.len(), 2);
+        assert_eq!(
+            advertisements
+                .iter()
+                .filter(|ad| ad.verified.display_name() == "Same Name")
+                .count(),
+            2
+        );
+        assert_ne!(
+            advertisements[0].verified.profile_did(),
+            advertisements[1].verified.profile_did()
+        );
+    }
+
+    #[test]
+    fn decode_response_rejects_raw_cardinality_over_limit_before_decoding() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
+        let response = DiscoveryProviderAdvertisementResponse {
+            status: "ok".to_string(),
+            data: DiscoveryProviderAdvertisementData {
+                advertisements: vec![
+                    "not-even-base64".to_string();
+                    MAX_DISCOVERY_QUERY_RESULTS + 1
+                ],
+            },
+        };
+
+        let error = match decode_advertisement_response(&network_profile, &response, 100) {
+            Ok(_) => panic!("expected raw advertisement cardinality rejection"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("discovery query returned too many advertisements"));
+    }
+
+    #[test]
+    fn observed_profile_heads_prevent_downgrade_after_visibility_gap() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let network_profile = signed_profile(NETWORK, &trusted, Vec::new());
+        let profile_signer = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let device = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let authority = CollaborationDiscoveryAuthority::new(
+            SigningKey::from_bytes(&device.to_bytes()),
+            network_profile,
+        );
+        let revision_one = cached_advertisement(
+            &authority,
+            &verified_discovery_profile_with(
+                &profile_signer,
+                &device,
+                "Downgrade Test",
+                Some("v1"),
+                1,
+                None,
+                10,
+            ),
+            10,
+        );
+        let revision_two = cached_advertisement(
+            &authority,
+            &verified_discovery_profile_with(
+                &profile_signer,
+                &device,
+                "Downgrade Test",
+                Some("v2"),
+                2,
+                Some(&revision_one.verified.profile_envelope_sha256().unwrap()),
+                20,
+            ),
+            20,
+        );
+        let mut state = DiscoveryClientState {
+            current_advertisement: None,
+            visible_advertisements: BTreeMap::new(),
+            observed_profile_heads: BTreeMap::new(),
+            remote_visibility_may_remain_until: None,
+            transport_available: false,
+            connecting: false,
+        };
+
+        apply_decoded_advertisements(&mut state, vec![revision_two.clone()], true).unwrap();
+        assert_eq!(state.visible_advertisements.len(), 1);
+        apply_decoded_advertisements(&mut state, Vec::new(), true).unwrap();
+        assert!(state.visible_advertisements.is_empty());
+        apply_decoded_advertisements(&mut state, vec![revision_one], true).unwrap();
+        assert!(state.visible_advertisements.is_empty());
+        let head = state
+            .observed_profile_heads
+            .get(revision_two.verified.profile_did())
+            .unwrap();
+        assert_eq!(head.revision, 2);
+        assert_eq!(
+            head.profile_envelope_sha256,
+            revision_two.verified.profile_envelope_sha256().unwrap()
+        );
+    }
+
+    #[test]
+    fn observed_profile_head_pruning_evicts_deterministically() {
         let mut heads = BTreeMap::new();
         for index in 0..=MAX_DISCOVERY_QUERY_RESULTS {
             heads.insert(

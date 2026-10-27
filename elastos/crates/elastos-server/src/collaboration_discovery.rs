@@ -752,10 +752,6 @@ impl VerifiedCollaborationProfileContactRequest {
 }
 
 impl VerifiedCollaborationProfileMailboxPoll {
-    pub fn message(&self) -> &VerifiedCollaborationMessage {
-        &self.message
-    }
-
     pub(crate) fn mailbox_kind(&self) -> CollaborationDiscoveryMailboxKind {
         self.mailbox_kind
     }
@@ -1518,7 +1514,10 @@ mod tests {
             request.message().envelope().payload.recipient.id,
             advertisement.profile_did()
         );
-        assert_eq!(request.profile().sole_endpoint_did().unwrap(), requester_did);
+        assert_eq!(
+            request.profile().sole_endpoint_did().unwrap(),
+            requester_did
+        );
 
         let receipt_bytes = decision_receipt_bytes(
             &recipient_key,
@@ -2487,8 +2486,8 @@ mod tests {
             request.profile().sole_endpoint_did().unwrap(),
             device_did(&requester_key)
         );
-        let stored = verify_stored_collaboration_profile_contact_request(&request_bytes, &network)
-            .unwrap();
+        let stored =
+            verify_stored_collaboration_profile_contact_request(&request_bytes, &network).unwrap();
         assert_eq!(stored, request);
 
         let recipient_profile =
@@ -2556,12 +2555,8 @@ mod tests {
                 .contains("belongs to another scope")
         );
 
-        let profile_request = profile_request_bytes(
-            &requester_key,
-            advertisement.profile_did(),
-            NOW,
-            NOW + 60,
-        );
+        let profile_request =
+            profile_request_bytes(&requester_key, advertisement.profile_did(), NOW, NOW + 60);
         assert!(verify_collaboration_contact_request(
             &profile_request,
             &network,
@@ -2655,9 +2650,7 @@ mod tests {
         );
 
         let to_non_did = profile_request_bytes(&requester_key, "not-a-did", NOW, NOW + 60);
-        assert!(
-            verify_collaboration_profile_contact_request(&to_non_did, &network, NOW).is_err()
-        );
+        assert!(verify_collaboration_profile_contact_request(&to_non_did, &network, NOW).is_err());
 
         let request = profile_request_bytes(&requester_key, &recipient_did, NOW, NOW + 60);
         let other_network = verified_profile_with_network(&network_signer, "another-network");
@@ -2750,10 +2743,8 @@ mod tests {
         // The requested Profile, in a revision whose device list no longer
         // includes the signing device, does not authorize the receipt.
         let (replacement_key, _) = generate_keypair();
-        let revision_without_signer = recipient_profile_with_endpoints(
-            &recipient_key,
-            vec![device_did(&replacement_key)],
-        );
+        let revision_without_signer =
+            recipient_profile_with_endpoints(&recipient_key, vec![device_did(&replacement_key)]);
         let receipt = profile_receipt_bytes(
             &recipient_key,
             &request,

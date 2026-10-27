@@ -417,15 +417,6 @@ struct ProfileContactStoreState {
     removed_contacts: Vec<StoredRemovedContact>,
 }
 
-impl ProfileContactStoreState {
-    fn is_empty(&self) -> bool {
-        self.requests.is_empty()
-            && self.decisions.is_empty()
-            && self.accepted_profile_heads.is_empty()
-            && self.removed_contacts.is_empty()
-    }
-}
-
 /// A decision on a request addressed by DID, self-contained: the signed
 /// receipt and the deciding Profile's canonical signed document, whose DID is
 /// the addressed one and which authorizes the receipt signer.
@@ -585,7 +576,6 @@ impl CollaborationContactReadSnapshot<'_> {
                 .advertisements
                 .get(request.advertisement_envelope_sha256())
             else {
-                addressed_by_did: false,
                 continue;
             };
             requested.push(CollaborationOutgoingContactRequest {
@@ -595,6 +585,7 @@ impl CollaborationContactReadSnapshot<'_> {
                 handle: advertisement.handle().map(str::to_string),
                 created_at: envelope.created_at,
                 expires_at: envelope.expires_at,
+                addressed_by_did: false,
             });
         }
         for (request_hash, request) in &loaded.profile_requests {
@@ -606,7 +597,6 @@ impl CollaborationContactReadSnapshot<'_> {
                 continue;
             }
             let known = known_profile(loaded, request.recipient_profile_did());
-                addressed_by_did: true,
             requested.push(CollaborationOutgoingContactRequest {
                 request_hash: request_hash.clone(),
                 recipient_profile_did: request.recipient_profile_did().to_string(),
@@ -616,6 +606,7 @@ impl CollaborationContactReadSnapshot<'_> {
                 handle: known.and_then(|profile| profile.document().handle.clone()),
                 created_at: envelope.created_at,
                 expires_at: envelope.expires_at,
+                addressed_by_did: true,
             });
         }
         requested.sort_by(|left, right| {
@@ -1628,12 +1619,14 @@ impl CollaborationContactStore {
             if loaded.removed_contacts.len() >= MAX_REMOVED_CONTACTS {
                 anyhow::bail!("removed contact records exceed their limit");
             }
-            removed_records_for_pair(loaded, &remote_profile_did, &self.local_profile_did)?.push(StoredRemovedContact {
-                revocation_envelope: String::from_utf8(envelope_bytes.to_vec())
-                    .context("contact revocation envelope must be UTF-8 JSON")?,
-                removed_by_local: true,
-                revocation_settled: false,
-            });
+            removed_records_for_pair(loaded, &remote_profile_did, &self.local_profile_did)?.push(
+                StoredRemovedContact {
+                    revocation_envelope: String::from_utf8(envelope_bytes.to_vec())
+                        .context("contact revocation envelope must be UTF-8 JSON")?,
+                    removed_by_local: true,
+                    revocation_settled: false,
+                },
+            );
             loaded.removed_contacts.insert(
                 remote_profile_did.clone(),
                 LoadedRemovedContact {
@@ -1720,12 +1713,14 @@ impl CollaborationContactStore {
             if loaded.removed_contacts.len() >= MAX_REMOVED_CONTACTS {
                 anyhow::bail!("removed contact records exceed their limit");
             }
-            removed_records_for_pair(loaded, &remote_profile_did, &self.local_profile_did)?.push(StoredRemovedContact {
-                revocation_envelope: String::from_utf8(envelope_bytes.to_vec())
-                    .context("contact revocation envelope must be UTF-8 JSON")?,
-                removed_by_local: false,
-                revocation_settled: true,
-            });
+            removed_records_for_pair(loaded, &remote_profile_did, &self.local_profile_did)?.push(
+                StoredRemovedContact {
+                    revocation_envelope: String::from_utf8(envelope_bytes.to_vec())
+                        .context("contact revocation envelope must be UTF-8 JSON")?,
+                    removed_by_local: false,
+                    revocation_settled: true,
+                },
+            );
             loaded.removed_contacts.insert(
                 remote_profile_did.clone(),
                 LoadedRemovedContact {
@@ -1860,10 +1855,9 @@ impl CollaborationContactStore {
         let existing = self.load_state()?;
         let mut loaded = match existing {
             Some(loaded) => loaded,
-            None => self.loaded_state_from_states(
-                self.empty_v1_state(),
-                self.empty_profile_state(),
-            )?,
+            None => {
+                self.loaded_state_from_states(self.empty_v1_state(), self.empty_profile_state())?
+            }
         };
         let original_v1 = loaded.state.clone();
         let original_profile = loaded.profile_state.clone();
@@ -2085,9 +2079,9 @@ impl CollaborationContactStore {
                 serde_json::from_str(&entry.receipt)
                     .context("invalid stored Profile contact decision")?;
             let request_hash = raw.payload.request_envelope_sha256.clone();
-            let request = requests
-                .get(&request_hash)
-                .ok_or_else(|| anyhow::anyhow!("stored Profile contact decision request is missing"))?;
+            let request = requests.get(&request_hash).ok_or_else(|| {
+                anyhow::anyhow!("stored Profile contact decision request is missing")
+            })?;
             let recipient_profile = verify_canonical_signed_profile(&entry.recipient_profile)?;
             let receipt = verify_stored_collaboration_profile_contact_decision_receipt(
                 entry.receipt.as_bytes(),
@@ -2101,7 +2095,9 @@ impl CollaborationContactStore {
                 anyhow::bail!("Profile contact store has conflicting contact decisions");
             }
         }
-        for (profile_did, head) in parse_accepted_profile_heads(&profile_state.accepted_profile_heads)? {
+        for (profile_did, head) in
+            parse_accepted_profile_heads(&profile_state.accepted_profile_heads)?
+        {
             if loaded
                 .accepted_profile_heads
                 .insert(profile_did, head)
@@ -2110,10 +2106,12 @@ impl CollaborationContactStore {
                 anyhow::bail!("duplicate accepted profile head for one profile DID");
             }
         }
-        for (remote_did, removed) in
-            self.parse_removed_contacts(&profile_state.removed_contacts)?
-        {
-            if loaded.removed_contacts.insert(remote_did, removed).is_some() {
+        for (remote_did, removed) in self.parse_removed_contacts(&profile_state.removed_contacts)? {
+            if loaded
+                .removed_contacts
+                .insert(remote_did, removed)
+                .is_some()
+            {
                 anyhow::bail!("duplicate removed relationship for one profile DID");
             }
         }
@@ -2645,18 +2643,20 @@ impl CollaborationContactStore {
         let dropped: HashSet<String> = loaded
             .profile_requests
             .iter()
-            .filter(|(request_hash, request)| match loaded.profile_decisions.get(*request_hash) {
-                None => request.message().envelope().payload.expires_at <= now,
-                Some((receipt, _)) => {
-                    let payload = &receipt.envelope().payload;
-                    payload.decision == CollaborationContactDecision::Declined
-                        && !keep_newest.contains(*request_hash)
-                        && payload
-                            .decided_at
-                            .saturating_add(PROFILE_CONTACT_DECLINE_COOL_DOWN_SECS)
-                            <= now
-                }
-            })
+            .filter(
+                |(request_hash, request)| match loaded.profile_decisions.get(*request_hash) {
+                    None => request.message().envelope().payload.expires_at <= now,
+                    Some((receipt, _)) => {
+                        let payload = &receipt.envelope().payload;
+                        payload.decision == CollaborationContactDecision::Declined
+                            && !keep_newest.contains(*request_hash)
+                            && payload
+                                .decided_at
+                                .saturating_add(PROFILE_CONTACT_DECLINE_COOL_DOWN_SECS)
+                                <= now
+                    }
+                },
+            )
             .map(|(request_hash, _)| request_hash.clone())
             .collect();
         if dropped.is_empty() {
@@ -2751,10 +2751,13 @@ impl CollaborationContactStore {
             if declined_within_cool_down(loaded, requester, &self.local_profile_did, now) {
                 return Ok((ContactStoreWrite::Replayed, false));
             }
-            let already_waiting = loaded.profile_requests.iter().any(|(request_hash, stored)| {
-                stored.requester_profile_did() == requester
-                    && !loaded.profile_decisions.contains_key(request_hash)
-            });
+            let already_waiting = loaded
+                .profile_requests
+                .iter()
+                .any(|(request_hash, stored)| {
+                    stored.requester_profile_did() == requester
+                        && !loaded.profile_decisions.contains_key(request_hash)
+                });
             if already_waiting {
                 return Ok((ContactStoreWrite::Replayed, false));
             }
@@ -2786,9 +2789,8 @@ impl CollaborationContactStore {
         let receipt_json = std::str::from_utf8(receipt_bytes)
             .context("contact decision receipt is not UTF-8 JSON")?;
         self.with_mutation(now, |loaded| {
-            let raw: SignedCollaborationContactDecisionReceipt =
-                serde_json::from_str(receipt_json)
-                    .context("invalid contact decision receipt envelope")?;
+            let raw: SignedCollaborationContactDecisionReceipt = serde_json::from_str(receipt_json)
+                .context("invalid contact decision receipt envelope")?;
             let request_hash = raw.payload.request_envelope_sha256;
             let request = loaded
                 .profile_requests
@@ -2878,23 +2880,6 @@ impl CollaborationContactStore {
                 .profile_decisions
                 .get(request_hash)
                 .map(|(receipt, _)| receipt.envelope().payload.decision)
-        }))
-    }
-
-    /// The hash of this Profile's undecided, unexpired request by DID to
-    /// `recipient_profile_did`, if one is waiting.
-    pub(crate) fn waiting_outgoing_profile_request(
-        &self,
-        recipient_profile_did: &str,
-        now: u64,
-    ) -> anyhow::Result<Option<String>> {
-        Ok(self.load_state()?.and_then(|loaded| {
-            waiting_outgoing_profile_request(
-                &loaded,
-                recipient_profile_did,
-                &self.local_profile_did,
-                now,
-            )
         }))
     }
 
@@ -3870,7 +3855,12 @@ fn declined_within_cool_down(
     loaded
         .decisions
         .values()
-        .chain(loaded.profile_decisions.values().map(|(receipt, _)| receipt))
+        .chain(
+            loaded
+                .profile_decisions
+                .values()
+                .map(|(receipt, _)| receipt),
+        )
         .any(|receipt| {
             let payload = &receipt.envelope().payload;
             payload.decision == CollaborationContactDecision::Declined
@@ -3905,7 +3895,12 @@ fn known_profile(
                     .values()
                     .map(|request| request.profile()),
             )
-            .chain(loaded.profile_decisions.values().map(|(_, profile)| profile))
+            .chain(
+                loaded
+                    .profile_decisions
+                    .values()
+                    .map(|(_, profile)| profile),
+            )
             .filter(|profile| profile.document().profile_did == profile_did),
     );
     candidates
@@ -3924,7 +3919,11 @@ fn pair_has_v1_chain(
 ) -> anyhow::Result<bool> {
     for chain in accepted_chains(loaded)? {
         if chain.v1
-            && chain.remote_profile(local_profile_did)?.document().profile_did == remote_profile_did
+            && chain
+                .remote_profile(local_profile_did)?
+                .document()
+                .profile_did
+                == remote_profile_did
         {
             return Ok(true);
         }
@@ -5857,13 +5856,14 @@ mod tests {
             network_id: NETWORK.to_string(),
             request_envelope_sha256: collaboration_message_envelope_sha256(request_bytes),
             conversation_id: request.payload.conversation_id.clone(),
-            requester_profile_did: crate::collaboration_profile_authority::verify_signed_profile_document(
-                &request_payload.signed_profile,
-            )
-            .unwrap()
-            .document()
-            .profile_did
-            .clone(),
+            requester_profile_did:
+                crate::collaboration_profile_authority::verify_signed_profile_document(
+                    &request_payload.signed_profile,
+                )
+                .unwrap()
+                .document()
+                .profile_did
+                .clone(),
             requester_endpoint_did: request.signer_did,
             request_message_id: request.payload.message_id,
             request_message_nonce: request.payload.nonce,
@@ -5890,12 +5890,8 @@ mod tests {
 
     /// This Home asks `remote` by DID and records the remote's acceptance.
     fn add_outgoing_profile_contact(fixture: &Fixture, remote: &RemoteIdentity, at: u64) {
-        let request = profile_scope_request(
-            &fixture.local_key,
-            &fixture.local_profile,
-            remote.did(),
-            at,
-        );
+        let request =
+            profile_scope_request(&fixture.local_key, &fixture.local_profile, remote.did(), at);
         fixture
             .store
             .record_outgoing_profile_contact_request(&request, at)
@@ -5935,7 +5931,11 @@ mod tests {
         let receipt = profile_scope_receipt(&fixture.local_key, &request, decision, at + 1);
         fixture
             .store
-            .record_profile_contact_decision(&receipt, &signed_bytes(&fixture.local_profile), at + 1)
+            .record_profile_contact_decision(
+                &receipt,
+                &signed_bytes(&fixture.local_profile),
+                at + 1,
+            )
             .unwrap();
         request
     }
@@ -6047,10 +6047,18 @@ mod tests {
 
         // The v1 file was never rewritten, and on its own it still passes
         // exactly the v1 rules alpha.25 applies.
-        assert_eq!(fs::read(store_state_path(&fixture)).unwrap(), v1_disk_before);
+        assert_eq!(
+            fs::read(store_state_path(&fixture)).unwrap(),
+            v1_disk_before
+        );
         assert_eq!(protected_plaintext(&fixture, &v1_uri).unwrap(), v1_plain);
         let v1_only = fixture.store.verify_v1_state(parsed).unwrap();
-        assert_eq!(derive_contacts(&v1_only, &fixture.store.local_profile_did).unwrap().len(), 1);
+        assert_eq!(
+            derive_contacts(&v1_only, &fixture.store.local_profile_did)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(protected_plaintext(&fixture, &profile_uri).is_some());
     }
 
@@ -6134,7 +6142,11 @@ mod tests {
         );
         fixture
             .store
-            .record_profile_contact_decision(&declined, &signed_bytes(&first_remote.profile), NOW + 21)
+            .record_profile_contact_decision(
+                &declined,
+                &signed_bytes(&first_remote.profile),
+                NOW + 21,
+            )
             .unwrap();
         fixture
             .store
@@ -6203,7 +6215,11 @@ mod tests {
                 .unwrap(),
             ContactStoreWrite::Replayed
         );
-        assert!(fixture.store.pending_incoming_requests().unwrap().is_empty());
+        assert!(fixture
+            .store
+            .pending_incoming_requests()
+            .unwrap()
+            .is_empty());
 
         // The decliner may still ask the other way.
         fixture
@@ -6270,12 +6286,8 @@ mod tests {
     fn an_answer_must_come_with_the_addressed_profile() {
         let fixture = Fixture::new();
         let asked = RemoteIdentity::new("Asked");
-        let request = profile_scope_request(
-            &fixture.local_key,
-            &fixture.local_profile,
-            asked.did(),
-            NOW,
-        );
+        let request =
+            profile_scope_request(&fixture.local_key, &fixture.local_profile, asked.did(), NOW);
         fixture
             .store
             .record_outgoing_profile_contact_request(&request, NOW)
@@ -6329,8 +6341,11 @@ mod tests {
         .unwrap()
         .unwrap();
         fs::remove_file(
-            rooted_localhost_fs_path(&fixture.data_root, &fixture.store.profile_state_object_uri())
-                .unwrap(),
+            rooted_localhost_fs_path(
+                &fixture.data_root,
+                &fixture.store.profile_state_object_uri(),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert!(fixture.store.snapshot().unwrap().contacts().is_empty());
