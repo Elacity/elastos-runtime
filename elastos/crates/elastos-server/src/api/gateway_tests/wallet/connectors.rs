@@ -390,6 +390,33 @@ async fn test_walletconnect_connector_requires_pinned_config() {
     );
 }
 
+#[test]
+fn test_marketplace_lists_walletconnect_only_once_its_config_is_pinned() {
+    let dir = tempfile::tempdir().unwrap();
+    write_test_browser_capsule(
+        dir.path(),
+        WALLET_WALLETCONNECT_CAPSULE_ID,
+        "app",
+        "WalletConnect",
+        None,
+    );
+    let listed = || {
+        capsule_catalog_summary(dir.path())
+            .capsules
+            .iter()
+            .any(|capsule| capsule.name == WALLET_WALLETCONNECT_CAPSULE_ID)
+    };
+    assert!(
+        !listed(),
+        "an unconfigured WalletConnect must stay out of Marketplace"
+    );
+    seed_walletconnect_connector_config(dir.path());
+    assert!(
+        listed(),
+        "a configured WalletConnect must be listed in Marketplace"
+    );
+}
+
 #[tokio::test]
 async fn test_walletconnect_connector_accepts_pinned_config() {
     let dir = tempfile::tempdir().unwrap();

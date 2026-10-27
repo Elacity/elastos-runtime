@@ -42,6 +42,8 @@ pub(in crate::api::gateway) fn capsule_catalog_summary_for(
         })
         // Browser is absent, not merely unlaunchable, where it is unavailable.
         .filter(|manifest| manifest.name != "browser" || crate::setup::browser_available(platform))
+        // An unconfigured WalletConnect is hidden here as in the launcher and Wallet.
+        .filter(|manifest| ensure_wallet_connector_configured(data_dir, &manifest.name).is_ok())
         .map(|manifest| {
             catalog_capsule_summary(
                 manifest,

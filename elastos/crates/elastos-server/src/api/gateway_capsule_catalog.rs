@@ -1434,8 +1434,12 @@ mod tests {
                 crate::protected_content_runtime::protected_content_enabled(data_dir.path())
                     || *name != crate::protected_content_runtime::ELACITY_PLAYER_CAPSULE_ID
             })
+            // WalletConnect stays out until an operator pins its config.
+            .filter(|name| *name != WALLET_WALLETCONNECT_CAPSULE_ID)
             .collect::<BTreeSet<_>>();
         assert_eq!(catalog_names, expected);
+        assert!(active_names.contains(WALLET_WALLETCONNECT_CAPSULE_ID));
+        assert!(!catalog_names.contains(WALLET_WALLETCONNECT_CAPSULE_ID));
         assert!(!catalog_names.contains("bus-v1-conformance"));
 
         let catalog_interface_count = catalog
