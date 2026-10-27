@@ -1301,30 +1301,39 @@ async fn handle_operator_stream(
     let expected_requesters: Vec<String> =
         config.peers.iter().map(|peer| peer.did.clone()).collect();
 
-    let response = match verify_request_envelope(line.trim().as_bytes(), &expected_requesters) {
+    let verified = verify_request_envelope(line.trim().as_bytes(), &expected_requesters);
+    let authenticated = verified.is_ok();
+    let response = match verified {
         Ok(request) => build_operator_response(ctx, &config, request).await,
-        Err(err) => OperatorResponsePayload {
-            version: 1,
-            request_id,
-            accepted: false,
-            target_did: ctx.local_did.clone(),
-            ts: now_ts(),
-            result: serde_json::Value::Null,
-            error: Some(err.to_string()),
-        },
+        Err(err) => {
+            tracing::debug!("operator control request rejected: {:#}", err);
+            OperatorResponsePayload {
+                version: 1,
+                request_id,
+                accepted: false,
+                target_did: ctx.local_did.clone(),
+                ts: now_ts(),
+                result: serde_json::Value::Null,
+                error: Some(err.to_string()),
+            }
+        }
     };
 
-    append_audit_entry(
-        &ctx.data_dir,
-        AuditEntry {
-            ts: response.ts,
-            request_id: response.request_id.clone(),
-            requester_did,
-            action,
-            accepted: response.accepted,
-            error: response.error.clone(),
-        },
-    );
+    // The audit file records requests whose signature verified; it is also
+    // the replay record for read-only actions.
+    if authenticated {
+        append_audit_entry(
+            &ctx.data_dir,
+            AuditEntry {
+                ts: response.ts,
+                request_id: response.request_id.clone(),
+                requester_did,
+                action,
+                accepted: response.accepted,
+                error: response.error.clone(),
+            },
+        );
+    }
 
     let (signing_key, _did) = elastos_identity::load_or_create_did(&ctx.data_dir)?;
     let envelope = sign_envelope(&signing_key, OPERATOR_RESPONSE_DOMAIN, &response)?;
@@ -2488,6 +2497,82 @@ mod tests {
         assert!(answer.is_empty());
         assert!(started.elapsed() >= OPERATOR_REQUEST_WAIT - Duration::from_millis(100));
         drop(send);
+    }
+
+    #[tokio::test]
+    async fn operator_stream_audits_verified_requests_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [14u8; 32];
+        write_test_device_key(dir.path(), &key);
+        let (sk, did) = elastos_identity::derive_did(&key);
+        let node = start_carrier_node(&sk, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let ticket = local_endpoint_ticket(&node.endpoint).unwrap();
+        let addr = decode_ticket_endpoints(&ticket).remove(0);
+        let client = OperatorClient::connect_endpoint_addr(addr, 10)
+            .await
+            .unwrap();
+        let audit_path = dir.path().join(OPERATOR_AUDIT_FILE);
+
+        let (requester_sk, requester_did) = elastos_identity::derive_did(&[15u8; 32]);
+        upsert_peer(
+            dir.path(),
+            OperatorPeer {
+                did: requester_did.clone(),
+                label: "requester".to_string(),
+                connect_ticket: String::new(),
+                allow: vec![OPERATOR_ACTION_STATUS_READ.to_string()],
+            },
+        )
+        .unwrap();
+
+        // An unsigned request is denied and leaves no audit entry.
+        let unsigned = serde_json::json!({
+            "payload": {
+                "version": 1,
+                "request_id": "r".repeat(32 * 1024),
+                "requester_did": requester_did,
+                "target_did": did,
+                "ts": now_ts(),
+                "action": OPERATOR_ACTION_STATUS_READ,
+                "args": null,
+            },
+            "signature": "",
+            "signer_did": requester_did,
+        });
+        let answer = client.send_request(&unsigned).await.unwrap();
+        let denied = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!denied.accepted);
+        assert!(!audit_path.exists());
+
+        // A signed request is audited, and repeating it is refused as a replay.
+        let request = OperatorRequestPayload {
+            version: 1,
+            request_id: "req-status-1".to_string(),
+            requester_did: requester_did.clone(),
+            target_did: did.clone(),
+            ts: now_ts(),
+            action: OPERATOR_ACTION_STATUS_READ.to_string(),
+            args: serde_json::Value::Null,
+        };
+        let signed = sign_envelope(&requester_sk, OPERATOR_REQUEST_DOMAIN, &request).unwrap();
+        let answer = client.send_request(&signed).await.unwrap();
+        let accepted = verify_response_envelope(&answer, &did).unwrap();
+        assert!(accepted.accepted, "{:?}", accepted.error);
+        assert!(audit_contains_request_id(
+            dir.path(),
+            &requester_did,
+            &request.request_id
+        ));
+
+        let answer = client.send_request(&signed).await.unwrap();
+        let replayed = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!replayed.accepted);
+        assert_eq!(
+            replayed.error.as_deref(),
+            Some("operator request replay detected")
+        );
     }
 
     #[tokio::test]
