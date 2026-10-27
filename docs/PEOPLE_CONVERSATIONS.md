@@ -68,8 +68,10 @@ Use these concepts consistently:
   second concurrent device.
 - `DiscoveryAdvertisement`: a short-lived signed publication of the current
   signed Profile document while discovery is on and this Home is online.
-- `ContactRequest`: an Inbox-reviewed request bound to one exact signed
-  discovery advertisement.
+- `ContactRequest`: an Inbox-reviewed request addressed to a Profile DID. A
+  request sent from Discovery's `Visible now` list is instead bound to one
+  exact signed discovery advertisement, so a Home on 0.8.0-alpha.25 can still
+  receive it.
 - `Contact`: a mutual relationship derived from a verified request plus the
   exact signed acceptance receipt.
 - `Conversation`: a direct, group, or public thread between profile identities.
@@ -99,12 +101,15 @@ User-facing actions:
 
 - Edit my profile card.
 - Turn Discovery on or off.
+- Show `Your DID` and copy it, so people can add you.
 
 Copy rules:
 
 - Say "device", "profile", "people", "conversation".
 - Do not say "runtime DID" in ordinary UI.
-- If a DID is shown in advanced details, label it as technical proof material.
+- Show a Profile DID only where a person copies or pastes it: `Your DID` in
+  People, the Add field, and `Copy DID` on a Chat profile card. Device DIDs stay
+  hidden.
 
 ### People / Contacts
 
@@ -114,6 +119,7 @@ User-facing actions:
 - Choose whether other people can find this Home.
 - See the bounded `Visible now` list of people who have opted in, with optional
   local filtering.
+- Add someone by the DID they shared, with or without Discovery.
 - Send contact request.
 - Start chat.
 - Remove contact.
@@ -166,8 +172,8 @@ Use one compact card everywhere:
 - relationship state: `You`, `Contact`, `Requested`, or `Pending`
 - primary action: `Message`, `Add contact`, `Accept`, `Decline`, or `Remove`
 
-Do not show raw DID text on the card. Put technical identifiers behind
-`Details`.
+Do not show raw DID text on the card. `Copy DID` copies the person's Profile
+DID; the card itself carries only an opaque reference.
 
 ### Discovery Panel
 
@@ -247,6 +253,45 @@ Privacy constraints:
 - Discovery advertisements refresh while enabled and online; after disconnect
   or failed withdrawal, the last advertisement can remain visible only until
   its existing TTL expires.
+
+## Adding by DID
+
+Discovery off means "not listed", not "unreachable". Anyone who has your
+Profile DID can send you one contact request, from People's Add form or a
+Chat profile card:
+
+1. The requester's Home signs a request addressed to your Profile DID (scope
+   `elastos.people.contact.profile`, 24 hour lifetime) that carries their
+   signed Profile, and queues it.
+2. The Community node holds it in a mailbox keyed by your Profile DID. Your
+   Home reads that mailbox on every pass while it is in Community, whatever
+   the Discovery setting.
+3. You Accept or Decline in Inbox. The answer travels back with your current
+   signed Profile, and the requester's Home checks that this Profile is the
+   DID it asked and authorizes the device that signed the answer.
+
+What each side learns:
+
+- The requester learns nothing about you until you answer: not whether the
+  DID exists, nor your name, nor whether you are online. People shows a name
+  only when this Home already holds that person's signed Profile, otherwise
+  `Name not known yet`.
+- The Community node learns which Profile asked which, as it already does for
+  Discovery requests, and holds the requester's signed Profile.
+- A Decline sends your signed Profile to the requester, as Discovery's Decline
+  does.
+
+Leave Community stops all requests. There is no separate setting, because
+every requester is by definition not yet a contact.
+
+Compatibility: requests by DID use their own relay operations and mailboxes,
+so a Home on 0.8.0-alpha.25 never meets one and never receives one; adds from
+the `Visible now` list keep the advertisement-bound request it can receive.
+The Community node must run 0.8.0 first; until it does, People says
+`Contact requests can't be delivered right now.` on each waiting request.
+Contacts added by DID live in their own file beside the Discovery contact
+store, so Undo to 0.8.0-alpha.25 keeps People and direct messages for
+Discovery contacts but does not show contacts added by DID.
 
 ## QR, Code, and Link Flow
 
@@ -491,6 +536,16 @@ Each limit is a constant in the Runtime and refuses only the extra item:
   `Visible now`; renewing a stored listing is free. The relay stores at most 8
   contact requests per sender Profile and 16 per Home, and refuses a call
   without an authenticated Carrier endpoint.
+- Requests by DID: the relay accepts one new request per device every 5
+  seconds, at most 8 per sender Profile, 16 per device, 16 per recipient and
+  512 in total; a newer request to the same person replaces the older one,
+  and an answer removes the request at once. Only the signing device may
+  submit a request, answer or mailbox read. Your Home keeps one waiting request
+  per person and 32 in total, and drops requests from someone you declined
+  for 7 days; you can still ask them. You can have 16 requests waiting for an
+  answer. Profiles are free to create, so these limits bound one identity:
+  many new identities can fill one person's 16 relay slots until the requests
+  expire.
 
 ## Near-Term Non-Goals
 

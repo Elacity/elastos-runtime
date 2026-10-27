@@ -116,6 +116,24 @@ reading once it passes one 200 MiB file as base64 (about 268 MiB), the largest
 file Runtime downloads whole. Only two such fetches run at once, and one per
 peer.
 
+### Contact requests by DID
+
+**Severity:** Low
+**Files:** `elastos/crates/elastos-server/src/collaboration_discovery_runtime.rs`, `elastos/crates/elastos-server/src/collaboration_contact_store.rs`
+**Status:** Open ([#86](https://github.com/Elacity/elastos-runtime/issues/86))
+
+Anyone who has a Profile's DID can send it one contact request through the
+seed's Community node, whether or not that Profile is visible in Discovery.
+The node learns which Profile asked which and holds the requester's signed
+Profile; it learns nothing more about the recipient until the recipient
+answers in Inbox. Only the device that signed a request, answer or mailbox
+read may submit it, and the recipient's Home checks every request and answer
+itself. Profiles and devices are free to create, so the per-sender and
+per-device limits bound one identity only: many new identities can fill one
+person's 16 request slots on the node until those requests expire after
+24 hours, and that person's other requests wait meanwhile. Leave Community
+stops all requests.
+
 ## Resolved Findings
 
 These findings are resolved in source but remain listed as security history because they shaped the runtime contract.

@@ -6,6 +6,15 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
+### Added
+
+- Add someone by their DID, with or without Discovery: People shows Your DID
+  to copy and has an Add form, and a Chat profile card offers Add contact and
+  Copy DID. They answer in Inbox; after a Decline, your new requests to them
+  are dropped for 7 days. Requests go through the seed's Community node and
+  reach only Homes on this version. Undo to 0.8.0-alpha.25 keeps the contacts
+  added through Discovery but not the ones added by DID.
+
 ### Changed
 
 - Setup tries a component download once more, 5 seconds later, when the
@@ -234,7 +243,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 ### Changed
 
 - Updates: test-channel Homes update to 0.8.0 in System; the install command moves them to stable (#335). If an update needs the install command, System and `elastos update` show it and keep your version. Home now waits up to 2 minutes for the new Runtime, so it starts after an update on a slow device such as a Jetson. If the old version was put back but cannot start, `elastos home --browser` starts it.
-- A Home joins the shared Community by default; to keep it out, run `elastos setup --isolated` before it first joins. An admin can leave in System → Security. Signed posts reach members without Discovery, also across networks, through the seed's Community node, which can read them until the relay arrives in 0.8.1. Direct messages need a direct connection, which some networks block until then; contact requests across networks need Discovery on.
+- A Home joins the shared Community by default; to keep it out, run `elastos setup --isolated` before it first joins. An admin can leave in System → Security. Signed posts reach members without Discovery, also across networks, through the seed's Community node, which can read them until the relay arrives in 0.8.1. Direct messages need a direct connection, which some networks block until then; contact requests cross networks without Discovery.
 - Community: Inbox asks once whether members see you online (Always, Only while Community is open, Later or Never); change it in System → Security. Before Undo to a test version without this choice, turn Discovery off in People to stay hidden. A post whose delivery could not be confirmed says "Delivery unconfirmed".
 - Marketplace lists models in the same rows and detail window as other items, with the download size and whether it fits your device's memory.
 - Library and Documents no longer offer share links, because another Home cannot open them yet (0.8.1). Your devices keep new copies of your files only after you allow it on each: `elastos node peer add --did <home-did> --allow content.replica`, repeating every `--allow` it had. The seed keeps no new copies in this release.
