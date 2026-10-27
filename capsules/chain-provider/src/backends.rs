@@ -201,7 +201,13 @@ impl ChainProvider {
             if !data.is_empty() && data != "null" {
                 detail.push_str(&format!(": data {data}"));
             }
-            detail.truncate(1024);
+            // Upstream text may hold multibyte characters; shorten on a char
+            // boundary at or below the limit.
+            let mut end = detail.len().min(1024);
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.truncate(end);
             return Err(Response::error("upstream_rpc_error", &detail));
         }
         body.get("result")
