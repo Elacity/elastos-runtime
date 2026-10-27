@@ -3459,8 +3459,22 @@ fn library_request_touches_webspace(request: &ObjectProviderRequest) -> bool {
 
 fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Result<LibraryObject> {
     let target = library_target(data_dir, principal_id, uri)?;
-    let metadata = fs::metadata(&target.path)?;
-    let is_dir = metadata.is_dir();
+    // A place with no directory yet is the empty folder `list` already shows;
+    // its times are unknown (0).
+    let metadata = match fs::metadata(&target.path) {
+        Ok(metadata) => Some(metadata),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                && library_roots(data_dir, principal_id)
+                    .iter()
+                    .any(|root| root.uri == target.uri) =>
+        {
+            None
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let is_dir = metadata.as_ref().is_none_or(fs::Metadata::is_dir);
+    let file_len = metadata.as_ref().map_or(0, fs::Metadata::len);
     let name = if target.uri == target.localhost_root {
         "Home".to_string()
     } else {
@@ -3472,8 +3486,14 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
             .unwrap_or("object")
             .to_string()
     };
-    let modified_at = system_time_secs(metadata.modified().ok()).unwrap_or_else(now_ts);
-    let created_at = system_time_secs(metadata.created().ok()).unwrap_or(modified_at);
+    let (modified_at, created_at) = match &metadata {
+        Some(metadata) => {
+            let modified_at = system_time_secs(metadata.modified().ok()).unwrap_or_else(now_ts);
+            let created_at = system_time_secs(metadata.created().ok()).unwrap_or(modified_at);
+            (modified_at, created_at)
+        }
+        None => (0, 0),
+    };
     let mut blocked_reason = None;
     let (size, revision, content_cid) = if is_dir {
         (0, directory_revision(&target.path, &target.uri)?, None)
@@ -3486,11 +3506,11 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
             }
             Err(err) if is_unencrypted_principal_root_object(&err) => {
                 blocked_reason = Some("protected_principal_root_object_not_encrypted".to_string());
-                blocked_object_projection(&target.uri, metadata.len(), modified_at)
+                blocked_object_projection(&target.uri, file_len, modified_at)
             }
             Err(err) if is_damaged_principal_root_object(&err) => {
                 blocked_reason = Some("protected_principal_root_object_damaged".to_string());
-                blocked_object_projection(&target.uri, metadata.len(), modified_at)
+                blocked_object_projection(&target.uri, file_len, modified_at)
             }
             Err(err) => return Err(err),
         }

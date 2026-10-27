@@ -105,6 +105,9 @@ import {
     };
     let homeChromeReady = false;
     let lastHomeMenuManifestSignature = "";
+    // Set by every change in this window; the next folder load re-reads the
+    // roots' item state (Public's and Trash's emptiness).
+    let rootStateStale = false;
     let renderContent = () => {};
     let renderFooter = () => {};
     let scheduleContentRender = () => {};
@@ -326,7 +329,10 @@ import {
       showSharedAccessReceipt,
       startCreateObject,
       state,
-      uploadObject,
+      uploadObject: (...args) => {
+        rootStateStale = true;
+        return uploadObject(...args);
+      },
       writeResourceIdentifier: (identifier) =>
         homeClipboard.writeText(identifier, {
           purpose: "resource.identifier",
@@ -387,6 +393,7 @@ import {
         state.folderCache.clear();
         state.folderPrefetches.clear();
         perf.folderCacheSize = 0;
+        rootStateStale = true;
       }
       return result;
     }
@@ -569,7 +576,7 @@ import {
 
     function handleMenuCommand(command) {
       if (command === "refresh") {
-        loadCurrentFolder().catch(showError);
+        refreshCurrentFolder().catch(showError);
         return;
       }
       if (command === "toggle-search") {
@@ -656,6 +663,7 @@ import {
     }
 
     async function loadRoots() {
+      rootStateStale = false;
       const data = await providerApi("roots");
       state.roots = orderRoots(Array.isArray(data.roots) ? data.roots : []);
       if (!state.currentUri && state.roots.length) {
@@ -664,6 +672,23 @@ import {
         state.currentUri = initialRoot ? state.initialUri : (documents || state.roots[0]).uri;
       }
       renderPlaces();
+    }
+
+    // Updates each root's item state in place and re-applies which places
+    // show, without rebuilding the sidebar.
+    async function refreshRootState() {
+      rootStateStale = false;
+      const data = await providerApi("roots");
+      const fresh = new Map((Array.isArray(data.roots) ? data.roots : []).map((root) => [root.uri, root]));
+      for (const root of state.roots) {
+        if (fresh.has(root.uri)) root.metadata = fresh.get(root.uri).metadata;
+      }
+      syncPlacesActive();
+    }
+
+    function refreshCurrentFolder() {
+      rootStateStale = true;
+      return loadCurrentFolder();
     }
 
     function orderRoots(roots) {
@@ -703,6 +728,7 @@ import {
     async function loadCurrentFolder(options = {}) {
       if (!state.currentUri) return;
       const loadSeq = ++state.loadSeq;
+      if (rootStateStale) refreshRootState().catch(showError);
       const uri = state.currentUri;
       const cached = options.useCache ? state.folderCache.get(uri) : null;
       let renderedCached = false;
@@ -1118,7 +1144,7 @@ import {
         ],
       }));
       actions.push("-");
-      actions.push(menuAction("Refresh", loadCurrentFolder));
+      actions.push(menuAction("Refresh", refreshCurrentFolder));
       actions.push(menuAction("Show Hidden", () => toggleShowHidden(), { checked: state.showHidden }));
       actions.push("-");
       if (!readOnly) {
@@ -1223,7 +1249,7 @@ import {
         handleBrowserPopState,
         hideDialog,
         hideMenu,
-        loadCurrentFolder,
+        refreshCurrentFolder,
         moveSelectedObjectsTo,
         navigate,
         navigateBack,

@@ -34,6 +34,7 @@ export async function exerciseNavigationConsumers(makeClient) {
     homeNavigation: client("library"),
     providerApi: async (_op, { uri }) => ({ object: { uri, kind: "directory" }, objects: [] }),
     cacheFolderListing: () => ({}), setObjects() {}, setStatus() {}, setFolderStatus() {}, renderAll() {}, runInitialObjectAction() {},
+    rootStateStale: false,
     isDirectory: object => object?.kind === "directory",
   });
   vm.runInContext(selectionFunction(read("capsules/library/browser/src/app.js"), "loadCurrentFolder"), library);

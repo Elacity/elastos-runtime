@@ -236,6 +236,9 @@ const roots = [
   { schema: "elastos.library.root/v1", id: "webspaces", label: "Spaces", uri: webspacesUri, kind: "webspace-root" },
 ];
 
+// Places a fresh Home has never written to: no directory exists yet.
+const untouchedPlaceUris = new Set([picturesUri]);
+
 const localhostSpace = object(principalRoot, "Localhost", "directory", [
   "open",
   "list",
@@ -827,8 +830,16 @@ function handleProvider(op, payload, res) {
     object: findObject(payload.uri) || null,
   }));
   if (op === "stat") {
+    // As the Runtime does: a place with no directory yet is an empty folder
+    // with unknown times; any other missing path fails.
     const found = findObject(payload.uri);
-    return sendJson(res, 200, ok({ object: found || createFolderObject(payload.uri, baseName(payload.uri)) }));
+    if (found) return sendJson(res, 200, ok({ object: found }));
+    if (!roots.some((root) => root.uri === payload.uri)) {
+      return sendJson(res, 404, JSON.stringify({ status: "error", message: "not found" }));
+    }
+    const place = createFolderObject(payload.uri, baseName(payload.uri));
+    if (untouchedPlaceUris.has(payload.uri)) Object.assign(place, { created_at: 0, modified_at: 0 });
+    return sendJson(res, 200, ok({ object: place }));
   }
   if (op === "download" || op === "read") {
     const found = findObject(payload.uri) || file;
@@ -2265,6 +2276,19 @@ async function run() {
     assertPropertyLabels(documentsProperties.details, ["Object URI"], "Documents folder Details");
     await page.locator(".properties-window-actions [data-dialog-close]").click();
 
+    // A fresh Home's Pictures has no directory yet; its Properties still open.
+    await page.locator(".place").filter({ hasText: "Pictures" }).first().click();
+    await page.locator(".crumb-current").filter({ hasText: "Pictures" }).first().waitFor();
+    await openBackgroundMenu(page);
+    await clickMenu(page, "Properties");
+    await page.locator(".window-item-properties").filter({ hasText: "Pictures properties" }).first().waitFor();
+    assert(ops.some((entry) => entry.op === "stat" && entry.payload.uri === picturesUri), "Untouched place Properties must read the place from the Runtime");
+    const picturesProperties = await readProperties(page);
+    assertPlainGeneral(picturesProperties, "Untouched Pictures Properties");
+    assertPropertyLabels(picturesProperties.general, ["Name", "Type"], "Untouched Pictures General");
+    assertPropertyLabels(picturesProperties.details, ["Object URI"], "Untouched Pictures Details");
+    await page.locator(".properties-window-actions [data-dialog-close]").click();
+
     await page.locator(".place").filter({ hasText: "Public" }).first().click();
     await page.locator(".item").filter({ hasText: "Public Draft.md" }).first().waitFor();
     await page.locator(".item").filter({ hasText: "Public Draft.md" }).filter({ hasText: "Public folder" }).first().waitFor();
@@ -2733,6 +2757,37 @@ async function run() {
     await page.locator(".place").filter({ hasText: "Documents" }).first().click();
     await page.locator(".crumb-current").filter({ hasText: "Documents" }).first().waitFor();
     assert(!(await page.locator('.place[data-root-id="public"]').isVisible()), "An empty Public place must stay out of the sidebar");
+
+    // Refresh re-reads the places' item state without rebuilding the sidebar.
+    const placesRendersBeforeRefresh = await page.evaluate(() => window.__libraryPerf?.renderPlacesCount);
+    assert(Number.isInteger(placesRendersBeforeRefresh), "Library must expose its sidebar render count");
+    putObject(publicUri, createFileObject(`${publicUri}/Elsewhere.txt`, "Elsewhere.txt"));
+    await openBackgroundMenu(page);
+    await clickMenu(page, "Refresh");
+    await page.locator('.place[data-root-id="public"]').waitFor();
+    objectsFor(publicUri).splice(0);
+    await openBackgroundMenu(page);
+    await clickMenu(page, "Refresh");
+    await page.locator('.place[data-root-id="public"]').waitFor({ state: "hidden" });
+    assert(
+      await page.evaluate(() => window.__libraryPerf?.renderPlacesCount) === placesRendersBeforeRefresh,
+      "Refreshing the places' item state must not rebuild the sidebar",
+    );
+
+    // Moving a file into an empty Public makes Public appear.
+    putObject(documentsUri, createFileObject(`${documentsUri}/For Public.txt`, "For Public.txt"));
+    putObject(principalRoot, createFolderObject(publicUri, "Public"));
+    await openBackgroundMenu(page);
+    await clickMenu(page, "Refresh");
+    await openItemMenu(page, "For Public.txt");
+    await clickMenu(page, "Cut");
+    await page.locator(".place").filter({ hasText: "Home" }).first().click();
+    await page.locator(".crumb-current").filter({ hasText: "Home" }).first().waitFor();
+    assert(!(await page.locator('.place[data-root-id="public"]').isVisible()), "Public must stay hidden until a file moves in");
+    includesAll(await openItemMenu(page, "Public"), ["Paste Into Folder"], "Public folder item menu after Cut");
+    await clickMenu(page, "Paste Into Folder");
+    await waitForOp((entry) => entry.op === "move" && entry.payload.target_parent_uri === publicUri, "Paste Into Folder must move the file into Public");
+    await page.locator('.place[data-root-id="public"]').waitFor();
 
     const readsBeforeViewerOpen = ops.filter((entry) => entry.op === "read" && entry.payload.uri.endsWith("/Viewer.md")).length;
     await page.goto(`http://127.0.0.1:${port}/host.html`);

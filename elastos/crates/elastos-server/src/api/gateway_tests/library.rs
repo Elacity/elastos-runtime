@@ -1449,6 +1449,45 @@ async fn test_library_public_root_reports_whether_it_holds_items() {
 }
 
 #[tokio::test]
+async fn test_library_stat_of_an_untouched_place_is_the_empty_folder_list_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let pictures_uri = format!("{root}/Pictures");
+
+    let (list_status, list) =
+        post_library(app.clone(), &token, "list", json!({ "uri": pictures_uri })).await;
+    assert_eq!(list_status, StatusCode::OK, "{list}");
+    assert_eq!(list["data"]["objects"], json!([]), "{list}");
+
+    let (stat_status, stat) =
+        post_library(app.clone(), &token, "stat", json!({ "uri": pictures_uri })).await;
+    assert_eq!(stat_status, StatusCode::OK, "{stat}");
+    let object = &stat["data"]["object"];
+    assert_eq!(object["uri"], pictures_uri, "{stat}");
+    assert_eq!(object["name"], "Pictures", "{stat}");
+    assert_eq!(object["kind"], "directory", "{stat}");
+    assert_eq!(object["modified_at"], 0, "{stat}");
+    assert_eq!(object["created_at"], 0, "{stat}");
+
+    // Only a place stands in for a missing directory; any other missing path
+    // still fails.
+    let (missing_status, missing) = post_library(
+        app.clone(),
+        &token,
+        "stat",
+        json!({ "uri": format!("{root}/Pictures/Missing") }),
+    )
+    .await;
+    assert!(
+        missing_status != StatusCode::OK || missing["status"] != "ok",
+        "{missing}"
+    );
+}
+
+#[tokio::test]
 async fn test_library_provider_object_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(library_test_state(dir.path()).await);
