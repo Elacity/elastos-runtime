@@ -249,6 +249,24 @@ pub struct VerifiedCollaborationContactRequest {
     profile: VerifiedCollaborationProfileDocument,
 }
 
+/// A contact request addressed to a Profile DID. `recipient.id` is inside the
+/// requester's signature, so it cannot be replayed to anyone else; the
+/// payload's signed Profile proves the signing device belongs to the
+/// requester and may sign contact requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedCollaborationProfileContactRequest {
+    message: VerifiedCollaborationMessage,
+    profile: VerifiedCollaborationProfileDocument,
+}
+
+/// A mailbox poll under the Profile-contact scope, verified against the
+/// poller's own signed Profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedCollaborationProfileMailboxPoll {
+    message: VerifiedCollaborationMessage,
+    mailbox_kind: CollaborationDiscoveryMailboxKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedCollaborationDiscoveryWithdrawal {
     message: VerifiedCollaborationMessage,
@@ -711,7 +729,208 @@ pub(crate) fn verify_stored_collaboration_contact_decision_receipt(
     advertisement: &VerifiedCollaborationDiscoveryAdvertisement,
 ) -> anyhow::Result<VerifiedCollaborationContactDecisionReceipt> {
     let verified = verify_stored_contact_decision_receipt_envelope(envelope_bytes)?;
-    validate_contact_decision_receipt_against_request(&verified.envelope, request, advertisement)?;
+    validate_contact_decision_receipt_against_request(
+        &verified.envelope,
+        &request.message,
+        &request.profile,
+        &advertisement.profile,
+    )?;
+    Ok(verified)
+}
+
+impl VerifiedCollaborationProfileContactRequest {
+    pub fn message(&self) -> &VerifiedCollaborationMessage {
+        &self.message
+    }
+
+    pub(crate) fn requester_profile_did(&self) -> &str {
+        &self.profile.document().profile_did
+    }
+
+    /// The Profile DID the requester addressed, inside their signature.
+    pub(crate) fn recipient_profile_did(&self) -> &str {
+        &self.message.envelope().payload.recipient.id
+    }
+
+    pub(crate) fn display_name(&self) -> &str {
+        &self.profile.document().display_name
+    }
+
+    pub(crate) fn handle(&self) -> Option<&str> {
+        self.profile.document().handle.as_deref()
+    }
+
+    pub(crate) fn profile(&self) -> &VerifiedCollaborationProfileDocument {
+        &self.profile
+    }
+
+    pub(crate) fn route_endpoint_did(&self) -> anyhow::Result<&str> {
+        self.profile.sole_endpoint_did()
+    }
+}
+
+impl VerifiedCollaborationProfileMailboxPoll {
+    pub fn message(&self) -> &VerifiedCollaborationMessage {
+        &self.message
+    }
+
+    pub(crate) fn mailbox_kind(&self) -> CollaborationDiscoveryMailboxKind {
+        self.mailbox_kind
+    }
+
+    /// The polling Profile: the sender, proven by its own signed Profile.
+    pub(crate) fn profile_did(&self) -> &str {
+        &self.message.envelope().payload.sender_profile_did
+    }
+
+    /// The device that signed the poll; the poller's Profile authorizes it.
+    pub(crate) fn polling_endpoint_did(&self) -> &str {
+        &self.message.envelope().signer_did
+    }
+}
+
+/// Verifies a contact request addressed to a Profile DID, as it arrives.
+pub fn verify_collaboration_profile_contact_request(
+    envelope_bytes: &[u8],
+    network_profile: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    now: u64,
+) -> anyhow::Result<VerifiedCollaborationProfileContactRequest> {
+    let message = verify_collaboration_message(
+        envelope_bytes,
+        network_profile,
+        COLLABORATION_DISCOVERY_SERVICE,
+        now,
+    )?;
+    verify_profile_contact_request_from_message(message)
+}
+
+/// Re-verifies a stored request addressed to a Profile DID, without a clock.
+pub(crate) fn verify_stored_collaboration_profile_contact_request(
+    envelope_bytes: &[u8],
+    network_profile: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+) -> anyhow::Result<VerifiedCollaborationProfileContactRequest> {
+    let message = verify_stored_collaboration_message(
+        envelope_bytes,
+        network_profile,
+        COLLABORATION_DISCOVERY_SERVICE,
+    )?;
+    verify_profile_contact_request_from_message(message)
+}
+
+fn verify_profile_contact_request_from_message(
+    message: VerifiedCollaborationMessage,
+) -> anyhow::Result<VerifiedCollaborationProfileContactRequest> {
+    let envelope = &message.envelope().payload;
+    if envelope.payload_type != COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE {
+        anyhow::bail!("unsupported collaboration contact request payload_type");
+    }
+    if envelope.conversation_id != COLLABORATION_PROFILE_CONTACT_ID {
+        anyhow::bail!("collaboration Profile contact request belongs to another scope");
+    }
+    if envelope.recipient.kind != CollaborationRecipientKind::Profile {
+        anyhow::bail!("collaboration Profile contact request recipient is invalid");
+    }
+    validate_canonical_did(
+        &envelope.recipient.id,
+        "collaboration Profile contact request recipient",
+    )?;
+    if envelope.sender_profile_did == envelope.recipient.id {
+        anyhow::bail!("collaboration contact request cannot target the sender Profile");
+    }
+    let payload = decode_canonical_payload::<CollaborationProfileContactRequestPayload>(
+        &envelope.payload,
+        "collaboration Profile contact request",
+    )?;
+    validate_product_ttl(
+        envelope.created_at,
+        envelope.expires_at,
+        COLLABORATION_PROFILE_CONTACT_REQUEST_TTL_SECS,
+        "collaboration Profile contact request",
+    )?;
+    let profile = verify_signed_profile_document(&payload.signed_profile)
+        .context("invalid collaboration Profile contact request profile")?;
+    require_profile_message_authority(&profile, &message, "collaboration Profile contact request")?;
+    Ok(VerifiedCollaborationProfileContactRequest { message, profile })
+}
+
+/// Verifies a mailbox poll under the Profile-contact scope. The poll carries
+/// the poller's signed Profile: its DID must be the sender, and it must
+/// authorize the signing device as an endpoint and as a mailbox-poll signer.
+pub fn verify_collaboration_profile_mailbox_poll(
+    envelope_bytes: &[u8],
+    network_profile: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    now: u64,
+) -> anyhow::Result<VerifiedCollaborationProfileMailboxPoll> {
+    let message = verify_collaboration_message(
+        envelope_bytes,
+        network_profile,
+        COLLABORATION_DISCOVERY_SERVICE,
+        now,
+    )?;
+    let envelope = &message.envelope().payload;
+    if envelope.payload_type != COLLABORATION_DISCOVERY_MAILBOX_POLL_PAYLOAD_TYPE {
+        anyhow::bail!("unsupported collaboration Profile mailbox poll payload_type");
+    }
+    if envelope.conversation_id != COLLABORATION_PROFILE_CONTACT_ID {
+        anyhow::bail!("collaboration Profile mailbox poll belongs to another scope");
+    }
+    if envelope.recipient.kind != CollaborationRecipientKind::Profile
+        || envelope.recipient.id != envelope.sender_profile_did
+    {
+        anyhow::bail!("collaboration Profile mailbox poll recipient is invalid");
+    }
+    let payload = decode_canonical_payload::<CollaborationProfileMailboxPollPayload>(
+        &envelope.payload,
+        "collaboration Profile mailbox poll",
+    )?;
+    validate_product_ttl(
+        envelope.created_at,
+        envelope.expires_at,
+        COLLABORATION_DISCOVERY_CONTROL_TTL_SECS,
+        "collaboration Profile mailbox poll",
+    )?;
+    let profile = verify_signed_profile_document(&payload.signed_profile)
+        .context("invalid collaboration Profile mailbox poll profile")?;
+    require_profile_message_authority(&profile, &message, "collaboration Profile mailbox poll")?;
+    Ok(VerifiedCollaborationProfileMailboxPoll {
+        message,
+        mailbox_kind: payload.mailbox_kind,
+    })
+}
+
+/// Verifies the answer to a request addressed by DID, as it arrives. The
+/// recipient's signed Profile travels beside the receipt: its DID must be the
+/// one the requester addressed, and it must authorize the receipt signer.
+pub fn verify_collaboration_profile_contact_decision_receipt(
+    envelope_bytes: &[u8],
+    request: &VerifiedCollaborationProfileContactRequest,
+    recipient_profile: &VerifiedCollaborationProfileDocument,
+    now: u64,
+) -> anyhow::Result<VerifiedCollaborationContactDecisionReceipt> {
+    let verified = verify_stored_collaboration_profile_contact_decision_receipt(
+        envelope_bytes,
+        request,
+        recipient_profile,
+    )?;
+    if verified.envelope.payload.decided_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+    {
+        anyhow::bail!("collaboration contact decision receipt time is invalid");
+    }
+    Ok(verified)
+}
+
+pub(crate) fn verify_stored_collaboration_profile_contact_decision_receipt(
+    envelope_bytes: &[u8],
+    request: &VerifiedCollaborationProfileContactRequest,
+    recipient_profile: &VerifiedCollaborationProfileDocument,
+) -> anyhow::Result<VerifiedCollaborationContactDecisionReceipt> {
+    let verified = verify_stored_contact_decision_receipt_envelope(envelope_bytes)?;
+    validate_contact_decision_receipt_against_request(
+        &verified.envelope,
+        &request.message,
+        &request.profile,
+        recipient_profile,
+    )?;
     Ok(verified)
 }
 
@@ -934,17 +1153,22 @@ fn validate_contact_decision_receipt_shape(
     Ok(())
 }
 
+/// Checks a decision receipt against the request it answers and the signed
+/// Profile of the side that decided. For an advertisement-bound request that
+/// Profile is the advertisement's; for a request addressed by DID it is the
+/// Profile delivered beside the receipt, which must be the addressed DID's.
 fn validate_contact_decision_receipt_against_request(
     envelope: &SignedCollaborationContactDecisionReceipt,
-    request: &VerifiedCollaborationContactRequest,
-    advertisement: &VerifiedCollaborationDiscoveryAdvertisement,
+    request_message: &VerifiedCollaborationMessage,
+    requester_profile: &VerifiedCollaborationProfileDocument,
+    recipient_profile: &VerifiedCollaborationProfileDocument,
 ) -> anyhow::Result<()> {
     let receipt = &envelope.payload;
-    let request_envelope = &request.message().envelope().payload;
+    let request_envelope = &request_message.envelope().payload;
     if receipt.network_id != request_envelope.network_id {
         anyhow::bail!("collaboration contact decision receipt belongs to another network");
     }
-    if receipt.request_envelope_sha256 != request.message().envelope_sha256() {
+    if receipt.request_envelope_sha256 != request_message.envelope_sha256() {
         anyhow::bail!("collaboration contact decision receipt request hash mismatch");
     }
     if receipt.conversation_id != request_envelope.conversation_id {
@@ -956,22 +1180,22 @@ fn validate_contact_decision_receipt_against_request(
     if receipt.request_message_nonce != request_envelope.nonce {
         anyhow::bail!("collaboration contact decision receipt message nonce mismatch");
     }
-    if receipt.requester_endpoint_did != request.route_endpoint_did()? {
+    if receipt.requester_endpoint_did != requester_profile.sole_endpoint_did()? {
         anyhow::bail!("collaboration contact decision receipt requester endpoint DID mismatch");
     }
-    if receipt.requester_profile_did != request.requester_profile_did() {
+    if receipt.requester_profile_did != requester_profile.document().profile_did {
         anyhow::bail!("collaboration contact decision receipt requester profile DID mismatch");
     }
-    if receipt.recipient_profile_did != advertisement.profile_did() {
+    if recipient_profile.document().profile_did != request_envelope.recipient.id {
+        anyhow::bail!("collaboration contact decision Profile is not the requested Profile");
+    }
+    if receipt.recipient_profile_did != recipient_profile.document().profile_did {
         anyhow::bail!("collaboration contact decision receipt recipient profile DID mismatch");
     }
-    if !advertisement
-        .profile
-        .authorizes_endpoint(&receipt.recipient_endpoint_did)
-    {
+    if !recipient_profile.authorizes_endpoint(&receipt.recipient_endpoint_did) {
         anyhow::bail!("collaboration contact decision receipt endpoint is not authorized");
     }
-    if !advertisement.profile.authorizes_signer(
+    if !recipient_profile.authorizes_signer(
         &envelope.signer_did,
         COLLABORATION_DISCOVERY_SERVICE,
         COLLABORATION_CONTACT_DECISION_RECEIPT_SCHEMA_V1,
@@ -2130,5 +2354,439 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("requester endpoint DID mismatch"));
+    }
+
+    fn profile_did_for_device(device_key: &SigningKey) -> String {
+        device_did(&profile_signing_key_for_device(device_key))
+    }
+
+    /// A Profile-scope message signed by `signing_key` on behalf of
+    /// `sender_profile_did`, so a test can name a sender the signer does not
+    /// belong to.
+    #[allow(clippy::too_many_arguments)]
+    fn profile_scope_message_from(
+        signing_key: &SigningKey,
+        sender_profile_did: &str,
+        recipient_profile_did: &str,
+        payload_type: &str,
+        payload: serde_json::Value,
+        created_at: u64,
+        expires_at: u64,
+    ) -> Vec<u8> {
+        let message = CollaborationMessage {
+            schema: COLLABORATION_MESSAGE_SCHEMA_V1.to_string(),
+            network_id: NETWORK.to_string(),
+            conversation_id: COLLABORATION_PROFILE_CONTACT_ID.to_string(),
+            message_id: crate::collaboration_core::random_hex_128().unwrap(),
+            nonce: crate::collaboration_core::random_hex_128().unwrap(),
+            created_at,
+            expires_at,
+            sender_profile_did: sender_profile_did.to_string(),
+            sender_service: COLLABORATION_DISCOVERY_SERVICE.to_string(),
+            recipient: CollaborationRecipient {
+                kind: CollaborationRecipientKind::Profile,
+                id: recipient_profile_did.to_string(),
+            },
+            payload_type: payload_type.to_string(),
+            payload,
+        };
+        let payload_bytes = canonical_collaboration_message_bytes(&message).unwrap();
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            signing_key,
+            COLLABORATION_MESSAGE_SIGNATURE_DOMAIN_V1,
+            &payload_bytes,
+        );
+        canonical_signed_collaboration_message_bytes(&SignedCollaborationMessage {
+            payload: message,
+            signature,
+            signer_did,
+        })
+        .unwrap()
+    }
+
+    fn profile_request_bytes(
+        signing_key: &SigningKey,
+        recipient_profile_did: &str,
+        created_at: u64,
+        expires_at: u64,
+    ) -> Vec<u8> {
+        profile_scope_message_from(
+            signing_key,
+            &profile_did_for_device(signing_key),
+            recipient_profile_did,
+            COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE,
+            canonical_payload_value(&CollaborationProfileContactRequestPayload {
+                signed_profile: signed_profile_for_device(
+                    signing_key,
+                    "Alice",
+                    Some("alice"),
+                    1,
+                    None,
+                    created_at,
+                ),
+            }),
+            created_at,
+            expires_at,
+        )
+    }
+
+    /// The recipient's signed Profile, naming `endpoints` as its devices.
+    fn recipient_profile_with_endpoints(
+        device_key: &SigningKey,
+        endpoints: Vec<String>,
+    ) -> VerifiedCollaborationProfileDocument {
+        crate::collaboration_profile_authority::signed_profile_document_for_test(
+            &profile_signing_key_for_device(device_key),
+            "Bob",
+            Some("bob"),
+            1,
+            None,
+            NOW,
+            endpoints,
+        )
+        .unwrap()
+    }
+
+    fn profile_receipt_bytes(
+        signing_key: &SigningKey,
+        request: &VerifiedCollaborationProfileContactRequest,
+        recipient_profile_did: &str,
+        decision: CollaborationContactDecision,
+        decided_at: u64,
+    ) -> Vec<u8> {
+        let request_envelope = &request.message().envelope().payload;
+        let receipt = CollaborationContactDecisionReceipt {
+            schema: COLLABORATION_CONTACT_DECISION_RECEIPT_SCHEMA_V1.to_string(),
+            network_id: request_envelope.network_id.clone(),
+            request_envelope_sha256: request.message().envelope_sha256().to_string(),
+            conversation_id: request_envelope.conversation_id.clone(),
+            requester_profile_did: request.requester_profile_did().to_string(),
+            requester_endpoint_did: request.message().envelope().signer_did.clone(),
+            request_message_id: request_envelope.message_id.clone(),
+            request_message_nonce: request_envelope.nonce.clone(),
+            recipient_profile_did: recipient_profile_did.to_string(),
+            recipient_endpoint_did: device_did(signing_key),
+            decision,
+            decided_at,
+        };
+        let payload_bytes = serde_json::to_vec(&serde_json::to_value(&receipt).unwrap()).unwrap();
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            signing_key,
+            COLLABORATION_CONTACT_DECISION_RECEIPT_SIGNATURE_DOMAIN_V1,
+            &payload_bytes,
+        );
+        canonical_signed_collaboration_contact_decision_receipt_bytes(
+            &SignedCollaborationContactDecisionReceipt {
+                payload: receipt,
+                signature,
+                signer_did,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn profile_contact_request_and_answer_verify_without_an_advertisement() {
+        let (network_signer, _) = generate_keypair();
+        let network = verified_profile(&network_signer);
+        let (requester_key, _) = generate_keypair();
+        let (recipient_key, _) = generate_keypair();
+        let recipient_did = profile_did_for_device(&recipient_key);
+
+        let request_bytes = profile_request_bytes(&requester_key, &recipient_did, NOW, NOW + 60);
+        let request =
+            verify_collaboration_profile_contact_request(&request_bytes, &network, NOW).unwrap();
+        assert_eq!(
+            request.requester_profile_did(),
+            profile_did_for_device(&requester_key)
+        );
+        assert_eq!(request.recipient_profile_did(), recipient_did);
+        assert_eq!(
+            request.route_endpoint_did().unwrap(),
+            device_did(&requester_key)
+        );
+        let stored = verify_stored_collaboration_profile_contact_request(&request_bytes, &network)
+            .unwrap();
+        assert_eq!(stored, request);
+
+        let recipient_profile =
+            recipient_profile_with_endpoints(&recipient_key, vec![device_did(&recipient_key)]);
+        let receipt_bytes = profile_receipt_bytes(
+            &recipient_key,
+            &request,
+            &recipient_did,
+            CollaborationContactDecision::Accepted,
+            NOW + 1,
+        );
+        let live = verify_collaboration_profile_contact_decision_receipt(
+            &receipt_bytes,
+            &request,
+            &recipient_profile,
+            NOW + 1,
+        )
+        .unwrap();
+        let stored_receipt = verify_stored_collaboration_profile_contact_decision_receipt(
+            &receipt_bytes,
+            &stored,
+            &recipient_profile,
+        )
+        .unwrap();
+        assert_eq!(live, stored_receipt);
+        assert!(verify_collaboration_profile_contact_decision_receipt(
+            &receipt_bytes,
+            &request,
+            &recipient_profile,
+            NOW - MAX_COLLABORATION_CLOCK_SKEW_SECS - 1,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("decision receipt time is invalid"));
+    }
+
+    #[test]
+    fn each_contact_request_verifier_refuses_the_other_kind() {
+        let (network_signer, _) = generate_keypair();
+        let network = verified_profile(&network_signer);
+        let (requester_key, _) = generate_keypair();
+        let (recipient_key, _) = generate_keypair();
+
+        let advertisement_bytes = advertisement_bytes(&recipient_key);
+        let advertisement =
+            verify_collaboration_discovery_advertisement(&advertisement_bytes, &network, NOW)
+                .unwrap();
+        let v1_request = request_bytes_for_advertisement(
+            &requester_key,
+            advertisement.profile_did(),
+            advertisement.message().envelope_sha256(),
+            NOW,
+            NOW + 60,
+        );
+        assert!(
+            verify_collaboration_profile_contact_request(&v1_request, &network, NOW)
+                .unwrap_err()
+                .to_string()
+                .contains("belongs to another scope")
+        );
+        assert!(
+            verify_stored_collaboration_profile_contact_request(&v1_request, &network)
+                .unwrap_err()
+                .to_string()
+                .contains("belongs to another scope")
+        );
+
+        let profile_request = profile_request_bytes(
+            &requester_key,
+            advertisement.profile_did(),
+            NOW,
+            NOW + 60,
+        );
+        assert!(verify_collaboration_contact_request(
+            &profile_request,
+            &network,
+            &advertisement,
+            NOW
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("belongs to another scope"));
+        assert!(
+            verify_stored_unbound_collaboration_contact_request(&profile_request, &network)
+                .unwrap_err()
+                .to_string()
+                .contains("belongs to another scope")
+        );
+
+        // Polls: the Discovery mailbox refuses the Profile-scope poll, and
+        // the Profile mailbox refuses the Discovery poll.
+        let requester_did = profile_did_for_device(&requester_key);
+        let profile_poll = profile_scope_message_from(
+            &requester_key,
+            &requester_did,
+            &requester_did,
+            COLLABORATION_DISCOVERY_MAILBOX_POLL_PAYLOAD_TYPE,
+            canonical_payload_value(&CollaborationProfileMailboxPollPayload {
+                mailbox_kind: CollaborationDiscoveryMailboxKind::Requests,
+                signed_profile: signed_profile_for_device(
+                    &requester_key,
+                    "Alice",
+                    Some("alice"),
+                    1,
+                    None,
+                    NOW,
+                ),
+            }),
+            NOW,
+            NOW + 30,
+        );
+        let verified_poll =
+            verify_collaboration_profile_mailbox_poll(&profile_poll, &network, NOW).unwrap();
+        assert_eq!(verified_poll.profile_did(), requester_did);
+        assert_eq!(
+            verified_poll.polling_endpoint_did(),
+            device_did(&requester_key)
+        );
+        assert!(
+            verify_collaboration_discovery_mailbox_poll(&profile_poll, &network, NOW)
+                .unwrap_err()
+                .to_string()
+                .contains("belongs to another scope")
+        );
+        let v1_poll = signed_message(
+            &requester_key,
+            COLLABORATION_DISCOVERY_DIRECTORY_ID,
+            CollaborationRecipient {
+                kind: CollaborationRecipientKind::Profile,
+                id: requester_did.clone(),
+            },
+            COLLABORATION_DISCOVERY_MAILBOX_POLL_PAYLOAD_TYPE,
+            serde_json::json!({"mailbox_kind": "requests", "profile_did": requester_did}),
+            NOW,
+            NOW + 30,
+        );
+        assert!(
+            verify_collaboration_profile_mailbox_poll(&v1_poll, &network, NOW)
+                .unwrap_err()
+                .to_string()
+                .contains("belongs to another scope")
+        );
+    }
+
+    #[test]
+    fn profile_contact_request_refuses_self_wrong_network_long_life_and_foreign_signer() {
+        let (network_signer, _) = generate_keypair();
+        let network = verified_profile(&network_signer);
+        let (requester_key, _) = generate_keypair();
+        let (recipient_key, _) = generate_keypair();
+        let recipient_did = profile_did_for_device(&recipient_key);
+
+        let to_self = profile_request_bytes(
+            &requester_key,
+            &profile_did_for_device(&requester_key),
+            NOW,
+            NOW + 60,
+        );
+        assert!(
+            verify_collaboration_profile_contact_request(&to_self, &network, NOW)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot target the sender Profile")
+        );
+
+        let to_non_did = profile_request_bytes(&requester_key, "not-a-did", NOW, NOW + 60);
+        assert!(
+            verify_collaboration_profile_contact_request(&to_non_did, &network, NOW).is_err()
+        );
+
+        let request = profile_request_bytes(&requester_key, &recipient_did, NOW, NOW + 60);
+        let other_network = verified_profile_with_network(&network_signer, "another-network");
+        assert!(
+            verify_collaboration_profile_contact_request(&request, &other_network, NOW).is_err()
+        );
+
+        let longest = profile_request_bytes(
+            &requester_key,
+            &recipient_did,
+            NOW,
+            NOW + COLLABORATION_PROFILE_CONTACT_REQUEST_TTL_SECS,
+        );
+        verify_collaboration_profile_contact_request(&longest, &network, NOW).unwrap();
+        let too_long = profile_request_bytes(
+            &requester_key,
+            &recipient_did,
+            NOW,
+            NOW + COLLABORATION_PROFILE_CONTACT_REQUEST_TTL_SECS + 1,
+        );
+        assert!(
+            verify_collaboration_profile_contact_request(&too_long, &network, NOW)
+                .unwrap_err()
+                .to_string()
+                .contains("lifetime is too long")
+        );
+
+        // Another device signs a request in the requester's name, carrying
+        // the requester's real signed Profile: that Profile does not
+        // authorize the signing device.
+        let (intruder_key, _) = generate_keypair();
+        let forged = profile_scope_message_from(
+            &intruder_key,
+            &profile_did_for_device(&requester_key),
+            &recipient_did,
+            COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE,
+            canonical_payload_value(&CollaborationProfileContactRequestPayload {
+                signed_profile: signed_profile_for_device(
+                    &requester_key,
+                    "Alice",
+                    Some("alice"),
+                    1,
+                    None,
+                    NOW,
+                ),
+            }),
+            NOW,
+            NOW + 60,
+        );
+        assert!(
+            verify_collaboration_profile_contact_request(&forged, &network, NOW)
+                .unwrap_err()
+                .to_string()
+                .contains("endpoint is not authorized")
+        );
+    }
+
+    #[test]
+    fn profile_contact_answer_needs_the_requested_profile_authorizing_its_signer() {
+        let (network_signer, _) = generate_keypair();
+        let network = verified_profile(&network_signer);
+        let (requester_key, _) = generate_keypair();
+        let (recipient_key, _) = generate_keypair();
+        let recipient_did = profile_did_for_device(&recipient_key);
+        let request_bytes = profile_request_bytes(&requester_key, &recipient_did, NOW, NOW + 60);
+        let request =
+            verify_collaboration_profile_contact_request(&request_bytes, &network, NOW).unwrap();
+
+        // Someone else answers with their own valid Profile and receipt.
+        let (other_key, _) = generate_keypair();
+        let other_profile =
+            recipient_profile_with_endpoints(&other_key, vec![device_did(&other_key)]);
+        let other_receipt = profile_receipt_bytes(
+            &other_key,
+            &request,
+            &profile_did_for_device(&other_key),
+            CollaborationContactDecision::Accepted,
+            NOW + 1,
+        );
+        assert!(verify_collaboration_profile_contact_decision_receipt(
+            &other_receipt,
+            &request,
+            &other_profile,
+            NOW + 1,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not the requested Profile"));
+
+        // The requested Profile, in a revision whose device list no longer
+        // includes the signing device, does not authorize the receipt.
+        let (replacement_key, _) = generate_keypair();
+        let revision_without_signer = recipient_profile_with_endpoints(
+            &recipient_key,
+            vec![device_did(&replacement_key)],
+        );
+        let receipt = profile_receipt_bytes(
+            &recipient_key,
+            &request,
+            &recipient_did,
+            CollaborationContactDecision::Declined,
+            NOW + 1,
+        );
+        assert!(verify_collaboration_profile_contact_decision_receipt(
+            &receipt,
+            &request,
+            &revision_without_signer,
+            NOW + 1,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("endpoint is not authorized"));
     }
 }
