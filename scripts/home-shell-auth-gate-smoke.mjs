@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-update-20261003a";
+const moduleVersion = "home-links-20261027a";
 const requests = [];
 const windowListeners = new Map();
 const documentListeners = new Map();
