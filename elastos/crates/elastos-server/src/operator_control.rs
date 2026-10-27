@@ -1253,6 +1253,7 @@ async fn handle_operator_connection(
     conn: iroh::endpoint::Connection,
     ctx: OperatorRuntimeContext,
 ) -> Result<()> {
+    let peer = conn.remote_id();
     loop {
         let (mut send, recv) = match conn.accept_bi().await {
             Ok(streams) => streams,
@@ -1260,7 +1261,7 @@ async fn handle_operator_connection(
         };
         let stream_ctx = ctx.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_operator_stream(&mut send, recv, &stream_ctx).await {
+            if let Err(err) = handle_operator_stream(&mut send, recv, &stream_ctx, peer).await {
                 tracing::debug!("operator control stream error: {:#}", err);
             }
         });
@@ -1272,6 +1273,7 @@ async fn handle_operator_stream(
     send: &mut iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
     ctx: &OperatorRuntimeContext,
+    peer: iroh::EndpointId,
 ) -> Result<()> {
     let line = crate::carrier::read_peer_line(
         &mut BufReader::new(recv),
@@ -1306,7 +1308,7 @@ async fn handle_operator_stream(
     let response = match verified {
         Ok(request) => build_operator_response(ctx, &config, request).await,
         Err(err) => {
-            tracing::debug!("operator control request rejected: {:#}", err);
+            tracing::debug!("operator control request from {peer} did not verify");
             OperatorResponsePayload {
                 version: 1,
                 request_id,
@@ -1319,8 +1321,8 @@ async fn handle_operator_stream(
         }
     };
 
-    // The audit file records requests whose signature verified; it is also
-    // the replay record for read-only actions.
+    // Requests whose envelope verified are audited, accepted or denied; the
+    // audit file is also the replay record for read-only actions.
     if authenticated {
         append_audit_entry(
             &ctx.data_dir,
@@ -2217,7 +2219,15 @@ mod tests {
     fn write_test_device_key(data_dir: &Path, key: &[u8; 32]) {
         let identity_dir = data_dir.join("identity");
         std::fs::create_dir_all(&identity_dir).unwrap();
-        std::fs::write(identity_dir.join("device.key"), key).unwrap();
+        let path = identity_dir.join("device.key");
+        std::fs::write(&path, key).unwrap();
+        // The identity store refuses a device key that others can read, and
+        // the operator handler loads it to sign every answer.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     async fn start_ticket_provider(
@@ -2572,6 +2582,39 @@ mod tests {
         assert_eq!(
             replayed.error.as_deref(),
             Some("operator request replay detected")
+        );
+
+        // A verified request for an action the peer may not run is denied
+        // and still audited, as is the refused repeat above.
+        let unallowed = OperatorRequestPayload {
+            request_id: "req-check-1".to_string(),
+            action: OPERATOR_ACTION_UPDATE_CHECK.to_string(),
+            ts: now_ts(),
+            ..request.clone()
+        };
+        let signed = sign_envelope(&requester_sk, OPERATOR_REQUEST_DOMAIN, &unallowed).unwrap();
+        let answer = client.send_request(&signed).await.unwrap();
+        let refused = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!refused.accepted);
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        let entries: Vec<(String, bool)> = audit
+            .lines()
+            .map(|line| {
+                let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+                (
+                    entry["request_id"].as_str().unwrap().to_string(),
+                    entry["accepted"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("req-status-1".to_string(), true),
+                ("req-status-1".to_string(), false),
+                ("req-check-1".to_string(), false),
+            ]
         );
     }
 
