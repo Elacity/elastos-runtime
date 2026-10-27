@@ -1,7 +1,5 @@
 import {
   archiveLibraryObjectPayload,
-  baseName,
-  contentCid,
   escapeHtml,
   hasCapability,
   inTrash,
@@ -11,7 +9,9 @@ import {
   isTrashRootUri,
   isTrashUri,
   isWebSpaceUri,
+  matchRoot,
   parentUri,
+  pathCrumbs,
   viewerOptions,
 } from "./model.js";
 import { createLibraryRuntime } from "./api.js?v=library-20260711c";
@@ -221,6 +221,7 @@ import {
       hideMenu,
       objectByUri,
       onBeforeClose: () => revokePreviewUrl(),
+      roots: () => state.roots,
     });
     ({
       previewObject,
@@ -399,10 +400,7 @@ import {
     }
 
     function activeRootForUri(uri) {
-      const value = String(uri || "");
-      return state.roots
-        .filter((root) => value === root.uri || value.startsWith(root.uri + "/"))
-        .sort((left, right) => right.uri.length - left.uri.length)[0] || null;
+      return matchRoot(state.roots, uri);
     }
 
     function currentFolderReadOnly() {
@@ -916,19 +914,11 @@ import {
 
     function renderBreadcrumbs() {
       elements.breadcrumbs.innerHTML = "";
-      const root = rootForUri(state.currentUri);
-      if (!root) return;
-      const segments = state.currentUri === root.uri
-        ? []
-        : state.currentUri.slice(root.uri.length + 1).split("/").filter(Boolean);
-      const rootButton = crumbButton(root.label, root.uri, segments.length === 0);
-      elements.breadcrumbs.appendChild(rootButton);
-      let cursor = root.uri;
-      for (let index = 0; index < segments.length; index += 1) {
-        cursor += "/" + segments[index];
-        elements.breadcrumbs.appendChild(pathSeparator());
-        elements.breadcrumbs.appendChild(crumbButton(decodeURIComponent(segments[index]), cursor, index === segments.length - 1));
-      }
+      const crumbs = pathCrumbs(state.roots, state.currentUri);
+      crumbs.forEach((crumb, index) => {
+        if (index) elements.breadcrumbs.appendChild(pathSeparator());
+        elements.breadcrumbs.appendChild(crumbButton(crumb.label, crumb.uri, index === crumbs.length - 1));
+      });
     }
 
     function pathSeparator() {
@@ -1034,17 +1024,6 @@ import {
         if (hasCapability(object, "delete_permanently")) actions.push(menuAction("Delete Permanently", () => deleteObject(object)));
       }
       actions.push("-");
-      const localContentCid = contentCid(object);
-      if (localContentCid) {
-        actions.push(
-          menuAction("Copy Content CID", () =>
-            copyText(
-              localContentCid,
-              "content CID",
-              "resource.identifier",
-            )),
-        );
-      }
       actions.push(menuAction("Properties", () => showProperties(object)));
       renderMenu(actions, x, y, [object.uri]);
     }
@@ -1054,14 +1033,11 @@ import {
     }
 
     function showArchiveSupport(object) {
-      const support = object?.metadata?.archive_support || {};
-      const family = support.family || "archive";
       const archiveViewer = viewerOptions(object).find((viewer) => viewer?.id === "archive-manager");
       if (archiveViewer && openWithViewer(object, archiveViewer.id)) {
         setStatus(`Opening ${object.name || "archive"} in Archive.`);
         return;
       }
-      setStatus(`${object.name || "Archive"} is a ${family} archive. Extraction is disabled pending dependency and release-policy review.`);
       showProperties(object);
     }
 
@@ -1153,19 +1129,11 @@ import {
       renderMenu(actions, x, y);
     }
 
-    function showFolderProperties() {
-      const root = rootForUri(state.currentUri);
-      showProperties({
-        uri: state.currentUri,
-        name: root?.uri === state.currentUri ? root.label : baseName(state.currentUri),
-        kind: "directory",
-        mime: "inode/directory",
-        size: 0,
-        modified_at: 0,
-        revision: "-",
-        availability: "local-only",
-        viewers: [],
-      });
+    async function showFolderProperties() {
+      const uri = state.currentUri;
+      const { object } = await providerApi("stat", { uri });
+      const root = state.roots.find((entry) => entry.uri === uri);
+      showProperties(root ? { ...object, name: root.label } : object);
     }
 
     function setSort(sort) {

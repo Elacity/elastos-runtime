@@ -230,12 +230,12 @@ async function readThemeSnapshot(page) {
       };
     };
     return {
-      activeTab: document.querySelector(".item-props-tab-selected")?.textContent?.trim() || "",
+      detailsOpen: document.querySelector(".item-props-details")?.open === true,
       body: read("body"),
       statusbar: read(".statusbar"),
       card: read(".window-item-properties"),
       title: read(".properties-window-title"),
-      panel: read(".item-props-tab-content-selected"),
+      panel: read(".item-props-body"),
       label: read(".item-prop-label"),
       value: read(".item-prop-val"),
       copyButton: read(".props-copy-btn"),
@@ -244,7 +244,6 @@ async function readThemeSnapshot(page) {
 }
 
 function assertReadableTheme(snapshot, label) {
-  assert(snapshot.activeTab.length > 0, `${label}: Properties tab did not stay selected.`);
   assert(
     colorDistance(snapshot.statusbar.backgroundColor, snapshot.statusbar.color, snapshot.body.backgroundColor) > 40,
     `${label}: footer text lost readable contrast.`,
@@ -398,22 +397,21 @@ async function run() {
 
     await openProperties(page, "Alpha.txt");
     const darkGeneral = await readThemeSnapshot(page);
-    assert(darkGeneral.activeTab === "General", "Properties must open on the General tab.");
+    assert(!darkGeneral.detailsOpen, "Properties must open with Details collapsed.");
     assertReadableTheme(darkGeneral, "dark general");
-    await page.locator(".item-props-tab-btn").filter({ hasText: "Technical" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').waitFor();
-    const darkTechnical = await readThemeSnapshot(page);
-    assert(darkTechnical.activeTab === "Technical", "Properties must switch to the Technical tab.");
-    assertReadableTheme(darkTechnical, "dark technical");
+    await page.locator(".item-props-details > summary").click();
+    await page.locator(".item-props-details[open]").filter({ hasText: "Object URI" }).waitFor();
+    const darkDetails = await readThemeSnapshot(page);
+    assert(darkDetails.detailsOpen, "Properties Details must open on click.");
+    assertReadableTheme(darkDetails, "dark details");
     await page.evaluate(() => {
       document.documentElement.setAttribute("data-el-theme", "light");
     });
-    const lightTechnical = await readThemeSnapshot(page);
-    assertReadableTheme(lightTechnical, "light technical");
-    await page.locator(".item-props-tab-btn").filter({ hasText: "General" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="general"]').waitFor();
+    const lightDetails = await readThemeSnapshot(page);
+    assertReadableTheme(lightDetails, "light details");
+    await page.locator(".item-props-details > summary").click();
     const lightGeneral = await readThemeSnapshot(page);
-    assert(lightGeneral.activeTab === "General", "Properties must return to the General tab.");
+    assert(!lightGeneral.detailsOpen, "Properties Details must close on a second click.");
     assertReadableTheme(lightGeneral, "light general");
     assert(darkGeneral.statusbar.backgroundColor !== lightGeneral.statusbar.backgroundColor, "Library footer must react to theme changes.");
     assert(darkGeneral.panel.backgroundColor !== lightGeneral.panel.backgroundColor, "Library Properties panel must react to theme changes.");

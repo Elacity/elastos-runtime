@@ -27,6 +27,36 @@ export function childUri(parent, name) {
   return String(parent || "").replace(/\/+$/, "") + "/" + encodeURIComponent(name).replace(/%20/g, " ");
 }
 
+// The longest place root that holds the URI, or null.
+export function matchRoot(roots, uri) {
+  const value = String(uri || "");
+  return (Array.isArray(roots) ? roots : [])
+    .filter((root) => value === root.uri || value.startsWith(root.uri + "/"))
+    .sort((left, right) => right.uri.length - left.uri.length)[0] || null;
+}
+
+// The place path to a URI as the breadcrumbs show it: the root's label, then
+// each decoded segment. Empty when no root holds the URI.
+export function pathCrumbs(roots, uri) {
+  const root = matchRoot(roots, uri);
+  if (!root) return [];
+  const crumbs = [{ label: root.label, uri: root.uri }];
+  let cursor = root.uri;
+  for (const segment of String(uri).slice(root.uri.length + 1).split("/").filter(Boolean)) {
+    cursor += "/" + segment;
+    crumbs.push({ label: decodeSegment(segment), uri: cursor });
+  }
+  return crumbs;
+}
+
+function decodeSegment(segment) {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 export function nextObjectName(objects, base, extension = "") {
   const existing = new Set(objects.map((object) => String(object.name || "").toLowerCase()));
   const initial = `${base}${extension}`;

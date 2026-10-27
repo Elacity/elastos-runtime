@@ -825,6 +825,10 @@ function handleProvider(op, payload, res) {
     objects: folders.get(payload.uri) || [],
     object: findObject(payload.uri) || null,
   }));
+  if (op === "stat") {
+    const found = findObject(payload.uri);
+    return sendJson(res, 200, ok({ object: found || createFolderObject(payload.uri, baseName(payload.uri)) }));
+  }
   if (op === "download" || op === "read") {
     const found = findObject(payload.uri) || file;
     const filename = found.kind === "directory" ? `${found.name}.tar.gz` : found.name;
@@ -1774,6 +1778,50 @@ function excludesAll(actual, forbidden, context) {
   }
 }
 
+// The open Properties dialog: General rows, Details rows and text, keyed by label.
+async function readProperties(page) {
+  return page.evaluate(() => {
+    const card = document.querySelector(".window-item-properties");
+    // Collapsed Details have no innerText, so read each value's parts (a
+    // badge and its hint, or a copy value) as separate words.
+    const text = (cell) => {
+      if (!cell) return "";
+      const parts = cell.querySelectorAll(".item-prop-badge, .item-prop-hint, .props-copy-text");
+      return (parts.length ? Array.from(parts, (part) => part.textContent).join(" ") : cell.textContent)
+        .replace(/\s+/g, " ")
+        .trim();
+    };
+    const rows = (selector) => Object.fromEntries(Array.from(card?.querySelectorAll(selector) || []).map((row) => [
+      text(row.querySelector(".item-prop-label")),
+      text(row.querySelector(".item-prop-val")),
+    ]));
+    return {
+      general: rows(".item-props-body > .item-props-tbl tr"),
+      details: rows(".item-props-details tr"),
+      detailsOpen: card?.querySelector(".item-props-details")?.open === true,
+      tabs: card?.querySelectorAll(".item-props-tab-btn, [data-tab]").length ?? -1,
+      generalHtml: card?.querySelector(".item-props-body > .item-props-tbl")?.outerHTML || "",
+      html: card?.outerHTML || "",
+    };
+  });
+}
+
+function assertPropertyLabels(rows, expected, context) {
+  assert(
+    JSON.stringify(Object.keys(rows)) === JSON.stringify(expected),
+    `${context} rows must be exactly [${expected.join(", ")}]; actual=${JSON.stringify(rows)}`,
+  );
+}
+
+function assertPlainGeneral(properties, context) {
+  assert(!properties.generalHtml.includes("localhost://"), `${context}: General must not show a localhost:// address`);
+  assert(!/publish/i.test(properties.html.replace(/Published|Unpublish from the item menu/g, "")), `${context}: Properties must not mention Publish`);
+  assert(!properties.html.includes("elastos://"), `${context}: Properties must not show elastos:// text`);
+  assert(!properties.html.includes(SMOKE_PUBLISHED_CID), `${context}: Properties must not show the published CID`);
+  assert(properties.tabs === 0, `${context}: Properties must not show tabs`);
+  assert(!properties.detailsOpen, `${context}: Details must start collapsed`);
+}
+
 // #441: search hides items, so Delete, Shift+Delete and the item menu act only on what is visible.
 async function assertSearchKeepsDeleteTargetsVisible(page) {
   const names = ["Alpha Clip.txt", "Beta Clip.txt", "Gamma Clip.txt", "Delta Clip.txt"];
@@ -2133,7 +2181,8 @@ async function run() {
     await clickSubmenu(page, "Sort By", "Ascending");
     assert(await page.evaluate(() => localStorage.getItem("library.sortOrder")) === null, "Ascending menu action must keep sort state out of durable browser storage");
 
-    includesAll(await openItemMenu(page, "Readme.md"), [
+    const readmeRows = await openItemMenu(page, "Readme.md");
+    includesAll(readmeRows, [
       "Open",
       "Download",
       "Compress to ZIP",
@@ -2141,10 +2190,9 @@ async function run() {
       "Copy",
       "Delete",
       "Rename",
-      "Copy Content CID",
       "Properties",
     ], "file menu");
-    excludesAll(await openItemMenu(page, "Readme.md"), ["Open With", "Publish", "Copy Published Link"], "file menu without Publish, installed viewer or published link");
+    excludesAll(readmeRows, ["Open With", "Publish", "Copy Published Link", "Copy Content CID"], "file menu without Publish, installed viewer, published link or content CID");
     includesAll(await openItemMenu(page, "Clip.mp4"), [
       "Open",
       "Download",
@@ -2180,16 +2228,16 @@ async function run() {
     await openItemMenu(page, "Readme.md");
     await clickMenu(page, "Properties");
     await page.locator(".window-item-properties").filter({ hasText: "Readme.md properties" }).first().waitFor();
-    await page.locator(".item-props-tab-selected").filter({ hasText: "General" }).first().waitFor();
-    await page.locator(".item-props-tbl").filter({ hasText: "Placement" }).filter({ hasText: "Private folder" }).first().waitFor();
-    await page.locator(".item-props-tbl").filter({ hasText: "Visibility" }).first().waitFor();
-    await page.locator(".item-props-tbl").filter({ hasText: "Visibility" }).filter({ hasText: "Private" }).first().waitFor();
-    assert(await page.locator(".item-props-tab-btn").filter({ hasText: "Archive" }).count() === 0, "Normal file Properties must not show the Archive tab");
-    await page.locator(".item-props-tab-btn").filter({ hasText: "Technical" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Object kind" }).first().waitFor();
-    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Content ID" }).first().waitFor();
-    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Resolver Target" }).first().waitFor();
-    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Public Folder Policy" }).first().waitFor();
+    const readmeProperties = await readProperties(page);
+    assertPlainGeneral(readmeProperties, "Readme.md Properties");
+    assertPropertyLabels(readmeProperties.general, ["Name", "Location", "Type", "Opens with", "Size", "Modified", "Created", "Sharing"], "Readme.md General");
+    assert(readmeProperties.general.Location === "Documents", `Readme.md Location must use the breadcrumb form; got ${readmeProperties.general.Location}`);
+    assert(readmeProperties.general.Type === "text/plain", "Readme.md Type must match the list's Type column");
+    assert(readmeProperties.general["Opens with"] === "No installed app", "A file with no viewer must say No installed app");
+    assert(readmeProperties.general.Sharing === "Private", `Readme.md Sharing must be Private; got ${readmeProperties.general.Sharing}`);
+    assertPropertyLabels(readmeProperties.details, ["Object URI", "Content ID"], "Readme.md Details");
+    assert(readmeProperties.details["Object URI"] === `${documentsUri}/Readme.md`, "Details must keep the object URI");
+    await page.locator(".item-props-details > summary").click();
     const contentIdCopy = page.locator(
       '.props-copy-btn[title="Copy content ID"]',
     ).first();
@@ -2201,8 +2249,19 @@ async function run() {
     assert(
       await page.evaluate(() => window.__clipboardText) ===
         SMOKE_LOCAL_CONTENT_CID,
-      "Technical Content ID must use the identifier Clipboard purpose",
+      "Details Content ID must use the identifier Clipboard purpose",
     );
+    await page.locator(".properties-window-actions [data-dialog-close]").click();
+
+    await openBackgroundMenu(page);
+    await clickMenu(page, "Properties");
+    await page.locator(".window-item-properties").filter({ hasText: "Documents properties" }).first().waitFor();
+    assert(ops.some((entry) => entry.op === "stat" && entry.payload.uri === documentsUri), "Folder Properties must read the folder from the Runtime");
+    const documentsProperties = await readProperties(page);
+    assertPlainGeneral(documentsProperties, "Documents folder Properties");
+    assertPropertyLabels(documentsProperties.general, ["Name", "Type", "Modified", "Created"], "Documents folder General");
+    assert(documentsProperties.general.Name === "Documents" && documentsProperties.general.Type === "Folder", "Folder Properties must name the place");
+    assertPropertyLabels(documentsProperties.details, ["Object URI"], "Documents folder Details");
     await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     await page.locator(".place").filter({ hasText: "Public" }).first().click();
@@ -2212,10 +2271,14 @@ async function run() {
     excludesAll(await openItemMenu(page, "Public Draft.md"), ["Publish", "Copy Published Link"], "public folder unpublished file menu");
     await clickMenu(page, "Properties");
     await page.locator(".window-item-properties").filter({ hasText: "Public Draft.md properties" }).first().waitFor();
-    await page.locator(".item-props-tbl").filter({ hasText: "Placement" }).filter({ hasText: "Public folder" }).first().waitFor();
-    await page.locator(".item-props-tbl").filter({ hasText: "Visibility" }).filter({ hasText: "Private" }).first().waitFor();
-    await page.locator(".item-props-tab-btn").filter({ hasText: "Technical" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Placement only; items here stay private." }).first().waitFor();
+    const publicDraftProperties = await readProperties(page);
+    assertPlainGeneral(publicDraftProperties, "Public Draft.md Properties");
+    assert(publicDraftProperties.general.Location === "Public", "Public Draft.md Location must be Public");
+    assert(
+      publicDraftProperties.general.Sharing === "Private Items here stay private.",
+      `Public Draft.md Sharing must be Private; got ${publicDraftProperties.general.Sharing}`,
+    );
+    assertPropertyLabels(publicDraftProperties.details, ["Object URI", "Content ID"], "Public Draft.md Details");
     await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     await page.locator(".place").filter({ hasText: "Documents" }).first().click();
@@ -2316,10 +2379,20 @@ async function run() {
       "Status",
       "Repair",
       "Unpublish",
-      "Copy Content CID",
       "Properties",
     ], "published file menu");
-    excludesAll(publishedRows, ["Publish", "Share", "Copy Published Link"], "published file menu");
+    excludesAll(publishedRows, ["Publish", "Share", "Copy Published Link", "Copy Content CID"], "published file menu");
+    await clickMenu(page, "Properties");
+    await page.locator(".window-item-properties").filter({ hasText: "Published.md properties" }).first().waitFor();
+    const publishedProperties = await readProperties(page);
+    assertPlainGeneral(publishedProperties, "Published.md Properties");
+    assert(
+      publishedProperties.general.Sharing === "Published Unpublish from the item menu",
+      `Published.md Sharing must name Unpublish; got ${publishedProperties.general.Sharing}`,
+    );
+    assertPropertyLabels(publishedProperties.details, ["Object URI", "Content ID"], "Published.md Details");
+    await page.locator(".properties-window-actions [data-dialog-close]").click();
+    await openItemMenu(page, "Published.md");
     await clickMenu(page, "Status");
     await page.locator(".dialog-card").filter({ hasText: "Availability" }).first().waitFor();
     await page.locator(".dialog-card details").filter({ hasText: "Technical details" }).first().locator("summary").click();
@@ -2344,6 +2417,13 @@ async function run() {
     await page.waitForFunction(() => !document.querySelector(".badge-published"));
     excludesAll(await openItemMenu(page, "Published.md"), ["Publish", "Unpublish"], "unpublished file menu");
 
+    await openItemMenu(page, "Bundle.tar.gz");
+    await clickMenu(page, "Properties");
+    await page.locator(".window-item-properties").filter({ hasText: "Bundle.tar.gz properties" }).first().waitFor();
+    const bundleProperties = await readProperties(page);
+    assertPlainGeneral(bundleProperties, "Bundle.tar.gz Properties");
+    assert(bundleProperties.general.Archive === "Can be extracted", `Bundle.tar.gz Archive row; got ${bundleProperties.general.Archive}`);
+    await page.locator(".properties-window-actions [data-dialog-close]").click();
     includesAll(await openItemMenu(page, "Bundle.tar.gz"), ["Open", "Download", "Extract Here", "Cut", "Copy", "Delete", "Rename", "Properties"], "archive file menu");
     excludesAll(await openItemMenu(page, "Readme.md"), ["Extract Here"], "non-archive file menu");
     await openItemMenu(page, "Bundle.tar.gz");
@@ -2366,14 +2446,24 @@ async function run() {
     await openItemMenu(page, "Legacy.7z");
     await clickMenu(page, "Archive Support");
     await page.locator(".window-item-properties").filter({ hasText: "Legacy.7z properties" }).first().waitFor();
-    await page.locator(".item-props-tab-btn").filter({ hasText: "Archive" }).first().click();
-    await page.locator('.item-props-tab-content-selected[data-tab="archive"]').filter({ hasText: "policy-gated archive" }).first().waitFor();
-    await page.locator('.item-props-tab-content-selected[data-tab="archive"]').filter({ hasText: "dependency and release-policy review" }).first().waitFor();
+    const legacyProperties = await readProperties(page);
+    assertPlainGeneral(legacyProperties, "Legacy.7z Properties");
+    assert(
+      legacyProperties.general.Archive === "Library can't extract 7z archives yet",
+      `Legacy.7z Archive row must replace the Archive tab; got ${legacyProperties.general.Archive}`,
+    );
     await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     const blockedRows = await openItemMenu(page, "secret.md");
     includesAll(blockedRows, ["Properties"], "blocked file menu");
     excludesAll(blockedRows, ["Open", "Delete", "Rename"], "blocked file menu");
+    await clickMenu(page, "Properties");
+    await page.locator(".window-item-properties").filter({ hasText: "secret.md properties" }).first().waitFor();
+    const blockedProperties = await readProperties(page);
+    assertPlainGeneral(blockedProperties, "secret.md Properties");
+    assert(blockedProperties.general.Problem === "protected principal-root object is not encrypted", `Blocked Properties must name the Problem; got ${blockedProperties.general.Problem}`);
+    assert(!("Sharing" in blockedProperties.general), "Blocked Properties must not show Sharing");
+    await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     await page.locator(".place").filter({ hasText: "Trash" }).first().click();
     await page.locator(".item").filter({ hasText: "Deleted.txt" }).first().waitFor();
@@ -2385,6 +2475,18 @@ async function run() {
       "Delete Permanently",
       "Properties",
     ], "trash file menu");
+    await clickMenu(page, "Properties");
+    await page.locator(".window-item-properties").filter({ hasText: "Deleted.txt properties" }).first().waitFor();
+    const trashProperties = await readProperties(page);
+    assertPlainGeneral(trashProperties, "Deleted.txt Properties");
+    assert(trashProperties.general.Name === "Deleted.txt", "Trash Properties must name the item");
+    assert(trashProperties.general.Location === "Trash", `Trash Properties Location must be Trash; got ${trashProperties.general.Location}`);
+    assert(
+      trashProperties.general["Original location"] === "Documents",
+      `Trash Properties must show where Restore puts it; got ${trashProperties.general["Original location"]}`,
+    );
+    assert(!("Sharing" in trashProperties.general), "Trash Properties must not show a Sharing row");
+    await page.locator(".properties-window-actions [data-dialog-close]").click();
     await openItemMenu(page, "Purge.txt");
     await clickMenu(page, "Delete Permanently");
     await page.locator("#dialog").filter({ hasText: "Delete permanently?" }).first().waitFor();
@@ -2409,6 +2511,22 @@ async function run() {
     await page.locator(".item").filter({ hasText: "Localhost" }).first().waitFor();
     includesAll(await openItemMenu(page, "Localhost"), ["Open", "Open in New Window", "Properties"], "Localhost Spaces pointer menu");
     excludesAll(await openItemMenu(page, "Localhost"), ["Download", "Compress to ZIP", "Publish", "Delete", "Rename"], "Localhost Spaces pointer menu");
+    for (const [name, source] of [["Localhost", undefined], ["Elastos", undefined], ["Cloud", "cloud://drive"]]) {
+      await openItemMenu(page, name);
+      await clickMenu(page, "Properties");
+      await page.locator(".window-item-properties").filter({ hasText: `${name} properties` }).first().waitFor();
+      const spaceProperties = await readProperties(page);
+      assertPlainGeneral(spaceProperties, `${name} Space Properties`);
+      assert(!("Sharing" in spaceProperties.general), `${name} Space Properties must not show Sharing`);
+      assert(spaceProperties.details.Source === source, `${name} Space Source must be ${source}; got ${spaceProperties.details.Source}`);
+      if (name === "Cloud") {
+        assert(spaceProperties.general.Location === "Spaces", `Cloud Location must be Spaces; got ${spaceProperties.general.Location}`);
+        assert(spaceProperties.general.Access === "Read-only", "A read-only Space must say Access Read-only");
+        await page.locator(".item-props-details > summary").click();
+        assert(await page.locator(".item-props-details [data-prop-copy]").count() === 1, "Source must be plain text; only the Object URI copies");
+      }
+      await page.locator(".properties-window-actions [data-dialog-close]").click();
+    }
     await page.locator(".item").filter({ hasText: "Localhost" }).first().dblclick();
     await page.locator(".crumb-current").filter({ hasText: "Home" }).first().waitFor();
     await page.locator(".place").filter({ hasText: "Spaces" }).first().click();
@@ -2601,20 +2719,7 @@ async function run() {
       "Alt-drag/drop copy must call copy with the destination folder",
     );
 
-    excludesAll(await openItemMenu(page, "Guide.md"), ["Publish", "Publish Selected"], "Guide menu");
-
-    await openItemMenu(page, "Guide.md");
-    await clickMenu(page, "Copy Content CID");
-    assert(
-      await page.evaluate(() => window.__clipboardText) ===
-        SMOKE_LOCAL_CONTENT_CID,
-      "Copy Content CID must preserve the current technical identifier",
-    );
-    assert(
-      await page.evaluate(() => window.__clipboardPurposes.at(-1)) ===
-        "resource.identifier",
-      "Copy Content CID must use the identifier Clipboard purpose",
-    );
+    excludesAll(await openItemMenu(page, "Guide.md"), ["Publish", "Publish Selected", "Copy Content CID"], "Guide menu");
 
     await openItemMenu(page, "Guide.md");
     await clickMenu(page, "Delete");

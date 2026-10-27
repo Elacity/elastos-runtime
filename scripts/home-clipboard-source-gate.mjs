@@ -191,7 +191,7 @@ assert(
   "Clipboard wire schemas and target policy must have only one source of truth",
 );
 assert(
-  libraryAppSource.includes("Copy Content CID") &&
+  !libraryAppSource.includes("Copy Content CID") &&
     libraryAppSource.includes('purpose: "resource.identifier"') &&
     libraryAppSource.includes('{ purpose: "resource.uri" }') &&
     libraryActionsSource.includes('purpose === "resource.identifier"') &&
@@ -200,16 +200,8 @@ assert(
     libraryDialogSource.includes(
       '"content ID", "resource.identifier"',
     ) &&
-    libraryDialogSource.includes(
-      '"published CID", "resource.identifier"',
-    ) &&
-    libraryDialogSource.includes(
-      '"object head", "resource.identifier"',
-    ) &&
-    libraryDialogSource.includes(
-      '"resolver target", "resource.identifier"',
-    ),
-  "Library identifier and resource URI actions must remain distinct canonical Home Clipboard callers",
+    libraryDialogSource.includes('copyableValue(object.uri, "object URI")'),
+  "Library Properties Details must copy the content ID as an identifier and the object URI as a resource URI, through the canonical Home Clipboard",
 );
 
 process.stdout.write(

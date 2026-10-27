@@ -5,8 +5,12 @@ import {
   formatTime,
   hasCapability,
   decimalIntegerToHexQuantity,
+  inTrash,
+  isBlockedObject,
   isDirectory,
+  isWebSpaceUri,
   parentUri,
+  pathCrumbs,
   protectionLabel,
   publishedCid,
   visibilityContract,
@@ -20,96 +24,66 @@ export function createLibraryDialog({
   hideMenu,
   objectByUri,
   onBeforeClose,
+  roots,
 }) {
   let pendingDialogResolve = null;
   // Item URIs a decision dialog acts on; it never confirms once any is hidden (#441).
   let decisionTargetUris = [];
   const propertyCopyResetTimers = new WeakMap();
 
+  // General shows what a person can read or act on, omitting a row rather
+  // than showing "-"; Details keeps the one address and content ID.
   function showProperties(object) {
-    const identity = smartWebIdentity(object);
-    const availability = safeAvailabilitySummary(object.availability);
-    const remoteAccess = safeRemoteAccessSummary({}, object);
-    const archive = safeArchiveSummary(object);
-    const viewers = viewerOptions(object).map((viewer) => viewer.label || viewer.id);
-    const typeLabel = isDirectory(object) ? "Folder" : object.mime || "File";
-    const location = parentUri(object.uri || "");
-    const visibility = propertiesVisibilitySummary(object, identity, remoteAccess);
-    const placement = propertiesPlacementSummary(object);
-    const generalRows = [
-      ["Name", object.name || "-"],
-      ["Path", copyableValue(object.uri || "-", "path")],
-      ["Type", typeLabel],
-      ["Opens with", viewers.join(", ") || "-"],
-      ["Where", location || "-"],
-      ["Size", isDirectory(object) ? "-" : formatBytes(object.size)],
-      ["Modified", formatTime(object.modified_at)],
-      ["Created", formatTime(object.created_at)],
-      ["Placement", badgeValue(placement.label, placement.tone)],
-      ["Visibility", badgeValue(visibility.label, visibility.tone)],
-      ["Access granted to", remoteAccess.status],
-    ];
-    if (archive.relevant) {
-      generalRows.push(["Archive", archive.status]);
+    const file = !isDirectory(object);
+    const trashed = inTrash(object);
+    const blocked = isBlockedObject(object);
+    const generalRows = [["Name", object.name]];
+    if (pathCrumbs(roots(), object.uri).length > 1) {
+      generalRows.push(["Location", placePath(parentUri(object.uri))]);
     }
-    if (object.metadata?.trash?.original_uri) {
-      generalRows.push(["Original location", copyableValue(object.metadata.trash.original_uri, "original location")]);
+    generalRows.push(["Type", file ? object.mime || "File" : "Folder"]);
+    if (file) {
+      const viewers = viewerOptions(object).map((viewer) => viewer.label || viewer.id);
+      generalRows.push(["Opens with", viewers.join(", ") || "No installed app"]);
+      generalRows.push(["Size", Number(object.size) > 0 ? formatBytes(object.size) : "0 B"]);
     }
-    const technicalRows = [
-      ["Object ID", identity.objectId],
-      ["Object kind", identity.kind],
-      ["Content ID", copyableValue(identity.contentId, "content ID", "resource.identifier")],
-      ["Published CID", copyableValue(identity.publishedId, "published CID", "resource.identifier")],
-      ["Service", identity.provider],
-      ["Object URI", copyableValue(object.uri || "-", "object URI")],
-      ["Content URI", identity.contentUri],
-      ["Head", copyableValue(identity.headId, "object head", "resource.identifier")],
-      ["Revision", object.revision || "-"],
-      ["Resolver", identity.resolver],
-      ["Resolver Target", copyableValue(identity.resolverTarget, "resolver target", "resource.identifier")],
-      ["Access Policy", identity.accessPolicy],
-      ["Availability", availability.status],
-      ["Replicas", availability.replicas],
-      ["Live Proof", availability.liveProof],
-      ["Quota", availability.quota],
-      ["Repair", availability.repair],
-      ["Storage Market", availability.storageMarket],
-      ["Remote Open", remoteAccess.openStatus],
-      ["Key Release", remoteAccess.keyRelease],
-      ["Protection", protectionLabel(object)],
-      ["Public Folder Policy", placement.policy],
-      ["Visibility format", object.metadata?.visibility?.schema || "elastos.library.visibility/v1"],
-    ];
-    const archiveTab = archive.relevant
-      ? `<div class="item-props-tab-btn antialiased disable-user-select" data-tab="archive">Archive</div>`
-      : "";
-    const archivePanel = archive.relevant
-      ? propertiesPanel("archive", [
-          ["Status", archive.status],
-          ["Family", archive.details?.object?.family || "-"],
-          ["Extractable", archive.details?.object?.extractable ? "yes" : "no"],
-          ["Compressible", archive.details?.object?.compressible ? "yes" : "no"],
-          ["Download formats", archive.details?.implemented?.download_formats?.join(", ") || "-"],
-          ["Extract formats", archive.details?.implemented?.extract_formats?.join(", ") || "-"],
-          ["Safety", archive.details?.implemented?.safety || "-"],
-          ["Remaining policy", archive.details?.remaining_policy || "-"],
-        ])
-      : "";
+    if (object.modified_at) generalRows.push(["Modified", formatTime(object.modified_at)]);
+    if (object.created_at) generalRows.push(["Created", formatTime(object.created_at)]);
+    if (file && !trashed && !blocked && !isWebSpaceUri(object.uri)) {
+      generalRows.push(["Sharing", sharingValue(object)]);
+    }
+    if (object.metadata?.readonly === true || object.metadata?.access_policy === "read-only") {
+      generalRows.push(["Access", badgeValue("Read-only", "readonly")]);
+    }
+    const archive = archiveSummary(object);
+    if (archive) generalRows.push(["Archive", archive]);
+    const originalUri = object.metadata?.trash?.original_uri;
+    if (trashed && originalUri) generalRows.push(["Original location", placePath(parentUri(originalUri))]);
+    if (blocked) generalRows.push(["Problem", protectionLabel(object)]);
+
+    const detailRows = [["Object URI", copyableValue(object.uri, "object URI")]];
+    const localContentId = contentCid(object);
+    if (file && localContentId) {
+      detailRows.push(["Content ID", copyableValue(localContentId, "content ID", "resource.identifier")]);
+    }
+    const source = String(object.metadata?.target_uri || "");
+    // A Space's own target is shown only when it is not another localhost://
+    // address and not an elastos:// link a recipient cannot open yet.
+    if (isWebSpaceUri(object.uri) && source && !source.startsWith("localhost://") && !source.startsWith("elastos://")) {
+      detailRows.push(["Source", source]);
+    }
     dialog.innerHTML = `
       <div class="dialog-card properties-card window-item-properties">
         <div class="properties-window-title">
           <span>${escapeHtml(object.name || "Object")} properties</span>
           <button type="button" aria-label="Close properties" data-dialog-close>&times;</button>
         </div>
-        <div class="item-props-tabview">
-          <div class="item-props-tab">
-            <div class="item-props-tab-btn antialiased disable-user-select item-props-tab-selected" data-tab="general">General</div>
-            <div class="item-props-tab-btn antialiased disable-user-select" data-tab="technical">Technical</div>
-            ${archiveTab}
-          </div>
-          ${propertiesPanel("general", generalRows, true)}
-          ${propertiesPanel("technical", technicalRows)}
-          ${archivePanel}
+        <div class="item-props-body">
+          ${propertiesTable(generalRows.filter(([, value]) => value))}
+          <details class="item-props-details">
+            <summary>Details</summary>
+            ${propertiesTable(detailRows)}
+          </details>
         </div>
         <div class="properties-window-actions">
           <button class="btn btn-primary" type="button" data-dialog-close>Close</button>
@@ -119,15 +93,39 @@ export function createLibraryDialog({
     dialog.classList.remove("hidden");
   }
 
-  function propertiesPanel(tab, rows, selected = false) {
+  // A folder as the breadcrumbs name it, e.g. "Documents / Projects"; empty
+  // when no place holds it, so General never shows a raw localhost:// URI.
+  function placePath(uri) {
+    return pathCrumbs(roots(), uri).map((crumb) => crumb.label).join(" / ");
+  }
+
+  function sharingValue(object) {
+    if (object.published) {
+      return badgeValue("Published", "public", hasCapability(object, "unpublish") ? "Unpublish from the item menu" : "");
+    }
+    return badgeValue(
+      "Private",
+      "private",
+      visibilityContract(object).placement === "public_folder" ? "Items here stay private." : "",
+    );
+  }
+
+  function archiveSummary(object) {
+    const support = object.metadata?.archive_support;
+    if (support?.status === "extractable" && hasCapability(object, "extract_archive")) return "Can be extracted";
+    if (support?.status === "policy_gated_unsupported_archive_family") {
+      return `Library can't extract ${support.family || "these"} archives yet`;
+    }
+    return "";
+  }
+
+  function propertiesTable(rows) {
     return `
-      <div class="item-props-tab-content${selected ? " item-props-tab-content-selected" : ""}" data-tab="${escapeHtml(tab)}"${selected ? ' style="border-top-left-radius:0;"' : ""}>
-        <table class="item-props-tbl">
-          <tbody>
-            ${rows.map(([label, value]) => propertiesRow(label, value)).join("")}
-          </tbody>
-        </table>
-      </div>
+      <table class="item-props-tbl">
+        <tbody>
+          ${rows.map(([label, value]) => propertiesRow(label, value)).join("")}
+        </tbody>
+      </table>
     `;
   }
 
@@ -143,16 +141,13 @@ export function createLibraryDialog({
 
   function propertiesValue(value) {
     if (value && typeof value === "object" && value.kind === "copyable") {
-      const text = displayValue(value.value);
-      if (text === "-") return { title: text, html: escapeHtml(text) };
-      const label = value.label || "value";
-      const purpose = value.purpose || "resource.uri";
+      const text = String(value.value);
       return {
         title: text,
         html: `
           <span class="props-copy-value">
             <code class="props-copy-text">${escapeHtml(text)}</code>
-            <button class="props-copy-btn el-copy-btn" type="button" data-prop-copy="${escapeHtml(text)}" data-copy-label="${escapeHtml(label)}" data-copy-purpose="${escapeHtml(purpose)}" title="Copy ${escapeHtml(label)}">
+            <button class="props-copy-btn el-copy-btn" type="button" data-prop-copy="${escapeHtml(text)}" data-copy-label="${escapeHtml(value.label)}" data-copy-purpose="${escapeHtml(value.purpose)}" title="Copy ${escapeHtml(value.label)}">
               ${copyIconSvg()}
             </button>
           </span>
@@ -160,29 +155,23 @@ export function createLibraryDialog({
       };
     }
     if (value && typeof value === "object" && value.kind === "badge") {
-      const text = displayValue(value.value);
+      const text = String(value.value);
+      const hint = value.hint ? `<span class="item-prop-hint">${escapeHtml(value.hint)}</span>` : "";
       return {
-        title: text,
-        html: `<span class="item-prop-badge item-prop-badge-${escapeHtml(value.tone || "neutral")}">${escapeHtml(text)}</span>`,
+        title: value.hint ? `${text}. ${value.hint}` : text,
+        html: `<span class="item-prop-badge item-prop-badge-${escapeHtml(value.tone)}">${escapeHtml(text)}</span>${hint}`,
       };
     }
-    const text = displayValue(value);
+    const text = String(value);
     return { title: text, html: escapeHtml(text) };
   }
 
-  // An elastos:// link stays plain text: Home cannot yet open one that someone
-  // sends, so Library offers no way to copy it (a resolver target can be one).
   function copyableValue(value, label, purpose = "resource.uri") {
-    if (String(value || "").startsWith("elastos://")) return value;
     return { kind: "copyable", value, label, purpose };
   }
 
-  function badgeValue(value, tone) {
-    return { kind: "badge", value, tone };
-  }
-
-  function displayValue(value) {
-    return value === null || value === undefined || value === "" ? "-" : String(value);
+  function badgeValue(value, tone, hint = "") {
+    return { kind: "badge", value, tone, hint };
   }
 
   function copyIconSvg() {
@@ -220,111 +209,21 @@ export function createLibraryDialog({
     propertyCopyResetTimers.set(button, timer);
   }
 
-  function propertiesVisibilitySummary(object = {}, identity = {}, remoteAccess = {}) {
-    const visibility = visibilityContract(object);
-    if (visibility.effective_access === "public_content_link") {
-      return object.shared
-        ? { label: "Published and shared", tone: "public" }
-        : { label: "Published", tone: "public" };
-    }
-    if (visibility.effective_access === "recipient_scoped_link") {
-      return { label: "Recipient scoped", tone: "shared" };
-    }
-    if (visibility.effective_access === "blocked") {
-      return { label: "Blocked", tone: "readonly" };
-    }
-    if (visibility.placement === "public_folder") {
-      return { label: "Private", tone: "staged" };
-    }
-    if (identity.publishedId && identity.publishedId !== "-") {
-      return object.shared
-        ? { label: "Published and shared", tone: "public" }
-        : { label: "Published", tone: "public" };
-    }
-    if (remoteAccess.status === "recipient scoped") {
-      return { label: "Recipient scoped", tone: "shared" };
-    }
-    if (object.shared) {
-      return { label: "Shared", tone: "shared" };
-    }
-    if (object.metadata?.readonly === true) {
-      return { label: "Mounted read-only", tone: "readonly" };
-    }
-    if (object.metadata?.readonly === false) {
-      return { label: "Mounted writable", tone: "writable" };
-    }
-    return { label: "Private", tone: "private" };
-  }
-
-  function propertiesPlacementSummary(object = {}) {
-    const visibility = visibilityContract(object);
-    const placement = visibility.placement || "private_folder";
-    if (placement === "public_folder") {
-      return {
-        label: visibility.placement_label || "Public folder",
-        tone: "staged",
-        policy: "Placement only; items here stay private.",
-      };
-    }
-    if (placement === "trash") {
-      return {
-        label: "Trash",
-        tone: "readonly",
-        policy: "Trash is not public.",
-      };
-    }
-    if (placement === "runtime_private") {
-      return {
-        label: "Private",
-        tone: "readonly",
-        policy: "Private items are not published.",
-      };
-    }
-    return {
-      label: visibility.placement_label || "Private folder",
-      tone: "private",
-      policy: "Private to you.",
-    };
-  }
-
   function smartWebIdentity(object = {}, record = null) {
     const metadata = object.metadata || {};
-    const localContentId = contentCid(object);
     const publicContentId = record?.cid || publishedCid(object);
-    const contentUri = publicContentId ? `elastos://${publicContentId}` : "-";
     const resolver = metadata.resolver || metadata.provider || "";
-    const resolverTarget = metadata.target_uri || metadata.resolver_target || metadata.source_uri || "";
-    const accessPolicy = metadata.access_policy || (
-      metadata.readonly === false
-        ? "owner-writable"
-        : metadata.readonly === true
-          ? "read-only"
-          : "-"
-    );
     const kind = publicContentId
       ? "Published content object"
-      : localContentId
+      : contentCid(object)
         ? "Local content object"
       : resolver
         ? "Mounted Space object"
         : "Local Library object";
-    const provider = publicContentId
-      ? "content-provider"
-      : resolver
-        ? `${resolver} resolver`
-        : "object-provider";
-    const objectId = metadata.object_id || object.uri || "-";
     return {
       kind,
-      provider,
-      contentId: localContentId || "-",
-      publishedId: publicContentId || "-",
-      contentUri,
-      objectId,
-      headId: metadata.head_id || object.revision || "-",
-      resolver: resolver || "-",
-      resolverTarget: resolverTarget || "-",
-      accessPolicy: accessPolicy || "-",
+      contentUri: publicContentId ? `elastos://${publicContentId}` : "-",
+      objectId: metadata.object_id || object.uri || "-",
     };
   }
 
@@ -489,78 +388,6 @@ export function createLibraryDialog({
         next: remoteEnforcement?.next || keyRelease?.next || null,
       },
     };
-  }
-
-  function safeArchiveSummary(object = {}) {
-    const backend = object.metadata?.archive_support || null;
-    const name = String(object.name || "").toLowerCase();
-    const mime = String(object.mime || "").toLowerCase();
-    const family = backend?.family || archiveFamilyForName(name, mime);
-    const extractable = hasCapability(object, "extract_archive")
-      && (name.endsWith(".zip")
-        || name.endsWith(".tar")
-        || name.endsWith(".tar.gz")
-        || name.endsWith(".tgz"));
-    const policyGated = backend?.status === "policy_gated_unsupported_archive_family"
-      || (!!family && !extractable && !["zip", "tar", "tar.gz"].includes(family));
-    const compressible = hasCapability(object, "compress_archive");
-    const archiveLike = extractable
-      || policyGated
-      || !!backend
-      || mime.includes("zip")
-      || mime.includes("tar")
-      || name.endsWith(".gz");
-    return {
-      relevant: archiveLike,
-      status: extractable
-        ? "extractable"
-        : policyGated
-          ? "policy-gated archive"
-        : compressible
-          ? "can compress/download"
-          : archiveLike
-            ? "view only"
-            : "-",
-      details: {
-        schema: "elastos.library.archive-support/v1",
-        backend,
-        implemented: {
-          download_formats: ["zip", "tar.gz"],
-          compress_to_library: ["zip"],
-          extract_formats: ["zip", "tar", "tar.gz", "tgz"],
-          safety: "relative UTF-8 file paths only; non-file archive entries are rejected",
-        },
-        object: {
-          name: object.name || null,
-          mime: object.mime || null,
-          family,
-          extractable,
-          compressible,
-          policy_gated: policyGated,
-        },
-        remaining_policy: policyGated
-          ? "This archive family is recognized but disabled pending dependency and release-policy review."
-          : "Other generic archive families need dependency and release-policy review before enabling.",
-      },
-    };
-  }
-
-  function archiveFamilyForName(name, mime = "") {
-    if (name.endsWith(".tar.gz") || name.endsWith(".tgz")) return "tar.gz";
-    if (name.endsWith(".tar")) return "tar";
-    if (name.endsWith(".zip") || mime.includes("zip")) return "zip";
-    if (name.endsWith(".tar.xz") || name.endsWith(".txz")) return "tar.xz";
-    if (name.endsWith(".tar.bz2") || name.endsWith(".tbz2")) return "tar.bz2";
-    if (name.endsWith(".tar.zst") || name.endsWith(".tzst")) return "tar.zst";
-    if (name.endsWith(".7z")) return "7z";
-    if (name.endsWith(".rar")) return "rar";
-    if (name.endsWith(".xz")) return "xz";
-    if (name.endsWith(".bz2")) return "bz2";
-    if (name.endsWith(".zst")) return "zst";
-    if (name.endsWith(".lz4")) return "lz4";
-    if (name.endsWith(".gz")) return "gzip";
-    if (mime.includes("tar")) return "tar";
-    return "";
   }
 
   function showObjectStatus(payload) {
@@ -851,18 +678,6 @@ export function createLibraryDialog({
               setPropertyCopyFeedback(propertyCopy, label, false);
             });
         }
-        return;
-      }
-      const propertiesTab = event.target.closest(".item-props-tab-btn[data-tab]");
-      if (propertiesTab) {
-        const card = propertiesTab.closest(".properties-card");
-        const tab = propertiesTab.getAttribute("data-tab");
-        card?.querySelectorAll(".item-props-tab-btn").forEach((button) => {
-          button.classList.toggle("item-props-tab-selected", button === propertiesTab);
-        });
-        card?.querySelectorAll(".item-props-tab-content").forEach((panel) => {
-          panel.classList.toggle("item-props-tab-content-selected", panel.getAttribute("data-tab") === tab);
-        });
         return;
       }
       if (event.target.closest('[data-dialog-action="properties"]')) {
