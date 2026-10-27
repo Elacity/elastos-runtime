@@ -54,7 +54,8 @@ export function hasHomeAuthorityToken() {
 
 export async function fetchJson(url, init) {
   const requiresHomeAuthority = url === "/api/apps/home/launch"
-    || url === "/api/apps/home/active-shell";
+    || url === "/api/apps/home/active-shell"
+    || url === "/api/apps/home/shared-content/get";
   const authorityHeaders = requiresHomeAuthority && homeAuthorityToken
     ? { "x-elastos-home-token": homeAuthorityToken }
     : {};

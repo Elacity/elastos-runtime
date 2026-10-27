@@ -49,10 +49,11 @@ import {
 import { createHomeLinkStatus } from "./home-link-status.js?v=home-20260924a";
 import {
   createHomeExternalLinkPrompt,
+  requestHomeSharedContent,
   EXTERNAL_LINK_REQUEST_SCHEMA,
   HOME_OPEN_EXTERNAL_TYPE,
   MAX_EXTERNAL_LINK_LENGTH,
-} from "./home-external-link.js?v=home-20261017c";
+} from "./home-external-link.js?v=home-20261027a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -147,6 +148,13 @@ const homeExternalLinkPrompt = createHomeExternalLinkPrompt({
   address: document.querySelector("#home-link-address"),
   openButton: document.querySelector("#home-link-open"),
   cancelButton: document.querySelector("#home-link-cancel"),
+  eyebrow: document.querySelector("#home-link-kind"),
+  title: document.querySelector("#home-link-title"),
+  asker: document.querySelector("#home-link-copy"),
+  size: document.querySelector("#home-link-size"),
+  status: document.querySelector("#home-link-status"),
+  linkLabel: document.querySelector("#home-link-label"),
+  openSharedFile: ({ cid, uri }) => openTargetFromHomeGui("documents", { query: { cid, uri, view: "read" } }),
   isLive: externalLinkSenderIsLive,
   otherSheetShown: () => !homeClipboardPromptRoot.hidden,
 });
@@ -1975,6 +1983,10 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (data.type === "home:open-uri") {
+    if (["chat-room", "documents"].includes(context.targetId)) {
+      requestHomeSharedContent({ context, data, prompt: homeExternalLinkPrompt, fetchJson });
+      return;
+    }
     if (!canOpenUriFromHomeMessage(context)) {
       console.warn("home ignored unauthorized open-uri message", context.targetId);
       return;

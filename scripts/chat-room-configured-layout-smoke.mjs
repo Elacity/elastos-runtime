@@ -30,6 +30,8 @@ const externalLinkUrl = "https://example.invalid/chat-link?from=chat";
 const textLinkUrl = "https://example.invalid/chat-text-link?from=text";
 const sharedDid = "did:key:z6Mka1b2c3";
 const directDid = "did:key:z6Mkd4e5f6";
+const sharedCid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+const sharedUri = `elastos://${sharedCid}`;
 const directLinkUrl = "https://example.invalid/chat-direct-link?from=direct";
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
@@ -93,7 +95,7 @@ function directConversation() {
 
 function historyMessage(seq, text, createdAt) {
   return {
-    seq, sender: "Fixture Friend", sender_profile_verified: true,
+    seq, message_id: `sha256:message-${seq}`, sender: "Fixture Friend", sender_profile_verified: true,
     from_current_session: false, kind: "text", body: text,
     created_at: Math.floor(Date.parse(createdAt) / 1000),
   };
@@ -240,6 +242,7 @@ function startServer(scenario) {
     stallPoll: false,
     stalledMarkerReady: false,
     attachmentRequests: [],
+    uploads: [], sharedChecks: [], sharedGets: [],
     attachmentMarkerReady: false,
     attachmentMarkerPolled: false,
     lastPollSince: null,
@@ -280,6 +283,19 @@ function startServer(scenario) {
             size_bytes: attachmentRetryPng.length, is_image: true, is_audio: false, is_video: false } },
         ...(trace.attachmentMarkerReady ? [historyMessage(2, attachmentRetryMarker, "2026-03-09T12:00:01Z")] : []),
       ];
+    }
+    if (scenario === "shared-file-via-home" || scenario === "community-attach") {
+      poll.latest_seq = 1;
+      poll.objects = [historyMessage(1, `hello.txt · 30 B · ${sharedUri}`, "2026-03-09T12:00:00Z")];
+      if (scenario === "shared-file-via-home") {
+        poll.objects.push({ ...historyMessage(2, "", "2026-03-09T12:01:00Z"), kind: "link", body: null,
+          link: { url: sharedUri, host: sharedCid, title: "Local file link" } });
+        poll.latest_seq = 2;
+      }
+      if (trace.uploads.some(upload => upload.path.endsWith('/finish'))) {
+        poll.objects.push(historyMessage(3, `attached.txt · 30 B · ${sharedUri}`, "2026-03-09T12:02:00Z"));
+        poll.latest_seq = 3;
+      }
     }
     if (scenario === "external-link-via-home") {
       // A Link object (local mode) and a Community Text message that holds a
@@ -358,6 +374,30 @@ function startServer(scenario) {
         response.writeHead(200, { "content-type":"application/javascript", "content-length":body.length });
         response.end(body); return;
       }
+      if (url.pathname === "/home-external-link.js") {
+        const body = await readFile(join(repoRoot, "capsules/home/browser/home-external-link.js"));
+        response.writeHead(200, { "content-type": "application/javascript" }); response.end(body); return;
+      }
+      if (url.pathname.startsWith("/api/apps/home/shared-content/")) {
+        let raw = ""; for await (const chunk of request) raw += chunk;
+        const body = JSON.parse(raw);
+        if (url.pathname.endsWith("/check")) {
+          trace.sharedChecks.push({ body, token: request.headers['x-elastos-home-token'] });
+          json(response, { schema: "elastos.home.shared-content.result/v1", cid: sharedCid, uri: sharedUri,
+            sender_display_name: "Alma", size_bytes: 30, state: "available", check_id: "file-check" });
+        } else { trace.sharedGets.push(body); json(response, { state: "local" }); }
+        return;
+      }
+      if (url.pathname.startsWith("/api/apps/chat-room/upload/")) {
+        const chunks = []; for await (const chunk of request) chunks.push(chunk);
+        const bytes = Buffer.concat(chunks);
+        trace.uploads.push({ path: url.pathname, bytes, offset: request.headers['x-elastos-upload-offset'],
+          token: request.headers['x-elastos-home-token'] });
+        if (url.pathname.endsWith('/start')) json(response, { upload_id: "fixture-upload", chunk_size_bytes: 16 });
+        else if (url.pathname.endsWith('/chunk')) json(response, {});
+        else json(response, { cid: sharedCid, name: "attached.txt", size_bytes: 30 });
+        return;
+      }
       if (url.pathname === "/fixture") {
         const homeOrigin = `http://127.0.0.1:${server.address().port}`;
         const chatSrc = `/apps/chat-room/?home_origin=${encodeURIComponent(homeOrigin)}${isDirectSwitchScenario(scenario) || initialDirectRecovery ? "&conversation_id=direct%3Asha256%3Afixture-conversation" : ""}#home_token=test-token`;
@@ -388,7 +428,39 @@ function startServer(scenario) {
             document.body.append(frame);
           });
         </script>` : "";
-        const reconnectHost = linkHost + didHost + (initialDirectRecovery || sharedRecovery ? `<script>
+        const sharedHost = ["shared-file-via-home", "community-attach"].includes(scenario) ? `
+          <section id="shared-sheet" role="dialog" hidden style="position:fixed;inset:20%;background:white;color:black;padding:20px;z-index:10;overflow-wrap:anywhere">
+            <p id="kind"></p><h1 id="title"></h1><p><span id="app"></span><span id="asker"></span></p>
+            <p id="host"></p><p id="address"></p><p id="size"></p><p id="status"></p>
+            <button id="open">Get and open</button><button id="cancel">Cancel</button>
+          </section><script type="module">
+          import { createHomeExternalLinkPrompt, requestHomeSharedContent } from '/home-external-link.js';
+          const node = id => document.getElementById(id);
+          window.fixtureSharedMessages = []; window.fixtureFileOpens = []; window.fixturePickerReplies = [];
+          window.fixtureFileSize = 30;
+          const prompt = createHomeExternalLinkPrompt({ root: node('shared-sheet'), appName: node('app'),
+            host: node('host'), address: node('address'), openButton: node('open'), cancelButton: node('cancel'),
+            eyebrow: node('kind'), title: node('title'), asker: node('asker'), size: node('size'), status: node('status'),
+            openSharedFile: async result => window.fixtureFileOpens.push(result) });
+          window.fixturePrompt = prompt;
+          window.addEventListener('message', event => {
+            if (event.source !== document.querySelector('iframe').contentWindow || event.origin !== 'null'
+              || event.data?.homeToken !== 'test-token') return;
+            const data = event.data;
+            if (data.type === 'home:open-uri') {
+              window.fixtureSharedMessages.push(data);
+              requestHomeSharedContent({ context: { kind: 'app-frame', targetId: 'chat-room', homeToken: 'test-token' },
+                data, prompt, fetchJson: async (url, init) => (await fetch(url, init)).json() });
+            }
+            if (data.type === 'home:open-target' && data.target === 'library') {
+              event.source.postMessage({ type: 'chat-room:attach-library-item', requestId: data.requestId,
+                documentNonce: data.documentNonce, pickerId: 'picker', deliveryId: 'delivery', fileName: 'attached.txt',
+                mimeType: 'text/plain', blob: new Blob(['x'.repeat(window.fixtureFileSize)], { type: 'text/plain' }) }, '*');
+            }
+            if (data.type === 'home:picker-accepted') window.fixturePickerReplies.push(data);
+          });
+          </script>` : "";
+        const reconnectHost = linkHost + didHost + sharedHost + (initialDirectRecovery || sharedRecovery ? `<script>
           window.fixtureReconnects = 0;
           window.addEventListener("message", (event) => {
             const data = event.data;
@@ -703,7 +775,8 @@ function startServer(scenario) {
             message_id: "message:fixture-direct",
             direction: "incoming",
             text: scenario === "external-link-via-home" ? `hello from direct ${directLinkUrl}`
-              : didLinkScenario ? `hello from direct ${directDid} ${directDid}#key` : "hello from direct",
+              : didLinkScenario ? `hello from direct ${directDid} ${directDid}#key`
+              : scenario === "shared-file-via-home" ? `hello from direct ${sharedUri}` : "hello from direct",
             created_at: 1_725_000_000,
             delivery_state: "received",
           }],
@@ -796,7 +869,6 @@ async function waitForConfiguredChatWithoutLegacyFlash(frame, label) {
         return style.display !== "none" && style.visibility !== "hidden";
       };
       const legacySelectors = [
-        "#attach-button",
         "#browser-access-section",
         "#browser-access-stage",
         "#conversation-invite-create",
@@ -940,6 +1012,60 @@ async function runScenario(scenario) {
         await handle.evaluate(node => node.remove());
       }
       assert((await page.evaluate(() => window.fixtureOpenPeople.length)) === 2, "DID activation asked Home twice");
+      return;
+    }
+    if (scenario === "shared-file-via-home") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "shared file");
+      const link = frame.locator('[data-seq="1"] a[data-open-uri]');
+      await link.waitFor({ timeout: 5000 });
+      assert(await link.getAttribute('href') === null, "shared link navigates Chat");
+      assert(await link.getAttribute('data-message-ref') === 'shared/sha256:message-1', "message reference missing");
+      for (const gesture of ['click', 'Enter', ' ']) {
+        if (gesture === 'click') await link.click(); else { await link.focus(); await link.press(gesture); }
+        await page.locator('#shared-sheet').waitFor({ state: 'visible' });
+        assert(await page.locator('#address').innerText() === sharedUri, "sheet changed the address");
+        assert(await page.locator('#host').innerText() === 'From: Alma · online', "sheet sender missing");
+        assert(trace.sharedGets.length === 0, "link fetched before Get");
+        await page.locator('#cancel').click();
+        await page.waitForTimeout(3100);
+      }
+      assert(trace.sharedChecks.every(check => check.token === 'test-token'
+        && JSON.stringify(check.body) === JSON.stringify({ schema: 'elastos.home.shared-content.check/v1', uri: sharedUri,
+          source: { conversation_id: 'shared', message_id: 'sha256:message-1' } })), "check contract differs", trace.sharedChecks);
+      await frame.locator('[data-seq="2"] a[data-open-uri]').click();
+      await page.locator('#shared-sheet').waitFor({ state: 'visible' });
+      await page.waitForTimeout(600); await page.locator('#open').click();
+      await page.waitForFunction(() => window.fixtureFileOpens.length === 1);
+      assert(JSON.stringify(trace.sharedGets) === JSON.stringify([{ check_id: 'file-check' }]), "Get contract differs");
+      await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').click();
+      const dm = frame.locator('a[data-open-uri]'); await dm.waitFor();
+      await dm.press('Enter'); await page.locator('#shared-sheet').waitFor({ state: 'visible' });
+      const dmSource = trace.sharedChecks.at(-1).body.source;
+      assert(dmSource.conversation_id === 'direct:sha256:fixture-conversation' && !!dmSource.message_id, "DM reference missing", dmSource);
+      assert(await frame.locator('#attach-button').isDisabled(), "DM Attach is enabled");
+      return;
+    }
+    if (scenario === "community-attach") {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "Community Attach");
+      assert(await frame.locator('#community-files-public').innerText() ===
+        'Files you post in Community are public. Anyone with the link can get them.', "public file copy differs");
+      for (const [size, error] of [[0, "Empty files can't be sent."], [8 * 1024 * 1024 + 1, "Choose a file of 8 MB or less."]]) {
+        await page.evaluate(size => { window.fixtureFileSize = size; }, size);
+        await frame.locator('#attach-button').click();
+        await frame.waitForFunction(error => document.querySelector('#error-text').textContent === error, error);
+        assert(trace.uploads.length === 0, "invalid file uploaded");
+      }
+      await page.evaluate(() => { window.fixtureFileSize = 30; });
+      await frame.locator('#attach-button').click();
+      await page.waitForFunction(() => window.fixturePickerReplies.some(reply => reply.accepted));
+      assert(trace.uploads.length === 4, "expected start, two chunks and finish", trace.uploads);
+      const [start, ...rest] = trace.uploads;
+      assert(JSON.stringify(JSON.parse(start.bytes)) === JSON.stringify({ file_name: 'attached.txt', mime_type: 'text/plain', size_bytes: 30 }), "upload start differs");
+      assert(rest[0].offset === '0' && rest[1].offset === '16' && Buffer.concat(rest.slice(0, 2).map(item => item.bytes)).equals(Buffer.from('x'.repeat(30))), "upload chunks differ");
+      assert(trace.uploads.every(item => item.token === 'test-token'), "upload launch authority missing");
+      assert(!trace.requests.some(value => value.endsWith('/objects/send')), "Chat duplicated Runtime's post");
+      await notifyChatRuntime(page);
+      await frame.waitForFunction(() => document.querySelector('#message-list').textContent.includes('attached.txt'));
       return;
     }
 
@@ -1860,7 +1986,7 @@ async function runScenario(scenario) {
           return state.active
             && state.chatMode === "shared"
             && state.selected === "shared"
-            && state.attachHidden
+            && !state.attachHidden
             ? state
             : false;
         });
@@ -1884,7 +2010,7 @@ async function runScenario(scenario) {
           && switched.conversationTitle === "Community"
           && switched.conversationDetail === "Live"
           && switched.errorText === ""
-          && switched.attachHidden,
+          && !switched.attachHidden,
         "direct-to-shared switch did not leave configured Chat in shared mode",
         { heldBoundary, ...switched, preClickTrace, trace },
       );
@@ -2006,7 +2132,7 @@ async function runScenario(scenario) {
           }, width);
       state.topWidth = topWidth;
       assert(state.active === "true", "configured Chat session did not open", state);
-      assert(state.attachHidden, "configured Chat exposed Attach", state);
+      assert(!state.attachHidden, "Community Attach is unavailable", state);
       assert(state.browserStageHidden && state.browserRequestsHidden, "configured Chat exposed browser join controls", state);
       assert(state.roomSettingsHidden, "configured Chat exposed legacy room settings", state);
       assert(state.textVisible, "configured Chat text composer is unavailable", state);
@@ -2183,6 +2309,8 @@ async function main() {
     "direct-retry-terminal",
     "direct-retry-unavailable",
     "external-link-via-home",
+    "shared-file-via-home",
+    "community-attach",
   ];
   for (const scenario of scenarios) {
     await runScenario(scenario);

@@ -341,6 +341,8 @@ impl ShellSessionBootstrapFailure {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct ConversationObjectView {
     seq: u64,
+    #[serde(default)]
+    message_id: Option<String>,
     sender: String,
     /// Opaque reference to the sender's profile card, when Runtime has one.
     #[serde(default)]
@@ -627,6 +629,26 @@ struct AttachmentUploadStartInput<'a> {
 struct AttachmentUploadStartResponse {
     upload_id: String,
     chunk_size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommunityUploadFinish {
+    #[serde(rename = "cid")]
+    _cid: String,
+    #[serde(rename = "name")]
+    _name: String,
+    #[serde(rename = "size_bytes")]
+    _size_bytes: u64,
+}
+
+fn validate_attachment_size(size: u64) -> Result<(), String> {
+    if size == 0 {
+        return Err("Empty files can't be sent.".into());
+    }
+    if size > 8 * 1024 * 1024 {
+        return Err("Choose a file of 8 MB or less.".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -1765,7 +1787,13 @@ impl App {
             let Some(uri) = anchor.get_attribute("data-open-uri") else {
                 return;
             };
-            match link_app.open_elastos_uri_from_shell(&uri) {
+            if selection_intersects(&anchor) {
+                return;
+            }
+            match link_app.open_elastos_uri_from_shell(
+                &uri,
+                anchor.get_attribute("data-message-ref").as_deref(),
+            ) {
                 Ok(true) => event.prevent_default(),
                 Ok(false) => {}
                 Err(error) => {
@@ -1788,14 +1816,24 @@ impl App {
                 let Some(link) = event
                     .target()
                     .and_then(|value| value.dyn_into::<Element>().ok())
-                    .and_then(|target| target.closest("[data-open-external]").ok().flatten())
+                    .and_then(|target| {
+                        target
+                            .closest("[data-open-external], [data-open-uri]")
+                            .ok()
+                            .flatten()
+                    })
                 else {
                     return;
                 };
-                let Some(url) = link.get_attribute("data-open-external") else {
-                    return;
-                };
-                key_app.activate_external_link(&event, &url);
+                if let Some(uri) = link.get_attribute("data-open-uri") {
+                    event.prevent_default();
+                    let _ = key_app.open_elastos_uri_from_shell(
+                        &uri,
+                        link.get_attribute("data-message-ref").as_deref(),
+                    );
+                } else if let Some(url) = link.get_attribute("data-open-external") {
+                    key_app.activate_external_link(&event, &url);
+                }
             },
         ));
         self.message_list
@@ -3072,10 +3110,8 @@ impl App {
         blob: Blob,
         request: &LibraryPickerRequest,
     ) -> Result<(), String> {
+        validate_attachment_size(blob.size() as u64)?;
         let bytes = blob_to_bytes(blob).await?;
-        if bytes.is_empty() {
-            return Err("Library item is empty.".to_string());
-        }
         self.send_attachment_bytes(file_name, mime_type, &bytes, request)
             .await
     }
@@ -3090,6 +3126,8 @@ impl App {
         if !self.library_picker_is_current(request) {
             return Err("Open a new Library picker in the current conversation.".to_string());
         }
+        validate_attachment_size(bytes.len() as u64)?;
+        let configured = self.state.borrow().transport.configured;
         let headers = self.room_request_headers();
         let start: AttachmentUploadStartResponse = api_post_session_json(
             &self.room_api_url("/upload/start"),
@@ -3125,7 +3163,7 @@ impl App {
         if !self.library_picker_is_current(request) {
             return Err("The selected conversation changed.".to_string());
         }
-        let sent: ConversationObjectView = api_post_empty_json_with_headers(
+        let sent: serde_json::Value = api_post_empty_json_with_headers(
             &self.room_api_url(&format!("/upload/{}/finish", start.upload_id)),
             &headers,
         )
@@ -3134,7 +3172,15 @@ impl App {
         if !self.library_picker_is_current(request) {
             return Err("The selected conversation changed.".to_string());
         }
-        record_own_shared_send(&mut self.state.borrow_mut(), sent);
+        if configured {
+            // Runtime posts the Text message; the next poll owns its row.
+            let _: CommunityUploadFinish = serde_json::from_value(sent)
+                .map_err(|_| "Home could not confirm the file post.".to_string())?;
+        } else {
+            let object = serde_json::from_value(sent)
+                .map_err(|_| "Home could not confirm the attachment.".to_string())?;
+            record_own_shared_send(&mut self.state.borrow_mut(), object);
+        }
         Ok(())
     }
 
@@ -3173,18 +3219,19 @@ impl App {
         Ok(true)
     }
 
-    fn open_elastos_uri_from_shell(&self, uri: &str) -> Result<bool, JsValue> {
-        let clean_uri = uri.trim();
-        let Some(home_token) = self.home_token() else {
-            return Ok(false);
-        };
-        if !self.is_shell_mode() || !clean_uri.starts_with("elastos://") {
+    fn open_elastos_uri_from_shell(
+        &self,
+        uri: &str,
+        message_ref: Option<&str>,
+    ) -> Result<bool, JsValue> {
+        if !self.is_shell_mode() {
             return Ok(false);
         }
-        self.post_home_message(&serde_json::json!({
-            "type": "home:open-uri", "uri": clean_uri, "preferredViewer": "documents",
-            "homeToken": home_token,
-        }))
+        let Some(message) = shared_file_request(self.home_token().as_deref(), uri, message_ref)
+        else {
+            return Ok(false);
+        };
+        self.post_home_message(&message)
     }
 
     /// App documents have no popup permission. Inside Home a web link has no
@@ -3223,7 +3270,12 @@ impl App {
     /// Appends a message's text: plain runs as text nodes (never parsed as
     /// markup) and each web address as a link element. Shared by room Text
     /// messages and direct messages.
-    fn append_message_text(&self, body: &Element, text: &str) -> Result<(), JsValue> {
+    fn append_message_text(
+        &self,
+        body: &Element,
+        text: &str,
+        message_ref: Option<&str>,
+    ) -> Result<(), JsValue> {
         for node in message_text_nodes(text, self.is_shell_mode()) {
             match node {
                 MessageTextNode::Text(text) => body.append_with_str_1(text)?,
@@ -3232,6 +3284,11 @@ impl App {
                     link.set_class_name("message-link");
                     for (name, value) in attributes {
                         link.set_attribute(name, &value)?;
+                    }
+                    if text.starts_with("elastos://") {
+                        if let Some(message_ref) = message_ref {
+                            link.set_attribute("data-message-ref", message_ref)?;
+                        }
                     }
                     link.set_text_content(Some(text));
                     body.append_child(&link)?;
@@ -3775,6 +3832,15 @@ impl App {
     }
 
     fn open_library_from_home(&self) -> Result<bool, JsValue> {
+        if self
+            .state
+            .borrow()
+            .direct
+            .selected_conversation_id
+            .is_some()
+        {
+            return Err(JsValue::from_str(DIRECT_ATTACHMENTS_UNAVAILABLE));
+        }
         if self.home_token().is_none() || self.home_parent_origin.is_none() {
             return Ok(false);
         }
@@ -3828,6 +3894,12 @@ impl App {
             .as_ref()
             .is_some_and(|current| current.id == request.id)
             && self.state.borrow().community_send_enabled()
+            && self
+                .state
+                .borrow()
+                .direct
+                .selected_conversation_id
+                .is_none()
             && self.selection_guard_is_current(&request.selection)
     }
 
@@ -4194,6 +4266,12 @@ impl App {
         // control says so where the person meets it — visibly unavailable,
         // never silently missing.
         set_hidden(&self.attach_button, !direct_mode && !controls.show_attach)?;
+        if let Some(public_note) = self.document.get_element_by_id("community-files-public") {
+            set_hidden(
+                &public_note,
+                direct_mode || !state.transport.configured || !controls.show_attach,
+            )?;
+        }
         self.attach_button
             .set_disabled(direct_mode || !controls.enable_attach);
         if direct_mode {
@@ -4438,6 +4516,10 @@ impl App {
             let outgoing = message.direction == DirectMessageDirection::Outgoing;
             let item = self.document.create_element("li")?;
             item.set_attribute("data-direct-message-id", &message.message_id)?;
+            item.set_attribute(
+                "data-message-ref",
+                &format!("{conversation_id}/{}", message.message_id),
+            )?;
             item.set_class_name(if outgoing {
                 "message self-message"
             } else {
@@ -4469,7 +4551,11 @@ impl App {
             meta.append_child(&detail)?;
             let body = self.document.create_element("div")?;
             body.set_class_name("message-body");
-            self.append_message_text(&body, &message.text)?;
+            self.append_message_text(
+                &body,
+                &message.text,
+                Some(&format!("{conversation_id}/{}", message.message_id)),
+            )?;
             item.append_child(&meta)?;
             item.append_child(&body)?;
             if outgoing
@@ -4938,6 +5024,13 @@ impl App {
             self.append_day_separator_if_new(&mut last_day, object.created_at)?;
             let item = self.document.create_element("li")?;
             item.set_attribute("data-seq", &object.seq.to_string())?;
+            let message_ref = object
+                .message_id
+                .as_deref()
+                .map(|id| format!("shared/{id}"));
+            if let Some(message_ref) = &message_ref {
+                item.set_attribute("data-message-ref", message_ref)?;
+            }
             let is_self = object.from_current_session;
             item.set_class_name(
                 if is_self && object.kind != ConversationObjectKind::System {
@@ -4982,7 +5075,11 @@ impl App {
                 }
                 ConversationObjectKind::Text => {
                     body.set_class_name("message-body");
-                    self.append_message_text(&body, object.body.as_deref().unwrap_or_default())?;
+                    self.append_message_text(
+                        &body,
+                        object.body.as_deref().unwrap_or_default(),
+                        message_ref.as_deref(),
+                    )?;
                 }
                 ConversationObjectKind::Emoji => {
                     body.set_class_name("message-body emoji-body");
@@ -4993,9 +5090,14 @@ impl App {
                     if let Some(link) = &object.link {
                         let anchor = if link.url.starts_with("elastos://") {
                             let anchor = self.document.create_element("a")?;
-                            anchor.set_attribute("href", &link.url)?;
-                            anchor.set_attribute("data-open-uri", &link.url)?;
-                            anchor.set_attribute("aria-label", "Open published document")?;
+                            if is_shared_file_uri(&link.url) {
+                                for (name, value) in shared_file_attributes(&link.url) {
+                                    anchor.set_attribute(name, &value)?;
+                                }
+                                if let Some(message_ref) = &message_ref {
+                                    anchor.set_attribute("data-message-ref", message_ref)?;
+                                }
+                            }
                             anchor
                         } else {
                             self.external_link_element(&link.url, &link.title)?
@@ -5352,9 +5454,47 @@ fn documents_attachment_message(
     })
 }
 
+fn is_shared_file_uri(uri: &str) -> bool {
+    uri.strip_prefix("elastos://").is_some_and(|host| {
+        host.parse::<cid::Cid>()
+            .is_ok_and(|cid| cid.to_string() == host)
+    })
+}
+
+fn shared_file_attributes(uri: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("data-open-uri", uri.into()),
+        ("role", "link".into()),
+        ("tabindex", "0".into()),
+        ("aria-label", format!("Open shared file {uri}")),
+    ]
+}
+
+fn shared_file_request(
+    home_token: Option<&str>,
+    uri: &str,
+    message_ref: Option<&str>,
+) -> Option<serde_json::Value> {
+    let home_token = home_token.filter(|token| !token.is_empty())?;
+    if !is_shared_file_uri(uri) {
+        return None;
+    }
+    let mut request =
+        serde_json::json!({"type": "home:open-uri", "uri": uri, "homeToken": home_token});
+    if let Some(reference) = message_ref {
+        let (conversation_id, message_id) = reference.split_once('/')?;
+        if conversation_id.is_empty() || message_id.is_empty() {
+            return None;
+        }
+        request["source"] =
+            serde_json::json!({"conversation_id": conversation_id, "message_id": message_id});
+    }
+    Some(request)
+}
+
 const OPEN_LINK_FROM_HOME: &str = "Open Chat from Home to open web links.";
 
-/// One run of a Text message: plain text, or a web address shown as a link.
+/// One run of a Text message: plain text, a web address, or a shared file link.
 #[derive(Debug, PartialEq, Eq)]
 enum TextSegment<'a> {
     Text(&'a str),
@@ -5380,7 +5520,11 @@ fn message_text_nodes(text: &str, shell_mode: bool) -> Vec<MessageTextNode<'_>> 
             TextSegment::Text(text) => MessageTextNode::Text(text),
             TextSegment::Link(url) => MessageTextNode::Link {
                 text: url,
-                attributes: external_link_attributes(url, None, shell_mode),
+                attributes: if url.starts_with("elastos://") {
+                    shared_file_attributes(url)
+                } else {
+                    external_link_attributes(url, None, shell_mode)
+                },
             },
         })
         .collect()
@@ -5424,7 +5568,7 @@ fn split_text_links(text: &str) -> Vec<TextSegment<'_>> {
     segments
 }
 
-/// Splits message text into plain runs and `http://`/`https://` addresses.
+/// Splits message text into plain runs, web addresses and canonical CID links.
 /// An address runs to the next whitespace or full-width (CJK) punctuation,
 /// minus trailing sentence punctuation, quotes and unbalanced closing
 /// brackets. Nothing else (a bare `example.com`) is a link. The address is
@@ -5437,7 +5581,11 @@ fn split_web_links(text: &str) -> Vec<TextSegment<'_>> {
         let rest = &text[start..];
         let run_end = start + rest.find(ends_link_run).unwrap_or(rest.len());
         let end = start + trim_link_end(&text[start..run_end]).len();
-        if end > start + scheme_len {
+        if end > start + scheme_len
+            && (scheme_len != "elastos://".len()
+                || (is_shared_file_uri(&text[start..end])
+                    && !text[start + scheme_len..run_end].contains(['/', '?', '#'])))
+        {
             if plain_start < start {
                 segments.push(TextSegment::Text(&text[plain_start..start]));
             }
@@ -5454,7 +5602,7 @@ fn split_web_links(text: &str) -> Vec<TextSegment<'_>> {
     segments
 }
 
-/// The next `http://` or `https://` (any ASCII case) at or after `from` that
+/// The next web or shared-file scheme at or after `from` that
 /// does not continue an ASCII word, with the scheme's length. CJK text needs
 /// no space before an address.
 fn next_web_scheme(text: &str, from: usize) -> Option<(usize, usize)> {
@@ -5468,12 +5616,14 @@ fn next_web_scheme(text: &str, from: usize) -> Option<(usize, usize)> {
         {
             return None;
         }
-        ["https://", "http://"].into_iter().find_map(|scheme| {
-            bytes
-                .get(index..index + scheme.len())
-                .filter(|candidate| candidate.eq_ignore_ascii_case(scheme.as_bytes()))
-                .map(|_| (index, scheme.len()))
-        })
+        ["https://", "http://", "elastos://"]
+            .into_iter()
+            .find_map(|scheme| {
+                bytes
+                    .get(index..index + scheme.len())
+                    .filter(|candidate| candidate.eq_ignore_ascii_case(scheme.as_bytes()))
+                    .map(|_| (index, scheme.len()))
+            })
     })
 }
 
@@ -6397,6 +6547,7 @@ mod tests {
     fn runtime_delivery_changes_refresh_known_community_rows_without_new_sequence() {
         use super::CommunityDeliveryState::{Accepted, Expired, Sending, Unknown};
         let object = |seq, is_own| ConversationObjectView {
+            message_id: None,
             delivery_state: None,
             seq,
             sender: if is_own { "Local" } else { "Peer" }.into(),
@@ -6673,6 +6824,7 @@ mod tests {
 
     fn attachment_object(seq: u64, attachment_id: Option<&str>) -> ConversationObjectView {
         ConversationObjectView {
+            message_id: None,
             delivery_state: None,
             seq,
             created_at: 100 + seq,
@@ -6779,6 +6931,7 @@ mod tests {
     #[test]
     fn recovered_history_changes_display_order_without_rewinding_poll_cursor() {
         let object = |seq, created_at| ConversationObjectView {
+            message_id: None,
             delivery_state: None,
             seq,
             created_at,
@@ -6847,6 +7000,7 @@ mod tests {
         let mut state = two_direct_conversations();
         state.session_active = true;
         state.objects.push(ConversationObjectView {
+            message_id: None,
             delivery_state: None,
             seq: 1,
             created_at: 100,
@@ -7040,6 +7194,7 @@ mod tests {
     #[test]
     fn a_late_community_send_does_not_move_a_direct_reader() {
         let sent = || ConversationObjectView {
+            message_id: None,
             delivery_state: None,
             seq: 7,
             sender: "Me".into(),
@@ -7067,6 +7222,7 @@ mod tests {
     #[test]
     fn a_shared_send_keeps_the_poll_cursor_until_intervening_peer_rows_arrive() {
         let object = |seq, sender: &str| ConversationObjectView {
+            message_id: None,
             delivery_state: None,
             seq,
             sender: sender.into(),
@@ -7106,6 +7262,7 @@ mod tests {
     #[test]
     fn a_late_community_receipt_keeps_one_object_and_the_newer_poll_cursor() {
         let object = |seq, sender: &str, body: &str| ConversationObjectView {
+            message_id: None,
             delivery_state: None,
             seq,
             sender: sender.into(),
@@ -7360,6 +7517,96 @@ mod tests {
             split_text_links(&text),
             [Link(url), Text(&text[url.len()..])]
         );
+    }
+
+    #[test]
+    fn shared_file_request_keeps_the_server_message_reference() {
+        let uri = "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+        for conversation in ["shared", "direct:sha256:conversation"] {
+            let reference = format!("{conversation}/sha256:message");
+            assert_eq!(
+                super::shared_file_request(Some("launch"), uri, Some(&reference)),
+                Some(serde_json::json!({
+                    "type": "home:open-uri", "uri": uri, "homeToken": "launch",
+                    "source": { "conversation_id": conversation, "message_id": "sha256:message" },
+                }))
+            );
+        }
+        let row: ConversationObjectView = serde_json::from_value(serde_json::json!({
+            "seq": 7, "message_id": "sha256:message", "sender": "Alma", "kind": "text", "body": uri, "created_at": 1,
+        })).unwrap();
+        assert_eq!(row.message_id.as_deref(), Some("sha256:message"));
+        assert!(super::shared_file_request(Some("launch"), uri, None)
+            .unwrap()
+            .get("source")
+            .is_none());
+        assert!(super::shared_file_request(None, uri, Some("shared/message")).is_none());
+        assert!(super::shared_file_request(Some("launch"), uri, Some("shared/")).is_none());
+        assert!(super::shared_file_request(Some("launch"), &format!(" {uri}"), None).is_none());
+        assert!(super::shared_file_request(Some("launch"), &format!("{uri} "), None).is_none());
+        let nodes = message_text_nodes(uri, true);
+        assert_eq!(
+            nodes,
+            vec![MessageTextNode::Link {
+                text: uri,
+                attributes: super::shared_file_attributes(uri)
+            }]
+        );
+    }
+
+    #[test]
+    fn community_attachment_sizes_and_finish_match_the_upload_contract() {
+        assert_eq!(
+            super::validate_attachment_size(0).unwrap_err(),
+            "Empty files can't be sent."
+        );
+        assert!(super::validate_attachment_size(8 * 1024 * 1024).is_ok());
+        assert_eq!(
+            super::validate_attachment_size(8 * 1024 * 1024 + 1).unwrap_err(),
+            "Choose a file of 8 MB or less."
+        );
+        assert!(
+            serde_json::from_value::<super::CommunityUploadFinish>(serde_json::json!({
+                "cid": "cid", "name": "hello.txt", "size_bytes": 30,
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn shared_file_links_require_a_canonical_bare_cid() {
+        use TextSegment::{Link, Text};
+        let v0 = "QmYwAPJzv5CZsnAzt8auVZRnGiRAzrxksBuP5xT9H6hQ6D";
+        let v1 = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+        for cid in [v0, v1] {
+            let uri = format!("elastos://{cid}");
+            assert_eq!(split_text_links(&uri), vec![Link(&uri)]);
+            let prose = format!("See ({uri}).");
+            assert_eq!(
+                split_text_links(&prose),
+                vec![Text("See ("), Link(&uri), Text(").")]
+            );
+            for suffix in ["/", "/a", "?x", "#fragment"] {
+                let invalid = format!("{uri}{suffix}");
+                assert_eq!(split_text_links(&invalid), vec![Text(&invalid)]);
+            }
+        }
+        for invalid in [
+            "elastos://peer/invite?token=x".to_string(),
+            "elastos://invalid".to_string(),
+            format!("elastos://{}", v1.to_uppercase()),
+            format!("ELASTOS://{v1}"),
+            format!("elastos://{}", &v0[..45]),
+            "elastos://bafyb".to_string(),
+            format!("elastos:// {v1}"),
+            format!("elastos://{} {}", &v1[..20], &v1[20..]),
+        ] {
+            assert_eq!(
+                split_text_links(&invalid),
+                vec![Text(&invalid)],
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
@@ -7820,8 +8067,8 @@ mod tests {
 
         let policy = chat_control_policy(true, true, true, true, CommunityState::Live, true, true);
         assert!(policy.enable_text_send);
-        assert!(!policy.show_attach);
-        assert!(!policy.enable_attach);
+        assert!(policy.show_attach);
+        assert!(policy.enable_attach);
         assert!(!policy.show_browser_requests);
         assert!(!policy.show_room_access_toggle);
         assert!(!policy.show_room_access);
@@ -7849,6 +8096,7 @@ mod tests {
         assert_eq!(participant_detail(&participant, false, false), "active now");
 
         let object = ConversationObjectView {
+            message_id: None,
             delivery_state: None,
             sender_ref: None,
             seq: 1,
@@ -7918,6 +8166,7 @@ mod tests {
             ],
             objects: vec![
                 ConversationObjectView {
+                    message_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 1,
@@ -7932,6 +8181,7 @@ mod tests {
                     created_at: 1,
                 },
                 ConversationObjectView {
+                    message_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 2,
@@ -7946,6 +8196,7 @@ mod tests {
                     created_at: 2,
                 },
                 ConversationObjectView {
+                    message_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 3,
@@ -7960,6 +8211,7 @@ mod tests {
                     created_at: 3,
                 },
                 ConversationObjectView {
+                    message_id: None,
                     delivery_state: None,
                     sender_ref: None,
                     seq: 4,
@@ -8548,11 +8800,8 @@ fn chat_control_policy(
     let gateway_surface = room_mode_known && !shell_mode && !configured;
     ChatControlPolicy {
         enable_text_send: session_active && community_state == CommunityState::Live,
-        show_attach: room_mode_known && !configured,
-        enable_attach: room_mode_known
-            && !configured
-            && session_active
-            && community_state == CommunityState::Live,
+        show_attach: room_mode_known,
+        enable_attach: room_mode_known && session_active && community_state == CommunityState::Live,
         show_browser_requests: gateway_surface && has_pending_requests,
         show_room_access_toggle: gateway_surface && session_active,
         show_room_access: gateway_surface && session_active && show_access_controls,

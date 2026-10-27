@@ -1,4 +1,4 @@
-// Home opens an app's web link only after the person sees the exact address
+// Home opens an app's web link or shared file after the person sees the exact address
 // and chooses Open link (#430). App documents have no popup permission.
 //
 // One request at a time. The Runtime names the requesting app from its signed
@@ -62,6 +62,51 @@ function validatedResult(result, appId, homeOrigin) {
   return { appTitle: result.app_title.trim(), href: parsed.href, host: parsed.host };
 }
 
+const SHARED_RESULT_SCHEMA = "elastos.home.shared-content.result/v1";
+const CHECK_STATES = ["local", "available", "sender_offline", "not_contact", "not_here"];
+const GET_STATES = ["local", "sender_offline", "not_shared", "too_large", "mismatch", "timeout"];
+
+function validatedSharedResult(result, uri) {
+  if (!result || typeof result !== "object" || Array.isArray(result)
+    || Object.keys(result).some(key => !["schema", "check_id", "cid", "uri", "sender_display_name", "state", "size_bytes"].includes(key))
+    || result.schema !== SHARED_RESULT_SCHEMA || result.uri !== uri
+    || typeof result.cid !== "string" || !result.cid || uri !== `elastos://${result.cid}`
+    || !CHECK_STATES.includes(result.state)
+    || (result.state === "available" && (typeof result.check_id !== "string" || !result.check_id))
+    || (result.sender_display_name !== undefined && typeof result.sender_display_name !== "string")
+    || (result.size_bytes !== undefined && (!Number.isSafeInteger(result.size_bytes) || result.size_bytes < 0))) return null;
+  return result;
+}
+
+// The launch context is verified by Home before this boundary. Runtime owns
+// CID and message validation; Home preserves the exact request and binding.
+export function requestHomeSharedContent({ context, data, prompt, fetchJson }) {
+  const source = data.source;
+  const keys = ["type", "uri", "homeToken", ...(source === undefined ? [] : ["source"])];
+  if (context.kind !== "app-frame" || !["chat-room", "documents"].includes(context.targetId)
+    || !hasExactKeys(data, keys) || data.type !== "home:open-uri"
+    || data.homeToken !== context.homeToken || typeof data.uri !== "string"
+    || !data.uri.startsWith("elastos://") || data.uri.length > MAX_EXTERNAL_LINK_LENGTH
+    || (source !== undefined && (context.targetId !== "chat-room" || !source
+      || typeof source !== "object" || Array.isArray(source)
+      || !hasExactKeys(source, ["conversation_id", "message_id"])
+      || ![source.conversation_id, source.message_id].every(value => typeof value === "string" && value.length > 0)))) return false;
+  const check = signal => fetchJson("/api/apps/home/shared-content/check", {
+    method: "POST", signal,
+    headers: { "x-elastos-home-token": context.homeToken },
+    body: JSON.stringify({ schema: "elastos.home.shared-content.check/v1", uri: data.uri,
+      ...(source === undefined ? {} : { source }) }),
+  });
+  const get = (check_id, signal) => fetchJson("/api/apps/home/shared-content/get", {
+    method: "POST", signal, body: JSON.stringify({ check_id }),
+  });
+  const requestId = prompt.begin({ homeToken: context.homeToken, appId: context.targetId,
+    kind: "shared", uri: data.uri, check, get });
+  if (!requestId) return false;
+  check().then(result => prompt.show(requestId, result)).catch(() => prompt.checkFailed(requestId));
+  return true;
+}
+
 export function createHomeExternalLinkPrompt({
   root,
   appName,
@@ -69,6 +114,8 @@ export function createHomeExternalLinkPrompt({
   address,
   openButton,
   cancelButton,
+  eyebrow, title, asker, size, status, linkLabel,
+  openSharedFile = async () => {},
   windowRef = globalThis.window,
   isLive = () => true,
   // True while another Home sheet (the Clipboard prompt) is on screen; the two
@@ -101,6 +148,7 @@ export function createHomeExternalLinkPrompt({
     active = null;
     pointerPress = null;
     keyboardPress = null;
+    request?.controller?.abort();
     if (request?.phase === "shown") {
       hide();
     }
@@ -113,6 +161,81 @@ export function createHomeExternalLinkPrompt({
     }
     const request = close();
     cooldownUntil.set(request.appId, now() + cooldownMs);
+  }
+
+  function renderShared(request) {
+    const value = request.result;
+    const name = value?.sender_display_name || "The sender";
+    const state = request.state;
+    eyebrow.textContent = "Shared file";
+    title.textContent = state === "local" ? "Open this file?" : "Get this file?";
+    appName.textContent = value?.sender_display_name || "";
+    asker.textContent = value?.sender_display_name ? " shared this in Chat." : "";
+    host.textContent = value?.sender_display_name
+      ? `From: ${name}${state === "available" ? " · online" : state === "sender_offline" ? " · offline" : ""}` : "";
+    address.textContent = request.uri;
+    if (linkLabel) linkLabel.hidden = false;
+    size.hidden = false;
+    size.textContent = value?.size_bytes === undefined ? "Size: shown after download, at most 64 MB"
+      : `Size: ${formatSize(value.size_bytes)}`;
+    const messages = {
+      sender_offline: `${name}'s Home is offline. Try again when ${name} is online.`,
+      not_contact: `Files come only from your contacts. Add ${name} as a contact first.`,
+      not_here: "This file isn't on your Home.", getting: "Getting file…", checking: "Checking file…",
+      not_shared: `${name}'s Home no longer shares this file.`, too_large: "This file is larger than 64 MB.",
+      mismatch: "This file didn't match its link, so Home discarded it.",
+      timeout: "Getting the file took too long. Try again.",
+      check_failed: "Home could not check this file. Try again.",
+      get_failed: "Home could not get this file. Try again.",
+      open_failed: "Home could not open this file. Try again.",
+    };
+    status.textContent = messages[state] || "";
+    status.hidden = !status.textContent;
+    openButton.textContent = state === "local" ? "Open" : state === "available" ? "Get and open" : "Try again";
+    openButton.disabled = request.busy || !["local", "available", "sender_offline", "timeout", "check_failed", "get_failed", "open_failed"].includes(state);
+    openButton.hidden = openButton.disabled;
+  }
+
+  async function activateShared(request) {
+    const state = request.state;
+    request.busy = true;
+    request.controller = new AbortController();
+    const current = () => active === request && isLive(request.homeToken) && !request.controller.signal.aborted;
+    try {
+      if (state === "local") {
+        await openSharedFile(request.result);
+        if (current()) close();
+        return;
+      }
+      request.state = state === "available" ? "getting" : "checking";
+      renderShared(request);
+      if (state === "available") {
+        const result = await request.get(request.result.check_id, request.controller.signal);
+        if (!current()) return;
+        if (!result || !hasExactKeys(result, ["state"]) || !GET_STATES.includes(result.state)) throw new Error("Invalid file result");
+        request.state = result.state;
+        if (result.state === "local") {
+          await openSharedFile(request.result);
+          if (current()) close();
+          return;
+        }
+      } else {
+        const result = validatedSharedResult(await request.check(request.controller.signal), request.uri);
+        if (!current()) return;
+        if (!result) throw new Error("Invalid file check");
+        request.result = result;
+        request.state = result.state;
+      }
+    } catch (_error) {
+      if (!current()) return;
+      request.state = state === "local" || request.state === "local" ? "open_failed"
+        : state === "available" ? "get_failed" : "check_failed";
+    }
+    if (current()) {
+      request.busy = false;
+      request.shownAt = now();
+      renderShared(request);
+    }
   }
 
   function eligiblePress(event) {
@@ -187,6 +310,10 @@ export function createHomeExternalLinkPrompt({
     ) {
       return;
     }
+    if (active.kind === "shared") {
+      if (!active.busy && isLive(active.homeToken)) void activateShared(active);
+      return;
+    }
     const request = close();
     if (!isLive(request.homeToken)) {
       return;
@@ -210,7 +337,7 @@ export function createHomeExternalLinkPrompt({
     } else if (event?.key === "Tab") {
       // Focus stays on the sheet's two buttons while it is open.
       event.preventDefault?.();
-      const next = windowRef.document?.activeElement === cancelButton ? openButton : cancelButton;
+      const next = !openButton.disabled && windowRef.document?.activeElement === cancelButton ? openButton : cancelButton;
       next.focus({ preventScroll: true });
     }
   });
@@ -219,14 +346,14 @@ export function createHomeExternalLinkPrompt({
   return {
     // Claims the one request slot for this sender. Returns "" while another
     // request is open or being checked, or during the sender's cool-down.
-    begin({ homeToken, appId }) {
+    begin({ homeToken, appId, kind = "web", uri, check, get }) {
       if (active || !homeToken || !appId || (cooldownUntil.get(appId) || 0) > now()) {
         return "";
       }
       cooldownUntil.delete(appId);
       sequence += 1;
       const requestId = `external-link-${sequence}`;
-      active = { requestId, homeToken, appId, phase: "checking", href: "" };
+      active = { requestId, homeToken, appId, kind, uri, check, get, phase: "checking", href: "", busy: false };
       return requestId;
     },
     // Shows the Runtime-checked request. Anything stale or malformed, or a
@@ -236,7 +363,7 @@ export function createHomeExternalLinkPrompt({
         return false;
       }
       const checked = isLive(active.homeToken) && !otherSheetShown()
-        ? validatedResult(result, active.appId, windowRef.location?.origin)
+        ? (active.kind === "shared" ? validatedSharedResult(result, active.uri) : validatedResult(result, active.appId, windowRef.location?.origin))
         : null;
       if (!checked) {
         active = null;
@@ -246,15 +373,42 @@ export function createHomeExternalLinkPrompt({
       keyboardPress = null;
       active.phase = "shown";
       active.shownAt = now();
-      active.href = checked.href;
-      appName.textContent = checked.appTitle;
-      host.textContent = checked.host;
-      address.textContent = checked.href;
+      if (active.kind === "shared") {
+        active.result = checked;
+        active.state = checked.state;
+        renderShared(active);
+      } else {
+        active.href = checked.href;
+        if (eyebrow) eyebrow.textContent = "Web link";
+        if (title) title.textContent = "Open this link?";
+        if (asker) asker.textContent = " wants to open this address in your browser.";
+        appName.textContent = checked.appTitle;
+        host.textContent = checked.host;
+        address.textContent = checked.href;
+        if (linkLabel) linkLabel.hidden = true;
+        if (size) size.hidden = true;
+        if (status) status.hidden = true;
+        openButton.textContent = "Open link";
+        openButton.hidden = false;
+        openButton.disabled = false;
+      }
       root.hidden = false;
       root.setAttribute("aria-hidden", "false");
-      openButton.disabled = false;
       cancelButton.focus({ preventScroll: true });
       return true;
+    },
+    checkFailed(requestId) {
+      if (active?.requestId !== requestId || active.kind !== "shared" || !isLive(active.homeToken) || otherSheetShown()) {
+        if (active?.requestId === requestId) close();
+        return;
+      }
+      active.phase = "shown";
+      active.state = "check_failed";
+      active.shownAt = now();
+      renderShared(active);
+      root.hidden = false;
+      root.setAttribute("aria-hidden", "false");
+      cancelButton.focus({ preventScroll: true });
     },
     abandon(requestId) {
       if (active?.requestId === requestId) {
@@ -272,4 +426,10 @@ export function createHomeExternalLinkPrompt({
       close();
     },
   };
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
