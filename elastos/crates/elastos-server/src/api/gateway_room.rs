@@ -2295,6 +2295,11 @@ async fn community_upload_finish(
         Ok(session) => session.token,
         Err(err) => return room_service_error_response(err),
     };
+    // A send the rate limit would refuse is refused before the upload is
+    // taken or published, so the sender can finish it again later.
+    if let Err(err) = port.check_message_allowed(&profile, now_ts()) {
+        return room_service_error_response(err);
+    }
     let taken = {
         let (data_dir, token, upload_id) = (data_dir.clone(), token.clone(), upload_id.clone());
         tokio::task::spawn_blocking(move || {

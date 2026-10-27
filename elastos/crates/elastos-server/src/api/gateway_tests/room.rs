@@ -3062,6 +3062,60 @@ async fn community_upload_finish_pins_the_file_here_then_posts_its_link() {
     let (status, _) = finish().await;
     assert_ne!(status, StatusCode::OK);
     assert_eq!(content.requests.lock().unwrap().len(), 1);
+
+    // A finish the send rate limit refuses publishes nothing and keeps the
+    // upload, so it can be finished once the window has passed.
+    let (status, body) = call(
+        "/api/apps/chat-room/upload/start".into(),
+        Body::from(r#"{"file_name":"later.txt","mime_type":"text/plain","size_bytes":2}"#),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let later = serde_json::from_str::<serde_json::Value>(&body).unwrap()["upload_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) = call(
+        format!("/api/apps/chat-room/upload/{later}/chunk"),
+        Body::from("ok"),
+        Some("0"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The file post counts toward the window; fill the rest of it.
+    for index in 1..crate::collaboration_rate_limit::COMMUNITY_SENDS_PER_WINDOW {
+        let (status, body) = call(
+            "/api/apps/chat-room/objects/send".into(),
+            Body::from(
+                json!({
+                    "request_id": format!("chat-message:{index:032x}"),
+                    "body": format!("message {index}"),
+                })
+                .to_string(),
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let uploads = || {
+        room_store_snapshot(dir.path())
+            .into_iter()
+            .filter(|(path, _)| path.contains("upload"))
+            .collect::<Vec<_>>()
+    };
+    let staged = uploads();
+    assert!(!staged.is_empty());
+    let (status, body) = call(
+        format!("/api/apps/chat-room/upload/{later}/finish"),
+        Body::empty(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(content.requests.lock().unwrap().len(), 1);
+    assert_eq!(uploads(), staged);
 }
 
 #[tokio::test]

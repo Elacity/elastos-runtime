@@ -159,6 +159,17 @@ impl CollaborationChatProductPort {
         Ok(self.core.summary()?.live_unresolved_outgoing)
     }
 
+    /// Whether `profile` may post one more Chat message now (the send rate
+    /// limit), checked without sending.
+    pub(crate) fn check_message_allowed(
+        &self,
+        profile: &crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        self.core
+            .check_community_send_allowed(&profile.document().profile_did, now)
+    }
+
     /// Durably prepare one fixed Chat message. The Runtime request binding is
     /// idempotency evidence only; the port supplies all product authority fields.
     pub(crate) fn prepare_message(
