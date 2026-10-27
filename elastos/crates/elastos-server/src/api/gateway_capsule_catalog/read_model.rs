@@ -63,10 +63,10 @@ pub(in crate::api::gateway) fn capsule_catalog_summary_for(
             capsule.launchable = false;
         }
     }
-    // Home lists only its visible targets; the others open from their owner app.
+    // Archive opens archives from Library only, so Marketplace offers no Open.
     for capsule in capsules
         .iter_mut()
-        .filter(|capsule| !is_home_visible_target(&capsule.name))
+        .filter(|capsule| capsule.name == "archive-manager")
     {
         capsule.launchable = false;
     }

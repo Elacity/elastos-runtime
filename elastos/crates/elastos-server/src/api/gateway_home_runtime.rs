@@ -246,6 +246,7 @@ pub(super) fn home_targets_from_catalog(
         .iter()
         .filter(|capsule| capsule.launchable)
         .filter(|capsule| capsule.role != CapsuleRole::Shell)
+        .filter(|capsule| is_home_visible_target(&capsule.name))
         .filter_map(|capsule| {
             Some(HomeTargetSummary {
                 target: capsule.launch_target.clone()?,
@@ -349,9 +350,9 @@ fn home_viewer_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
     targets
 }
 
-/// Targets Home shows in its launcher, desktop and Marketplace Open. Wallet
-/// connectors open from Wallet and Archive opens archives from Library, so
-/// both stay launchable but are not listed.
+/// Targets Home shows in its launcher and on its desktop. Wallet connectors
+/// open from Wallet and Archive opens archives from Library, so both stay
+/// launchable but are not listed.
 pub(super) fn is_home_visible_target(name: &str) -> bool {
     !matches!(
         name,

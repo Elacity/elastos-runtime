@@ -393,27 +393,35 @@ async fn test_walletconnect_connector_requires_pinned_config() {
 #[test]
 fn test_marketplace_lists_walletconnect_only_once_its_config_is_pinned() {
     let dir = tempfile::tempdir().unwrap();
-    write_test_browser_capsule(
-        dir.path(),
-        WALLET_WALLETCONNECT_CAPSULE_ID,
-        "app",
-        "WalletConnect",
-        None,
-    );
-    let listed = || {
+    for (name, title) in [
+        (WALLET_WALLETCONNECT_CAPSULE_ID, "WalletConnect"),
+        (WALLET_METAMASK_CAPSULE_ID, "MetaMask"),
+        (WALLET_UNISAT_CAPSULE_ID, "UniSat"),
+        ("archive-manager", "Archive"),
+    ] {
+        write_test_browser_capsule(dir.path(), name, "app", title, None);
+    }
+    let launchable = |name: &str| {
         capsule_catalog_summary(dir.path())
             .capsules
             .iter()
-            .any(|capsule| capsule.name == WALLET_WALLETCONNECT_CAPSULE_ID)
+            .find(|capsule| capsule.name == name)
+            .map(|capsule| capsule.launchable)
     };
+    let listed = || launchable(WALLET_WALLETCONNECT_CAPSULE_ID).is_some();
+    // Marketplace keeps Open for the wallet connectors; Archive opens from Library only.
+    assert_eq!(launchable(WALLET_METAMASK_CAPSULE_ID), Some(true));
+    assert_eq!(launchable(WALLET_UNISAT_CAPSULE_ID), Some(true));
+    assert_eq!(launchable("archive-manager"), Some(false));
     assert!(
         !listed(),
         "an unconfigured WalletConnect must stay out of Marketplace"
     );
     seed_walletconnect_connector_config(dir.path());
-    assert!(
-        listed(),
-        "a configured WalletConnect must be listed in Marketplace"
+    assert_eq!(
+        launchable(WALLET_WALLETCONNECT_CAPSULE_ID),
+        Some(true),
+        "a configured WalletConnect is listed in Marketplace and keeps its Open"
     );
 }
 
