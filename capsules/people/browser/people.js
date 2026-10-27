@@ -69,6 +69,27 @@ async function boot() {
   await refreshPeople();
 }
 
+function prefillContactFromLaunch() {
+  const did = launchParams.get("did");
+  if (!localProfileId || sendingContact || !addContactInput || !did || did !== did.trim()
+      || !/^did:key:z[1-9A-HJ-NP-Za-km-z]+$/.test(did)) return;
+  activateSection("people");
+  addContactInput.value = did;
+  addContactInput.scrollIntoView({ block: "center" });
+  addContactInput.focus();
+  launchParams.delete("did");
+}
+
+function receivePeopleNavigation(event) {
+  const data = event.data;
+  if (event.source !== window.parent || event.origin !== "null"
+      || data?.type !== "elastos.people.navigate/v1" || data.homeToken !== homeToken
+      || !data.query || Object.keys(data.query).join(",") !== "did"
+      || typeof data.query.did !== "string") return;
+  launchParams.set("did", data.query.did);
+  prefillContactFromLaunch();
+}
+
 function announceReady() {
   if (homeToken && homeParentOrigin && window.top !== window) {
     window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
@@ -122,6 +143,7 @@ function activateSection(targetId) {
 }
 
 function bindActions() {
+  window.addEventListener("message", receivePeopleNavigation);
   profileIdCopy?.addEventListener("click", async () => {
     if (!localProfileId || profileIdCopy.disabled) return;
     profileIdCopy.disabled = true;
@@ -301,6 +323,7 @@ function renderProfileId(profileId) {
   if (profileIdValue) profileIdValue.textContent = localProfileId;
   if (profileIdSection) profileIdSection.hidden = !localProfileId;
   if (addContactForm) addContactForm.hidden = !localProfileId;
+  prefillContactFromLaunch();
 }
 
 function contactRequestMessage(result) {
@@ -308,10 +331,10 @@ function contactRequestMessage(result) {
   const unknown = name === "Name not known yet";
   switch (result?.status) {
     case "requested": return unknown
-      ? "Name not known yet. Request sent. They'll see it in Inbox when their Home is online."
+      ? "Request sent. Name not known yet. They'll see it in Inbox when their Home is online."
       : `Request sent. ${name} sees it in Inbox when their Home is online.`;
     case "already_requested": return unknown
-      ? "Name not known yet. Request sent. Waiting for them to accept."
+      ? "Request sent. Name not known yet. Waiting for them to accept."
       : `Request sent. Waiting for ${name} to accept.`;
     case "already_contact": return `${name} is already a contact.`;
     case "pending_from_them": return `${name} already asked to connect. Open Inbox to answer.`;
@@ -338,11 +361,14 @@ async function sendContactRequest() {
     // A refresh failure does not change the confirmed request outcome.
     await refreshPeople({ quiet: true }).catch(() => {});
   } catch (error) {
-    addContactResult.textContent = error.message || "Could not send the request. Try again.";
+    addContactResult.textContent = [400, 409].includes(error?.status)
+      ? readText(error.message) || "Could not send the request. Try again."
+      : publicError(error, "Could not send the request. Try again.");
   } finally {
     sendingContact = false;
     addContactSubmit.disabled = false;
     addContactInput.disabled = false;
+    prefillContactFromLaunch();
   }
 }
 
@@ -593,7 +619,11 @@ function reachabilityLabel(contact) {
 }
 
 function contactMarkup(contact) {
-  const name = readText(contact?.display_name);
+  const displayName = readText(contact?.display_name);
+  const did = readText(contact?.remote_profile_did);
+  const name = displayName === "Name not known yet" && did
+    ? `${displayName} (…${did.slice(-6)})`
+    : displayName;
   const relationship = relationshipLabel(contact?.relationship);
   const handle = readText(contact?.handle);
   const deliveryDetail = contact?.relationship === "requested" ? readText(contact.delivery_detail) : "";
@@ -710,7 +740,7 @@ function profileSaveFailureMessage(error) {
     ? "Could not save your Profile. Try again."
     : "Could not create your Profile. Try again.";
   const message = readText(error?.message);
-  if (!message || /\b(device|endpoint|route|provider|carrier|schema|projection|launch token|unauthorized|forbidden|[45]\d\d)\b/i.test(message)) {
+  if (!message || /\b(did:|device|endpoint|route|provider|carrier|schema|projection|launch token|unauthorized|forbidden|[45]\d\d)\b/i.test(message)) {
     return fallback;
   }
   return message;
@@ -801,7 +831,7 @@ async function fetchJson(path, options = {}) {
 
 function publicError(error, fallback) {
   const message = readText(error?.message);
-  return !message || /\b(schema|projection|provider|capability|launch token|hostcall|unauthorized|forbidden|[45]\d\d)\b/i.test(message)
+  return ![400, 409].includes(error?.status) || !message || /\b(schema|projection|provider|capability|launch token|hostcall|unauthorized|forbidden|[45]\d\d)\b/i.test(message)
     ? fallback
     : message;
 }

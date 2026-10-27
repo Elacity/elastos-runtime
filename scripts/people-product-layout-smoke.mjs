@@ -644,7 +644,7 @@ async function assertReadyOffScenario(frame, page, width) {
   assert(await frame.locator("#add-contact-id").inputValue() === "invalid", "Refusal cleared the input");
   await frame.locator("#add-contact-id").fill("did:key:zRemote");
   await frame.locator("#add-contact-id").press("Enter");
-  await frame.waitForFunction(() => document.querySelector("#add-contact-result").textContent.startsWith("Name not known yet. Request sent."));
+  await frame.waitForFunction(() => document.querySelector("#add-contact-result").textContent.startsWith("Request sent. Name not known yet."));
   assert(await frame.locator("#add-contact-id").inputValue() === "", "Sent request kept the input");
   await assertNoOverflow(frame, `DID request at ${width}px`);
   await openDiscovery(frame);
@@ -814,6 +814,7 @@ async function assertRemoveConfirmationScenario(frame, page, width, trace) {
   const beforePosts = trace.removalTargets.length;
   const remove = frame.locator('[data-action="remove"][data-contact-id="contact:accepted"]');
   await remove.waitFor({ state: "visible" });
+  await remove.evaluate(node => node.scrollIntoView({ block: "center" }));
   await remove.click();
   const confirm = frame.locator('[data-action="confirm-remove"][data-contact-id="contact:accepted"]');
   const cancel = frame.locator('[data-action="cancel-remove"][data-contact-id="contact:accepted"]');
@@ -828,6 +829,7 @@ async function assertRemoveConfirmationScenario(frame, page, width, trace) {
   await cancel.click();
   await confirm.waitFor({ state: "hidden" });
   assert(trace.removalTargets.length === beforePosts, "Cancel sent a removal POST");
+  await remove.evaluate(node => node.scrollIntoView({ block: "center" }));
   await remove.click();
   const failed = page.waitForResponse(response => response.request().method() === "POST"
     && new URL(response.url()).pathname === "/api/apps/people/contacts/remove", { timeout: 10000 });

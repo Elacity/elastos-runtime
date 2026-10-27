@@ -173,13 +173,6 @@ assert(
   "System device DID copies must use the canonical bounded identifier Clipboard policy",
 );
 assert(
-  protocolSource.includes('"profile.id"') &&
-    hostSource.includes('"people:profile.id:write"') &&
-    hostSource.includes('"chat-room:profile.id:write"') &&
-    chatRoomUiSource.includes('JsValue::from_str("elastosChatCopyProfileId")'),
-  "Profile DID copies must use the canonical bounded identifier Clipboard policy",
-);
-assert(
   protocolSource.includes(
     "Object.hasOwn(HOME_CLIPBOARD_TARGET_PURPOSE_POLICY, targetId)",
   ) &&

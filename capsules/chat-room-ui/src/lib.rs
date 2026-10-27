@@ -3614,41 +3614,14 @@ impl App {
         &self,
         participant_ref: &str,
     ) -> Result<ContactRequestResponse, String> {
-        self.contact_post("/contacts/request", participant_ref)
-            .await
-    }
-
-    // Contact refusals are plain public copy supplied by Runtime.
-    async fn contact_post<T: DeserializeOwned>(
-        &self,
-        route: &str,
-        participant_ref: &str,
-    ) -> Result<T, String> {
-        let deadline = request_deadline(REQUEST_DEADLINE_MS);
-        let mut request = Request::post(&self.room_api_url(route))
-            .credentials(RequestCredentials::SameOrigin)
-            .abort_signal(Some(&deadline));
-        for (name, value) in self.home_token_headers() {
-            request = request.header(name, &value);
-        }
-        let response = request
-            .json(&serde_json::json!({ "participant_ref": participant_ref }))
-            .map_err(|err| err.to_string())?
-            .send()
-            .await
-            .map_err(|_| {
-                "Contact requests can't be delivered right now. Try again later.".to_string()
-            })?;
-        if !response.ok() {
-            return Err(response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Could not read the response. Try again.".to_string()));
-        }
-        response
-            .json::<T>()
-            .await
-            .map_err(|_| "Could not read the response. Try again.".to_string())
+        api_post_json_with_headers(
+            &self.room_api_url("/contacts/request"),
+            &serde_json::json!({ "participant_ref": participant_ref }),
+            &self.home_token_headers(),
+            Some(REQUEST_DEADLINE_MS),
+        )
+        .await
+        .map_err(|error| contact_failure_message(&error, "Could not send the request. Try again."))
     }
 
     fn copy_participant_profile_id(self: &Rc<Self>) {
@@ -3670,9 +3643,16 @@ impl App {
         let request_token = self.home_token();
         let app = Rc::clone(self);
         spawn_local(async move {
-            let result: Result<ProfileIdResponse, String> = app
-                .contact_post("/contacts/profile-id", &participant_ref)
-                .await;
+            let result: Result<ProfileIdResponse, String> = api_post_json_with_headers(
+                &app.room_api_url("/contacts/profile-id"),
+                &serde_json::json!({ "participant_ref": participant_ref }),
+                &app.home_token_headers(),
+                Some(REQUEST_DEADLINE_MS),
+            )
+            .await
+            .map_err(|error| {
+                contact_failure_message(&error, "DID could not be copied. Try again.")
+            });
             if app.home_token() != request_token || app.participant_card_opening.get() != opening {
                 app.participant_profile_copying.set(false);
                 app.refresh_open_participant_card();
@@ -5406,12 +5386,50 @@ fn message_text_nodes(text: &str, shell_mode: bool) -> Vec<MessageTextNode<'_>> 
         .collect()
 }
 
+fn is_bare_profile_did(text: &str) -> bool {
+    text.strip_prefix("did:key:z").is_some_and(|key| {
+        !key.is_empty()
+            && key.bytes().all(|byte| {
+                b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(&byte)
+            })
+    })
+}
+
+/// Bare DID tokens use the same Home launch route as other app links.
+/// A DID URL, attached punctuation or an embedded token stays plain text.
+fn split_text_links(text: &str) -> Vec<TextSegment<'_>> {
+    let mut segments = Vec::new();
+    for segment in split_web_links(text) {
+        let TextSegment::Text(plain) = segment else {
+            segments.push(segment);
+            continue;
+        };
+        let mut offset = 0;
+        let mut plain_start = 0;
+        for run in plain.split_inclusive(char::is_whitespace) {
+            let token = run.trim_end();
+            if is_bare_profile_did(token) {
+                if plain_start < offset {
+                    segments.push(TextSegment::Text(&plain[plain_start..offset]));
+                }
+                segments.push(TextSegment::Link(token));
+                plain_start = offset + token.len();
+            }
+            offset += run.len();
+        }
+        if plain_start < plain.len() {
+            segments.push(TextSegment::Text(&plain[plain_start..]));
+        }
+    }
+    segments
+}
+
 /// Splits message text into plain runs and `http://`/`https://` addresses.
 /// An address runs to the next whitespace or full-width (CJK) punctuation,
 /// minus trailing sentence punctuation, quotes and unbalanced closing
 /// brackets. Nothing else (a bare `example.com`) is a link. The address is
 /// sent unchanged; the Runtime checks it.
-fn split_text_links(text: &str) -> Vec<TextSegment<'_>> {
+fn split_web_links(text: &str) -> Vec<TextSegment<'_>> {
     let mut segments = Vec::new();
     let mut plain_start = 0;
     let mut cursor = 0;
@@ -5516,7 +5534,13 @@ fn external_link_attributes(
     shell_mode: bool,
 ) -> Vec<(&'static str, String)> {
     let mut attributes = vec![("data-open-external", url.to_string())];
-    if shell_mode {
+    if is_bare_profile_did(url) {
+        attributes.extend([
+            ("role", "link".to_string()),
+            ("tabindex", "0".to_string()),
+            ("aria-label", format!("Add by DID in People: {url}")),
+        ]);
+    } else if shell_mode {
         let label = match title.map(str::trim).filter(|title| !title.is_empty()) {
             Some(title) => format!("Open link: {title} ({url})"),
             None => format!("Open link: {url}"),
@@ -5568,6 +5592,15 @@ fn external_link_request(
     home_token: Option<&str>,
     url: &str,
 ) -> ExternalLinkRequest {
+    if is_bare_profile_did(url) {
+        return match (shell_mode, home_token) {
+            (true, Some(home_token)) => ExternalLinkRequest::AskHome(serde_json::json!({
+                "type": "home:open-target", "target": "people",
+                "query": { "did": url }, "homeToken": home_token,
+            })),
+            _ => ExternalLinkRequest::Refuse,
+        };
+    }
     match (shell_mode, home_token) {
         (false, _) => ExternalLinkRequest::Native,
         (true, Some(home_token)) => {
@@ -7187,6 +7220,55 @@ mod tests {
     }
 
     #[test]
+    fn bare_did_tokens_link_to_people_without_sending_a_request() {
+        use TextSegment::{Link, Text};
+        let did = "did:key:z6Mka1b2c3";
+        let text = format!("My DID {did}\nmessage me");
+        assert_eq!(
+            split_text_links(&text),
+            [Text("My DID "), Link(did), Text("\nmessage me")]
+        );
+        for plain in [
+            "did:key:z",
+            "did:key:z0OIl",
+            "DID:key:z6Mka1b2c3",
+            "xdid:key:z6Mka1b2c3",
+            "did:key:z6Mka1b2c3/path",
+            "did:key:z6Mka1b2c3?x=1",
+            "did:key:z6Mka1b2c3#key",
+            "(did:key:z6Mka1b2c3)",
+            "did:key:z6Mka1b2c3,",
+            "<did:key:z6Mka1b2c3>",
+        ] {
+            assert_eq!(split_text_links(plain), [Text(plain)], "{plain}");
+        }
+        assert_eq!(
+            external_link_request(true, Some("home-token"), did),
+            ExternalLinkRequest::AskHome(serde_json::json!({
+                "type": "home:open-target", "target": "people",
+                "query": { "did": did }, "homeToken": "home-token",
+            }))
+        );
+        assert_eq!(
+            external_link_request(true, None, did),
+            ExternalLinkRequest::Refuse
+        );
+        assert_eq!(
+            external_link_request(false, Some("home-token"), did),
+            ExternalLinkRequest::Refuse
+        );
+        for shell in [false, true] {
+            let nodes = message_text_nodes(did, shell);
+            let [super::MessageTextNode::Link { text, attributes }] = &nodes[..] else {
+                panic!("DID link missing")
+            };
+            assert_eq!(*text, did);
+            assert!(attributes.iter().all(|(name, _)| *name != "href"));
+            assert!(attributes.contains(&("aria-label", format!("Add by DID in People: {did}"))));
+        }
+    }
+
+    #[test]
     fn text_web_addresses_split_into_links() {
         use TextSegment::{Link, Text};
         let cases: &[(&str, &[TextSegment])] = &[
@@ -8678,6 +8760,17 @@ impl ContactRequestStatus {
     }
 }
 
+// The shared POST helper frames HTTP errors as "request failed: STATUS BODY".
+// Runtime supplies public contact refusal copy only for 400 and 409.
+fn contact_failure_message(error: &str, fallback: &str) -> String {
+    error
+        .strip_prefix("request failed: 400 ")
+        .or_else(|| error.strip_prefix("request failed: 409 "))
+        .filter(|body| !body.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
 #[derive(Debug, Deserialize)]
 struct ContactRequestResponse {
     status: ContactRequestStatus,
@@ -8689,11 +8782,11 @@ impl ContactRequestResponse {
         let name = &self.display_name;
         match self.status {
             ContactRequestStatus::Requested if name == "Name not known yet" =>
-                "Name not known yet. Request sent. They'll see it in Inbox when their Home is online.".to_string(),
+                "Request sent. Name not known yet. They'll see it in Inbox when their Home is online.".to_string(),
             ContactRequestStatus::Requested =>
                 format!("Request sent. {name} sees it in Inbox when their Home is online."),
             ContactRequestStatus::AlreadyRequested if name == "Name not known yet" =>
-                "Name not known yet. Request sent. Waiting for them to accept.".to_string(),
+                "Request sent. Name not known yet. Waiting for them to accept.".to_string(),
             ContactRequestStatus::AlreadyRequested => format!("Request sent. Waiting for {name} to accept."),
             ContactRequestStatus::AlreadyContact => format!("{name} is already a contact."),
             ContactRequestStatus::PendingFromThem => format!("{name} already asked to connect. Open Inbox to answer."),
@@ -8717,10 +8810,6 @@ fn participant_card_copy(
             Some(("Open Inbox", "inbox")),
         ),
         "none" if card.can_add_contact => ("In Community", Some(("Add contact", "add-contact"))),
-        "none" => ("In Community", None),
-        "removed" => ("Removed", None),
-        "removed_you" => ("No longer connected", None),
-        "declined" => ("Declined", None),
         _ => ("Relationship unavailable", None),
     };
     (text, if can_act { action } else { None })
@@ -9289,6 +9378,38 @@ mod participant_card_tests {
     }
 
     #[test]
+    fn contact_errors_trust_only_public_refusals_and_name_the_action() {
+        for (error, expected) in [
+            ("request failed: 400 That isn't a DID.", "That isn't a DID."),
+            (
+                "request failed: 409 That's your own DID.",
+                "That's your own DID.",
+            ),
+            (
+                "request failed: 500 private diagnostic",
+                "Could not send the request. Try again.",
+            ),
+            (
+                "request failed: 401 launch token expired",
+                "Could not send the request. Try again.",
+            ),
+            ("Failed to fetch", "Could not send the request. Try again."),
+        ] {
+            assert_eq!(
+                super::contact_failure_message(error, "Could not send the request. Try again."),
+                expected
+            );
+        }
+        assert_eq!(
+            super::contact_failure_message(
+                "Failed to fetch",
+                "DID could not be copied. Try again."
+            ),
+            "DID could not be copied. Try again."
+        );
+    }
+
+    #[test]
     fn participant_card_offers_one_action_per_relationship() {
         assert_eq!(
             participant_card_copy(&card("you", None, false), true).1,
@@ -9319,21 +9440,6 @@ mod participant_card_tests {
             None,
             "without a Home token the card only informs"
         );
-    }
-
-    #[test]
-    fn participant_card_describes_each_relationship_without_discovery() {
-        for (relationship, text) in [
-            ("none", "In Community"),
-            ("removed", "Removed"),
-            ("removed_you", "No longer connected"),
-            ("declined", "Declined"),
-        ] {
-            assert_eq!(
-                participant_card_copy(&card(relationship, None, false), true),
-                (text, None)
-            );
-        }
     }
 
     #[test]
@@ -9370,7 +9476,7 @@ mod participant_card_tests {
         .unwrap();
         assert_eq!(
             response.message(),
-            "Name not known yet. Request sent. They'll see it in Inbox when their Home is online."
+            "Request sent. Name not known yet. They'll see it in Inbox when their Home is online."
         );
         assert!(
             serde_json::from_value::<ContactRequestResponse>(serde_json::json!({

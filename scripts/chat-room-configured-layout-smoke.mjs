@@ -28,6 +28,8 @@ const attachmentRetryPng = Buffer.from(
 );
 const externalLinkUrl = "https://example.invalid/chat-link?from=chat";
 const textLinkUrl = "https://example.invalid/chat-text-link?from=text";
+const sharedDid = "did:key:z6Mka1b2c3";
+const directDid = "did:key:z6Mkd4e5f6";
 const directLinkUrl = "https://example.invalid/chat-direct-link?from=direct";
 const brave = process.env.BRAVE_BIN || "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
@@ -164,6 +166,7 @@ function startServer(scenario) {
   const sharedCursorScenario = scenario === "shared-send-intervening-peer" || communitySendOrdering;
   const didOutcome = scenario.startsWith("contact-did-") ? scenario.slice("contact-did-".length).replace(/-phone$/, "") : null;
   const contactAcceptance = scenario.startsWith("contact-acceptance") || didOutcome !== null;
+  const didLinkScenario = scenario.startsWith("did-link-via-home");
   const historyScenario = scenario === "history-status-order-calendar";
   const unreadScenario = scenario === "direct-unread" || scenario === "visible-read";
   const retryScenario = scenario.startsWith("direct-retry");
@@ -287,6 +290,10 @@ function startServer(scenario) {
         link: { url: externalLinkUrl, host: "example.com", title: "Example link" },
       }, historyMessage(2, `Read (${textLinkUrl}). <b>not markup</b>`, "2026-03-09T12:01:00Z")];
     }
+    if (didLinkScenario) {
+      poll.latest_seq = 1;
+      poll.objects = [historyMessage(1, `My DID ${sharedDid} ${sharedDid}/path`, "2026-03-09T12:00:00Z")];
+    }
     if (historyScenario) {
       const details = {
         searching: "Checking recent Community history from online participants.",
@@ -365,7 +372,23 @@ function startServer(scenario) {
             window.fixtureOpenExternal.push(event.data);
           });
         </script>` : "";
-        const reconnectHost = linkHost + (initialDirectRecovery || sharedRecovery ? `<script>
+        const didHost = didLinkScenario ? `<script>
+          window.fixtureOpenPeople = [];
+          window.addEventListener("message", (event) => {
+            if (event.source !== document.querySelector('iframe[title="Chat"]').contentWindow || event.origin !== "null"
+              || event.data?.type !== "home:open-target" || event.data.target !== "people"
+              || event.data.homeToken !== "test-token") return;
+            window.fixtureOpenPeople.push(event.data);
+            const frame = document.createElement("iframe");
+            frame.title = "People";
+            frame.sandbox = "allow-forms allow-scripts";
+            frame.style = "position:fixed;inset:0;width:100%;height:100%;background:white";
+            const query = new URLSearchParams({ ...event.data.query, home_origin: location.origin });
+            frame.src = "/apps/people/?" + query + "#home_token=test-token";
+            document.body.append(frame);
+          });
+        </script>` : "";
+        const reconnectHost = linkHost + didHost + (initialDirectRecovery || sharedRecovery ? `<script>
           window.fixtureReconnects = 0;
           window.addEventListener("message", (event) => {
             const data = event.data;
@@ -386,6 +409,29 @@ function startServer(scenario) {
           "content-length": body.length,
           "content-type": "text/html; charset=utf-8",
         });
+        response.end(body);
+        return;
+      }
+      if (didLinkScenario && url.pathname.startsWith("/api/apps/people/")) {
+        if (request.method === "POST") {
+          trace.contactRequests += 1;
+          return json(response, { error: "Unexpected automatic contact request" }, 400);
+        }
+        return json(response, {
+          profile_id: "did:key:z6MkLocal",
+          identity: { profile: { display_name: "Local Profile" },
+            profile_readiness: { schema: "elastos.profile.readiness/v1", status: "ready" } },
+          people: { contacts: [] }, discovery: {},
+        });
+      }
+      if (didLinkScenario && url.pathname.startsWith("/apps/people/")) {
+        const relative = url.pathname === "/apps/people/" ? "index.html" : url.pathname.slice("/apps/people/".length);
+        const root = join(repoRoot, "capsules/people/browser");
+        const path = resolve(root, relative);
+        assert(path.startsWith(`${root}/`), "invalid People asset path");
+        const body = await readFile(path);
+        response.writeHead(200, { "access-control-allow-origin": "null", "content-length": body.length,
+          "content-type": { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" }[extname(path)] });
         response.end(body);
         return;
       }
@@ -572,7 +618,7 @@ function startServer(scenario) {
           response.end(didOutcome === "unlisted" ? "This person is no longer listed in Community." : "Contact requests can't be delivered right now. Try again later.");
           return;
         }
-        const status = ["refusal", "unlisted", "removed", "declined"].includes(didOutcome) ? "requested" : (didOutcome || "requested");
+        const status = ["refusal", "unlisted"].includes(didOutcome) ? "requested" : (didOutcome || "requested");
         trace.contactRequested = true;
         trace.contactRelationship = { requested: "requested", already_requested: "requested", already_contact: "contact", pending_from_them: "pending", own_profile: "you" }[status];
         return json(response, { status, display_name: "Fixture Friend" });
@@ -656,7 +702,8 @@ function startServer(scenario) {
           messages: [{
             message_id: "message:fixture-direct",
             direction: "incoming",
-            text: scenario === "external-link-via-home" ? `hello from direct ${directLinkUrl}` : "hello from direct",
+            text: scenario === "external-link-via-home" ? `hello from direct ${directLinkUrl}`
+              : didLinkScenario ? `hello from direct ${directDid} ${directDid}#key` : "hello from direct",
             created_at: 1_725_000_000,
             delivery_state: "received",
           }],
@@ -862,6 +909,39 @@ async function runScenario(scenario) {
     }
     await page.goto(url, { waitUntil: "domcontentloaded" });
     let frame = await chatFrame(page);
+
+    if (scenario.startsWith("did-link-via-home")) {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "DID link");
+      for (const [mode, did] of [["Community", sharedDid], ["DM", directDid]]) {
+        if (mode === "DM") {
+          await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').click();
+          await frame.waitForFunction(() => document.body.dataset.chatMode === "direct"
+            && document.querySelector("#message-list")?.textContent.includes("hello from direct"));
+        }
+        const link = frame.locator('#message-list a.message-link[data-open-external]');
+        await link.waitFor();
+        assert(await link.count() === 1 && await link.innerText() === did, `${mode} must link only the bare DID`);
+        assert(await link.getAttribute("href") === null, "DID link can navigate Chat");
+        if (mode === "Community") await link.click();
+        else { await link.focus(); await link.press("Enter"); }
+        const handle = await page.waitForSelector('iframe[title="People"]');
+        const people = await handle.contentFrame();
+        await people.waitForFunction(did => {
+          const input = document.querySelector("#add-contact-id");
+          return input?.value === did && document.activeElement === input;
+        }, did);
+        assert(await people.locator("#add-contact-form").isVisible(), "People did not open Add by DID");
+        assert(trace.contactRequests === 0, "Opening a DID sent a contact request");
+        const messages = await page.evaluate(() => window.fixtureOpenPeople);
+        const message = messages.at(-1);
+        assert(message.type === "home:open-target" && message.target === "people" && message.homeToken === "test-token"
+          && message.query.did === did && Object.keys(message.query).length === 1,
+          "DID launch changed its parameter", messages);
+        await handle.evaluate(node => node.remove());
+      }
+      assert((await page.evaluate(() => window.fixtureOpenPeople.length)) === 2, "DID activation asked Home twice");
+      return;
+    }
 
     if (scenario === "external-link-via-home") {
       await waitForConfiguredChatWithoutLegacyFlash(frame, "external link");
@@ -1576,7 +1656,7 @@ async function runScenario(scenario) {
         own_profile: "That's your own DID.",
       };
       await frame.waitForFunction(message => document.querySelector("#participant-card-state").textContent === message,
-        messages[["refusal", "unlisted", "removed", "declined"].includes(outcome) ? "requested" : outcome]);
+        messages[["refusal", "unlisted"].includes(outcome) ? "requested" : outcome]);
       if (outcome === "pending_from_them") {
         assert(await frame.locator("#participant-card-action").innerText() === "Open Inbox", "Incoming request has no Inbox action");
       } else {
@@ -2065,9 +2145,10 @@ async function runScenario(scenario) {
 
 async function main() {
   const scenarios = process.env.CHAT_LAYOUT_SCENARIOS?.split(",").map((value) => value.trim()).filter(Boolean) || [
+    "did-link-via-home", "did-link-via-home-phone",
     "contact-did-requested", "contact-did-requested-phone", "contact-did-already_requested",
     "contact-did-already_contact", "contact-did-pending_from_them", "contact-did-own_profile", "contact-did-refusal",
-    "contact-did-unlisted", "contact-did-removed", "contact-did-declined",
+    "contact-did-unlisted",
     "success",
     "single-conversation",
     "session-failure",
