@@ -1057,6 +1057,7 @@ function handleProvider(op, payload, res) {
         {
           id: "entry:0",
           path: "alpha.txt",
+          display_path: "alpha.txt",
           name: "alpha.txt",
           kind: "file",
           size: 9,
@@ -1067,6 +1068,7 @@ function handleProvider(op, payload, res) {
         {
           id: "entry:1",
           path: "Nested/deep.txt",
+          display_path: "Nested/deep.txt",
           name: "deep.txt",
           kind: "file",
           size: 10,
@@ -1077,6 +1079,7 @@ function handleProvider(op, payload, res) {
         {
           id: "entry:2",
           path: "../escape.txt",
+          display_path: "../escape.txt",
           name: "escape.txt",
           kind: "blocked",
           size: 6,
@@ -1105,6 +1108,7 @@ function handleProvider(op, payload, res) {
       family: found.name.endsWith(".zip") ? "zip" : "tar.gz",
       entry: {
         path: payload.entry,
+        display_path: payload.entry,
         name: baseName(payload.entry),
         kind: "file",
         size: payload.entry === "Nested/deep.txt" ? 10 : 9,
