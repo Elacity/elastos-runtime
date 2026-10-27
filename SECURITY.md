@@ -77,7 +77,10 @@ durable rotation receipt.
 Runtime identifies each Carrier peer by its endpoint key. A key alone gives no
 authority. A Home serves a peer's `content/fetch` only for a CID pinned on it
 now: pinned content is public by link, and unpinned or cached blocks are never
-served to peers. Unpinning stops serving at once, before garbage collection.
+served to peers. Unpublish stops new transfers before garbage collection. A
+Home answers a peer's read in one message and checks the pin again just before
+sending it, so a read under way when the pin goes is refused. Bytes already
+sent can't be recalled.
 Only a node that serves publisher content (a seed) answers the raw
 `content_fetch` byte operation or serves without the pin check. In this
 release a seed accepts no new copies from other Homes; copies it already holds

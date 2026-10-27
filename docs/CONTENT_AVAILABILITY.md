@@ -617,8 +617,10 @@ tickets, peer handles, or Kubo authority.
 
 Peer `content/fetch` admission: every peer read is `local_only`. An ordinary
 Home serves it only for a CID pinned there now (Kubo `pin/ls`); pinned content
-is public by link, and unpinned or cached blocks are never served to peers, so
-Unpublish stops serving at once. A seed serves as before. A whole read past the
+is public by link, and unpinned or cached blocks are never served to peers.
+Unpublish stops new transfers. The answer goes out in one message after a
+second pin check, so a read under way when the pin goes is refused; bytes
+already sent can't be recalled. A seed serves as before. A whole read past the
 requested `whole_max_bytes` answers the fixed token `content_too_large`, and
 the requester bounds the answer line to that size.
 

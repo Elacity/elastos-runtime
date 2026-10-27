@@ -2842,7 +2842,7 @@ fn carrier_peer_refusal(error: &str) -> serde_json::Value {
 
 /// This node's own pin state for `cid`: `Some(true)` pinned, `Some(false)`
 /// not pinned, `None` when the pin state cannot be read now.
-async fn local_cid_pinned(registry: &ProviderRegistry, cid: &str) -> Option<bool> {
+pub(crate) async fn local_cid_pinned(registry: &ProviderRegistry, cid: &str) -> Option<bool> {
     let response = registry
         .send_raw(
             "ipfs",
@@ -2993,6 +2993,10 @@ async fn carrier_provider_invoke_registry(
             "source_endpoint_did": source_endpoint_did,
         }),
     );
+    // An ordinary Home's peer read, admitted again after the read: the whole
+    // reply goes out in one message, so a CID unpinned while it was read is
+    // refused before any byte of it is sent.
+    let mut pinned_read_dir = None;
     if let (CarrierProviderCaller::Peer { data_dir }, "content") = (caller, target) {
         if let Err(answer) = admit_carrier_peer_content_request(
             data_dir,
@@ -3008,6 +3012,7 @@ async fn carrier_provider_invoke_registry(
             {
                 return Ok(answer);
             }
+            pinned_read_dir = Some(data_dir);
         }
     }
 
@@ -3021,6 +3026,11 @@ async fn carrier_provider_invoke_registry(
     } else {
         registry.send_raw(target, &request).await
     };
+    if let (Ok(_), Some(data_dir)) = (&result, pinned_read_dir) {
+        if let Err(answer) = admit_carrier_peer_content_fetch(registry, data_dir, &request).await {
+            return Ok(answer);
+        }
+    }
     match result {
         Ok(result) => Ok(serde_json::json!({
             "ok": true,
@@ -14386,6 +14396,88 @@ pub(crate) mod tests {
             .register_sub_provider("ipfs", Arc::new(PinStatusIpfs { pinned: Some(true) }))
             .await
             .unwrap();
+    }
+
+    /// Content whose read completes after the owner unpins the CID.
+    struct UnpinDuringReadContent {
+        pinned: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for UnpinDuringReadContent {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("raw operations only".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+        fn name(&self) -> &'static str {
+            "unpin-during-read-content"
+        }
+        async fn send_raw(
+            &self,
+            _request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            self.pinned
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(serde_json::json!({ "status": "ok", "data": { "data": "c2VjcmV0" } }))
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_peer_fetch_unpinned_during_its_read_sends_no_bytes() {
+        let pinned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider(
+                "content",
+                Arc::new(UnpinDuringReadContent {
+                    pinned: pinned.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        registry
+            .register_sub_provider(
+                "ipfs",
+                Arc::new(SwitchPinIpfs {
+                    pinned: pinned.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        let request = serde_json::json!({
+            "source": "home-shared-content", "target": "content", "operation": "fetch",
+            "transfer": "json",
+            "request": {"op":"fetch", "cid": FIXTURE_CID, "_runtime_invocation": {
+                "schema":"elastos.provider.invocation/v1", "source":"home-shared-content",
+                "target":"content", "op":"fetch",
+                "capability":"provider:home-shared-content->content:fetch",
+                "transport":"carrier-provider-plane", "carrier":null, "transfer":"json",
+                "range":null, "progress":null
+            }}
+        });
+        let data_dir = tempfile::tempdir().unwrap();
+        let answer = carrier_provider_invoke_registry(
+            &registry,
+            &request,
+            &authenticated_test_source_endpoint(),
+            CarrierProviderCaller::Peer {
+                data_dir: data_dir.path(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !pinned.load(std::sync::atomic::Ordering::SeqCst),
+            "read ran"
+        );
+        assert_eq!(answer["ok"], false, "{answer}");
+        assert_eq!(answer["code"], CARRIER_PEER_REFUSED);
+        assert!(!answer.to_string().contains("c2VjcmV0"));
     }
 
     #[tokio::test]
