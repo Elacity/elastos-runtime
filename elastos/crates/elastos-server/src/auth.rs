@@ -423,27 +423,57 @@ struct AuthStateFileIdentity {
     content_hash: [u8; 32],
 }
 
-fn read_auth_state_bytes(data_dir: &Path) -> anyhow::Result<Option<(Vec<u8>, AuthStateFileIdentity)>> {
+/// The auth state file changed while it was read; the caller retries or skips the cache.
+#[derive(Debug)]
+struct AuthStateReadRace;
+
+impl std::fmt::Display for AuthStateReadRace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("auth state changed concurrently during readback")
+    }
+}
+
+impl std::error::Error for AuthStateReadRace {}
+
+fn read_auth_state_bytes(
+    data_dir: &Path,
+) -> anyhow::Result<Option<(Vec<u8>, AuthStateFileIdentity)>> {
     let path = auth_state_path(data_dir)?;
     let Some(before) = observe_optional_regular_file_identity(&path, "auth state")? else {
         return Ok(None);
     };
-    let mut file = File::open(&path)?;
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Err(AuthStateReadRace.into()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {path:?}")),
+    };
     let opened = regular_file_identity_from_metadata(&file.metadata()?, "auth state")?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {path:?}"))?;
     let after = regular_file_identity_from_metadata(&file.metadata()?, "auth state")?;
-    if before != opened || opened != after
+    if before != opened
+        || opened != after
         || observe_optional_regular_file_identity(&path, "auth state")? != Some(after)
     {
-        anyhow::bail!("auth state changed concurrently during readback");
+        return Err(AuthStateReadRace.into());
     }
     let content_hash = Sha256::digest(&bytes).into();
-    Ok(Some((bytes, AuthStateFileIdentity { file: after, content_hash })))
+    Ok(Some((
+        bytes,
+        AuthStateFileIdentity {
+            file: after,
+            content_hash,
+        },
+    )))
 }
 
-fn observe_auth_state_file_identity(data_dir: &Path) -> anyhow::Result<Option<AuthStateFileIdentity>> {
-    Ok(read_auth_state_bytes(data_dir)?.map(|(_, identity)| identity))
+/// Metadata of the auth state file, compared with an earlier stable, hashed read to detect
+/// any change since that read.
+fn observe_auth_state_file_metadata(
+    data_dir: &Path,
+) -> anyhow::Result<Option<RegularFileIdentity>> {
+    observe_optional_regular_file_identity(&auth_state_path(data_dir)?, "auth state")
 }
 
 fn observe_audit_chain_activation_file_identity(
@@ -516,14 +546,18 @@ fn take_verified_auth_state_cache_hit(
 #[cfg(test)]
 type AuthStateWriteHook = Box<dyn FnOnce(&Path) -> anyhow::Result<()> + Send>;
 #[cfg(test)]
-static AUTH_STATE_WRITE_HOOKS: OnceLock<Mutex<HashMap<PathBuf, AuthStateWriteHook>>> = OnceLock::new();
+static AUTH_STATE_WRITE_HOOKS: OnceLock<Mutex<HashMap<PathBuf, AuthStateWriteHook>>> =
+    OnceLock::new();
 
 #[cfg(test)]
-fn run_auth_state_write_hook(data_dir: &Path) -> anyhow::Result<()> {
-    let hook = AUTH_STATE_WRITE_HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
-        .lock().unwrap().remove(data_dir);
+fn run_auth_state_write_hook(path: &Path) -> anyhow::Result<()> {
+    let hook = AUTH_STATE_WRITE_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .remove(path);
     if let Some(hook) = hook {
-        hook(data_dir)?;
+        hook(path)?;
     }
     Ok(())
 }
@@ -533,14 +567,31 @@ static AUDIT_SIGNATURE_VERIFICATIONS: OnceLock<Mutex<HashMap<PathBuf, usize>>> =
 
 #[cfg(test)]
 fn audit_signature_count(data_dir: &Path) -> usize {
-    *AUDIT_SIGNATURE_VERIFICATIONS.get_or_init(|| Mutex::new(HashMap::new()))
-        .lock().unwrap().get(data_dir).unwrap_or(&0)
+    *AUDIT_SIGNATURE_VERIFICATIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(data_dir)
+        .unwrap_or(&0)
 }
 
 #[cfg(test)]
 fn record_audit_signature(data_dir: &Path) {
-    *AUDIT_SIGNATURE_VERIFICATIONS.get_or_init(|| Mutex::new(HashMap::new()))
-        .lock().unwrap().entry(data_dir.to_path_buf()).or_default() += 1;
+    *AUDIT_SIGNATURE_VERIFICATIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(data_dir.to_path_buf())
+        .or_default() += 1;
+}
+
+/// Releases the cache lock before the caller asserts, so a failed assertion cannot poison it.
+#[cfg(test)]
+fn verified_auth_state_cache_contains(data_dir: &Path) -> bool {
+    verified_auth_state_cache()
+        .lock()
+        .unwrap()
+        .contains_key(&auth_state_cache_key(data_dir))
 }
 
 #[cfg(test)]
@@ -3850,20 +3901,39 @@ mod owner_enrollment_tests {
         let secret = random_secret_hex();
         let mut identity = elastos_identity::IdentityManager::new(data.into()).unwrap();
         let (_, options) = begin_owner_enrollment(
-            data, &mut identity, &local(&secret), "nested-save", now_ts()
-        ).unwrap().unwrap();
+            data,
+            &mut identity,
+            &local(&secret),
+            "nested-save",
+            now_ts(),
+        )
+        .unwrap()
+        .unwrap();
         let response = owner_attestation_for_test(
-            &options.unwrap().public_key.challenge, "localhost", local(&secret).origin
+            &options.unwrap().public_key.challenge,
+            "localhost",
+            local(&secret).origin,
         );
-        complete_owner_enrollment(data, &mut identity, &local(&secret), "nested-save",
-            Some(&response), Some("Owner"), now_ts()).unwrap();
-        assert!(verified_auth_state_cache().lock().unwrap().contains_key(&auth_state_cache_key(data)));
+        complete_owner_enrollment(
+            data,
+            &mut identity,
+            &local(&secret),
+            "nested-save",
+            Some(&response),
+            Some("Owner"),
+            now_ts(),
+        )
+        .unwrap();
+        assert!(verified_auth_state_cache_contains(data));
         let before = audit_signature_count(data);
         let cached = load_auth_state(data).unwrap();
         assert_eq!(audit_signature_count(data), before);
         invalidate_verified_auth_state_cache(data);
         let fresh = load_auth_state(data).unwrap();
-        assert_eq!(serde_json::to_value(cached).unwrap(), serde_json::to_value(fresh).unwrap());
+        assert_eq!(
+            serde_json::to_value(cached).unwrap(),
+            serde_json::to_value(fresh).unwrap()
+        );
     }
 
     #[test]
@@ -4342,13 +4412,23 @@ impl AuditBaseline {
     }
 
     fn trusted_prefix(&self, state: &AuthState) -> usize {
-        let offset = state.audit_chain.first().zip(self.links.first())
+        let offset = state
+            .audit_chain
+            .first()
+            .zip(self.links.first())
             .and_then(|(next, old)| next.sequence.checked_sub(old.sequence))
             .and_then(|offset| usize::try_from(offset).ok());
-        let Some(offset) = offset.filter(|offset| *offset < self.links.len()) else { return 0; };
-        state.audit.iter().zip(&state.audit_chain)
+        let Some(offset) = offset.filter(|offset| *offset < self.links.len()) else {
+            return 0;
+        };
+        state
+            .audit
+            .iter()
+            .zip(&state.audit_chain)
             .zip(self.audit.iter().zip(&self.links).skip(offset))
-            .take_while(|((event, link), (old_event, old_link))| event == old_event && link == old_link)
+            .take_while(|((event, link), (old_event, old_link))| {
+                event == old_event && link == old_link
+            })
             .count()
     }
 }
@@ -4572,7 +4652,10 @@ fn write_secret_json_atomic(path: &Path, value: &impl Serialize) -> anyhow::Resu
     write_secret_bytes_atomic(path, &serde_json::to_vec_pretty(value)?).map(|_| ())
 }
 
-fn write_secret_bytes_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<Option<RegularFileIdentity>> {
+fn write_secret_bytes_atomic(
+    path: &Path,
+    bytes: &[u8],
+) -> anyhow::Result<Option<RegularFileIdentity>> {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -4596,7 +4679,10 @@ fn write_secret_bytes_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<Option
         #[cfg(test)]
         run_auth_state_write_hook(path)?;
         let held = regular_file_identity_from_metadata(&file.metadata()?, "secret state")?;
-        Ok((observe_optional_regular_file_identity(path, "secret state")? == Some(held)).then_some(held))
+        Ok(
+            (observe_optional_regular_file_identity(path, "secret state")? == Some(held))
+                .then_some(held),
+        )
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -4608,18 +4694,27 @@ pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
     load_auth_state_with_identity(data_dir).map(|(state, _)| state)
 }
 
-fn load_auth_state_with_identity(data_dir: &Path) -> anyhow::Result<(AuthState, Option<RegularFileIdentity>)> {
+fn load_auth_state_with_identity(
+    data_dir: &Path,
+) -> anyhow::Result<(AuthState, Option<RegularFileIdentity>)> {
     with_audit_chain_activation_lock(data_dir, || {
         for _ in 0..2 {
-            if let Some(state) = load_auth_state_locked_once(data_dir)? {
-                return Ok(state);
+            match load_auth_state_locked_once(data_dir) {
+                Ok(Some(state)) => return Ok(state),
+                Ok(None) => {}
+                Err(error) if error.is::<AuthStateReadRace>() => {
+                    invalidate_verified_auth_state_cache(data_dir);
+                }
+                Err(error) => return Err(error),
             }
         }
         anyhow::bail!("auth state changed concurrently while it was being verified")
     })
 }
 
-fn load_auth_state_locked_once(data_dir: &Path) -> anyhow::Result<Option<(AuthState, Option<RegularFileIdentity>)>> {
+fn load_auth_state_locked_once(
+    data_dir: &Path,
+) -> anyhow::Result<Option<(AuthState, Option<RegularFileIdentity>)>> {
     let disk = read_auth_state_bytes(data_dir)?;
     let initial_auth_state_identity = disk.as_ref().map(|(_, identity)| *identity);
     let mut expected_activation_identity = observe_audit_chain_activation_file_identity(data_dir)?;
@@ -4632,10 +4727,10 @@ fn load_auth_state_locked_once(data_dir: &Path) -> anyhow::Result<Option<(AuthSt
     ) {
         #[cfg(test)]
         run_verified_auth_state_cache_hit_hook(data_dir)?;
-        let final_auth_state_identity = observe_auth_state_file_identity(data_dir)?;
+        let final_auth_state_identity = observe_auth_state_file_metadata(data_dir)?;
         let final_activation_identity = observe_audit_chain_activation_file_identity(data_dir)?;
         let final_runtime_device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
-        if final_auth_state_identity != initial_auth_state_identity
+        if final_auth_state_identity != initial_auth_state_identity.map(|identity| identity.file)
             || final_activation_identity != expected_activation_identity
             || final_runtime_device_key_identity != initial_runtime_device_key_identity
         {
@@ -4647,7 +4742,9 @@ fn load_auth_state_locked_once(data_dir: &Path) -> anyhow::Result<Option<(AuthSt
         return Ok(Some((state, initial_runtime_device_key_identity)));
     }
 
-    let stored_state = disk.map(|(bytes, _)| parse_auth_state(data_dir, &bytes)).transpose()?;
+    let stored_state = disk
+        .map(|(bytes, _)| parse_auth_state(data_dir, &bytes))
+        .transpose()?;
     let state_was_present = stored_state.is_some();
     let mut state = stored_state.unwrap_or_default();
     let activation = load_audit_chain_activation_unlocked(data_dir)?;
@@ -4697,10 +4794,10 @@ fn load_auth_state_locked_once(data_dir: &Path) -> anyhow::Result<Option<(AuthSt
     #[cfg(test)]
     run_verified_auth_state_cache_fill_hook(data_dir)?;
 
-    let final_auth_state_identity = observe_auth_state_file_identity(data_dir)?;
+    let final_auth_state_identity = observe_auth_state_file_metadata(data_dir)?;
     let final_activation_identity = observe_audit_chain_activation_file_identity(data_dir)?;
     let final_runtime_device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
-    if final_auth_state_identity != initial_auth_state_identity
+    if final_auth_state_identity != initial_auth_state_identity.map(|identity| identity.file)
         || final_activation_identity != expected_activation_identity
         || final_runtime_device_key_identity != initial_runtime_device_key_identity
     {
@@ -4730,7 +4827,9 @@ fn auth_state_requires_audit_chain(state: &AuthState) -> bool {
 }
 
 fn load_auth_state_unverified(data_dir: &Path) -> anyhow::Result<Option<AuthState>> {
-    read_auth_state_bytes(data_dir)?.map(|(bytes, _)| parse_auth_state(data_dir, &bytes)).transpose()
+    read_auth_state_bytes(data_dir)?
+        .map(|(bytes, _)| parse_auth_state(data_dir, &bytes))
+        .transpose()
 }
 
 fn parse_auth_state(data_dir: &Path, bytes: &[u8]) -> anyhow::Result<AuthState> {
@@ -4748,7 +4847,11 @@ pub fn verify_auth_audit_chain_ready(data_dir: &Path) -> anyhow::Result<()> {
     load_auth_state(data_dir).map(|_| ())
 }
 
-pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState, baseline: Option<&AuditBaseline>) -> anyhow::Result<()> {
+pub(crate) fn save_auth_state(
+    data_dir: &Path,
+    state: &AuthState,
+    baseline: Option<&AuditBaseline>,
+) -> anyhow::Result<()> {
     // Every error path, including the gap before the checkpoint, leaves a cold cache.
     invalidate_verified_auth_state_cache(data_dir);
     #[cfg(test)]
@@ -4811,15 +4914,23 @@ pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState, baseline: Opti
                 )?);
             }
         }
+        // The write is durable here; an observation failure only leaves the cache cold.
         if let Some(identity) = published_identity {
             if state.schema == AUTH_STATE_SCHEMA
                 && (state.audit_chain_state.is_some() || !auth_state_requires_audit_chain(state))
-                && observe_auth_state_file_identity(data_dir)? == Some(identity)
-                && observe_audit_chain_activation_file_identity(data_dir)? == activation_identity
-                && observe_runtime_device_key_file_identity(data_dir)? == device_key_identity
+                && observe_auth_state_file_metadata(data_dir).ok() == Some(Some(identity.file))
+                && observe_audit_chain_activation_file_identity(data_dir).ok()
+                    == Some(activation_identity)
+                && observe_runtime_device_key_file_identity(data_dir).ok()
+                    == Some(device_key_identity)
             {
-                store_verified_auth_state_cache(data_dir, Some(identity), activation_identity,
-                    device_key_identity, state);
+                store_verified_auth_state_cache(
+                    data_dir,
+                    Some(identity),
+                    activation_identity,
+                    device_key_identity,
+                    state,
+                );
             }
         }
         Ok(())
@@ -7079,7 +7190,11 @@ fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> 
     verify_audit_chain_from(data_dir, state, None)
 }
 
-fn verify_audit_chain_from(data_dir: &Path, state: &AuthState, baseline: Option<&AuditBaseline>) -> anyhow::Result<()> {
+fn verify_audit_chain_from(
+    data_dir: &Path,
+    state: &AuthState,
+    baseline: Option<&AuditBaseline>,
+) -> anyhow::Result<()> {
     let device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
     let baseline = baseline.filter(|baseline| baseline.device_key_identity == device_key_identity);
     let trusted_prefix = baseline.map_or(0, |baseline| baseline.trusted_prefix(state));
@@ -7101,20 +7216,20 @@ fn verify_audit_chain_from(data_dir: &Path, state: &AuthState, baseline: Option<
             "audit chain state",
         )?;
         if baseline.is_none_or(|baseline| baseline.chain_state.as_ref() != Some(chain_state)) {
-        let payload = audit_chain_state_payload(
-            chain_state.activated_at,
-            chain_state.head_sequence,
-            &chain_state.head_hash,
-        )?;
-        #[cfg(test)]
-        record_audit_signature(data_dir);
-        crate::crypto::verify_domain_separated_signature(
-            &expected_runtime_did,
-            AUDIT_CHAIN_STATE_DOMAIN,
-            &payload,
-            &chain_state.signature,
-        )
-        .context("audit chain state signature is invalid")?;
+            let payload = audit_chain_state_payload(
+                chain_state.activated_at,
+                chain_state.head_sequence,
+                &chain_state.head_hash,
+            )?;
+            #[cfg(test)]
+            record_audit_signature(data_dir);
+            crate::crypto::verify_domain_separated_signature(
+                &expected_runtime_did,
+                AUDIT_CHAIN_STATE_DOMAIN,
+                &payload,
+                &chain_state.signature,
+            )
+            .context("audit chain state signature is invalid")?;
         }
         let (head_sequence, head_hash) = state
             .audit_chain
@@ -7148,16 +7263,16 @@ fn verify_audit_chain_from(data_dir: &Path, state: &AuthState, baseline: Option<
             "audit chain anchor",
         )?;
         if baseline.is_none_or(|baseline| baseline.anchor.as_ref() != Some(anchor)) {
-        let payload = audit_chain_anchor_payload(anchor.sequence, &anchor.chain_hash)?;
-        #[cfg(test)]
-        record_audit_signature(data_dir);
-        crate::crypto::verify_domain_separated_signature(
-            &expected_runtime_did,
-            AUDIT_CHAIN_ANCHOR_DOMAIN,
-            &payload,
-            &anchor.signature,
-        )
-        .context("audit chain anchor signature is invalid")?;
+            let payload = audit_chain_anchor_payload(anchor.sequence, &anchor.chain_hash)?;
+            #[cfg(test)]
+            record_audit_signature(data_dir);
+            crate::crypto::verify_domain_separated_signature(
+                &expected_runtime_did,
+                AUDIT_CHAIN_ANCHOR_DOMAIN,
+                &payload,
+                &anchor.signature,
+            )
+            .context("audit chain anchor signature is invalid")?;
         }
     }
     let mut previous: Option<&AuditChainLinkV1> = None;
@@ -7189,37 +7304,37 @@ fn verify_audit_chain_from(data_dir: &Path, state: &AuthState, baseline: Option<
             #[cfg(test)]
             record_audit_signature(data_dir);
             verify_audit_event_signature(event, &expected_runtime_did)?;
-        let event_hash = format!(
-            "sha256:{}",
-            hex::encode(Sha256::digest(serde_json::to_vec(event)?))
-        );
-        if link.event_hash != event_hash
-            || link.chain_hash
-                != audit_chain_hash(
-                    link.sequence,
-                    &link.event_id,
-                    &link.previous_hash,
-                    &link.event_hash,
-                )?
-        {
-            anyhow::bail!("audit chain hash is invalid");
-        }
-        let payload = audit_chain_signature_payload(
-            link.sequence,
-            &link.event_id,
-            &link.previous_hash,
-            &link.event_hash,
-            &link.chain_hash,
-        )?;
-        #[cfg(test)]
-        record_audit_signature(data_dir);
-        crate::crypto::verify_domain_separated_signature(
-            &expected_runtime_did,
-            AUDIT_CHAIN_DOMAIN,
-            &payload,
-            &link.signature,
-        )
-        .context("audit chain signature is invalid")?;
+            let event_hash = format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(serde_json::to_vec(event)?))
+            );
+            if link.event_hash != event_hash
+                || link.chain_hash
+                    != audit_chain_hash(
+                        link.sequence,
+                        &link.event_id,
+                        &link.previous_hash,
+                        &link.event_hash,
+                    )?
+            {
+                anyhow::bail!("audit chain hash is invalid");
+            }
+            let payload = audit_chain_signature_payload(
+                link.sequence,
+                &link.event_id,
+                &link.previous_hash,
+                &link.event_hash,
+                &link.chain_hash,
+            )?;
+            #[cfg(test)]
+            record_audit_signature(data_dir);
+            crate::crypto::verify_domain_separated_signature(
+                &expected_runtime_did,
+                AUDIT_CHAIN_DOMAIN,
+                &payload,
+                &link.signature,
+            )
+            .context("audit chain signature is invalid")?;
         }
         previous = Some(link);
     }
@@ -11215,14 +11330,19 @@ mod tests {
     }
 
     fn assert_own_write_cache_matches_disk(data: &Path) {
-        assert!(verified_auth_state_cache().lock().unwrap().contains_key(&auth_state_cache_key(data)),
-            "own write must fill the verified cache");
+        assert!(
+            verified_auth_state_cache_contains(data),
+            "own write must fill the verified cache"
+        );
         let before = audit_signature_count(data);
         let cached = load_auth_state(data).unwrap();
         assert_eq!(audit_signature_count(data), before);
         invalidate_verified_auth_state_cache(data);
         let fresh = load_auth_state(data).unwrap();
-        assert_eq!(serde_json::to_value(cached).unwrap(), serde_json::to_value(fresh).unwrap());
+        assert_eq!(
+            serde_json::to_value(cached).unwrap(),
+            serde_json::to_value(fresh).unwrap()
+        );
     }
 
     #[test]
@@ -11253,20 +11373,32 @@ mod tests {
             for writer in 0..2 {
                 scope.spawn(move || {
                     for index in 0..8 {
-                        append_audit_event(data, test_audit_event(100 + writer * 8 + index)).unwrap();
+                        append_audit_event(data, test_audit_event(100 + writer * 8 + index))
+                            .unwrap();
                     }
                 });
             }
             scope.spawn(|| {
-                for _ in 0..16 { load_auth_state(data).unwrap(); }
+                for _ in 0..16 {
+                    load_auth_state(data).unwrap();
+                }
             });
         });
-        let state = load_auth_state(data).unwrap();
-        assert_eq!(state.audit.len(), 20);
-        for index in 100..116 {
-            assert_eq!(state.audit.iter().filter(|event| event.event_id == format!("audit:test:{index}")).count(), 1);
-        }
+        // The last operation is a write, so the cache must hold exactly that write.
+        append_audit_event(data, test_audit_event(116)).unwrap();
         assert_own_write_cache_matches_disk(data);
+        let state = load_auth_state(data).unwrap();
+        assert_eq!(state.audit.len(), 21);
+        for index in 100..=116 {
+            assert_eq!(
+                state
+                    .audit
+                    .iter()
+                    .filter(|event| event.event_id == format!("audit:test:{index}"))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
@@ -11282,7 +11414,12 @@ mod tests {
         assert_eq!(original.len(), changed.len());
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::fs::write(&path, changed).unwrap();
-        File::options().write(true).open(path).unwrap().set_modified(modified).unwrap();
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
         let before = verify_audit_chain_call_count(data);
         assert!(load_auth_state(data).is_err());
         assert!(verify_audit_chain_call_count(data) > before);
@@ -11294,27 +11431,33 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let data = root.path();
             refresh_fixture(data, 4);
-            AUTH_STATE_WRITE_HOOKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
-                .insert(auth_state_path(data).unwrap(), Box::new(move |path| {
-                    let path = path.to_path_buf();
-                    let original = std::fs::read_to_string(&path)?;
-                    let changed = original.replacen("test event 1", "fake event 1", 1);
-                    assert_ne!(changed, original);
-                    let modified = std::fs::metadata(&path)?.modified()?;
-                    if replace {
-                        let replacement = path.with_extension("replacement");
-                        std::fs::write(&replacement, changed)?;
-                        std::fs::rename(replacement, &path)?;
-                    } else {
-                        let mut file = File::options().write(true).open(&path)?;
-                        file.write_all(changed.as_bytes())?;
-                        file.sync_all()?;
-                        file.set_modified(modified)?;
-                    }
-                    Ok(())
-                }));
+            AUTH_STATE_WRITE_HOOKS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap()
+                .insert(
+                    auth_state_path(data).unwrap(),
+                    Box::new(move |path| {
+                        let path = path.to_path_buf();
+                        let original = std::fs::read_to_string(&path)?;
+                        let changed = original.replacen("test event 1", "fake event 1", 1);
+                        assert_ne!(changed, original);
+                        let modified = std::fs::metadata(&path)?.modified()?;
+                        if replace {
+                            let replacement = path.with_extension("replacement");
+                            std::fs::write(&replacement, changed)?;
+                            std::fs::rename(replacement, &path)?;
+                        } else {
+                            let mut file = File::options().write(true).open(&path)?;
+                            file.write_all(changed.as_bytes())?;
+                            file.sync_all()?;
+                            file.set_modified(modified)?;
+                        }
+                        Ok(())
+                    }),
+                );
             append_audit_event(data, test_audit_event(5)).unwrap();
-            assert!(!verified_auth_state_cache().lock().unwrap().contains_key(&auth_state_cache_key(data)));
+            assert!(!verified_auth_state_cache_contains(data));
             let before = verify_audit_chain_call_count(data);
             assert!(load_auth_state(data).is_err());
             assert!(verify_audit_chain_call_count(data) > before);
@@ -11338,13 +11481,23 @@ mod tests {
                         push_audit_event(data, state, event)?;
                         state.audit_chain.last_mut().unwrap().signature = "forged".into();
                     }
-                    2 => { state.audit.remove(3); state.audit_chain.remove(3); }
-                    3 => { state.audit.swap(3, 4); state.audit_chain.swap(3, 4); }
+                    2 => {
+                        state.audit.remove(3);
+                        state.audit_chain.remove(3);
+                    }
+                    3 => {
+                        state.audit.swap(3, 4);
+                        state.audit_chain.swap(3, 4);
+                    }
                     4 => {
-                        state.audit_chain_anchor = Some(sign_audit_chain_anchor(data, 1, AUDIT_CHAIN_GENESIS)?);
+                        state.audit_chain_anchor =
+                            Some(sign_audit_chain_anchor(data, 1, AUDIT_CHAIN_GENESIS)?);
                     }
                     5 => state.audit_chain_state.as_mut().unwrap().signature = "forged".into(),
-                    6 => { state.audit.pop(); state.audit_chain.pop(); }
+                    6 => {
+                        state.audit.pop();
+                        state.audit_chain.pop();
+                    }
                     _ => unreachable!(),
                 }
                 Ok(())
@@ -11363,10 +11516,13 @@ mod tests {
         elastos_identity::load_or_create_did(replacement.path()).unwrap();
         let before = refresh_persisted_bytes(data);
         assert!(mutate_auth_state(data, |_state| {
-            std::fs::copy(elastos_identity::device_key_path(replacement.path()),
-                elastos_identity::device_key_path(data))?;
+            std::fs::copy(
+                elastos_identity::device_key_path(replacement.path()),
+                elastos_identity::device_key_path(data),
+            )?;
             Ok(())
-        }).is_err());
+        })
+        .is_err());
         assert_eq!(refresh_persisted_bytes(data), before);
         assert!(load_auth_state(data).is_err());
     }
@@ -11378,16 +11534,22 @@ mod tests {
         refresh_fixture(data, 4);
         load_auth_state(data).unwrap();
         let before = refresh_persisted_bytes(data);
-        inject_recovery_reassignment_test_fault(data, RecoveryReassignmentTestFault::AfterAuthStateWrite);
+        inject_recovery_reassignment_test_fault(
+            data,
+            RecoveryReassignmentTestFault::AfterAuthStateWrite,
+        );
         assert!(append_audit_event(data, test_audit_event(5)).is_err());
-        assert!(!verified_auth_state_cache().lock().unwrap().contains_key(&auth_state_cache_key(data)));
+        assert!(!verified_auth_state_cache_contains(data));
         let interrupted = refresh_persisted_bytes(data);
         assert_ne!(interrupted.0, before.0);
         assert_eq!(interrupted.1, before.1);
         let recovered = load_auth_state(data).unwrap();
         assert_eq!(recovered.audit.last().unwrap().event_id, "audit:test:5");
         let activation = load_audit_chain_activation(data).unwrap().unwrap();
-        assert_eq!(Some(activation.checkpoint), audit_chain_checkpoint(&recovered).unwrap());
+        assert_eq!(
+            Some(activation.checkpoint),
+            audit_chain_checkpoint(&recovered).unwrap()
+        );
         assert_own_write_cache_matches_disk(data);
     }
 
@@ -11400,7 +11562,10 @@ mod tests {
         append_audit_event(data, test_audit_event(5)).unwrap();
         assert_own_write_cache_matches_disk(data);
         std::fs::write(auth_state_path(data).unwrap(), older).unwrap();
-        assert!(load_auth_state(data).unwrap_err().to_string().contains("rollback"));
+        assert!(load_auth_state(data)
+            .unwrap_err()
+            .to_string()
+            .contains("rollback"));
     }
 
     #[test]
@@ -11408,13 +11573,21 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let data = root.path();
         refresh_fixture(data, 4);
-        mutate_auth_state(data, |state| {
+        // Assert outside the closure: a panic under the mutation lock would poison it.
+        let nested = mutate_auth_state(data, |state| {
             state.guest_registration_enabled = true;
             save_auth_state(data, state, None)?;
-            assert_own_write_cache_matches_disk(data);
+            let filled = verified_auth_state_cache_contains(data);
+            let cached = serde_json::to_value(load_auth_state(data)?)?;
+            invalidate_verified_auth_state_cache(data);
+            let fresh = serde_json::to_value(load_auth_state(data)?)?;
             let event = sign_audit_event(data, test_audit_event(5))?;
-            push_audit_event(data, state, event)
-        }).unwrap();
+            push_audit_event(data, state, event)?;
+            Ok((filled, cached, fresh))
+        })
+        .unwrap();
+        assert!(nested.0, "nested save must fill the verified cache");
+        assert_eq!(nested.1, nested.2);
         assert_own_write_cache_matches_disk(data);
         assert_eq!(load_auth_state(data).unwrap().audit.len(), 5);
     }
@@ -11453,25 +11626,55 @@ mod tests {
             state.audit.push(event);
             state.audit_chain.push(link);
         }
-        state.audit_chain_state = Some(sign_audit_chain_state(data,
-            state.audit_chain_state.as_ref().unwrap().activated_at,
-            state.audit_chain.last()).unwrap());
+        state.audit_chain_state = Some(
+            sign_audit_chain_state(
+                data,
+                state.audit_chain_state.as_ref().unwrap().activated_at,
+                state.audit_chain.last(),
+            )
+            .unwrap(),
+        );
         save_auth_state(data, &state, None).unwrap();
         load_auth_state(data).unwrap();
-        let mut samples = Vec::new();
-        let before = audit_signature_count(data);
-        for index in 513..523 {
-            let start = std::time::Instant::now();
-            let mut event = test_audit_event(index);
+        let mut next = 513;
+        let mut append = || {
+            let mut event = test_audit_event(next);
+            next += 1;
             event.event_type = "object.provider.completed".into();
             event.reason = "Library read completed ".repeat(20);
             append_audit_event(data, event).unwrap();
-            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        };
+        fn median(mut samples: Vec<f64>) -> f64 {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
         }
-        samples.sort_by(f64::total_cmp);
-        println!("warm_library_append: bytes={} events=512 n=10 median_ms={:.3} signatures={} samples_ms={samples:?}",
+        let timed = |run: &mut dyn FnMut()| {
+            let start = std::time::Instant::now();
+            run();
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+        let before = audit_signature_count(data);
+        let single: Vec<f64> = (0..21).map(|_| timed(&mut || append())).collect();
+        let signatures = (audit_signature_count(data) - before) / 21;
+        let op: Vec<f64> = (0..21)
+            .map(|_| {
+                timed(&mut || {
+                    append();
+                    append();
+                })
+            })
+            .collect();
+        let load: Vec<f64> = (0..21)
+            .map(|_| timed(&mut || drop(load_auth_state(data).unwrap())))
+            .collect();
+        println!(
+            "warm_library_append: bytes={} events={} n=21 append_median_ms={:.2} op_2_appends_median_ms={:.2} warm_load_median_ms={:.2} signatures_per_append={signatures}",
             std::fs::metadata(auth_state_path(data).unwrap()).unwrap().len(),
-            (samples[4] + samples[5]) / 2.0, audit_signature_count(data) - before);
+            load_auth_state(data).unwrap().audit.len(),
+            median(single),
+            median(op),
+            median(load),
+        );
     }
 
     #[test]
