@@ -171,7 +171,6 @@ export function previewKind(object) {
   if (mime.startsWith("image/")) return "image";
   if (mime.startsWith("video/")) return "video";
   if (mime.startsWith("audio/")) return "audio";
-  if (mime === "application/pdf" || name.endsWith(".pdf")) return "pdf";
   if (
     mime.startsWith("text/") ||
     [

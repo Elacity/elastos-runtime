@@ -49,6 +49,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Library's upload progress, and the fields and details in its dialogs, are
   readable in both themes. Before, the dark theme showed white text on light
   grey.
+- Opening a PDF in Library no longer shows its raw source in Documents.
+  Documents opens only Markdown and text files; for a PDF or another file no
+  app in Home opens, Library offers to download it so you can open it on your
+  computer.
 - Marketplace no longer lists WalletConnect while it is not set up on this
   Home, as Home and Wallet already hide it.
 - In Chat, clicking a person's name on a Community post opens their profile

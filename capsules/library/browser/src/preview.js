@@ -52,8 +52,6 @@ export function createLibraryPreview({
         previewMarkup = `<video src="${url}" controls playsinline></video>`;
       } else if (kind === "audio") {
         previewMarkup = `<audio src="${url}" controls></audio>`;
-      } else if (kind === "pdf") {
-        previewMarkup = `<iframe src="${url}" title="${escapeHtml(object.name)} preview"></iframe>`;
       }
     }
     dialog.innerHTML = `

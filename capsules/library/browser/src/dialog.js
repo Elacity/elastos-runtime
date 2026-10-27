@@ -579,6 +579,22 @@ export function createLibraryDialog({
   }
 
   function confirmDestructive({ title, message, confirmLabel, targetUris = [] }) {
+    return confirmDecision({ eyebrow: "Confirm", title, message, confirmLabel, confirmClass: "btn-danger", targetUris });
+  }
+
+  // A file no installed app opens is offered as a download, never as text.
+  function offerDownload(object) {
+    return confirmDecision({
+      eyebrow: "Open",
+      title: object.name || "File",
+      message: "No app in Home opens this kind of file. Download it to open it with an app on this computer.",
+      confirmLabel: "Download",
+      confirmClass: "btn-primary",
+      targetUris: [object.uri],
+    });
+  }
+
+  function confirmDecision({ eyebrow, title, message, confirmLabel, confirmClass, targetUris }) {
     hideMenu();
     hideDialog();
     decisionTargetUris = targetUris;
@@ -587,13 +603,13 @@ export function createLibraryDialog({
       dialog.innerHTML = `
         <div class="dialog-card">
           <div>
-            <p class="eyebrow">Confirm</p>
+            <p class="eyebrow">${escapeHtml(eyebrow)}</p>
             <h2>${escapeHtml(title)}</h2>
             <p class="subtitle">${escapeHtml(message)}</p>
           </div>
           <div class="button-row">
             <button class="btn" type="button" data-dialog-close>Cancel</button>
-            <button class="btn btn-danger" type="button" data-dialog-confirm>${escapeHtml(confirmLabel)}</button>
+            <button class="btn ${confirmClass}" type="button" data-dialog-confirm>${escapeHtml(confirmLabel)}</button>
           </div>
         </div>
       `;
@@ -696,6 +712,7 @@ export function createLibraryDialog({
     confirmDestructive,
     hideDialog,
     hideDialogIfTargetsHidden,
+    offerDownload,
     showProtectAndListDialog,
     showObjectStatus,
     showProperties,

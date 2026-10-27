@@ -15,6 +15,7 @@ function makeActions(overrides = {}) {
     loadCurrentFolder: async () => {},
     loadRoots: async () => {},
     navigate: async () => {},
+    offerDownload: async () => false,
     openTarget: () => false,
     previewObject: async () => {},
     providerApi: {},
@@ -273,6 +274,62 @@ test("Library opens a published file from its local copy", async () => {
       },
     },
   ]);
+});
+
+test("Library offers a PDF with no viewer as a download, never as a preview or Documents", async () => {
+  const offers = [];
+  const previews = [];
+  const launches = [];
+  const downloads = [];
+  const statuses = [];
+  const clicks = [];
+  const previousDocument = globalThis.document;
+  globalThis.document = {
+    body: { appendChild() {} },
+    createElement: () => ({ click() { clicks.push(this.download); }, remove() {} }),
+  };
+  try {
+    const pdf = {
+      uri: "localhost://Users/test/Documents/letter.pdf",
+      name: "letter.pdf",
+      mime: "application/pdf",
+      capabilities: ["open", "read", "download"],
+    };
+    for (const accept of [false, true]) {
+      const actions = makeActions({
+        async downloadObjectRaw(payload) {
+          downloads.push(payload.uri);
+          return { blob: new Blob(["%PDF-1.4"]), filename: "letter.pdf" };
+        },
+        async offerDownload(object) {
+          offers.push(object.uri);
+          return accept;
+        },
+        openTarget(target) {
+          launches.push(target);
+          return true;
+        },
+        async previewObject(object) {
+          previews.push(object.uri);
+        },
+        setStatus(status) {
+          statuses.push(status);
+        },
+      });
+      await actions.openObject(pdf);
+    }
+  } finally {
+    globalThis.document = previousDocument;
+  }
+  assert.deepEqual(offers, [
+    "localhost://Users/test/Documents/letter.pdf",
+    "localhost://Users/test/Documents/letter.pdf",
+  ]);
+  assert.deepEqual(previews, []);
+  assert.deepEqual(launches, []);
+  assert.deepEqual(downloads, ["localhost://Users/test/Documents/letter.pdf"]);
+  assert.deepEqual(clicks, ["letter.pdf"]);
+  assert.deepEqual(statuses, ["Downloaded letter.pdf."]);
 });
 
 test("Library protect and list ignores ineligible objects", async () => {

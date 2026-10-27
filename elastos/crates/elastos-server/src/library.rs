@@ -7832,8 +7832,6 @@ fn viewer_ids_for_name(name: &str) -> Vec<&'static str> {
         vec!["image-viewer"]
     } else if lower.ends_with(".mp4") {
         vec!["video-viewer"]
-    } else if lower.ends_with(".pdf") {
-        vec!["documents"]
     } else if lower.ends_with(".gba") {
         vec!["gba-emulator"]
     } else {
@@ -7922,6 +7920,53 @@ mod tests {
         );
         let plain = super::provider_error_from("library_error", &anyhow::anyhow!("only"));
         assert!(plain.get("detail").is_none());
+    }
+
+    /// Documents edits text: a name routes to it only when its manifest
+    /// accepts that extension, so a PDF or other binary never opens as text.
+    #[test]
+    fn documents_is_offered_only_for_extensions_its_manifest_accepts() {
+        let manifest: Value = serde_json::from_str(
+            &fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../capsules/documents/capsule.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let accepted: Vec<String> = manifest["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|interface| interface["methods"].as_array().unwrap().iter())
+            .filter(|method| method["id"] == "document.open")
+            .flat_map(|method| method["input_schema"]["accepts"].as_array().unwrap().iter())
+            .flat_map(|accept| accept["extensions"].as_array().unwrap().iter())
+            .map(|extension| extension.as_str().unwrap().to_string())
+            .collect();
+        assert!(!accepted.is_empty());
+        for name in [
+            "note.md",
+            "note.txt",
+            "letter.pdf",
+            "photo.png",
+            "bundle.zip",
+            "clip.mp4",
+            "song.mp3",
+            "data.json",
+            "page.html",
+            "game.gba",
+            "blob.bin",
+        ] {
+            let routed = super::viewer_ids_for_name(name).contains(&"documents");
+            let accepts = accepted
+                .iter()
+                .any(|extension| name.ends_with(extension.as_str()));
+            assert_eq!(
+                routed, accepts,
+                "{name}: Documents routing must match its manifest"
+            );
+        }
     }
 
     use super::*;

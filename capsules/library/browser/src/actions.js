@@ -29,6 +29,7 @@ export function createLibraryActions({
   loadCurrentFolder,
   loadRoots,
   navigate,
+  offerDownload,
   openTarget,
   previewObject,
   providerApi,
@@ -88,6 +89,13 @@ export function createLibraryActions({
     }
     if (canPreviewObject(object)) {
       await previewObject(object);
+      return;
+    }
+    if (hasCapability(object, "download")) {
+      if (await offerDownload(object)) {
+        await downloadObject(object);
+        setStatus(`Downloaded ${object.name}.`);
+      }
       return;
     }
     setStatus("No installed app can open this item.");

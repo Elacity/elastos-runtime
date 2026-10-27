@@ -2582,6 +2582,22 @@ async function run() {
       ops.some((entry) => entry.op === "download_raw" && entry.payload.uri.endsWith("/WebSpaces/Cloud/Drive/Project X/file.pdf") && entry.payload.transport === "raw-body"),
       "Indexed WebSpace Download must use the raw Library download transport",
     );
+    // A PDF no installed app opens is offered as a download, never previewed as text.
+    const downloadsBeforeOpen = ops.filter((entry) => entry.op === "download_raw").length;
+    await page.locator(".item").filter({ hasText: "file.pdf" }).first().dblclick();
+    const offer = page.locator("#dialog .dialog-card").filter({ hasText: "No app in Home opens this kind of file." });
+    await offer.waitFor();
+    assert(!(await page.locator("#dialog iframe, #dialog pre").count()), "Opening a PDF must not preview it in a frame or as text");
+    await offer.locator("[data-dialog-close]").click();
+    await page.locator("#dialog.hidden").waitFor({ state: "attached" });
+    assert(
+      ops.filter((entry) => entry.op === "download_raw").length === downloadsBeforeOpen,
+      "Cancelling the download offer must not download the PDF",
+    );
+    await page.locator(".item").filter({ hasText: "file.pdf" }).first().dblclick();
+    const offeredDownload = page.waitForEvent("download");
+    await offer.locator("[data-dialog-confirm]").filter({ hasText: "Download" }).click();
+    assert((await offeredDownload).suggestedFilename() === "file.pdf", "The offered download must save the PDF by its name");
 
     await page.locator(".place").filter({ hasText: "Spaces" }).first().click();
     await page.locator(".item").filter({ hasText: "Elastos" }).first().dblclick();
