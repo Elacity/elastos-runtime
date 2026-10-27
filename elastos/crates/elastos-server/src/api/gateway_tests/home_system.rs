@@ -8633,6 +8633,97 @@ async fn test_home_browser_state_drops_unknown_targets() {
     assert_eq!(json["recent_targets"], json!(["people", "system"]));
 }
 
+/// Archive opens only from Library. A window, shortcut or recent entry an
+/// earlier release saved for it is dropped when Home loads its state, and
+/// Library can still open it.
+#[tokio::test]
+async fn test_home_drops_a_saved_archive_window_and_library_still_opens_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    write_test_browser_capsule(dir.path(), "archive-manager", "viewer", "Archive", None);
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let state_uri = format!("{localhost_root}/.AppData/ElastOS/Home/browser-state.json");
+    let state_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &state_uri).unwrap();
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    crate::auth::write_principal_root_object(
+        dir.path(),
+        &authority.principal_id,
+        &localhost_root,
+        &state_uri,
+        &state_path,
+        &serde_json::to_vec(&json!({
+            "schema": "elastos.home.browser-state/v1",
+            "principal_id": authority.principal_id.clone(),
+            "localhost_root": localhost_root.clone(),
+            "layout": {
+                "desktop": {
+                    "archive-manager": { "x": 12, "y": 12 },
+                    "system": { "x": 18, "y": 18 }
+                },
+                "taskbar": ["archive-manager", "system"]
+            },
+            "session": {
+                "browser_context_id": "browser:test",
+                "windows": [
+                    { "target": "archive-manager", "active": true },
+                    { "target": "system", "active": false }
+                ]
+            },
+            "recent_targets": ["archive-manager", "system"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let get = |uri: &'static str| {
+        app.clone().oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri(uri)
+                .header("x-elastos-home-token", authority.home_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+
+    let loaded = get("/api/apps/home/state").await.unwrap();
+    assert_eq!(loaded.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(loaded.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        state["session"]["windows"],
+        json!([{ "target": "system", "active": false }])
+    );
+    assert_eq!(state["recent_targets"], json!(["system"]));
+    assert!(state["layout"]["desktop"].get("archive-manager").is_none());
+    assert_eq!(state["layout"]["taskbar"], json!(["system"]));
+
+    let summary = get("/api/apps/home/summary").await.unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let targets = summary["targets"].as_array().unwrap();
+    assert!(targets.iter().any(|target| target["target"] == "system"));
+    assert!(!targets
+        .iter()
+        .any(|target| target["target"] == "archive-manager"));
+    let catalog = capsule_catalog_summary(dir.path());
+    let archive = catalog
+        .capsules
+        .iter()
+        .find(|capsule| capsule.name == "archive-manager")
+        .unwrap();
+    assert!(
+        !archive.launchable,
+        "Marketplace must not offer Open for Archive"
+    );
+    assert!(home_launch_target(dir.path(), "archive-manager").is_some());
+}
+
 #[tokio::test]
 async fn test_home_browser_state_defaults_preserve_malformed_state_and_refuse_overwrite() {
     let dir = tempfile::tempdir().unwrap();

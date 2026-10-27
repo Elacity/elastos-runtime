@@ -1874,8 +1874,8 @@ async function main() {
       assert(desktopTargets.includes("inbox"), "Inbox should be exposed as a Home desktop shortcut", desktopTargets);
       assert(launcherTargets.includes("library"), "Library should be exposed in the Home launcher", launcherTargets);
       assert(desktopTargets.includes("library"), "Library should be exposed as a Home desktop shortcut", desktopTargets);
-      assert(launcherTargets.includes("archive-manager"), "Archive should be exposed in the Home launcher", launcherTargets);
-      assert(desktopTargets.includes("archive-manager"), "Archive should be exposed as a Home desktop shortcut", desktopTargets);
+      assert(!launcherTargets.includes("archive-manager"), "Archive opens from Library and must not be in the Home launcher", launcherTargets);
+      assert(!desktopTargets.includes("archive-manager"), "Archive opens from Library and must not be a Home desktop shortcut", desktopTargets);
       assert(state.launcherHeading === "Apps", "Home launcher heading should match the canonical Apps launcher", state);
       assert(state.launcherSearchPlaceholder === "Search", "Home launcher search placeholder should match the canonical launcher copy", state);
       assert(!state.launcherGroupHeadings.includes("All Apps"), "Home launcher should not describe mixed targets as apps", state);
@@ -1897,11 +1897,6 @@ async function main() {
         state,
       );
       assert(
-        state.launcherCards.some((card) => card.target === "archive-manager" && card.title === "Archive"),
-        "Home launcher did not label Archive as Archive",
-        state,
-      );
-      assert(
         state.launcherCards.some((card) => card.target === "inbox" && card.title === "Inbox"),
         "Home launcher did not label inbox as Inbox",
         state,
@@ -1914,11 +1909,6 @@ async function main() {
       assert(
         state.desktopShortcuts.some((shortcut) => shortcut.target === "library" && shortcut.label === "Library"),
         "Home desktop did not label library as Library",
-        state,
-      );
-      assert(
-        state.desktopShortcuts.some((shortcut) => shortcut.target === "archive-manager" && shortcut.label === "Archive"),
-        "Home desktop did not label Archive as Archive",
         state,
       );
       assert(

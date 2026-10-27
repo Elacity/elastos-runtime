@@ -63,6 +63,13 @@ pub(in crate::api::gateway) fn capsule_catalog_summary_for(
             capsule.launchable = false;
         }
     }
+    // Home lists only its visible targets; the others open from their owner app.
+    for capsule in capsules
+        .iter_mut()
+        .filter(|capsule| !is_home_visible_target(&capsule.name))
+    {
+        capsule.launchable = false;
+    }
     let model_catalog_state = match crate::api::capsule_inventory::model_catalog_entries(data_dir) {
         Ok(None) => "unconfigured",
         Ok(Some(entries))

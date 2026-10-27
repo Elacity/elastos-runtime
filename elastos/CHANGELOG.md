@@ -29,6 +29,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   Library and Documents no longer offer Publish, and Documents drops its
   History tab and Published icon. A file published earlier opens from this
   Home's own copy and can still be unpublished from its menu.
+- Archive no longer has a Home launcher tile, desktop shortcut or Marketplace
+  Open button. Double-click a ZIP in Library, or use Open With, to open it in
+  Archive; Library's Compress and Extract are unchanged. An Archive window saved
+  by an earlier version is not reopened when Home starts.
 - In this release the seed accepts no new copies of a Home's files; copies it
   already holds stay. Your own devices accept new copies of a Home's files only
   when you allow it: on each device, run
