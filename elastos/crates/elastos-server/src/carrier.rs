@@ -13053,8 +13053,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         // Without its own backend the holder still pins what it serves.
-        let backend =
-            backend.unwrap_or_else(|| Arc::new(PinStatusIpfs { pinned: Some(true) }));
+        let backend = backend.unwrap_or_else(|| Arc::new(PinStatusIpfs { pinned: Some(true) }));
         registry
             .register_sub_provider("ipfs", backend)
             .await
@@ -14366,10 +14365,12 @@ pub(crate) mod tests {
     async fn carrier_peer_fetch_serves_only_cids_pinned_on_an_ordinary_home() {
         let fixture = peer_did_route_fixture(156, 157).await;
         let invoke = || {
-            fixture.local_registry.invoke_provider(peer_did_content_invocation(
-                &fixture.remote_did,
-                serde_json::json!({ "op": "fetch", "cid": FIXTURE_CID }),
-            ))
+            fixture
+                .local_registry
+                .invoke_provider(peer_did_content_invocation(
+                    &fixture.remote_did,
+                    serde_json::json!({ "op": "fetch", "cid": FIXTURE_CID }),
+                ))
         };
         // Pinned: any peer reads it, locally only.
         invoke().await.unwrap();

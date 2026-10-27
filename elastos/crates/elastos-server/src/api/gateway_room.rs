@@ -2123,11 +2123,8 @@ pub(super) async fn room_service_upload_start(
     headers: HeaderMap,
     Json(body): Json<RoomUploadStartBody>,
 ) -> Response {
-    if state.collaboration_chat_product_port.is_some() {
-        return configured_attachment_unsupported_response();
-    }
     let data_dir = state.data_dir.clone();
-    let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
+    let token = match room_upload_token(&state, &headers) {
         Ok(token) => token,
         Err(err) => return room_service_error_response(err),
     };
@@ -2154,11 +2151,8 @@ pub(super) async fn room_service_upload_chunk(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if state.collaboration_chat_product_port.is_some() {
-        return configured_attachment_unsupported_response();
-    }
     let data_dir = state.data_dir.clone();
-    let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
+    let token = match room_upload_token(&state, &headers) {
         Ok(token) => token,
         Err(err) => return room_service_error_response(err),
     };
@@ -2186,7 +2180,7 @@ pub(super) async fn room_service_upload_finish(
     headers: HeaderMap,
 ) -> Response {
     if state.collaboration_chat_product_port.is_some() {
-        return configured_attachment_unsupported_response();
+        return community_upload_finish(state, headers, upload_id).await;
     }
     let data_dir = state.data_dir.clone();
     let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
@@ -2199,6 +2193,168 @@ pub(super) async fn room_service_upload_finish(
     .await
     {
         Ok(Ok(output)) => Json(output.object).into_response(),
+        Ok(Err(err)) => room_service_error_response(err),
+        Err(err) => room_service_join_error_response(err),
+    }
+}
+
+/// The upload session: Community uploads act under Chat's signed Home launch;
+/// the plain local room keeps its session cookie.
+fn room_upload_token(state: &GatewayState, headers: &HeaderMap) -> anyhow::Result<String> {
+    if state.collaboration_chat_product_port.is_none() {
+        return chat_room_access_token_from_headers(&state.data_dir, headers);
+    }
+    let context =
+        require_home_launch_token_context(&state.data_dir, headers, CHAT_ROOM_CAPSULE_ID)?;
+    Ok(start_configured_chat_room_session(&state.data_dir, &context)?.token)
+}
+
+#[cfg(test)]
+mod community_file_post_tests {
+    #[test]
+    fn a_file_post_is_one_exact_line_within_the_body_limit() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let (body, name) = super::community_file_post("a\nb\tc.txt", 30, cid);
+        assert_eq!(body, format!("a b c.txt · 30 bytes · elastos://{cid}"));
+        assert_eq!(name, "a b c.txt");
+        let long = "x".repeat(2_100);
+        let (body, name) = super::community_file_post(&long, 3_565_158, cid);
+        assert_eq!(
+            body.chars().count(),
+            crate::room_service::MAX_OBJECT_BODY_LEN
+        );
+        assert!(name.ends_with('…'));
+        assert!(body.ends_with(&format!(" · 3.4 MB · elastos://{cid}")));
+        let (body, _) = super::community_file_post(&"y".repeat(300), 1024, cid);
+        assert_eq!(
+            body,
+            format!("{} · 1.0 KB · elastos://{cid}", "y".repeat(300))
+        );
+    }
+}
+
+/// The Community post for one attached file: `<name> · <size> · elastos://<cid>`,
+/// one line, within the Chat body limit (the name gives way).
+fn community_file_post(name: &str, size_bytes: u64, cid: &str) -> (String, String) {
+    let name: String = name
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let name = if name.is_empty() {
+        "file".to_string()
+    } else {
+        name
+    };
+    let tail = format!(
+        " · {} · elastos://{cid}",
+        format_shared_file_size(size_bytes)
+    );
+    let room = crate::room_service::MAX_OBJECT_BODY_LEN.saturating_sub(tail.chars().count());
+    let name = if name.chars().count() > room {
+        let mut short: String = name.chars().take(room.saturating_sub(1)).collect();
+        short.push('…');
+        short
+    } else {
+        name
+    };
+    (format!("{name}{tail}"), name)
+}
+
+/// Community finish: the file is pinned on this Home only (no wait on any
+/// seed), the staged bytes are gone, and the Runtime posts the link as an
+/// ordinary Text message through the normal send path and its rate limit.
+async fn community_upload_finish(
+    state: GatewayState,
+    headers: HeaderMap,
+    upload_id: String,
+) -> Response {
+    let data_dir = state.data_dir.clone();
+    let (Some(port), Some(registry)) = (
+        state.collaboration_chat_product_port.clone(),
+        state.provider_registry.clone(),
+    ) else {
+        return configured_attachment_unsupported_response();
+    };
+    let context = match require_home_launch_token_context(&data_dir, &headers, CHAT_ROOM_CAPSULE_ID)
+    {
+        Ok(context) => context,
+        Err(err) => return room_service_error_response(err),
+    };
+    let profile = match gateway_home_system::load_profile_authority_for_context(&data_dir, &context)
+    {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            return room_service_error_response(anyhow::anyhow!("Chat requires a signed Profile"))
+        }
+        Err(err) => return room_service_error_response(err),
+    };
+    let token = match start_configured_chat_room_session(&data_dir, &context) {
+        Ok(session) => session.token,
+        Err(err) => return room_service_error_response(err),
+    };
+    let taken = {
+        let (data_dir, token, upload_id) = (data_dir.clone(), token.clone(), upload_id.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::room_service::take_completed_attachment_upload(&data_dir, &token, &upload_id)
+        })
+        .await
+    };
+    let (file_name, bytes) = match taken {
+        Ok(Ok(taken)) => taken,
+        Ok(Err(err)) => return room_service_error_response(err),
+        Err(err) => return room_service_join_error_response(err),
+    };
+    let size_bytes = bytes.len() as u64;
+    let publish = serde_json::json!({
+        "op": "publish",
+        "kind": "file",
+        "filename": file_name.replace(['"', '\\'], "_"),
+        "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+        "pin": true,
+        "availability_policy": crate::content::LOCAL_PIN_AVAILABILITY_POLICY,
+        "publisher_did": context.principal_id,
+    });
+    drop(bytes);
+    let cid = match registry.send_raw("content", &publish).await {
+        Ok(response) if response["status"] == "ok" => match response["data"]["cid"].as_str() {
+            Some(cid) => cid.to_string(),
+            None => {
+                return room_service_error_response(anyhow::anyhow!(
+                    "content publish returned no CID"
+                ))
+            }
+        },
+        Ok(response) => {
+            return room_service_error_response(anyhow::anyhow!(
+                "content publish failed: {}",
+                response["message"].as_str().unwrap_or("unknown error")
+            ))
+        }
+        Err(err) => return room_service_error_response(anyhow::anyhow!("{err}")),
+    };
+    let (body, name) = community_file_post(&file_name, size_bytes, &cid);
+    let now = now_ts();
+    let posted = tokio::task::spawn_blocking(move || {
+        let operation = crate::collaboration_product::chat_message_request_binding(
+            &format!("chat-message:{upload_id}"),
+            &context.principal_id,
+            &body,
+            &profile,
+        )?;
+        let prepared = port.prepare_message(operation, &body, &profile, now)?;
+        port.project_prepared_message(&data_dir, &prepared, Some(&token))
+    })
+    .await;
+    match posted {
+        Ok(Ok(_)) => Json(serde_json::json!({
+            "cid": cid,
+            "name": name,
+            "size_bytes": size_bytes,
+        }))
+        .into_response(),
         Ok(Err(err)) => room_service_error_response(err),
         Err(err) => room_service_join_error_response(err),
     }
@@ -2420,6 +2576,7 @@ pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
     {
         StatusCode::FORBIDDEN
     } else if text.contains("must not be empty")
+        || text == crate::room_service::EMPTY_FILE_REFUSAL
         || text.contains("characters or fewer")
         || text.contains("exceeds")
         || text.contains("request_id")

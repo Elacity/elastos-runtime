@@ -66,6 +66,8 @@ mod gateway_home_agent;
 mod gateway_home_external_link;
 #[path = "gateway_home_runtime.rs"]
 mod gateway_home_runtime;
+#[path = "gateway_home_shared_content.rs"]
+mod gateway_home_shared_content;
 #[path = "gateway_home_system.rs"]
 mod gateway_home_system;
 #[path = "gateway_home_system_ai_provider.rs"]
@@ -120,6 +122,7 @@ use gateway_esp::*;
 use gateway_home_external_link::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
+use gateway_home_shared_content::*;
 
 pub(crate) fn principal_root_protected_object_inventory(
     localhost_root: &str,
@@ -1051,6 +1054,14 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/api/apps/home/runtime/ensure", post(home_runtime_ensure))
         .route("/api/apps/home/launch", post(home_launch))
         .route("/api/apps/home/external-link", post(home_external_link))
+        .route(
+            "/api/apps/home/shared-content/check",
+            post(home_shared_content_check),
+        )
+        .route(
+            "/api/apps/home/shared-content/get",
+            post(home_shared_content_get),
+        )
         .route(
             "/api/apps/home-cli/terminal/contract",
             get(home_cli_terminal_contract),

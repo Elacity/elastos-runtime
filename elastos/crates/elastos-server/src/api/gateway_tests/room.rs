@@ -1042,30 +1042,31 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
         .unwrap();
     assert_eq!(forged.status(), StatusCode::FORBIDDEN);
 
-    let uploads_path = elastos_common::localhost::rooted_localhost_fs_path(
-        dir.path(),
-        crate::room_service::room_root_uri(),
-    )
-    .unwrap()
-    .join("local/uploads.json");
-    let uploads_before = std::fs::read(&uploads_path).unwrap();
-    let upload = app
-        .clone()
-        .oneshot(
-            Request::builder()
+    // Community accepts attachments; an empty file is refused in plain words.
+    let start = |body: &'static str| {
+        app.clone().oneshot(
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/chat-room/upload/start")
                 .header("x-elastos-home-token", token.as_str())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"file_name":"unsupported.txt","mime_type":"text/plain","size_bytes":4}"#,
-                ))
+                .body(Body::from(body))
                 .unwrap(),
         )
+    };
+    let empty = start(r#"{"file_name":"empty.txt","mime_type":"text/plain","size_bytes":0}"#)
         .await
         .unwrap();
-    assert_eq!(upload.status(), StatusCode::CONFLICT);
-    assert_eq!(std::fs::read(uploads_path).unwrap(), uploads_before);
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    let text = axum::body::to_bytes(empty.into_body(), 4096).await.unwrap();
+    assert_eq!(
+        &text[..],
+        crate::room_service::EMPTY_FILE_REFUSAL.as_bytes()
+    );
+    let upload = start(r#"{"file_name":"notes.txt","mime_type":"text/plain","size_bytes":4}"#)
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
 
     let leave = app
         .clone()
@@ -1222,9 +1223,6 @@ async fn configured_chat_rejects_every_legacy_control_and_guest_route_before_mut
         Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/invites/claim").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"token":"invite","member_did":"did:key:z6member"}"#)).unwrap(),
         Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/invites/acceptance").header(CONTENT_TYPE, "application/json").body(Body::from(acceptance.to_string())).unwrap(),
         Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/invites/join").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"invite":"invite"}"#)).unwrap(),
-        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/upload/start").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"file_name":"blocked.txt","mime_type":"text/plain","size_bytes":1}"#)).unwrap(),
-        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/upload/upload/chunk").header("x-elastos-upload-offset", "0").body(Body::from("x")).unwrap(),
-        Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/apps/chat-room/upload/upload/finish").body(Body::empty()).unwrap(),
         Request::builder().header("x-elastos-home-token", token.as_str()).uri("/api/apps/chat-room/attachments/attachment").body(Body::empty()).unwrap(),
         Request::builder().header("x-elastos-home-token", token.as_str()).method("POST").uri("/api/browser/session/request").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"display_name":"Guest","device_label":"Browser","capabilities":["room.access"]}"#)).unwrap(),
         Request::builder().header("x-elastos-home-token", token.as_str()).uri("/api/browser/session/request/request").header(COOKIE, "browser-session-request=request").body(Body::empty()).unwrap(),
