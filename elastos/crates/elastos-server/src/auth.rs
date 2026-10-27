@@ -214,7 +214,7 @@ struct RegularFileIdentity {
 
 #[derive(Debug, Clone)]
 struct VerifiedAuthStateCacheEntry {
-    auth_state_identity: Option<RegularFileIdentity>,
+    auth_state_identity: Option<AuthStateFileIdentity>,
     activation_identity: Option<RegularFileIdentity>,
     runtime_device_key_identity: Option<RegularFileIdentity>,
     state: AuthState,
@@ -417,10 +417,33 @@ fn observe_optional_regular_file_identity(
     Ok(Some(regular_file_identity_from_metadata(&metadata, label)?))
 }
 
-fn observe_auth_state_file_identity(
-    data_dir: &Path,
-) -> anyhow::Result<Option<RegularFileIdentity>> {
-    observe_optional_regular_file_identity(&auth_state_path(data_dir)?, "auth state")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthStateFileIdentity {
+    file: RegularFileIdentity,
+    content_hash: [u8; 32],
+}
+
+fn read_auth_state_bytes(data_dir: &Path) -> anyhow::Result<Option<(Vec<u8>, AuthStateFileIdentity)>> {
+    let path = auth_state_path(data_dir)?;
+    let Some(before) = observe_optional_regular_file_identity(&path, "auth state")? else {
+        return Ok(None);
+    };
+    let mut file = File::open(&path)?;
+    let opened = regular_file_identity_from_metadata(&file.metadata()?, "auth state")?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let after = regular_file_identity_from_metadata(&file.metadata()?, "auth state")?;
+    if before != opened || opened != after
+        || observe_optional_regular_file_identity(&path, "auth state")? != Some(after)
+    {
+        anyhow::bail!("auth state changed concurrently during readback");
+    }
+    let content_hash = Sha256::digest(&bytes).into();
+    Ok(Some((bytes, AuthStateFileIdentity { file: after, content_hash })))
+}
+
+fn observe_auth_state_file_identity(data_dir: &Path) -> anyhow::Result<Option<AuthStateFileIdentity>> {
+    Ok(read_auth_state_bytes(data_dir)?.map(|(_, identity)| identity))
 }
 
 fn observe_audit_chain_activation_file_identity(
@@ -450,20 +473,22 @@ fn invalidate_verified_auth_state_cache(data_dir: &Path) {
 
 fn store_verified_auth_state_cache(
     data_dir: &Path,
-    auth_state_identity: Option<RegularFileIdentity>,
+    auth_state_identity: Option<AuthStateFileIdentity>,
     activation_identity: Option<RegularFileIdentity>,
     runtime_device_key_identity: Option<RegularFileIdentity>,
     state: &AuthState,
 ) {
     let key = auth_state_cache_key(data_dir);
     if let Ok(mut cache) = verified_auth_state_cache().lock() {
+        let mut state = state.clone();
+        normalize_principal_records(&mut state);
         cache.insert(
             key,
             VerifiedAuthStateCacheEntry {
                 auth_state_identity,
                 activation_identity,
                 runtime_device_key_identity,
-                state: state.clone(),
+                state,
             },
         );
     }
@@ -471,7 +496,7 @@ fn store_verified_auth_state_cache(
 
 fn take_verified_auth_state_cache_hit(
     data_dir: &Path,
-    auth_state_identity: Option<RegularFileIdentity>,
+    auth_state_identity: Option<AuthStateFileIdentity>,
     activation_identity: Option<RegularFileIdentity>,
     runtime_device_key_identity: Option<RegularFileIdentity>,
 ) -> Option<AuthState> {
@@ -486,6 +511,36 @@ fn take_verified_auth_state_cache_hit(
     } else {
         None
     }
+}
+
+#[cfg(test)]
+type AuthStateWriteHook = Box<dyn FnOnce(&Path) -> anyhow::Result<()> + Send>;
+#[cfg(test)]
+static AUTH_STATE_WRITE_HOOKS: OnceLock<Mutex<HashMap<PathBuf, AuthStateWriteHook>>> = OnceLock::new();
+
+#[cfg(test)]
+fn run_auth_state_write_hook(data_dir: &Path) -> anyhow::Result<()> {
+    let hook = AUTH_STATE_WRITE_HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().unwrap().remove(data_dir);
+    if let Some(hook) = hook {
+        hook(data_dir)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+static AUDIT_SIGNATURE_VERIFICATIONS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn audit_signature_count(data_dir: &Path) -> usize {
+    *AUDIT_SIGNATURE_VERIFICATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().unwrap().get(data_dir).unwrap_or(&0)
+}
+
+#[cfg(test)]
+fn record_audit_signature(data_dir: &Path) {
+    *AUDIT_SIGNATURE_VERIFICATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().unwrap().entry(data_dir.to_path_buf()).or_default() += 1;
 }
 
 #[cfg(test)]
@@ -835,7 +890,7 @@ pub struct StoredAuthSession {
     pub revoked_at: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditChainLinkV1 {
     pub schema: String,
     pub sequence: u64,
@@ -847,7 +902,7 @@ pub struct AuditChainLinkV1 {
     pub signature: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditChainStateV1 {
     pub schema: String,
     pub activated_at: u64,
@@ -857,7 +912,7 @@ pub struct AuditChainStateV1 {
     pub signature: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditChainAnchorV1 {
     pub schema: String,
     pub sequence: u64,
@@ -1213,7 +1268,7 @@ pub(crate) fn complete_guest_registration(
             }
             state.guest_registrations.push(record);
             // This same auth record is the pre-effect recovery owner.
-            save_auth_state(data_dir, state)?;
+            save_auth_state(data_dir, state, None)?;
             identity.cancel_challenge(ceremony_id);
             state.guest_registrations.len() - 1
         };
@@ -2193,7 +2248,7 @@ pub(crate) fn complete_owner_enrollment_with_intent(
             };
             state.owner_enrollment = Some(record.clone());
             // The admission and exact candidate reach disk BEFORE credential effects.
-            save_auth_state(data_dir, state)?;
+            save_auth_state(data_dir, state, None)?;
         }
         let verification = match &record.phase {
             OwnerEnrollmentPhase::Verified { verification }
@@ -3789,6 +3844,29 @@ mod owner_enrollment_tests {
     }
 
     #[test]
+    fn owner_enrollment_nested_save_and_outer_save_cache_match_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        let secret = random_secret_hex();
+        let mut identity = elastos_identity::IdentityManager::new(data.into()).unwrap();
+        let (_, options) = begin_owner_enrollment(
+            data, &mut identity, &local(&secret), "nested-save", now_ts()
+        ).unwrap().unwrap();
+        let response = owner_attestation_for_test(
+            &options.unwrap().public_key.challenge, "localhost", local(&secret).origin
+        );
+        complete_owner_enrollment(data, &mut identity, &local(&secret), "nested-save",
+            Some(&response), Some("Owner"), now_ts()).unwrap();
+        assert!(verified_auth_state_cache().lock().unwrap().contains_key(&auth_state_cache_key(data)));
+        let before = audit_signature_count(data);
+        let cached = load_auth_state(data).unwrap();
+        assert_eq!(audit_signature_count(data), before);
+        invalidate_verified_auth_state_cache(data);
+        let fresh = load_auth_state(data).unwrap();
+        assert_eq!(serde_json::to_value(cached).unwrap(), serde_json::to_value(fresh).unwrap());
+    }
+
+    #[test]
     fn owner_enrollment_restart_recovers_exact_candidate_and_one_terminal_grant() {
         for fault in [
             OwnerEnrollmentTestFault::BeforeCredential,
@@ -4243,6 +4321,38 @@ fn unlock_auth_state_file(lock: FileLock) -> anyhow::Result<()> {
     lock.release().context("failed to unlock auth state")
 }
 
+// Only constructed from a verified load, before the mutation closure runs.
+pub(crate) struct AuditBaseline {
+    audit: Vec<RuntimeAuditEventV1>,
+    links: Vec<AuditChainLinkV1>,
+    anchor: Option<AuditChainAnchorV1>,
+    chain_state: Option<AuditChainStateV1>,
+    device_key_identity: Option<RegularFileIdentity>,
+}
+
+impl AuditBaseline {
+    fn new(state: &AuthState, device_key_identity: Option<RegularFileIdentity>) -> Self {
+        Self {
+            audit: state.audit.clone(),
+            links: state.audit_chain.clone(),
+            anchor: state.audit_chain_anchor.clone(),
+            chain_state: state.audit_chain_state.clone(),
+            device_key_identity,
+        }
+    }
+
+    fn trusted_prefix(&self, state: &AuthState) -> usize {
+        let offset = state.audit_chain.first().zip(self.links.first())
+            .and_then(|(next, old)| next.sequence.checked_sub(old.sequence))
+            .and_then(|offset| usize::try_from(offset).ok());
+        let Some(offset) = offset.filter(|offset| *offset < self.links.len()) else { return 0; };
+        state.audit.iter().zip(&state.audit_chain)
+            .zip(self.audit.iter().zip(&self.links).skip(offset))
+            .take_while(|((event, link), (old_event, old_link))| event == old_event && link == old_link)
+            .count()
+    }
+}
+
 fn mutate_auth_state<T>(
     data_dir: &Path,
     mutation: impl FnOnce(&mut AuthState) -> anyhow::Result<T>,
@@ -4251,10 +4361,11 @@ fn mutate_auth_state<T>(
         .lock()
         .map_err(|_| anyhow!("auth state mutation lock poisoned"))?;
     let lock = lock_auth_state_file(open_auth_state_lock(data_dir)?)?;
-    let mut state = load_auth_state(data_dir)?;
+    let (mut state, device_key_identity) = load_auth_state_with_identity(data_dir)?;
+    let baseline = AuditBaseline::new(&state, device_key_identity);
     ensure_audit_chain_state(data_dir, &mut state)?;
     let value = mutation(&mut state)?;
-    save_auth_state(data_dir, &state)?;
+    save_auth_state(data_dir, &state, Some(&baseline))?;
     unlock_auth_state_file(lock)?;
     Ok(value)
 }
@@ -4458,6 +4569,10 @@ fn sync_parent_directory(_path: &Path) -> anyhow::Result<()> {
 }
 
 fn write_secret_json_atomic(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
+    write_secret_bytes_atomic(path, &serde_json::to_vec_pretty(value)?).map(|_| ())
+}
+
+fn write_secret_bytes_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<Option<RegularFileIdentity>> {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -4471,15 +4586,17 @@ fn write_secret_json_atomic(path: &Path, value: &impl Serialize) -> anyhow::Resu
         std::process::id(),
         unique
     ));
-    let result = (|| -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<Option<RegularFileIdentity>> {
         let mut file = open_new_secret_file(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
-        drop(file);
         std::fs::rename(&temp, path)?;
         set_secret_file_permissions(path)?;
         sync_parent_directory(path)?;
-        Ok(())
+        #[cfg(test)]
+        run_auth_state_write_hook(path)?;
+        let held = regular_file_identity_from_metadata(&file.metadata()?, "secret state")?;
+        Ok((observe_optional_regular_file_identity(path, "secret state")? == Some(held)).then_some(held))
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -4488,6 +4605,10 @@ fn write_secret_json_atomic(path: &Path, value: &impl Serialize) -> anyhow::Resu
 }
 
 pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
+    load_auth_state_with_identity(data_dir).map(|(state, _)| state)
+}
+
+fn load_auth_state_with_identity(data_dir: &Path) -> anyhow::Result<(AuthState, Option<RegularFileIdentity>)> {
     with_audit_chain_activation_lock(data_dir, || {
         for _ in 0..2 {
             if let Some(state) = load_auth_state_locked_once(data_dir)? {
@@ -4498,8 +4619,9 @@ pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
     })
 }
 
-fn load_auth_state_locked_once(data_dir: &Path) -> anyhow::Result<Option<AuthState>> {
-    let initial_auth_state_identity = observe_auth_state_file_identity(data_dir)?;
+fn load_auth_state_locked_once(data_dir: &Path) -> anyhow::Result<Option<(AuthState, Option<RegularFileIdentity>)>> {
+    let disk = read_auth_state_bytes(data_dir)?;
+    let initial_auth_state_identity = disk.as_ref().map(|(_, identity)| *identity);
     let mut expected_activation_identity = observe_audit_chain_activation_file_identity(data_dir)?;
     let initial_runtime_device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
     if let Some(cached) = take_verified_auth_state_cache_hit(
@@ -4522,10 +4644,10 @@ fn load_auth_state_locked_once(data_dir: &Path) -> anyhow::Result<Option<AuthSta
         }
         let mut state = cached;
         prune_auth_state(&mut state, now_ts());
-        return Ok(Some(state));
+        return Ok(Some((state, initial_runtime_device_key_identity)));
     }
 
-    let stored_state = load_auth_state_unverified(data_dir)?;
+    let stored_state = disk.map(|(bytes, _)| parse_auth_state(data_dir, &bytes)).transpose()?;
     let state_was_present = stored_state.is_some();
     let mut state = stored_state.unwrap_or_default();
     let activation = load_audit_chain_activation_unlocked(data_dir)?;
@@ -4593,7 +4715,7 @@ fn load_auth_state_locked_once(data_dir: &Path) -> anyhow::Result<Option<AuthSta
         &state,
     );
     prune_auth_state(&mut state, now_ts());
-    Ok(Some(state))
+    Ok(Some((state, initial_runtime_device_key_identity)))
 }
 
 fn auth_state_requires_audit_chain(state: &AuthState) -> bool {
@@ -4608,37 +4730,37 @@ fn auth_state_requires_audit_chain(state: &AuthState) -> bool {
 }
 
 fn load_auth_state_unverified(data_dir: &Path) -> anyhow::Result<Option<AuthState>> {
+    read_auth_state_bytes(data_dir)?.map(|(bytes, _)| parse_auth_state(data_dir, &bytes)).transpose()
+}
+
+fn parse_auth_state(data_dir: &Path, bytes: &[u8]) -> anyhow::Result<AuthState> {
     let path = auth_state_path(data_dir)?;
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).context("failed to inspect auth state"),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        anyhow::bail!("auth state must be a regular non-symlink file");
-    }
-    let bytes = std::fs::read(&path).with_context(|| format!("failed to read {path:?}"))?;
-    let mut state: AuthState = serde_json::from_slice(&bytes)
+    let mut state: AuthState = serde_json::from_slice(bytes)
         .with_context(|| format!("failed to parse auth state {path:?}"))?;
     if state.schema != AUTH_STATE_SCHEMA {
         anyhow::bail!("unsupported auth state schema");
     }
     normalize_principal_records(&mut state);
-    Ok(Some(state))
+    Ok(state)
 }
 
 pub fn verify_auth_audit_chain_ready(data_dir: &Path) -> anyhow::Result<()> {
     load_auth_state(data_dir).map(|_| ())
 }
 
-pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> {
+pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState, baseline: Option<&AuditBaseline>) -> anyhow::Result<()> {
+    // Every error path, including the gap before the checkpoint, leaves a cold cache.
+    invalidate_verified_auth_state_cache(data_dir);
     #[cfg(test)]
     consume_recovery_reassignment_test_fault(
         data_dir,
         RecoveryReassignmentTestFault::AuthStateSave,
     )?;
     with_audit_chain_activation_lock(data_dir, || {
-        verify_audit_chain(data_dir, state)?;
+        invalidate_verified_auth_state_cache(data_dir);
+        let device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
+        verify_audit_chain_from(data_dir, state, baseline)?;
+        let mut activation_identity = observe_audit_chain_activation_file_identity(data_dir)?;
         let path = auth_state_path(data_dir)?;
         if let Some(parent) = path.parent() {
             ensure_regular_auth_parent(data_dir, parent)?;
@@ -4663,7 +4785,13 @@ pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Res
             }
             _ => {}
         }
-        write_secret_json_atomic(&path, state)?;
+        let bytes = serde_json::to_vec_pretty(state)?;
+        let written_identity = write_secret_bytes_atomic(&path, &bytes)?;
+        // Metadata sampled after rename alone cannot establish which bytes we wrote.
+        let readback = read_auth_state_bytes(data_dir).ok().flatten();
+        let published_identity = readback.and_then(|(published, identity)| {
+            (published == bytes && Some(identity.file) == written_identity).then_some(identity)
+        });
         #[cfg(test)]
         consume_recovery_reassignment_test_fault(
             data_dir,
@@ -4676,14 +4804,24 @@ pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Res
                 .as_ref()
                 .is_none_or(|activation| activation.checkpoint != *checkpoint);
             if should_persist {
-                persist_audit_chain_activation_unlocked(
+                activation_identity = Some(persist_audit_chain_activation_unlocked(
                     data_dir,
                     chain_state.activated_at,
                     checkpoint,
-                )?;
+                )?);
             }
         }
-        invalidate_verified_auth_state_cache(data_dir);
+        if let Some(identity) = published_identity {
+            if state.schema == AUTH_STATE_SCHEMA
+                && (state.audit_chain_state.is_some() || !auth_state_requires_audit_chain(state))
+                && observe_auth_state_file_identity(data_dir)? == Some(identity)
+                && observe_audit_chain_activation_file_identity(data_dir)? == activation_identity
+                && observe_runtime_device_key_file_identity(data_dir)? == device_key_identity
+            {
+                store_verified_auth_state_cache(data_dir, Some(identity), activation_identity,
+                    device_key_identity, state);
+            }
+        }
         Ok(())
     })
 }
@@ -6730,7 +6868,6 @@ fn push_audit_event(
 
 fn ensure_audit_chain_state(data_dir: &Path, state: &mut AuthState) -> anyhow::Result<()> {
     if state.audit_chain_state.is_some() {
-        verify_audit_chain(data_dir, state)?;
         return Ok(());
     }
     if !state.audit.is_empty()
@@ -6939,6 +7076,13 @@ fn require_runtime_audit_signer(
 fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> {
     #[cfg(test)]
     record_verify_audit_chain_call(data_dir);
+    verify_audit_chain_from(data_dir, state, None)
+}
+
+fn verify_audit_chain_from(data_dir: &Path, state: &AuthState, baseline: Option<&AuditBaseline>) -> anyhow::Result<()> {
+    let device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
+    let baseline = baseline.filter(|baseline| baseline.device_key_identity == device_key_identity);
+    let trusted_prefix = baseline.map_or(0, |baseline| baseline.trusted_prefix(state));
     if state.audit.is_empty()
         && state.audit_chain.is_empty()
         && state.audit_chain_state.is_none()
@@ -6956,11 +7100,14 @@ fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> 
             &expected_runtime_did,
             "audit chain state",
         )?;
+        if baseline.is_none_or(|baseline| baseline.chain_state.as_ref() != Some(chain_state)) {
         let payload = audit_chain_state_payload(
             chain_state.activated_at,
             chain_state.head_sequence,
             &chain_state.head_hash,
         )?;
+        #[cfg(test)]
+        record_audit_signature(data_dir);
         crate::crypto::verify_domain_separated_signature(
             &expected_runtime_did,
             AUDIT_CHAIN_STATE_DOMAIN,
@@ -6968,6 +7115,7 @@ fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> 
             &chain_state.signature,
         )
         .context("audit chain state signature is invalid")?;
+        }
         let (head_sequence, head_hash) = state
             .audit_chain
             .last()
@@ -6999,7 +7147,10 @@ fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> 
             &expected_runtime_did,
             "audit chain anchor",
         )?;
+        if baseline.is_none_or(|baseline| baseline.anchor.as_ref() != Some(anchor)) {
         let payload = audit_chain_anchor_payload(anchor.sequence, &anchor.chain_hash)?;
+        #[cfg(test)]
+        record_audit_signature(data_dir);
         crate::crypto::verify_domain_separated_signature(
             &expected_runtime_did,
             AUDIT_CHAIN_ANCHOR_DOMAIN,
@@ -7007,10 +7158,10 @@ fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> 
             &anchor.signature,
         )
         .context("audit chain anchor signature is invalid")?;
+        }
     }
     let mut previous: Option<&AuditChainLinkV1> = None;
-    for (event, link) in state.audit.iter().zip(&state.audit_chain) {
-        verify_audit_event_signature(event, &expected_runtime_did)?;
+    for (index, (event, link)) in state.audit.iter().zip(&state.audit_chain).enumerate() {
         if link.schema != AUDIT_CHAIN_SCHEMA || link.event_id != event.event_id {
             anyhow::bail!("audit chain event binding is invalid");
         }
@@ -7034,6 +7185,10 @@ fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> 
         } else if link.sequence == 1 && link.previous_hash != AUDIT_CHAIN_GENESIS {
             anyhow::bail!("audit chain genesis is invalid");
         }
+        if index >= trusted_prefix {
+            #[cfg(test)]
+            record_audit_signature(data_dir);
+            verify_audit_event_signature(event, &expected_runtime_did)?;
         let event_hash = format!(
             "sha256:{}",
             hex::encode(Sha256::digest(serde_json::to_vec(event)?))
@@ -7056,6 +7211,8 @@ fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> 
             &link.event_hash,
             &link.chain_hash,
         )?;
+        #[cfg(test)]
+        record_audit_signature(data_dir);
         crate::crypto::verify_domain_separated_signature(
             &expected_runtime_did,
             AUDIT_CHAIN_DOMAIN,
@@ -7063,6 +7220,7 @@ fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> 
             &link.signature,
         )
         .context("audit chain signature is invalid")?;
+        }
         previous = Some(link);
     }
     Ok(())
@@ -10586,6 +10744,7 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
 
+        invalidate_verified_auth_state_cache(data_dir.path());
         let verifies_before_first = verify_audit_chain_call_count(data_dir.path());
         let first = load_auth_state(data_dir.path()).unwrap();
         let verifies_after_first = verify_audit_chain_call_count(data_dir.path());
@@ -10818,6 +10977,7 @@ mod tests {
         let original_identity =
             regular_file_identity_from_metadata(&original_metadata, "auth state").unwrap();
 
+        invalidate_verified_auth_state_cache(data_dir.path());
         let verifies_before_prime = verify_audit_chain_call_count(data_dir.path());
         assert!(
             load_auth_state(data_dir.path())
@@ -10908,6 +11068,7 @@ mod tests {
         let original_identity =
             regular_file_identity_from_metadata(&original_metadata, "runtime device key").unwrap();
 
+        invalidate_verified_auth_state_cache(data_dir.path());
         let verifies_before_prime = verify_audit_chain_call_count(data_dir.path());
         assert!(
             load_auth_state(data_dir.path())
@@ -11042,7 +11203,7 @@ mod tests {
             )
             .unwrap(),
         );
-        save_auth_state(data_dir, &state).unwrap();
+        save_auth_state(data_dir, &state, None).unwrap();
         grant
     }
 
@@ -11053,8 +11214,268 @@ mod tests {
         )
     }
 
+    fn assert_own_write_cache_matches_disk(data: &Path) {
+        assert!(verified_auth_state_cache().lock().unwrap().contains_key(&auth_state_cache_key(data)),
+            "own write must fill the verified cache");
+        let before = audit_signature_count(data);
+        let cached = load_auth_state(data).unwrap();
+        assert_eq!(audit_signature_count(data), before);
+        invalidate_verified_auth_state_cache(data);
+        let fresh = load_auth_state(data).unwrap();
+        assert_eq!(serde_json::to_value(cached).unwrap(), serde_json::to_value(fresh).unwrap());
+    }
+
     #[test]
-    fn refresh_fusion_halves_verified_passes_with_512_signed_events() {
+    fn cache_after_own_write_matches_fresh_full_load() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        let mut grant = refresh_fixture(data, 511);
+        assert_own_write_cache_matches_disk(data);
+        append_audit_event(data, test_audit_event(512)).unwrap();
+        assert_own_write_cache_matches_disk(data);
+        append_audit_event(data, test_audit_event(513)).unwrap();
+        assert_own_write_cache_matches_disk(data);
+        grant.expires_at += 60;
+        renew_session_grant_with_audit(data, grant.clone(), refresh_audit(&grant, 514)).unwrap();
+        assert_own_write_cache_matches_disk(data);
+        set_guest_registration_enabled(data, true, now_ts()).unwrap();
+        assert_own_write_cache_matches_disk(data);
+        revoke_session_grant(data, &grant.session_id, now_ts()).unwrap();
+        assert_own_write_cache_matches_disk(data);
+    }
+
+    #[test]
+    fn concurrent_appends_keep_cache_coherent() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        refresh_fixture(data, 4);
+        std::thread::scope(|scope| {
+            for writer in 0..2 {
+                scope.spawn(move || {
+                    for index in 0..8 {
+                        append_audit_event(data, test_audit_event(100 + writer * 8 + index)).unwrap();
+                    }
+                });
+            }
+            scope.spawn(|| {
+                for _ in 0..16 { load_auth_state(data).unwrap(); }
+            });
+        });
+        let state = load_auth_state(data).unwrap();
+        assert_eq!(state.audit.len(), 20);
+        for index in 100..116 {
+            assert_eq!(state.audit.iter().filter(|event| event.event_id == format!("audit:test:{index}")).count(), 1);
+        }
+        assert_own_write_cache_matches_disk(data);
+    }
+
+    #[test]
+    fn external_rewrite_after_own_write_is_fully_verified() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        refresh_fixture(data, 4);
+        append_audit_event(data, test_audit_event(5)).unwrap();
+        let path = auth_state_path(data).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let changed = original.replacen("test event 1", "fake event 1", 1);
+        assert_ne!(original, changed);
+        assert_eq!(original.len(), changed.len());
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, changed).unwrap();
+        File::options().write(true).open(path).unwrap().set_modified(modified).unwrap();
+        let before = verify_audit_chain_call_count(data);
+        assert!(load_auth_state(data).is_err());
+        assert!(verify_audit_chain_call_count(data) > before);
+    }
+
+    #[test]
+    fn write_race_replacement_and_in_place_write_are_not_cached() {
+        for replace in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path();
+            refresh_fixture(data, 4);
+            AUTH_STATE_WRITE_HOOKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
+                .insert(auth_state_path(data).unwrap(), Box::new(move |path| {
+                    let path = path.to_path_buf();
+                    let original = std::fs::read_to_string(&path)?;
+                    let changed = original.replacen("test event 1", "fake event 1", 1);
+                    assert_ne!(changed, original);
+                    let modified = std::fs::metadata(&path)?.modified()?;
+                    if replace {
+                        let replacement = path.with_extension("replacement");
+                        std::fs::write(&replacement, changed)?;
+                        std::fs::rename(replacement, &path)?;
+                    } else {
+                        let mut file = File::options().write(true).open(&path)?;
+                        file.write_all(changed.as_bytes())?;
+                        file.sync_all()?;
+                        file.set_modified(modified)?;
+                    }
+                    Ok(())
+                }));
+            append_audit_event(data, test_audit_event(5)).unwrap();
+            assert!(!verified_auth_state_cache().lock().unwrap().contains_key(&auth_state_cache_key(data)));
+            let before = verify_audit_chain_call_count(data);
+            assert!(load_auth_state(data).is_err());
+            assert!(verify_audit_chain_call_count(data) > before);
+        }
+    }
+
+    #[test]
+    fn checked_save_rejects_edits_forgery_dropped_links_and_swapped_anchors() {
+        // Each case enters save with a verified baseline and must leave both files intact.
+        for case in 0..7 {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path();
+            refresh_fixture(data, 512);
+            append_audit_event(data, test_audit_event(513)).unwrap();
+            let before = refresh_persisted_bytes(data);
+            let result = mutate_auth_state(data, |state| {
+                match case {
+                    0 => state.audit[3].reason = "edited retained event".into(),
+                    1 => {
+                        let event = sign_audit_event(data, test_audit_event(514))?;
+                        push_audit_event(data, state, event)?;
+                        state.audit_chain.last_mut().unwrap().signature = "forged".into();
+                    }
+                    2 => { state.audit.remove(3); state.audit_chain.remove(3); }
+                    3 => { state.audit.swap(3, 4); state.audit_chain.swap(3, 4); }
+                    4 => {
+                        state.audit_chain_anchor = Some(sign_audit_chain_anchor(data, 1, AUDIT_CHAIN_GENESIS)?);
+                    }
+                    5 => state.audit_chain_state.as_mut().unwrap().signature = "forged".into(),
+                    6 => { state.audit.pop(); state.audit_chain.pop(); }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            });
+            assert!(result.is_err(), "tamper case {case}");
+            assert_eq!(refresh_persisted_bytes(data), before, "tamper case {case}");
+        }
+    }
+
+    #[test]
+    fn device_key_change_during_mutation_forces_full_verify() {
+        let root = tempfile::tempdir().unwrap();
+        let replacement = tempfile::tempdir().unwrap();
+        let data = root.path();
+        refresh_fixture(data, 4);
+        elastos_identity::load_or_create_did(replacement.path()).unwrap();
+        let before = refresh_persisted_bytes(data);
+        assert!(mutate_auth_state(data, |_state| {
+            std::fs::copy(elastos_identity::device_key_path(replacement.path()),
+                elastos_identity::device_key_path(data))?;
+            Ok(())
+        }).is_err());
+        assert_eq!(refresh_persisted_bytes(data), before);
+        assert!(load_auth_state(data).is_err());
+    }
+
+    #[test]
+    fn fault_after_auth_state_write_invalidates_cache_and_recovers_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        refresh_fixture(data, 4);
+        load_auth_state(data).unwrap();
+        let before = refresh_persisted_bytes(data);
+        inject_recovery_reassignment_test_fault(data, RecoveryReassignmentTestFault::AfterAuthStateWrite);
+        assert!(append_audit_event(data, test_audit_event(5)).is_err());
+        assert!(!verified_auth_state_cache().lock().unwrap().contains_key(&auth_state_cache_key(data)));
+        let interrupted = refresh_persisted_bytes(data);
+        assert_ne!(interrupted.0, before.0);
+        assert_eq!(interrupted.1, before.1);
+        let recovered = load_auth_state(data).unwrap();
+        assert_eq!(recovered.audit.last().unwrap().event_id, "audit:test:5");
+        let activation = load_audit_chain_activation(data).unwrap().unwrap();
+        assert_eq!(Some(activation.checkpoint), audit_chain_checkpoint(&recovered).unwrap());
+        assert_own_write_cache_matches_disk(data);
+    }
+
+    #[test]
+    fn rollback_to_older_signed_own_write_after_cache_fill_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        refresh_fixture(data, 4);
+        let older = refresh_persisted_bytes(data).0;
+        append_audit_event(data, test_audit_event(5)).unwrap();
+        assert_own_write_cache_matches_disk(data);
+        std::fs::write(auth_state_path(data).unwrap(), older).unwrap();
+        assert!(load_auth_state(data).unwrap_err().to_string().contains("rollback"));
+    }
+
+    #[test]
+    fn nested_bare_save_then_outer_baseline_save_keeps_cache_coherent() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        refresh_fixture(data, 4);
+        mutate_auth_state(data, |state| {
+            state.guest_registration_enabled = true;
+            save_auth_state(data, state, None)?;
+            assert_own_write_cache_matches_disk(data);
+            let event = sign_audit_event(data, test_audit_event(5))?;
+            push_audit_event(data, state, event)
+        }).unwrap();
+        assert_own_write_cache_matches_disk(data);
+        assert_eq!(load_auth_state(data).unwrap().audit.len(), 5);
+    }
+
+    #[test]
+    fn append_at_cap_verifies_only_new_signatures() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        refresh_fixture(data, 512);
+        load_auth_state(data).unwrap();
+        let before = audit_signature_count(data);
+        append_audit_event(data, test_audit_event(513)).unwrap();
+        let checks = audit_signature_count(data) - before;
+        assert_eq!(checks, 4, "warm retained append signature checks");
+        let before = audit_signature_count(data);
+        load_auth_state(data).unwrap();
+        assert_eq!(audit_signature_count(data), before);
+        invalidate_verified_auth_state_cache(data);
+        load_auth_state(data).unwrap();
+        assert_eq!(audit_signature_count(data) - before, 1026);
+    }
+
+    #[test]
+    #[ignore = "manual Mac before/after measurement; timing is not an assertion"]
+    fn warm_library_sized_append_measurement() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path();
+        let mut state = AuthState::default();
+        ensure_audit_chain_state(data, &mut state).unwrap();
+        for index in 1..=512 {
+            let mut event = test_audit_event(index);
+            event.event_type = "object.provider.completed".into();
+            event.reason = "Library read completed ".repeat(20);
+            let event = sign_audit_event(data, event).unwrap();
+            let link = sign_audit_chain_link(data, state.audit_chain.last(), &event).unwrap();
+            state.audit.push(event);
+            state.audit_chain.push(link);
+        }
+        state.audit_chain_state = Some(sign_audit_chain_state(data,
+            state.audit_chain_state.as_ref().unwrap().activated_at,
+            state.audit_chain.last()).unwrap());
+        save_auth_state(data, &state, None).unwrap();
+        load_auth_state(data).unwrap();
+        let mut samples = Vec::new();
+        let before = audit_signature_count(data);
+        for index in 513..523 {
+            let start = std::time::Instant::now();
+            let mut event = test_audit_event(index);
+            event.event_type = "object.provider.completed".into();
+            event.reason = "Library read completed ".repeat(20);
+            append_audit_event(data, event).unwrap();
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        println!("warm_library_append: bytes={} events=512 n=10 median_ms={:.3} signatures={} samples_ms={samples:?}",
+            std::fs::metadata(auth_state_path(data).unwrap()).unwrap().len(),
+            (samples[4] + samples[5]) / 2.0, audit_signature_count(data) - before);
+    }
+
+    #[test]
+    fn refresh_at_cap_verifies_only_new_signatures() {
         let root = tempfile::tempdir().unwrap();
         let data = root.path();
         let mut grant = refresh_fixture(data, 512);
@@ -11062,18 +11483,18 @@ mod tests {
         assert_eq!(initial.principals.len(), 1);
         assert_eq!(initial.sessions.len(), 3);
         grant.expires_at += 60;
-        let before = verify_audit_chain_call_count(data);
+        let before = audit_signature_count(data);
         renew_session_grant(data, grant.clone()).unwrap();
         append_audit_event(data, refresh_audit(&grant, 513)).unwrap();
-        let separate = verify_audit_chain_call_count(data) - before;
-        assert_eq!(separate, 6);
+        let separate = audit_signature_count(data) - before;
+        assert_eq!(separate, 4);
         let prior = load_auth_state(data).unwrap(); // verify and warm for the fused operation
         grant.expires_at += 60;
-        let before = verify_audit_chain_call_count(data);
+        let before = audit_signature_count(data);
         renew_session_grant_with_audit(data, grant.clone(), refresh_audit(&grant, 514)).unwrap();
-        let fused = verify_audit_chain_call_count(data) - before;
-        assert_eq!(fused, 3);
-        println!("refresh_fusion: retained_events=512 separate_verifies={separate} fused_verifies={fused}");
+        let fused = audit_signature_count(data) - before;
+        assert_eq!(fused, 4);
+        println!("refresh_signatures: retained_events=512 separate={separate} fused={fused}");
         let after = load_auth_state(data).unwrap();
         assert_eq!(
             serde_json::to_value(&after.sessions[0].grant).unwrap(),
@@ -12060,7 +12481,7 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let mut state = AuthState::default();
         ensure_audit_chain_state(data_dir.path(), &mut state).unwrap();
-        save_auth_state(data_dir.path(), &state).unwrap();
+        save_auth_state(data_dir.path(), &state, None).unwrap();
         for index in 1..=3 {
             let event = sign_audit_event(data_dir.path(), test_audit_event(index)).unwrap();
             push_audit_event(data_dir.path(), &mut state, event).unwrap();
@@ -12071,7 +12492,7 @@ mod tests {
             sign_audit_chain_state(data_dir.path(), activated_at, state.audit_chain.last())
                 .unwrap(),
         );
-        save_auth_state(data_dir.path(), &state).unwrap();
+        save_auth_state(data_dir.path(), &state, None).unwrap();
 
         let retained = load_auth_state(data_dir.path()).unwrap();
         let anchor = retained.audit_chain_anchor.as_ref().unwrap();
@@ -12087,7 +12508,7 @@ mod tests {
             sign_audit_chain_state(data_dir.path(), activated_at, truncated.audit_chain.last())
                 .unwrap(),
         );
-        let err = save_auth_state(data_dir.path(), &truncated)
+        let err = save_auth_state(data_dir.path(), &truncated, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not continue from its retained anchor"));

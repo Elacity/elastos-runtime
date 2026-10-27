@@ -3069,7 +3069,7 @@ async fn legacy_inbox_room_decisions_require_current_admin() {
         .find(|entry| entry.principal_id == authority.principal_id)
         .unwrap()
         .role = crate::auth::RuntimePrincipalRole::Guest;
-    crate::auth::save_auth_state(dir.path(), &auth).unwrap();
+    crate::auth::save_auth_state(dir.path(), &auth, None).unwrap();
     let before = room_store_snapshot(dir.path());
     for action in ["room-approve-request:", "room-deny-request:"] {
         let response = app

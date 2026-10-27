@@ -18,6 +18,19 @@ rename, and followed by a parent-directory sync. Auth state, activation state,
 and their lock files must be regular non-symlink files under regular
 non-symlink auth directories.
 
+Runtime fully verifies audit bytes when it loads a file outside the verified
+cache. During a locked mutation, save compares retained events and links with
+the verified loaded prefix and verifies signatures and hashes for the changed
+suffix, anchor, and chain state. A changed device-key identity requires full
+verification. After its own atomic write, Runtime reads the published file
+under a stable identity and compares its bytes with the serialized state. It
+fills the cache only when those bytes match and the auth file, activation
+checkpoint, and device-key identities remain stable. The auth-file identity
+includes inode, size, modification and change times, and a SHA-256 content hash.
+A mismatch or a write failure leaves the cache cold. Auth state still reaches
+disk before its signed checkpoint, and the retained window stays at 512 events
+plus the signed anchor.
+
 ## Compatibility Policy
 
 There is no automatic legacy migration and no offline migration script in this

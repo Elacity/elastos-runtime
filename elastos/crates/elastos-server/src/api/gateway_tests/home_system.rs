@@ -881,7 +881,7 @@ async fn test_home_cli_terminal_developer_mode_policy_matrix() {
                     .find(|entry| entry.principal_id == owner.principal_id)
                     .unwrap()
                     .role = crate::auth::RuntimePrincipalRole::Guest;
-                crate::auth::save_auth_state(dir.path(), &auth).unwrap();
+                crate::auth::save_auth_state(dir.path(), &auth, None).unwrap();
                 assert!(home_terminal_policy_allows(dir.path()));
             }
         }
@@ -4841,7 +4841,7 @@ async fn test_recovery_readiness_projects_unavailable_and_first_profile_fails_cl
     let mut auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
     auth_state.principal_root_protections.clear();
     auth_state.principal_root_protections.push(protection);
-    crate::auth::save_auth_state(dir.path(), &auth_state).unwrap();
+    crate::auth::save_auth_state(dir.path(), &auth_state, None).unwrap();
     let before = file_snapshot(dir.path());
 
     for (path, token, origin) in [
@@ -6082,7 +6082,7 @@ async fn system_community_membership_is_home_wide_and_requires_current_owner_aut
         .find(|entry| entry.principal_id == principal.principal_id)
         .unwrap();
     *current = principal;
-    crate::auth::save_auth_state(dir.path(), &auth).unwrap();
+    crate::auth::save_auth_state(dir.path(), &auth, None).unwrap();
     let response = app
         .oneshot(
             test_browser_request("localhost:61180", "null")
@@ -10387,7 +10387,7 @@ async fn test_only_an_admin_approves_an_offer_its_listing_marks_hosted() {
             .find(|entry| entry.principal_id == bob.authority.principal_id)
             .unwrap()
             .role = role;
-        crate::auth::save_auth_state(right.path(), &auth).unwrap();
+        crate::auth::save_auth_state(right.path(), &auth, None).unwrap();
     };
 
     set_bob_role(crate::auth::RuntimePrincipalRole::Guest);

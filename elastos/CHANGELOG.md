@@ -78,6 +78,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   the console) and System fell back to "Not set" beside Passkeys. The account
   list, read with the Home token, already shows each account's passkeys. The
   System behavior smoke now fails on any Runtime call without the Home token.
+- Auth audit saves verify the changed suffix against a verified loaded prefix and
+  refill the cache after stable byte readback; retention, signatures, checkpoint
+  order, and the file format stay unchanged.
+
 - Library writes and archive extraction keep the start check's folder rule
   (#449): a write that would put a folder 16 or more folders below a protected
   root is refused by name (write, upload, new folder, copy, move, rename,
