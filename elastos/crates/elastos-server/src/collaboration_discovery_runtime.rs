@@ -10172,6 +10172,541 @@ pub(crate) mod tests {
 
     #[test]
     fn observed_profile_head_pruning_evicts_deterministically() {
+    /// One Home device and its Profile, as the relay sees a party to a
+    /// request by Profile DID.
+    struct ProfileContactParty {
+        device: SigningKey,
+        authority: CollaborationDiscoveryAuthority,
+        profile: VerifiedCollaborationProfileDocument,
+    }
+
+    impl ProfileContactParty {
+        fn new(network: &VerifiedCollaborationNetworkProfile, display_name: &str) -> Self {
+            let device = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+            let profile = verified_discovery_profile(&device, display_name, None);
+            Self::with(network, device, profile)
+        }
+
+        fn with(
+            network: &VerifiedCollaborationNetworkProfile,
+            device: SigningKey,
+            profile: VerifiedCollaborationProfileDocument,
+        ) -> Self {
+            let authority = CollaborationDiscoveryAuthority::new(
+                SigningKey::from_bytes(&device.to_bytes()),
+                network.clone(),
+            );
+            Self {
+                device,
+                authority,
+                profile,
+            }
+        }
+
+        fn did(&self) -> String {
+            self.profile.document().profile_did.clone()
+        }
+
+        fn device_did(&self) -> String {
+            crate::crypto::encode_signing_key_did(&self.device)
+        }
+
+        fn request_to(&self, recipient_profile_did: &str, now: u64) -> Vec<u8> {
+            self.authority
+                .prepare_profile_contact_request(recipient_profile_did, &self.profile, now)
+                .unwrap()
+        }
+
+        fn poll(&self, kind: CollaborationDiscoveryMailboxKind, now: u64) -> serde_json::Value {
+            from_source(
+                serde_json::json!({
+                    "op": PROFILE_CONTACT_POLL_OP,
+                    "poll": encode_bytes(
+                        &self
+                            .authority
+                            .prepare_profile_mailbox_poll(&self.profile, kind, now)
+                            .unwrap()
+                    ),
+                }),
+                &self.device_did(),
+            )
+        }
+
+        /// This party's decision on `request`, as the decide op carries it.
+        fn decide(
+            &self,
+            network: &VerifiedCollaborationNetworkProfile,
+            request: &[u8],
+            decision: CollaborationContactDecision,
+            now: u64,
+        ) -> serde_json::Value {
+            let verified =
+                verify_collaboration_profile_contact_request(request, network, now).unwrap();
+            let receipt = self
+                .authority
+                .prepare_profile_contact_decision_receipt(&verified, &self.profile, decision, now)
+                .unwrap();
+            serde_json::json!({
+                "op": PROFILE_CONTACT_DECISION_OP,
+                "request": encode_bytes(request),
+                "receipt": encode_bytes(&receipt),
+                "recipient_profile": encode_bytes(
+                    &serde_json::to_vec(self.profile.signed_envelope()).unwrap()
+                ),
+            })
+        }
+    }
+
+    /// One relay call at an explicit time, as `send_raw` makes it.
+    fn relay_at(
+        relay: &CollaborationDiscoveryRelayProvider,
+        request: &serde_json::Value,
+        now: u64,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let mut state = relay.state.lock().unwrap();
+        relay.prune(now, &mut state);
+        match request["op"].as_str().unwrap() {
+            PROFILE_CONTACT_SEND_OP => relay.send_profile_contact_request(&mut state, request, now),
+            PROFILE_CONTACT_POLL_OP => relay.poll_profile_mailbox(&state, request, now),
+            PROFILE_CONTACT_DECISION_OP => {
+                relay.submit_profile_contact_decision(&mut state, request, now)
+            }
+            op => panic!("relay_at does not drive {op}"),
+        }
+    }
+
+    fn profile_send(request: &[u8], source_endpoint_did: &str) -> serde_json::Value {
+        from_source(
+            serde_json::json!({ "op": PROFILE_CONTACT_SEND_OP, "request": encode_bytes(request) }),
+            source_endpoint_did,
+        )
+    }
+
+    fn profile_mailbox(response: serde_json::Value) -> DiscoveryProviderProfileMailboxData {
+        let response: DiscoveryProviderProfileMailboxResponse =
+            serde_json::from_value(response).unwrap();
+        assert_eq!(response.status, "ok");
+        response.data
+    }
+
+    #[test]
+    fn relay_profile_requests_need_their_signing_device_and_keep_one_per_pair() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let network = signed_profile(NETWORK, &trusted, Vec::new());
+        let relay = CollaborationDiscoveryRelayProvider::new(network.clone());
+        let now = current_timestamp();
+        let sender = ProfileContactParty::new(&network, "Sender");
+        let recipient = ProfileContactParty::new(&network, "Recipient");
+        let first = sender.request_to(&recipient.did(), now);
+
+        // Another Home, or the Profile DID itself, is not the signing device;
+        // a refused submission stores nothing and spends no rate.
+        for source in [test_relay_source(), sender.did()] {
+            let error = relay_at(&relay, &profile_send(&first, &source), now).unwrap_err();
+            assert!(error.to_string().contains("signing device"), "{error}");
+        }
+        {
+            let state = relay.state.lock().unwrap();
+            assert!(state.profile_requests.is_empty());
+            assert!(state.profile_request_mailboxes.is_empty());
+            assert!(state.profile_request_sent_at.is_empty());
+        }
+
+        relay_at(&relay, &profile_send(&first, &sender.device_did()), now).unwrap();
+        // A replay is accepted inside the rate interval and stores nothing new.
+        relay_at(&relay, &profile_send(&first, &sender.device_did()), now + 1).unwrap();
+        assert_eq!(relay.state.lock().unwrap().profile_requests.len(), 1);
+
+        // A newer request to the same person waits for the device interval,
+        // then replaces the older one.
+        let second = sender.request_to(&recipient.did(), now + 1);
+        let error = relay_at(
+            &relay,
+            &profile_send(&second, &sender.device_did()),
+            now + 1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("rate limit"), "{error}");
+        let later = now + PROFILE_REQUEST_DEVICE_INTERVAL_SECS + 1;
+        relay_at(&relay, &profile_send(&second, &sender.device_did()), later).unwrap();
+        let state = relay.state.lock().unwrap();
+        let second_hash = collaboration_message_envelope_sha256(&second);
+        assert_eq!(
+            state.profile_requests.keys().collect::<Vec<_>>(),
+            vec![&second_hash]
+        );
+        assert_eq!(
+            state.profile_request_mailboxes.get(&recipient.did()),
+            Some(&vec![second_hash.clone()])
+        );
+        // The v1 Discovery maps never hold a request by DID.
+        assert!(state.requests.is_empty());
+        assert!(state.request_mailboxes.is_empty());
+    }
+
+    #[test]
+    fn relay_limits_profile_requests_per_sender_device_recipient_and_in_total() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let network = signed_profile(NETWORK, &trusted, Vec::new());
+        let relay = CollaborationDiscoveryRelayProvider::new(network.clone());
+        let now = current_timestamp();
+        let fresh_did = || {
+            crate::crypto::encode_signing_key_did(&SigningKey::from_bytes(
+                &generate_keypair().0.to_bytes(),
+            ))
+        };
+        let count = || relay.state.lock().unwrap().profile_requests.len();
+
+        // One Profile reaches the per-sender limit, one request per interval.
+        let sender = ProfileContactParty::new(&network, "Sender");
+        let mut at = now;
+        for _ in 0..MAX_PROFILE_REQUESTS_PER_SENDER {
+            let request = sender.request_to(&fresh_did(), at);
+            relay_at(&relay, &profile_send(&request, &sender.device_did()), at).unwrap();
+            at += PROFILE_REQUEST_DEVICE_INTERVAL_SECS;
+        }
+        let over = sender.request_to(&fresh_did(), at);
+        let error = relay_at(&relay, &profile_send(&over, &sender.device_did()), at).unwrap_err();
+        assert!(error.to_string().contains("request limit"), "{error}");
+        assert_eq!(count(), MAX_PROFILE_REQUESTS_PER_SENDER);
+
+        // One device reaches the per-device limit even with fresh Profiles.
+        let device = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let fresh_party = || {
+            let profile_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+            ProfileContactParty::with(
+                &network,
+                SigningKey::from_bytes(&device.to_bytes()),
+                verified_discovery_profile_with(&profile_key, &device, "Fresh", None, 1, None, 1),
+            )
+        };
+        let device_did = crate::crypto::encode_signing_key_did(&device);
+        let mut at = now;
+        for _ in 0..MAX_PROFILE_REQUESTS_PER_DEVICE {
+            let request = fresh_party().request_to(&fresh_did(), at);
+            relay_at(&relay, &profile_send(&request, &device_did), at).unwrap();
+            at += PROFILE_REQUEST_DEVICE_INTERVAL_SECS;
+        }
+        let over = fresh_party().request_to(&fresh_did(), at);
+        let error = relay_at(&relay, &profile_send(&over, &device_did), at).unwrap_err();
+        assert!(error.to_string().contains("request limit"), "{error}");
+        assert_eq!(
+            count(),
+            MAX_PROFILE_REQUESTS_PER_SENDER + MAX_PROFILE_REQUESTS_PER_DEVICE
+        );
+
+        // One person's mailbox holds a bounded number of requests.
+        let recipient = fresh_did();
+        for index in 0..MAX_PROFILE_REQUESTS_PER_RECIPIENT {
+            let party = ProfileContactParty::new(&network, &format!("Asker {index}"));
+            let request = party.request_to(&recipient, now);
+            relay_at(&relay, &profile_send(&request, &party.device_did()), now).unwrap();
+        }
+        let party = ProfileContactParty::new(&network, "One more");
+        let over = party.request_to(&recipient, now);
+        let error = relay_at(&relay, &profile_send(&over, &party.device_did()), now).unwrap_err();
+        assert!(error.to_string().contains("mailbox is full"), "{error}");
+        let filled = count();
+        assert_eq!(
+            filled,
+            MAX_PROFILE_REQUESTS_PER_SENDER
+                + MAX_PROFILE_REQUESTS_PER_DEVICE
+                + MAX_PROFILE_REQUESTS_PER_RECIPIENT
+        );
+        assert!(!relay
+            .state
+            .lock()
+            .unwrap()
+            .profile_request_sent_at
+            .contains_key(&party.device_did()));
+
+        // The relay total bounds everything; a refusal leaves no trace.
+        {
+            let mut state = relay.state.lock().unwrap();
+            let template = state.profile_requests.values().next().unwrap().clone();
+            for index in filled..MAX_PROFILE_TOTAL_REQUESTS {
+                state
+                    .profile_requests
+                    .insert(format!("sha256:{index:064x}"), template.clone());
+            }
+        }
+        let party = ProfileContactParty::new(&network, "Overflow");
+        let over = party.request_to(&fresh_did(), now);
+        let error = relay_at(&relay, &profile_send(&over, &party.device_did()), now).unwrap_err();
+        assert!(error.to_string().contains("capacity is full"), "{error}");
+        let state = relay.state.lock().unwrap();
+        assert_eq!(state.profile_requests.len(), MAX_PROFILE_TOTAL_REQUESTS);
+        assert!(!state
+            .profile_requests
+            .contains_key(&collaboration_message_envelope_sha256(&over)));
+        assert!(!state
+            .profile_request_sent_at
+            .contains_key(&party.device_did()));
+    }
+
+    #[test]
+    fn relay_profile_decision_is_self_contained_across_a_relay_restart() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let network = signed_profile(NETWORK, &trusted, Vec::new());
+        let now = current_timestamp();
+        let requester = ProfileContactParty::new(&network, "Requester");
+        let recipient = ProfileContactParty::new(&network, "Recipient");
+        let request = requester.request_to(&recipient.did(), now);
+        let request_hash = collaboration_message_envelope_sha256(&request);
+
+        let relay = CollaborationDiscoveryRelayProvider::new(network.clone());
+        relay_at(
+            &relay,
+            &profile_send(&request, &requester.device_did()),
+            now,
+        )
+        .unwrap();
+        // Only the polling Profile's own device may read its mailbox.
+        let mut stolen = recipient.poll(CollaborationDiscoveryMailboxKind::Requests, now);
+        stolen["_runtime_invocation"]["carrier"]["source_endpoint_did"] =
+            serde_json::Value::String(requester.device_did());
+        let error = relay_at(&relay, &stolen, now).unwrap_err();
+        assert!(error.to_string().contains("signing device"), "{error}");
+        let polled = profile_mailbox(
+            relay_at(
+                &relay,
+                &recipient.poll(CollaborationDiscoveryMailboxKind::Requests, now),
+                now,
+            )
+            .unwrap(),
+        );
+        assert_eq!(polled.requests, vec![encode_bytes(&request)]);
+        assert!(polled.decisions.is_empty());
+
+        // The relay restarts: everything in memory is gone, the request too.
+        let relay = CollaborationDiscoveryRelayProvider::new(network.clone());
+        let accept = recipient.decide(
+            &network,
+            &request,
+            CollaborationContactDecision::Accepted,
+            now + 1,
+        );
+        // Only the device that signed the answer may submit it.
+        let error = relay_at(
+            &relay,
+            &from_source(accept.clone(), &requester.device_did()),
+            now + 1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("signing device"), "{error}");
+        relay_at(
+            &relay,
+            &from_source(accept.clone(), &recipient.device_did()),
+            now + 1,
+        )
+        .unwrap();
+        // A replay is fine; a different answer to the same request is not.
+        relay_at(
+            &relay,
+            &from_source(accept.clone(), &recipient.device_did()),
+            now + 2,
+        )
+        .unwrap();
+        let decline = recipient.decide(
+            &network,
+            &request,
+            CollaborationContactDecision::Declined,
+            now + 2,
+        );
+        let error = relay_at(
+            &relay,
+            &from_source(decline, &recipient.device_did()),
+            now + 2,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("different terminal decision"),
+            "{error}"
+        );
+        // A late resend of the decided request is answered by the entry and
+        // not stored again.
+        relay_at(
+            &relay,
+            &profile_send(&request, &requester.device_did()),
+            now + 3,
+        )
+        .unwrap();
+        {
+            let state = relay.state.lock().unwrap();
+            assert!(state.profile_requests.is_empty());
+            assert!(state.profile_request_mailboxes.is_empty());
+        }
+
+        // The requester reads a self-contained answer that verifies on its own.
+        let polled = profile_mailbox(
+            relay_at(
+                &relay,
+                &requester.poll(CollaborationDiscoveryMailboxKind::Decisions, now + 3),
+                now + 3,
+            )
+            .unwrap(),
+        );
+        assert!(polled.requests.is_empty());
+        assert_eq!(polled.decisions.len(), 1);
+        let entry = &polled.decisions[0];
+        assert_eq!(entry.receipt, accept["receipt"].as_str().unwrap());
+        let profile_bytes = decode_bytes(&entry.recipient_profile, "test Profile").unwrap();
+        let signed: crate::collaboration_profile_authority::SignedCollaborationProfileDocument =
+            serde_json::from_slice(&profile_bytes).unwrap();
+        let answered_by =
+            crate::collaboration_profile_authority::verify_signed_profile_document(&signed)
+                .unwrap();
+        assert_eq!(answered_by.document().profile_did, recipient.did());
+        let verified_request =
+            verify_collaboration_profile_contact_request(&request, &network, now + 3).unwrap();
+        let receipt = verify_collaboration_profile_contact_decision_receipt(
+            &decode_bytes(&entry.receipt, "test receipt").unwrap(),
+            &verified_request,
+            &answered_by,
+            now + 3,
+        )
+        .unwrap();
+        assert_eq!(
+            receipt.envelope().payload.request_envelope_sha256,
+            request_hash
+        );
+        // The decider's own decision mailbox is not the requester's.
+        let polled = profile_mailbox(
+            relay_at(
+                &relay,
+                &recipient.poll(CollaborationDiscoveryMailboxKind::Decisions, now + 3),
+                now + 3,
+            )
+            .unwrap(),
+        );
+        assert!(polled.decisions.is_empty());
+
+        // The entry outlives prune without the request, until its own expiry.
+        let expires_at = verified_request.message().envelope().payload.expires_at;
+        {
+            let mut state = relay.state.lock().unwrap();
+            relay.prune(expires_at - 1, &mut state);
+            assert_eq!(
+                state
+                    .profile_decision_mailboxes
+                    .get(&requester.did())
+                    .map(Vec::len),
+                Some(1)
+            );
+            relay.prune(expires_at + MAX_COLLABORATION_CLOCK_SKEW_SECS, &mut state);
+            assert!(state.profile_decision_mailboxes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn alpha25_mailbox_polls_never_see_requests_or_answers_addressed_by_did() {
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let network = signed_profile(NETWORK, &trusted, Vec::new());
+        let relay = CollaborationDiscoveryRelayProvider::new(network.clone());
+        let now = current_timestamp();
+        let recipient = ProfileContactParty::new(&network, "Recipient");
+        let answered = ProfileContactParty::new(&network, "Answered");
+        let waiting = ProfileContactParty::new(&network, "Waiting");
+
+        // One request by DID is answered (a decision entry for `answered`),
+        // one still waits in the recipient's Profile mailbox.
+        let answered_request = answered.request_to(&recipient.did(), now);
+        relay
+            .send_raw(&profile_send(&answered_request, &answered.device_did()))
+            .await
+            .unwrap();
+        relay
+            .send_raw(&from_source(
+                recipient.decide(
+                    &network,
+                    &answered_request,
+                    CollaborationContactDecision::Accepted,
+                    now,
+                ),
+                &recipient.device_did(),
+            ))
+            .await
+            .unwrap();
+        let waiting_request = waiting.request_to(&recipient.did(), now);
+        relay
+            .send_raw(&profile_send(&waiting_request, &waiting.device_did()))
+            .await
+            .unwrap();
+
+        // An alpha.25 Home polls the v1 mailboxes with v1 polls and parses
+        // the answer with its own unknown-field-denying shape.
+        let v1_poll = |party: &ProfileContactParty, op: &str, kind| {
+            serde_json::json!({
+                "op": op,
+                "poll": encode_bytes(
+                    &party
+                        .authority
+                        .prepare_mailbox_poll(&party.profile, kind, now)
+                        .unwrap()
+                ),
+            })
+        };
+        for (party, op, kind) in [
+            (
+                &recipient,
+                "poll_requests",
+                CollaborationDiscoveryMailboxKind::Requests,
+            ),
+            (
+                &recipient,
+                "poll_decisions",
+                CollaborationDiscoveryMailboxKind::Decisions,
+            ),
+            (
+                &answered,
+                "poll_decisions",
+                CollaborationDiscoveryMailboxKind::Decisions,
+            ),
+            (
+                &waiting,
+                "poll_requests",
+                CollaborationDiscoveryMailboxKind::Requests,
+            ),
+        ] {
+            let response = relay.send_raw(&v1_poll(party, op, kind)).await.unwrap();
+            let response: DiscoveryProviderMailboxResponse =
+                serde_json::from_value(response).unwrap();
+            assert_eq!(response.status, "ok");
+            assert!(response.data.requests.is_empty(), "{op}");
+            assert!(response.data.decisions.is_empty(), "{op}");
+        }
+        // A poll of either kind is refused by the other kind's op.
+        let mut profile_poll_on_v1_op =
+            recipient.poll(CollaborationDiscoveryMailboxKind::Requests, now);
+        profile_poll_on_v1_op["op"] = serde_json::Value::String("poll_requests".to_string());
+        assert!(relay.send_raw(&profile_poll_on_v1_op).await.is_err());
+        let v1_poll_on_profile_op = from_source(
+            v1_poll(
+                &recipient,
+                PROFILE_CONTACT_POLL_OP,
+                CollaborationDiscoveryMailboxKind::Requests,
+            ),
+            &recipient.device_did(),
+        );
+        assert!(relay.send_raw(&v1_poll_on_profile_op).await.is_err());
+
+        // Both entries are still there for a 0.8.0 Home.
+        let polled = profile_mailbox(
+            relay
+                .send_raw(&recipient.poll(CollaborationDiscoveryMailboxKind::Requests, now))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(polled.requests, vec![encode_bytes(&waiting_request)]);
+        let polled = profile_mailbox(
+            relay
+                .send_raw(&answered.poll(CollaborationDiscoveryMailboxKind::Decisions, now))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(polled.decisions.len(), 1);
+    }
+
         let mut heads = BTreeMap::new();
         for index in 0..=MAX_DISCOVERY_QUERY_RESULTS {
             heads.insert(
