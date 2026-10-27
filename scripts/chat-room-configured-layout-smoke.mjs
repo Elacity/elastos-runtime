@@ -162,7 +162,8 @@ function startServer(scenario) {
   const communityDeliveryScenario = scenario === "community-delivery-status"
     || communityResponseOrdering || communityNonterminalOrdering;
   const sharedCursorScenario = scenario === "shared-send-intervening-peer" || communitySendOrdering;
-  const contactAcceptance = scenario.startsWith("contact-acceptance");
+  const didOutcome = scenario.startsWith("contact-did-") ? scenario.slice("contact-did-".length).replace(/-phone$/, "") : null;
+  const contactAcceptance = scenario.startsWith("contact-acceptance") || didOutcome !== null;
   const historyScenario = scenario === "history-status-order-calendar";
   const unreadScenario = scenario === "direct-unread" || scenario === "visible-read";
   const retryScenario = scenario.startsWith("direct-retry");
@@ -218,6 +219,8 @@ function startServer(scenario) {
     sharedCursorPolls: [],
     peerAccepted: false,
     contactRequested: false,
+    contactRelationship: null,
+    profileCopies: 0,
     contactRequests: 0,
     contactResponses: 0,
     authPosts: 0,
@@ -310,7 +313,8 @@ function startServer(scenario) {
         last_seen_at: 1, local_session_count: 0, is_current_session: false,
         card: {
           participant_ref: "participant:fixture-friend",
-          relationship: trace.peerAccepted ? "contact" : trace.contactRequested ? "requested" : "none",
+          // Runtime projects removed and declined pairs as addable "none" cards.
+          relationship: trace.peerAccepted ? "contact" : trace.contactRequested ? (trace.contactRelationship || "requested") : "none",
           conversation_id: trace.peerAccepted ? directConversation().conversation_id : null,
           can_add_contact: !trace.peerAccepted && !trace.contactRequested, active_now: true,
         },
@@ -542,6 +546,15 @@ function startServer(scenario) {
         }
         return json(response, poll);
       }
+      if (url.pathname === "/api/apps/chat-room/contacts/profile-id" && contactAcceptance) {
+        assert(request.method === "POST", "Copy DID method differs");
+        let body = "";
+        for await (const chunk of request) body += chunk;
+        assert(JSON.parse(body).participant_ref === "participant:fixture-friend", "Copy DID lost its opaque selector");
+        assert(request.headers["x-elastos-home-token"] === "test-token", "Copy DID lost Home authority");
+        trace.profileCopies += 1;
+        return json(response, { profile_id: "did:key:zFixtureFriend" });
+      }
       if (url.pathname === "/api/apps/chat-room/contacts/request" && contactAcceptance) {
         assert(request.method === "POST", "contact request method differs");
         let body = "";
@@ -553,9 +566,16 @@ function startServer(scenario) {
           holds["contact-request"].reached = true;
           await holds["contact-request"].promise;
         }
-        trace.contactRequested = true;
         trace.contactResponses += 1;
-        return json(response, { status: "requested" });
+        if (["refusal", "unlisted"].includes(didOutcome) && trace.contactRequests === 1) {
+          response.writeHead(409, { "access-control-allow-origin": "null", "content-type": "text/plain" });
+          response.end(didOutcome === "unlisted" ? "This person is no longer listed in Community." : "Contact requests can't be delivered right now. Try again later.");
+          return;
+        }
+        const status = ["refusal", "unlisted", "removed", "declined"].includes(didOutcome) ? "requested" : (didOutcome || "requested");
+        trace.contactRequested = true;
+        trace.contactRelationship = { requested: "requested", already_requested: "requested", already_contact: "contact", pending_from_them: "pending", own_profile: "you" }[status];
+        return json(response, { status, display_name: "Fixture Friend" });
       }
       if (url.pathname === "/api/apps/chat-room/send") {
         trace.current.sends += 1;
@@ -826,7 +846,7 @@ async function runScenario(scenario) {
   const context = await chromium.launchPersistentContext(profile, {
     executablePath: brave,
     headless: true,
-    viewport: { width: 1280, height: 900 },
+    viewport: { width: scenario.endsWith("-phone") ? 375 : 1280, height: 900 },
     ...(scenario === "history-status-order-calendar" ? { timezoneId: "America/New_York" } : {}),
   });
   const page = context.pages()[0] || await context.newPage();
@@ -1508,6 +1528,65 @@ async function runScenario(scenario) {
       return;
     }
 
+    if (scenario.startsWith("contact-did-")) {
+      await waitForConfiguredChatWithoutLegacyFlash(frame, "DID contact bootstrap");
+      await frame.locator("#participant-toggle").click();
+      await frame.locator('#participant-list [data-participant-ref="participant:fixture-friend"]').click();
+      assert(await frame.locator("#participant-card-action").innerText() === "Add contact", "Community card needs Discovery");
+      assert(!(await frame.locator("#participant-card").innerText()).includes("Discovery"), "Card still requires Discovery");
+      assert(trace.profileCopies === 0, "DID was fetched before Copy");
+      await page.evaluate(() => {
+        const child = document.querySelector("iframe").contentWindow;
+        const homeToken = "test-token";
+        child.postMessage({ type: "home:clipboard-ready", schema: "elastos.home.clipboard.ready/v1",
+          targetId: "chat-room", homeToken, parentOrigin: location.origin, generation: "fixture:1" }, "*");
+        window.didCopies = [];
+        window.addEventListener("message", event => {
+          const data = event.data;
+          if (event.source !== child || data?.type !== "home:clipboard-request") return;
+          window.didCopies.push(data);
+          const denied = window.didCopies.length === 1;
+          child.postMessage({ type: "home:clipboard-result", schema: "elastos.home.clipboard.result/v1",
+            requestId: data.requestId, targetId: "chat-room", homeToken, parentOrigin: location.origin,
+            generation: "fixture:1", operation: "write", purpose: "profile.id", ok: !denied,
+            ...(denied ? { error: "denied" } : {}) }, "*");
+        });
+      });
+      await frame.locator("#participant-card-copy").click();
+      await frame.waitForFunction(() => document.querySelector("#participant-card-state").textContent === "DID could not be copied. Try again.");
+      await frame.locator("#participant-card-copy").click();
+      await frame.waitForFunction(() => document.querySelector("#participant-card-state").textContent === "DID copied.");
+      const copies = await page.evaluate(() => window.didCopies);
+      assert(trace.profileCopies === 2 && copies.length === 2
+        && copies.every(item => item.text === "did:key:zFixtureFriend" && item.purpose === "profile.id"), "Copy DID bypassed Home", copies);
+      assert(!(await frame.locator("body").innerText()).includes("did:key:"), "Copy exposed a DID in the card");
+      await frame.locator("#participant-card-action").click();
+      const outcome = scenario.slice("contact-did-".length).replace(/-phone$/, "");
+      if (["refusal", "unlisted"].includes(outcome)) {
+        const refusal = outcome === "unlisted" ? "This person is no longer listed in Community." : "Contact requests can't be delivered right now. Try again later.";
+        await frame.waitForFunction(message => document.querySelector("#participant-card-state").textContent === message, refusal);
+        assert(await frame.locator("#participant-card-action").isEnabled(), "Refusal blocked retry");
+        await frame.locator("#participant-card-action").click();
+      }
+      const messages = {
+        requested: "Request sent. Fixture Friend sees it in Inbox when their Home is online.",
+        already_requested: "Request sent. Waiting for Fixture Friend to accept.",
+        already_contact: "Fixture Friend is already a contact.",
+        pending_from_them: "Fixture Friend already asked to connect. Open Inbox to answer.",
+        own_profile: "That's your own DID.",
+      };
+      await frame.waitForFunction(message => document.querySelector("#participant-card-state").textContent === message,
+        messages[["refusal", "unlisted", "removed", "declined"].includes(outcome) ? "requested" : outcome]);
+      if (outcome === "pending_from_them") {
+        assert(await frame.locator("#participant-card-action").innerText() === "Open Inbox", "Incoming request has no Inbox action");
+      } else {
+        assert(await frame.locator("#participant-card-action").isHidden(), "Request result kept Add contact");
+      }
+      assert(await frame.locator("#participant-card-copy").isHidden() === (outcome === "own_profile"), "Copy DID visibility differs");
+      const cardBox = await frame.locator("#participant-card").boundingBox();
+      assert(cardBox && cardBox.x >= 0 && cardBox.x + cardBox.width <= page.viewportSize().width + 1, "DID card overflows");
+      return;
+    }
     if (scenario === "contact-acceptance-from-message") {
       await waitForConfiguredChatWithoutLegacyFlash(frame, "message name bootstrap");
       const sender = frame.locator('#message-list [data-participant-ref="participant:fixture-friend"]');
@@ -1543,7 +1622,7 @@ async function runScenario(scenario) {
           "an unchanged poll re-enabled the in-flight contact request");
       } else {
         await frame.waitForFunction(() => document.querySelector("#participant-card-action")?.hidden === true
-          && document.querySelector("#participant-card-state")?.textContent.includes("Waiting"));
+          && /Request sent|Waiting/.test(document.querySelector("#participant-card-state")?.textContent));
       }
       await frame.locator("#participant-card-close").focus();
       trace.peerAccepted = true;
@@ -1986,6 +2065,9 @@ async function runScenario(scenario) {
 
 async function main() {
   const scenarios = process.env.CHAT_LAYOUT_SCENARIOS?.split(",").map((value) => value.trim()).filter(Boolean) || [
+    "contact-did-requested", "contact-did-requested-phone", "contact-did-already_requested",
+    "contact-did-already_contact", "contact-did-pending_from_them", "contact-did-own_profile", "contact-did-refusal",
+    "contact-did-unlisted", "contact-did-removed", "contact-did-declined",
     "success",
     "single-conversation",
     "session-failure",

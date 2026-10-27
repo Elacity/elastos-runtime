@@ -225,6 +225,8 @@ struct App {
     /// that sent it.
     participant_card_opening: Cell<u64>,
     participant_contact_requests: RefCell<BTreeSet<String>>,
+    participant_card_notice: RefCell<Option<(String, String)>>,
+    participant_profile_copying: Cell<bool>,
     /// The name that opened the card: its reference, and the message `seq`
     /// when it was a message sender. Lists re-render, so closing the card finds
     /// that exact name again and returns focus to it.
@@ -271,6 +273,7 @@ struct App {
     participant_card_name: HtmlElement,
     participant_card_state: HtmlElement,
     participant_card_action: HtmlButtonElement,
+    participant_card_copy: HtmlButtonElement,
     participant_card_close: HtmlButtonElement,
     browser_access_section: HtmlElement,
     browser_access_count: HtmlElement,
@@ -695,6 +698,8 @@ pub fn start() -> Result<(), JsValue> {
         picker_request: RefCell::new(None),
         participant_card_opening: Cell::new(0),
         participant_contact_requests: RefCell::new(BTreeSet::new()),
+        participant_card_notice: RefCell::new(None),
+        participant_profile_copying: Cell::new(false),
         participant_card_opener: RefCell::new(None),
         direct_pending_seen: RefCell::new(BTreeMap::new()),
         pending_note_render: RefCell::new(None),
@@ -739,6 +744,7 @@ pub fn start() -> Result<(), JsValue> {
         participant_card_name: element_by_id(&document, "participant-card-name")?,
         participant_card_state: element_by_id(&document, "participant-card-state")?,
         participant_card_action: button_by_id(&document, "participant-card-action")?,
+        participant_card_copy: button_by_id(&document, "participant-card-copy")?,
         participant_card_close: button_by_id(&document, "participant-card-close")?,
         browser_access_section: element_by_id(&document, "browser-access-section")?,
         browser_access_count: element_by_id(&document, "browser-access-count")?,
@@ -3394,6 +3400,7 @@ impl App {
         if self.participant_card_for(participant_ref).is_none() {
             return;
         }
+        self.participant_card_notice.borrow_mut().take();
         // The card lives in the People drawer; a name on a message opens it too.
         let drawer_closed =
             !std::mem::replace(&mut self.state.borrow_mut().show_participants, true);
@@ -3438,6 +3445,15 @@ impl App {
                 }
                 _ => state_text.to_string(),
             }));
+        if let Some((relationship, message)) = self.participant_card_notice.borrow().as_ref() {
+            if relationship == &card.relationship {
+                self.participant_card_state.set_text_content(Some(message));
+            }
+        }
+        self.participant_card_copy
+            .set_hidden(card.relationship == "you" || self.home_token().is_none());
+        self.participant_card_copy
+            .set_disabled(self.participant_profile_copying.get());
         match action {
             Some((label, action)) => {
                 self.participant_card_action.set_text_content(Some(label));
@@ -3525,6 +3541,7 @@ impl App {
                 {
                     return;
                 }
+                self.participant_card_notice.borrow_mut().take();
                 self.participant_card_action.set_disabled(true);
                 let opening = self.participant_card_opening.get();
                 self.participant_contact_requests
@@ -3547,31 +3564,42 @@ impl App {
                         app.close_participant_card(true);
                         return;
                     };
-                    if current.relationship != "none" {
-                        app.refresh_open_participant_card();
-                        return;
-                    }
                     match result {
-                        Ok(()) => {
+                        Ok(response) => {
+                            if current.relationship != "none"
+                                && current.relationship != response.status.relationship()
+                            {
+                                app.refresh_open_participant_card();
+                                return;
+                            }
                             for participant in &mut app.state.borrow_mut().participants {
                                 if let Some(card) = participant.card.as_mut().filter(|card| {
                                     card.participant_ref == participant_ref
                                         && card.relationship == "none"
                                 }) {
-                                    card.relationship = "requested".to_string();
+                                    card.relationship = response.status.relationship().to_string();
                                     card.can_add_contact = false;
                                 }
                             }
+                            *app.participant_card_notice.borrow_mut() = Some((
+                                response.status.relationship().to_string(),
+                                response.message(),
+                            ));
                             app.refresh_open_participant_card();
                         }
                         Err(error) => {
+                            if current.relationship != "none" {
+                                app.refresh_open_participant_card();
+                                return;
+                            }
+                            *app.participant_card_notice.borrow_mut() =
+                                Some((current.relationship, error));
                             app.refresh_open_participant_card();
-                            app.participant_card_state.set_text_content(Some(&error));
                         }
                     }
                 });
             }
-            "inbox" | "people" => {
+            "inbox" => {
                 self.close_participant_card(false);
                 let _ = self.post_library_picker_message(serde_json::json!({
                     "type": "home:open-target", "target": action, "query": {},
@@ -3582,15 +3610,91 @@ impl App {
         }
     }
 
-    async fn request_contact(&self, participant_ref: &str) -> Result<(), String> {
-        let _: serde_json::Value = api_post_json_with_headers(
-            &self.room_api_url("/contacts/request"),
-            &serde_json::json!({ "participant_ref": participant_ref }),
-            &self.home_token_headers(),
-            None,
-        )
-        .await?;
-        Ok(())
+    async fn request_contact(
+        &self,
+        participant_ref: &str,
+    ) -> Result<ContactRequestResponse, String> {
+        self.contact_post("/contacts/request", participant_ref)
+            .await
+    }
+
+    // Contact refusals are plain public copy supplied by Runtime.
+    async fn contact_post<T: DeserializeOwned>(
+        &self,
+        route: &str,
+        participant_ref: &str,
+    ) -> Result<T, String> {
+        let deadline = request_deadline(REQUEST_DEADLINE_MS);
+        let mut request = Request::post(&self.room_api_url(route))
+            .credentials(RequestCredentials::SameOrigin)
+            .abort_signal(Some(&deadline));
+        for (name, value) in self.home_token_headers() {
+            request = request.header(name, &value);
+        }
+        let response = request
+            .json(&serde_json::json!({ "participant_ref": participant_ref }))
+            .map_err(|err| err.to_string())?
+            .send()
+            .await
+            .map_err(|_| {
+                "Contact requests can't be delivered right now. Try again later.".to_string()
+            })?;
+        if !response.ok() {
+            return Err(response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Could not read the response. Try again.".to_string()));
+        }
+        response
+            .json::<T>()
+            .await
+            .map_err(|_| "Could not read the response. Try again.".to_string())
+    }
+
+    fn copy_participant_profile_id(self: &Rc<Self>) {
+        let Some(participant_ref) = self.participant_card.get_attribute("data-participant-ref")
+        else {
+            return;
+        };
+        let Some((_, card)) = self.participant_card_for(&participant_ref) else {
+            return;
+        };
+        if card.relationship == "you"
+            || self.home_token().is_none()
+            || self.participant_profile_copying.replace(true)
+        {
+            return;
+        }
+        self.participant_card_copy.set_disabled(true);
+        let opening = self.participant_card_opening.get();
+        let request_token = self.home_token();
+        let app = Rc::clone(self);
+        spawn_local(async move {
+            let result: Result<ProfileIdResponse, String> = app
+                .contact_post("/contacts/profile-id", &participant_ref)
+                .await;
+            if app.home_token() != request_token || app.participant_card_opening.get() != opening {
+                app.participant_profile_copying.set(false);
+                app.refresh_open_participant_card();
+                return;
+            }
+            let copied = match result {
+                Ok(response) => copy_profile_id_to_clipboard(&response.profile_id).await,
+                Err(error) => Err(error),
+            };
+            app.participant_profile_copying.set(false);
+            if app.home_token() == request_token && app.participant_card_opening.get() == opening {
+                if let Some((_, current)) = app.participant_card_for(&participant_ref) {
+                    *app.participant_card_notice.borrow_mut() = Some((
+                        current.relationship,
+                        copied
+                            .map(|()| "DID copied.".to_string())
+                            .unwrap_or_else(|error| error),
+                    ));
+                }
+            }
+            app.refresh_open_participant_card();
+        });
     }
 
     /// "Show me in Community" after Later: Runtime opens the Inbox card
@@ -3662,6 +3766,13 @@ impl App {
         self.participant_card_action
             .add_event_listener_with_callback("click", card_action.as_ref().unchecked_ref())?;
         card_action.forget();
+        let card_copy_app = Rc::clone(self);
+        let card_copy = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            card_copy_app.copy_participant_profile_id();
+        }));
+        self.participant_card_copy
+            .add_event_listener_with_callback("click", card_copy.as_ref().unchecked_ref())?;
+        card_copy.forget();
         let card_close_app = Rc::clone(self);
         let card_close = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
             card_close_app.close_participant_card(true);
@@ -8541,6 +8652,56 @@ fn participant_shown_name(participant: &ParticipantView) -> &str {
     &participant.display_name
 }
 
+#[derive(Debug, Deserialize)]
+struct ProfileIdResponse {
+    profile_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ContactRequestStatus {
+    Requested,
+    AlreadyRequested,
+    AlreadyContact,
+    PendingFromThem,
+    OwnProfile,
+}
+
+impl ContactRequestStatus {
+    fn relationship(&self) -> &'static str {
+        match self {
+            Self::Requested | Self::AlreadyRequested => "requested",
+            Self::AlreadyContact => "contact",
+            Self::PendingFromThem => "pending",
+            Self::OwnProfile => "you",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ContactRequestResponse {
+    status: ContactRequestStatus,
+    display_name: String,
+}
+
+impl ContactRequestResponse {
+    fn message(&self) -> String {
+        let name = &self.display_name;
+        match self.status {
+            ContactRequestStatus::Requested if name == "Name not known yet" =>
+                "Name not known yet. Request sent. They'll see it in Inbox when their Home is online.".to_string(),
+            ContactRequestStatus::Requested =>
+                format!("Request sent. {name} sees it in Inbox when their Home is online."),
+            ContactRequestStatus::AlreadyRequested if name == "Name not known yet" =>
+                "Name not known yet. Request sent. Waiting for them to accept.".to_string(),
+            ContactRequestStatus::AlreadyRequested => format!("Request sent. Waiting for {name} to accept."),
+            ContactRequestStatus::AlreadyContact => format!("{name} is already a contact."),
+            ContactRequestStatus::PendingFromThem => format!("{name} already asked to connect. Open Inbox to answer."),
+            ContactRequestStatus::OwnProfile => "That's your own DID.".to_string(),
+        }
+    }
+}
+
 /// The card's status line and its one action (label, action id).
 fn participant_card_copy(
     card: &ParticipantCard,
@@ -8555,11 +8716,12 @@ fn participant_card_copy(
             "Wants to add you as a contact.",
             Some(("Open Inbox", "inbox")),
         ),
-        _ if card.can_add_contact => ("In Community", Some(("Add contact", "add-contact"))),
-        _ => (
-            "To add each other, both of you turn on Discovery in People.",
-            Some(("Open People", "people")),
-        ),
+        "none" if card.can_add_contact => ("In Community", Some(("Add contact", "add-contact"))),
+        "none" => ("In Community", None),
+        "removed" => ("Removed", None),
+        "removed_you" => ("No longer connected", None),
+        "declined" => ("Declined", None),
+        _ => ("Relationship unavailable", None),
     };
     (text, if can_act { action } else { None })
 }
@@ -8702,6 +8864,23 @@ async fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
     JsFuture::from(Promise::from(promise))
         .await
         .map_err(js_error)?;
+    Ok(())
+}
+
+async fn copy_profile_id_to_clipboard(profile_id: &str) -> Result<(), String> {
+    let window = window().ok_or_else(|| "Open Chat from Home to copy a DID.".to_string())?;
+    let write = Reflect::get(
+        window.as_ref(),
+        &JsValue::from_str("elastosChatCopyProfileId"),
+    )
+    .and_then(|value| value.dyn_into::<Function>())
+    .map_err(|_| "Open Chat from Home to copy a DID.".to_string())?;
+    let promise = write
+        .call1(&JsValue::UNDEFINED, &JsValue::from_str(profile_id))
+        .map_err(|_| "DID could not be copied. Try again.".to_string())?;
+    JsFuture::from(Promise::from(promise))
+        .await
+        .map_err(|_| "DID could not be copied. Try again.".to_string())?;
     Ok(())
 }
 
@@ -9133,12 +9312,71 @@ mod participant_card_tests {
         );
         assert_eq!(
             participant_card_copy(&card("none", None, false), true).1,
-            Some(("Open People", "people"))
+            None
         );
         assert_eq!(
             participant_card_copy(&card("contact", Some("direct:1"), false), false).1,
             None,
             "without a Home token the card only informs"
+        );
+    }
+
+    #[test]
+    fn participant_card_describes_each_relationship_without_discovery() {
+        for (relationship, text) in [
+            ("none", "In Community"),
+            ("removed", "Removed"),
+            ("removed_you", "No longer connected"),
+            ("declined", "Declined"),
+        ] {
+            assert_eq!(
+                participant_card_copy(&card(relationship, None, false), true),
+                (text, None)
+            );
+        }
+    }
+
+    #[test]
+    fn contact_request_outcomes_keep_the_runtime_relationship_and_name() {
+        for (status, relationship, message) in [
+            (
+                "requested",
+                "requested",
+                "Request sent. Alma sees it in Inbox when their Home is online.",
+            ),
+            (
+                "already_requested",
+                "requested",
+                "Request sent. Waiting for Alma to accept.",
+            ),
+            ("already_contact", "contact", "Alma is already a contact."),
+            (
+                "pending_from_them",
+                "pending",
+                "Alma already asked to connect. Open Inbox to answer.",
+            ),
+            ("own_profile", "you", "That's your own DID."),
+        ] {
+            let response: ContactRequestResponse = serde_json::from_value(serde_json::json!({
+                "status": status, "display_name": "Alma",
+            }))
+            .unwrap();
+            assert_eq!(response.status.relationship(), relationship);
+            assert_eq!(response.message(), message);
+        }
+        let response: ContactRequestResponse = serde_json::from_value(serde_json::json!({
+            "status": "requested", "display_name": "Name not known yet",
+        }))
+        .unwrap();
+        assert_eq!(
+            response.message(),
+            "Name not known yet. Request sent. They'll see it in Inbox when their Home is online."
+        );
+        assert!(
+            serde_json::from_value::<ContactRequestResponse>(serde_json::json!({
+                "status": "unexpected", "display_name": "Alma",
+            }))
+            .is_err()
         );
     }
 

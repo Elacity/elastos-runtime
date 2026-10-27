@@ -33,7 +33,8 @@ function chatFixture() {
   const context = vm.createContext({ window, URL, URLSearchParams, Event, init() {},
     createHomeNavigationClient: options => createHomeNavigationClient({ ...options, windowRef: window }),
     createHomeClipboardClient(options) { const client = { token: options.homeToken, started: false, retired: false,
-      start() { this.started = true; }, teardown() { this.retired = true; }, writeText() {} };
+      start() { this.started = true; }, teardown() { this.retired = true; },
+      writes: [], writeText(text, options) { this.writes.push({ text, purpose: options.purpose }); return Promise.resolve(); } };
       clipboard.push(client); return client; },
   });
   const source = read("capsules/chat-room/browser/chat-room.js")
@@ -163,4 +164,17 @@ test("Home GUI accepts only the open Chat entry and keeps its iframe document", 
   assert.equal(receipts.at(-1).type, "home:chat-authority-committed");
   assert.equal(receipts.at(-1).ok, false, "a closed Chat entry must refuse the commit");
   assert.equal(context.renewHomeGuiChatWindowAuthority("fresh", launched("later"), homeOrigin), false);
+});
+
+test("Copy DID uses its own Home purpose and the renewed launch token", async () => {
+  const f = chatFixture();
+  assert.equal(typeof f.context.elastosChatCopyProfileId, "function");
+  await f.context.elastosChatCopyProfileId("did:key:zProfile");
+  assert.deepEqual(f.clipboard[0].writes, [{ text: "did:key:zProfile", purpose: "profile.id" }]);
+  const pending = f.context.elastosChatReconnect();
+  f.respond(f.messages[0].data.requestId, launched("fresh"));
+  await pending;
+  await f.context.elastosChatCopyProfileId("did:key:zOther");
+  assert.equal(f.clipboard[0].writes.length, 1);
+  assert.deepEqual(f.clipboard[1].writes, [{ text: "did:key:zOther", purpose: "profile.id" }]);
 });
