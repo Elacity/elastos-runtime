@@ -2317,6 +2317,19 @@ pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
         )
             .into_response();
     }
+    if let Some(refusal) =
+        err.downcast_ref::<crate::collaboration_discovery_runtime::ProfileContactRequestRefusal>()
+    {
+        use crate::collaboration_discovery_runtime::ProfileContactRequestRefusal;
+        let status = match refusal {
+            ProfileContactRequestRefusal::InvalidProfileId
+            | ProfileContactRequestRefusal::OwnDeviceId => StatusCode::BAD_REQUEST,
+            ProfileContactRequestRefusal::TooManyWaiting
+            | ProfileContactRequestRefusal::CommunityLeft
+            | ProfileContactRequestRefusal::Undeliverable => StatusCode::CONFLICT,
+        };
+        return (status, refusal.to_string()).into_response();
+    }
     let profile_required = gateway_home_system::profile_required_message(&err);
     let text = profile_required
         .map(str::to_string)

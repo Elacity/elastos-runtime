@@ -1117,6 +1117,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/apps/people/contacts/remove",
             post(people_contact_remove),
         )
+        .route(
+            "/api/apps/people/contacts/request",
+            post(people_contact_request_create),
+        )
         .route("/api/apps/chat-room/summary", get(chat_room_summary))
         .route(
             "/api/apps/chat-room/direct/conversations",

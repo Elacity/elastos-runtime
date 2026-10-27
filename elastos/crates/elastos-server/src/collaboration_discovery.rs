@@ -42,6 +42,14 @@ pub const COLLABORATION_CONTACT_DECISION_RECEIPT_SCHEMA_V1: &str =
 pub const COLLABORATION_CONTACT_DECISION_RECEIPT_SIGNATURE_DOMAIN_V1: &str =
     "elastos.people.contact-decision-receipt.v1";
 pub const MAX_COLLABORATION_CONTACT_DECISION_RECEIPT_BYTES: usize = 8 * 1024;
+/// Scope of a contact request addressed to a Profile DID rather than bound to
+/// a Discovery advertisement. It reuses the `contact-request/v1` and
+/// `mailbox-poll/v1` payload types; alpha.25 verifiers refuse the scope, so
+/// the two request kinds can never be confused.
+pub const COLLABORATION_PROFILE_CONTACT_ID: &str = "elastos.people.contact.profile";
+/// A request addressed by DID waits in the relay for a recipient who may be
+/// offline, so it lives as long as a revocation or a direct message.
+pub const COLLABORATION_PROFILE_CONTACT_REQUEST_TTL_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +61,25 @@ pub struct CollaborationDiscoveryAdvertisementPayload {
 #[serde(deny_unknown_fields)]
 pub struct CollaborationContactRequestPayload {
     pub advertisement_envelope_sha256: String,
+    pub signed_profile: SignedCollaborationProfileDocument,
+}
+
+/// A contact request addressed to `recipient.id`, a Profile DID. The payload
+/// is the requester's own signed Profile; the recipient's signed Profile comes
+/// back beside the decision receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaborationProfileContactRequestPayload {
+    pub signed_profile: SignedCollaborationProfileDocument,
+}
+
+/// A mailbox poll under the Profile-contact scope. It carries the poller's
+/// signed Profile because, with Discovery off, the relay holds no
+/// advertisement that proves the polling device belongs to the Profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaborationProfileMailboxPollPayload {
+    pub mailbox_kind: CollaborationDiscoveryMailboxKind,
     pub signed_profile: SignedCollaborationProfileDocument,
 }
 

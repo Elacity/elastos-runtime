@@ -198,6 +198,66 @@ pub(crate) struct CollaborationRelationshipEvent {
     pub(crate) occurred_at: u64,
 }
 
+/// Shown where a name would be when this Home holds no signed Profile for
+/// the DID yet (a request sent to a pasted DID before any answer).
+pub(crate) const CONTACT_NAME_NOT_KNOWN: &str = "Name not known yet";
+
+/// An unexpired outgoing request with no decision yet, over both request
+/// kinds: bound to a Discovery advertisement (v1) or addressed to a Profile
+/// DID. `display_name` is `None` when this Home holds no signed Profile for
+/// the recipient; callers show `CONTACT_NAME_NOT_KNOWN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CollaborationOutgoingContactRequest {
+    pub(crate) request_hash: String,
+    pub(crate) recipient_profile_did: String,
+    pub(crate) display_name: Option<String>,
+    pub(crate) handle: Option<String>,
+    pub(crate) created_at: u64,
+    pub(crate) expires_at: u64,
+}
+
+/// This Home's relationship with one Profile DID, projected from signed truth
+/// over both request kinds. Precedence when several facts exist for one DID:
+/// contact, pending (they asked), requested (we asked), removed, declined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CollaborationContactRelationship {
+    /// No relationship yet: a request may be sent.
+    None,
+    /// The local Profile itself.
+    OwnProfile,
+    Contact {
+        conversation_id: String,
+    },
+    /// They asked; the decision belongs in Inbox under this hash.
+    PendingFromThem {
+        request_hash: String,
+    },
+    /// We asked; no answer yet.
+    Requested,
+    /// An ended relationship; `by_local` says which side removed it.
+    Removed {
+        by_local: bool,
+    },
+    /// The latest decision between the pair was Declined.
+    Declined,
+}
+
+impl CollaborationContactRelationship {
+    /// The relationship string used by People rows and Chat cards.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::OwnProfile => "you",
+            Self::Contact { .. } => "contact",
+            Self::PendingFromThem { .. } => "pending",
+            Self::Requested => "requested",
+            Self::Removed { by_local: true } => "removed",
+            Self::Removed { by_local: false } => "removed_you",
+            Self::Declined => "declined",
+        }
+    }
+}
+
 impl CollaborationContactStoreSnapshot {
     pub(crate) fn contacts(&self) -> &[CollaborationAcceptedContact] {
         &self.contacts
@@ -419,7 +479,7 @@ impl CollaborationContactReadSnapshot<'_> {
     pub(crate) fn outgoing_pending_requests(
         &self,
         now: u64,
-    ) -> anyhow::Result<Vec<CollaborationRelationshipEvent>> {
+    ) -> anyhow::Result<Vec<CollaborationOutgoingContactRequest>> {
         let Some(loaded) = self.loaded.as_ref() else {
             return Ok(Vec::new());
         };
@@ -443,19 +503,129 @@ impl CollaborationContactReadSnapshot<'_> {
             else {
                 continue;
             };
-            requested.push(CollaborationRelationshipEvent {
-                remote_profile_did: advertisement.profile_did().to_string(),
-                display_name: advertisement.display_name().to_string(),
+            requested.push(CollaborationOutgoingContactRequest {
+                request_hash: request.message().envelope_sha256().to_string(),
+                recipient_profile_did: advertisement.profile_did().to_string(),
+                display_name: Some(advertisement.display_name().to_string()),
                 handle: advertisement.handle().map(str::to_string),
-                occurred_at: envelope.created_at,
+                created_at: envelope.created_at,
+                expires_at: envelope.expires_at,
             });
         }
         requested.sort_by(|left, right| {
-            left.occurred_at
-                .cmp(&right.occurred_at)
-                .then_with(|| left.remote_profile_did.cmp(&right.remote_profile_did))
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.recipient_profile_did.cmp(&right.recipient_profile_did))
         });
         Ok(requested)
+    }
+
+    /// The signed display name this Home holds for a Profile DID, from any
+    /// relationship fact over both request kinds; `None` when it holds no
+    /// signed Profile for the DID.
+    pub(crate) fn display_name_for(
+        &self,
+        remote_profile_did: &str,
+        now: u64,
+    ) -> anyhow::Result<Option<String>> {
+        let snapshot = self.snapshot()?;
+        if let Some(contact) = snapshot
+            .contacts()
+            .iter()
+            .find(|contact| contact.remote_profile_did() == remote_profile_did)
+        {
+            return Ok(Some(contact.remote_display_name().to_string()));
+        }
+        if let Some(request) = self
+            .pending_incoming_requests()?
+            .into_iter()
+            .find(|request| request.requester_profile_did() == remote_profile_did)
+        {
+            return Ok(Some(request.display_name().to_string()));
+        }
+        if let Some(name) = self
+            .outgoing_pending_requests(now)?
+            .into_iter()
+            .find(|request| request.recipient_profile_did == remote_profile_did)
+            .and_then(|request| request.display_name)
+        {
+            return Ok(Some(name));
+        }
+        if let Some(removed) = snapshot
+            .removed()
+            .iter()
+            .find(|removed| removed.remote_profile_did() == remote_profile_did)
+        {
+            return Ok(Some(removed.display_name().to_string()));
+        }
+        Ok(self
+            .declined_relationships()?
+            .into_iter()
+            .find(|declined| declined.remote_profile_did == remote_profile_did)
+            .map(|declined| declined.display_name))
+    }
+
+    /// The relationship with one Profile DID, over both request kinds.
+    pub(crate) fn relationship_with(
+        &self,
+        remote_profile_did: &str,
+        now: u64,
+    ) -> anyhow::Result<CollaborationContactRelationship> {
+        if remote_profile_did == self.store.local_profile_did {
+            return Ok(CollaborationContactRelationship::OwnProfile);
+        }
+        Ok(self
+            .relationships(now)?
+            .remove(remote_profile_did)
+            .unwrap_or(CollaborationContactRelationship::None))
+    }
+
+    /// Every Profile DID this Home has a relationship with, keyed by DID,
+    /// with the precedence documented on `CollaborationContactRelationship`.
+    pub(crate) fn relationships(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<HashMap<String, CollaborationContactRelationship>> {
+        let mut relationships = HashMap::new();
+        // Lowest precedence first; each later fact overwrites.
+        for declined in self.declined_relationships()? {
+            relationships.insert(
+                declined.remote_profile_did,
+                CollaborationContactRelationship::Declined,
+            );
+        }
+        let snapshot = self.snapshot()?;
+        for removed in snapshot.removed() {
+            relationships.insert(
+                removed.remote_profile_did().to_string(),
+                CollaborationContactRelationship::Removed {
+                    by_local: removed.removed_by_local(),
+                },
+            );
+        }
+        for request in self.outgoing_pending_requests(now)? {
+            relationships.insert(
+                request.recipient_profile_did,
+                CollaborationContactRelationship::Requested,
+            );
+        }
+        for request in self.pending_incoming_requests()? {
+            relationships.insert(
+                request.requester_profile_did().to_string(),
+                CollaborationContactRelationship::PendingFromThem {
+                    request_hash: request.request_hash().to_string(),
+                },
+            );
+        }
+        for contact in snapshot.contacts() {
+            relationships.insert(
+                contact.remote_profile_did().to_string(),
+                CollaborationContactRelationship::Contact {
+                    conversation_id: contact.conversation_id().to_string(),
+                },
+            );
+        }
+        Ok(relationships)
     }
 
     /// Chains whose terminal decision was Declined, in either direction.
@@ -723,7 +893,7 @@ impl CollaborationContactStore {
     pub(crate) fn outgoing_pending_requests(
         &self,
         now: u64,
-    ) -> anyhow::Result<Vec<CollaborationRelationshipEvent>> {
+    ) -> anyhow::Result<Vec<CollaborationOutgoingContactRequest>> {
         self.read_only_snapshot()?.outgoing_pending_requests(now)
     }
 

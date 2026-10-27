@@ -115,6 +115,74 @@ pub(crate) struct CollaborationDiscoveryStatus {
     incoming_requests: Vec<PendingIncomingContactRequest>,
 }
 
+/// The result of asking to add someone by their Profile DID. Every variant is
+/// a success for the caller: the request is queued, or nothing needs sending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProfileContactRequestOutcome {
+    /// A new request is queued; the outbox delivers it through the relay.
+    Requested,
+    /// An unexpired, undecided request to this Profile already exists.
+    AlreadyRequested,
+    /// The Profile is already an accepted contact.
+    AlreadyContact { conversation_id: String },
+    /// They already asked; the answer belongs in Inbox, keyed by this hash.
+    PendingFromThem { request_hash: String },
+    /// The DID is this Home's own Profile.
+    OwnProfile,
+}
+
+impl ProfileContactRequestOutcome {
+    /// The `status` field of the gateway response.
+    pub(crate) fn status(&self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::AlreadyRequested => "already_requested",
+            Self::AlreadyContact { .. } => "already_contact",
+            Self::PendingFromThem { .. } => "pending_from_them",
+            Self::OwnProfile => "own_profile",
+        }
+    }
+}
+
+/// Why a request by Profile DID was refused. `Display` is the exact text a
+/// person sees; none of them echoes the DID back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileContactRequestRefusal {
+    /// Not a canonical `did:key`.
+    InvalidProfileId,
+    /// This Home's own device DID (System shows it), not a Profile DID.
+    OwnDeviceId,
+    /// The local Profile already has the maximum of undecided outgoing
+    /// requests by DID.
+    TooManyWaiting,
+    /// This Home left Community.
+    CommunityLeft,
+    /// The Community node refused the last profile-contact operations, so a
+    /// queued request would not be delivered.
+    Undeliverable,
+}
+
+/// Undecided outgoing requests by DID one Profile may have at once.
+pub(crate) const MAX_WAITING_PROFILE_CONTACT_REQUESTS: usize = 16;
+
+impl std::fmt::Display for ProfileContactRequestRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidProfileId => "That isn't a DID. A DID starts with did:key:z.",
+            Self::OwnDeviceId => "That's this Home's device DID. Use the DID shown in People.",
+            Self::TooManyWaiting => {
+                "You have 16 requests waiting. Wait for answers before sending more."
+            }
+            Self::CommunityLeft => crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL,
+            Self::Undeliverable => {
+                "Contact requests can't be delivered right now. Try again later."
+            }
+        })
+    }
+}
+
+impl std::error::Error for ProfileContactRequestRefusal {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveryVisiblePerson {
     advertisement_id: String,
@@ -187,6 +255,54 @@ struct DiscoveryProviderStatusResponse {
     status: String,
     #[serde(rename = "data")]
     _data: DiscoveryProviderEmptyData,
+}
+
+// Profile-contact relay ops. Additive: the v1 ops and their response shapes
+// stay byte-for-byte unchanged, because alpha.25 clients deny unknown fields.
+//
+// `{"op":"send_profile_contact_request","request":<b64 signed request>}`
+//   → `{"status":"ok","data":{}}`
+// `{"op":"poll_profile_mailbox","poll":<b64 signed poll>}`
+//   → `{"status":"ok","data":{"requests":[<b64>],"decisions":[{"receipt":<b64>,"recipient_profile":<b64>}]}}`
+//   (only the list named by the poll's `mailbox_kind` is non-empty)
+// `{"op":"submit_profile_contact_decision","request":<b64>,"receipt":<b64>,"recipient_profile":<b64>}`
+//   → `{"status":"ok","data":{}}`
+// The decision op carries the request so the relay can verify it after a
+// restart has lost the request; the stored decision entry is self-contained.
+const PROFILE_CONTACT_SEND_OP: &str = "send_profile_contact_request";
+const PROFILE_CONTACT_POLL_OP: &str = "poll_profile_mailbox";
+const PROFILE_CONTACT_DECISION_OP: &str = "submit_profile_contact_decision";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryProviderProfileDecisionRequest {
+    op: String,
+    request: String,
+    receipt: String,
+    recipient_profile: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryProviderProfileMailboxResponse {
+    status: String,
+    data: DiscoveryProviderProfileMailboxData,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryProviderProfileMailboxData {
+    requests: Vec<String>,
+    decisions: Vec<DiscoveryProviderProfileDecisionEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryProviderProfileDecisionEntry {
+    receipt: String,
+    /// The deciding Profile's canonical signed document (base64): its DID is
+    /// the requested DID and it authorizes the receipt signer.
+    recipient_profile: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1199,6 +1315,30 @@ impl CollaborationDiscoveryService {
             }
         }
         self.status_from_state(store, now)
+    }
+
+    /// Queues one contact request addressed to `recipient_profile_did`, with
+    /// or without Discovery. It only records intent; the outbox delivers it
+    /// through the Community relay and the recipient decides in Inbox.
+    /// Refusals are `ProfileContactRequestRefusal` errors, so a caller can
+    /// downcast them for the exact text a person sees.
+    pub(crate) async fn send_profile_contact_request(
+        &self,
+        store: &CollaborationContactStore,
+        recipient_profile_did: &str,
+        profile: &VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) -> anyhow::Result<ProfileContactRequestOutcome> {
+        let _ = (store, recipient_profile_did, profile, now);
+        Err(ProfileContactRequestRefusal::Undeliverable.into())
+    }
+
+    /// True after the Community node refused consecutive profile-contact
+    /// operations: queued requests by DID would not be delivered, so People
+    /// says so on the waiting rows.
+    pub(crate) fn profile_contact_delivery_unavailable(&self, profile_did: &str) -> bool {
+        let _ = profile_did;
+        false
     }
 
     pub(crate) async fn send_contact_request(

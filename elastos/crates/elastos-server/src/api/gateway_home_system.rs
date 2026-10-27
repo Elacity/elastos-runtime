@@ -174,6 +174,14 @@ pub(super) struct PeopleDiscoveryRequestCreate {
     advertisement_id: String,
 }
 
+/// `POST /api/apps/people/contacts/request`: add someone by the DID they
+/// shared. Response `{status, display_name}`; see `contact_request_response`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PeopleContactRequestCreate {
+    profile_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct HomePeopleDiscoverySummary {
     schema: &'static str,
@@ -577,9 +585,15 @@ pub(super) async fn people_summary(
         } else {
             unconfigured_people_discovery_summary()
         };
+        // The local Profile DID, so People can show "Your DID" and copy it.
+        // It is deliberately not part of `identity`, which never carries DIDs.
+        let profile_id = contact_authority
+            .as_ref()
+            .map(|authority| authority.profile.document().profile_did.clone());
         Ok::<_, anyhow::Error>(serde_json::json!({
             "schema": "elastos.people.summary/v1",
             "identity": identity.without_device_identity(),
+            "profile_id": profile_id,
             "people": people,
             "discovery": discovery,
         }))
@@ -773,6 +787,96 @@ pub(super) async fn people_contact_remove(
     .into_response()
 }
 
+pub(super) async fn people_contact_request_create(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<PeopleContactRequestCreate>,
+) -> Response {
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, PEOPLE_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
+    let Some(service) = state.collaboration_discovery_service.clone() else {
+        return (
+            StatusCode::CONFLICT,
+            "Contacts are unavailable on this Home.",
+        )
+            .into_response();
+    };
+    let data_dir = state.data_dir.clone();
+    let authority = match tokio::task::spawn_blocking({
+        let context = context.clone();
+        let service = service.clone();
+        move || load_configured_contact_authority_for_context(&data_dir, &context, Some(&service))
+    })
+    .await
+    {
+        Ok(Ok(Some(authority))) => authority,
+        Ok(Ok(None)) => {
+            return room_service_error_response(profile_required_error(
+                PROFILE_REQUIRED_PEOPLE_CONTACTS_MESSAGE,
+            ))
+        }
+        Ok(Err(err)) => return room_service_error_response(err),
+        Err(err) => return room_service_join_error_response(err),
+    };
+    let recipient = body.profile_id.trim().to_string();
+    send_profile_contact_request_response(&service, &context, &authority, &recipient).await
+}
+
+/// Queues a request by Profile DID and answers `{status, display_name}`.
+/// `status` is `requested`, `already_requested`, `already_contact`,
+/// `pending_from_them` or `own_profile`; `display_name` is the signed name
+/// this Home holds for the DID, else `CONTACT_NAME_NOT_KNOWN`. A refusal is a
+/// 400 or 409 whose body is the refusal's text, and never echoes the DID.
+pub(super) async fn send_profile_contact_request_response(
+    service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    context: &HomeLaunchTokenContext,
+    authority: &ConfiguredContactAuthority,
+    recipient_profile_did: &str,
+) -> Response {
+    let now = now_ts();
+    let outcome = match service
+        .send_profile_contact_request(
+            authority.store.as_ref(),
+            recipient_profile_did,
+            &authority.profile,
+            now,
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => return room_service_error_response(err),
+    };
+    if let Err(err) = register_configured_contact_sync_for_context(service, context, authority, now)
+        .and_then(|()| service.wake_registered_sync(authority.store.as_ref(), &authority.profile, now))
+    {
+        return room_service_error_response(err);
+    }
+    let display_name = if outcome
+        == crate::collaboration_discovery_runtime::ProfileContactRequestOutcome::OwnProfile
+    {
+        Ok(Some(authority.profile.document().display_name.clone()))
+    } else {
+        authority
+            .store
+            .read_only_snapshot()
+            .and_then(|read| read.display_name_for(recipient_profile_did, now))
+    };
+    let display_name = match display_name {
+        Ok(name) => name.unwrap_or_else(|| {
+            crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN.to_string()
+        }),
+        Err(err) => return room_service_error_response(err),
+    };
+    Json(serde_json::json!({
+        "status": outcome.status(),
+        "display_name": display_name,
+    }))
+    .into_response()
+}
+
 fn configured_people_summary_from_contact_store(
     store: &crate::collaboration_contact_store::CollaborationContactStore,
 ) -> anyhow::Result<HomePeopleSummary> {
@@ -812,16 +916,18 @@ fn configured_people_summary_from_snapshot(
         .map(|contact| contact.remote_profile_did().to_string())
         .collect();
     for requested in read.outgoing_pending_requests(now)? {
-        if !seen.insert(requested.remote_profile_did.clone()) {
+        if !seen.insert(requested.recipient_profile_did.clone()) {
             continue;
         }
         contacts.push(HomePeopleContactSummary {
-            contact_id: home_people_contact_id(&requested.remote_profile_did),
-            remote_profile_did: Some(requested.remote_profile_did.clone()),
-            added_at: requested.occurred_at,
+            contact_id: home_people_contact_id(&requested.recipient_profile_did),
+            remote_profile_did: Some(requested.recipient_profile_did),
+            added_at: requested.created_at,
             conversation_id: None,
-            display_name: requested.display_name.clone(),
-            handle: requested.handle.clone(),
+            display_name: requested.display_name.unwrap_or_else(|| {
+                crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN.to_string()
+            }),
+            handle: requested.handle,
             relationship: "requested".to_string(),
             can_message: false,
             device_label: None,
@@ -908,7 +1014,7 @@ pub(super) fn contact_relationships(
     }
     if let Ok(requests) = store.outgoing_pending_requests(now) {
         for request in requests {
-            relationships.insert(request.remote_profile_did, ("requested", None));
+            relationships.insert(request.recipient_profile_did, ("requested", None));
         }
     }
     if let Ok(snapshot) = store.snapshot() {
