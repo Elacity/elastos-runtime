@@ -1156,6 +1156,11 @@ fn verify_request_envelope(
     envelope_bytes: &[u8],
     expected_requesters: &[String],
 ) -> Result<OperatorRequestPayload> {
+    // The envelope check treats an empty trusted set as "any signer"; an
+    // operator request verifies only against a configured peer.
+    if expected_requesters.is_empty() {
+        anyhow::bail!("requester DID is not configured for operator control");
+    }
     let (value, signer_did) = verify_release_envelope_against_dids(
         envelope_bytes,
         OPERATOR_REQUEST_DOMAIN,
@@ -2526,6 +2531,28 @@ mod tests {
         let audit_path = dir.path().join(OPERATOR_AUDIT_FILE);
 
         let (requester_sk, requester_did) = elastos_identity::derive_did(&[15u8; 32]);
+
+        // With no operator peers configured (the default), a request signed
+        // by any key is denied and leaves no audit entry.
+        let unconfigured = OperatorRequestPayload {
+            version: 1,
+            request_id: "req-unconfigured-1".to_string(),
+            requester_did: requester_did.clone(),
+            target_did: did.clone(),
+            ts: now_ts(),
+            action: OPERATOR_ACTION_STATUS_READ.to_string(),
+            args: serde_json::Value::Null,
+        };
+        let signed = sign_envelope(&requester_sk, OPERATOR_REQUEST_DOMAIN, &unconfigured).unwrap();
+        let answer = client.send_request(&signed).await.unwrap();
+        let denied = verify_response_envelope(&answer, &did).unwrap();
+        assert!(!denied.accepted);
+        assert_eq!(
+            denied.error.as_deref(),
+            Some("requester DID is not configured for operator control")
+        );
+        assert!(!audit_path.exists());
+
         upsert_peer(
             dir.path(),
             OperatorPeer {
