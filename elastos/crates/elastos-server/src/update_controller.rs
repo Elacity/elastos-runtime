@@ -1300,6 +1300,10 @@ impl Controller {
                 }
                 .context(crate::update::UpdateSourceUnavailable)?;
                 if cid == choice.head_cid {
+                    // Bytes that differ from the chosen CID may be transport damage: retryable.
+                    crate::update::mismatched(crate::update::verify_release_metadata_cid(
+                        &cid, &bytes,
+                    ))?;
                     crate::update::refused(verify_update_choice(&bytes, &choice, &trusted))?;
                 }
                 Ok(bytes)
@@ -1564,7 +1568,6 @@ pub(crate) fn verify_update_choice(
     choice: &UpdateRequest,
     source: &TrustedSource,
 ) -> Result<()> {
-    crate::update::verify_release_metadata_cid(&choice.head_cid, bytes)?;
     let (head, signer) = crate::crypto::verify_release_envelope_against_dids(
         bytes,
         "elastos.release.head.v1",

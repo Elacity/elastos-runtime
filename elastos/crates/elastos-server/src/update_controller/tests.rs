@@ -771,7 +771,6 @@ fn signed_update_choice_requires_the_exact_head_release_publisher_version_and_ch
     let (source, choice, head) = choice_fixture();
     verify_update_choice(&head, &choice, &source).unwrap();
     for refusal in [
-        "head CID",
         "release CID",
         "version",
         "chosen publisher",
@@ -784,10 +783,6 @@ fn signed_update_choice_requires_the_exact_head_release_publisher_version_and_ch
         let mut choice = choice.clone();
         let mut value: Value = serde_json::from_slice(&head).unwrap();
         let bytes = match refusal {
-            "head CID" => {
-                choice.head_cid = raw_cid(b"another head");
-                head.clone()
-            }
             "release CID" => {
                 choice.release_cid = raw_cid(b"another release");
                 head.clone()
@@ -819,9 +814,7 @@ fn signed_update_choice_requires_the_exact_head_release_publisher_version_and_ch
             "signing domain" => signed(value["payload"].clone(), "elastos.release.v1"),
             _ => unreachable!(),
         };
-        if !matches!(refusal, "head CID") {
-            choice.head_cid = raw_cid(&bytes);
-        }
+        choice.head_cid = raw_cid(&bytes);
         assert!(
             verify_update_choice(&bytes, &choice, &source).is_err(),
             "{refusal}"
@@ -882,6 +875,75 @@ fn canary_update_choice_accepts_only_the_trusted_signers_stable_head() {
         let error = verify_update_choice(&bytes, &choice, &source).unwrap_err();
         assert!(error.to_string().contains(expected), "{case}: {error:#}");
     }
+}
+
+/// Bytes that do not match the chosen head CID are a retryable download
+/// mismatch through the real apply path, never a recorded refusal.
+#[tokio::test]
+async fn apply_keeps_a_head_cid_mismatch_retryable_and_records_no_refusal() {
+    let fixture = PrivateFixture::new();
+    let source = fixture.publish_installed_release();
+    publish_retained_receipt(&fixture);
+    let release = signed(
+        json!({"schema":"elastos.release/v1","version":"0.7.1","channel":"stable","platforms":{}}),
+        "elastos.release.v1",
+    );
+    let head = signed(
+        json!({
+            "schema":"elastos.release.head/v1","version":"0.7.1","channel":"stable",
+            "latest_release_cid":raw_cid(&release),"release_sha256":digest(&release)
+        }),
+        "elastos.release.head.v1",
+    );
+    let (_, mut request, _) = choice_fixture();
+    request.head_cid = raw_cid(&head);
+    request.release_cid = raw_cid(&release);
+    verify_update_choice(&head, &request, &installed_source(&fixture.data).unwrap()).unwrap();
+    let mut truncated = head.clone();
+    truncated.truncate(head.len() / 2);
+    let (_reachable, endpoint, serving) = crate::setup::tests::carrier_cid_source(
+        &fixture.data,
+        &source,
+        std::collections::HashMap::from([
+            (request.head_cid.clone(), truncated),
+            (request.release_cid.clone(), release),
+        ]),
+    )
+    .await;
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command.args(["-c", "exec sleep 60"]);
+    let mut controller = Controller {
+        receipt: read_private_json(&fixture.directory.join(RECEIPT)).unwrap(),
+        directory: fixture.directory.clone(),
+        child: Some(child::OwnedChild::spawn(&mut command).unwrap()),
+        request: Some(request.clone()),
+        previous_binary_sha256: String::new(),
+        previous_version: String::new(),
+        generation: "a".repeat(32),
+        host_ready: true,
+        carrier: None,
+        carrier_close: None,
+        test_readiness: None,
+    };
+    controller
+        .publish("staging", "Checking the signed update.")
+        .unwrap();
+    let result = controller.apply().await;
+    controller.publish_apply_result(&result).unwrap();
+    endpoint.close().await;
+    serving.await.unwrap();
+    let error = result.unwrap_err();
+    assert_eq!(
+        classify_apply_failure(&error),
+        ApplyFailure::DownloadMismatch,
+        "{error:#}"
+    );
+    assert_eq!(
+        status(&fixture.data).unwrap().unwrap().message,
+        ApplyFailure::DownloadMismatch.message()
+    );
+    assert!(!fixture.directory.join(REFUSED).exists());
+    assert!(!release_refused(&fixture.data, &request.head_cid, &request.release_cid).unwrap());
 }
 
 #[test]
