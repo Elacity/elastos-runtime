@@ -20,7 +20,8 @@ use elastos_runtime::signature::SigningKey;
 use serde::{Deserialize, Serialize};
 
 use crate::collaboration_contact_store::{
-    CollaborationContactStore, ContactStoreWrite, PendingIncomingContactRequest,
+    CollaborationContactRelationship, CollaborationContactStore, ContactStoreWrite,
+    PendingIncomingContactRequest,
 };
 use crate::collaboration_core::random_hex_128;
 use crate::collaboration_direct_messages::CollaborationDirectMessageService;
@@ -28,12 +29,16 @@ use crate::collaboration_discovery::{
     canonical_signed_collaboration_contact_decision_receipt_bytes,
     verify_collaboration_contact_decision_receipt, verify_collaboration_contact_request,
     verify_collaboration_discovery_advertisement, verify_collaboration_discovery_mailbox_poll,
-    verify_collaboration_discovery_withdrawal, CollaborationContactDecision,
-    CollaborationContactDecisionReceipt, CollaborationContactRequestPayload,
-    CollaborationDiscoveryAdvertisementPayload, CollaborationDiscoveryMailboxKind,
-    CollaborationDiscoveryMailboxPollPayload, CollaborationDiscoveryWithdrawalPayload,
-    SignedCollaborationContactDecisionReceipt, VerifiedCollaborationContactRequest,
-    VerifiedCollaborationDiscoveryAdvertisement, COLLABORATION_CONTACT_DECISION_RECEIPT_SCHEMA_V1,
+    verify_collaboration_discovery_withdrawal,
+    verify_collaboration_profile_contact_decision_receipt,
+    verify_collaboration_profile_contact_request, verify_collaboration_profile_mailbox_poll,
+    CollaborationContactDecision, CollaborationContactDecisionReceipt,
+    CollaborationContactRequestPayload, CollaborationDiscoveryAdvertisementPayload,
+    CollaborationDiscoveryMailboxKind, CollaborationDiscoveryMailboxPollPayload,
+    CollaborationDiscoveryWithdrawalPayload, CollaborationProfileContactRequestPayload,
+    CollaborationProfileMailboxPollPayload, SignedCollaborationContactDecisionReceipt,
+    VerifiedCollaborationContactRequest, VerifiedCollaborationDiscoveryAdvertisement,
+    VerifiedCollaborationProfileContactRequest, COLLABORATION_CONTACT_DECISION_RECEIPT_SCHEMA_V1,
     COLLABORATION_CONTACT_DECISION_RECEIPT_SIGNATURE_DOMAIN_V1,
     COLLABORATION_DISCOVERY_ADVERTISEMENT_PAYLOAD_TYPE,
     COLLABORATION_DISCOVERY_ADVERTISEMENT_TTL_SECS, COLLABORATION_DISCOVERY_CONTACT_ID,
@@ -41,6 +46,7 @@ use crate::collaboration_discovery::{
     COLLABORATION_DISCOVERY_CONTACT_REQUEST_TTL_SECS, COLLABORATION_DISCOVERY_CONTROL_TTL_SECS,
     COLLABORATION_DISCOVERY_DIRECTORY_ID, COLLABORATION_DISCOVERY_MAILBOX_POLL_PAYLOAD_TYPE,
     COLLABORATION_DISCOVERY_SERVICE, COLLABORATION_DISCOVERY_WITHDRAWAL_PAYLOAD_TYPE,
+    COLLABORATION_PROFILE_CONTACT_ID, COLLABORATION_PROFILE_CONTACT_REQUEST_TTL_SECS,
     MAX_COLLABORATION_CONTACT_DECISION_RECEIPT_BYTES,
 };
 use crate::collaboration_network::{
@@ -88,6 +94,23 @@ const DISCOVERY_SYNC_MAX_BACKOFF_SECS: u64 = 60;
 /// relay pass retries within this bound instead of the idle backoff ceiling.
 const DISCOVERY_SYNC_ENABLED_MAX_BACKOFF_SECS: u64 = 15;
 const MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC: usize = 4;
+// Relay limits for requests addressed by Profile DID. They live 24 h, so the
+// totals are larger than v1's; per-identity limits bound one identity only,
+// and the per-recipient cap bounds what a flood can do to one person.
+const MAX_PROFILE_REQUESTS_PER_SENDER: usize = 8;
+const MAX_PROFILE_REQUESTS_PER_DEVICE: usize = 16;
+const MAX_PROFILE_REQUESTS_PER_RECIPIENT: usize = 16;
+const MAX_PROFILE_TOTAL_REQUESTS: usize = 512;
+const MAX_PROFILE_DECISIONS_PER_REQUESTER: usize = 32;
+const MAX_PROFILE_TOTAL_DECISIONS: usize = 512;
+/// One new request by DID per device per this many seconds.
+const PROFILE_REQUEST_DEVICE_INTERVAL_SECS: u64 = 5;
+/// Consecutive relay refusals of a profile-contact operation before People
+/// says requests can't be delivered (the Community node is too old).
+const PROFILE_RELAY_REFUSALS_BEFORE_UNDELIVERABLE: usize = 3;
+const UNSUPPORTED_RELAY_OPERATION: &str = "unsupported collaboration discovery operation";
+/// A signed Profile beside a decision larger than this is refused unparsed.
+const MAX_RELAY_SIGNED_PROFILE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct CollaborationDiscoveryService {
@@ -101,6 +124,9 @@ pub struct CollaborationDiscoveryService {
     intent_mutex: Arc<Mutex<()>>,
     direct_messages: CollaborationDirectMessageService,
     profile_updates: crate::collaboration_profile_updates::CollaborationProfileUpdateService,
+    /// Consecutive relay refusals of profile-contact operations ("unsupported
+    /// operation" from a Community node older than 0.8.0); reset by success.
+    profile_relay_refusals: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,22 +188,26 @@ pub(crate) enum ProfileContactRequestRefusal {
     Undeliverable,
 }
 
-/// Undecided outgoing requests by DID one Profile may have at once.
-pub(crate) const MAX_WAITING_PROFILE_CONTACT_REQUESTS: usize = 16;
-
 impl std::fmt::Display for ProfileContactRequestRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::InvalidProfileId => "That isn't a DID. A DID starts with did:key:z.",
-            Self::OwnDeviceId => "That's this Home's device DID. Use the DID shown in People.",
-            Self::TooManyWaiting => {
-                "You have 16 requests waiting. Wait for answers before sending more."
+        match self {
+            Self::InvalidProfileId => {
+                formatter.write_str("That isn't a DID. A DID starts with did:key:z.")
             }
-            Self::CommunityLeft => crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL,
-            Self::Undeliverable => {
-                "Contact requests can't be delivered right now. Try again later."
+            Self::OwnDeviceId => {
+                formatter.write_str("That's this Home's device DID. Use the DID shown in People.")
             }
-        })
+            Self::TooManyWaiting => write!(
+                formatter,
+                "You have {} requests waiting. Wait for answers before sending more.",
+                crate::collaboration_contact_store::MAX_WAITING_OUTGOING_PROFILE_REQUESTS
+            ),
+            Self::CommunityLeft => {
+                formatter.write_str(crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL)
+            }
+            Self::Undeliverable => formatter
+                .write_str("Contact requests can't be delivered right now. Try again later."),
+        }
     }
 }
 
@@ -404,6 +434,15 @@ struct DiscoveryRelayState {
     advertisements: HashMap<String, CachedAdvertisement>,
     requests: HashMap<String, RelayContactRequest>,
     request_mailboxes: HashMap<String, Vec<String>>,
+    /// Requests addressed by Profile DID, in their own mailboxes so an
+    /// alpha.25 poll of the v1 mailboxes never meets one.
+    profile_requests: HashMap<String, RelayProfileContactRequest>,
+    profile_request_mailboxes: HashMap<String, Vec<String>>,
+    /// Self-contained decision entries per requester Profile DID; they stay
+    /// until their own expiry even after the request is gone.
+    profile_decision_mailboxes: HashMap<String, Vec<RelayProfileDecision>>,
+    /// When each device last sent a new request by DID.
+    profile_request_sent_at: HashMap<String, u64>,
     decision_mailboxes: HashMap<String, Vec<RelayDecision>>,
 }
 
@@ -418,6 +457,21 @@ struct RelayContactRequest {
 struct RelayDecision {
     envelope_bytes: Vec<u8>,
     request_hash: String,
+}
+
+#[derive(Clone)]
+struct RelayProfileContactRequest {
+    envelope_bytes: Vec<u8>,
+    verified: VerifiedCollaborationProfileContactRequest,
+}
+
+/// Everything the requester needs, without the relay holding the request.
+#[derive(Clone)]
+struct RelayProfileDecision {
+    request_hash: String,
+    receipt_bytes: Vec<u8>,
+    recipient_profile_bytes: Vec<u8>,
+    expires_at: u64,
 }
 
 impl CollaborationDiscoveryService {
@@ -456,6 +510,7 @@ impl CollaborationDiscoveryService {
             intent_mutex: Arc::new(Mutex::new(())),
             direct_messages,
             profile_updates,
+            profile_relay_refusals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -1192,6 +1247,15 @@ impl CollaborationDiscoveryService {
         // published/pending pointer before deciding whether to renew it.
         store.clear_expired_published_local_advertisement(now)?;
         let stored_current = self.stored_published_local_advertisement(store, now)?;
+        // Requests by DID do not depend on Discovery: anyone holding this
+        // Profile's DID may ask, so its mailboxes are read on every joined
+        // pass. A failure here never marks Discovery unavailable.
+        if let Err(err) = self.sync_profile_contacts(store, profile, now).await {
+            tracing::debug!(
+                error = %format!("{err:#}"),
+                "Profile contact relay pass failed; retrying on the next pass"
+            );
+        }
         let has_pending_outbox = !store
             .resendable_outgoing_contact_requests(now, 1)?
             .is_empty()
@@ -1329,16 +1393,214 @@ impl CollaborationDiscoveryService {
         profile: &VerifiedCollaborationProfileDocument,
         now: u64,
     ) -> anyhow::Result<ProfileContactRequestOutcome> {
-        let _ = (store, recipient_profile_did, profile, now);
-        Err(ProfileContactRequestRefusal::Undeliverable.into())
+        let recipient_profile_did = recipient_profile_did.trim();
+        if !recipient_profile_did.starts_with("did:key:z")
+            || crate::crypto::decode_did_key(recipient_profile_did).is_err()
+        {
+            return Err(ProfileContactRequestRefusal::InvalidProfileId.into());
+        }
+        let profile_did = self.require_profile_store_match(store, profile)?;
+        if recipient_profile_did == profile_did {
+            return Ok(ProfileContactRequestOutcome::OwnProfile);
+        }
+        if recipient_profile_did == self.authority.local_device_did() {
+            return Err(ProfileContactRequestRefusal::OwnDeviceId.into());
+        }
+        if !self.community_joined() {
+            return Err(ProfileContactRequestRefusal::CommunityLeft.into());
+        }
+        let _guard = self
+            .intent_mutex
+            .lock()
+            .map_err(|_| anyhow::anyhow!("discovery intent lock is poisoned"))?;
+        let _community_choice = match self.community_membership.as_ref() {
+            Some(membership) => match membership.lock_joined() {
+                Ok(guard) => Some(guard),
+                Err(_) if !membership.joined() => {
+                    return Err(ProfileContactRequestRefusal::CommunityLeft.into())
+                }
+                Err(err) => return Err(err),
+            },
+            None => None,
+        };
+        match store
+            .read_only_snapshot()?
+            .relationship_with(recipient_profile_did, now)?
+        {
+            CollaborationContactRelationship::OwnProfile => {
+                return Ok(ProfileContactRequestOutcome::OwnProfile)
+            }
+            CollaborationContactRelationship::Contact { conversation_id } => {
+                return Ok(ProfileContactRequestOutcome::AlreadyContact { conversation_id })
+            }
+            CollaborationContactRelationship::PendingFromThem { request_hash } => {
+                return Ok(ProfileContactRequestOutcome::PendingFromThem { request_hash })
+            }
+            CollaborationContactRelationship::Requested => {
+                return Ok(ProfileContactRequestOutcome::AlreadyRequested)
+            }
+            CollaborationContactRelationship::None
+            | CollaborationContactRelationship::Removed { .. }
+            | CollaborationContactRelationship::Declined => {}
+        }
+        if self.profile_contact_delivery_unavailable() {
+            return Err(ProfileContactRequestRefusal::Undeliverable.into());
+        }
+        if store.waiting_outgoing_profile_request_count(now)?
+            >= crate::collaboration_contact_store::MAX_WAITING_OUTGOING_PROFILE_REQUESTS
+        {
+            return Err(ProfileContactRequestRefusal::TooManyWaiting.into());
+        }
+        let request = self
+            .authority
+            .prepare_profile_contact_request(recipient_profile_did, profile, now)?;
+        store.record_outgoing_profile_contact_request(&request, now)?;
+        Ok(ProfileContactRequestOutcome::Requested)
     }
 
     /// True after the Community node refused consecutive profile-contact
-    /// operations: queued requests by DID would not be delivered, so People
-    /// says so on the waiting rows.
-    pub(crate) fn profile_contact_delivery_unavailable(&self, profile_did: &str) -> bool {
-        let _ = profile_did;
-        false
+    /// operations as unsupported: requests by DID would not be delivered, so
+    /// sending is refused and People says so on the waiting rows.
+    pub(crate) fn profile_contact_delivery_unavailable(&self) -> bool {
+        self.profile_relay_refusals
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= PROFILE_RELAY_REFUSALS_BEFORE_UNDELIVERABLE
+    }
+
+    /// Counts a relay answer to a profile-contact operation: only an
+    /// "unsupported operation" refusal says the Community node is too old;
+    /// any success resets the count.
+    fn note_profile_relay_result<T>(&self, result: &anyhow::Result<T>) {
+        match result {
+            Ok(_) => self
+                .profile_relay_refusals
+                .store(0, std::sync::atomic::Ordering::SeqCst),
+            Err(err) if format!("{err:#}").contains(UNSUPPORTED_RELAY_OPERATION) => {
+                self.profile_relay_refusals
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// One pass of the Profile-contact plane, run on every joined pass
+    /// whatever the Discovery setting: send queued requests and decisions,
+    /// then read this Profile's mailboxes. A bad mailbox entry is logged and
+    /// skipped; it never stops the rest.
+    async fn sync_profile_contacts(
+        &self,
+        store: &CollaborationContactStore,
+        profile: &VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        let mut first_failure: Option<anyhow::Error> = None;
+        for request in store
+            .resendable_outgoing_profile_contact_requests(now, MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC)?
+        {
+            let sent = self
+                .invoke_bootstrap(
+                    PROFILE_CONTACT_SEND_OP,
+                    serde_json::to_value(DiscoveryProviderContactRequest {
+                        op: PROFILE_CONTACT_SEND_OP.to_string(),
+                        request: encode_bytes(&request),
+                    })?,
+                )
+                .await
+                .and_then(|response| {
+                    require_discovery_provider_success(response, "contact request submission")
+                });
+            self.note_profile_relay_result(&sent);
+            if let Err(err) = sent {
+                first_failure.get_or_insert(err);
+            }
+        }
+        for decision in
+            store.resendable_profile_contact_decisions(now, MAX_DISCOVERY_OUTBOX_SENDS_PER_SYNC)?
+        {
+            let sent = self
+                .invoke_bootstrap(
+                    PROFILE_CONTACT_DECISION_OP,
+                    serde_json::to_value(DiscoveryProviderProfileDecisionRequest {
+                        op: PROFILE_CONTACT_DECISION_OP.to_string(),
+                        request: encode_bytes(&decision.request),
+                        receipt: encode_bytes(&decision.receipt),
+                        recipient_profile: encode_bytes(&decision.recipient_profile),
+                    })?,
+                )
+                .await
+                .and_then(|response| {
+                    require_discovery_provider_success(response, "contact decision submission")
+                });
+            self.note_profile_relay_result(&sent);
+            if let Err(err) = sent {
+                first_failure.get_or_insert(err);
+            }
+        }
+        for kind in [
+            CollaborationDiscoveryMailboxKind::Requests,
+            CollaborationDiscoveryMailboxKind::Decisions,
+        ] {
+            let polled = self.poll_profile_mailbox(store, profile, kind, now).await;
+            self.note_profile_relay_result(&polled);
+            if let Err(err) = polled {
+                first_failure.get_or_insert(err);
+            }
+        }
+        match first_failure {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    async fn poll_profile_mailbox(
+        &self,
+        store: &CollaborationContactStore,
+        profile: &VerifiedCollaborationProfileDocument,
+        kind: CollaborationDiscoveryMailboxKind,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        let poll = self
+            .authority
+            .prepare_profile_mailbox_poll(profile, kind, now)?;
+        let response = self
+            .invoke_bootstrap(
+                PROFILE_CONTACT_POLL_OP,
+                serde_json::to_value(DiscoveryProviderMailboxPollRequest {
+                    op: PROFILE_CONTACT_POLL_OP.to_string(),
+                    poll: encode_bytes(&poll),
+                })?,
+            )
+            .await?;
+        let response: DiscoveryProviderProfileMailboxResponse =
+            serde_json::from_value(response).context("invalid Profile contact mailbox response")?;
+        if response.status != "ok" {
+            anyhow::bail!("Profile contact mailbox returned an error");
+        }
+        for request in response.data.requests {
+            let recorded = decode_bytes(&request, "Profile contact request")
+                .and_then(|bytes| store.record_incoming_profile_contact_request(&bytes, now));
+            if let Err(err) = recorded {
+                tracing::info!(
+                    error = %format!("{err:#}"),
+                    "skipped a contact request from the Profile contact mailbox"
+                );
+            }
+        }
+        for decision in response.data.decisions {
+            let recorded = decode_bytes(&decision.receipt, "Profile contact decision")
+                .and_then(|receipt| {
+                    let recipient_profile =
+                        decode_bytes(&decision.recipient_profile, "Profile contact decision")?;
+                    store.record_profile_contact_decision(&receipt, &recipient_profile, now)
+                });
+            if let Err(err) = recorded {
+                tracing::info!(
+                    error = %format!("{err:#}"),
+                    "skipped a decision from the Profile contact mailbox"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn send_contact_request(
@@ -1421,6 +1683,33 @@ impl CollaborationDiscoveryService {
                 .as_ref()
                 .map(|membership| membership.lock_joined())
                 .transpose()?;
+            if store.is_profile_contact_request(request_hash)? {
+                // A request addressed by DID: the decision carries this
+                // Profile's current signed document, which the requester
+                // checks against the DID it asked.
+                match store.stored_profile_contact_decision(request_hash)? {
+                    Some(stored) if stored != decision => {
+                        anyhow::bail!("contact request already has a different terminal decision")
+                    }
+                    Some(_) => {}
+                    None => {
+                        let request = store
+                            .pending_incoming_profile_request(request_hash, now)?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("contact request is not waiting for a decision")
+                            })?;
+                        let receipt = self.authority.prepare_profile_contact_decision_receipt(
+                            &request, profile, decision, now,
+                        )?;
+                        store.record_profile_contact_decision(
+                            &receipt,
+                            &serde_json::to_vec(profile.signed_envelope())?,
+                            now,
+                        )?;
+                    }
+                }
+                return Ok(());
+            }
             match store.stored_contact_decision_receipt(request_hash)? {
                 Some(receipt) => {
                     let stored_receipt: SignedCollaborationContactDecisionReceipt =
@@ -2358,7 +2647,104 @@ impl CollaborationDiscoveryAuthority {
         decision: CollaborationContactDecision,
         decided_at: u64,
     ) -> anyhow::Result<Vec<u8>> {
-        if request.message().envelope().payload.recipient.id != profile.document().profile_did {
+        self.sign_contact_decision_receipt(
+            request.message(),
+            request.profile(),
+            profile,
+            decision,
+            decided_at,
+        )
+    }
+
+    /// A request addressed to `recipient_profile_did`, carrying this
+    /// Profile's signed document. It is only queued; the outbox sends it.
+    fn prepare_profile_contact_request(
+        &self,
+        recipient_profile_did: &str,
+        profile: &VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        if !profile.authorizes_endpoint(&self.local_device_did()) {
+            anyhow::bail!("local endpoint is not authorized by the signed Profile");
+        }
+        let envelope = self.sign_message(
+            &profile.document().profile_did,
+            COLLABORATION_PROFILE_CONTACT_ID,
+            CollaborationRecipient {
+                kind: CollaborationRecipientKind::Profile,
+                id: recipient_profile_did.to_string(),
+            },
+            COLLABORATION_DISCOVERY_CONTACT_REQUEST_PAYLOAD_TYPE,
+            canonical_payload_value(&CollaborationProfileContactRequestPayload {
+                signed_profile: profile.signed_envelope().clone(),
+            })?,
+            CollaborationMessageTiming {
+                created_at: now,
+                ttl_secs: COLLABORATION_PROFILE_CONTACT_REQUEST_TTL_SECS,
+            },
+        )?;
+        verify_collaboration_profile_contact_request(&envelope, &self.profile, now)?;
+        Ok(envelope)
+    }
+
+    /// A poll of this Profile's mailbox for requests by DID or answers to
+    /// them. It carries the signed Profile, so the relay needs no listing.
+    fn prepare_profile_mailbox_poll(
+        &self,
+        profile: &VerifiedCollaborationProfileDocument,
+        mailbox_kind: CollaborationDiscoveryMailboxKind,
+        now: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        if !profile.authorizes_endpoint(&self.local_device_did()) {
+            anyhow::bail!("local endpoint is not authorized by the signed Profile");
+        }
+        let envelope = self.sign_message(
+            &profile.document().profile_did,
+            COLLABORATION_PROFILE_CONTACT_ID,
+            CollaborationRecipient {
+                kind: CollaborationRecipientKind::Profile,
+                id: profile.document().profile_did.clone(),
+            },
+            COLLABORATION_DISCOVERY_MAILBOX_POLL_PAYLOAD_TYPE,
+            canonical_payload_value(&CollaborationProfileMailboxPollPayload {
+                mailbox_kind,
+                signed_profile: profile.signed_envelope().clone(),
+            })?,
+            CollaborationMessageTiming {
+                created_at: now,
+                ttl_secs: COLLABORATION_DISCOVERY_CONTROL_TTL_SECS,
+            },
+        )?;
+        verify_collaboration_profile_mailbox_poll(&envelope, &self.profile, now)?;
+        Ok(envelope)
+    }
+
+    fn prepare_profile_contact_decision_receipt(
+        &self,
+        request: &VerifiedCollaborationProfileContactRequest,
+        profile: &VerifiedCollaborationProfileDocument,
+        decision: CollaborationContactDecision,
+        decided_at: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.sign_contact_decision_receipt(
+            request.message(),
+            request.profile(),
+            profile,
+            decision,
+            decided_at,
+        )
+    }
+
+    fn sign_contact_decision_receipt(
+        &self,
+        request_message: &crate::collaboration_protocol::VerifiedCollaborationMessage,
+        requester_profile: &VerifiedCollaborationProfileDocument,
+        profile: &VerifiedCollaborationProfileDocument,
+        decision: CollaborationContactDecision,
+        decided_at: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let request_payload = &request_message.envelope().payload;
+        if request_payload.recipient.id != profile.document().profile_did {
             anyhow::bail!("contact decision recipient does not match this Profile");
         }
         let local_endpoint_did = self.local_device_did();
@@ -2367,13 +2753,13 @@ impl CollaborationDiscoveryAuthority {
         }
         let payload = CollaborationContactDecisionReceipt {
             schema: COLLABORATION_CONTACT_DECISION_RECEIPT_SCHEMA_V1.to_string(),
-            network_id: request.message().envelope().payload.network_id.clone(),
-            request_envelope_sha256: request.message().envelope_sha256().to_string(),
-            conversation_id: request.message().envelope().payload.conversation_id.clone(),
-            requester_profile_did: request.requester_profile_did().to_string(),
-            requester_endpoint_did: request.route_endpoint_did()?.to_string(),
-            request_message_id: request.message().envelope().payload.message_id.clone(),
-            request_message_nonce: request.message().envelope().payload.nonce.clone(),
+            network_id: request_payload.network_id.clone(),
+            request_envelope_sha256: request_message.envelope_sha256().to_string(),
+            conversation_id: request_payload.conversation_id.clone(),
+            requester_profile_did: requester_profile.document().profile_did.clone(),
+            requester_endpoint_did: requester_profile.sole_endpoint_did()?.to_string(),
+            request_message_id: request_payload.message_id.clone(),
+            request_message_nonce: request_payload.nonce.clone(),
             recipient_profile_did: profile.document().profile_did.clone(),
             recipient_endpoint_did: local_endpoint_did,
             decision,
@@ -2502,6 +2888,10 @@ impl CollaborationDiscoveryRelayProvider {
                 advertisements: HashMap::new(),
                 requests: HashMap::new(),
                 request_mailboxes: HashMap::new(),
+                profile_requests: HashMap::new(),
+                profile_request_mailboxes: HashMap::new(),
+                profile_decision_mailboxes: HashMap::new(),
+                profile_request_sent_at: HashMap::new(),
                 decision_mailboxes: HashMap::new(),
             }),
         }
@@ -2561,6 +2951,288 @@ impl CollaborationDiscoveryRelayProvider {
         state
             .decision_mailboxes
             .retain(|_, mailbox| !mailbox.is_empty());
+        // Requests by DID expire on their own lifetime; decision entries carry
+        // their own expiry and never depend on the request still being here.
+        state.profile_requests.retain(|_, request| {
+            request.verified.message().envelope().payload.expires_at > now
+        });
+        for mailbox in state.profile_request_mailboxes.values_mut() {
+            mailbox.retain(|request_hash| state.profile_requests.contains_key(request_hash));
+        }
+        state
+            .profile_request_mailboxes
+            .retain(|_, mailbox| !mailbox.is_empty());
+        for mailbox in state.profile_decision_mailboxes.values_mut() {
+            mailbox.retain(|decision| {
+                decision
+                    .expires_at
+                    .saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+                    > now
+            });
+        }
+        state
+            .profile_decision_mailboxes
+            .retain(|_, mailbox| !mailbox.is_empty());
+        state.profile_request_sent_at.retain(|_, sent_at| {
+            sent_at.saturating_add(PROFILE_REQUEST_DEVICE_INTERVAL_SECS) > now
+        });
+    }
+}
+
+fn relay_error(err: impl std::fmt::Display) -> ProviderError {
+    ProviderError::Provider(err.to_string())
+}
+
+fn relay_ok() -> serde_json::Value {
+    serde_json::json!({"status":"ok","data":{}})
+}
+
+impl CollaborationDiscoveryRelayProvider {
+    /// Admits one request addressed by Profile DID into the recipient's
+    /// Profile mailbox. Only the signing device may submit it; a replay is
+    /// accepted; a newer request from the same sender to the same recipient
+    /// replaces the older one.
+    fn send_profile_contact_request(
+        &self,
+        state: &mut DiscoveryRelayState,
+        request: &serde_json::Value,
+        now: u64,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let source_endpoint_did = relay_source_endpoint(request)?;
+        let request: DiscoveryProviderContactRequest =
+            parse_discovery_provider_request(request, "Profile contact request submission")?;
+        let envelope_bytes =
+            decode_bytes(&request.request, "Profile contact request").map_err(relay_error)?;
+        let verified =
+            verify_collaboration_profile_contact_request(&envelope_bytes, &self.profile, now)
+                .map_err(relay_error)?;
+        let signer_did = verified.message().envelope().signer_did.clone();
+        require_signing_endpoint(&source_endpoint_did, &signer_did)?;
+        let request_hash = verified.message().envelope_sha256().to_string();
+        let sender = verified.requester_profile_did().to_string();
+        let recipient = verified.recipient_profile_did().to_string();
+        if state.profile_requests.contains_key(&request_hash) {
+            return Ok(relay_ok());
+        }
+        // Already answered: the decision entry stands in for the request.
+        if state
+            .profile_decision_mailboxes
+            .get(&sender)
+            .is_some_and(|mailbox| mailbox.iter().any(|entry| entry.request_hash == request_hash))
+        {
+            return Ok(relay_ok());
+        }
+        if state
+            .profile_request_sent_at
+            .get(&signer_did)
+            .is_some_and(|sent_at| now < sent_at.saturating_add(PROFILE_REQUEST_DEVICE_INTERVAL_SECS))
+        {
+            return Err(relay_error(
+                "Profile contact request rate limit reached for this Home",
+            ));
+        }
+        let replaced: HashSet<String> = state
+            .profile_requests
+            .iter()
+            .filter(|(_, stored)| {
+                stored.verified.requester_profile_did() == sender
+                    && stored.verified.recipient_profile_did() == recipient
+            })
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        let remaining = state
+            .profile_requests
+            .iter()
+            .filter(|(hash, _)| !replaced.contains(*hash));
+        let (mut same_sender, mut same_device, mut total, mut same_recipient) = (0, 0, 0, 0);
+        for (_, stored) in remaining {
+            total += 1;
+            same_sender += usize::from(stored.verified.requester_profile_did() == sender);
+            same_device +=
+                usize::from(stored.verified.message().envelope().signer_did == signer_did);
+            same_recipient += usize::from(stored.verified.recipient_profile_did() == recipient);
+        }
+        if same_sender >= MAX_PROFILE_REQUESTS_PER_SENDER
+            || same_device >= MAX_PROFILE_REQUESTS_PER_DEVICE
+        {
+            return Err(relay_error(
+                "Profile contact request limit reached for this sender",
+            ));
+        }
+        if same_recipient >= MAX_PROFILE_REQUESTS_PER_RECIPIENT {
+            return Err(relay_error("Profile contact mailbox is full"));
+        }
+        if total >= MAX_PROFILE_TOTAL_REQUESTS {
+            return Err(relay_error("Profile contact relay capacity is full"));
+        }
+        state
+            .profile_requests
+            .retain(|hash, _| !replaced.contains(hash));
+        let mailbox = state
+            .profile_request_mailboxes
+            .entry(recipient)
+            .or_default();
+        mailbox.retain(|hash| !replaced.contains(hash));
+        mailbox.push(request_hash.clone());
+        state.profile_requests.insert(
+            request_hash,
+            RelayProfileContactRequest {
+                envelope_bytes,
+                verified,
+            },
+        );
+        state.profile_request_sent_at.insert(signer_did, now);
+        Ok(relay_ok())
+    }
+
+    /// Returns the polling Profile's requests or decision entries. The poll
+    /// carries the signed Profile that proves the polling device belongs to
+    /// it, and only that device may send the poll.
+    fn poll_profile_mailbox(
+        &self,
+        state: &DiscoveryRelayState,
+        request: &serde_json::Value,
+        now: u64,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let source_endpoint_did = relay_source_endpoint(request)?;
+        let request: DiscoveryProviderMailboxPollRequest =
+            parse_discovery_provider_request(request, "Profile contact mailbox poll")?;
+        let envelope_bytes =
+            decode_bytes(&request.poll, "Profile contact mailbox poll").map_err(relay_error)?;
+        let verified = verify_collaboration_profile_mailbox_poll(&envelope_bytes, &self.profile, now)
+            .map_err(relay_error)?;
+        require_signing_endpoint(&source_endpoint_did, verified.polling_endpoint_did())?;
+        let profile_did = verified.profile_did();
+        let mut data = DiscoveryProviderProfileMailboxData::default();
+        match verified.mailbox_kind() {
+            CollaborationDiscoveryMailboxKind::Requests => {
+                if let Some(mailbox) = state.profile_request_mailboxes.get(profile_did) {
+                    data.requests = mailbox
+                        .iter()
+                        .filter_map(|hash| state.profile_requests.get(hash))
+                        .map(|stored| encode_bytes(&stored.envelope_bytes))
+                        .collect();
+                }
+            }
+            CollaborationDiscoveryMailboxKind::Decisions => {
+                if let Some(mailbox) = state.profile_decision_mailboxes.get(profile_did) {
+                    data.decisions = mailbox
+                        .iter()
+                        .map(|entry| DiscoveryProviderProfileDecisionEntry {
+                            receipt: encode_bytes(&entry.receipt_bytes),
+                            recipient_profile: encode_bytes(&entry.recipient_profile_bytes),
+                        })
+                        .collect();
+                }
+            }
+        }
+        Ok(serde_json::to_value(DiscoveryProviderProfileMailboxResponse {
+            status: "ok".to_string(),
+            data,
+        })
+        .expect("Profile contact mailbox response is serializable"))
+    }
+
+    /// Records a decision on a request by DID as a self-contained entry for
+    /// the requester, and drops the request at once so a decided request no
+    /// longer counts against anyone. The submission carries the request, so
+    /// it verifies even after a relay restart lost it.
+    fn submit_profile_contact_decision(
+        &self,
+        state: &mut DiscoveryRelayState,
+        request: &serde_json::Value,
+        now: u64,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let source_endpoint_did = relay_source_endpoint(request)?;
+        let request: DiscoveryProviderProfileDecisionRequest =
+            parse_discovery_provider_request(request, "Profile contact decision submission")?;
+        let request_bytes =
+            decode_bytes(&request.request, "Profile contact request").map_err(relay_error)?;
+        let receipt_bytes =
+            decode_bytes(&request.receipt, "contact decision receipt").map_err(relay_error)?;
+        let profile_bytes =
+            decode_bytes(&request.recipient_profile, "contact decision Profile")
+                .map_err(relay_error)?;
+        if receipt_bytes.len() > MAX_COLLABORATION_CONTACT_DECISION_RECEIPT_BYTES
+            || profile_bytes.len() > MAX_RELAY_SIGNED_PROFILE_BYTES
+        {
+            return Err(relay_error(
+                "Profile contact decision exceeds the protocol byte limit",
+            ));
+        }
+        let contact_request =
+            verify_collaboration_profile_contact_request(&request_bytes, &self.profile, now)
+                .map_err(relay_error)?;
+        let signed_profile: crate::collaboration_profile_authority::SignedCollaborationProfileDocument =
+            serde_json::from_slice(&profile_bytes).map_err(relay_error)?;
+        if serde_json::to_vec(&signed_profile).map_err(relay_error)? != profile_bytes {
+            return Err(relay_error("contact decision Profile is not canonical JSON"));
+        }
+        let recipient_profile =
+            crate::collaboration_profile_authority::verify_signed_profile_document(&signed_profile)
+                .map_err(relay_error)?;
+        let receipt = verify_collaboration_profile_contact_decision_receipt(
+            &receipt_bytes,
+            &contact_request,
+            &recipient_profile,
+            now,
+        )
+        .map_err(relay_error)?;
+        require_signing_endpoint(&source_endpoint_did, &receipt.envelope().signer_did)?;
+        let request_hash = contact_request.message().envelope_sha256().to_string();
+        let requester = contact_request.requester_profile_did().to_string();
+        let existing = state
+            .profile_decision_mailboxes
+            .get(&requester)
+            .and_then(|mailbox| mailbox.iter().find(|entry| entry.request_hash == request_hash));
+        match existing {
+            Some(entry) if entry.receipt_bytes != receipt_bytes => {
+                return Err(relay_error(
+                    "contact request already has a different terminal decision",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                if state
+                    .profile_decision_mailboxes
+                    .get(&requester)
+                    .map_or(0, Vec::len)
+                    >= MAX_PROFILE_DECISIONS_PER_REQUESTER
+                {
+                    return Err(relay_error("Profile contact decision mailbox is full"));
+                }
+                if state
+                    .profile_decision_mailboxes
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>()
+                    >= MAX_PROFILE_TOTAL_DECISIONS
+                {
+                    return Err(relay_error("Profile contact relay capacity is full"));
+                }
+                state
+                    .profile_decision_mailboxes
+                    .entry(requester)
+                    .or_default()
+                    .push(RelayProfileDecision {
+                        request_hash: request_hash.clone(),
+                        receipt_bytes,
+                        recipient_profile_bytes: profile_bytes,
+                        expires_at: contact_request.message().envelope().payload.expires_at,
+                    });
+            }
+        }
+        state.profile_requests.remove(&request_hash);
+        if let Some(mailbox) = state
+            .profile_request_mailboxes
+            .get_mut(contact_request.recipient_profile_did())
+        {
+            mailbox.retain(|hash| *hash != request_hash);
+        }
+        state
+            .profile_request_mailboxes
+            .retain(|_, mailbox| !mailbox.is_empty());
+        Ok(relay_ok())
     }
 }
 
@@ -3097,8 +3769,13 @@ impl Provider for CollaborationDiscoveryRelayProvider {
                 }
                 Ok(serde_json::json!({"status":"ok","data":{}}))
             }
+            PROFILE_CONTACT_SEND_OP => self.send_profile_contact_request(&mut state, request, now),
+            PROFILE_CONTACT_POLL_OP => self.poll_profile_mailbox(&state, request, now),
+            PROFILE_CONTACT_DECISION_OP => {
+                self.submit_profile_contact_decision(&mut state, request, now)
+            }
             _ => Err(ProviderError::Provider(
-                "unsupported collaboration discovery operation".to_string(),
+                UNSUPPORTED_RELAY_OPERATION.to_string(),
             )),
         }
     }
@@ -7135,6 +7812,7 @@ pub(crate) mod tests {
             sync_pass_lock: local_service.sync_pass_lock.clone(),
             intent_mutex: local_service.intent_mutex.clone(),
             direct_messages: local_service.direct_messages.clone(),
+            profile_relay_refusals: local_service.profile_relay_refusals.clone(),
         };
         let error = bad_service
             .invoke_bootstrap(
@@ -7351,6 +8029,7 @@ pub(crate) mod tests {
             sync_pass_lock: service.sync_pass_lock.clone(),
             intent_mutex: service.intent_mutex.clone(),
             direct_messages: service.direct_messages.clone(),
+            profile_relay_refusals: service.profile_relay_refusals.clone(),
         };
         let error = mismatched
             .invoke_bootstrap(

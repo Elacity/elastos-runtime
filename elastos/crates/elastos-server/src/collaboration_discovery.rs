@@ -329,10 +329,6 @@ impl VerifiedCollaborationDiscoveryAdvertisement {
     pub(crate) fn profile_authorizes_device(&self, device_did: &str) -> bool {
         self.profile.authorizes_endpoint(device_did)
     }
-
-    pub(crate) fn route_endpoint_did(&self) -> anyhow::Result<&str> {
-        self.profile.sole_endpoint_did()
-    }
 }
 
 impl VerifiedCollaborationDiscoveryMailboxPoll {
@@ -374,26 +370,8 @@ impl VerifiedCollaborationContactRequest {
         &self.profile.document().profile_did
     }
 
-    pub(crate) fn profile_revision(&self) -> u64 {
-        self.profile.document().revision
-    }
-
-    pub(crate) fn profile_envelope_sha256(&self) -> anyhow::Result<String> {
-        Ok(sha256_label(&serde_json::to_vec(
-            self.profile.signed_envelope(),
-        )?))
-    }
-
-    pub(crate) fn signed_profile(&self) -> &SignedCollaborationProfileDocument {
-        self.profile.signed_envelope()
-    }
-
     pub(crate) fn profile_authorizes_device(&self, device_did: &str) -> bool {
         self.profile.authorizes_endpoint(device_did)
-    }
-
-    pub(crate) fn route_endpoint_did(&self) -> anyhow::Result<&str> {
-        self.profile.sole_endpoint_did()
     }
 }
 
@@ -770,10 +748,6 @@ impl VerifiedCollaborationProfileContactRequest {
 
     pub(crate) fn profile(&self) -> &VerifiedCollaborationProfileDocument {
         &self.profile
-    }
-
-    pub(crate) fn route_endpoint_did(&self) -> anyhow::Result<&str> {
-        self.profile.sole_endpoint_did()
     }
 }
 
@@ -1544,7 +1518,7 @@ mod tests {
             request.message().envelope().payload.recipient.id,
             advertisement.profile_did()
         );
-        assert_eq!(request.route_endpoint_did().unwrap(), requester_did);
+        assert_eq!(request.profile().sole_endpoint_did().unwrap(), requester_did);
 
         let receipt_bytes = decision_receipt_bytes(
             &recipient_key,
@@ -2510,7 +2484,7 @@ mod tests {
         );
         assert_eq!(request.recipient_profile_did(), recipient_did);
         assert_eq!(
-            request.route_endpoint_did().unwrap(),
+            request.profile().sole_endpoint_did().unwrap(),
             device_did(&requester_key)
         );
         let stored = verify_stored_collaboration_profile_contact_request(&request_bytes, &network)
