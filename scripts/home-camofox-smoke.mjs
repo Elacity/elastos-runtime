@@ -466,16 +466,42 @@ async function openShellTarget(tabId, target, query = {}) {
   })()`);
 }
 
-async function openElastosUri(tabId, uri, preferredViewer = "documents") {
-  const message = JSON.stringify({
-    type: "home:open-uri",
-    uri,
-    preferredViewer,
-  });
-  return evaluate(tabId, `(() => {
-    window.postMessage(${message}, window.location.origin);
-    return { ok: true };
-  })()`);
+async function confirmSharedFile(tabId, uri, allowMissing = false) {
+  const ready = await waitFor(async () => evaluate(tabId, `(() => {
+    const prompt = document.querySelector("#home-link-prompt");
+    const button = document.querySelector("#home-link-open");
+    const missing = button.disabled && document.querySelector("#home-link-status")?.textContent === "This file isn't on your Home.";
+    return !!prompt && !prompt.hidden &&
+      document.querySelector("#home-link-address")?.textContent === ${JSON.stringify(uri)} &&
+      ((!button.disabled && button.textContent === "Open") || (${allowMissing} && missing));
+  })()`), 12000, 250);
+  assert(ready, "Home did not offer the local shared file", await shellState(tabId));
+  const missing = await evaluate(tabId, `document.querySelector("#home-link-open").disabled`);
+  if (missing) {
+    await click(tabId, "#home-link-cancel");
+    const routes = await evaluate(tabId, `(() => [...document.querySelectorAll('.window-frame')].map(frame => frame.getAttribute("src") || ""))()`);
+    assert(!routes.some(route => route.includes("cid=" + uri.slice("elastos://".length))), "Missing content opened a viewer", routes);
+    return false;
+  }
+  await delay(600);
+  await click(tabId, "#home-link-open");
+  return true;
+}
+
+async function openElastosUri(tabId, uri) {
+  await openShellTarget(tabId, "documents");
+  const sent = await waitFor(async () => {
+    const result = await frameState(tabId, "documents", `(() => {
+      const homeToken = new URLSearchParams(win.location.hash.slice(1)).get("home_token") || "";
+      if (!homeToken) return { ok: false };
+      const message = { type: "home:open-uri", uri: ${JSON.stringify(uri)}, homeToken };
+      win.eval("window.parent.postMessage(" + JSON.stringify(message) + ", window.location.origin)");
+      return { ok: true };
+    })()`);
+    return result.ok;
+  }, 7000, 300);
+  assert(sent, "Documents could not request the shared file");
+  return confirmSharedFile(tabId, uri, true);
 }
 
 async function frameState(tabId, targetId, expression) {
@@ -1336,9 +1362,9 @@ async function main() {
       assert(Math.abs(viewer.editorHeaderHeight - viewer.inspectorHeaderHeight) <= 2, "Documents inspector tabs should not make the header taller than Write", viewer);
     });
 
-    await runCase("elastos-document-uri-opens-documents-viewer", async (tabId) => {
+    await runCase("elastos-file-uri-offers-local-open-or-recovery", async (tabId) => {
       const uri = `elastos://${TEST_DOCUMENT_CID}`;
-      await openElastosUri(tabId, uri);
+      if (!await openElastosUri(tabId, uri)) return;
       const opened = await waitFor(async () => {
         const routes = await evaluate(tabId, `(() => [...document.querySelectorAll('.window[data-target="documents"] .window-frame')]
           .map((frame) => frame.getAttribute("src") || ""))()`);
@@ -1496,18 +1522,18 @@ async function main() {
             ok: true,
             found: !!anchor,
             href: anchor?.getAttribute("href") || "",
-            title: anchor?.querySelector(".link-title")?.textContent?.trim() || "",
-            detail: anchor?.querySelector(".link-detail")?.textContent?.trim() || "",
+            role: anchor?.getAttribute("role") || "",
             target: anchor?.getAttribute("target") || "",
           };
         })()`);
         return linkCard.ok && linkCard.found;
       }, 12000, 500);
       assert(renderedLink, "Chat Room did not render the elastos:// document as an openable link", linkCard);
-      assert(linkCard.href === uri && linkCard.detail === "Documents" && linkCard.target === "", "Chat Room document link chrome drifted", linkCard);
+      assert(linkCard.href === "" && linkCard.role === "link" && linkCard.target === "", "Chat Room document link chrome drifted", linkCard);
 
       const opened = await clickInFrame(tabId, "chat-room", `#message-list [data-open-uri="${uri}"]`);
       assert(opened.ok, "Chat Room document link was not clickable", opened);
+      await confirmSharedFile(tabId, uri);
       const openedViewer = await waitFor(async () => {
         const routes = await evaluate(tabId, `(() => [...document.querySelectorAll('.window[data-target="documents"] .window-frame')]
           .map((frame) => frame.getAttribute("src") || ""))()`);
@@ -1566,7 +1592,7 @@ async function main() {
             query: {},
             homeToken: "not-a-valid-token",
           });
-          const homeToken = new URL(win.location.href).searchParams.get("home_token") || "";
+          const homeToken = new URLSearchParams(win.location.hash.slice(1)).get("home_token") || "";
           sendFromFrame({
             type: "home:open-target",
             target: "system",
@@ -1590,11 +1616,10 @@ async function main() {
       let authorized = null;
       const authorizedSent = await waitFor(async () => {
         authorized = await frameState(tabId, "documents", `(() => {
-          const homeToken = new URL(win.location.href).searchParams.get("home_token") || "";
+          const homeToken = new URLSearchParams(win.location.hash.slice(1)).get("home_token") || "";
           const message = {
             type: "home:open-uri",
             uri: ${JSON.stringify(uri)},
-            preferredViewer: "documents",
             homeToken,
           };
           win.eval("window.parent.postMessage(" + JSON.stringify(message) + ", window.location.origin)");
@@ -1603,6 +1628,7 @@ async function main() {
         return authorized.ok;
       }, 7000, 300);
       assert(authorizedSent, "Documents frame could not send authorized open-uri message", authorized);
+      if (!await confirmSharedFile(tabId, uri, true)) return;
       const opened = await waitFor(async () => {
         const routes = await evaluate(tabId, `(() => [...document.querySelectorAll('.window[data-target="documents"] .window-frame')]
           .map((frame) => frame.getAttribute("src") || ""))()`);

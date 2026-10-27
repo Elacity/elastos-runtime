@@ -82,10 +82,13 @@ function validatedSharedResult(result, uri) {
 // CID and message validation; Home preserves the exact request and binding.
 export function requestHomeSharedContent({ context, data, prompt, fetchJson }) {
   const source = data.source;
-  const keys = ["type", "uri", "homeToken", ...(source === undefined ? [] : ["source"])];
+  const fileName = data.fileName;
+  const keys = ["type", "uri", "homeToken", ...(source === undefined ? [] : ["source"]), ...(fileName === undefined ? [] : ["fileName"])];
   if (context.kind !== "app-frame" || !["chat-room", "documents"].includes(context.targetId)
     || !hasExactKeys(data, keys) || data.type !== "home:open-uri"
     || data.homeToken !== context.homeToken || typeof data.uri !== "string"
+    || (fileName !== undefined && (context.targetId !== "chat-room" || typeof fileName !== "string"
+      || !fileName.trim() || fileName.length > 255 || /[\x00-\x1f\x7f/\\]/.test(fileName)))
     || !data.uri.startsWith("elastos://") || data.uri.length > MAX_EXTERNAL_LINK_LENGTH
     || (source !== undefined && (context.targetId !== "chat-room" || !source
       || typeof source !== "object" || Array.isArray(source)
@@ -100,7 +103,7 @@ export function requestHomeSharedContent({ context, data, prompt, fetchJson }) {
     method: "POST", signal, body: JSON.stringify({ check_id }),
   });
   const requestId = prompt.begin({ homeToken: context.homeToken, appId: context.targetId,
-    kind: "shared", uri: data.uri, check, get });
+    kind: "shared", uri: data.uri, fileName, check, get });
   if (!requestId) return false;
   check().then(result => prompt.show(requestId, result)).catch(() => prompt.checkFailed(requestId));
   return true;
@@ -108,7 +111,7 @@ export function requestHomeSharedContent({ context, data, prompt, fetchJson }) {
 
 // Read only the verified local gateway after the person chooses Open/Get.
 // Raw CID responses use application/octet-stream, so inspect a bounded sample.
-export async function openHomeSharedFile({ cid, uri }, { openTarget, fetchLocal = globalThis.fetch, signal } = {}) {
+export async function openHomeSharedFile({ cid, uri, fileName }, { openTarget, fetchLocal = globalThis.fetch, signal } = {}) {
   const response = await fetchLocal(`/content/${encodeURIComponent(cid)}`, { cache: "no-store", signal });
   if (!response.ok) throw new Error("Could not read the local file");
   const reader = response.body.getReader();
@@ -133,7 +136,7 @@ export async function openHomeSharedFile({ cid, uri }, { openTarget, fetchLocal 
   } catch (_) { /* Binary content opens in Library. */ }
   if (signal?.aborted) return;
   return openTarget(text ? "documents" : "library", {
-    query: { cid, uri, ...(text ? { view: "read" } : {}) },
+    query: { cid, ...(text ? { uri, view: "read" } : fileName ? { fileName } : {}) },
   });
 }
 
@@ -210,7 +213,7 @@ export function createHomeExternalLinkPrompt({
       : `Size: ${formatSize(value.size_bytes)}`;
     const messages = {
       sender_offline: `${name}'s Home is offline. Try again when ${name} is online.`,
-      not_contact: `Files come only from your contacts. Add ${name} as a contact first.`,
+      not_contact: `Files come only from your contacts. Add ${value?.sender_display_name || "this person"} as a contact first.`,
       not_here: "This file isn't on your Home.", getting: "Getting file…", checking: "Checking file…",
       not_shared: `${name}'s Home no longer shares this file.`, too_large: "This file is larger than 64 MB.",
       mismatch: "This file didn't match its link, so Home discarded it.",
@@ -233,7 +236,7 @@ export function createHomeExternalLinkPrompt({
     const current = () => active === request && isLive(request.homeToken) && !request.controller.signal.aborted;
     try {
       if (state === "local") {
-        await openSharedFile(request.result, request.controller.signal);
+        await openSharedFile({ ...request.result, ...(request.fileName ? { fileName: request.fileName } : {}) }, request.controller.signal);
         if (current()) close();
         return;
       }
@@ -245,7 +248,7 @@ export function createHomeExternalLinkPrompt({
         if (!result || !hasExactKeys(result, ["state"]) || !GET_STATES.includes(result.state)) throw new Error("Invalid file result");
         request.state = result.state;
         if (result.state === "local") {
-          await openSharedFile(request.result, request.controller.signal);
+          await openSharedFile({ ...request.result, ...(request.fileName ? { fileName: request.fileName } : {}) }, request.controller.signal);
           if (current()) close();
           return;
         }
@@ -376,14 +379,14 @@ export function createHomeExternalLinkPrompt({
   return {
     // Claims the one request slot for this sender. Returns "" while another
     // request is open or being checked, or during the sender's cool-down.
-    begin({ homeToken, appId, kind = "web", uri, check, get }) {
+    begin({ homeToken, appId, kind = "web", uri, fileName, check, get }) {
       if (active || !homeToken || !appId || (cooldownUntil.get(appId) || 0) > now()) {
         return "";
       }
       cooldownUntil.delete(appId);
       sequence += 1;
       const requestId = `external-link-${sequence}`;
-      active = { requestId, homeToken, appId, kind, uri, check, get, phase: "checking", href: "", busy: false };
+      active = { requestId, homeToken, appId, kind, uri, fileName, check, get, phase: "checking", href: "", busy: false };
       return requestId;
     },
     // Shows the Runtime-checked request. Anything stale or malformed, or a
@@ -459,7 +462,11 @@ export function createHomeExternalLinkPrompt({
 }
 
 function formatSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024) return `${bytes} bytes`;
+  const power = bytes < 1024 ** 2 ? 1 : bytes < 1024 ** 3 ? 2 : 3;
+  const scaled = bytes * 10 / 1024 ** power;
+  const floor = Math.floor(scaled);
+  // Rust's post formatter rounds exact halves to the even decimal.
+  const rounded = scaled - floor === 0.5 ? floor + floor % 2 : Math.round(scaled);
+  return `${(rounded / 10).toFixed(1)} ${['', 'KB', 'MB', 'GB'][power]}`;
 }

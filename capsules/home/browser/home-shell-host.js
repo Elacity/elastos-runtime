@@ -18,7 +18,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-update-20261003a";
+} from "./shell-core.js?v=home-links-20261027a";
 import {
   addAccountPasskey,
   bindHomeUnlock,
@@ -54,7 +54,7 @@ import {
   EXTERNAL_LINK_REQUEST_SCHEMA,
   HOME_OPEN_EXTERNAL_TYPE,
   MAX_EXTERNAL_LINK_LENGTH,
-} from "./home-external-link.js?v=home-20261027a";
+} from "./home-external-link.js?v=home-links-20261027b";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -103,7 +103,6 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
 });
-const SHELL_MESSAGE_OPEN_URI_SOURCES = new Set(["documents", "chat-room"]);
 const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
   "chat-room": new Set(["documents"]),
   documents: new Set(["chat-room"]),
@@ -1984,26 +1983,7 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (data.type === "home:open-uri") {
-    if (["chat-room", "documents"].includes(context.targetId)) {
-      requestHomeSharedContent({ context, data, prompt: homeExternalLinkPrompt, fetchJson });
-      return;
-    }
-    if (!canOpenUriFromHomeMessage(context)) {
-      console.warn("home ignored unauthorized open-uri message", context.targetId);
-      return;
-    }
-    const resolved = resolveOpenUri(data);
-    if (!resolved) {
-      console.warn("home could not resolve URI", data.uri);
-      return;
-    }
-    if (!targetById(shellState.currentSummary, resolved.target)) {
-      console.warn("home could not open URI because its viewer is not installed", data.uri);
-      return;
-    }
-    openTargetFromHomeGui(resolved.target, { query: resolved.query }).catch((error) => {
-      console.error("home open-uri failed", error);
-    });
+    requestHomeSharedContent({ context, data, prompt: homeExternalLinkPrompt, fetchJson });
     return;
   }
   if (data.type === "home:deliver-to-target") {
@@ -2301,10 +2281,6 @@ function isBoundedStepUpRequest(request) {
   }
 }
 
-function canOpenUriFromHomeMessage(context) {
-  return context.kind === "home" || SHELL_MESSAGE_OPEN_URI_SOURCES.has(context.targetId);
-}
-
 // An app frame or Home CLI asks Home to open a web link. The Runtime names the
 // app from its signed launch and returns the one validated address; Home then
 // shows its own sheet (home-external-link.js). The app never gets a reply.
@@ -2378,50 +2354,6 @@ function canDeliverTargetFromHomeMessage(context, target) {
   }
   const policy = SHELL_MESSAGE_DELIVER_TARGET_SOURCES[context.targetId];
   return !!policy && policy.has(target);
-}
-
-function resolveOpenUri(data) {
-  const uri = typeof data.uri === "string" ? data.uri.trim() : "";
-  if (!uri.startsWith("elastos://")) {
-    return null;
-  }
-  const peerInvite = resolvePeerInviteUri(uri);
-  if (peerInvite) {
-    return peerInvite;
-  }
-  const cid = uri.slice("elastos://".length).split(/[/?#]/)[0].trim();
-  if (!cid) {
-    return null;
-  }
-  const preferredViewer = typeof data.preferredViewer === "string" ? data.preferredViewer.trim() : "";
-  if (preferredViewer === "documents" || preferredViewer === "") {
-    return {
-      target: "documents",
-      query: {
-        cid,
-        uri,
-        view: "read",
-      },
-    };
-  }
-  return null;
-}
-
-function resolvePeerInviteUri(uri) {
-  try {
-    const parsed = new URL(uri);
-    const path = parsed.pathname.replace(/^\/+/, "");
-    const isPeerInvite = parsed.hostname === "peer" && path === "invite";
-    if (parsed.protocol === "elastos:" && isPeerInvite && parsed.searchParams.get("token")) {
-      return {
-        target: "chat-room",
-        query: { invite: uri },
-      };
-    }
-  } catch (_error) {
-    return null;
-  }
-  return null;
 }
 
 async function boot() {

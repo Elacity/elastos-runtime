@@ -1,4 +1,4 @@
-import { sharedFileMarkup } from "./shared-file.js";
+import { sharedFileMarkup } from "./shared-file.js?v=library-links-20261027a";
 import {
   archiveLibraryObjectPayload,
   escapeHtml,
@@ -671,7 +671,7 @@ import {
       state.roots = orderRoots(Array.isArray(data.roots) ? data.roots : []);
       if (!state.currentUri && state.roots.length) {
         const documents = state.roots.find((root) => root.id === "documents");
-        const initialRoot = state.initialUri ? rootForUri(state.initialUri) : null;
+        const initialRoot = state.initialUri ? activeRootForUri(state.initialUri) : null;
         state.currentUri = initialRoot ? state.initialUri : (documents || state.roots[0]).uri;
       }
       renderPlaces();
@@ -1298,17 +1298,18 @@ import {
         await loadRoots();
         installBrowserHistory();
         await loadCurrentFolder();
-        const sharedCid = queryParams.get("cid");
-        if (state.mode === "browse" && sharedCid) {
-          elements.dialog.innerHTML = sharedFileMarkup(sharedCid);
-          elements.dialog.classList.remove("hidden");
-          setStatus("Shared file is ready to download.");
-        }
         scheduleRootPrefetch();
         startLibraryEventStream();
       } catch (error) {
         showError(error);
         elements.content.innerHTML = '<div class="empty"><div><h2>Library could not open</h2><p>Close Library and try again.</p></div></div>';
+      } finally {
+        const sharedCid = queryParams.get("cid");
+        if (state.mode === "browse" && sharedCid) {
+          elements.dialog.innerHTML = sharedFileMarkup(sharedCid, queryParams.get("fileName"));
+          elements.dialog.classList.remove("hidden");
+          setStatus("Shared file is ready to download.");
+        }
       }
     }
 

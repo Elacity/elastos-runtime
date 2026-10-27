@@ -16,3 +16,9 @@ test('Library escapes link text and confines downloads to the local gateway', ()
   assert.ok(!markup.includes('<script>'));
   assert.ok(markup.includes('href="/content/bad%22%2F%3E%3Cscript%3E"'));
 });
+
+test('Library uses the post filename and falls back to the CID', () => {
+  assert.ok(shared.sharedFileMarkup('cid', 'report.pdf').includes('download="report.pdf"'));
+  assert.ok(shared.sharedFileMarkup('cid', '').includes('download="cid"'));
+  assert.ok(shared.sharedFileMarkup('cid', 'report".pdf').includes('download="report&quot;.pdf"'));
+});

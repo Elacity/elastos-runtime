@@ -286,14 +286,14 @@ function startServer(scenario) {
     }
     if (scenario === "shared-file-via-home" || scenario === "community-attach") {
       poll.latest_seq = 1;
-      poll.objects = [historyMessage(1, `hello.txt · 30 B · ${sharedUri}`, "2026-03-09T12:00:00Z")];
+      poll.objects = [historyMessage(1, `hello.txt · 30 bytes · ${sharedUri}`, "2026-03-09T12:00:00Z")];
       if (scenario === "shared-file-via-home") {
         poll.objects.push({ ...historyMessage(2, "", "2026-03-09T12:01:00Z"), kind: "link", body: null,
           link: { url: sharedUri, host: sharedCid, title: "Local file link" } });
         poll.latest_seq = 2;
       }
       if (trace.uploads.some(upload => upload.path.endsWith('/finish'))) {
-        poll.objects.push(historyMessage(3, `attached.txt · 30 B · ${sharedUri}`, "2026-03-09T12:02:00Z"));
+        poll.objects.push(historyMessage(3, `attached.txt · 30 bytes · ${sharedUri}`, "2026-03-09T12:02:00Z"));
         poll.latest_seq = 3;
       }
     }
@@ -363,8 +363,8 @@ function startServer(scenario) {
       if (request.method === "POST" && url.pathname.startsWith("/api/auth/")) trace.authPosts += 1;
       if (request.method === "OPTIONS") {
         response.writeHead(204, {
-          "access-control-allow-headers": "content-type,x-elastos-home-token",
-          "access-control-allow-methods": "GET,POST,OPTIONS",
+          "access-control-allow-headers": "content-type,x-elastos-home-token,x-elastos-upload-offset",
+          "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
           "access-control-allow-origin": "null",
         }).end();
         return;

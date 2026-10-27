@@ -39,7 +39,7 @@ test('shared file shows the exact checked address, sender, size and online state
   assert.equal(h.title.textContent, 'Get this file?');
   assert.equal(h.address.textContent, uri);
   assert.equal(h.host.textContent, 'From: Alma · online');
-  assert.equal(h.size.textContent, 'Size: 30 B');
+  assert.equal(h.size.textContent, 'Size: 30 bytes');
   assert.equal(h.openButton.textContent, 'Get and open');
   assert.equal(h.begin(), '');
 });
@@ -141,6 +141,7 @@ test('the Home handoff checks the exact source with launch authority and gets wi
 test('the Home handoff refuses extra fields, malformed source and unauthorized apps', () => {
   for (const [sender, data] of [
     [context, { ...message(), preferredViewer: 'documents' }],
+    ...[null, [], '', '../report.pdf', 'a\\b', 'a\nb', 'x'.repeat(256)].map(fileName => [context, { ...message(), fileName }]),
     [context, { ...message(), source: { ...message().source, cid } }],
     [context, { ...message(), source: null }], [context, { ...message(), source: [] }],
     [context, { ...message(), source: { conversation_id: 'file-community', message_id: '' } }],
@@ -219,5 +220,31 @@ for (const [label, bytes, target] of [
     openTarget: async (...args) => opens.push(args),
   });
   assert.equal(reads[0].path, `/content/${cid}`);
-  assert.deepEqual(opens, [[target, { query: { cid, uri, ...(target === 'documents' ? { view: 'read' } : {}) } }]]);
+  assert.deepEqual(opens, [[target, { query: { cid, ...(target === 'documents' ? { uri, view: 'read' } : {}) } }]]);
+});
+
+test('shared file sheet uses the byte count shown in a Chat post', () => {
+  for (const [bytes, size] of [[30, '30 bytes'], [1024, '1.0 KB'], [3328, '3.2 KB'], [3840, '3.8 KB'], [3565158, '3.4 MB'], [1073741824, '1.0 GB']]) {
+    const h = harness(); h.prompt.show(h.begin(), { ...result(), size_bytes: bytes });
+    assert.equal(h.size.textContent, `Size: ${size}`);
+  }
+});
+test('an unnamed sender uses natural contact instructions', () => {
+  const h = harness(); h.prompt.show(h.begin(), { ...result('not_contact'), sender_display_name: undefined });
+  assert.match(h.status.textContent, /Add this person as a contact first/);
+});
+
+test('Chat filename reaches the local Library download without changing the server check', async () => {
+  const h = harness(), checks = [];
+  const data = { ...message(), fileName: 'report.pdf' };
+  assert.equal(requestHomeSharedContent({ context, data, prompt: h.prompt,
+    fetchJson: async (_path, init) => { checks.push(JSON.parse(init.body)); return result('local'); } }), true);
+  await settle(); h.tick(); h.click(); await settle();
+  assert.equal(checks[0].fileName, undefined);
+  assert.equal(h.opened[0].fileName, 'report.pdf');
+  const { openHomeSharedFile } = await import('./home-external-link.js');
+  const opens = [];
+  await openHomeSharedFile(h.opened[0], { fetchLocal: async () => new Response('%PDF-1.7'),
+    openTarget: async (...args) => opens.push(args) });
+  assert.deepEqual(opens, [['library', { query: { cid, fileName: 'report.pdf' } }]]);
 });
