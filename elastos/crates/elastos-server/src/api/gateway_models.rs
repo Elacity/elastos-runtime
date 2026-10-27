@@ -1070,6 +1070,9 @@ struct GatewayRoomPollView {
 #[derive(Debug, Clone, Serialize)]
 struct GatewayConversationObjectView {
     seq: u64,
+    /// Verified Community envelope id; absent on local-room rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_id: Option<String>,
     sender: String,
     /// Runtime-only identity used to attach `sender_ref`; never serialized.
     #[serde(skip)]
@@ -1352,6 +1355,7 @@ impl From<crate::room_service::ConversationObjectView> for GatewayConversationOb
     fn from(view: crate::room_service::ConversationObjectView) -> Self {
         Self {
             seq: view.seq,
+            message_id: view.message_id,
             sender: view.sender,
             sender_member_did: view.sender_member_did,
             sender_ref: None,

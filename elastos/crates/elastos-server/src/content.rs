@@ -18,9 +18,9 @@ use elastos_common::protected_content::{
     validate_protected_content_key_envelope_algorithms, SealedObjectV1, SEALED_OBJECT_SCHEMA,
 };
 use elastos_runtime::provider::{
-    Provider, ProviderByteRange, ProviderError, ProviderInvocation, ProviderInvocationTransport,
-    ProviderProgress, ProviderRegistry, ProviderStreamOptions, ProviderTransfer, ResourceRequest,
-    ResourceResponse,
+    Provider, ProviderByteRange, ProviderCarrierRoute, ProviderError, ProviderInvocation,
+    ProviderInvocationTransport, ProviderProgress, ProviderRegistry, ProviderStreamOptions,
+    ProviderTransfer, ResourceRequest, ResourceResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -93,6 +93,8 @@ const REPAIR_WORKER_MAX_ATTEMPTS_LIMIT: u32 = 25;
 const REPAIR_WORKER_DEFAULT_FAILURE_BUDGET: u32 = 10;
 const REPAIR_WORKER_MAX_FAILURE_BUDGET: u32 = 100;
 const IMPORT_EXACT_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Publish policy that pins on this node only and never asks availability to replicate.
+pub(crate) const LOCAL_PIN_AVAILABILITY_POLICY: &str = "local_pin";
 const IMPORT_OBJECT_MAX_FILES: usize = 512;
 const AVAILABILITY_DASHBOARD_REMOTE_ROW_LIMIT: usize = 10;
 const OBJECT_MANIFEST_SCHEMA: &str = "elastos.content.object.manifest/v1";
@@ -2922,6 +2924,158 @@ async fn fetch_bytes_via_content(
         .map_err(|err| anyhow::anyhow!("content provider stream read failed: {err}"))
 }
 
+/// Runtime provider source for Home getting a file a contact shared in Chat.
+pub(crate) const HOME_SHARED_CONTENT_SOURCE: &str = "home-shared-content";
+/// Largest file Home gets from a contact: `import_exact`'s own bound.
+pub(crate) const HOME_SHARED_CONTENT_MAX_BYTES: usize = IMPORT_EXACT_MAX_BYTES;
+/// How long Home connects to the sender's Home before calling it offline.
+const HOME_SHARED_CONTENT_CONNECT_MS: u64 = 5_000;
+
+/// The outcome of getting a shared file from its sender's Home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedContentGet {
+    /// The exact bytes are pinned here now.
+    Local,
+    SenderOffline,
+    /// The sender's Home refused or no longer pins the CID.
+    NotShared,
+    TooLarge,
+    /// The bytes did not hash to the link's CID; nothing was pinned.
+    Mismatch,
+    Timeout,
+}
+
+impl SharedContentGet {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::SenderOffline => "sender_offline",
+            Self::NotShared => "not_shared",
+            Self::TooLarge => "too_large",
+            Self::Mismatch => "mismatch",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// Whether this Home's latest content receipt shows `cid` pinned here.
+pub(crate) async fn content_pinned_here(registry: &ProviderRegistry, cid: &str) -> bool {
+    let Ok(response) = registry
+        .send_raw("content", &json!({ "op": "status", "cid": cid }))
+        .await
+    else {
+        return false;
+    };
+    response.get("status").and_then(Value::as_str) == Some("ok")
+        && response
+            .pointer("/data/availability/status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status != "local_unpinned")
+}
+
+/// Gets `cid` from the Home at `peer_did` with its existing local-only
+/// `content/fetch`, waiting at most `reply_wait` for the answer, then imports
+/// it with `import_exact`: added unpinned, compared with `cid`, pinned only on
+/// a match. The holder reads at most [`HOME_SHARED_CONTENT_MAX_BYTES`], and the
+/// answer this Home accepts is bounded to match.
+pub(crate) async fn get_shared_content_from_peer(
+    registry: &ProviderRegistry,
+    peer_did: &str,
+    cid: &str,
+    filename: &str,
+    reply_wait: Duration,
+) -> anyhow::Result<SharedContentGet> {
+    anyhow::ensure!(is_valid_cid(cid), "shared content requires a valid CID");
+    let reply_wait_ms = u64::try_from(reply_wait.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let fetched = registry
+        .invoke_provider(ProviderInvocation {
+            source: HOME_SHARED_CONTENT_SOURCE.to_string(),
+            target: "content".to_string(),
+            op: "fetch".to_string(),
+            request: json!({
+                "op": "fetch",
+                "cid": cid,
+                "local_only": true,
+                "transfer": "stream",
+                "whole_max_bytes": HOME_SHARED_CONTENT_MAX_BYTES,
+            }),
+            transfer: ProviderTransfer::Stream,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: peer_did.to_string(),
+                timeout_ms: Some(HOME_SHARED_CONTENT_CONNECT_MS),
+                reply_wait_ms: Some(reply_wait_ms),
+            }),
+        })
+        .await;
+    let mut response = match fetched {
+        Ok(response) => response,
+        Err(ProviderError::Unavailable(_)) => return Ok(SharedContentGet::SenderOffline),
+        Err(ProviderError::Io(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
+            return Ok(SharedContentGet::Timeout)
+        }
+        Err(err) => {
+            let text = err.to_string();
+            return Ok(
+                if text.ends_with(crate::carrier::CARRIER_CONTENT_TOO_LARGE) {
+                    SharedContentGet::TooLarge
+                } else if text.ends_with(crate::carrier::PEER_ROUTE_IN_TRANSIT) {
+                    SharedContentGet::SenderOffline
+                } else {
+                    SharedContentGet::NotShared
+                },
+            );
+        }
+    };
+    if response.get("status").and_then(Value::as_str) != Some("ok") {
+        return Ok(SharedContentGet::NotShared);
+    }
+    // Move the payload out so only one copy of the bytes is held at a time.
+    let mut import = json!({ "op": "import_exact", "cid": cid, "filename": filename });
+    match response.get_mut("data") {
+        Some(data) if data.get("stream").is_some() => import["stream"] = data["stream"].take(),
+        Some(data) if data.get("data").is_some_and(Value::is_string) => {
+            import["data"] = data["data"].take()
+        }
+        _ => return Ok(SharedContentGet::NotShared),
+    }
+    drop(response);
+    let imported = registry
+        .invoke_provider(ProviderInvocation {
+            source: HOME_SHARED_CONTENT_SOURCE.to_string(),
+            target: "content".to_string(),
+            op: "import_exact".to_string(),
+            request: import,
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        })
+        .await;
+    match imported {
+        Ok(response) if response.get("status").and_then(Value::as_str) == Some("ok") => {
+            Ok(SharedContentGet::Local)
+        }
+        Ok(response) if response.get("code").and_then(Value::as_str) == Some("cid_mismatch") => {
+            Ok(SharedContentGet::Mismatch)
+        }
+        Err(err) if err.to_string().contains("import_exact payload exceeds") => {
+            Ok(SharedContentGet::TooLarge)
+        }
+        Ok(response) => anyhow::bail!(
+            "shared content import failed: {}",
+            response
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        ),
+        Err(err) => anyhow::bail!("shared content import failed: {err}"),
+    }
+}
+
 /// Validate signed catalog metadata using the existing content closure list.
 /// This proves descriptive consistency only; payload verification and admission
 /// require the later bounded content transfer.
@@ -3557,7 +3711,12 @@ impl ContentProvider {
             .await?;
         let cid = provider_response_cid(&ipfs_response)?;
         let local_outcome = AvailabilityOutcome::local_publish(pin);
-        let outcome = if pin {
+        // `local_pin` keeps the object on this node only; no network replication is attempted.
+        let local_only_policy = request
+            .get("availability_policy")
+            .and_then(|value| value.as_str())
+            == Some(LOCAL_PIN_AVAILABILITY_POLICY);
+        let outcome = if pin && !local_only_policy {
             self.ensure_network_availability(
                 &registry,
                 &cid,
@@ -6149,7 +6308,7 @@ impl AvailabilityOutcome {
         if pin {
             Self {
                 provider: "ipfs-provider".to_string(),
-                policy: "local_pin".to_string(),
+                policy: LOCAL_PIN_AVAILABILITY_POLICY.to_string(),
                 status: "local_pinned".to_string(),
                 replicas: 1,
                 reason: None,
@@ -8222,15 +8381,23 @@ fn validate_import_exact_invocation(request: &Value) -> Result<(), ProviderError
         request,
         "content import_exact requires Runtime provider invocation metadata",
     )?;
+    // A peer's replica push arrives over Carrier; Home's own `get` of a file a
+    // contact shared imports locally. No other caller may import.
+    let (source, transport) = match runtime.get("source").and_then(|value| value.as_str()) {
+        Some(HOME_SHARED_CONTENT_SOURCE) => {
+            (HOME_SHARED_CONTENT_SOURCE, "runtime-local-provider-plane")
+        }
+        _ => ("carrier-availability", "carrier-provider-plane"),
+    };
     validate_runtime_invocation_fields(
         runtime,
         "content import_exact",
         &[
             ("schema", "elastos.provider.invocation/v1"),
-            ("source", "carrier-availability"),
+            ("source", source),
             ("target", "content"),
             ("op", "import_exact"),
-            ("transport", "carrier-provider-plane"),
+            ("transport", transport),
         ],
     )?;
     if !matches!(
@@ -10666,6 +10833,41 @@ mod tests {
             1
         );
         assert!(!dashboard.to_string().contains("connect_ticket"));
+    }
+
+    #[tokio::test]
+    async fn content_publish_local_pin_policy_never_calls_availability() {
+        let (_data_dir, registry, ipfs, content) = registry_with_content_and_ipfs().await;
+        let availability = Arc::new(MockAvailabilityProvider {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(provider_ok(json!({}))),
+        });
+        registry.register(availability.clone()).await;
+
+        let response = content
+            .send_raw(&json!({
+                "op": "publish",
+                "kind": "file",
+                "filename": "notes.txt",
+                "data": "aGVsbG8K",
+                "pin": true,
+                "availability_policy": LOCAL_PIN_AVAILABILITY_POLICY,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(response["status"], "ok", "{response}");
+        assert_eq!(response["data"]["availability"]["status"], "local_pinned");
+        assert_eq!(
+            response["data"]["receipt"]["payload"]["policy"],
+            LOCAL_PIN_AVAILABILITY_POLICY
+        );
+        assert_eq!(response["data"]["repair_task"]["status"], "local_only");
+        assert!(availability.requests.lock().await.is_empty());
+        assert_eq!(
+            *ipfs.added_files.lock().await,
+            vec!["notes.txt".to_string()]
+        );
     }
 
     #[tokio::test]

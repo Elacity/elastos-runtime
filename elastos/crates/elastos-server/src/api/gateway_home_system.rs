@@ -2305,10 +2305,7 @@ fn stamp_contact_reachability(
         let Some(profile_did) = contact.remote_profile_did.as_deref() else {
             continue;
         };
-        contact.reachable =
-            Some(snapshot.records().iter().any(|record| {
-                record.sender_profile_did() == profile_did && record.expires_at() > now
-            }));
+        contact.reachable = Some(profile_reachable(snapshot, profile_did, now));
     }
 }
 
@@ -2343,6 +2340,19 @@ fn stamp_undeliverable_requests(
         }
     }
     Ok(())
+}
+
+/// Whether `profile_did` has an unexpired presence heartbeat right now: the
+/// one meaning of "reachable" for a contact.
+pub(super) fn profile_reachable(
+    snapshot: &crate::collaboration_presence::CollaborationPresenceSnapshot,
+    profile_did: &str,
+    now: u64,
+) -> bool {
+    snapshot
+        .records()
+        .iter()
+        .any(|record| record.sender_profile_did() == profile_did && record.expires_at() > now)
 }
 
 fn apply_profile_people_authority(
@@ -4077,6 +4087,38 @@ fn home_services_remote_exit_id(display_name: &str, request_id: &str) -> String 
     }
 }
 
+/// The presence device DID of `context`'s accepted contact that speaks as the
+/// Carrier peer `source`, if any. Every Carrier service that serves only
+/// contacts asks this one question. A principal without a Profile has no
+/// contacts.
+fn accepted_contact_for_carrier_source(
+    data_dir: &std::path::Path,
+    network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    context: &HomeLaunchTokenContext,
+    local_did: &str,
+    source: &iroh::PublicKey,
+) -> anyhow::Result<Option<String>> {
+    let Some(profile) = load_profile_authority_for_context(data_dir, context)? else {
+        return Ok(None);
+    };
+    let store = crate::collaboration_contact_store::CollaborationContactStore::new(
+        data_dir,
+        &context.principal_id,
+        &home_browser_localhost_root(context),
+        network.clone(),
+        &profile,
+        local_did,
+    )?;
+    Ok(store
+        .snapshot()?
+        .contacts()
+        .iter()
+        .find(|contact| {
+            crate::carrier::did_to_public_key(contact.remote_presence_device_did()) == Some(*source)
+        })
+        .map(|contact| contact.remote_presence_device_did().to_string()))
+}
+
 /// One entry per principal from the active passkey records. A principal with
 /// several passkeys has one record per passkey but owns one set of service
 /// requests, so the grant loops must read it once. The flag is true only when
@@ -4133,24 +4175,11 @@ pub(crate) fn authorize_home_service_exit(
                     && home_services_local_exit_shared(data_dir, &context)?,
                 "Exit grant is not active"
             );
-            let profile = load_profile_authority_for_context(data_dir, &context)?
-                .ok_or_else(|| anyhow::anyhow!("Exit profile authority unavailable"))?;
-            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
-                data_dir,
-                &context.principal_id,
-                &home_browser_localhost_root(&context),
-                network.clone(),
-                &profile,
-                &local_did,
+            let contact = accepted_contact_for_carrier_source(
+                data_dir, network, &context, &local_did, source,
             )?;
             anyhow::ensure!(
-                store.snapshot()?.contacts().iter().any(
-                    |contact| crate::carrier::did_to_public_key(
-                        contact.remote_presence_device_did()
-                    ) == Some(*source)
-                        && record.requester_did.as_deref()
-                            == Some(contact.remote_presence_device_did())
-                ),
+                contact.is_some() && record.requester_did == contact,
                 "Exit requester is no longer an accepted contact"
             );
             let grant = crate::carrier::BrowserExitGrant {
@@ -4266,24 +4295,11 @@ pub(crate) fn authorize_home_service_engine(
                     && home_services_local_engine_shared(data_dir, &context)?,
                 "Engine grant is not active"
             );
-            let profile = load_profile_authority_for_context(data_dir, &context)?
-                .ok_or_else(|| anyhow::anyhow!("Engine profile authority unavailable"))?;
-            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
-                data_dir,
-                &context.principal_id,
-                &home_browser_localhost_root(&context),
-                network.clone(),
-                &profile,
-                &local_did,
+            let contact = accepted_contact_for_carrier_source(
+                data_dir, network, &context, &local_did, source,
             )?;
             anyhow::ensure!(
-                store.snapshot()?.contacts().iter().any(
-                    |contact| crate::carrier::did_to_public_key(
-                        contact.remote_presence_device_did()
-                    ) == Some(*source)
-                        && record.requester_did.as_deref()
-                            == Some(contact.remote_presence_device_did())
-                ),
+                contact.is_some() && record.requester_did == contact,
                 "Engine requester is no longer an accepted contact"
             );
             let grant = crate::carrier::BrowserEngineGrant {
@@ -4585,24 +4601,11 @@ pub(crate) fn authorize_home_service_model(
                         || crate::api::any_hosted_model_shared(data_dir)),
                 "model grant is not active"
             );
-            let profile = load_profile_authority_for_context(data_dir, &context)?
-                .ok_or_else(|| anyhow::anyhow!("model profile authority unavailable"))?;
-            let store = crate::collaboration_contact_store::CollaborationContactStore::new(
-                data_dir,
-                &context.principal_id,
-                &home_browser_localhost_root(&context),
-                network.clone(),
-                &profile,
-                &local_did,
+            let contact = accepted_contact_for_carrier_source(
+                data_dir, network, &context, &local_did, source,
             )?;
             anyhow::ensure!(
-                store.snapshot()?.contacts().iter().any(
-                    |contact| crate::carrier::did_to_public_key(
-                        contact.remote_presence_device_did()
-                    ) == Some(*source)
-                        && record.requester_did.as_deref()
-                            == Some(contact.remote_presence_device_did())
-                ),
+                contact.is_some() && record.requester_did == contact,
                 "model requester is no longer an accepted contact"
             );
             let grant = super::ModelServiceGrant {

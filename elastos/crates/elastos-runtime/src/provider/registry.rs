@@ -344,6 +344,9 @@ pub enum ProviderCarrierRoute {
         peer_did: String,
         /// Optional per-hop timeout. Runtime rejects zero-duration values.
         timeout_ms: Option<u64>,
+        /// Optional bound on the wait for the peer's answer. When set it
+        /// replaces the Carrier's open-ended answer wait for this call.
+        reply_wait_ms: Option<u64>,
     },
 }
 
@@ -1884,10 +1887,20 @@ fn validate_provider_transfer_contract(
                     ));
                 }
             }
-            ProviderCarrierRoute::PeerDid { peer_did, .. } => {
+            ProviderCarrierRoute::PeerDid {
+                peer_did,
+                reply_wait_ms,
+                ..
+            } => {
                 if peer_did.trim().is_empty() {
                     return Err(ProviderError::Provider(
                         "Carrier provider invocation requires peer_did".to_string(),
+                    ));
+                }
+                if *reply_wait_ms == Some(0) {
+                    return Err(ProviderError::Provider(
+                        "Carrier provider invocation reply_wait_ms must be greater than zero"
+                            .to_string(),
                     ));
                 }
             }
@@ -3185,6 +3198,7 @@ mod tests {
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: "did:key:zFixture".into(),
                 timeout_ms: Some(5000),
+                reply_wait_ms: None,
             }),
         ] {
             let (mut invocation, _) = bounded_read_fixture(ProviderTransfer::Bytes);
@@ -3303,6 +3317,7 @@ mod tests {
                 ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                     peer_did: "did:key:zFixture".into(),
                     timeout_ms: Some(5000),
+                    reply_wait_ms: None,
                 }),
             ] {
                 let (mut invocation, _) = bounded_read_fixture(ProviderTransfer::Bytes);
@@ -3539,6 +3554,7 @@ mod tests {
                 ProviderCarrierRoute::PeerDid {
                     peer_did,
                     timeout_ms,
+                    ..
                 } => (None, Some(peer_did.as_str()), *timeout_ms),
             };
             self.requests.lock().await.push(serde_json::json!({
@@ -3931,6 +3947,7 @@ mod tests {
         let route = ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did: "did:key:zFixture".into(),
             timeout_ms: Some(5000),
+            reply_wait_ms: None,
         });
         let (mut raw, _) = complete_metadata_fixture(ProviderTransfer::Bytes);
         raw.transport = route.clone();
@@ -4057,6 +4074,7 @@ mod tests {
         let route = ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did: "did:key:zFixture".into(),
             timeout_ms: Some(5000),
+            reply_wait_ms: None,
         });
         // Content carries the bound inside its request; the holder's Runtime
         // applies it, so the hop reaches the Carrier invoker unchanged.
@@ -4519,6 +4537,7 @@ mod tests {
                 transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                     peer_did: "did:key:zPeer".to_string(),
                     timeout_ms: Some(2_000),
+                    reply_wait_ms: None,
                 }),
             })
             .await

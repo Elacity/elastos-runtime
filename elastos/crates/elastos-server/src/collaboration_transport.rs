@@ -248,6 +248,7 @@ impl SharedHomeDelivery {
                             ProviderCarrierRoute::PeerDid {
                                 peer_did: peer.clone(),
                                 timeout_ms: Some(HOME_DELIVERY_TIMEOUT.as_millis() as u64),
+                                reply_wait_ms: None,
                             },
                         ),
                     }),

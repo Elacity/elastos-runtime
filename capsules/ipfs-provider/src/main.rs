@@ -2166,9 +2166,9 @@ fn try_flock_exclusive(_file: &fs::File) -> bool {
 /// Runtime's Carrier transfers).
 const WHOLE_CONTENT_CEILING: u64 = elastos_common::MAX_WHOLE_CONTENT_BYTES as u64;
 
-/// Starts every refusal of content past a whole read's limit. That refusal is
-/// final: another route would read the same content again.
-const WHOLE_CONTENT_TOO_LARGE: &str = "content exceeds the whole-content limit";
+// Starts every refusal of content past a whole read's limit. That refusal is
+// final: another route would read the same content again.
+use elastos_common::WHOLE_CONTENT_TOO_LARGE;
 
 fn is_whole_content_too_large(error: &str) -> bool {
     error.starts_with(WHOLE_CONTENT_TOO_LARGE)

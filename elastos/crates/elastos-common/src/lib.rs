@@ -40,6 +40,10 @@ pub use types::{CapsuleId, CapsuleStatus};
 /// as the gateway, pass their own smaller limit.
 pub const MAX_WHOLE_CONTENT_BYTES: usize = 200 * 1024 * 1024;
 
+/// Starts every refusal of content past a whole read's limit. The IPFS
+/// provider writes it; Runtime recognises it to report a typed "too large".
+pub const WHOLE_CONTENT_TOO_LARGE: &str = "content exceeds the whole-content limit";
+
 /// Convert a Runtime principal/profile label into the non-reversible Browser
 /// profile key used for profile-disk names and guest boot args.
 pub fn browser_profile_key_from_value(value: &str) -> Option<String> {

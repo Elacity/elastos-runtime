@@ -5001,6 +5001,7 @@ fn runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carr
         ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did,
             timeout_ms: None,
+            reply_wait_ms: None,
         }) if peer_did == &peer_did_1
     ));
     assert!(matches!(
@@ -5008,6 +5009,7 @@ fn runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carr
         ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did,
             timeout_ms: None,
+            reply_wait_ms: None,
         }) if peer_did == &peer_did_2
     ));
 
@@ -5022,10 +5024,12 @@ fn runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carr
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peer_did_1.clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peer_did_2.clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
         ],
     );
@@ -5098,6 +5102,7 @@ fn runtime_custody_composition_accepts_three_remote_routes() {
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: actual,
                 timeout_ms: None,
+                reply_wait_ms: None,
             }) if actual == peer_did
         ));
     }
@@ -5112,14 +5117,17 @@ fn runtime_custody_composition_accepts_three_remote_routes() {
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peers[0].clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peers[1].clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
             ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peers[2].clone(),
                 timeout_ms: None,
+                reply_wait_ms: None,
             }),
         ],
     );

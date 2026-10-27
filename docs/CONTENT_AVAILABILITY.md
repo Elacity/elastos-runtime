@@ -611,9 +611,16 @@ bounded JSON/base64 byte path, not the final streaming ABI.
 Carrier has a typed internal
 `content_fetch` byte operation on its file ALPN: a connected Runtime peer can
 request a CID/path and the serving Runtime reads bytes through its local
-`ipfs-provider`. That operation is still Runtime-internal; normal capsules do
-not receive raw Carrier tickets, peer handles, or Kubo authority. It remains a
-narrow compatibility/bootstrap path.
+`ipfs-provider`. Only a node that serves publisher content (a seed) answers it;
+an ordinary Home refuses it. Normal capsules do not receive raw Carrier
+tickets, peer handles, or Kubo authority.
+
+Peer `content/fetch` admission: every peer read is `local_only`. An ordinary
+Home serves it only for a CID pinned there now (Kubo `pin/ls`); pinned content
+is public by link, and unpinned or cached blocks are never served to peers, so
+Unpublish stops serving at once. A seed serves as before. A whole read past the
+requested `whole_max_bytes` answers the fixed token `content_too_large`, and
+the requester bounds the answer line to that size.
 
 Internal `content-provider` calls use the Runtime provider-to-provider
 invocation envelope for IPFS and availability effects. The envelope validates

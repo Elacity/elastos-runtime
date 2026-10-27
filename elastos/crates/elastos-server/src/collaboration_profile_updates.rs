@@ -398,6 +398,7 @@ impl CollaborationProfileUpdateService {
                 transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                     peer_did: recipient_endpoint_did.to_string(),
                     timeout_ms: Some(PROFILE_UPDATE_TIMEOUT_MS),
+                    reply_wait_ms: None,
                 }),
             })
             .await?;

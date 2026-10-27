@@ -2259,6 +2259,7 @@ async fn accepted_contacts_exchange_direct_messages_without_bootstrap_peers_or_s
                 transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                     peer_did: remote_did,
                     timeout_ms: Some(DIRECT_PROVIDER_TIMEOUT_MS),
+                    reply_wait_ms: None,
                 }),
             })
             .await
@@ -2604,6 +2605,7 @@ async fn same_runtime_carrier_loopback_rejects_wrong_authority_and_recipient_bin
         transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
             peer_did: endpoint_did.clone(),
             timeout_ms: Some(DIRECT_PROVIDER_TIMEOUT_MS),
+            reply_wait_ms: None,
         }),
     };
     let before = pair

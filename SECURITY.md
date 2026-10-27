@@ -75,7 +75,11 @@ durable rotation receipt.
 **Status:** Open (host-plane envelope)
 
 Runtime identifies each Carrier peer by its endpoint key. A key alone gives no
-authority. Any peer can read content that this Home holds locally. In this
+authority. A Home serves a peer's `content/fetch` only for a CID pinned on it
+now: pinned content is public by link, and unpinned or cached blocks are never
+served to peers. Unpinning stops serving at once, before garbage collection.
+Only a node that serves publisher content (a seed) answers the raw
+`content_fetch` byte operation or serves without the pin check. In this
 release a seed accepts no new copies from other Homes; copies it already holds
 stay. A Home accepts a new copy from a peer only if the owner gave that peer
 the `content.replica` permission; copies it already holds stay. The owner

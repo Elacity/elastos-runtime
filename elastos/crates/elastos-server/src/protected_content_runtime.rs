@@ -2689,6 +2689,7 @@ fn load_runtime_custody_composition_config(
                 ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                     peer_did: canonical_peer_did,
                     timeout_ms: None,
+                    reply_wait_ms: None,
                 })
             }
         };

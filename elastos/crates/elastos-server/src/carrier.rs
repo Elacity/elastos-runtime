@@ -171,7 +171,15 @@ const _: () = assert!(CARRIER_PROVIDER_REPLY_MAX_BYTES >= GOSSIP_PEEK_MAX_BATCH_
 /// base64 stream chunks, plus room for the chunk fields (under 100 bytes per
 /// 64 KiB chunk) and the reply envelope.
 const CARRIER_WHOLE_CONTENT_REPLY_MAX_BYTES: u64 =
-    (elastos_common::MAX_WHOLE_CONTENT_BYTES as u64).div_ceil(3) * 4 + 1024 * 1024;
+    whole_content_reply_bound(elastos_common::MAX_WHOLE_CONTENT_BYTES as u64);
+
+/// The answer bound for one whole file of at most `max_bytes`, as above.
+const fn whole_content_reply_bound(max_bytes: u64) -> u64 {
+    max_bytes
+        .div_ceil(3)
+        .saturating_mul(4)
+        .saturating_add(1024 * 1024)
+}
 /// How long a peer may take to send one complete request line.
 const CARRIER_PEER_LINE_WAIT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 /// How long Runtime waits for an open-ended provider answer. Long model runs
@@ -2298,6 +2306,18 @@ async fn handle_file_stream(
             info!("carrier: served file {} ({} bytes)", path, len);
         }
         "content_fetch" => {
+            // Only nodes that serve publisher content answer this unscoped read.
+            if !is_trusted_source_runtime(data_dir) {
+                send_json(
+                    send,
+                    &serde_json::json!({
+                        "ok": false,
+                        "error": "this node does not serve content_fetch",
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
             let Some(registry) = provider_registry.and_then(|registry| registry.upgrade()) else {
                 send_json(
                     send,
@@ -2815,15 +2835,57 @@ enum CarrierProviderCaller<'a> {
 fn carrier_peer_refusal(error: &str) -> serde_json::Value {
     serde_json::json!({
         "ok": false,
-        "code": "unauthorized_provider_peer",
+        "code": CARRIER_PEER_REFUSED,
         "error": error,
     })
 }
 
-/// Runtime admission for a Carrier peer's `content` operation. Any peer may
-/// read what this node holds locally. Replica operations need the owner's
-/// `content.replica` grant; a seed accepts no replicas. Publish, unpublish
-/// and repair stay local. `Err` is the answer to send instead of dispatching.
+/// This node's own pin state for `cid`: `Some(true)` pinned, `Some(false)`
+/// not pinned, `None` when the pin state cannot be read now.
+async fn local_cid_pinned(registry: &ProviderRegistry, cid: &str) -> Option<bool> {
+    let response = registry
+        .send_raw(
+            "ipfs",
+            &serde_json::json!({ "op": "pin_status", "cid": cid }),
+        )
+        .await
+        .ok()?;
+    if response.get("status").and_then(|value| value.as_str()) != Some("ok") {
+        return None;
+    }
+    response.get("data")?.get("pinned")?.as_bool()
+}
+
+/// A peer `fetch` on a node that does not serve publisher content reads only
+/// a CID pinned here: pinned content is public by link, while unpinned or
+/// cached blocks are never served to peers. Unpinning stops serving at once,
+/// before blocks are collected.
+async fn admit_carrier_peer_content_fetch(
+    registry: &ProviderRegistry,
+    data_dir: &std::path::Path,
+    request: &serde_json::Value,
+) -> std::result::Result<(), serde_json::Value> {
+    if is_trusted_source_runtime(data_dir) {
+        return Ok(());
+    }
+    let cid = request
+        .get("cid")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if validate_content_cid(cid).is_err() || local_cid_pinned(registry, cid).await != Some(true) {
+        return Err(carrier_peer_refusal(
+            "this Home does not share this content",
+        ));
+    }
+    Ok(())
+}
+
+/// Runtime admission for a Carrier peer's `content` operation. A peer reads
+/// only locally held content, and on an ordinary Home only as
+/// [`admit_carrier_peer_content_fetch`] allows. Replica operations need the
+/// owner's `content.replica` grant; a seed accepts no replicas. Publish,
+/// unpublish and repair stay local. `Err` is the answer to send instead of
+/// dispatching.
 fn admit_carrier_peer_content_request(
     data_dir: &std::path::Path,
     peer_did: &str,
@@ -2940,6 +3002,13 @@ async fn carrier_provider_invoke_registry(
         ) {
             return Ok(answer);
         }
+        if operation == "fetch" {
+            if let Err(answer) =
+                admit_carrier_peer_content_fetch(registry, data_dir, &request).await
+            {
+                return Ok(answer);
+            }
+        }
     }
 
     let result = if target == "custody"
@@ -2957,6 +3026,20 @@ async fn carrier_provider_invoke_registry(
             "ok": true,
             "result": result,
         })),
+        // A whole read past its bound is final for the caller; say so with a
+        // fixed token instead of backend text.
+        Err(err)
+            if target == "content"
+                && err
+                    .to_string()
+                    .contains(elastos_common::WHOLE_CONTENT_TOO_LARGE) =>
+        {
+            Ok(serde_json::json!({
+                "ok": false,
+                "code": CARRIER_CONTENT_TOO_LARGE,
+                "error": "content is larger than the requested bound",
+            }))
+        }
         Err(err) => Ok(serde_json::json!({
             "ok": false,
             "code": "provider_error",
@@ -4146,21 +4229,7 @@ impl CarrierAvailabilityProvider {
     /// pinned, `None` when the pin state cannot be read now.
     async fn local_pin_replicas(&self, cid: &str) -> Option<u32> {
         let registry = self.provider_registry.as_ref()?.upgrade()?;
-        let response = registry
-            .send_raw(
-                "ipfs",
-                &serde_json::json!({ "op": "pin_status", "cid": cid }),
-            )
-            .await
-            .ok()?;
-        if response.get("status").and_then(|value| value.as_str()) != Some("ok") {
-            return None;
-        }
-        response
-            .get("data")?
-            .get("pinned")?
-            .as_bool()
-            .map(u32::from)
+        local_cid_pinned(&registry, cid).await.map(u32::from)
     }
 
     async fn announce_availability(
@@ -8555,7 +8624,11 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                     None => ProviderError::Provider(message),
                 })
             }
-            ProviderCarrierRoute::PeerDid { peer_did, .. } => {
+            ProviderCarrierRoute::PeerDid {
+                peer_did,
+                reply_wait_ms,
+                ..
+            } => {
                 let public_key = did_to_public_key(peer_did).ok_or_else(|| {
                     ProviderError::Provider(
                         "Carrier provider invocation peer_did is invalid".to_string(),
@@ -8606,6 +8679,20 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                                 "response deadline of {timeout_secs}s passed"
                             ))
                         })
+                } else if let Some(wait_ms) = reply_wait_ms {
+                    // The caller bounded its wait: dropping the call closes the stream.
+                    match tokio::time::timeout(std::time::Duration::from_millis(*wait_ms), invoke)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            self.forget_peer(public_key).await;
+                            return Err(ProviderError::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "Carrier provider answer wait passed",
+                            )));
+                        }
+                    }
                 } else {
                     invoke.await
                 };
@@ -8618,9 +8705,18 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                             error = %err,
                             "Carrier peer invocation failed"
                         );
-                        Err(ProviderError::Provider(
-                            "Carrier provider invocation peer_did route failed".to_string(),
-                        ))
+                        // Only the peer's fixed decision token or the transit
+                        // marker travels on; never its free text.
+                        let cause = match err.downcast_ref::<CarrierProviderDecision>() {
+                            Some(decision) => decision.code,
+                            None if err.downcast_ref::<CarrierTransportFailure>().is_some() => {
+                                PEER_ROUTE_IN_TRANSIT
+                            }
+                            None => "failed",
+                        };
+                        Err(ProviderError::Provider(format!(
+                            "Carrier provider invocation peer_did route failed: {cause}"
+                        )))
                     }
                 }
             }
@@ -8774,15 +8870,24 @@ pub(crate) struct CarrierProviderDecision {
     pub code: &'static str,
 }
 
-const CARRIER_PROVIDER_DECISION_CODES: [&str; 8] = [
+/// A peer refused a Content operation for this caller (not admitted, or the
+/// CID is not shared here).
+pub(crate) const CARRIER_PEER_REFUSED: &str = "unauthorized_provider_peer";
+/// The holder's whole-content read passed the requested bound.
+pub(crate) const CARRIER_CONTENT_TOO_LARGE: &str = "content_too_large";
+/// A peer-DID call whose stream broke in transit, after the connect.
+pub(crate) const PEER_ROUTE_IN_TRANSIT: &str = "in_transit";
+
+const CARRIER_PROVIDER_DECISION_CODES: [&str; 9] = [
     "denied",
     "rate_limited",
     "offer_unavailable",
     "provider_failure",
     "invalid_provider_invocation",
     "unauthorized_provider_target",
-    "unauthorized_provider_peer",
+    CARRIER_PEER_REFUSED,
     "provider_registry_unavailable",
+    CARRIER_CONTENT_TOO_LARGE,
 ];
 
 impl CarrierProviderDecision {
@@ -9155,6 +9260,13 @@ impl CarrierClient {
         // A whole-object content reply arrives as one line, bounded by the
         // shared whole-content limit; only two run at once and one per peer.
         let whole_content = !bounded && invocation.target == "content" && invocation.op == "fetch";
+        // A caller that asked for less than the shared limit reads at most that.
+        let whole_reply_bound = request
+            .get("whole_max_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(CARRIER_WHOLE_CONTENT_REPLY_MAX_BYTES, |max_bytes| {
+                whole_content_reply_bound(max_bytes).min(CARRIER_WHOLE_CONTENT_REPLY_MAX_BYTES)
+            });
         let _content_slots = if whole_content {
             Some(acquire_content_reply_slots(self.conn.remote_id()).await?)
         } else {
@@ -9183,7 +9295,7 @@ impl CarrierClient {
         } else if bounded {
             Some(CARRIER_BOUNDED_INVOKE_MAX_RESPONSE_BYTES)
         } else if whole_content {
-            Some(CARRIER_WHOLE_CONTENT_REPLY_MAX_BYTES)
+            Some(whole_reply_bound)
         } else {
             None
         };
@@ -9585,6 +9697,16 @@ pub(crate) mod tests {
             })),
         )
         .await;
+        // Release components come from a node that serves publisher content.
+        std::fs::create_dir_all(publisher_artifacts_path(holder._dir.path())).unwrap();
+        let refusing = start_holder_runtime(
+            92,
+            Arc::new(MockCarrierContentProvider),
+            Some(Arc::new(WholeFileIpfsBackend {
+                bytes: bytes[..16].to_vec(),
+            })),
+        )
+        .await;
         let runtime = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .bind()
             .await
@@ -9604,8 +9726,25 @@ pub(crate) mod tests {
         .unwrap();
         assert!(fetched == bytes, "content_fetch returned other bytes");
         client.close().await;
+        // An ordinary Home never answers the unscoped byte read.
+        let client = CarrierClient::connect_known_endpoint(&runtime, refusing.addr.clone(), 5)
+            .await
+            .unwrap();
+        let refused = client
+            .fetch_content(
+                "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("does not serve content_fetch"),
+            "{refused}"
+        );
+        client.close().await;
         runtime.close().await;
         shutdown_test_carrier_node(holder.node).await;
+        shutdown_test_carrier_node(refusing.node).await;
     }
 
     #[tokio::test]
@@ -12528,9 +12667,42 @@ pub(crate) mod tests {
         server.close().await;
     }
 
+    const FIXTURE_CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+
+    /// Kubo stand-in whose pin state for every CID a test can switch.
+    struct SwitchPinIpfs {
+        pinned: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SwitchPinIpfs {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("raw operations only".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+        fn name(&self) -> &'static str {
+            "switch-pin-ipfs"
+        }
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            assert_eq!(request["op"], "pin_status");
+            let pinned = self.pinned.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(serde_json::json!({ "status": "ok", "data": { "pinned": pinned } }))
+        }
+    }
+
     struct PeerDidRouteFixture {
         local_registry: Arc<ProviderRegistry>,
         remote_requests: Arc<StdMutex<Vec<serde_json::Value>>>,
+        /// The remote's pin state for every CID; serving reads it.
+        remote_pinned: Arc<std::sync::atomic::AtomicBool>,
         remote_did: String,
         remote_addr: iroh::EndpointAddr,
         local_node: CarrierNode,
@@ -12613,6 +12785,10 @@ pub(crate) mod tests {
             &self,
             request: &serde_json::Value,
         ) -> std::result::Result<serde_json::Value, ProviderError> {
+            // The holder pins what it serves; serving asks before each read.
+            if request["op"] == "pin_status" {
+                return Ok(serde_json::json!({ "status": "ok", "data": { "pinned": true } }));
+            }
             let _turn = match &self.serial {
                 Some(serial) => Some(serial.lock().await),
                 None => None,
@@ -12876,12 +13052,13 @@ pub(crate) mod tests {
             .register_sub_provider("content", content)
             .await
             .unwrap();
-        if let Some(backend) = backend {
-            registry
-                .register_sub_provider("ipfs", backend)
-                .await
-                .unwrap();
-        }
+        // Without its own backend the holder still pins what it serves.
+        let backend =
+            backend.unwrap_or_else(|| Arc::new(PinStatusIpfs { pinned: Some(true) }));
+        registry
+            .register_sub_provider("ipfs", backend)
+            .await
+            .unwrap();
         let (sk, did) = elastos_identity::derive_did(&[seed; 32]);
         let node = start_isolated_carrier_node_with_registry(
             &sk,
@@ -13438,6 +13615,7 @@ pub(crate) mod tests {
                 ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                     peer_did: slow.did.clone(),
                     timeout_ms: Some(1_000),
+                    reply_wait_ms: None,
                 });
             invocation
         };
@@ -13523,6 +13701,16 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+        let remote_pinned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        remote_registry
+            .register_sub_provider(
+                "ipfs",
+                Arc::new(SwitchPinIpfs {
+                    pinned: remote_pinned.clone(),
+                }),
+            )
+            .await
+            .unwrap();
         let remote_dir = tempfile::tempdir().unwrap();
         let (remote_sk, remote_did) = elastos_identity::derive_did(&[remote_seed; 32]);
         let remote_node = start_isolated_carrier_node_with_registry(
@@ -13542,6 +13730,7 @@ pub(crate) mod tests {
         PeerDidRouteFixture {
             local_registry,
             remote_requests,
+            remote_pinned,
             remote_did,
             remote_addr,
             local_node,
@@ -13615,6 +13804,7 @@ pub(crate) mod tests {
             transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: fixture.remote_did.clone(),
                 timeout_ms: Some(5_000),
+                reply_wait_ms: None,
             }),
         };
         let response = tokio::time::timeout(
@@ -13678,13 +13868,14 @@ pub(crate) mod tests {
             source: "content-provider".to_string(),
             target: "content".to_string(),
             op: "fetch".to_string(),
-            request: serde_json::json!({ "op": "fetch" }),
+            request: serde_json::json!({ "op": "fetch", "cid": FIXTURE_CID }),
             transfer: ProviderTransfer::Json,
             range: None,
             progress: None,
             transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peer_did.to_string(),
                 timeout_ms: Some(5_000),
+                reply_wait_ms: None,
             }),
         }
     }
@@ -13701,6 +13892,7 @@ pub(crate) mod tests {
             transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peer_did.to_string(),
                 timeout_ms: Some(5_000),
+                reply_wait_ms: None,
             }),
         }
     }
@@ -13713,7 +13905,7 @@ pub(crate) mod tests {
             source: "content-provider".to_string(),
             target: "content".to_string(),
             op: "fetch".to_string(),
-            request: serde_json::json!({ "op": "fetch" }),
+            request: serde_json::json!({ "op": "fetch", "cid": FIXTURE_CID }),
             transfer: ProviderTransfer::Json,
             range: None,
             progress: None,
@@ -13826,6 +14018,7 @@ pub(crate) mod tests {
             transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
                 peer_did: peer_did.to_string(),
                 timeout_ms: Some(5_000),
+                reply_wait_ms: None,
             }),
         }
     }
@@ -13933,7 +14126,7 @@ pub(crate) mod tests {
         }
         assert!(recorded_content_ops(&fixture.remote_requests).is_empty());
 
-        // Any peer may read what this node holds, but only locally.
+        // Any peer may read a CID pinned here, but only locally.
         invoke(serde_json::json!({ "op": "fetch", "cid": cid }))
             .await
             .unwrap();
@@ -14167,6 +14360,30 @@ pub(crate) mod tests {
             .register_sub_provider("ipfs", Arc::new(PinStatusIpfs { pinned: Some(true) }))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn carrier_peer_fetch_serves_only_cids_pinned_on_an_ordinary_home() {
+        let fixture = peer_did_route_fixture(156, 157).await;
+        let invoke = || {
+            fixture.local_registry.invoke_provider(peer_did_content_invocation(
+                &fixture.remote_did,
+                serde_json::json!({ "op": "fetch", "cid": FIXTURE_CID }),
+            ))
+        };
+        // Pinned: any peer reads it, locally only.
+        invoke().await.unwrap();
+        assert_eq!(recorded_content_ops(&fixture.remote_requests), ["fetch"]);
+        // Unpublished, or blocks only cached: the blocks may still be present,
+        // but nothing is served from the moment the pin is gone.
+        fixture
+            .remote_pinned
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let refused = invoke().await.unwrap_err().to_string();
+        assert!(refused.ends_with(CARRIER_PEER_REFUSED), "{refused}");
+        assert_eq!(recorded_content_ops(&fixture.remote_requests), ["fetch"]);
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
     }
 
     async fn availability_test_state(
