@@ -76,6 +76,53 @@ function colorDistance(left, right, base = null) {
   );
 }
 
+function relativeLuminance([r, g, b]) {
+  const channel = (value) => {
+    const s = value / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  return (0.2126 * channel(r)) + (0.7152 * channel(g)) + (0.0722 * channel(b));
+}
+
+// WCAG ratio of text over a surface that may be translucent over its base.
+function contrastRatio(text, surface, base) {
+  const back = flattenColor(surface, base);
+  const fore = back && flattenColor(text, `rgb(${back.join(", ")})`);
+  if (!fore) return 0;
+  const [light, dark] = [relativeLuminance(fore), relativeLuminance(back)].sort((a, b) => b - a);
+  return (light + 0.05) / (dark + 0.05);
+}
+
+// The upload panel renders uploads.js rows; its text must read in either theme.
+async function assertUploadProgressReadable(page, label) {
+  const colors = await page.evaluate(() => {
+    const panel = document.getElementById("upload-progress");
+    panel.classList.remove("hidden");
+    panel.innerHTML = `
+      <div class="upload-row">
+        <div>
+          <div class="upload-name">explorer-note.txt</div>
+          <div>Complete</div>
+        </div>
+        <div class="upload-meter"><div class="upload-fill" style="--progress: 100%"></div></div>
+      </div>`;
+    const read = (selector) => getComputedStyle(document.querySelector(selector));
+    const result = {
+      base: read("body").backgroundColor,
+      surface: read("#upload-progress").backgroundColor,
+      name: read(".upload-name").color,
+      status: read(".upload-name + div").color,
+    };
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return result;
+  });
+  for (const key of ["name", "status"]) {
+    const ratio = contrastRatio(colors[key], colors.surface, colors.base);
+    assert(ratio >= 4.5, `${label}: upload ${key} contrast ${ratio.toFixed(2)}:1 is below 4.5:1 (${JSON.stringify(colors)}).`);
+  }
+}
+
 function object(uri, name, kind) {
   return {
     schema: "elastos.library.object/v1",
@@ -415,6 +462,10 @@ async function run() {
     assertReadableTheme(lightGeneral, "light general");
     assert(darkGeneral.statusbar.backgroundColor !== lightGeneral.statusbar.backgroundColor, "Library footer must react to theme changes.");
     assert(darkGeneral.panel.backgroundColor !== lightGeneral.panel.backgroundColor, "Library Properties panel must react to theme changes.");
+    await assertUploadProgressReadable(page, "light");
+    await page.evaluate(() => document.documentElement.removeAttribute("data-el-theme"));
+    await assertUploadProgressReadable(page, "dark");
+    await page.evaluate(() => document.documentElement.setAttribute("data-el-theme", "light"));
     await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     await page.fill("#search", "missing");

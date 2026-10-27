@@ -953,7 +953,7 @@
       margin: 8px 10px 0;
       border: 1px solid var(--line);
       border-radius: var(--radius-md);
-      background: rgba(255, 255, 255, 0.62);
+      background: var(--panel);
       padding: 10px;
     }
 
@@ -1351,7 +1351,7 @@
       overflow: auto;
       border: 1px solid var(--line);
       border-radius: var(--radius-md);
-      background: rgba(255, 255, 255, 0.68);
+      background: var(--panel-soft);
       padding: 10px;
       color: var(--ink);
       white-space: pre-wrap;
@@ -1380,7 +1380,7 @@
       min-width: 0;
       border: 1px solid var(--line);
       border-radius: var(--radius-md);
-      background: rgba(255, 255, 255, 0.84);
+      background: var(--panel-soft);
       padding: 9px;
       color: var(--ink);
       font: inherit;

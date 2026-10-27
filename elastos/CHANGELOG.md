@@ -46,6 +46,9 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   Phone detail controls have full touch targets, and Tab skips closed detail
   content.
 - Archive's file list is readable in the dark theme.
+- Library's upload progress, and the fields and details in its dialogs, are
+  readable in both themes. Before, the dark theme showed white text on light
+  grey.
 - Marketplace no longer lists WalletConnect while it is not set up on this
   Home, as Home and Wallet already hide it.
 - In Chat, clicking a person's name on a Community post opens their profile
