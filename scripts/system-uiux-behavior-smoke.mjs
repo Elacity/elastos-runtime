@@ -998,7 +998,8 @@ async function main() {
     await frame.fill("#ai-provider-key", "rejected-key");
     await frame.click("#ai-provider-validate");
     await frame.waitForFunction(() => document.querySelector('[data-field="ai-provider-state"]')?.textContent
-      === "The provider rejected this key." && document.querySelector("#ai-provider-cancel").textContent === "Cancel");
+      === "The provider rejected this key." && document.querySelector("#ai-provider-cancel").textContent === "Cancel"
+      && !document.querySelector("#ai-provider-cancel").disabled);
     assert(
       discardedStaged.at(-1) === "model:hosted-22222222222222222222222222222222",
       "System kept a key rejected while editing a saved connection",
