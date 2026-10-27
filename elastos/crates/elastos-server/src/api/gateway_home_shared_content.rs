@@ -149,7 +149,7 @@ fn stated_post_size(body: &str, uri: &str) -> Option<u64> {
         _ => return None,
     };
     let value: f64 = number.parse().ok()?;
-    (value.is_finite() && value >= 0.0).then(|| (value * scale) as u64)
+    (value.is_finite() && value >= 0.0).then_some((value * scale) as u64)
 }
 
 /// The size format Chat shows (`format_bytes` in the Chat app).
