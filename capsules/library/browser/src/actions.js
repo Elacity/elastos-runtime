@@ -1,6 +1,7 @@
 import {
   archiveLibraryObjectPayload,
   baseName,
+  canPublishObject,
   canPreviewObject,
   childUri,
   contentCid,
@@ -15,7 +16,8 @@ import {
   isTrashUri,
   isWebSpaceUri,
   parentUri,
-  publishedCid,
+  publishFailureText,
+  publishedLink,
   viewerOptions,
 } from "./model.js";
 
@@ -23,6 +25,7 @@ export function createLibraryActions({
   clearSelection,
   closeSelf,
   confirmDestructive,
+  confirmPublish,
   currentFolderReadOnly,
   deliverToTarget,
   downloadObjectRaw,
@@ -41,6 +44,7 @@ export function createLibraryActions({
   showObjectStatus,
   showProtectAndListDialog,
   showProperties,
+  showPublishedLink,
   showSharedAccessReceipt,
   startCreateObject,
   state,
@@ -49,6 +53,8 @@ export function createLibraryActions({
   writeResourceUri,
 }) {
   const RUNTIME_CUSTODY_METADATA_SCHEMA = "elastos.library.protected-content-identity/v1";
+  // Chat accepts files up to 8 MiB; Library does not read a larger file for it.
+  const CHAT_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024;
   const MINT_ID_HEX_RE = /^[0-9a-f]{64}$/;
   const protectAndListInFlight = new Map();
   const activeUploads = new Set();
@@ -133,26 +139,27 @@ export function createLibraryActions({
     return openTarget(viewer, query);
   }
 
+  // Chat's Community posts a Library file by its address and revision, so it
+  // gets no bytes for a file over the Chat limit; a local room still sends the
+  // bytes it is given. Browser always gets the file's bytes.
   async function attachObject(object) {
     const targetLabel = state.returnTarget === "browser" ? "Browser" : "Chat Room";
     setStatus("Preparing attachment...");
     try {
-      const raw = await downloadObjectRaw({ uri: object.uri });
-      const cid = publishedCid(object);
+      const chat = state.returnTarget === "chat-room";
+      const raw = chat && Number(object.size || 0) > CHAT_ATTACHMENT_MAX_BYTES
+        ? null
+        : await downloadObjectRaw({ uri: object.uri });
       const payload = {
-        type: state.returnTarget === "browser"
-          ? "browser:file-picker-selection"
-          : "chat-room:attach-library-item",
-        blob: raw.blob,
-        fileName: object.name || raw.filename || "Library item",
-        mimeType: object.mime || raw.blob?.type || "application/octet-stream",
-        sizeBytes: raw.blob?.size || object.size || 0,
+        type: chat ? "chat-room:attach-library-item" : "browser:file-picker-selection",
+        fileName: object.name || raw?.filename || "Library item",
+        mimeType: object.mime || raw?.blob?.type || "application/octet-stream",
+        sizeBytes: raw?.blob?.size ?? Number(object.size || 0),
         title: object.name || "",
         objectUri: object.uri,
       };
-      if (state.returnTarget === "chat-room" && object.published && cid) {
-        payload.publishedUri = "elastos://" + cid;
-      }
+      if (raw) payload.blob = raw.blob;
+      if (chat) payload.revision = String(object.revision || "");
       if (await deliverToTarget(state.returnTarget, payload)) {
         setStatus(`Attached to ${targetLabel}.`);
         closeSelf();
@@ -424,6 +431,68 @@ export function createLibraryActions({
     await loadCurrentFolder();
   }
 
+  async function publishObject(object) {
+    if (!canPublishObject(object)) return;
+    if (!await confirmPublish({ title: "Publish publicly?", files: [object], excluded: [] })) return;
+    setStatus(`Publishing ${object.name}...`);
+    try {
+      await providerApi("publish", { uri: object.uri, if_revision: object.revision });
+    } catch (error) {
+      setStatus(publishFailureText(error, object.name));
+      return;
+    }
+    setStatus(`Published ${object.name}.`);
+    await loadCurrentFolder();
+  }
+
+  // One confirmation for the whole selection: it lists the files that will be
+  // published and the items left out (folders, files already published).
+  async function publishSelectedObjects() {
+    const selection = selectedObjects().filter(Boolean);
+    const files = selection.filter(canPublishObject);
+    if (!files.length) {
+      setStatus("Select files to publish. Folders can't be published.");
+      return;
+    }
+    const excluded = selection.filter((object) => !files.includes(object));
+    if (!await confirmPublish({ title: "Publish publicly?", files, excluded })) return;
+    const failed = [];
+    for (const object of files) {
+      setStatus(`Publishing ${object.name}...`);
+      try {
+        await providerApi("publish", { uri: object.uri, if_revision: object.revision });
+      } catch (error) {
+        failed.push({ object, text: publishFailureText(error, object.name) });
+      }
+    }
+    clearSelection(false);
+    const published = files.length - failed.length;
+    const count = (value) => `${value} file${value === 1 ? "" : "s"}`;
+    if (!failed.length) {
+      setStatus(`Published ${count(published)}.`);
+    } else if (failed.length === 1) {
+      setStatus(`Published ${published} of ${count(files.length)}. ${failed[0].object.name}: ${failed[0].text}`);
+    } else {
+      setStatus(`Published ${published} of ${count(files.length)}. Not published: ${failed.map(({ object }) => object.name).join(", ")}.`);
+    }
+    await loadCurrentFolder();
+  }
+
+  // Copies the recorded publication link. When the clipboard refuses, the link
+  // shows as selectable text so it can still be copied by hand.
+  async function copyPublishedLink(object) {
+    const link = publishedLink(object);
+    if (!object?.published || !link) return;
+    try {
+      await writeResourceUri(link);
+    } catch {
+      showPublishedLink({ name: object.name, link });
+      setStatus("Copying didn't work. Select the link to copy it.");
+      return;
+    }
+    setStatus(`Copied the link to ${object.name}.`);
+  }
+
   async function repairObject(object) {
     setStatus(`Repairing availability for ${object.name}...`);
     await providerApi("repair", { uri: object.uri });
@@ -692,6 +761,7 @@ export function createLibraryActions({
     compressObjectToZip,
     compressSelectedObjectsToZip,
     copySelectedObjectsTo,
+    copyPublishedLink,
     copyText,
     createFolder,
     createTextDocument,
@@ -709,6 +779,8 @@ export function createLibraryActions({
     openWithViewer,
     pasteClipboardTo,
     protectAndListObject,
+    publishObject,
+    publishSelectedObjects,
     repairObject,
     restoreObject,
     restoreSelectedObjects,

@@ -12,6 +12,7 @@ import {
   parentUri,
   pathCrumbs,
   protectionLabel,
+  PUBLISH_CONFIRM_BODY,
   publishedCid,
   visibilityContract,
   viewerOptions,
@@ -594,7 +595,66 @@ export function createLibraryDialog({
     });
   }
 
-  function confirmDecision({ eyebrow, title, message, confirmLabel, confirmClass, targetUris }) {
+  // One public-sharing confirmation per action: the files it publishes and,
+  // for a selection, the items it leaves out.
+  function confirmPublish({ title, files, excluded = [] }) {
+    const excludedHtml = excluded.length
+      ? `<p class="dialog-hint">Not included:</p>${nameList(
+        excluded.map((object) => `${object.name || object.uri} (${publishExclusionReason(object)})`),
+        "data-publish-excluded",
+      )}`
+      : "";
+    return confirmDecision({
+      eyebrow: "Confirm",
+      title,
+      message: PUBLISH_CONFIRM_BODY,
+      confirmLabel: "Publish",
+      confirmClass: "btn-primary",
+      targetUris: files.map((object) => object.uri),
+      detailsHtml: nameList(files.map((object) => object.name || object.uri), "data-publish-files") + excludedHtml,
+    });
+  }
+
+  function publishExclusionReason(object) {
+    if (isDirectory(object)) return "folder";
+    if (object.published) return "already published";
+    return "can't be published";
+  }
+
+  function nameList(names, attribute, limit = 8) {
+    const shown = names.slice(0, limit).map((name) => `<li>${escapeHtml(name)}</li>`);
+    if (names.length > limit) shown.push(`<li>and ${names.length - limit} more</li>`);
+    return `<ul class="publish-list" ${attribute}>${shown.join("")}</ul>`;
+  }
+
+  // Shown when the clipboard refuses a published link: the link stays
+  // selectable so it can be copied by hand.
+  function showPublishedLink({ name, link }) {
+    hideMenu();
+    hideDialog();
+    dialog.innerHTML = `
+      <div class="dialog-card" data-published-link>
+        <div>
+          <p class="eyebrow">Copy link</p>
+          <h2>${escapeHtml(name || "Published file")}</h2>
+          <p class="subtitle">Copying didn't work. Select the link and copy it.</p>
+        </div>
+        <label class="dialog-field">
+          <span>Link</span>
+          <input type="text" readonly value="${escapeHtml(link)}" data-published-link-text>
+        </label>
+        <div class="button-row">
+          <button class="btn btn-primary" type="button" data-dialog-close>Close</button>
+        </div>
+      </div>
+    `;
+    dialog.classList.remove("hidden");
+    const input = dialog.querySelector("[data-published-link-text]");
+    input?.focus();
+    input?.select();
+  }
+
+  function confirmDecision({ eyebrow, title, message, confirmLabel, confirmClass, targetUris, detailsHtml = "" }) {
     hideMenu();
     hideDialog();
     decisionTargetUris = targetUris;
@@ -607,6 +667,7 @@ export function createLibraryDialog({
             <h2>${escapeHtml(title)}</h2>
             <p class="subtitle">${escapeHtml(message)}</p>
           </div>
+          ${detailsHtml}
           <div class="button-row">
             <button class="btn" type="button" data-dialog-close>Cancel</button>
             <button class="btn ${confirmClass}" type="button" data-dialog-confirm>${escapeHtml(confirmLabel)}</button>
@@ -710,12 +771,14 @@ export function createLibraryDialog({
   return {
     bindDialogEvents,
     confirmDestructive,
+    confirmPublish,
     hideDialog,
     hideDialogIfTargetsHidden,
     offerDownload,
     showProtectAndListDialog,
     showObjectStatus,
     showProperties,
+    showPublishedLink,
     showSharedAccessReceipt,
   };
 }

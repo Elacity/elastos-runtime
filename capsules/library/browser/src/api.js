@@ -17,12 +17,20 @@ export function createLibraryRuntime({ getHomeToken }) {
     });
     const envelope = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(envelope.message || envelope.error || `Library request failed: ${response.status}`);
+      throw codedError(envelope.message || envelope.error || `Library request failed: ${response.status}`, envelope.code);
     }
     if (envelope.status === "error") {
-      throw new Error(envelope.message || "Runtime object provider failed.");
+      throw codedError(envelope.message || "Runtime object provider failed.", envelope.code);
     }
     return envelope.data || envelope;
+  }
+
+  // The provider's error code travels with the error so Library can say what
+  // went wrong in plain words before any generic message replaces it.
+  function codedError(message, code) {
+    const error = new Error(message);
+    if (typeof code === "string" && code) error.code = code;
+    return error;
   }
 
   function uploadObject({ uri, file, mime, onProgress }) {

@@ -9,6 +9,7 @@ function makeActions(overrides = {}) {
     clearSelection() {},
     closeSelf() {},
     confirmDestructive: async () => true,
+    confirmPublish: async () => true,
     currentFolderReadOnly: () => false,
     deliverToTarget: () => false,
     downloadObjectRaw: async () => ({ blob: new Blob([]), filename: "item.bin" }),
@@ -27,6 +28,7 @@ function makeActions(overrides = {}) {
     showObjectStatus() {},
     showProtectAndListDialog: async () => false,
     showProperties() {},
+    showPublishedLink() {},
     showSharedAccessReceipt() {},
     startCreateObject() {},
     state: {},
@@ -508,4 +510,183 @@ test("Library coalesces repeated protect and list clicks for one object", async 
   assert.equal(requests.length, 1);
   assert.deepEqual(reloads, ["reload"]);
   assert.equal(statuses.at(-1), "Protected and listed movie.mp4.");
+});
+
+const DOCS = "localhost://Users/test/Documents";
+
+function file(name, extra = {}) {
+  return {
+    uri: `${DOCS}/${name}`,
+    name,
+    kind: "file",
+    revision: `rev:${name}`,
+    capabilities: ["publish", "unpublish", "download"],
+    ...extra,
+  };
+}
+
+function publishHarness({ confirm = true, failures = {}, clipboardFails = false, selection = [] } = {}) {
+  const requests = [];
+  const statuses = [];
+  const confirmations = [];
+  const linkDialogs = [];
+  const clipboard = [];
+  const actions = makeActions({
+    async confirmPublish(request) {
+      confirmations.push(request);
+      return confirm;
+    },
+    async providerApi(op, payload) {
+      requests.push({ op, payload });
+      const code = failures[payload.uri];
+      if (code) throw Object.assign(new Error(`provider said ${code}`), { code });
+      return { uri: "elastos://bafkreipublished" };
+    },
+    selectedObjects: () => selection,
+    setStatus(status) {
+      statuses.push(status);
+    },
+    showPublishedLink(request) {
+      linkDialogs.push(request);
+    },
+    async writeResourceUri(value) {
+      if (clipboardFails) throw new Error("Clipboard write was denied.");
+      clipboard.push(value);
+    },
+  });
+  return { actions, clipboard, confirmations, linkDialogs, requests, statuses };
+}
+
+test("Library Publish asks once and sends nothing when cancelled", async () => {
+  const one = publishHarness({ confirm: false });
+  await one.actions.publishObject(file("Guide.md"));
+  assert.equal(one.confirmations.length, 1);
+  assert.equal(one.confirmations[0].title, "Publish publicly?");
+  assert.deepEqual(one.requests, []);
+
+  const many = publishHarness({ confirm: false, selection: [file("A.md"), file("B.md")] });
+  await many.actions.publishSelectedObjects();
+  assert.equal(many.confirmations.length, 1);
+  assert.deepEqual(many.requests, []);
+});
+
+test("Library Publish sends the plain publish shape after one confirmation", async () => {
+  const harness = publishHarness();
+  await harness.actions.publishObject(file("Guide.md"));
+  assert.deepEqual(harness.requests, [
+    { op: "publish", payload: { uri: `${DOCS}/Guide.md`, if_revision: "rev:Guide.md" } },
+  ]);
+  assert.equal(harness.statuses.at(-1), "Published Guide.md.");
+});
+
+test("Library Publish Selected lists eligible files and leaves folders and published files out", async () => {
+  const folder = { uri: `${DOCS}/Projects`, name: "Projects", kind: "directory", capabilities: ["publish"] };
+  const published = file("Shared.md", { published: true, published_cid: "bafkreishared" });
+  const harness = publishHarness({ selection: [file("A.md"), folder, published, file("B.md")] });
+  await harness.actions.publishSelectedObjects();
+  assert.equal(harness.confirmations.length, 1);
+  assert.deepEqual(harness.confirmations[0].files.map((object) => object.name), ["A.md", "B.md"]);
+  assert.deepEqual(harness.confirmations[0].excluded.map((object) => object.name), ["Projects", "Shared.md"]);
+  assert.deepEqual(harness.requests.map(({ payload }) => payload.uri), [`${DOCS}/A.md`, `${DOCS}/B.md`]);
+  assert.equal(harness.statuses.at(-1), "Published 2 files.");
+});
+
+test("Library Publish Selected with only folders asks nothing and says why", async () => {
+  const folder = { uri: `${DOCS}/Projects`, name: "Projects", kind: "directory" };
+  const harness = publishHarness({ selection: [folder] });
+  await harness.actions.publishSelectedObjects();
+  assert.deepEqual(harness.confirmations, []);
+  assert.deepEqual(harness.requests, []);
+  assert.equal(harness.statuses.at(-1), "Select files to publish. Folders can't be published.");
+});
+
+test("Library Publish Selected reports partial success in plain words", async () => {
+  const harness = publishHarness({
+    selection: [file("A.md"), file("Empty.md"), file("C.md")],
+    failures: { [`${DOCS}/Empty.md`]: "empty_file" },
+  });
+  await harness.actions.publishSelectedObjects();
+  assert.equal(harness.requests.length, 3);
+  assert.equal(harness.statuses.at(-1), "Published 2 of 3 files. Empty.md: Empty files can't be published.");
+
+  const two = publishHarness({
+    selection: [file("A.md"), file("Big.bin"), file("Old.md")],
+    failures: { [`${DOCS}/Big.bin`]: "too_large", [`${DOCS}/Old.md`]: "stale_revision" },
+  });
+  await two.actions.publishSelectedObjects();
+  assert.equal(two.statuses.at(-1), "Published 1 of 3 files. Not published: Big.bin, Old.md.");
+});
+
+test("Library Publish maps each error code to plain words", async () => {
+  const expected = {
+    empty_file: "Empty files can't be published.",
+    too_large: "This file is too large to publish. Files up to 8 MiB can be published.",
+    stale_revision: "This file changed. Refresh Library and try again.",
+    unsupported: "Folders can't be published.",
+    unavailable: "Publishing isn't available right now. Try again.",
+    changed_since_publish: "This file changed after it was published. Unpublish it first, then publish it again.",
+    library_error: "Guide.md could not be published. Try again.",
+  };
+  for (const [code, text] of Object.entries(expected)) {
+    const harness = publishHarness({ failures: { [`${DOCS}/Guide.md`]: code } });
+    await harness.actions.publishObject(file("Guide.md"));
+    assert.equal(harness.statuses.at(-1), text, code);
+  }
+});
+
+test("Library Copy Link copies the recorded publication, never the current file CID", async () => {
+  const harness = publishHarness();
+  await harness.actions.copyPublishedLink(file("Guide.md", {
+    published: true,
+    published_cid: "bafkreirecorded",
+    content_cid: "bafkreicurrentbytes",
+  }));
+  assert.deepEqual(harness.clipboard, ["elastos://bafkreirecorded"]);
+  assert.deepEqual(harness.linkDialogs, []);
+  assert.equal(harness.statuses.at(-1), "Copied the link to Guide.md.");
+});
+
+test("Library Copy Link shows the link as selectable text when the clipboard fails", async () => {
+  const harness = publishHarness({ clipboardFails: true });
+  await harness.actions.copyPublishedLink(file("Guide.md", { published: true, published_cid: "bafkreirecorded" }));
+  assert.deepEqual(harness.linkDialogs, [{ name: "Guide.md", link: "elastos://bafkreirecorded" }]);
+  assert.equal(harness.statuses.at(-1), "Copying didn't work. Select the link to copy it.");
+});
+
+test("Library gives Chat the file's address and revision, and Browser the file's bytes", async () => {
+  const deliveries = [];
+  const downloads = [];
+  const harness = (returnTarget) => makeActions({
+    closeSelf() {},
+    async deliverToTarget(target, payload) {
+      deliveries.push({ target, payload });
+      return true;
+    },
+    async downloadObjectRaw({ uri }) {
+      downloads.push(uri);
+      return { blob: new Blob(["hello"], { type: "text/plain" }), filename: "Note.txt" };
+    },
+    state: { mode: "attach", returnTarget },
+  });
+  const note = file("Note.txt", { mime: "text/plain", size: 5 });
+  await harness("chat-room").attachObject(note);
+  const chat = deliveries.at(-1);
+  assert.equal(chat.target, "chat-room");
+  assert.equal(chat.payload.type, "chat-room:attach-library-item");
+  assert.equal(chat.payload.objectUri, `${DOCS}/Note.txt`);
+  assert.equal(chat.payload.revision, "rev:Note.txt");
+  assert.equal(chat.payload.fileName, "Note.txt");
+  assert.equal(chat.payload.sizeBytes, 5);
+
+  const big = file("Big.bin", { size: 8 * 1024 * 1024 + 1 });
+  await harness("chat-room").attachObject(big);
+  assert.deepEqual(downloads, [`${DOCS}/Note.txt`], "Library must not read a file over Chat's limit");
+  assert.equal(deliveries.at(-1).payload.blob, undefined);
+  assert.equal(deliveries.at(-1).payload.sizeBytes, 8 * 1024 * 1024 + 1);
+
+  await harness("browser").attachObject(note);
+  const browser = deliveries.at(-1);
+  assert.equal(browser.payload.type, "browser:file-picker-selection");
+  assert.equal(await browser.payload.blob.text(), "hello");
+  assert.equal(browser.payload.revision, undefined);
 });

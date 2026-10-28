@@ -1,6 +1,7 @@
 import { sharedFileMarkup, sharedFileName } from "./shared-file.js?v=library-links-20261028b";
 import {
   archiveLibraryObjectPayload,
+  canPublishObject,
   escapeHtml,
   hasCapability,
   inTrash,
@@ -10,15 +11,17 @@ import {
   isTrashRootUri,
   isTrashUri,
   isWebSpaceUri,
+  libraryErrorText,
   matchRoot,
   parentUri,
   pathCrumbs,
+  publishedLink,
   viewerOptions,
 } from "./model.js";
-import { createLibraryRuntime } from "./api.js?v=library-20260711c";
+import { createLibraryRuntime } from "./api.js?v=library-20261028a";
 import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
-import { createLibraryActions } from "./actions.js?v=library-20261028b";
-import { createLibraryDialog } from "./dialog.js?v=library-20260711d";
+import { createLibraryActions } from "./actions.js?v=library-20261028c";
+import { createLibraryDialog } from "./dialog.js?v=library-20261028a";
 import { createLibraryEditor } from "./editor.js";
 import { bindLibraryEvents } from "./events.js";
 import { createLibraryMenu } from "./menu.js";
@@ -125,6 +128,7 @@ import {
     let compressObjectToZip = async () => {};
     let compressSelectedObjectsToZip = async () => {};
     let copySelectedObjectsTo = async () => {};
+    let copyPublishedLink = async () => {};
     let copyText = async () => {};
     let createFolder = async () => {};
     let createTextDocument = async () => {};
@@ -142,6 +146,8 @@ import {
     let openWithViewer = () => false;
     let pasteClipboardTo = async () => {};
     let protectAndListObject = async () => {};
+    let publishObject = async () => {};
+    let publishSelectedObjects = async () => {};
     let repairObject = async () => {};
     let restoreObject = async () => {};
     let restoreSelectedObjects = async () => {};
@@ -213,12 +219,14 @@ import {
     const {
       bindDialogEvents,
       confirmDestructive,
+      confirmPublish,
       hideDialog,
       hideDialogIfTargetsHidden,
       offerDownload,
       showObjectStatus,
       showProtectAndListDialog,
       showProperties,
+      showPublishedLink,
       showSharedAccessReceipt,
     } = createLibraryDialog({
       allVisible,
@@ -282,6 +290,7 @@ import {
       compressObjectToZip,
       compressSelectedObjectsToZip,
       copySelectedObjectsTo,
+      copyPublishedLink,
       copyText,
       createFolder,
       createTextDocument,
@@ -299,6 +308,8 @@ import {
       openWithViewer,
       pasteClipboardTo,
       protectAndListObject,
+      publishObject,
+      publishSelectedObjects,
       repairObject,
       restoreObject,
       restoreSelectedObjects,
@@ -313,6 +324,7 @@ import {
       clearSelection,
       closeSelf,
       confirmDestructive,
+      confirmPublish,
       currentFolderReadOnly,
       deliverToTarget,
       downloadObjectRaw,
@@ -331,6 +343,7 @@ import {
       showObjectStatus,
       showProtectAndListDialog,
       showProperties,
+      showPublishedLink,
       showSharedAccessReceipt,
       startCreateObject,
       state,
@@ -1038,13 +1051,17 @@ import {
           } else if (isPolicyGatedArchive(object)) {
             actions.push(menuAction("Archive Support", () => showArchiveSupport(object)));
           }
-            if (object.published) {
-              actions.push(menuAction("Status", () => showStatusObject(object)));
-              if (hasCapability(object, "repair")) actions.push(menuAction("Repair", () => repairObject(object)));
-              if (object.shared) actions.push(menuAction("Check My Access", () => checkMyAccess(object)));
-              if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
-          } else if (isRuntimeCustodyProtectableVideo(object)) {
-            actions.push(menuAction("Protect and List...", () => protectAndListObject(object)));
+          if (object.published) {
+            if (publishedLink(object)) actions.push(menuAction("Copy Link", () => copyPublishedLink(object)));
+            actions.push(menuAction("Status", () => showStatusObject(object)));
+            if (hasCapability(object, "repair")) actions.push(menuAction("Repair", () => repairObject(object)));
+            if (object.shared) actions.push(menuAction("Check My Access", () => checkMyAccess(object)));
+            if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
+          } else {
+            if (canPublishObject(object)) actions.push(menuAction("Publish", () => publishObject(object)));
+            if (isRuntimeCustodyProtectableVideo(object)) {
+              actions.push(menuAction("Protect and List...", () => protectAndListObject(object)));
+            }
           }
         }
         actions.push("-");
@@ -1118,6 +1135,7 @@ import {
       ) {
         actions.push(menuAction("Compress Selected to ZIP", compressSelectedObjectsToZip));
       }
+      if (files.some(canPublishObject)) actions.push(menuAction("Publish Selected", publishSelectedObjects));
       if (published.some((object) => hasCapability(object, "unpublish"))) actions.push(menuAction("Unpublish Selected", unpublishSelectedObjects));
       if (active.length) actions.push("-");
       if (active.some((object) => hasCapability(object, "move"))) actions.push(menuAction("Cut", () => setClipboard("move", active)));
@@ -1205,7 +1223,7 @@ import {
 
     function showError(error) {
       console.error(error);
-      setStatus(error && error.message ? error.message : "Library action failed.");
+      setStatus(libraryErrorText(error) || (error && error.message ? error.message : "Library action failed."));
     }
 
     function bindEvents() {

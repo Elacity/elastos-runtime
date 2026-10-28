@@ -147,6 +147,44 @@ export function publishedCid(object) {
   return String(object?.published_cid || "").trim();
 }
 
+// The recorded publication's link. It names the published version, never the
+// file's current bytes, so a later save does not change what was shared.
+export function publishedLink(object) {
+  const cid = publishedCid(object);
+  return cid ? `elastos://${cid}` : "";
+}
+
+export const PUBLISH_CONFIRM_BODY =
+  "Anyone with the link may download and keep a copy. Unpublish removes it from your Home. Copies elsewhere may remain.";
+
+export function canPublishObject(object) {
+  return !!object &&
+    !isDirectory(object) &&
+    !inTrash(object) &&
+    !isBlockedObject(object) &&
+    !object.published &&
+    hasCapability(object, "publish");
+}
+
+const LIBRARY_ERROR_TEXT = {
+  empty_file: "Empty files can't be published.",
+  too_large: "This file is too large to publish. Files up to 8 MiB can be published.",
+  stale_revision: "This file changed. Refresh Library and try again.",
+  unsupported: "Folders can't be published.",
+  unavailable: "Publishing isn't available right now. Try again.",
+  changed_since_publish: "This file changed after it was published. Unpublish it first, then publish it again.",
+  published_withdraw_first: "Unpublish this file before deleting it.",
+};
+
+// Plain words for a Library error code; empty for an unknown code.
+export function libraryErrorText(error) {
+  return LIBRARY_ERROR_TEXT[String(error?.code || "")] || "";
+}
+
+export function publishFailureText(error, name) {
+  return libraryErrorText(error) || `${name || "This file"} could not be published. Try again.`;
+}
+
 export function visibilityContract(object) {
   const visibility = object?.metadata?.visibility;
   if (visibility && typeof visibility === "object") return visibility;

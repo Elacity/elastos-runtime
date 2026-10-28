@@ -40,6 +40,7 @@ export function createHomeClipboardClient({ targetId } = {}) {
         text.length <= 2048 &&
         /^[A-Za-z0-9][A-Za-z0-9._~:/?#@!$&'()*+,;=%\\[\\]-]*$/.test(text);
       if (
+        globalThis.__clipboardDeny ||
         !started ||
         typeof text !== "string" ||
         !(
@@ -959,6 +960,14 @@ function handleProvider(op, payload, res) {
         message: "Runtime custody creator mint is pending exact Wallet or Chain settlement",
       }));
     }
+    if (found.size === 0) {
+      // The raw message names internals; Library must show the code's plain words instead.
+      return sendJson(res, 200, JSON.stringify({
+        status: "error",
+        code: "empty_file",
+        message: "object provider refused an empty object",
+      }));
+    }
     found.published_cid = SMOKE_PUBLISHED_CID;
     found.published = true;
     found.availability = "local_pinned";
@@ -1732,6 +1741,11 @@ async function clickMenu(page, label) {
   await page.locator("#context-menu > .menu-entry > .menu-item").filter({ hasText: label }).first().click();
 }
 
+// "Publish" is part of "Unpublish" and "Copy" of "Copy Link"; match the whole label.
+async function clickMenuExact(page, label) {
+  await page.locator("#context-menu > .menu-entry > .menu-item").filter({ hasText: new RegExp(`^${label}$`) }).first().click();
+}
+
 async function clickSubmenu(page, parentLabel, childLabel) {
   const parent = page.locator("#context-menu > .menu-entry > .menu-item").filter({ hasText: parentLabel }).first();
   await parent.click();
@@ -2202,17 +2216,19 @@ async function run() {
       "Open",
       "Download",
       "Compress to ZIP",
+      "Publish",
       "Cut",
       "Copy",
       "Delete",
       "Rename",
       "Properties",
     ], "file menu");
-    excludesAll(readmeRows, ["Open With", "Publish", "Copy Published Link", "Copy Content CID"], "file menu without Publish, installed viewer, published link or content CID");
+    excludesAll(readmeRows, ["Open With", "Copy Link", "Copy Content CID"], "file menu without installed viewer, published link or content CID");
     includesAll(await openItemMenu(page, "Clip.mp4"), [
       "Open",
       "Download",
       "Compress to ZIP",
+      "Publish",
       "Protect and List...",
       "Properties",
     ], "protected publish video menu");
@@ -2296,8 +2312,8 @@ async function run() {
     await page.locator(".place").filter({ hasText: "Public" }).first().click();
     await page.locator(".item").filter({ hasText: "Public Draft.md" }).first().waitFor();
     await page.locator(".item").filter({ hasText: "Public Draft.md" }).filter({ hasText: "Public folder" }).first().waitFor();
-    includesAll(await openItemMenu(page, "Public Draft.md"), ["Properties"], "public folder unpublished file menu");
-    excludesAll(await openItemMenu(page, "Public Draft.md"), ["Publish", "Copy Published Link"], "public folder unpublished file menu");
+    includesAll(await openItemMenu(page, "Public Draft.md"), ["Publish", "Properties"], "public folder unpublished file menu");
+    excludesAll(await openItemMenu(page, "Public Draft.md"), ["Copy Link"], "public folder unpublished file menu");
     await clickMenu(page, "Properties");
     await page.locator(".window-item-properties").filter({ hasText: "Public Draft.md properties" }).first().waitFor();
     const publicDraftProperties = await readProperties(page);
@@ -2405,12 +2421,34 @@ async function run() {
       "Open",
       "Download",
       "Compress to ZIP",
+      "Copy Link",
       "Status",
       "Repair",
       "Unpublish",
       "Properties",
     ], "published file menu");
-    excludesAll(publishedRows, ["Publish", "Share", "Copy Published Link", "Copy Content CID"], "published file menu");
+    excludesAll(publishedRows, ["Publish", "Share", "Copy Content CID"], "published file menu");
+    // Copy Link copies the recorded publication link, never the file's current CID.
+    await clickMenuExact(page, "Copy Link");
+    await page.waitForFunction((link) => window.__clipboardText === link, `elastos://${SMOKE_PUBLISHED_CID}`);
+    assert(
+      await page.evaluate(() => window.__clipboardPurposes.at(-1)) === "resource.uri",
+      "Copy Link must use the resource URI Clipboard purpose",
+    );
+    // When the clipboard refuses, the link shows as selectable text.
+    await page.evaluate(() => { window.__clipboardDeny = true; window.__clipboardText = ""; });
+    await openItemMenu(page, "Published.md");
+    await clickMenuExact(page, "Copy Link");
+    const fallbackLink = page.locator("[data-published-link] [data-published-link-text]");
+    await fallbackLink.waitFor();
+    assert(await fallbackLink.inputValue() === `elastos://${SMOKE_PUBLISHED_CID}`, "Copy Link fallback must show the recorded link");
+    assert(
+      await fallbackLink.evaluate((input) => input.readOnly && document.activeElement === input && input.selectionEnd - input.selectionStart === input.value.length),
+      "Copy Link fallback must select the read-only link",
+    );
+    await page.locator("[data-published-link] [data-dialog-close]").click();
+    await page.evaluate(() => { window.__clipboardDeny = false; });
+    await openItemMenu(page, "Published.md");
     await clickMenu(page, "Properties");
     await page.locator(".window-item-properties").filter({ hasText: "Published.md properties" }).first().waitFor();
     const publishedProperties = await readProperties(page);
@@ -2439,12 +2477,14 @@ async function run() {
     await clickMenu(page, "Repair");
     assert((await repaired).ok(), "Repair response must succeed");
     assert(ops.some((entry) => entry.op === "repair" && entry.payload.uri.endsWith("/Published.md")), "Repair must call repair");
-    // An item published before Publish was hidden can still be unpublished.
+    // Unpublish withdraws the publication and offers Publish again.
     await openItemMenu(page, "Published.md");
     await clickMenu(page, "Unpublish");
     await waitForOp((entry) => entry.op === "unpublish" && entry.payload.uri.endsWith("/Published.md"), "Unpublish must call unpublish");
     await page.waitForFunction(() => !document.querySelector(".badge-published"));
-    excludesAll(await openItemMenu(page, "Published.md"), ["Publish", "Unpublish"], "unpublished file menu");
+    const unpublishedRows = await openItemMenu(page, "Published.md");
+    includesAll(unpublishedRows, ["Publish"], "unpublished file menu");
+    excludesAll(unpublishedRows, ["Unpublish", "Copy Link"], "unpublished file menu");
 
     await openItemMenu(page, "Bundle.tar.gz");
     await clickMenu(page, "Properties");
@@ -2764,7 +2804,72 @@ async function run() {
       "Alt-drag/drop copy must call copy with the destination folder",
     );
 
-    excludesAll(await openItemMenu(page, "Guide.md"), ["Publish", "Publish Selected", "Copy Content CID"], "Guide menu");
+    // Publish asks once; Cancel sends nothing.
+    const guidePublishes = () => ops.filter((entry) => entry.op === "publish" && entry.payload.uri === `${documentsUri}/Guide.md`).length;
+    await openItemMenu(page, "Guide.md");
+    await clickMenuExact(page, "Publish");
+    const publishDialog = page.locator(".dialog-card").filter({ hasText: "Publish publicly?" }).first();
+    await publishDialog.waitFor();
+    assert(
+      (await publishDialog.textContent()).includes("Anyone with the link may download and keep a copy. Unpublish removes it from your Home. Copies elsewhere may remain."),
+      "Publish confirmation must say what publishing does",
+    );
+    await publishDialog.locator("[data-dialog-close]").click();
+    await publishDialog.waitFor({ state: "detached" });
+    assert(guidePublishes() === 0, "Cancel must not publish");
+    await openItemMenu(page, "Guide.md");
+    await clickMenuExact(page, "Publish");
+    await publishDialog.locator("[data-dialog-confirm]").click();
+    await waitForOp(
+      (entry) => entry.op === "publish" && entry.payload.uri === `${documentsUri}/Guide.md` && entry.payload.if_revision && !entry.payload.protection,
+      "Publish must call publish with the plain file shape",
+    );
+    await page.locator(".item").filter({ hasText: "Guide.md" }).locator(".badge-published").first().waitFor();
+    const guidePublishedRows = await openItemMenu(page, "Guide.md");
+    includesAll(guidePublishedRows, ["Copy Link", "Status", "Repair", "Unpublish"], "published Guide menu");
+    excludesAll(guidePublishedRows, ["Publish", "Share", "Copy Content CID"], "published Guide menu");
+    await clickMenu(page, "Unpublish");
+    await waitForOp((entry) => entry.op === "unpublish" && entry.payload.uri === `${documentsUri}/Guide.md`, "Unpublish must call unpublish");
+    await page.waitForFunction(() => !Array.from(document.querySelectorAll(".item")).some((item) => item.textContent.includes("Guide.md") && item.querySelector(".badge-published")));
+
+    // A refused publish shows the code's plain words, not the provider message.
+    const emptyFile = createFileObject(`${documentsUri}/Empty.txt`, "Empty.txt");
+    emptyFile.size = 0;
+    putObject(documentsUri, emptyFile);
+    await openBackgroundMenu(page);
+    await clickMenu(page, "Refresh");
+    await page.locator(".item").filter({ hasText: "Empty.txt" }).first().waitFor();
+    await openItemMenu(page, "Empty.txt");
+    await clickMenuExact(page, "Publish");
+    await publishDialog.locator("[data-dialog-confirm]").click();
+    await page.waitForFunction(() => document.querySelector("#status-text")?.textContent === "Empty files can't be published.");
+
+    // Publish Selected confirms once, listing the files and the folders it leaves out.
+    const publishesBeforeBatch = guidePublishes();
+    await page.keyboard.press("Escape");
+    await page.locator(`.item[data-uri="${documentsUri}/Guide.md"]`).click();
+    await page.locator(`.item[data-uri="${documentsUri}/Work"]`).click({ modifiers: [multiSelectModifier] });
+    const batchRows = await openItemMenuWithoutClearingSelection(page, "Guide.md");
+    includesAll(batchRows, ["Publish Selected"], "file and folder selection menu");
+    await clickMenuExact(page, "Publish Selected");
+    await publishDialog.waitFor();
+    assert(await publishDialog.locator("[data-publish-files] li").allTextContents().then((rows) => rows.join("|")) === "Guide.md",
+      "Publish Selected must list only the selected files");
+    assert(await publishDialog.locator("[data-publish-excluded] li").allTextContents().then((rows) => rows.join("|")) === "Work (folder)",
+      "Publish Selected must list the folders it leaves out");
+    await publishDialog.locator("[data-dialog-close]").click();
+    assert(guidePublishes() === publishesBeforeBatch, "Cancelling Publish Selected must not publish");
+    await page.locator(`.item[data-uri="${documentsUri}/Guide.md"]`).click();
+    await page.locator(`.item[data-uri="${documentsUri}/Work"]`).click({ modifiers: [multiSelectModifier] });
+    await openItemMenuWithoutClearingSelection(page, "Guide.md");
+    await clickMenuExact(page, "Publish Selected");
+    await publishDialog.locator("[data-dialog-confirm]").click();
+    await waitForOp(() => guidePublishes() === publishesBeforeBatch + 1, "Publish Selected must publish the selected file");
+    assert(!ops.some((entry) => entry.op === "publish" && entry.payload.uri === `${documentsUri}/Work`), "Publish Selected must never publish a folder");
+    await page.locator(".item").filter({ hasText: "Guide.md" }).locator(".badge-published").first().waitFor();
+    await openItemMenu(page, "Guide.md");
+    await clickMenu(page, "Unpublish");
+    await page.waitForFunction(() => !Array.from(document.querySelectorAll(".item")).some((item) => item.textContent.includes("Guide.md") && item.querySelector(".badge-published")));
 
     // An empty Public place leaves the sidebar the next time the places load.
     assert(await page.locator('.place[data-root-id="public"]').isVisible(), "Public must show in the sidebar while it holds items");
