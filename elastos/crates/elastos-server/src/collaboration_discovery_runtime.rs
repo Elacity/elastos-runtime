@@ -105,11 +105,12 @@ const MAX_PROFILE_DECISIONS_PER_REQUESTER: usize = 32;
 const MAX_PROFILE_TOTAL_DECISIONS: usize = 512;
 /// One new request by DID per device per this many seconds.
 const PROFILE_REQUEST_DEVICE_INTERVAL_SECS: u64 = 5;
-/// What the Community node last answered to a Profile-contact operation.
+/// What the Community node is known to do with Profile-contact operations.
 const PROFILE_RELAY_SUPPORT_UNKNOWN: u8 = 0;
 const PROFILE_RELAY_SUPPORTED: u8 = 1;
-/// It answered "unsupported operation": it runs a release older than 0.8.0,
-/// so a request by DID would never be delivered.
+/// It answers the v1 Discovery poll but not this Profile's own mailbox poll:
+/// it runs a release older than 0.8.0, so a request by DID would never be
+/// delivered.
 const PROFILE_RELAY_UNSUPPORTED: u8 = 2;
 const UNSUPPORTED_RELAY_OPERATION: &str = "unsupported collaboration discovery operation";
 /// A signed Profile beside a decision larger than this is refused unparsed.
@@ -130,9 +131,9 @@ pub struct CollaborationDiscoveryService {
     intent_mutex: Arc<Mutex<()>>,
     direct_messages: CollaborationDirectMessageService,
     profile_updates: crate::collaboration_profile_updates::CollaborationProfileUpdateService,
-    /// What the Community node last answered to a Profile-contact operation:
-    /// unknown until it answers, then supported or unsupported ("unsupported
-    /// operation" from a node older than 0.8.0). Any success sets supported.
+    /// What the Community node is known to do with Profile-contact
+    /// operations: unknown until it answers, then supported, or unsupported
+    /// when it answers v1 Discovery but not them. Any success sets supported.
     profile_relay_support: Arc<std::sync::atomic::AtomicU8>,
     /// What the Community relay has accepted from this Home's Profile-contact
     /// outbox, so delivered items leave it and the rest rotate.
@@ -1614,8 +1615,8 @@ impl CollaborationDiscoveryService {
     /// Before the first request by DID since this Runtime started, reads this
     /// Profile's own request mailbox once, so a Community node that refuses
     /// the operations is known before anything is queued. After any answer
-    /// the regular passes keep the support state current. A transport error
-    /// leaves it unknown and the request is queued as usual.
+    /// the regular passes keep the support state current. An unreachable
+    /// node leaves it unknown and the request is queued as usual.
     pub(crate) async fn check_profile_relay_support(
         &self,
         store: &CollaborationContactStore,
@@ -1639,21 +1640,58 @@ impl CollaborationDiscoveryService {
             )
             .await;
         self.note_profile_relay_result(&polled);
+        if polled.is_err() {
+            self.note_profile_poll_refused(profile, now).await;
+        }
     }
 
-    /// Records a relay answer to a Profile-contact operation: only an
-    /// "unsupported operation" refusal says the Community node is too old;
-    /// any success says it is not. Other failures say nothing.
+    /// Records a relay answer to a Profile-contact operation: any success
+    /// says the Community node supports them. A failure alone says nothing,
+    /// because Carrier hides a peer's error text; see
+    /// `note_profile_poll_refused`.
     fn note_profile_relay_result<T>(&self, result: &anyhow::Result<T>) {
-        let support = match result {
-            Ok(_) => PROFILE_RELAY_SUPPORTED,
-            Err(err) if format!("{err:#}").contains(UNSUPPORTED_RELAY_OPERATION) => {
-                PROFILE_RELAY_UNSUPPORTED
-            }
-            Err(_) => return,
-        };
-        self.profile_relay_support
-            .store(support, std::sync::atomic::Ordering::SeqCst);
+        if result.is_ok() {
+            self.profile_relay_support
+                .store(PROFILE_RELAY_SUPPORTED, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// After this Profile's own mailbox poll failed: if the same node answers
+    /// the v1 Discovery poll, which every release has, it is reachable and
+    /// does not know the Profile-contact operations, so it is older than
+    /// 0.8.0. If the v1 poll fails too, the node is unreachable and nothing
+    /// is learned.
+    async fn note_profile_poll_refused(
+        &self,
+        profile: &VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) {
+        let answered = async {
+            let poll = self.authority.prepare_mailbox_poll(
+                profile,
+                CollaborationDiscoveryMailboxKind::Requests,
+                now,
+            )?;
+            let response = self
+                .invoke_bootstrap(
+                    "poll_requests",
+                    serde_json::to_value(DiscoveryProviderMailboxPollRequest {
+                        op: "poll_requests".to_string(),
+                        poll: encode_bytes(&poll),
+                    })?,
+                )
+                .await?;
+            let response: DiscoveryProviderMailboxResponse = serde_json::from_value(response)?;
+            anyhow::ensure!(response.status == "ok", "v1 mailbox poll failed");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if answered.is_ok() {
+            self.profile_relay_support.store(
+                PROFILE_RELAY_UNSUPPORTED,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
     }
 
     /// One pass of the Profile-contact plane, run on every joined pass
@@ -1677,6 +1715,9 @@ impl CollaborationDiscoveryService {
             let polled = self.poll_profile_mailbox(store, profile, kind, now).await;
             self.note_profile_relay_result(&polled);
             if let Err(err) = polled {
+                if kind == CollaborationDiscoveryMailboxKind::Requests {
+                    self.note_profile_poll_refused(profile, now).await;
+                }
                 first_failure.get_or_insert(err);
             }
         }
