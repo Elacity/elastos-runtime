@@ -274,3 +274,84 @@ test("queued saves remain bound to the selected session", async () => {
   assert.equal(app.state.current.doc_did, "did:three");
   assert.equal(app.elements.editor.value, "Keep three");
 });
+
+function libraryEditor(file) {
+  const context = vm.createContext({
+    atob, btoa, TextDecoder, TextEncoder,
+    state: { current: { doc_did: "", library_object_uri: file.uri, revision: file.revision, title: "notes.txt", body: file.body,
+      file_name: "notes.txt", mime: "text/plain" }, currentSessionId: 1, dirty: true, documents: [], mode: "shell" },
+    elements: { titleInput: { value: "notes.txt" }, editor: { value: file.body } },
+    saveInFlight: null, autosaveQueued: false, pendingHomeWindowCloseTarget: null,
+    saveRecovery: null, documentSelectionSequence: 0, queuedSaveTarget: null, savedWorkingCopy: null,
+    isLibraryFileProjection: (doc) => !!doc?.library_object_uri, isDraftDocument: () => false,
+    documentIdentity: (doc) => `library:${doc.library_object_uri}`,
+    libraryObjectApi: (...args) => file.request(...args),
+    clearAutosaveTimer() {}, showError() {}, clearStatus() {}, sortDocuments() {},
+    renderDocumentsList() {}, renderCurrentDocument() { context.state.dirty = false; context.elements.editor.value = context.state.current.body; },
+    refreshPreviewFromEditor() {}, upsertDocumentListItem() {}, reportSaveFailure() {}, scheduleAutosave() {},
+    homeNavigation: { setQuery() {} },
+    setDirty(value) { context.state.dirty = value; },
+  });
+  vm.runInContext(["base64ToUtf8", "utf8ToBase64", "updateDocumentsNavigation", "isCurrentSessionTarget", "isCurrentDocumentTarget",
+    "applySavedDocumentState", "saveCurrent"].map(functionSource).join("\n"), context);
+  return context;
+}
+
+function libraryFile(body) {
+  const file = { uri: "localhost://Users/me/Documents/notes.txt", body, revision: "", writes: 0, reply: "ok" };
+  const stamp = () => { file.revision = createHash("sha256").update(file.body).digest("hex"); };
+  stamp();
+  file.change = (next) => { file.body = next; stamp(); };
+  file.request = async (op, payload) => {
+    if (op === "read") {
+      return { object: { uri: file.uri, name: "notes.txt", revision: file.revision }, data: Buffer.from(file.body).toString("base64") };
+    }
+    assert.equal(op, "write");
+    if (file.reply === "lost-before-write") throw new Error("Documents did not answer in time. Your edits are kept.");
+    if (payload.if_revision !== file.revision) throw new Error("File changed since it was read.");
+    file.writes += 1;
+    file.change(Buffer.from(payload.data, "base64").toString());
+    if (file.reply === "lost-after-write") throw new Error("Documents did not answer in time. Your edits are kept.");
+    return { object: { uri: file.uri, name: "notes.txt", revision: file.revision } };
+  };
+  return file;
+}
+
+test("a Library-file save whose reply was lost after it wrote does not leave later saves stuck", async () => {
+  const file = libraryFile("Old"), app = libraryEditor(file);
+  app.elements.editor.value = "Mine";
+  file.reply = "lost-after-write";
+  await assert.rejects(app.saveCurrent(), /did not answer in time/);
+  assert.equal(file.body, "Mine");
+  file.reply = "ok";
+  app.elements.editor.value = "Mine and more";
+  await app.saveCurrent();
+  assert.equal(file.body, "Mine and more");
+  assert.equal(app.state.current.revision, file.revision);
+  assert.equal(app.state.dirty, false);
+  app.elements.editor.value = "Mine and more, later";
+  app.state.dirty = true;
+  await app.saveCurrent();
+  assert.equal(file.body, "Mine and more, later");
+});
+
+test("a Library-file save that never landed retries, and a file changed meanwhile is never overwritten", async () => {
+  const file = libraryFile("Old"), app = libraryEditor(file);
+  app.elements.editor.value = "Mine";
+  file.reply = "lost-before-write";
+  await assert.rejects(app.saveCurrent());
+  file.reply = "ok";
+  await app.saveCurrent();
+  assert.equal(file.body, "Mine");
+
+  const other = libraryFile("Old"), stuck = libraryEditor(other);
+  stuck.elements.editor.value = "Mine";
+  other.reply = "lost-before-write";
+  await assert.rejects(stuck.saveCurrent());
+  other.reply = "ok";
+  other.change("Theirs");
+  await assert.rejects(stuck.saveCurrent(), /changed since you opened it/);
+  assert.equal(other.body, "Theirs");
+  assert.equal(stuck.elements.editor.value, "Mine");
+  assert.equal(stuck.state.dirty, true);
+});

@@ -1675,6 +1675,22 @@ async function saveCurrent(options) {
   const requestedBody = elements.editor.value;
   saveInFlight = (async () => {
     if (isLibraryFileProjection(saveDocument)) {
+      // A write whose reply was lost (or timed out) may have landed. Check the
+      // stored file before writing again, as ordinary saves do.
+      if (saveRecovery?.phase === "library" && isCurrentDocumentTarget(saveRecovery.target)) {
+        const recovery = saveRecovery;
+        const stored = await libraryObjectApi("read", { uri: saveDocument.library_object_uri });
+        if (!isCurrentDocumentTarget(saveTarget)) return;
+        const storedObject = stored?.object || {};
+        const storedBody = base64ToUtf8(stored?.data || "");
+        if (storedObject.revision && storedBody === recovery.body) {
+          saveDocument = { ...saveDocument, revision: storedObject.revision };
+        } else if (storedObject.revision !== recovery.revision) {
+          throw new Error("The file changed since you opened it. Your edits are kept here.");
+        }
+        saveRecovery = null;
+      }
+      saveRecovery = { target: { ...saveTarget }, phase: "library", revision: saveDocument.revision, body: requestedBody };
       const response = await libraryObjectApi("write", {
         uri: saveDocument.library_object_uri,
         data: utf8ToBase64(requestedBody),
