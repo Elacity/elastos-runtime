@@ -936,16 +936,9 @@ pub(super) fn contact_request_answer(
 ) -> Response {
     use crate::collaboration_discovery_runtime::ProfileContactRequestOutcome as Outcome;
     let message = match (outcome, display_name) {
-        (Outcome::Requested, Some(name)) => {
-            format!("Request sent. {name} sees it in Inbox when they next open Home.")
-        }
-        (Outcome::Requested, None) => "Request sent.".to_string(),
-        (Outcome::AlreadyRequested, Some(name)) => {
-            format!("Request sent. Waiting for {name} to accept.")
-        }
-        (Outcome::AlreadyRequested, None) => {
-            "Request sent. Waiting for them to accept.".to_string()
-        }
+        // A pending request is one fact; who sees it when is not something
+        // to act on.
+        (Outcome::Requested | Outcome::AlreadyRequested, _) => "Request sent.".to_string(),
         (Outcome::AlreadyContact { .. }, Some(name)) => format!("{name} is already a contact."),
         (Outcome::AlreadyContact { .. }, None) => "They're already a contact.".to_string(),
         (Outcome::PendingFromThem { .. }, Some(name)) => {

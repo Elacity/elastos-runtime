@@ -412,7 +412,7 @@ async fn test_chat_contact_request_queues_a_request_by_did_with_discovery_off() 
         json(&body),
         serde_json::json!({
             "status": "requested",
-            "message": "Request sent. Remote sees it in Inbox when they next open Home.",
+            "message": "Request sent.",
         })
     );
     assert!(!body.contains("did:key:"), "{body}");
@@ -428,7 +428,7 @@ async fn test_chat_contact_request_queues_a_request_by_did_with_discovery_off() 
         json(&body),
         serde_json::json!({
             "status": "already_requested",
-            "message": "Request sent. Waiting for Remote to accept.",
+            "message": "Request sent.",
         })
     );
     assert_eq!(home.outgoing_requests().len(), 1);
@@ -448,7 +448,7 @@ async fn test_chat_contact_request_binds_to_the_listing_of_a_person_visible_in_d
         json(&body),
         serde_json::json!({
             "status": "requested",
-            "message": "Request sent. Remote sees it in Inbox when they next open Home.",
+            "message": "Request sent.",
         })
     );
     let outgoing = home.outgoing_requests();
@@ -566,7 +566,7 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
         json(&body),
         serde_json::json!({
             "status": "requested",
-            "message": "Request sent. Remote sees it in Inbox when they next open Home.",
+            "message": "Request sent.",
         })
     );
     assert!(!body.contains("did:key:"), "{body}");
