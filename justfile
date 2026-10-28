@@ -224,6 +224,7 @@ product-ui-browser:
     node scripts/isolation-ui-truth-browser-smoke.mjs
     node scripts/documents-product-layout-smoke.mjs
     node scripts/library-product-layout-smoke.mjs
+    node scripts/library-menu-smoke.mjs
     node scripts/library-shared-cid-smoke.mjs
     node scripts/browser-product-layout-smoke.mjs
     node scripts/system-uiux-layout-smoke.mjs
