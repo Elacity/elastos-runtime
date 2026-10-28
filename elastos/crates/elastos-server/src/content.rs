@@ -95,11 +95,6 @@ const REPAIR_WORKER_MAX_FAILURE_BUDGET: u32 = 100;
 const IMPORT_EXACT_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Publish policy that pins on this node only and never asks availability to replicate.
 pub(crate) const LOCAL_PIN_AVAILABILITY_POLICY: &str = "local_pin";
-const PUBLICATION_OWNERS_SCHEMA: &str = "elastos.content.publication-owners/v1";
-const PUBLICATION_OWNER_MAX_LEN: usize = 512;
-/// Serializes owner bookkeeping with the pin or unpin it decides, so a CID is
-/// never unpinned while another publication is taking ownership of it.
-static PUBLICATION_OWNERS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const IMPORT_OBJECT_MAX_FILES: usize = 512;
 const AVAILABILITY_DASHBOARD_REMOTE_ROW_LIMIT: usize = 10;
 const OBJECT_MANIFEST_SCHEMA: &str = "elastos.content.object.manifest/v1";
@@ -3293,13 +3288,15 @@ impl Provider for ContentProvider {
 
     async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
         match request.get("op").and_then(|op| op.as_str()) {
-            Some(op @ ("publish" | "ensure" | "repair")) => self.pin_owned(op, request).await,
+            Some("publish") => self.publish(request).await,
             Some("fetch") => self.fetch(request).await,
             Some("import_exact") => self.import_exact(request).await,
             Some("import_object") => self.import_object(request).await,
             Some("admission") => self.admission(request).await,
+            Some("ensure") => self.ensure(request).await,
+            Some("repair") => self.repair(request).await,
             Some("repair_worker") => self.run_repair_worker(request).await,
-            Some("unpublish") => self.unpublish_owned(request).await,
+            Some("unpublish") => self.unpublish(request).await,
             Some("status") => self.status(request).await,
             Some(op) => Ok(provider_error(
                 "unsupported_operation",
@@ -3310,41 +3307,6 @@ impl Provider for ContentProvider {
                 "missing content operation",
             )),
         }
-    }
-}
-
-/// Each pinned CID's publication owners. Identical bytes published twice are
-/// two owners of one Kubo pin.
-type PublicationOwners = BTreeMap<String, BTreeSet<String>>;
-
-#[derive(Serialize, Deserialize)]
-struct PublicationOwnersFile {
-    schema: String,
-    #[serde(default)]
-    cids: PublicationOwners,
-}
-
-/// The one claim every CID this Home held before owners were counted keeps
-/// for the publications made then.
-pub(crate) fn legacy_publication_owner(cid: &str) -> String {
-    format!("legacy:{cid}")
-}
-
-/// The optional `owner` of a publish, ensure, repair or unpublish request.
-fn publication_owner(request: &Value) -> Result<Option<&str>, Value> {
-    match request.get("owner") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(owner))
-            if !owner.trim().is_empty()
-                && owner.len() <= PUBLICATION_OWNER_MAX_LEN
-                && !owner.chars().any(char::is_control) =>
-        {
-            Ok(Some(owner.as_str()))
-        }
-        Some(_) => Err(provider_error(
-            "invalid_request",
-            "content publication owner is invalid",
-        )),
     }
 }
 
@@ -3635,10 +3597,7 @@ impl ContentProvider {
         }))
     }
 
-    /// With an `owner`, the bytes are added unpinned, the owner's claim on
-    /// their CID is saved, and only then are they pinned: a crash in between
-    /// leaves a claim its publisher can release, never a pin nobody owns.
-    async fn publish(&self, request: &Value, owner: Option<&str>) -> Result<Value, ProviderError> {
+    async fn publish(&self, request: &Value) -> Result<Value, ProviderError> {
         let kind = request.get("kind").and_then(|kind| kind.as_str());
         let pin = request
             .get("pin")
@@ -3733,11 +3692,6 @@ impl ContentProvider {
                 "content publish exceeds the principal storage quota",
             ));
         }
-        let mut ipfs_request = ipfs_request;
-        let claim_first = pin && owner.is_some();
-        if claim_first {
-            ipfs_request["pin"] = Value::Bool(false);
-        }
         let ipfs_response = self
             .invoke_provider(
                 &registry,
@@ -3748,19 +3702,6 @@ impl ContentProvider {
             )
             .await?;
         let cid = provider_response_cid(&ipfs_response)?;
-        if let (true, Some(owner)) = (claim_first, owner) {
-            self.claim_publication_owner(&cid, owner)?;
-            let pinned = self
-                .invoke_provider(
-                    &registry,
-                    "ipfs",
-                    "pin",
-                    json!({ "op": "pin", "cid": cid }),
-                    ProviderTransfer::Json,
-                )
-                .await?;
-            provider_response_ok(&pinned, "content publish pin")?;
-        }
         let local_outcome = AvailabilityOutcome::local_publish(pin);
         // `local_pin` keeps the object on this node only; no network replication is attempted.
         let local_only_policy = request
@@ -4291,195 +4232,6 @@ impl ContentProvider {
         provider_response_ok(&response, label)
     }
 
-    /// Publish, ensure or repair. With an `owner` (one publication of this
-    /// Home), the owner's claim on the CID is saved, under the owners lock,
-    /// before the CID is pinned.
-    async fn pin_owned(&self, op: &str, request: &Value) -> Result<Value, ProviderError> {
-        let owner = match publication_owner(request) {
-            Ok(owner) => owner,
-            Err(refusal) => return Ok(refusal),
-        };
-        let _guard = match owner {
-            Some(_) => Some(PUBLICATION_OWNERS_LOCK.lock().await),
-            None => None,
-        };
-        if op == "publish" {
-            return self.publish(request, owner).await;
-        }
-        // Ensure and repair name their CID: the claim is saved before the pin.
-        if let (Some(owner), Some(cid)) = (
-            owner,
-            request
-                .get("cid")
-                .and_then(Value::as_str)
-                .filter(|cid| is_valid_cid(cid)),
-        ) {
-            self.claim_publication_owner(cid, owner)?;
-        }
-        if op == "ensure" {
-            self.ensure(request).await
-        } else {
-            self.repair(request).await
-        }
-    }
-
-    /// Saves `owner`'s claim on `cid`. Caller holds the owners lock.
-    fn claim_publication_owner(&self, cid: &str, owner: &str) -> Result<(), ProviderError> {
-        let mut owners = self.load_publication_owners()?;
-        if owners
-            .entry(cid.to_string())
-            .or_default()
-            .insert(owner.to_string())
-        {
-            self.store_publication_owners(&owners)?;
-        }
-        Ok(())
-    }
-
-    /// Unpublish. With an `owner`, only that publication's claim is released:
-    /// the CID is unpinned only when no other owner remains, and an owner
-    /// already released releases nothing. Without a `cid`, the owner is
-    /// released wherever it holds a claim (a publish that never finished).
-    async fn unpublish_owned(&self, request: &Value) -> Result<Value, ProviderError> {
-        let owner = match publication_owner(request) {
-            Ok(Some(owner)) => owner,
-            Ok(None) => return self.unpublish(request).await,
-            Err(refusal) => return Ok(refusal),
-        };
-        let _guard = PUBLICATION_OWNERS_LOCK.lock().await;
-        let mut owners = self.load_publication_owners()?;
-        let Some(cid) = request.get("cid") else {
-            let held: Vec<String> = owners
-                .iter()
-                .filter(|(_, claims)| claims.contains(owner))
-                .map(|(cid, _)| cid.clone())
-                .collect();
-            let mut unpinned = Vec::new();
-            for cid in &held {
-                let Some(claims) = owners.get_mut(cid) else {
-                    continue;
-                };
-                claims.remove(owner);
-                if !claims.is_empty() {
-                    continue;
-                }
-                owners.remove(cid);
-                // The interrupted publish may never have pinned it.
-                match self.unpublish(&json!({ "cid": cid })).await {
-                    Ok(response) if response["status"] == "ok" => unpinned.push(cid.clone()),
-                    _ => tracing::warn!(cid = %cid, "content: released claim had no pin to remove"),
-                }
-            }
-            self.store_publication_owners(&owners)?;
-            return Ok(provider_ok(json!({
-                "owner": owner,
-                "released": held,
-                "unpinned": unpinned,
-            })));
-        };
-        let Some(cid) = cid.as_str().filter(|cid| is_valid_cid(cid)) else {
-            return self.unpublish(request).await;
-        };
-        let held = owners
-            .get_mut(cid)
-            .is_some_and(|claims| claims.remove(owner));
-        let remaining = owners.get(cid).map_or(0, BTreeSet::len);
-        if !held || remaining > 0 {
-            if held {
-                self.store_publication_owners(&owners)?;
-            }
-            let receipt = self.latest_receipt_for_cid(cid).transpose()?;
-            return Ok(provider_ok(json!({
-                "cid": cid,
-                "uri": format!("elastos://{cid}"),
-                "availability": {
-                    "provider": "ipfs-provider",
-                    "policy": "publication_release",
-                    "status": "publication_released",
-                    "replicas": u32::from(remaining > 0),
-                    "owners_remaining": remaining,
-                },
-                "receipt": receipt
-                    .map_or_else(|| json!({ "status": "not_provided" }), |receipt| json!(receipt)),
-            })));
-        }
-        let response = self.unpublish(request).await?;
-        if response["status"] == "ok" {
-            owners.remove(cid);
-            self.store_publication_owners(&owners)?;
-        }
-        Ok(response)
-    }
-
-    fn publication_owners_path(&self) -> PathBuf {
-        self.data_dir
-            .join("ElastOS")
-            .join("SystemServices")
-            .join("Content")
-            .join("publication-owners.json")
-    }
-
-    fn load_publication_owners(&self) -> Result<PublicationOwners, ProviderError> {
-        let path = self.publication_owners_path();
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // Counting starts here: every CID this Home already holds
-                // keeps one claim for the publications made before, so a new
-                // publication of the same bytes never unpins them.
-                let mut owners = PublicationOwners::new();
-                for receipt in self.latest_receipts()? {
-                    if receipt.payload.status != "local_unpinned" {
-                        let cid = receipt.payload.cid;
-                        let legacy = legacy_publication_owner(&cid);
-                        owners.entry(cid).or_default().insert(legacy);
-                    }
-                }
-                let file = PublicationOwnersFile {
-                    schema: PUBLICATION_OWNERS_SCHEMA.to_string(),
-                    cids: owners.clone(),
-                };
-                let bytes = serde_json::to_vec_pretty(&file).map_err(|err| {
-                    ProviderError::Provider(format!("content publication owners: {err}"))
-                })?;
-                crate::auth::atomic_write(&path, &bytes).map_err(|err| {
-                    ProviderError::Provider(format!("content publication owners not saved: {err}"))
-                })?;
-                return Ok(owners);
-            }
-            Err(err) => {
-                return Err(ProviderError::Provider(format!(
-                    "content publication owners are unreadable: {err}"
-                )))
-            }
-        };
-        let file: PublicationOwnersFile = serde_json::from_slice(&bytes).map_err(|err| {
-            ProviderError::Provider(format!("content publication owners are unreadable: {err}"))
-        })?;
-        if file.schema != PUBLICATION_OWNERS_SCHEMA {
-            return Err(ProviderError::Provider(
-                "content publication owners have an unknown schema".into(),
-            ));
-        }
-        Ok(file.cids)
-    }
-
-    fn store_publication_owners(&self, owners: &PublicationOwners) -> Result<(), ProviderError> {
-        let file = PublicationOwnersFile {
-            schema: PUBLICATION_OWNERS_SCHEMA.to_string(),
-            cids: owners
-                .iter()
-                .filter(|(_, claims)| !claims.is_empty())
-                .map(|(cid, claims)| (cid.clone(), claims.clone()))
-                .collect(),
-        };
-        let bytes = serde_json::to_vec_pretty(&file)
-            .map_err(|err| ProviderError::Provider(format!("content publication owners: {err}")))?;
-        crate::auth::atomic_write(&self.publication_owners_path(), &bytes).map_err(|err| {
-            ProviderError::Provider(format!("content publication owners not saved: {err}"))
-        })
-    }
-
     async fn unpublish(&self, request: &Value) -> Result<Value, ProviderError> {
         let cid = request
             .get("cid")
@@ -4506,7 +4258,25 @@ impl ContentProvider {
                 ProviderTransfer::Json,
             )
             .await?;
-        provider_response_ok(&ipfs_response, "content unpublish")?;
+        if ipfs_response.get("status").and_then(Value::as_str) == Some("error") {
+            // An unpin that fails because the CID is no longer pinned (an
+            // earlier unpublish got this far before it was interrupted)
+            // completes the unpublish: verified absence, not a guess.
+            let status = self
+                .invoke_provider(
+                    &registry,
+                    "ipfs",
+                    "pin_status",
+                    json!({ "op": "pin_status", "cid": cid }),
+                    ProviderTransfer::Json,
+                )
+                .await?;
+            if !(status.get("status").and_then(Value::as_str) == Some("ok")
+                && status["data"]["pinned"] == false)
+            {
+                provider_response_ok(&ipfs_response, "content unpublish")?;
+            }
+        }
         let previous_receipt = self.latest_receipt_for_cid(cid).transpose()?;
         let outcome = AvailabilityOutcome {
             provider: "ipfs-provider".to_string(),
@@ -9906,6 +9676,8 @@ mod tests {
         pinned: Mutex<Vec<String>>,
         pin_error: Mutex<Option<String>>,
         unpinned: Mutex<Vec<String>>,
+        unpin_error: Mutex<Option<String>>,
+        pin_status: Mutex<Option<bool>>,
         bounded_read_not_ready: Mutex<bool>,
     }
 
@@ -10010,6 +9782,9 @@ mod tests {
                     Ok(provider_ok(json!({})))
                 }
                 Some("unpin") => {
+                    if let Some(message) = self.unpin_error.lock().await.clone() {
+                        return Ok(provider_error("unpin_failed", &message));
+                    }
                     let cid = request
                         .get("cid")
                         .and_then(|cid| cid.as_str())
@@ -10018,6 +9793,13 @@ mod tests {
                     self.unpinned.lock().await.push(cid);
                     Ok(provider_ok(json!({})))
                 }
+                Some("pin_status") => match *self.pin_status.lock().await {
+                    Some(pinned) => Ok(provider_ok(json!({ "pinned": pinned }))),
+                    None => Ok(provider_error(
+                        "pin_status_failed",
+                        "mock pin set unreadable",
+                    )),
+                },
                 _ => Ok(provider_error("unsupported", "unsupported mock ipfs op")),
             }
         }
@@ -10241,6 +10023,8 @@ mod tests {
             pinned: Mutex::new(Vec::new()),
             pin_error: Mutex::new(None),
             unpinned: Mutex::new(Vec::new()),
+            unpin_error: Mutex::new(None),
+            pin_status: Mutex::new(None),
             bounded_read_not_ready: Mutex::new(false),
         });
         registry
@@ -11148,160 +10932,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_saves_an_owner_claim_before_it_pins_and_can_release_an_unfinished_one() {
+    async fn content_unpublish_completes_when_the_cid_is_verified_no_longer_pinned() {
         let (_data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
-        let publish = json!({
-            "op": "publish",
-            "kind": "file",
-            "filename": "a.txt",
-            "data": "aGVsbG8K",
-            "pin": true,
-            "availability_policy": LOCAL_PIN_AVAILABILITY_POLICY,
-            "owner": "library:a:1",
-        });
-        // The pin fails after the claim was saved: an unfinished publish.
-        *ipfs.pin_error.lock().await = Some("pin interrupted".to_string());
-        assert!(content.send_raw(&publish).await.is_err());
-        let requests = ipfs.requests.lock().await.clone();
-        let ops: Vec<_> = requests.iter().map(|r| r["op"].clone()).collect();
-        assert_eq!(ops, [json!("add_bytes"), json!("pin")]);
-        assert_eq!(requests[0]["pin"], false);
+        let unpublish = json!({ "op": "unpublish", "cid": TEST_CID });
+        *ipfs.unpin_error.lock().await = Some("not pinned or pinned indirectly".to_string());
+
+        // The pin set can't be read: the failure stands, so Unpublish is retried.
+        assert!(content.send_raw(&unpublish).await.is_err());
+        // Still pinned: the failure stands.
+        *ipfs.pin_status.lock().await = Some(true);
+        assert!(content.send_raw(&unpublish).await.is_err());
+        // Verified not pinned (an earlier unpin got through): done.
+        *ipfs.pin_status.lock().await = Some(false);
+        let response = content.send_raw(&unpublish).await.unwrap();
+        assert_eq!(response["status"], "ok", "{response}");
         assert_eq!(
-            content.load_publication_owners().unwrap()[TEST_CID],
-            BTreeSet::from(["library:a:1".to_string()])
+            response["data"]["receipt"]["payload"]["status"],
+            "local_unpinned"
         );
-
-        // Released by owner alone, wherever it holds a claim.
-        *ipfs.pin_error.lock().await = None;
-        let released = content
-            .send_raw(&json!({ "op": "unpublish", "owner": "library:a:1" }))
-            .await
-            .unwrap();
-        assert_eq!(released["status"], "ok", "{released}");
-        assert_eq!(released["data"]["released"], json!([TEST_CID]));
-        assert!(content.load_publication_owners().unwrap().is_empty());
-        assert_eq!(
-            ipfs.unpinned.lock().await.as_slice(),
-            [TEST_CID.to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn content_counts_publications_made_before_owners_as_one_claim() {
-        let (_data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
-        let publish = |owner: Option<&str>| {
-            let mut request = json!({
-                "op": "publish",
-                "kind": "file",
-                "filename": "same.txt",
-                "data": "aGVsbG8K",
-                "pin": true,
-                "availability_policy": LOCAL_PIN_AVAILABILITY_POLICY,
-            });
-            if let Some(owner) = owner {
-                request["owner"] = json!(owner);
-            }
-            request
-        };
-        // A publication from before owners were counted (A), then B.
-        content.send_raw(&publish(None)).await.unwrap();
-        content
-            .send_raw(&publish(Some("library:b:2")))
-            .await
-            .unwrap();
-
-        let b = content
-            .send_raw(&json!({ "op": "unpublish", "cid": TEST_CID, "owner": "library:b:2" }))
-            .await
-            .unwrap();
-        assert_eq!(b["data"]["availability"]["status"], "publication_released");
-        assert!(ipfs.unpinned.lock().await.is_empty(), "A stays pinned");
-
-        let a = content
-            .send_raw(&json!({
-                "op": "unpublish",
-                "cid": TEST_CID,
-                "owner": legacy_publication_owner(TEST_CID),
-            }))
-            .await
-            .unwrap();
-        assert_eq!(a["data"]["availability"]["status"], "local_unpinned");
-        assert_eq!(ipfs.unpinned.lock().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn content_unpins_a_cid_only_when_its_last_publication_owner_releases_it() {
-        let (_data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
-        let publish = |owner: &'static str| {
-            json!({
-                "op": "publish",
-                "kind": "file",
-                "filename": "same.txt",
-                "data": "aGVsbG8K",
-                "pin": true,
-                "availability_policy": LOCAL_PIN_AVAILABILITY_POLICY,
-                "owner": owner,
-            })
-        };
-        let unpublish =
-            |owner: &'static str| json!({ "op": "unpublish", "cid": TEST_CID, "owner": owner });
-
-        // Identical bytes published twice: one CID, two owners.
-        for owner in ["library:a:1", "library:b:2"] {
-            let response = content.send_raw(&publish(owner)).await.unwrap();
-            assert_eq!(response["data"]["cid"], TEST_CID, "{response}");
-        }
-
-        let first = content.send_raw(&unpublish("library:a:1")).await.unwrap();
-        assert_eq!(first["status"], "ok", "{first}");
-        assert_eq!(
-            first["data"]["availability"]["status"],
-            "publication_released"
-        );
-        assert_eq!(first["data"]["availability"]["owners_remaining"], 1);
-        assert!(ipfs.unpinned.lock().await.is_empty());
-
-        // Releasing an owner twice changes nothing.
-        let again = content.send_raw(&unpublish("library:a:1")).await.unwrap();
-        assert_eq!(
-            again["data"]["availability"]["status"],
-            "publication_released"
-        );
-        assert!(ipfs.unpinned.lock().await.is_empty());
-
-        let last = content.send_raw(&unpublish("library:b:2")).await.unwrap();
-        assert_eq!(last["status"], "ok", "{last}");
-        assert_eq!(last["data"]["availability"]["status"], "local_unpinned");
-        assert_eq!(
-            ipfs.unpinned.lock().await.as_slice(),
-            [TEST_CID.to_string()]
-        );
-
-        // Repair under an owner takes ownership again.
-        let repair = content
-            .send_raw(&json!({
-                "op": "repair",
-                "cid": TEST_CID,
-                "availability_policy": LOCAL_PIN_AVAILABILITY_POLICY,
-                "owner": "library:a:1",
-            }))
-            .await
-            .unwrap();
-        assert_eq!(repair["data"]["availability"]["status"], "local_pinned");
-        content.send_raw(&publish("library:c:3")).await.unwrap();
-        let released = content.send_raw(&unpublish("library:c:3")).await.unwrap();
-        assert_eq!(
-            released["data"]["availability"]["status"],
-            "publication_released"
-        );
-        assert_eq!(ipfs.unpinned.lock().await.len(), 1);
-
-        let invalid = content
-            .send_raw(&json!({ "op": "unpublish", "cid": TEST_CID, "owner": "" }))
-            .await
-            .unwrap();
-        assert_eq!(invalid["status"], "error");
-        assert_eq!(ipfs.unpinned.lock().await.len(), 1);
     }
 
     #[tokio::test]
