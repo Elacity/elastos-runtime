@@ -351,6 +351,15 @@ export function createLibraryActions({
     URL.revokeObjectURL(url);
   }
 
+  // A shared file is in the local content store, not a Library folder. Read it
+  // and save it like any Library download: a link to /content would navigate
+  // this frame, and the gateway refuses that navigation.
+  async function downloadSharedFile(cid) {
+    const response = await fetch(`/content/${encodeURIComponent(cid)}`, { cache: "no-store" });
+    if (!response.ok) throw new Error("Could not read the shared file. Open the link in Chat again.");
+    saveDownloadBlob(await response.blob(), cid);
+  }
+
   async function protectAndListObject(object) {
     if (!isRuntimeCustodyProtectableVideo(object)) return;
     const operationKey = String(object.uri || "");
@@ -692,6 +701,7 @@ export function createLibraryActions({
     downloadObjectAsZip,
     downloadSelectedObjects,
     downloadSelectedObjectsAsZip,
+    downloadSharedFile,
     emptyTrash,
     extractArchiveObject,
     moveSelectedObjectsTo,

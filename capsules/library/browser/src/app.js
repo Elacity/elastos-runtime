@@ -134,6 +134,7 @@ import {
     let downloadObjectAsZip = async () => {};
     let downloadSelectedObjects = async () => {};
     let downloadSelectedObjectsAsZip = async () => {};
+    let downloadSharedFile = async () => {};
     let emptyTrash = async () => {};
     let extractArchiveObject = async () => {};
     let moveSelectedObjectsTo = async () => {};
@@ -290,6 +291,7 @@ import {
       downloadObjectAsZip,
       downloadSelectedObjects,
       downloadSelectedObjectsAsZip,
+      downloadSharedFile,
       emptyTrash,
       extractArchiveObject,
       moveSelectedObjectsTo,
@@ -1308,6 +1310,12 @@ import {
         if (state.mode === "browse" && sharedCid) {
           elements.dialog.innerHTML = sharedFileMarkup(sharedCid);
           elements.dialog.classList.remove("hidden");
+          elements.dialog.querySelector("[data-shared-download]").addEventListener("click", () => {
+            setStatus("Downloading shared file...");
+            downloadSharedFile(sharedCid)
+              .then(() => setStatus("Downloaded the shared file."))
+              .catch(showError);
+          });
           setStatus("Shared file is ready to download.");
         }
       }

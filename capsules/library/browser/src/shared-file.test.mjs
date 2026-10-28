@@ -6,19 +6,12 @@ test('Library shows the exact local CID with a download control', () => {
   const cid = 'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u';
   const markup = shared.sharedFileMarkup(cid);
   assert.ok(markup.includes(`elastos://${cid}`));
-  assert.ok(markup.includes(`href="/content/${cid}"`));
-  assert.ok(markup.includes(`download="${cid}"`));
-  assert.ok(markup.includes('Download file'));
+  assert.ok(markup.includes('data-shared-download>Download file</button>'));
 });
 
-test('Library escapes link text and confines downloads to the local gateway', () => {
+test('Library escapes link text and never links the frame to /content', () => {
   const markup = shared.sharedFileMarkup('bad"/><script>');
   assert.ok(!markup.includes('<script>'));
-  assert.ok(markup.includes('href="/content/bad%22%2F%3E%3Cscript%3E"'));
-});
-
-test('Library keeps the CID as its download name when a sender supplies a filename', () => {
-  for (const name of ['report.pdf', '', 'report".pdf']) {
-    assert.ok(shared.sharedFileMarkup('cid', name).includes('download="cid"'));
-  }
+  assert.ok(!markup.includes('href='));
+  assert.ok(!markup.includes('download='));
 });

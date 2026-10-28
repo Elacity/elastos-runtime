@@ -226,6 +226,7 @@ product-ui-browser:
     node scripts/library-product-layout-smoke.mjs
     node scripts/library-menu-smoke.mjs
     node scripts/library-shared-cid-smoke.mjs
+    node scripts/home-library-open-headless-smoke.mjs
     node scripts/browser-product-layout-smoke.mjs
     node scripts/system-uiux-layout-smoke.mjs
     node scripts/system-window-policy-browser-smoke.mjs

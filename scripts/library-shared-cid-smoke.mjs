@@ -1,9 +1,10 @@
-// Browser regression: shared downloads survive invalid initial URIs and folder failures.
+// Browser regression: shared downloads survive invalid initial URIs and folder failures,
+// and Download file saves the CID's bytes under the CID name.
 // Provider list mirrors library.rs clean_library_uri: non-localhost:// URIs are an error.
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -19,6 +20,8 @@ const roots = [
   { schema: "elastos.library.root/v1", id: "documents", label: "Documents", uri: documentsUri, kind: "directory" },
 ];
 const listed = [];
+const cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+const sharedBytes = Buffer.from("%PDF-1.4 shared fixture\n");
 let failFolder = false;
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
@@ -40,6 +43,9 @@ const server = createServer(async (req, res) => {
     }
     return res.end(JSON.stringify({ status: "ok", data: {} }));
   }
+  if (url.pathname === `/content/${cid}`) {
+    res.writeHead(200, { "content-type": "application/octet-stream" }); return res.end(sharedBytes);
+  }
   const homeFile = url.pathname.match(/^\/apps\/home\/([a-z-]+\.js)$/);
   const file = homeFile ? path.join(repo, "capsules/home/browser", homeFile[1])
     : path.join(capsuleRoot, url.pathname.replace(/^\/apps\/library\/?/, "") || "index.html");
@@ -52,16 +58,17 @@ const server = createServer(async (req, res) => {
 await new Promise(r => server.listen(0, "127.0.0.1", r));
 const port = server.address().port;
 const browser = await chromium.launch({ headless: true, executablePath: brave });
-const cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
 try {
 for (const [label, query] of [["legacy query {cid,uri}", `cid=${cid}&uri=${encodeURIComponent(`elastos://${cid}`)}`], ["cid only", `cid=${cid}`], ["folder failure", `cid=${cid}`], ["sender filename ignored", `cid=${cid}&fileName=report.pdf`]]) {
   listed.length = 0;
   failFolder = label === "folder failure";
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${port}/apps/library/?${query}&home_origin=${encodeURIComponent("https://home.example")}#home_token=t`);
-  await page.locator("#dialog:not(.hidden) a[download]").waitFor();
-  assert.equal(await page.locator("#dialog a[download]").getAttribute("href"), `/content/${cid}`);
-  assert.equal(await page.locator("#dialog a[download]").getAttribute("download"), cid);
+  await page.locator("#dialog:not(.hidden) [data-shared-download]").waitFor();
+  const [download] = await Promise.all([page.waitForEvent("download"), page.locator("#dialog [data-shared-download]").click()]);
+  assert.equal(download.suggestedFilename(), cid);
+  const saved = await download.path();
+  assert.deepEqual(await readFile(saved), sharedBytes);
   assert.ok(listed.length > 0);
   assert.ok(listed.every(uri => uri.startsWith("localhost://")));
   const r = await page.evaluate(() => ({ content: document.getElementById("content")?.textContent.trim().slice(0, 80), dialog: document.getElementById("dialog")?.classList.contains("hidden") ? "(hidden)" : document.getElementById("dialog")?.textContent.replace(/\s+/g, " ").trim().slice(0, 120) }));
