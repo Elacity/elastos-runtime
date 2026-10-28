@@ -25,12 +25,24 @@ const cases = [
   { name: "invalid", author: "Untrusted publisher", signature: "invalid" },
   { name: "malformed", author: "Untrusted publisher", signature: { broken: true } },
   { name: "spoofed-state", author: "ElastOS", signature_state: "catalog-signature-verified" },
+  { name: "spoofed-did", author: "ElastOS", publisher_did: "ElastOS" },
+];
+// Marketplace lists only what Home can open or get: no services, Home views or helpers.
+const hidden = [
+  { name: "object-provider", role: "provider", launchable: false },
+  { name: "home-gui", role: "shell", launchable: true, launch_target: "home-gui" },
+  { name: "archive-manager", role: "viewer", launchable: false },
+  { name: "kubo", role: "content", launchable: false },
 ];
 function catalog() {
   return { model_catalog_state: catalogState, capsules: [
     ...cases.map(item => ({ ...item, title: `Fixture ${item.name}`, role: "app", type: "web-projection", cid,
-      source: "local", installed: false, launchable: false, trust_state: "cid-with-manifest-signature",
+      source: "local", installed: false, launchable: true, launch_target: item.name, trust_state: "cid-with-manifest-signature",
       signature_state: item.signature_state || "manifest-signature-declared", payment_state: "not-declared", drm_state: "unknown" })),
+    ...hidden.map(item => ({ ...item, title: `Fixture ${item.name}`, author: "elastos", installed: true })),
+    { name: "signed", title: "Fixture signed", author: "elastos", role: "app", installed: true, launchable: true,
+      launch_target: "signed", publisher_did: "did:key:zReleasePublisher", trust_state: "cid-without-manifest-signature",
+      signature_state: "no-manifest-signature", payment_state: "not-declared", drm_state: "unknown" },
     { name: "launchable", title: "Fixture launchable", author: "Publisher", role: "app", installed: true,
       launchable: true, launch_target: "launchable", trust_state: "local-dev", signature_state: "no-manifest-signature",
       payment_state: "provider", drm_state: "provider" },
@@ -123,18 +135,24 @@ try {
   await frame().locator('.store-row[data-app="blank"]').waitFor();
   for (const item of cases) {
     const row = frame().locator(`.store-row[data-app="${item.name}"]`).first();
-    const expected = !item.author || item.author === "Unknown publisher" ? "Publisher unknown" : `Declared author · ${item.author}`;
-    assert.equal(await row.locator(".store-row-sub").textContent(), expected);
+    assert.equal(await row.locator(".store-row-sub").count(), 0, `${item.name} has no publisher line`);
     await row.focus(); await row.press("Enter");
-    assert.equal(await frame().locator(".modal-developer").textContent(), expected);
+    assert.equal(await frame().locator(".modal-developer").count(), 0, `${item.name} detail has no publisher line`);
     const text = await frame().locator("#detail-content").textContent();
-    assert.doesNotMatch(text, /Runtime-verified|Verified|Signed local|Supports payments|Uses protected content/);
+    assert.doesNotMatch(text, /Runtime-verified|Verified|Signed local|Supports payments|Uses protected content|Declared author|Publisher unknown|Upstream/);
     assert.match(text, /Publisher verification unavailable/);
-    assert.equal(await frame().locator('#detail-content [data-action="open"]').count(), 0);
     assert.equal(await frame().locator('#detail-content [data-action="install"]').count(), 0);
     await frame().locator("#detail-content").press("Escape");
     assert.equal(await row.evaluate(el => document.activeElement === el), true);
   }
+  for (const item of hidden) assert.equal(await frame().locator(`.store-row[data-app="${item.name}"]`).count(), 0, `${item.name} is not listed`);
+  const signed = frame().locator('.store-row[data-app="signed"]').first();
+  assert.equal(await signed.locator(".store-row-sub").textContent(), "Verified publisher");
+  await signed.click();
+  assert.equal(await frame().locator(".modal-developer").textContent(), "Verified publisher");
+  assert.equal(await frame().locator(".modal-developer").getAttribute("title"), "did:key:zReleasePublisher");
+  assert.match(await frame().locator("#detail-content").textContent(), /Release signature verified/);
+  await frame().locator("#detail-content").press("Escape");
   const launch = frame().locator('.store-row[data-app="launchable"]').first();
   await launch.click();
   assert.match(await frame().locator("#detail-content").textContent(), /Supports payments/);

@@ -62,8 +62,6 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     { id: "viewers", label: "Viewers", icon: "play" },
     { id: "models", label: "Models", icon: "package" },
     { id: "content", label: "Content", icon: "document" },
-    { id: "providers", label: "Services", icon: "server" },
-    { id: "shells", label: "Home views", icon: "system" },
   ];
 
   // Every model row and detail, local or shared, uses the content icon.
@@ -74,8 +72,6 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     package: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16.5 9.4l-9-5.19M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>',
     play: '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>',
     document: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 3h7l4 4v14H7V3zm6 1.5V8h3.5L13 4.5zM9 12h6v1.5H9V12zm0 3h6v1.5H9V15z"/></svg>',
-    server: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 1h16c1.1 0 2 .9 2 2v4c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V3c0-1.1.9-2 2-2zm0 8h16c1.1 0 2 .9 2 2v4c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2v-4c0-1.1.9-2 2-2zm0 8h16c1.1 0 2 .9 2 2v4c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2v-4c0-1.1.9-2 2-2zm2-12v2h2V5H6zm0 8v2h2v-2H6zm0 8v2h2v-2H6z"/></svg>',
-    system: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>',
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></svg>',
     close: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>',
     check: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>',
@@ -397,6 +393,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
         interfacesByCapsule.set(capsule, records);
       }
       state.apps = capsules
+        .filter(listedInMarketplace)
         .map((capsule) => capsuleToApp(
           capsule,
           capsulesByName,
@@ -437,6 +434,14 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     `).join("")}</div>`;
   }
 
+  // Marketplace lists only what a person can open or get: apps, viewers and
+  // content Home can open, and signed models. Home views, services and helpers
+  // Home cannot open are not listed.
+  function listedInMarketplace(capsule) {
+    if (capsule.source === "signed-model-catalog") return true;
+    return capsule.launchable === true && Boolean(capsule.launch_target) && String(capsule.role || "").toLowerCase() !== "shell";
+  }
+
   function capsuleToApp(capsule, capsulesByName, interfaceEntries) {
     const model = capsule.source === "signed-model-catalog";
     const role = String(capsule.role || "").toLowerCase();
@@ -454,8 +459,9 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       contentBytes: model ? capsule.content_size_bytes : null,
       modelFit: model ? String(capsule.model_memory_fit || "") : "",
       name: publicTitle(capsule),
-      developer: String(model ? capsule.publisher_did : capsule.author || "").trim(),
-      upstreamOrigin: model ? "" : String(capsule.upstream_origin || "").trim(),
+      // Runtime names a publisher only for a signed model or an installed item
+      // whose package matches a record signed by a release key it trusts.
+      developer: typeof capsule.publisher_did === "string" && capsule.publisher_did.startsWith("did:") ? capsule.publisher_did : "",
       category: appCategory(capsule, role),
       description: model ? modelDescription(capsule) : publicDescription(capsule),
       version: String(capsule.version || ""),
@@ -494,8 +500,6 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       apps: "apps",
       viewers: "viewers",
       content: "content",
-      providers: "providers",
-      shells: "shells",
     };
     return canonical[category] || canonical[`${role}s`] || "apps";
   }
@@ -526,23 +530,19 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   function appIcon(role) {
-    if (role === "provider") return "server";
-    if (role === "shell") return "system";
     if (role === "viewer") return "play";
     if (role === "content") return "document";
     return "package";
   }
 
   function appGradient(role) {
-    if (role === "provider") return "gradient-slate";
     if (role === "viewer") return "gradient-blue";
     if (role === "content") return "gradient-green";
-    if (role === "shell") return "gradient-indigo";
     return "gradient-teal";
   }
 
   function appBadges(role, capsule, installed) {
-    const badges = [role === "provider" ? "service" : (role || "app")];
+    const badges = [role || "app"];
     if (installed) badges.push("installed");
     if (String(capsule.drm_state || "") === "provider") badges.push("ddrm");
     if (String(capsule.payment_state || "") === "provider") badges.push("wallet");
@@ -921,12 +921,9 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     return `${(bytes / 1000 ** rank).toLocaleString(undefined, { maximumFractionDigits: rank ? 2 : 0 })} ${units[rank]}`;
   }
 
+  // Only a Runtime-verified signer gives a publisher line; there is no other.
   function detailPublisher(app) {
-    if (app.modelCid) return "Verified publisher";
-    const author = app.developer;
-    if (author && !/^unknown publisher$/i.test(author)) return `Declared author · ${author}`;
-    // A repackaged upstream program credits its origin, never a verified publisher.
-    return app.upstreamOrigin ? `Upstream: ${app.upstreamOrigin}` : "Publisher unknown";
+    return app.developer ? "Verified publisher" : "";
   }
 
   // A model row shows its download size and whether it fits this device.
@@ -942,7 +939,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
         ${appIconHtml(app, "store-row-icon")}
         <div class="store-row-text">
           <div class="store-row-title">${escapeHtml(app.name)}</div>
-          <div class="store-row-sub">${escapeHtml(rowSubtitle(app))}</div>
+          ${rowSubtitle(app) ? `<div class="store-row-sub">${escapeHtml(rowSubtitle(app))}</div>` : ""}
         </div>
         ${actionButton(app)}
       </article>
@@ -1038,7 +1035,6 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     const tips = {
       wallet: "Supports payments",
       ddrm: "Uses protected content",
-      provider: "System service",
       installed: "Installed on this Home",
     };
     return tips[badge] || "";
@@ -1053,7 +1049,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
         ${icon}
         <div class="modal-title-section">
           <div class="modal-title">${escapeHtml(title)}</div>
-          <div class="modal-developer"${developerTitle ? ` title="${escapeAttr(developerTitle)}"` : ""}>${escapeHtml(developer)}</div>
+          ${developer ? `<div class="modal-developer"${developerTitle ? ` title="${escapeAttr(developerTitle)}"` : ""}>${escapeHtml(developer)}</div>` : ""}
           ${version ? `<div class="modal-version">Version ${escapeHtml(version)}</div>` : ""}
           <div class="modal-badges">${badges}</div>
         </div>
@@ -1088,7 +1084,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     }
     renderDetail({
       icon: appIconHtml(app, "modal-icon-size"), title: app.name, developer: detailPublisher(app),
-      developerTitle: app.modelCid ? app.developer : "", version: app.version,
+      developerTitle: app.developer, version: app.version,
       badges: badgesHtml(app), footerNote: packageLabel(app),
       body: `${aboutSection(app.description)}
         ${app.modelCid
@@ -1221,7 +1217,9 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       ? technicalSection([app.sourceSummary, roleLabel(app.role), "Model"], [
         packageLabel(app), `Publisher: ${app.developer}`, `Content ID: ${app.modelCid}`, `${app.contentBytes.toLocaleString()} bytes`,
       ])
-      : technicalSection([app.sourceSummary, roleLabel(app.role), app.capsuleType || "Unknown"], [signatureLabel(app), packageLabel(app)]);
+      : technicalSection([app.sourceSummary, roleLabel(app.role), app.capsuleType || "Unknown"], [
+        signatureLabel(app), packageLabel(app), ...(app.developer ? [`Publisher: ${app.developer}`] : []),
+      ]);
   }
 
   function technicalSection([source, role, type], rows) {
@@ -1241,7 +1239,8 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   function packageLabel(app) {
-    return app.modelCid ? "Catalog signature verified" : "Publisher verification unavailable";
+    if (app.modelCid) return "Catalog signature verified";
+    return app.developer ? "Release signature verified" : "Publisher verification unavailable";
   }
 
   function trustLabel(stateValue) {
@@ -1464,13 +1463,11 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     const description = String(capsule.description || "").trim();
     const role = String(capsule.role || "app").toLowerCase();
     const title = publicTitle(capsule);
-    if (role === "provider") return `${title} service for apps on this Home.`;
     if (description && !/\b(runtime|capsules?|providers?|projection|schema|derived facts?|boundary|capability surface|affordances?|host-loaded|structured home intents?)\b/i.test(description)) {
       return description;
     }
     if (role === "viewer") return `${title} opens compatible files and content.`;
     if (role === "content") return `${title} content.`;
-    if (role === "shell") return `${title} Home view.`;
     return `${title} app.`;
   }
 
@@ -1643,10 +1640,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     const labels = {
       app: "App",
       viewer: "Viewer",
-      provider: "Service",
-      service: "Service",
       content: "Content",
-      shell: "Shell",
       ddrm: "dDRM",
       wallet: "Wallet",
       installed: "Installed",
@@ -1655,7 +1649,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   function roleLabel(role) {
-    const labels = { app: "App", viewer: "Viewer", provider: "Service", content: "Content", shell: "Home view" };
+    const labels = { app: "App", viewer: "Viewer", content: "Content" };
     return labels[String(role || "").toLowerCase()] || "App";
   }
 

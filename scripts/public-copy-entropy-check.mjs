@@ -137,8 +137,6 @@ assert(
     && !marketplaceJs.includes("Marketplace catalog unavailable")
     && marketplaceJs.includes("runtime|capsules?|providers?|projection|schema|derived facts?|boundary")
     && marketplaceJs.includes("function publicTitle(capsule)")
-    && marketplaceJs.includes('role === "provider" ? "service"')
-    && marketplaceJs.includes('if (role === "provider") return `${title} service for apps on this Home.`;')
     && marketplaceJs.includes("sourceSummary")
     && marketplaceJs.includes("Available actions")
     && !marketplaceJs.includes("technicalDependencies")

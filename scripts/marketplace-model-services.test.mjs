@@ -133,43 +133,57 @@ function publisherFixture() {
   });
   for (const [start, end] of [
     ["  async function loadCatalogData()", "  async function loadMediaData()"],
-    ["  function capsuleToApp(", "  function appCategory("],
+    ["  function listedInMarketplace(", "  function appCategory("],
     ["  function modelSizeLabel(", "  function renderAppRow("],
     ["  function packageLabel(", "  function openApp("],
   ]) vm.runInContext(source.slice(source.indexOf(start), source.indexOf(end)), context);
   return context;
 }
 
-test("declared authors and signatures cannot receive Runtime publisher verification", () => {
+test("only a Runtime-verified signer gives a publisher line; authors and signature claims give none", () => {
   const context = publisherFixture();
-  for (const [author, expected] of [
-    ["", "Publisher unknown"], ["  ", "Publisher unknown"],
-    ["Unknown publisher", "Publisher unknown"], ["ElastOS", "Declared author · ElastOS"],
-  ]) {
+  for (const author of [undefined, "", "Unknown publisher", "ElastOS", "elastos"]) {
     for (const signature_state of ["invalid", { malformed: true }, "catalog-signature-verified"]) {
-      const app = context.capsuleToApp({ name: "fixture", role: "app", source: "local", author, signature_state }, new Map(), []);
-      assert.equal(context.detailPublisher(app), expected);
-      assert.equal(context.packageLabel(app), "Publisher verification unavailable");
-      assert.doesNotMatch(context.signatureLabel(app), /Runtime verified|Verified publisher/);
+      for (const publisher_did of [undefined, "", "ElastOS", { did: "did:key:z" }]) {
+        const app = context.capsuleToApp({ name: "fixture", role: "app", source: "installed", author, signature_state,
+          publisher_did, upstream_origin: "github.com/ipfs/kubo" }, new Map(), []);
+        assert.equal(context.detailPublisher(app), "");
+        assert.equal(context.rowSubtitle(app), "");
+        assert.equal(context.packageLabel(app), "Publisher verification unavailable");
+        assert.doesNotMatch(context.signatureLabel(app), /Runtime verified|Verified publisher/);
+      }
     }
   }
+  const signed = context.capsuleToApp({ name: "library", role: "app", source: "installed", author: "elastos",
+    publisher_did: "did:key:zRelease" }, new Map(), []);
+  assert.equal(context.detailPublisher(signed), "Verified publisher");
+  assert.equal(context.rowSubtitle(signed), "Verified publisher");
+  assert.equal(signed.developer, "did:key:zRelease");
+  assert.equal(context.packageLabel(signed), "Release signature verified");
 });
 
-test("a repackaged upstream program shows its upstream origin, never a verified publisher", () => {
+test("Marketplace lists only what a person can open or get", async () => {
   const context = publisherFixture();
-  for (const [author, upstream_origin, expected] of [
-    [undefined, "github.com/ipfs/kubo", "Upstream: github.com/ipfs/kubo"],
-    ["Unknown publisher", "nodejs.org", "Upstream: nodejs.org"],
-    [undefined, "  ", "Publisher unknown"],
-    ["elastos", "github.com/ipfs/kubo", "Declared author · elastos"],
-  ]) {
-    const app = context.capsuleToApp({ name: "kubo", role: "content", source: "installed", author, upstream_origin,
-      signature_state: "catalog-signature-verified" }, new Map(), []);
-    assert.equal(context.detailPublisher(app), expected);
-    assert.equal(context.rowSubtitle(app), expected);
-    assert.equal(context.packageLabel(app), "Publisher verification unavailable");
-    assert.doesNotMatch(context.signatureLabel(app), /Runtime verified|Verified publisher/);
-  }
+  const capsules = [
+    { name: "library", role: "app", launchable: true, launch_target: "library" },
+    { name: "wallet-metamask", role: "app", launchable: true, launch_target: "wallet-metamask" },
+    { name: "documents", role: "viewer", launchable: true, launch_target: "documents" },
+    { name: "gba-ucity", role: "content", launchable: true, launch_target: "gba-ucity" },
+    { name: "archive-manager", role: "viewer", launchable: false, launch_target: "archive-manager" },
+    { name: "home", role: "app", launchable: false },
+    { name: "home-gui", role: "shell", launchable: true, launch_target: "home-gui" },
+    { name: "object-provider", role: "provider", launchable: false },
+    { name: "kubo", role: "content", launchable: false },
+    { name: "no-target", role: "app", launchable: true },
+    { name: "model", source: "signed-model-catalog", role: "content", installed: false, launchable: false,
+      cid: `bafybei${"a".repeat(52)}`, publisher_did: "did:key:zFixture", content_size_bytes: 1024,
+      signature_state: "catalog-signature-verified" },
+  ];
+  context.fetch = async url => ({ ok: true, json: async () => url.endsWith("catalog")
+    ? { model_catalog_state: "verified", capsules } : { interfaces: [] } });
+  await context.loadCatalogData();
+  assert.deepEqual([...context.state.apps.map(app => app.id)].sort(),
+    ["documents", "gba-ucity", "library", `model:bafybei${"a".repeat(52)}`, "wallet-metamask"]);
 });
 
 test("invalid or unavailable model catalog verification clears publisher cards", async () => {

@@ -408,8 +408,6 @@ button {
 
 .gradient-blue { background: linear-gradient(135deg, #3b82f6, #1d4ed8); }
 .gradient-green { background: linear-gradient(135deg, #22c55e, #16a34a); }
-.gradient-slate { background: linear-gradient(135deg, #64748b, #475569); }
-.gradient-indigo { background: linear-gradient(135deg, #6366f1, #4f46e5); }
 .gradient-teal { background: linear-gradient(135deg, #14b8a6, #0d9488); }
 
 .store-pill,
@@ -465,10 +463,7 @@ button {
 
 .badge.app { --badge-hue: #3b82f6; }
 .badge.viewer { --badge-hue: #0ea5e9; }
-.badge.provider { --badge-hue: #f59e0b; }
-.badge.service { --badge-hue: #f59e0b; }
 .badge.content { --badge-hue: #22c55e; }
-.badge.shell { --badge-hue: #94a3b8; }
 .badge.ddrm { --badge-hue: #d946ef; }
 .badge.wallet { --badge-hue: #f97316; }
 .badge.installed { --badge-hue: #22c55e; }
@@ -477,10 +472,7 @@ button {
 
 .badge.app,
 .badge.viewer,
-.badge.provider,
-.badge.service,
 .badge.content,
-.badge.shell,
 .badge.ddrm,
 .badge.wallet,
 .badge.installed,

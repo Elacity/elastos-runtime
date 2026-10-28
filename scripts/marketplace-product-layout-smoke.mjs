@@ -101,6 +101,7 @@ const catalogCapsules = [
     accepted_content: [{ name: "markdown", title: "Markdown" }],
     requires: [{ name: "people" }],
     viewer_title: "Documents",
+    publisher_did: "did:key:z6MkFixtureReleasePublisher",
   },
   {
     name: "object-provider",
@@ -123,7 +124,8 @@ const catalogCapsules = [
     category: "apps",
     role: "app",
     installed: false,
-    launchable: false,
+    launchable: true,
+    launch_target: "bad-icons",
     type: "wasm",
     icon: [
       { size: 128, route: "/apps/not-allowed/icons/icon-128.png" },
@@ -938,17 +940,21 @@ async function run() {
     );
 
     const installedBadge = await frame.locator("#installed-badge").textContent();
-    assert(installedBadge?.trim() === "3", "Marketplace installed count must come from catalog installed fields", { installedBadge });
+    assert(installedBadge?.trim() === "2", "Marketplace installed count must come from listed catalog installed fields", { installedBadge });
 
     const discoverTitles = await frame.locator(".store-section-title").evaluateAll((nodes) => nodes.map((node) => node.textContent?.trim() || ""));
     assert(discoverTitles.includes("Installed"), "Marketplace Discover must include the Installed section", discoverTitles);
     assert(discoverTitles.includes("Apps"), "Marketplace Discover must include app category sections", discoverTitles);
-    assert(discoverTitles.includes("Services"), "Marketplace Discover must include service category sections", discoverTitles);
+    assert(!discoverTitles.includes("Services") && !discoverTitles.includes("Home views"), "Marketplace must not list services or Home views", discoverTitles);
+    for (const hidden of ["object-provider", "zip-viewer"]) {
+      const count = await frame.locator(`.store-row[data-app="${hidden}"]`).count();
+      assert(count === 0, "Marketplace must list only what Home can open or get", { hidden, count });
+    }
 
-    await frame.locator('.store-see-all[data-destination="providers"]').click();
+    await frame.locator('.store-see-all[data-destination="apps"]').click();
     await frame.locator("#store-title").waitFor({ state: "visible" });
-    const providerTitle = await frame.locator("#store-title").textContent();
-    assert(providerTitle?.trim() === "Services", "Marketplace See All must route through the category destination", { providerTitle });
+    const categoryTitle = await frame.locator("#store-title").textContent();
+    assert(categoryTitle?.trim() === "Apps", "Marketplace See All must route through the category destination", { categoryTitle });
 
     await frame.locator('[data-destination="discover"]').click();
     await frame.locator("#search-input").fill("documents");
@@ -1095,15 +1101,6 @@ async function run() {
     const latestOpen = openMessagesAfter.filter((entry) => entry.type === "home:open-target").at(-1);
     assert((openMessagesAfter.filter((entry) => entry.type === "home:open-target").length) === openMessagesBefore + 1, "Marketplace must launch only through Home open-target", openMessagesAfter);
     assert(latestOpen?.target === "people", "Marketplace must use the catalog launch_target", latestOpen);
-
-    const openCountBeforeBad = openMessagesAfter.filter((entry) => entry.type === "home:open-target").length;
-    await frame.locator('.store-row[data-app="bad-icons"]').first().click();
-    await frame.locator("#detail-modal.active").waitFor();
-    const badOpenButtonCount = await frame.locator('#detail-content [data-action="open"]').count();
-    assert(badOpenButtonCount === 0, "Marketplace must not offer Open for non-launchable entries");
-    await frame.locator('#detail-content [data-action="close-detail"]').last().click();
-    const openCountAfterBad = (await readHomeMessages(page)).filter((entry) => entry.type === "home:open-target").length;
-    assert(openCountAfterBad === openCountBeforeBad, "Marketplace non-launchable entries must not send launch messages");
 
     await frame.locator('[data-destination="discover"]').focus();
     await page.keyboard.press("ArrowDown");
