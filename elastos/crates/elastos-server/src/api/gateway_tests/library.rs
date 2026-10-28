@@ -1336,6 +1336,70 @@ async fn test_documents_viewer_route_can_read_and_save_library_file_only() {
     assert_eq!(save["status"], "ok");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_documents_viewer_route_refuses_a_file_reached_through_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let documents_token = app_token_for_authority(dir.path(), DOCUMENTS_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    write_test_static_capsule(
+        dir.path(),
+        DOCUMENTS_CAPSULE_ID,
+        "viewer",
+        "Test Documents viewer",
+        "<!doctype html><title>Documents Viewer</title>",
+    );
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("Secret.txt"), b"outside secret").unwrap();
+    let documents_path = library_object_path(dir.path(), &format!("{root}/Documents"));
+    std::fs::create_dir_all(&documents_path).unwrap();
+    std::os::unix::fs::symlink(outside.path(), documents_path.join("Linked")).unwrap();
+    let uri = format!("{root}/Documents/Linked/Secret.txt");
+    let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
+
+    for (method, body) in [
+        ("GET", Body::empty()),
+        (
+            "PUT",
+            Body::from(
+                serde_json::to_vec(&json!({
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"overwritten"),
+                }))
+                .unwrap(),
+            ),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method(method)
+                    .uri(format!(
+                        "/api/viewers/documents/library-object?uri={encoded_uri}"
+                    ))
+                    .header("x-elastos-home-token", documents_token.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&text);
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {text}");
+        assert!(text.contains("linked folder"), "{method}: {text}");
+    }
+    assert_eq!(
+        std::fs::read(outside.path().join("Secret.txt")).unwrap(),
+        b"outside secret"
+    );
+}
+
 #[tokio::test]
 async fn test_library_provider_rejects_unknown_operation() {
     let dir = tempfile::tempdir().unwrap();

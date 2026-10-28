@@ -3296,6 +3296,20 @@ fn library_target(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
     })
 }
 
+/// Refuses an object reached through a link anywhere from the data root down
+/// to the object itself, so a viewer that opens or saves by URI stays inside
+/// the principal's own folders.
+pub(crate) fn refuse_linked_library_object(
+    data_dir: &Path,
+    principal_id: &str,
+    uri: &str,
+) -> anyhow::Result<()> {
+    let target = library_target(data_dir, principal_id, uri)?;
+    crate::auth::ensure_no_symlink_components(data_dir, &target.path).map_err(|_| {
+        anyhow!("This file is a link or is in a linked folder, so it is not viewable in Home.")
+    })
+}
+
 fn clean_library_uri(localhost_root: &str, uri: &str) -> anyhow::Result<String> {
     let uri = uri.trim().trim_end_matches('/').to_string();
     if !uri.starts_with("localhost://") {

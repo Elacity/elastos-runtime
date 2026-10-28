@@ -17,6 +17,8 @@ const DOCUMENTS_SCHEMA: &str = "elastos.document/v2";
 const DOCUMENTS_DEFAULT_TITLE: &str = "Untitled";
 /// The most plain files the Documents list shows from the Documents folder.
 const DOCUMENTS_FOLDER_FILES_LIMIT: usize = 500;
+/// The most folder entries of any kind one summary reads while finding them.
+const DOCUMENTS_FOLDER_ENTRIES_LIMIT: usize = 5_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentsListItem {
@@ -1101,24 +1103,30 @@ fn documents_load_metadata_index(
 }
 
 fn documents_load_summary(data_dir: &Path, principal_id: &str) -> anyhow::Result<DocumentsSummary> {
-    let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
-    let metadata = documents_load_metadata_index(&objects, principal_id)?;
+    let metadata = {
+        let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
+        documents_load_metadata_index(&objects, principal_id)?
+    };
+    // The folder scan reads names and times only, so it runs without the
+    // shared object lock; a file saved meanwhile shows on the next summary.
     let docs_root = documents_root(data_dir, principal_id)?;
-    let indexed = metadata
-        .iter()
-        .map(|metadata| metadata.file_name.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let mut files = Vec::new();
-    if docs_root.is_dir() {
-        documents_collect_folder_files(
-            &docs_root,
-            "",
-            0,
-            &indexed,
-            &documents_working_copy_uri(principal_id, "")?,
-            &mut files,
-        );
+    let mut scan = DocumentsFolderScan {
+        indexed: metadata
+            .iter()
+            .map(|metadata| metadata.file_name.as_str())
+            .collect(),
+        base_uri: documents_working_copy_uri(principal_id, "")?,
+        visited: 0,
+        files: Vec::new(),
+    };
+    // Only the principal's real Documents folder: nothing on the way to it,
+    // nor the folder itself, may be a link.
+    let real_folder = crate::auth::ensure_no_symlink_components(data_dir, &docs_root).is_ok()
+        && std::fs::symlink_metadata(&docs_root).is_ok_and(|metadata| metadata.is_dir());
+    if real_folder {
+        scan.collect(&docs_root, "", 0);
     }
+    let mut files = scan.files;
     files.sort_by(|left, right| {
         right
             .updated_at
@@ -1131,72 +1139,77 @@ fn documents_load_summary(data_dir: &Path, principal_id: &str) -> anyhow::Result
     })
 }
 
-/// Walks the Documents folder by name, as the start walk does, to the same
-/// folder depth, skipping hidden entries, links and anything unreadable, and
-/// stops at `DOCUMENTS_FOLDER_FILES_LIMIT` files.
-fn documents_collect_folder_files(
-    dir: &Path,
-    relative: &str,
-    depth: usize,
-    indexed: &std::collections::HashSet<&str>,
-    base_uri: &str,
-    files: &mut Vec<DocumentsFolderFile>,
-) {
-    if depth >= crate::auth::MAX_PRINCIPAL_ROOT_INVENTORY_DEPTH {
-        return;
+/// Walks the Documents folder by name to the start walk's folder depth,
+/// skipping hidden entries, links and anything unreadable. It reads at most
+/// `DOCUMENTS_FOLDER_ENTRIES_LIMIT` entries of any kind and keeps at most
+/// `DOCUMENTS_FOLDER_FILES_LIMIT` files.
+struct DocumentsFolderScan<'a> {
+    indexed: std::collections::HashSet<&'a str>,
+    base_uri: String,
+    visited: usize,
+    files: Vec<DocumentsFolderFile>,
+}
+
+impl DocumentsFolderScan<'_> {
+    fn done(&self) -> bool {
+        self.visited >= DOCUMENTS_FOLDER_ENTRIES_LIMIT
+            || self.files.len() >= DOCUMENTS_FOLDER_FILES_LIMIT
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        if files.len() >= DOCUMENTS_FOLDER_FILES_LIMIT {
+
+    fn collect(&mut self, dir: &Path, relative: &str, depth: usize) {
+        if depth >= crate::auth::MAX_PRINCIPAL_ROOT_INVENTORY_DEPTH {
             return;
         }
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
         };
-        if name.starts_with('.') {
-            continue;
+        for entry in entries {
+            if self.done() {
+                return;
+            }
+            self.visited += 1;
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            // `DirEntry::file_type` does not follow a link.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if name.starts_with('.') || file_type.is_symlink() {
+                continue;
+            }
+            let path = if relative.is_empty() {
+                name.clone()
+            } else {
+                format!("{relative}/{name}")
+            };
+            if file_type.is_dir() {
+                self.collect(&entry.path(), &path, depth + 1);
+                continue;
+            }
+            let lower = name.to_ascii_lowercase();
+            if !file_type.is_file()
+                || !(lower.ends_with(".md") || lower.ends_with(".txt"))
+                || self.indexed.contains(path.as_str())
+            {
+                continue;
+            }
+            let updated_at = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |elapsed| elapsed.as_secs());
+            self.files.push(DocumentsFolderFile {
+                uri: format!("{}{path}", self.base_uri),
+                name,
+                path,
+                updated_at,
+            });
         }
-        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
-        let path = if relative.is_empty() {
-            name.clone()
-        } else {
-            format!("{relative}/{name}")
-        };
-        if metadata.is_dir() {
-            documents_collect_folder_files(
-                &entry.path(),
-                &path,
-                depth + 1,
-                indexed,
-                base_uri,
-                files,
-            );
-            continue;
-        }
-        let lower = name.to_ascii_lowercase();
-        if !metadata.is_file()
-            || !(lower.ends_with(".md") || lower.ends_with(".txt"))
-            || indexed.contains(path.as_str())
-        {
-            continue;
-        }
-        let updated_at = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |elapsed| elapsed.as_secs());
-        files.push(DocumentsFolderFile {
-            uri: format!("{base_uri}{path}"),
-            name,
-            path,
-            updated_at,
-        });
     }
 }
 
@@ -1919,15 +1932,87 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("Too deep.md"), "x\n").unwrap();
         std::fs::write(deep.parent().unwrap().join("Deepest.md"), "x\n").unwrap();
-        for index in 0..DOCUMENTS_FOLDER_FILES_LIMIT {
-            std::fs::write(docs_root.join(format!("n{index:03}.txt")), "x\n").unwrap();
-        }
 
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        let names = summary
+            .files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Deepest.md"]);
 
+        for index in 0..=DOCUMENTS_FOLDER_FILES_LIMIT {
+            std::fs::write(docs_root.join(format!("n{index:03}.txt")), "x\n").unwrap();
+        }
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
         assert_eq!(summary.files.len(), DOCUMENTS_FOLDER_FILES_LIMIT);
-        assert!(summary.files.iter().any(|file| file.name == "Deepest.md"));
-        assert!(!summary.files.iter().any(|file| file.name == "Too deep.md"));
+    }
+
+    #[test]
+    fn documents_summary_folder_scan_reads_a_bounded_number_of_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_root = dir.path().join("Documents");
+        std::fs::create_dir_all(docs_root.join("folder")).unwrap();
+        // Folders and files Documents does not list count as well.
+        for index in 0..DOCUMENTS_FOLDER_ENTRIES_LIMIT {
+            std::fs::write(docs_root.join(format!("photo{index}.png")), "").unwrap();
+            std::fs::write(docs_root.join("folder").join(format!("p{index}.png")), "").unwrap();
+        }
+
+        let mut scan = DocumentsFolderScan {
+            indexed: Default::default(),
+            base_uri: String::new(),
+            visited: 0,
+            files: Vec::new(),
+        };
+        scan.collect(&docs_root, "", 0);
+
+        assert_eq!(scan.visited, DOCUMENTS_FOLDER_ENTRIES_LIMIT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn documents_summary_does_not_list_through_a_linked_documents_folder() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("Elsewhere.txt"), "x\n").unwrap();
+
+        // The Documents folder itself is a link.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_root = documents_root(dir.path(), TEST_PRINCIPAL).unwrap();
+        std::fs::create_dir_all(docs_root.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &docs_root).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        assert!(summary.files.is_empty(), "{:?}", summary.files);
+
+        // A folder on the way to it is a link.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_root = documents_root(dir.path(), TEST_PRINCIPAL).unwrap();
+        let principal_folder = docs_root.parent().unwrap();
+        std::fs::create_dir_all(principal_folder.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(outside.path().join("Documents")).unwrap();
+        std::fs::write(outside.path().join("Documents").join("Away.md"), "x\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), principal_folder).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        assert!(summary.files.is_empty(), "{:?}", summary.files);
+
+        // A link inside it is skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_root = documents_root(dir.path(), TEST_PRINCIPAL).unwrap();
+        std::fs::create_dir_all(&docs_root).unwrap();
+        std::fs::write(docs_root.join("Own.md"), "x\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), docs_root.join("Linked")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("Elsewhere.txt"),
+            docs_root.join("Linked.txt"),
+        )
+        .unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        let paths = summary
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["Own.md"]);
     }
 
     #[test]

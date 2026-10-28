@@ -10531,7 +10531,7 @@ fn principal_root_file_mode(metadata: &std::fs::Metadata) -> u32 {
     }
 }
 
-fn ensure_no_symlink_components(data_dir: &Path, path: &Path) -> anyhow::Result<()> {
+pub(crate) fn ensure_no_symlink_components(data_dir: &Path, path: &Path) -> anyhow::Result<()> {
     let relative = path
         .strip_prefix(data_dir)
         .map_err(|_| anyhow!("principal-root object path escapes the Runtime data root"))?;
