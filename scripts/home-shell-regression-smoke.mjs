@@ -3151,4 +3151,65 @@ assert(
   "revealed Wallet moved on reload",
 );
 console.log("[home-shell-regression] auto-arrange, manual move and reveal survive reload: PASS");
+
+// Documents windows: "Save automatically" reaches every window and survives a
+// reload; sign-out settles each window's unsaved changes first.
+shellCore.initializeShellLayout(arrangedSummary);
+shellCore.shellState.currentSummary = { ...summary, targets: hybridTargets };
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+await openHybrid("documents", { query: { doc: "did:document-one" } });
+await openHybrid("documents", { query: { doc: "did:document-two" } });
+const preferenceWindows = [...shellCore.shellState.windows.values()].map((entry) => {
+  const frame = entry.node.querySelector(".window-frame");
+  frame.contentWindow = { posted: [], postMessage(message) { this.posted.push(message); } };
+  return { entry, frameWindow: frame.contentWindow,
+    token: new URLSearchParams(new URL(frame.dataset.route, window.location.href).hash.slice(1)).get("home_token") };
+});
+assert(preferenceWindows.length === 2 && preferenceWindows[0].token !== preferenceWindows[1].token,
+  "two Documents windows with their own launch tokens");
+const preferencesType = "elastos.documents.preferences/v1";
+sendWindowEvent("message", { origin: "null", source: preferenceWindows[0].frameWindow,
+  data: { type: "elastos.documents.preferences.set/v1", homeToken: preferenceWindows[0].token, autosave: true } });
+for (const { frameWindow, token } of preferenceWindows) {
+  assert(JSON.stringify(frameWindow.posted.at(-1)) === JSON.stringify({ type: preferencesType, homeToken: token, autosave: true }),
+    "every Documents window must hear Save automatically turn on", frameWindow.posted);
+}
+const preferencePatch = savedStatePatches.at(-1);
+assert(preferencePatch?.layout?.documentsAutosave === true, "Save automatically did not persist in the Home layout", preferencePatch);
+shellCore.initializeShellLayout({ ...arrangedSummary,
+  browser_state: { principal_id: "principal:arranged-layout", layout: preferencePatch.layout } });
+sendWindowEvent("message", { origin: "null", source: preferenceWindows[1].frameWindow,
+  data: { type: "elastos.documents.preferences.request/v1", homeToken: preferenceWindows[1].token } });
+assert(JSON.stringify(preferenceWindows[1].frameWindow.posted.at(-1)) ===
+  JSON.stringify({ type: preferencesType, homeToken: preferenceWindows[1].token, autosave: true }),
+  "Save automatically did not survive reload", preferenceWindows[1].frameWindow.posted);
+
+const closeRequestType = "elastos.documents.window-close.request/v1";
+const answerClose = (win, ok, reason) => {
+  const request = win.frameWindow.posted.at(-1);
+  assert(request?.type === closeRequestType && request.homeToken === win.token, "sign-out must ask the Documents window", win.frameWindow.posted);
+  for (const [state, settledOk, settledReason] of [["pending", false, "awaiting_decision"], ["terminal", ok, reason]]) {
+    sendWindowEvent("message", { origin: "null", source: win.frameWindow, data: {
+      type: "elastos.documents.window-close.result/v1", requestId: request.requestId, homeToken: win.token,
+      state, ok: settledOk, reason: settledReason, sessionId: 1 } });
+  }
+};
+// Cancel in the second window stops the sign-out and keeps that window.
+const cancelledSignOut = shellWindows.closeDocumentsWindowsBeforeSignOut();
+await settleOpen();
+assert(preferenceWindows[1].frameWindow.posted.at(-1)?.type !== closeRequestType,
+  "sign-out must ask one Documents window at a time");
+answerClose(preferenceWindows[0], true, "");
+await settleOpen();
+answerClose(preferenceWindows[1], false, "cancelled");
+assert(await cancelledSignOut === false, "Cancel in a Documents window must stop the sign-out");
+assert(!shellCore.shellState.windows.has(preferenceWindows[0].entry.id) &&
+  shellCore.shellState.windows.has(preferenceWindows[1].entry.id),
+  "the cancelled Documents window must stay open");
+const settledSignOut = shellWindows.closeDocumentsWindowsBeforeSignOut();
+await settleOpen();
+answerClose(preferenceWindows[1], true, "");
+assert(await settledSignOut === true, "settled Documents windows must let sign-out go on");
+console.log("[home-shell-regression] Documents preference reaches every window, survives reload, and sign-out asks first: PASS");
 console.log("[home-shell-regression] PASS");

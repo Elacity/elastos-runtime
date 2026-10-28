@@ -69,6 +69,7 @@ import {
 import {
   attachAuthorizedTarget,
   closeWindow,
+  closeDocumentsWindowsBeforeSignOut,
   cleanupBeforeUnload,
   configureWindowHooks,
   handleShellResize,
@@ -1271,7 +1272,20 @@ export function bindHomeGuiInteractions(options = {}) {
 
   bindAboutOverlay();
 
-  toolbarSignOutButton?.addEventListener("click", () => {
+  let signOutPending = false;
+  toolbarSignOutButton?.addEventListener("click", async () => {
+    if (signOutPending) {
+      return;
+    }
+    signOutPending = true;
+    try {
+      // Unsaved Documents edits are settled while the session still works.
+      if (!(await closeDocumentsWindowsBeforeSignOut())) {
+        return;
+      }
+    } finally {
+      signOutPending = false;
+    }
     document.body.dataset.homeStatus = "booting";
     signOut()
       .catch((error) => {
