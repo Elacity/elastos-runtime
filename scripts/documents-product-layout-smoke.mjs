@@ -660,6 +660,29 @@ async function run() {
     assert(readMode.highlights >= 2, "Documents read view must keep preview find highlights visible.");
 
     await assertNoHorizontalOverflow(page, "wide");
+    // Hide list sits on the list itself; collapsing gives the page the room and a
+    // Show list control at the title's leading edge brings the list back.
+    const desktopLayout = () => page.evaluate(() => {
+      const visible = (node) => !!node && getComputedStyle(node).display !== "none" && node.getBoundingClientRect().width > 0;
+      return {
+        toggleInList: !!document.querySelector("#documents-sidebar #sidebar-toggle"),
+        sidebar: visible(document.getElementById("documents-sidebar")),
+        showList: visible(document.getElementById("sidebar-show")),
+        mainLeft: Math.round(document.querySelector(".documents-main").getBoundingClientRect().left),
+      };
+    });
+    const expanded = await desktopLayout();
+    assert(expanded.toggleInList && expanded.sidebar && !expanded.showList && expanded.mainLeft >= 200,
+      `Documents desktop: Hide list belongs to the open list. Got ${JSON.stringify(expanded)}`);
+    await page.locator("#sidebar-toggle").click();
+    const collapsed = await desktopLayout();
+    assert(!collapsed.sidebar && collapsed.showList && collapsed.mainLeft === 0,
+      `Documents desktop: Hide list must give the page the list's room and offer Show list. Got ${JSON.stringify(collapsed)}`);
+    await page.locator("#sidebar-show").click();
+    const reopened = await desktopLayout();
+    assert(reopened.sidebar && !reopened.showList && reopened.mainLeft >= 200,
+      `Documents desktop: Show list must bring the list back. Got ${JSON.stringify(reopened)}`);
+    await assertNoHorizontalOverflow(page, "wide");
     // A list hidden on the desktop must still fill the phone drawer.
     await page.locator("#sidebar-toggle").click();
     await page.setViewportSize(PHONE_VIEWPORT);
@@ -686,7 +709,7 @@ async function run() {
         editorHeight: Math.round(editor.height),
         editorFont: getComputedStyle(document.getElementById("editor")).fontSize,
         splitHidden: hidden("mode-split"),
-        hideListHidden: hidden("sidebar-toggle"),
+        hideListHidden: hidden("sidebar-toggle") && hidden("sidebar-show"),
       };
     });
     await page.screenshot({ path: PHONE_SCREENSHOT });
@@ -707,8 +730,8 @@ async function run() {
       screenshot: PHONE_DRAWER_SCREENSHOT,
     });
     await setPhoneFormFactor(page, false);
-    const desktopList = await page.evaluate(() => getComputedStyle(document.getElementById("documents-list")).display);
-    assert(desktopList === "none", `Documents desktop: Hide list must still hide the list after the phone layout. Got ${desktopList}`);
+    const desktopSidebar = await page.evaluate(() => getComputedStyle(document.getElementById("documents-sidebar")).display);
+    assert(desktopSidebar === "none", `Documents desktop: Hide list must still hide the list after the phone layout. Got ${desktopSidebar}`);
 
     await page.close();
     resetDocumentsFixture();

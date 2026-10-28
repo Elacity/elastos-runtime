@@ -1355,9 +1355,8 @@ async function main() {
       assert(viewer.hasOutlineTab && !viewer.hasHistoryTab, "documents inspector tabs must be Preview and Outline only", viewer);
       assert(viewer.workspaceView === "split", "documents should default to split view on desktop shell", viewer);
       assert(!viewer.sidebarTitleExists && !viewer.sidebarSubtitleExists, "Documents sidebar should not duplicate title copy", viewer);
-      assert(viewer.actionLabels.join("|") === "Save|Save as|Delete|Hide list", "Documents toolbar actions drifted", viewer);
-      assert(viewer.actionCount === 4, "Documents toolbar actions should be compact icon buttons", viewer);
-      assert(viewer.actionLabels.at(-1) === "Hide list", "Documents Hide list control should stay at the far right of toolbar actions", viewer);
+      assert(viewer.actionLabels.join("|") === "Save|Save as|Delete", "Documents toolbar actions drifted", viewer);
+      assert(viewer.actionCount === 3, "Documents toolbar actions should be compact icon buttons", viewer);
       assert(Math.abs(viewer.editorWidth - viewer.previewWidth) <= 2, "Documents split view should be even", viewer);
       assert(Math.abs(viewer.editorHeaderHeight - viewer.inspectorHeaderHeight) <= 2, "Documents inspector tabs should not make the header taller than Write", viewer);
     });

@@ -172,14 +172,14 @@ a {
   background: var(--bg);
 }
 
-/* Collapsed: keep leading chrome column so traffic lights stay over material.
-   The phone drawer always shows the list, whatever the desktop chose. */
+/* Collapsed (desktop): the list leaves and the page takes the room; the Show
+   list control at the title's leading edge brings it back. The phone drawer
+   always shows the list, whatever the desktop chose. */
 :root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] {
-  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
 }
 
-:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] .sidebar-search,
-:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] .documents-list {
+:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] .documents-sidebar {
   display: none;
 }
 
@@ -263,6 +263,33 @@ a {
   display: flex;
   align-items: center;
   gap: var(--sidebar-compose-gap);
+}
+
+.sidebar-panel-toggle {
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 0.6rem;
+  background: transparent;
+  color: var(--sidebar-muted);
+}
+
+.sidebar-panel-toggle:hover,
+.sidebar-panel-toggle:focus-visible {
+  background: var(--panel-soft);
+  color: var(--ink);
+}
+
+#sidebar-show {
+  display: none;
+}
+
+:root:not([data-el-form-factor="phone"]) .documents-shell[data-sidebar-collapsed="true"] #sidebar-show {
+  display: inline-grid;
 }
 
 .sidebar-create {
@@ -511,6 +538,9 @@ a {
 }
 
 .documents-identity {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
   min-width: 0;
   flex: 1 1 auto;
 }
@@ -535,10 +565,6 @@ a {
   justify-content: flex-end;
   flex: 0 0 auto;
   min-width: max-content;
-}
-
-.sidebar-toggle {
-  min-width: 0;
 }
 
 .action-primary,
@@ -1422,6 +1448,9 @@ a {
       <div class="sidebar-controls">
         <button id="new-document" class="sidebar-create" type="button" aria-label="New document" title="New document" data-el-drawer-close>+</button>
         <input id="sidebar-search" class="sidebar-search" type="search" placeholder="Search documents" spellcheck="false">
+        <button id="sidebar-toggle" class="sidebar-panel-toggle" type="button" aria-label="Hide list" title="Hide list" aria-controls="documents-sidebar">
+          <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"></path><path d="M9 5v14"></path><path d="m15 9-3 3 3 3"></path></svg>
+        </button>
       </div>
       <div id="documents-list" class="documents-list" data-el-drawer-close></div>
     </aside>
@@ -1430,6 +1459,9 @@ a {
       <header class="documents-toolbar">
         <div class="documents-identity">
           <button type="button" class="el-drawer-toggle" data-el-drawer-toggle="documents-sidebar" aria-label="Show documents"></button>
+          <button id="sidebar-show" class="sidebar-panel-toggle" type="button" aria-label="Show list" title="Show list" aria-controls="documents-sidebar">
+            <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"></path><path d="M9 5v14"></path><path d="m13 9 3 3-3 3"></path></svg>
+          </button>
           <input id="title-input" class="title-input" type="text" placeholder="Untitled document" spellcheck="false">
         </div>
         <div class="toolbar-actions">
@@ -1465,11 +1497,6 @@ a {
                 </button>
               </div>
             </div>
-          </div>
-          <div class="toolbar-group">
-            <button id="sidebar-toggle" class="action-secondary action-icon-button sidebar-toggle" type="button" aria-label="Hide list" title="Hide list" aria-controls="documents-sidebar" aria-expanded="true">
-              <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"></path><path d="M9 5v14"></path><path d="m15 9-3 3 3 3"></path></svg>
-            </button>
           </div>
         </div>
       </header>

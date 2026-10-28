@@ -38,6 +38,7 @@ const elements = {
   sidebarSearch: document.getElementById("sidebar-search"),
   titleInput: document.getElementById("title-input"),
   sidebarToggle: document.getElementById("sidebar-toggle"),
+  sidebarShow: document.getElementById("sidebar-show"),
   saveButton: document.getElementById("save-button"),
   saveAsButton: document.getElementById("save-as-button"),
   deleteButton: document.getElementById("delete-button"),
@@ -977,10 +978,6 @@ function setWorkspaceView(view) {
 function setSidebarCollapsed(collapsed) {
   state.sidebarCollapsed = !!collapsed;
   elements.documentsShell.dataset.sidebarCollapsed = state.sidebarCollapsed ? "true" : "false";
-  const label = state.sidebarCollapsed ? "Show list" : "Hide list";
-  elements.sidebarToggle.setAttribute("aria-label", label);
-  elements.sidebarToggle.title = label;
-  elements.sidebarToggle.setAttribute("aria-expanded", String(!state.sidebarCollapsed));
 }
 
 function setInspectorView(view) {
@@ -1949,7 +1946,14 @@ function wireShellEvents() {
   });
   elements.saveAsButton.addEventListener("click", openSaveAsModal);
   elements.deleteButton.addEventListener("click", requestDeleteCurrent);
-  elements.sidebarToggle.addEventListener("click", () => setSidebarCollapsed(!state.sidebarCollapsed));
+  elements.sidebarToggle.addEventListener("click", () => {
+    setSidebarCollapsed(true);
+    elements.sidebarShow.focus({ preventScroll: true });
+  });
+  elements.sidebarShow.addEventListener("click", () => {
+    setSidebarCollapsed(false);
+    elements.sidebarToggle.focus({ preventScroll: true });
+  });
   wireMoreMenu();
   elements.sidebarSearch.addEventListener("input", () => {
     state.filterQuery = elements.sidebarSearch.value || "";
