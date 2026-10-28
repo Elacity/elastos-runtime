@@ -401,7 +401,10 @@ async fn test_chat_contact_request_queues_a_request_by_did_with_discovery_off() 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         json(&body),
-        serde_json::json!({ "status": "requested", "display_name": "Remote" })
+        serde_json::json!({
+            "status": "requested",
+            "message": "Request sent. Remote sees it in Inbox when they next open Home.",
+        })
     );
     assert!(!body.contains("did:key:"), "{body}");
     let outgoing = home.outgoing_requests();
@@ -412,7 +415,13 @@ async fn test_chat_contact_request_queues_a_request_by_did_with_discovery_off() 
     // Asking again reuses the waiting request.
     let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(json(&body)["status"], "already_requested");
+    assert_eq!(
+        json(&body),
+        serde_json::json!({
+            "status": "already_requested",
+            "message": "Request sent. Waiting for Remote to accept.",
+        })
+    );
     assert_eq!(home.outgoing_requests().len(), 1);
     assert!(!home.store.discovery_enabled().unwrap());
 }
@@ -428,7 +437,10 @@ async fn test_chat_contact_request_binds_to_the_listing_of_a_person_visible_in_d
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         json(&body),
-        serde_json::json!({ "status": "requested", "display_name": "Remote" })
+        serde_json::json!({
+            "status": "requested",
+            "message": "Request sent. Remote sees it in Inbox when they next open Home.",
+        })
     );
     let outgoing = home.outgoing_requests();
     assert_eq!(outgoing.len(), 1);
@@ -531,7 +543,10 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
     let own = home.local_profile.document().profile_did.clone();
     let (status, body) = ask(Some(token.clone()), own).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(json(&body)["status"], "own_profile");
+    assert_eq!(
+        json(&body),
+        serde_json::json!({ "status": "own_profile", "message": "That's your own DID." })
+    );
     assert!(home.outgoing_requests().is_empty());
 
     // Anyone else's DID is queued once, whatever Discovery says, named from
@@ -540,7 +555,10 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         json(&body),
-        serde_json::json!({ "status": "requested", "display_name": "Remote" })
+        serde_json::json!({
+            "status": "requested",
+            "message": "Request sent. Remote sees it in Inbox when they next open Home.",
+        })
     );
     assert!(!body.contains("did:key:"), "{body}");
     let (status, body) = ask(Some(token.clone()), remote_did.clone()).await;
@@ -555,7 +573,7 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
         json(&body),
         serde_json::json!({
             "status": "requested",
-            "display_name": crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN,
+            "message": "Request sent. Name not known yet. They'll see it in Inbox when they next open Home.",
         })
     );
     assert_eq!(home.outgoing_requests().len(), 2);

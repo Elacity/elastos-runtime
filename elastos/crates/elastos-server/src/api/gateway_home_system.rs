@@ -574,12 +574,12 @@ pub(super) async fn people_summary(
         if let Some(snapshot) = presence_snapshot.as_ref() {
             stamp_contact_reachability(&mut people, snapshot, now);
         }
-        stamp_community_names(&mut people, &community_names);
         let discovery = if let (Some(service), Some(authority)) =
             (discovery_service.as_ref(), contact_authority.as_ref())
         {
             let snapshot = authority.store.read_only_snapshot()?;
             stamp_undeliverable_requests(&mut people, &snapshot, service, now)?;
+            stamp_community_names(&mut people, &snapshot, &community_names, now)?;
             configured_people_discovery_summary(
                 &service.read_only_status_from_snapshot(&snapshot, &authority.profile, now)?,
                 &contact_relationships(&snapshot, now),
@@ -851,14 +851,10 @@ pub(super) async fn community_member_names_or_none(
     }
 }
 
-/// Queues a request by Profile DID and answers `{status, display_name}`.
-/// `status` is `requested`, `already_requested`, `already_contact`,
-/// `pending_from_them` or `own_profile`; `display_name` is the signed name
-/// this Home holds for the DID (its contact store first, then the Community
-/// names Chat shows), else `CONTACT_NAME_NOT_KNOWN`. A refusal is a
-/// 400 or 409 whose body is the refusal's text, and never echoes the DID.
-/// The device DIDs this Home knows from Community, presence and signed
-/// posts, are refused like a contact's device DID.
+/// Queues a request by Profile DID and answers with `contact_request_answer`.
+/// A refusal is a 400 or 409 whose body is the refusal's text, and never
+/// echoes the DID. The device DIDs this Home knows from Community, presence
+/// and signed posts, are refused like a contact's device DID.
 pub(super) async fn send_profile_contact_request_response(
     service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     state: &GatewayState,
@@ -912,27 +908,64 @@ pub(super) async fn send_profile_contact_request_response(
     {
         return room_service_error_response(err);
     }
+    // The signed name this Home holds: its contact store first, then the
+    // Community names Chat shows.
     let display_name = if outcome
         == crate::collaboration_discovery_runtime::ProfileContactRequestOutcome::OwnProfile
     {
-        Ok(Some(authority.profile.document().display_name.clone()))
+        Ok(None)
     } else {
         authority
             .store
             .read_only_snapshot()
             .and_then(|read| read.display_name_for(recipient_profile_did, now))
     };
-    let display_name = match display_name {
-        Ok(name) => name
-            .or_else(|| community_names.get(recipient_profile_did).cloned())
-            .unwrap_or_else(|| {
-                crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN.to_string()
-            }),
-        Err(err) => return room_service_error_response(err),
+    match display_name {
+        Ok(name) => contact_request_answer(
+            &outcome,
+            name.or_else(|| community_names.get(recipient_profile_did).cloned())
+                .as_deref(),
+        ),
+        Err(err) => room_service_error_response(err),
+    }
+}
+
+/// The answer to a contact request from People or a Chat card:
+/// `{status, message}`. `status` is `requested`, `already_requested`,
+/// `already_contact`, `pending_from_them` or `own_profile`; `message` is the
+/// text a person sees, naming them by the signed name this Home holds, if any.
+pub(super) fn contact_request_answer(
+    outcome: &crate::collaboration_discovery_runtime::ProfileContactRequestOutcome,
+    display_name: Option<&str>,
+) -> Response {
+    use crate::collaboration_discovery_runtime::ProfileContactRequestOutcome as Outcome;
+    let message = match (outcome, display_name) {
+        (Outcome::Requested, Some(name)) => {
+            format!("Request sent. {name} sees it in Inbox when they next open Home.")
+        }
+        (Outcome::Requested, None) => {
+            "Request sent. Name not known yet. They'll see it in Inbox when they next open Home."
+                .to_string()
+        }
+        (Outcome::AlreadyRequested, Some(name)) => {
+            format!("Request sent. Waiting for {name} to accept.")
+        }
+        (Outcome::AlreadyRequested, None) => {
+            "Request sent. Name not known yet. Waiting for them to accept.".to_string()
+        }
+        (Outcome::AlreadyContact { .. }, Some(name)) => format!("{name} is already a contact."),
+        (Outcome::AlreadyContact { .. }, None) => "They're already a contact.".to_string(),
+        (Outcome::PendingFromThem { .. }, Some(name)) => {
+            format!("{name} already asked to connect. Open Inbox to answer.")
+        }
+        (Outcome::PendingFromThem { .. }, None) => {
+            "They already asked to connect. Open Inbox to answer.".to_string()
+        }
+        (Outcome::OwnProfile, _) => "That's your own DID.".to_string(),
     };
     Json(serde_json::json!({
         "status": outcome.status(),
-        "display_name": display_name,
+        "message": message,
     }))
     .into_response()
 }
@@ -2370,22 +2403,25 @@ fn stamp_contact_reachability(
 /// store does not hold is named from Community, as Chat's card names them.
 fn stamp_community_names(
     people: &mut HomePeopleSummary,
+    read: &crate::collaboration_contact_store::CollaborationContactReadSnapshot<'_>,
     community_names: &std::collections::HashMap<String, String>,
-) {
+    now: u64,
+) -> anyhow::Result<()> {
     for contact in &mut people.contacts {
-        if contact.relationship != "requested"
-            || contact.display_name != crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN
-        {
+        if contact.relationship != "requested" {
             continue;
         }
-        if let Some(name) = contact
-            .remote_profile_did
-            .as_deref()
-            .and_then(|did| community_names.get(did))
-        {
+        let Some(did) = contact.remote_profile_did.as_deref() else {
+            continue;
+        };
+        let Some(name) = community_names.get(did) else {
+            continue;
+        };
+        if read.display_name_for(did, now)?.is_none() {
             contact.display_name = name.clone();
         }
     }
+    Ok(())
 }
 
 /// While the Community node refuses the Profile-contact operations (it runs

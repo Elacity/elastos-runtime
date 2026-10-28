@@ -342,7 +342,10 @@ function startServer() {
           return;
         }
         assert(profile_id === "did:key:zRemote", "DID request body differs");
-        return json(response, { status: "requested", display_name: "Name not known yet" });
+        return json(response, {
+          status: "requested",
+          message: "Request sent. Name not known yet. They'll see it in Inbox when they next open Home.",
+        });
       }
       if (url.pathname === "/api/apps/people/contacts/remove" && request.method === "POST") {
         const body = await readJson(request);

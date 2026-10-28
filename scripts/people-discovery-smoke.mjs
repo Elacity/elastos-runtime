@@ -436,15 +436,10 @@ async function runScenario(name) {
     await node("profile-id-copy").listeners.get("click")();
     await settle();
     assert.deepEqual(environment.copies, [{ text: "did:key:zLocalProfile", purpose: "profile.id" }]);
-    const expected = {
-      requested: "Request sent. Alma sees it in Inbox when they next open Home.",
-      already_requested: "Request sent. Waiting for Alma to accept.",
-      already_contact: "Alma is already a contact.",
-      pending_from_them: "Alma already asked to connect. Open Inbox to answer.",
-      own_profile: "That's your own DID.",
-    };
-    for (const [status, message] of Object.entries(expected)) {
-      environment.replies.push(response(200, { status, display_name: "Alma" }), ready());
+    // People shows Runtime's message verbatim; it holds no wording of its own.
+    for (const status of ["requested", "already_requested", "already_contact", "pending_from_them", "own_profile"]) {
+      const message = `Runtime says ${status}.`;
+      environment.replies.push(response(200, { status, message }), ready());
       node("add-contact-id").value = "  did:key:zRemoteProfile  ";
       node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
       await settle();
@@ -456,16 +451,11 @@ async function runScenario(name) {
       assert.equal(request.path, "/api/apps/people/contacts/request");
       assert.deepEqual(JSON.parse(request.options.body), { profile_id: "did:key:zRemoteProfile" });
     }
-    for (const [status, ending] of [
-      ["requested", "They'll see it in Inbox when they next open Home."],
-      ["already_requested", "Waiting for them to accept."],
-    ]) {
-      environment.replies.push(response(200, { status, display_name: "Name not known yet" }), ready());
-      node("add-contact-id").value = "did:key:zUnknown";
-      node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
-      await settle();
-      assert.equal(node("add-contact-result").textContent, `Request sent. Name not known yet. ${ending}`);
-    }
+    environment.replies.push(response(200, { status: "requested" }));
+    node("add-contact-id").value = "did:key:zRemote";
+    node("add-contact-form").listeners.get("submit")({ preventDefault() {} });
+    await settle();
+    assert.equal(node("add-contact-result").textContent, "Could not send the request. Try again.");
     for (const [status, message] of [
       [400, "That isn't a DID. A DID starts with did:key:z."],
       [400, "That's this Home's device DID. Use the DID shown in People."],
@@ -507,7 +497,7 @@ async function runScenario(name) {
     environment.listeners.get("message")({ source: environment.parentFrame, origin: "null", data: {
       type: "elastos.people.navigate/v1", homeToken: "people-test-token", query: { did: nextDid },
     } });
-    finish(response(200, { status: "requested", display_name: "Alma" }));
+    finish(response(200, { status: "requested", message: "Runtime says requested." }));
     await settle();
     assert.equal(node("add-contact-submit").disabled, false);
     assert.equal(node("add-contact-id").value, nextDid, "A DID opened during a send stays ready for a separate request");

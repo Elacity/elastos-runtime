@@ -1739,11 +1739,10 @@ pub(super) async fn chat_room_contact_request(
             )
             .await
         {
-            Ok(()) => Json(serde_json::json!({
-                "status": crate::collaboration_discovery_runtime::ProfileContactRequestOutcome::Requested.status(),
-                "display_name": person.display_name(),
-            }))
-            .into_response(),
+            Ok(()) => gateway_home_system::contact_request_answer(
+                &crate::collaboration_discovery_runtime::ProfileContactRequestOutcome::Requested,
+                Some(person.display_name()),
+            ),
             Err(err) => room_service_error_response(err),
         };
     }

@@ -3655,7 +3655,7 @@ impl App {
                             }
                             *app.participant_card_notice.borrow_mut() = Some((
                                 response.status.relationship().to_string(),
-                                response.message(),
+                                response.message,
                             ));
                             app.refresh_open_participant_card();
                         }
@@ -5563,7 +5563,7 @@ fn is_bare_profile_did(text: &str) -> bool {
 /// A DID URL, attached punctuation or an embedded token stays plain text.
 fn split_text_links(text: &str) -> Vec<TextSegment<'_>> {
     let mut segments = Vec::new();
-    for segment in split_web_links(text) {
+    for segment in split_address_links(text) {
         let TextSegment::Text(plain) = segment else {
             segments.push(segment);
             continue;
@@ -5593,7 +5593,7 @@ fn split_text_links(text: &str) -> Vec<TextSegment<'_>> {
 /// minus trailing sentence punctuation, quotes and unbalanced closing
 /// brackets. Nothing else (a bare `example.com`) is a link. The address is
 /// sent unchanged; the Runtime checks it.
-fn split_web_links(text: &str) -> Vec<TextSegment<'_>> {
+fn split_address_links(text: &str) -> Vec<TextSegment<'_>> {
     let mut segments = Vec::new();
     let mut plain_start = 0;
     let mut cursor = 0;
@@ -9156,28 +9156,11 @@ fn contact_failure_message(error: &str, fallback: &str) -> String {
         .to_string()
 }
 
+/// Runtime's answer to Add contact: the outcome, and the text to show.
 #[derive(Debug, Deserialize)]
 struct ContactRequestResponse {
     status: ContactRequestStatus,
-    display_name: String,
-}
-
-impl ContactRequestResponse {
-    fn message(&self) -> String {
-        let name = &self.display_name;
-        match self.status {
-            ContactRequestStatus::Requested if name == "Name not known yet" =>
-                "Request sent. Name not known yet. They'll see it in Inbox when they next open Home.".to_string(),
-            ContactRequestStatus::Requested =>
-                format!("Request sent. {name} sees it in Inbox when they next open Home."),
-            ContactRequestStatus::AlreadyRequested if name == "Name not known yet" =>
-                "Request sent. Name not known yet. Waiting for them to accept.".to_string(),
-            ContactRequestStatus::AlreadyRequested => format!("Request sent. Waiting for {name} to accept."),
-            ContactRequestStatus::AlreadyContact => format!("{name} is already a contact."),
-            ContactRequestStatus::PendingFromThem => format!("{name} already asked to connect. Open Inbox to answer."),
-            ContactRequestStatus::OwnProfile => "That's your own DID.".to_string(),
-        }
-    }
+    message: String,
 }
 
 /// The card's status line and its one action (label, action id).
@@ -9828,47 +9811,27 @@ mod participant_card_tests {
     }
 
     #[test]
-    fn contact_request_outcomes_keep_the_runtime_relationship_and_name() {
-        for (status, relationship, message) in [
-            (
-                "requested",
-                "requested",
-                "Request sent. Alma sees it in Inbox when they next open Home.",
-            ),
-            (
-                "already_requested",
-                "requested",
-                "Request sent. Waiting for Alma to accept.",
-            ),
-            ("already_contact", "contact", "Alma is already a contact."),
-            (
-                "pending_from_them",
-                "pending",
-                "Alma already asked to connect. Open Inbox to answer.",
-            ),
-            ("own_profile", "you", "That's your own DID."),
+    fn contact_request_outcomes_keep_the_runtime_relationship_and_message() {
+        for (status, relationship) in [
+            ("requested", "requested"),
+            ("already_requested", "requested"),
+            ("already_contact", "contact"),
+            ("pending_from_them", "pending"),
+            ("own_profile", "you"),
         ] {
             let response: ContactRequestResponse = serde_json::from_value(serde_json::json!({
-                "status": status, "display_name": "Alma",
+                "status": status, "message": "Runtime's text.",
             }))
             .unwrap();
             assert_eq!(response.status.relationship(), relationship);
-            assert_eq!(response.message(), message);
+            assert_eq!(response.message, "Runtime's text.");
         }
-        let response: ContactRequestResponse = serde_json::from_value(serde_json::json!({
-            "status": "requested", "display_name": "Name not known yet",
-        }))
-        .unwrap();
-        assert_eq!(
-            response.message(),
-            "Request sent. Name not known yet. They'll see it in Inbox when they next open Home."
-        );
-        assert!(
-            serde_json::from_value::<ContactRequestResponse>(serde_json::json!({
-                "status": "unexpected", "display_name": "Alma",
-            }))
-            .is_err()
-        );
+        for unexpected in [
+            serde_json::json!({ "status": "unexpected", "message": "Runtime's text." }),
+            serde_json::json!({ "status": "requested" }),
+        ] {
+            assert!(serde_json::from_value::<ContactRequestResponse>(unexpected).is_err());
+        }
     }
 
     #[test]

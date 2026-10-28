@@ -701,7 +701,7 @@ function startServer(scenario) {
         const status = ["refusal", "unlisted"].includes(didOutcome) ? "requested" : (didOutcome || "requested");
         trace.contactRequested = true;
         trace.contactRelationship = { requested: "requested", already_requested: "requested", already_contact: "contact", pending_from_them: "pending", own_profile: "you" }[status];
-        return json(response, { status, display_name: "Fixture Friend" });
+        return json(response, { status, message: `Runtime says ${status}.` });
       }
       if (url.pathname === "/api/apps/chat-room/send") {
         trace.current.sends += 1;
@@ -1808,15 +1808,9 @@ async function runScenario(scenario) {
         assert(await frame.locator("#participant-card-action").isEnabled(), "Refusal blocked retry");
         await frame.locator("#participant-card-action").click();
       }
-      const messages = {
-        requested: "Request sent. Fixture Friend sees it in Inbox when they next open Home.",
-        already_requested: "Request sent. Waiting for Fixture Friend to accept.",
-        already_contact: "Fixture Friend is already a contact.",
-        pending_from_them: "Fixture Friend already asked to connect. Open Inbox to answer.",
-        own_profile: "That's your own DID.",
-      };
+      // The card shows Runtime's message verbatim.
       await frame.waitForFunction(message => document.querySelector("#participant-card-state").textContent === message,
-        messages[["refusal", "unlisted"].includes(outcome) ? "requested" : outcome]);
+        `Runtime says ${["refusal", "unlisted"].includes(outcome) ? "requested" : outcome}.`);
       if (outcome === "pending_from_them") {
         assert(await frame.locator("#participant-card-action").innerText() === "Open Inbox", "Incoming request has no Inbox action");
       } else {

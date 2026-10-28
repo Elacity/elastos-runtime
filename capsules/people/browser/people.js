@@ -326,23 +326,6 @@ function renderProfileId(profileId) {
   prefillContactFromLaunch();
 }
 
-function contactRequestMessage(result) {
-  const name = readText(result?.display_name) || "Name not known yet";
-  const unknown = name === "Name not known yet";
-  switch (result?.status) {
-    case "requested": return unknown
-      ? "Request sent. Name not known yet. They'll see it in Inbox when they next open Home."
-      : `Request sent. ${name} sees it in Inbox when they next open Home.`;
-    case "already_requested": return unknown
-      ? "Request sent. Name not known yet. Waiting for them to accept."
-      : `Request sent. Waiting for ${name} to accept.`;
-    case "already_contact": return `${name} is already a contact.`;
-    case "pending_from_them": return `${name} already asked to connect. Open Inbox to answer.`;
-    case "own_profile": return "That's your own DID.";
-    default: throw new Error("Could not confirm the request. Try again.");
-  }
-}
-
 async function sendContactRequest() {
   const profileId = readText(addContactInput?.value);
   if (!localProfileId || sendingContact || !profileId) return;
@@ -355,7 +338,9 @@ async function sendContactRequest() {
     const result = await fetchJson("/api/apps/people/contacts/request", {
       method: "POST", body: JSON.stringify({ profile_id: profileId }),
     });
-    addContactResult.textContent = contactRequestMessage(result);
+    const message = readText(result?.message);
+    if (!message) throw new Error("Could not confirm the request. Try again.");
+    addContactResult.textContent = message;
     addContactInbox.hidden = result.status !== "pending_from_them";
     addContactInput.value = "";
     // A refresh failure does not change the confirmed request outcome.
@@ -573,7 +558,7 @@ function discoveryEmptyState(status, configured, enabled) {
   if (enabled) {
     return {
       emptyTitle: "Discovery unavailable",
-      emptyCopy: "Runtime will retry when Discovery is unavailable.",
+      emptyCopy: "Your Home will retry when Discovery is unavailable.",
     };
   }
   return {
