@@ -1081,8 +1081,7 @@ async function runScenario(scenario) {
     }
     if (scenario === "community-attach") {
       await waitForConfiguredChatWithoutLegacyFlash(frame, "Community Attach");
-      assert(await frame.locator('#community-files-public').innerText() ===
-        'Files you post in Community are public. Anyone with the link can get them.', "public file copy differs");
+      assert(await frame.locator('#community-files-public').count() === 0, "standing public file note is shown");
       for (const [size, error] of [[0, "Empty files can't be sent."], [8 * 1024 * 1024 + 1, "Choose a file of 8 MB or less."]]) {
         await page.evaluate(size => { window.fixtureFileSize = size; }, size);
         await frame.locator('#attach-button').click();

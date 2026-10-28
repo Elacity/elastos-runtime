@@ -4281,12 +4281,6 @@ impl App {
         // control says so where the person meets it — visibly unavailable,
         // never silently missing.
         set_hidden(&self.attach_button, !direct_mode && !controls.show_attach)?;
-        if let Some(public_note) = self.document.get_element_by_id("community-files-public") {
-            set_hidden(
-                &public_note.dyn_into::<HtmlElement>()?,
-                direct_mode || !state.collaboration_configured || !controls.show_attach,
-            )?;
-        }
         self.attach_button
             .set_disabled(direct_mode || !controls.enable_attach);
         if direct_mode {
