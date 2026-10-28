@@ -3218,5 +3218,25 @@ const settledLock = lock();
 await settleOpen();
 answerClose(preferenceWindows[1], true, "");
 assert(await settledLock === true && lockRequests === 1, "settled Documents windows must let the Lock go on");
+// A Documents window opened while another is asking is asked too.
+const fakeDocumentsWindow = (entry) => {
+  const frame = entry.node.querySelector(".window-frame");
+  frame.contentWindow = { posted: [], postMessage(message) { this.posted.push(message); } };
+  return { entry, frameWindow: frame.contentWindow,
+    token: new URLSearchParams(new URL(frame.dataset.route, window.location.href).hash.slice(1)).get("home_token") };
+};
+await openHybrid("documents", { query: { doc: "did:document-three" } });
+const firstLate = fakeDocumentsWindow([...shellCore.shellState.windows.values()].at(-1));
+const lockWithLateWindow = lock();
+await settleOpen();
+await openHybrid("documents", { query: { doc: "did:document-four" } });
+const lateWindow = fakeDocumentsWindow([...shellCore.shellState.windows.values()].at(-1));
+assert(lateWindow.entry !== firstLate.entry, "a second Documents window opened during the Lock");
+answerClose(firstLate, true, "");
+await settleOpen();
+answerClose(lateWindow, false, "cancelled");
+assert(await lockWithLateWindow === false && lockRequests === 1,
+  "a Documents window opened during the Lock must be asked before the Lock goes on");
+assert(shellCore.shellState.windows.has(lateWindow.entry.id), "the late window keeps its edits");
 console.log("[home-shell-regression] Documents preference reaches every window, survives reload, and Lock and sign-out ask first: PASS");
 console.log("[home-shell-regression] PASS");
