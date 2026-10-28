@@ -54,7 +54,7 @@ function editor(server, current = server.docs.get("did:one")) {
     confirmInCapsule: async () => false,
     chooseInCapsule: async () => "cancel",
   });
-  vm.runInContext(["updateDocumentsNavigation", "isCurrentSessionTarget", "isCurrentDocumentTarget", "resetPendingSaveIntent", "replaceCurrentDocument", "applySavedDocumentState", "requireSavedWorkingCopy", "saveCurrent", "selectDocument", "saveAsCurrent"].map(functionSource).join("\n"), context);
+  vm.runInContext(["updateDocumentsNavigation", "isCurrentSessionTarget", "isCurrentDocumentTarget", "resetPendingSaveIntent", "replaceCurrentDocument", "applySavedDocumentState", "requireSavedWorkingCopy", "saveCurrent", "selectDocument", "saveAsCurrent", "summaryListItems"].map(functionSource).join("\n"), context);
   return context;
 }
 

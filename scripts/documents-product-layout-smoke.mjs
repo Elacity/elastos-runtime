@@ -115,6 +115,15 @@ function listSummary() {
   }));
 }
 
+// A plain file in the Documents folder with no Documents object (made in Library).
+const folderFile = {
+  uri: "localhost://Users/fixture/Documents/Notes/Plain.txt",
+  name: "Plain.txt",
+  path: "Notes/Plain.txt",
+  updated_at: 1_779_000_000,
+};
+const folderFileBody = "Plain text from Library.";
+
 function contentType(filePath) {
   if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
   if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
@@ -182,7 +191,7 @@ function createAppServer() {
       req.on("end", async () => {
         const payload = body ? JSON.parse(body) : {};
         if (op === "summary") {
-          json(res, { documents: listSummary() });
+          json(res, { documents: listSummary(), files: [folderFile] });
           return;
         }
         if (op === "get") {
@@ -278,6 +287,18 @@ function createAppServer() {
       return;
     }
 
+    if (url.pathname === "/api/viewers/documents/library-object" && req.method === "GET") {
+      if (url.searchParams.get("uri") !== folderFile.uri) {
+        res.writeHead(404);
+        res.end("Library object not found");
+        return;
+      }
+      json(res, {
+        object: { uri: folderFile.uri, name: folderFile.name, revision: "fixture-revision", mime: "text/plain", modified_at: folderFile.updated_at },
+        data: Buffer.from(folderFileBody).toString("base64"),
+      });
+      return;
+    }
     if (url.pathname === "/apps/home/home-navigation-client.js") {
       res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
       createReadStream(homeNavigationClientPath).pipe(res);
@@ -830,6 +851,37 @@ async function run() {
       assert(statusShown.length === 0, `Documents typing and autosave must not flash a status line. Got ${JSON.stringify(statusShown)}`);
     } finally {
       await parserPage.close();
+    }
+
+    // Plain .md and .txt files in the Documents folder list beside Documents'
+    // own, by the same sort and search, and open as Library files.
+    resetDocumentsFixture();
+    const filesPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    trackPage(filesPage, consoleErrors, pageErrors, failedRequests, errorResponses);
+    try {
+      await filesPage.goto(`http://127.0.0.1:${port}/apps/documents/?home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
+      const fileItem = filesPage.locator(`.document-list-item[data-object-uri="${folderFile.uri}"]`);
+      await fileItem.waitFor();
+      const listed = await filesPage.evaluate(() => [...document.querySelectorAll(".document-list-item")]
+        .map((item) => item.querySelector(".document-list-title")?.textContent || ""));
+      assert(JSON.stringify(listed) === JSON.stringify(["Alpha", "Beta", "Plain.txt"]),
+        `Documents list must show the folder's .txt file, sorted with the rest by time. Got ${JSON.stringify(listed)}`);
+      await filesPage.locator("#sidebar-search").fill("notes/plain");
+      const searched = await filesPage.evaluate(() => [...document.querySelectorAll(".document-list-item")]
+        .map((item) => item.dataset.objectUri || item.dataset.docDid));
+      assert(JSON.stringify(searched) === JSON.stringify([folderFile.uri]),
+        `Documents search must filter folder files by name and path. Got ${JSON.stringify(searched)}`);
+      await filesPage.locator("#sidebar-search").fill("");
+      await fileItem.click();
+      await filesPage.waitForFunction((body) => document.getElementById("editor")?.value === body, folderFileBody);
+      const opened = await filesPage.evaluate(() => ({
+        title: document.getElementById("title-input")?.value || "",
+        active: document.querySelector(".document-list-item.active")?.dataset.objectUri || "",
+      }));
+      assert(opened.title === folderFile.name && opened.active === folderFile.uri,
+        `Documents must open a folder file from the list as the Library file. Got ${JSON.stringify(opened)}`);
+    } finally {
+      await filesPage.close();
     }
 
     // #436 invariant inside Home: after every step the Markdown views and

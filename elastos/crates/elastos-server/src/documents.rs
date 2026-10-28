@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 
 const DOCUMENTS_SCHEMA: &str = "elastos.document/v2";
 const DOCUMENTS_DEFAULT_TITLE: &str = "Untitled";
+/// The most plain files the Documents list shows from the Documents folder.
+const DOCUMENTS_FOLDER_FILES_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentsListItem {
@@ -26,6 +28,23 @@ pub struct DocumentsListItem {
     pub updated_at: u64,
     #[serde(default)]
     pub latest_published_cid: Option<String>,
+}
+
+/// A plain `.md` or `.txt` file in the user's Documents folder (or a folder in
+/// it) that has no Documents object, such as a file made in Library. Documents
+/// lists it and opens it as a Library file; listing imports nothing.
+#[derive(Debug, Clone, Serialize)]
+struct DocumentsFolderFile {
+    uri: String,
+    name: String,
+    path: String,
+    updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DocumentsSummary {
+    documents: Vec<DocumentsListItem>,
+    files: Vec<DocumentsFolderFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -454,9 +473,9 @@ fn handle_provider_request_inner(
     request: DocumentsProviderRequest,
 ) -> anyhow::Result<Value> {
     match request {
-        DocumentsProviderRequest::Summary { principal_id } => Ok(json!({
-            "documents": documents_load_summary(data_dir, &principal_id)?,
-        })),
+        DocumentsProviderRequest::Summary { principal_id } => Ok(serde_json::to_value(
+            documents_load_summary(data_dir, &principal_id)?,
+        )?),
         DocumentsProviderRequest::Create {
             principal_id,
             title,
@@ -1081,15 +1100,104 @@ fn documents_load_metadata_index(
     Ok(documents)
 }
 
-fn documents_load_summary(
-    data_dir: &Path,
-    principal_id: &str,
-) -> anyhow::Result<Vec<DocumentsListItem>> {
+fn documents_load_summary(data_dir: &Path, principal_id: &str) -> anyhow::Result<DocumentsSummary> {
     let objects = crate::auth::PrincipalRootObjectMutation::acquire(data_dir)?;
-    Ok(documents_load_metadata_index(&objects, principal_id)?
-        .into_iter()
-        .map(|metadata| documents_list_item(&metadata))
-        .collect())
+    let metadata = documents_load_metadata_index(&objects, principal_id)?;
+    let docs_root = documents_root(data_dir, principal_id)?;
+    let indexed = metadata
+        .iter()
+        .map(|metadata| metadata.file_name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut files = Vec::new();
+    if docs_root.is_dir() {
+        documents_collect_folder_files(
+            &docs_root,
+            "",
+            0,
+            &indexed,
+            &documents_working_copy_uri(principal_id, "")?,
+            &mut files,
+        );
+    }
+    files.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(DocumentsSummary {
+        documents: metadata.iter().map(documents_list_item).collect(),
+        files,
+    })
+}
+
+/// Walks the Documents folder by name, as the start walk does, to the same
+/// folder depth, skipping hidden entries, links and anything unreadable, and
+/// stops at `DOCUMENTS_FOLDER_FILES_LIMIT` files.
+fn documents_collect_folder_files(
+    dir: &Path,
+    relative: &str,
+    depth: usize,
+    indexed: &std::collections::HashSet<&str>,
+    base_uri: &str,
+    files: &mut Vec<DocumentsFolderFile>,
+) {
+    if depth >= crate::auth::MAX_PRINCIPAL_ROOT_INVENTORY_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        if files.len() >= DOCUMENTS_FOLDER_FILES_LIMIT {
+            return;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let path = if relative.is_empty() {
+            name.clone()
+        } else {
+            format!("{relative}/{name}")
+        };
+        if metadata.is_dir() {
+            documents_collect_folder_files(
+                &entry.path(),
+                &path,
+                depth + 1,
+                indexed,
+                base_uri,
+                files,
+            );
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if !metadata.is_file()
+            || !(lower.ends_with(".md") || lower.ends_with(".txt"))
+            || indexed.contains(path.as_str())
+        {
+            continue;
+        }
+        let updated_at = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_secs());
+        files.push(DocumentsFolderFile {
+            uri: format!("{base_uri}{path}"),
+            name,
+            path,
+            updated_at,
+        });
+    }
 }
 
 pub fn documents_load_document(
@@ -1760,23 +1868,66 @@ mod tests {
 
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
 
-        assert!(summary.is_empty());
+        assert!(summary.documents.is_empty() && summary.files.is_empty());
         assert!(!documents_root(dir.path(), TEST_PRINCIPAL).unwrap().exists());
         assert!(!documents_metadata_root(dir.path()).unwrap().exists());
     }
 
     #[test]
-    fn documents_summary_does_not_import_orphan_markdown() {
+    fn documents_summary_lists_plain_folder_files_without_importing() {
         let dir = tempfile::tempdir().unwrap();
         let docs_root = documents_root(dir.path(), TEST_PRINCIPAL).unwrap();
-        std::fs::create_dir_all(&docs_root).unwrap();
+        std::fs::create_dir_all(docs_root.join("Notes")).unwrap();
+        std::fs::create_dir_all(docs_root.join(".hidden")).unwrap();
         std::fs::write(docs_root.join("Legacy.md"), "# Legacy\n").unwrap();
+        std::fs::write(docs_root.join("New File.txt"), "plain\n").unwrap();
+        std::fs::write(docs_root.join("Notes").join("Todo.TXT"), "todo\n").unwrap();
+        std::fs::write(docs_root.join("photo.png"), [0u8; 4]).unwrap();
+        std::fs::write(docs_root.join(".hidden").join("Secret.md"), "x\n").unwrap();
 
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
 
-        assert!(summary.is_empty());
+        assert!(summary.documents.is_empty());
+        let mut paths = summary
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        paths.sort_unstable();
+        assert_eq!(paths, ["Legacy.md", "New File.txt", "Notes/Todo.TXT"]);
+        let root = crate::auth::principal_localhost_root(TEST_PRINCIPAL);
+        let todo = summary
+            .files
+            .iter()
+            .find(|file| file.path == "Notes/Todo.TXT")
+            .unwrap();
+        assert_eq!(todo.uri, format!("{root}/Documents/Notes/Todo.TXT"));
+        assert_eq!(todo.name, "Todo.TXT");
+        assert!(todo.updated_at > 0);
         assert!(!documents_metadata_root(dir.path()).unwrap().exists());
         assert!(docs_root.join("Legacy.md").is_file());
+    }
+
+    #[test]
+    fn documents_summary_folder_files_stay_within_depth_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_root = documents_root(dir.path(), TEST_PRINCIPAL).unwrap();
+        let mut deep = docs_root.clone();
+        for level in 0..crate::auth::MAX_PRINCIPAL_ROOT_INVENTORY_DEPTH {
+            deep = deep.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("Too deep.md"), "x\n").unwrap();
+        std::fs::write(deep.parent().unwrap().join("Deepest.md"), "x\n").unwrap();
+        for index in 0..DOCUMENTS_FOLDER_FILES_LIMIT {
+            std::fs::write(docs_root.join(format!("n{index:03}.txt")), "x\n").unwrap();
+        }
+
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+
+        assert_eq!(summary.files.len(), DOCUMENTS_FOLDER_FILES_LIMIT);
+        assert!(summary.files.iter().any(|file| file.name == "Deepest.md"));
+        assert!(!summary.files.iter().any(|file| file.name == "Too deep.md"));
     }
 
     #[test]
@@ -1787,13 +1938,17 @@ mod tests {
             documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Project Plan")).unwrap();
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
 
-        assert_eq!(summary.len(), 1);
-        assert_eq!(summary[0].doc_did, document.doc_did);
+        assert_eq!(summary.documents.len(), 1);
+        assert_eq!(summary.documents[0].doc_did, document.doc_did);
         assert_eq!(
-            summary[0].document_uri,
+            summary.documents[0].document_uri,
             documents_object_uri(&document.doc_did)
         );
-        assert_eq!(summary[0].title, "Project Plan");
+        assert_eq!(summary.documents[0].title, "Project Plan");
+        assert!(
+            summary.files.is_empty(),
+            "a Documents object is listed once"
+        );
     }
 
     #[test]
@@ -1820,8 +1975,12 @@ mod tests {
             format!("{root}/Documents/Shared Note.txt")
         );
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
-        assert_eq!(summary.len(), 1);
-        assert_eq!(summary[0].doc_did, imported.doc_did);
+        assert_eq!(summary.documents.len(), 1);
+        assert_eq!(summary.documents[0].doc_did, imported.doc_did);
+        assert!(
+            summary.files.is_empty(),
+            "a Documents object is listed once"
+        );
 
         documents_save_local(
             dir.path(),
@@ -1846,7 +2005,7 @@ mod tests {
         assert_eq!(reopened.doc_did, imported.doc_did);
         assert_eq!(reopened.body, "edited locally");
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
-        assert_eq!(summary.len(), 1);
+        assert_eq!(summary.documents.len(), 1);
     }
 
     #[test]
@@ -1922,7 +2081,9 @@ mod tests {
             documents_export_publish(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
         let loaded =
             documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
-        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL)
+            .unwrap()
+            .documents;
 
         assert_eq!(republish.next_version, 2);
         assert_eq!(loaded.title, newer.title);
@@ -1952,7 +2113,9 @@ mod tests {
 
         let unpublished =
             documents_unpublish_local(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
-        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL)
+            .unwrap()
+            .documents;
         let republish =
             documents_export_publish(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
 
@@ -1980,10 +2143,12 @@ mod tests {
         assert!(documents_delete_local(dir.path(), OTHER_PRINCIPAL, &owned.doc_did).is_err());
         assert!(documents_load_summary(dir.path(), OTHER_PRINCIPAL)
             .unwrap()
+            .documents
             .is_empty());
         assert_eq!(
             documents_load_summary(dir.path(), TEST_PRINCIPAL)
                 .unwrap()
+                .documents
                 .len(),
             1
         );
@@ -2029,7 +2194,9 @@ mod tests {
         )
         .unwrap();
 
-        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL)
+            .unwrap()
+            .documents;
 
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].doc_did, document.doc_did);
@@ -2301,6 +2468,7 @@ mod tests {
         assert!(!metadata_dir.exists());
         assert!(documents_load_summary(dir.path(), TEST_PRINCIPAL)
             .unwrap()
+            .documents
             .is_empty());
         assert!(documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).is_err());
     }

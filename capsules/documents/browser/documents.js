@@ -1080,21 +1080,28 @@ function renderDocumentsList() {
     return;
   }
 
+  const currentKey = state.current ? state.current.library_object_uri || state.current.doc_did : "";
   visibleDocuments.forEach((item) => {
     const button = window.document.createElement("button");
     button.type = "button";
     const classes = ["document-list-item"];
-    if (state.current && state.current.doc_did === item.doc_did) {
+    const isCurrent = !!currentKey && currentKey === (item.library_object_uri || item.doc_did);
+    if (isCurrent) {
       classes.push("active");
     }
     button.className = classes.join(" ");
     button.dataset.docDid = item.doc_did;
-    const dirtyMarker = state.current && state.current.doc_did === item.doc_did && state.dirty ? " • unsaved" : "";
+    if (item.library_object_uri) {
+      button.dataset.objectUri = item.library_object_uri;
+    }
+    const dirtyMarker = isCurrent && state.dirty ? " • unsaved" : "";
     button.innerHTML =
       '<span class="document-list-title-row"><span class="document-list-title">' + escapeHtml(item.title) + "</span></span>" +
       '<span class="document-list-meta">' + escapeHtml(item.file_name + dirtyMarker) + "</span>" +
       '<span class="document-list-row"><span class="document-list-updated">' + escapeHtml(formatTime(item.updated_at)) + '</span></span>';
-    button.addEventListener("click", () => selectDocument(item.doc_did));
+    button.addEventListener("click", () => item.library_object_uri
+      ? selectLibraryFile(item.library_object_uri)
+      : selectDocument(item.doc_did));
     elements.documentsList.appendChild(button);
   });
 }
@@ -1201,9 +1208,23 @@ function startDraftDocument(options) {
   }
 }
 
+// Documents' own objects, then plain .md and .txt files in the Documents
+// folder that have none (made in Library, say); those open as Library files.
+function summaryListItems(summary) {
+  const files = (summary.files || []).map((file) => ({
+    doc_did: "",
+    library_object_uri: file.uri,
+    title: file.name,
+    file_name: file.path,
+    updated_at: file.updated_at,
+    latest_published_cid: null,
+  }));
+  return [...(summary.documents || []), ...files];
+}
+
 async function loadSummary() {
   const summary = await documentsProviderApi("summary");
-  state.documents = summary.documents || [];
+  state.documents = summaryListItems(summary);
   sortDocuments();
   renderDocumentsList();
   if (state.initialIntent === "new") {
@@ -1278,6 +1299,25 @@ async function loadLibraryObject(uri) {
   });
   renderDocumentsList();
   renderCurrentDocument();
+}
+
+async function selectLibraryFile(uri) {
+  if (state.current && state.current.library_object_uri === uri) {
+    return;
+  }
+  if (state.current && state.dirty) {
+    const confirmed = await confirmInCapsule({
+      title: "Discard changes?",
+      message: "Open another document without saving this draft?",
+      confirmLabel: "Discard",
+    });
+    if (!confirmed) {
+      return;
+    }
+  }
+  await loadLibraryObject(uri).catch((error) => {
+    showError(readableDocumentsError(error, "This file could not be opened."));
+  });
 }
 
 async function openChatAttachment(payload) {
@@ -1405,7 +1445,13 @@ async function createDocument(title) {
 function applySavedDocumentState(persistedDocument, saveTarget, requestedTitle, requestedBody) {
   if (!isCurrentDocumentTarget(saveTarget)) return;
   const libraryProjection = isLibraryFileProjection(persistedDocument);
-  if (!libraryProjection) {
+  if (libraryProjection) {
+    const listItem = state.documents.find((item) => item.library_object_uri === persistedDocument.library_object_uri);
+    if (listItem) {
+      listItem.updated_at = persistedDocument.updated_at;
+      sortDocuments();
+    }
+  } else {
     upsertDocumentListItem(persistedDocument);
   }
   renderDocumentsList();
@@ -1498,7 +1544,7 @@ async function saveCurrent(options) {
         if (choice === "confirm") {
           const response = await documentsProviderApi("summary", {});
           if (!isCurrentDocumentTarget(saveTarget)) return;
-          state.documents = response.documents;
+          state.documents = summaryListItems(response);
           renderDocumentsList();
           throw new Error("Your draft is kept. Select the stored document to check it, or choose Save to create a copy.");
         }
