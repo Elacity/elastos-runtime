@@ -275,9 +275,12 @@ piece; it is not a Browser UI feature and not a direct-network escape hatch.
 `scripts/build/stage-browser-vm-target.sh` assembles that guest contract from
 explicit binaries and runs `scripts/browser-vm-target-preflight.sh`; it does
 not install Chromium or claim a bootable target without real guest artifacts.
-Gateway hosts without compatible virtualization select an approved remote Engine
-through Runtime's Services controls. Carrier transports the selected Engine's
-control and media below the same principal and lifecycle authority.
+Gateway hosts without compatible virtualization can pick, in Browser's Engine
+list, a remote Engine a contact has already approved. In 0.8.0 the Services app
+is hidden, so no new remote Engine or Exit can be requested; an approved one
+keeps working until its grant expires, one hour after approval. Carrier
+transports the selected Engine's control and media below the same principal
+and lifecycle authority.
 
 The test-only byte-transport helper lives at `elastos/tools/browser-stream-bridge`. It
 reads `ELASTOS_BROWSER_STREAM_BRIDGE_CONFIG`, binds the private

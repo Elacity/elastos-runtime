@@ -18,7 +18,7 @@ have separate identities. [Install/update acceptance](https://github.com/Elacity
 owns publication-parity evidence. The normal Home path does not need a separate `elastos serve` process.
 
 The current default Home exposes Assistant, Chat (Community), System, People,
-Services, Wallet, Documents, Library, Marketplace, Archive, and Inbox. On Apple Silicon
+Wallet, Documents, Library, Marketplace, Archive, and Inbox. On Apple Silicon
 Macs it also exposes Browser; Linux Homes do not show Browser in 0.8.0.
 
 Welcome to Home lists the first steps in order: create your Profile and save

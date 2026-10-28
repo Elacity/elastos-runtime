@@ -29,8 +29,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 - The app catalog is called Marketplace again everywhere: its Home title,
   window, menu and Assistant hints. Marketplace lists models in the same rows
-  as other items: catalog models first, then models shared with you and
-  contacts' AI services, in one list. A model opens the same detail as an app:
+  as other items: catalog models first, then models shared with you, in one
+  list. A model opens the same detail as an app:
   About, Status with the download size and memory fit, Available actions and
   Technical details, with Get, Retry, Stop or Open in Assistant beside Close.
   Shared model details show where prompts go.
@@ -64,6 +64,15 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   Open button. Double-click a ZIP in Library, or use Open With, to open it in
   Archive; Library's Compress and Extract are unchanged. An Archive window saved
   by an earlier version is not reopened when Home starts.
+- Services is hidden: it has no launcher tile, desktop shortcut or Marketplace
+  listing, and a Services window saved by an earlier version is not reopened.
+  System no longer offers Share as service, and Marketplace no longer lists
+  contacts' AI services, so you cannot ask a contact for an AI model, Browser
+  Engine or Browser Exit in this release. Access approved earlier keeps working
+  until it expires: one hour for an Engine or Exit, six hours for a model. You
+  can still approve or deny requests already waiting in Inbox, and revoke a
+  contact's use of your AI model there. Sharing returns inside People in a
+  later release.
 - Chat can share files in Community: Attach picks a Library file (up to
   8 MiB), asks once ("Post publicly?"), publishes it from Library and posts
   `name · size · elastos://<cid>`. Chat shows publishing and posting apart: if
@@ -133,6 +142,11 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Auth audit saves verify the changed suffix against a verified loaded prefix and
   refill the cache after stable byte readback; retention, signatures, checkpoint
   order, and the file format stay unchanged.
+- Services stays installed but is left out of the capsule catalog, so Home,
+  Marketplace and System do not list it.
+  `/api/apps/services/summary` accepts only a Services token, Services request
+  notifications name Inbox as their source app, and System's hosted connection
+  status no longer reports `share_enabled`.
 
 - Library writes and archive extraction keep the start check's folder rule
   (#449): a write that would put a folder 16 or more folders below a protected

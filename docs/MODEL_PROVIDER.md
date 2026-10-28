@@ -347,10 +347,11 @@ request, including saved operator connections; End stops its sends. The Home
 can also use an owner-scoped
 `providers/model-provider/validate-fixtures.json`. That file, when present,
 may bind validate HTTP only to `http://127.0.0.1` with an explicit port.
-Save stays private and publishes no service offer. A later Share action uses
-existing Marketplace, Services, grants, Carrier routing, and run journals.
-Services summary reports `share_enabled` on hosted cards. That field matches
-the stored share state. The key stays on the provider Home. Consumers see the
+Save stays private and publishes no service offer. Share uses grants, Carrier
+routing, and run journals. In 0.8.0 the Services app, where Share lived, is
+hidden: a hosted model shared by an earlier version stays shared, and each
+person's access ends when its grant expires, 6 hours after approval, or when
+the owner selects Revoke access in Inbox. The key stays on the provider Home. Consumers see the
 intermediary Home, the selected upstream processor (OpenRouter or Venice), and
 the payer. One
 connection budget covers that provider's private and shared offers, including
@@ -421,13 +422,13 @@ offer. Marketplace owns discovery and details; System owns model configuration
 and storage controls. Assistant selects an exact admitted or granted offer and
 keeps its typed run lifecycle. These surfaces share Runtime state.
 
-Marketplace separates verified local content, exact granted shared models, and
-contact access opportunities. The last group opens the existing Services card;
-the person requests access there and the provider Home decides in Inbox. After
-approval, Marketplace reads grant-scoped model offers and hands the selected
-offer to Assistant. Provider Home, processor, prompt destination, payer and
-reported limits use the same facts as Assistant. Discovery gives Marketplace
-read authority; Services and Runtime retain grant and inference authority.
+Marketplace separates verified local content and exact granted shared models.
+In 0.8.0 the Services app is hidden, so Marketplace no longer lists contacts' AI
+services and no new access can be requested. A model approved earlier stays
+listed until its grant expires, 6 hours after approval, and opens in Assistant.
+Provider Home, processor, prompt destination, payer and reported limits use the
+same facts as Assistant. Discovery gives Marketplace read authority; Runtime
+retains grant and inference authority.
 
 The installed small-model journey and its exact evidence scope are recorded in
 [GitHub issues](https://github.com/Elacity/elastos-runtime/issues). Acquisition, readiness, inference and warm reuse are
@@ -514,7 +515,8 @@ pass installed lifecycle tests before it can be shared:
    This requires signed offer and grant admission plus bounded Carrier ingress.
    A Jetson deployment is a separate acceptance track.
 5. After each private connection exists, add an explicit owner-funded Share of
-   that exact provider and model through existing Services and Marketplace.
+   that exact provider and model. Services is hidden in 0.8.0; sharing returns
+   inside People.
    Qualify OpenRouter Terms 5.1–5.2 or Venice TOS 7.3, plus the selected model
    terms, before Share. Keep one connection budget across that provider's
    private and shared offers, with per-consumer limits. Commercial billing,
