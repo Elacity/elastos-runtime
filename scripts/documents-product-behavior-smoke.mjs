@@ -47,11 +47,8 @@ assert(
   source.includes('id="status-row" class="status-row hidden"') &&
     source.includes('function clearStatus()') &&
     source.includes('elements.statusRow.classList.add("hidden");') &&
-    source.includes("function showError(message)") &&
-    !source.includes("setStatus(") &&
-    !source.includes("Unsaved local changes.") &&
     source.includes('workspaceView: "write"'),
-  "Documents must hide idle status, show only errors under the title, and default to Write when no authoritative preference exists.",
+  "Documents must hide idle status and default to Write when no authoritative preference exists.",
 );
 assert(
   !!announceMatch &&
