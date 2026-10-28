@@ -2334,41 +2334,51 @@ pub(super) async fn chat_room_attach_library(
         if_revision,
         request_id,
     } = body;
-    // The send rate limit is checked before anything is published. A retry
-    // whose publication already exists publishes nothing new, so it goes on
-    // to the send path, which replays an earlier post or refuses a new one.
-    if let Err(err) = port.check_message_allowed(&profile, now_ts()) {
-        let (data_dir, principal_id, uri, if_revision) = (
+    // The request_id is checked against its saved binding before anything
+    // happens: another file under the same id, or a publication withdrawn
+    // since, is refused; a saved publication is posted as it was published.
+    let lookup = {
+        let (data_dir, principal_id, request_id, uri, if_revision) = (
             data_dir.clone(),
             context.principal_id.clone(),
+            request_id.clone(),
             uri.clone(),
             if_revision.clone(),
         );
-        let current = tokio::task::spawn_blocking(move || {
-            crate::library::library_file_publication_is_current(
+        tokio::task::spawn_blocking(move || {
+            crate::library::chat_attach_lookup(
                 &data_dir,
                 &principal_id,
+                &request_id,
                 &uri,
                 if_revision.as_deref(),
             )
         })
         .await
-        .unwrap_or(false);
-        if !current {
-            return attach_library_chat_error(err);
+    };
+    let publication = match lookup {
+        Ok(Ok(crate::library::ChatAttachLookup::Published(publication))) => publication,
+        Ok(Ok(crate::library::ChatAttachLookup::New)) => {
+            // The send rate limit is checked before anything is published.
+            if let Err(err) = port.check_message_allowed(&profile, now_ts()) {
+                return attach_library_chat_error(err);
+            }
+            match crate::library::chat_attach_publish(
+                &data_dir,
+                &registry,
+                &context.principal_id,
+                &request_id,
+                &uri,
+                if_revision.as_deref(),
+            )
+            .await
+            {
+                Ok(publication) => publication,
+                Err(err) => return attach_library_publish_error(err),
+            }
         }
-    }
-    let publication = match crate::library::publish_library_file(
-        &data_dir,
-        &registry,
-        &context.principal_id,
-        &uri,
-        if_revision.as_deref(),
-    )
-    .await
-    {
-        Ok(publication) => publication,
-        Err(err) => return attach_library_publish_error(err),
+        Ok(Err(err)) => return attach_library_publish_error(err),
+        Err(err) => return attach_library_chat_error(anyhow::anyhow!("Chat task failed: {err}")),
     };
     let (post, name) =
         community_file_post(&publication.name, publication.size_bytes, &publication.cid);
@@ -2448,19 +2458,22 @@ fn attach_library_chat_error(err: anyhow::Error) -> Response {
 }
 
 fn attach_library_publish_error(err: anyhow::Error) -> Response {
-    let code = crate::library::library_refusal_code(&err).unwrap_or("library_error");
+    let refusal = crate::library::find_library_refusal(&err);
+    let code = refusal.map_or("library_error", |refusal| refusal.code);
     let status = match code {
         "too_large" => StatusCode::PAYLOAD_TOO_LARGE,
-        "stale_revision" | "changed_since_publish" => StatusCode::CONFLICT,
+        "stale_revision" | "changed_since_publish" | "request_id_reused" | "withdrawn" => {
+            StatusCode::CONFLICT
+        }
         "not_found" => StatusCode::NOT_FOUND,
         "unavailable" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
     };
-    attach_library_response(
-        status,
-        None,
-        attach_library_error_body(code, &err.to_string()),
-    )
+    let mut body = attach_library_error_body(code, &err.to_string());
+    if let Some(reason) = refusal.and_then(|refusal| refusal.reason) {
+        body["reason"] = serde_json::Value::String(reason.to_string());
+    }
+    attach_library_response(status, None, body)
 }
 
 pub(super) async fn room_service_attachment_get(

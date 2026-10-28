@@ -2940,6 +2940,7 @@ struct AttachFixture {
     token: String,
     principal_id: String,
     content: Arc<RecordingPublishContent>,
+    registry: Arc<ProviderRegistry>,
     port: crate::collaboration_product::CollaborationChatProductPort,
 }
 
@@ -2961,7 +2962,7 @@ async fn attach_fixture() -> AttachFixture {
         .unwrap();
     let mut state = test_state(dir.path());
     state.collaboration_chat_product_port = Some(port.clone());
-    state.provider_registry = Some(registry);
+    state.provider_registry = Some(registry.clone());
     let app = gateway_router(state);
     let token =
         projection_launch_token_for_authority_context(dir.path(), CHAT_ROOM_CAPSULE_ID, &authority);
@@ -2971,6 +2972,7 @@ async fn attach_fixture() -> AttachFixture {
         token,
         principal_id: authority.principal_id.clone(),
         content,
+        registry,
         port,
     }
 }
@@ -3126,9 +3128,16 @@ async fn community_attach_publishes_the_library_file_then_posts_its_link_once() 
     assert_eq!(objects[0]["conversation_id"], "file-community");
     assert_eq!(home.port.test_live_unresolved_outgoing().unwrap(), 1);
 
-    // A retry with the same request_id publishes and posts nothing new.
+    // A retry of the same request publishes and posts nothing new.
     let (status, again) = home
-        .attach("Documents/notes.txt", "chat-attach:notes")
+        .post(
+            "/api/apps/chat-room/attach-library",
+            json!({
+                "uri": home.uri("Documents/notes.txt"),
+                "if_revision": revision,
+                "request_id": "chat-attach:notes",
+            }),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(again["data"]["posted"], true);
@@ -3156,13 +3165,18 @@ async fn community_attach_checks_the_send_limit_before_publishing() {
 async fn community_attach_keeps_the_publication_when_the_post_fails_and_retries_the_post() {
     let home = attach_fixture().await;
     home.write("Documents/report.txt", b"report");
-    // The first attach publishes and posts; that post and four more fill the
-    // send window.
-    let (status, first) = home
-        .attach("Documents/report.txt", "chat-attach:report-0")
-        .await;
-    assert_eq!(status, StatusCode::OK, "{first}");
-    home.fill_send_window(1).await;
+    // Published and bound, but the post never went out (a lost post).
+    let published = crate::library::chat_attach_publish(
+        home.dir.path(),
+        &home.registry,
+        &home.principal_id,
+        "chat-attach:report",
+        &home.uri("Documents/report.txt"),
+        None,
+    )
+    .await
+    .unwrap();
+    home.fill_send_window(0).await;
 
     // The post is refused by the send limit; the publication stays.
     let (status, failed) = home
@@ -3171,15 +3185,18 @@ async fn community_attach_keeps_the_publication_when_the_post_fails_and_retries_
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{failed}");
     assert_eq!(failed["code"], "post_failed");
     assert_eq!(failed["data"]["posted"], false);
-    assert_eq!(
-        failed["data"]["publication"]["cid"],
-        first["data"]["publication"]["cid"]
-    );
+    assert_eq!(failed["data"]["publication"]["cid"], published.cid);
     assert_eq!(home.publishes().len(), 1);
     let stat = home.library("stat", json!({ "uri": home.uri("Documents/report.txt") }));
     assert_eq!(stat["data"]["object"]["published"], true, "{stat}");
 
-    // Once the window has passed, the same request posts the same link.
+    // The file moves and changes; the retry still posts what was published.
+    let rename = home.library(
+        "rename",
+        json!({ "uri": home.uri("Documents/report.txt"), "name": "moved.txt" }),
+    );
+    assert_eq!(rename["status"], "ok", "{rename}");
+    home.write("Documents/moved.txt", b"changed!");
     tokio::time::sleep(std::time::Duration::from_secs(
         crate::collaboration_rate_limit::COMMUNITY_RATE_WINDOW_SECS + 1,
     ))
@@ -3189,12 +3206,67 @@ async fn community_attach_keeps_the_publication_when_the_post_fails_and_retries_
         .await;
     assert_eq!(status, StatusCode::OK, "{retried}");
     assert_eq!(retried["data"]["posted"], true);
+    assert_eq!(retried["data"]["name"], "report.txt");
+    assert_eq!(retried["data"]["size_bytes"], 6);
+    assert_eq!(retried["data"]["publication"]["cid"], published.cid);
     assert_eq!(home.publishes().len(), 1);
+}
+
+#[tokio::test]
+async fn community_attach_request_id_stays_bound_to_its_file_and_publication() {
+    let home = attach_fixture().await;
+    home.write("Documents/one.txt", b"one");
+    home.write("Documents/two.txt", b"two");
+    let (status, first) = home.attach("Documents/one.txt", "chat-attach:bound").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+
+    // The same id with another file is refused before anything is published.
+    let (status, reused) = home.attach("Documents/two.txt", "chat-attach:bound").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{reused}");
+    assert_eq!(reused["code"], "request_id_reused");
+    assert_eq!(home.publishes().len(), 1);
+    let stat = home.library("stat", json!({ "uri": home.uri("Documents/two.txt") }));
+    assert_eq!(stat["data"]["object"]["published"], false, "{stat}");
+
+    // After Unpublish, replaying the request neither republishes nor posts.
+    let unpublish = crate::library::handle_object_provider_runtime_request(
+        home.dir.path(),
+        home.registry.clone(),
+        &json!({
+            "op": "unpublish",
+            "principal_id": home.principal_id,
+            "uri": home.uri("Documents/one.txt"),
+        }),
+    )
+    .await;
+    assert_eq!(unpublish["status"], "ok", "{unpublish}");
+    let (status, replay) = home.attach("Documents/one.txt", "chat-attach:bound").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{replay}");
+    assert_eq!(replay["code"], "withdrawn");
+    assert_eq!(home.publishes().len(), 1);
+    assert_eq!(home.port.test_live_unresolved_outgoing().unwrap(), 1);
 }
 
 #[tokio::test]
 async fn community_attach_refuses_files_it_must_not_publish() {
     let home = attach_fixture().await;
+    // The Profile authority bundle holds the Profile signing seed: a Chat
+    // launch can never publish it, or anything else in a hidden folder.
+    let bundle = elastos_common::localhost::rooted_localhost_fs_path(
+        home.dir.path(),
+        &home.uri(".AppData/ElastOS/Profile/profile-authority.json"),
+    )
+    .unwrap();
+    assert!(bundle.is_file(), "the fixture has a signed Profile");
+    let (status, body) = home
+        .attach(
+            ".AppData/ElastOS/Profile/profile-authority.json",
+            "chat-attach:bundle",
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "unsupported");
+    assert_eq!(body["reason"], "not_allowed_here");
     home.write("Documents/empty.txt", b"");
     let (status, body) = home
         .attach("Documents/empty.txt", "chat-attach:empty")
