@@ -940,41 +940,60 @@ async function run() {
         await manualPage.getByRole("button", { name: "Save", exact: true }).isEnabled(),
         "Clicking the open document must keep its unsaved edits.");
 
-      // Switching asks; Cancel keeps the edit and the document.
-      await manualPage.locator('.document-list-item[data-doc-did="doc-alpha"]').click();
-      await manualPage.locator("#confirm-modal.open").waitFor();
-      const prompt = await manualPage.evaluate(() => ({
-        title: document.getElementById("confirm-title")?.textContent || "",
-        save: document.getElementById("confirm-action")?.textContent || "",
-        dontSave: document.getElementById("confirm-secondary-action")?.textContent || "",
-        secondaryHidden: document.getElementById("confirm-secondary-action")?.hidden,
-        cancel: document.getElementById("confirm-cancel")?.textContent || "",
-      }));
-      assert(prompt.title === "Save changes to Beta?" && prompt.save === "Save" && prompt.dontSave === "Don't save" &&
-        prompt.secondaryHidden === false && prompt.cancel === "Cancel",
-        `Switching with unsaved changes must ask Save, Don't save or Cancel. Got ${JSON.stringify(prompt)}`);
-      await manualPage.locator("#confirm-cancel").click();
-      assert(await manualPage.locator("#title-input").inputValue() === "Beta" &&
-        await manualPage.locator("#editor").inputValue() === "# Beta\n\nFirst manual edit.",
-        "Cancel must keep the document and its edits.");
-      assert(saveCalls.length === 0, "Cancel must not save.");
+      // The Save button shows the open document has unsaved changes.
+      const saveMark = () => manualPage.evaluate(() => {
+        const button = document.getElementById("save-button");
+        return { unsaved: button.classList.contains("has-unsaved"), title: button.title,
+          dot: getComputedStyle(button, "::after").content !== "none" };
+      });
+      const marked = await saveMark();
+      assert(marked.unsaved && marked.dot && marked.title === "Save (unsaved changes)",
+        `Save must show unsaved changes. Got ${JSON.stringify(marked)}`);
+      const unsavedMark = (selector) => manualPage.locator(`${selector} .document-list-meta`).textContent()
+        .then((meta) => meta.includes("• unsaved"));
 
-      // Save in the prompt saves, then switches.
+      // Switching documents keeps the text in this window without asking.
       await manualPage.locator('.document-list-item[data-doc-did="doc-alpha"]').click();
-      await manualPage.locator("#confirm-modal.open").waitFor();
-      await manualPage.locator("#confirm-action").click();
       await manualPage.waitForFunction(() => document.getElementById("title-input")?.value === "Alpha");
-      assert(saveCalls.length === 1 && saveCalls[0].docDid === "doc-beta" && saveCalls[0].body === "# Beta\n\nFirst manual edit.",
-        `Save in the prompt must save the edits before switching. Got ${JSON.stringify(saveCalls)}`);
+      assert(!(await manualPage.locator("#confirm-modal.open").count()), "Switching documents must not ask.");
+      assert(saveCalls.length === 0, "Switching must not save with Save automatically off.");
+      assert(await unsavedMark('.document-list-item[data-doc-did="doc-beta"]'), "The list must keep Beta's unsaved mark.");
+      const cleanMark = await saveMark();
+      assert(!cleanMark.unsaved && !cleanMark.dot && cleanMark.title === "Save", `Save returns to normal for a saved document. Got ${JSON.stringify(cleanMark)}`);
 
-      // Don't save drops the edit and switches.
-      await manualPage.locator("#editor").fill("# Alpha\n\nDropped edit.");
+      // New keeps an edited document too, and a new one is listed until saved.
+      await manualPage.locator("#editor").fill("# Alpha\n\nAlso kept.");
+      await manualPage.locator("#new-document").click();
+      assert(!(await manualPage.locator("#confirm-modal.open").count()), "New must not ask.");
+      await manualPage.locator("#title-input").fill("Fresh");
+      await manualPage.locator("#editor").fill("A new idea.");
       await manualPage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
-      await manualPage.locator("#confirm-modal.open").waitFor();
-      await manualPage.locator("#confirm-secondary-action").click();
       await manualPage.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
-      assert(saveCalls.length === 1, "Don't save must not save.");
-      assert(!documents.get("doc-alpha").body.includes("Dropped edit."), "Don't save must leave the stored document unchanged.");
+      assert(await manualPage.locator("#editor").inputValue() === "# Beta\n\nFirst manual edit.",
+        "Switching back must bring back Beta's unsaved text.");
+      assert((await saveMark()).unsaved, "Beta's Save shows its unsaved changes again.");
+      assert(await unsavedMark('.document-list-item[data-doc-did="doc-alpha"]'), "The list must mark Alpha unsaved.");
+      const freshItem = manualPage.locator(".document-list-item[data-draft-key]");
+      assert(await freshItem.count() === 1 && (await freshItem.locator(".document-list-title").textContent()) === "Fresh" &&
+        await unsavedMark(".document-list-item[data-draft-key]"),
+        "An unsaved new document must be listed with its unsaved mark.");
+      await freshItem.click();
+      await manualPage.waitForFunction(() => document.getElementById("title-input")?.value === "Fresh");
+      assert(await manualPage.locator("#editor").inputValue() === "A new idea.", "The new document comes back.");
+      await manualPage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
+      await manualPage.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
+      assert(saveCalls.length === 0 && !(await manualPage.locator("#confirm-modal.open").count()),
+        "Moving between unsaved documents neither saves nor asks.");
+
+      // Save saves the open document and Save returns to normal.
+      await manualPage.getByRole("button", { name: "Save", exact: true }).click();
+      await waitForCondition(() => saveCalls.length === 1 && saveCalls[0].docDid === "doc-beta" &&
+        saveCalls[0].body === "# Beta\n\nFirst manual edit.", 4000, `Save must save Beta. Got ${JSON.stringify(saveCalls)}`);
+      await manualPage.waitForFunction(() => !document.getElementById("save-button").classList.contains("has-unsaved"));
+      assert(!(await unsavedMark('.document-list-item[data-doc-did="doc-beta"]')) &&
+        await unsavedMark('.document-list-item[data-doc-did="doc-alpha"]'),
+        "Saving Beta clears only Beta's unsaved mark.");
+      assert(!documents.get("doc-alpha").body.includes("Also kept."), "Kept text is not saved until its document saves.");
 
       // Cmd/Ctrl+S saves.
       await manualPage.locator("#editor").fill("# Beta\n\nKeyboard save.");
@@ -1133,8 +1152,8 @@ async function run() {
         await assertHomeFrameInvariant(frame, launch, "follow fragment");
         await frame.locator("#editor").fill(markdown + "\n\nEdited.");
         await assertHomeFrameInvariant(frame, launch, "edit");
+        // Switching keeps the edit in this window; it does not ask.
         await frame.locator('.document-list-item[data-doc-did="doc-alpha"]').click();
-        await frame.locator("#confirm-action").click();
         await frame.waitForFunction(() => document.getElementById("title-input")?.value === "Alpha");
         await assertHomeFrameInvariant(frame, launch, "switch document");
         await frame.locator("#editor").fill(markdown);
@@ -1296,9 +1315,8 @@ async function run() {
       const betaSavedBody = "# Beta\n\nThis autosave belongs to Beta only.";
       await racePage.locator("#editor").fill(alphaSavedBody);
       await delayedSave.started;
+      // Switching does not wait for Alpha's save under way or ask.
       await racePage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
-      await racePage.locator("#confirm-modal.open").waitFor();
-      await racePage.locator("#confirm-secondary-action").click();
       await racePage.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
       await racePage.locator("#editor").fill(betaSavedBody);
       await racePage.waitForTimeout(1200);
@@ -1321,6 +1339,8 @@ async function run() {
       assert(saveCalls[1].docDid === "doc-beta", `Queued autosave must keep Beta identity second. Got ${JSON.stringify(saveCalls)}`);
       assert(saveCalls[1].body === betaSavedBody, `Queued autosave must send only Beta's saved body second. Got ${JSON.stringify(saveCalls)}`);
       assert(maxConcurrentSaveCalls === 1, `Documents saves must remain serial with no overlap. Got ${JSON.stringify({ maxConcurrentSaveCalls, saveCalls })}`);
+      await racePage.waitForFunction(() => !document.querySelector('.document-list-item[data-doc-did="doc-alpha"] .document-list-meta')
+        ?.textContent.includes("unsaved"));
       const alphaStored = documents.get("doc-alpha");
       const betaStored = documents.get("doc-beta");
       assert(alphaStored?.body === alphaSavedBody, `Delayed autosave must persist only Alpha's body. Got ${JSON.stringify({ alphaStored, saveCalls })}`);

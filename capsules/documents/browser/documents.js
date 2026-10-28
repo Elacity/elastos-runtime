@@ -422,10 +422,14 @@ function isDraftDocument(document) {
   return !!document && !document.doc_did && !isLibraryFileProjection(document);
 }
 
+let draftSerial = 0;
+
 function createDraftDocument() {
+  draftSerial += 1;
   return {
     doc_did: "",
     document_uri: "",
+    draft_key: "draft-" + draftSerial,
     title: "",
     file_name: "",
     working_copy_uri: "",
@@ -585,6 +589,118 @@ async function resolveUnsavedChanges() {
     return false;
   }
   return sessionId === state.currentSessionId && !state.dirty;
+}
+
+// Unsaved documents this window holds while another one is open, keyed by
+// document. Switching documents, New and opening a file keep the text here
+// instead of asking; switching back brings it back. Only closing the window,
+// Lock and sign-out ask, since only they would lose it.
+const unsavedDocuments = new Map();
+
+function unsavedKey(document) {
+  if (!document) return "";
+  return isDraftDocument(document) ? "draft:" + (document.draft_key || "") : documentIdentity(document);
+}
+
+function listItemUnsavedKey(item) {
+  if (item.draft_key) return "draft:" + item.draft_key;
+  return item.library_object_uri ? "library:" + item.library_object_uri : "document:" + item.doc_did;
+}
+
+function hasUnsavedDocuments() {
+  return (state.dirty && !!state.current && !state.current.shared) || unsavedDocuments.size > 0;
+}
+
+// Keeps the open document's unsaved text just before another replaces it.
+function keepUnsavedCurrent() {
+  const current = state.current;
+  if (!current || !state.dirty || current.shared) return;
+  unsavedDocuments.set(unsavedKey(current), {
+    document: { ...current, title: elements.titleInput.value, body: elements.editor.value },
+    savedWorkingCopy: savedWorkingCopy ? { ...savedWorkingCopy } : null,
+    saveRecovery: saveRecovery && isCurrentSessionTarget(saveRecovery.target) ? { ...saveRecovery } : null,
+  });
+}
+
+// Before leaving a document: a new one still being created finishes first,
+// so it is not created twice; with Save automatically on and no save under
+// way, the document saves now, as it would have anyway. A save under way for
+// a stored document finishes on its own (reconcileKeptAfterSave).
+async function prepareToLeaveCurrent() {
+  if (saveInFlight && isDraftDocument(state.current)) {
+    await saveInFlight.catch(() => {});
+  }
+  if (!saveInFlight && state.autosave && state.dirty && state.current && !state.current.shared) {
+    await saveCurrent({ autosave: true }).catch((error) => {
+      reportSaveFailure(error, "Autosave failed.");
+    });
+  }
+}
+
+// A save that finishes after its document was left: the kept text is saved
+// if it is what was sent, or else now builds on the saved revision.
+function reconcileKeptAfterSave(identity, persistedDocument, requestedTitle, requestedBody) {
+  const kept = unsavedDocuments.get(identity);
+  if (!kept) {
+    return;
+  }
+  if (kept.document.body === requestedBody && kept.document.title === requestedTitle) {
+    unsavedDocuments.delete(identity);
+  } else {
+    kept.document = { ...kept.document, revision: persistedDocument.revision };
+    kept.savedWorkingCopy = { ...persistedDocument };
+    kept.saveRecovery = null;
+  }
+  renderDocumentsList();
+}
+
+// Brings back a document's unsaved text, keeping the open one's first.
+function restoreUnsavedDocument(key) {
+  const kept = unsavedDocuments.get(key);
+  if (!kept) return false;
+  keepUnsavedCurrent();
+  unsavedDocuments.delete(key);
+  replaceCurrentDocument({ ...kept.document });
+  savedWorkingCopy = kept.savedWorkingCopy;
+  if (kept.saveRecovery) {
+    saveRecovery = { ...kept.saveRecovery,
+      target: { sessionId: state.currentSessionId, identity: documentIdentity(state.current) } };
+  }
+  state.mode = "shell";
+  elements.shareShell.classList.add("hidden");
+  elements.documentsShell.classList.remove("hidden");
+  renderCurrentDocument();
+  setDirty(true);
+  scheduleAutosave();
+  return true;
+}
+
+async function openKeptDraft(draftKey) {
+  await prepareToLeaveCurrent();
+  restoreUnsavedDocument("draft:" + draftKey);
+}
+
+function unsavedDocumentNames() {
+  const names = state.dirty && state.current && !state.current.shared ? [unsavedDocumentName()] : [];
+  for (const kept of unsavedDocuments.values()) {
+    names.push(kept.document.title.trim() || kept.document.file_name || "Untitled");
+  }
+  return names;
+}
+
+// Save all, from closing the window: the open document, then each kept one.
+// Stops at the first that does not save, which stays open with its text.
+async function saveAllUnsaved() {
+  if (state.dirty) {
+    await saveCurrent();
+    if (state.dirty) return false;
+  }
+  for (const key of [...unsavedDocuments.keys()]) {
+    restoreUnsavedDocument(key);
+    await saveCurrent();
+    if (state.dirty) return false;
+  }
+  return true;
 }
 
 function reportSaveFailure(error, fallback) {
@@ -1097,6 +1213,10 @@ function setDirty(dirty) {
   const hasPersistedCurrent = hasCurrent && !isDraftDocument(state.current);
   const isLibraryFile = isLibraryFileProjection(state.current);
   elements.saveButton.disabled = !hasCurrent || !state.dirty || !!state.current.shared;
+  // The Save button itself shows that this document has unsaved changes.
+  const unsaved = !elements.saveButton.disabled;
+  elements.saveButton.classList.toggle("has-unsaved", unsaved);
+  elements.saveButton.title = unsaved ? "Save (unsaved changes)" : "Save";
   elements.saveAsButton.disabled = !hasPersistedCurrent || isLibraryFile;
   elements.deleteButton.disabled = !hasPersistedCurrent || isLibraryFile;
   if (hasCurrent && !state.dirty) {
@@ -1167,7 +1287,12 @@ function renderCurrentDocument() {
 function renderDocumentsList() {
   elements.documentsList.innerHTML = "";
   const query = state.filterQuery.trim().toLowerCase();
-  const visibleDocuments = state.documents.filter((item) => {
+  // New documents kept unsaved in this window list first, until saved.
+  const keptDrafts = [...unsavedDocuments.values()]
+    .filter((kept) => isDraftDocument(kept.document))
+    .map((kept) => ({ draft_key: kept.document.draft_key, title: kept.document.title.trim() || "Untitled",
+      file_name: "New document", updated_at: 0 }));
+  const visibleDocuments = [...keptDrafts, ...state.documents].filter((item) => {
     if (!query) {
       return true;
     }
@@ -1188,19 +1313,24 @@ function renderDocumentsList() {
       classes.push("active");
     }
     button.className = classes.join(" ");
-    if (item.library_object_uri) {
+    if (item.draft_key) {
+      button.dataset.draftKey = item.draft_key;
+    } else if (item.library_object_uri) {
       button.dataset.objectUri = item.library_object_uri;
     } else {
       button.dataset.docDid = item.doc_did;
     }
-    const dirtyMarker = isCurrent && state.dirty ? " • unsaved" : "";
+    const unsaved = (isCurrent && state.dirty) || unsavedDocuments.has(listItemUnsavedKey(item));
+    const dirtyMarker = unsaved ? " • unsaved" : "";
     button.innerHTML =
       '<span class="document-list-title-row"><span class="document-list-title">' + escapeHtml(item.title) + "</span></span>" +
       '<span class="document-list-meta">' + escapeHtml(item.file_name + dirtyMarker) + "</span>" +
       '<span class="document-list-row"><span class="document-list-updated">' + escapeHtml(formatTime(item.updated_at)) + '</span></span>';
-    button.addEventListener("click", () => item.library_object_uri
-      ? selectLibraryFile(item.library_object_uri)
-      : selectDocument(item.doc_did));
+    button.addEventListener("click", () => item.draft_key
+      ? openKeptDraft(item.draft_key)
+      : item.library_object_uri
+        ? selectLibraryFile(item.library_object_uri)
+        : selectDocument(item.doc_did));
     elements.documentsList.appendChild(button);
   });
 }
@@ -1401,6 +1531,7 @@ async function loadLibraryObject(uri) {
       title !== elements.titleInput.value || body !== elements.editor.value) return;
   const object = response.object || {};
   const name = object.name || baseName(object.uri || uri);
+  keepUnsavedCurrent();
   replaceCurrentDocument({
     doc_did: "",
     document_uri: object.uri || uri,
@@ -1488,7 +1619,8 @@ async function selectLibraryFile(uri) {
   if (state.current && state.current.library_object_uri === uri) {
     return;
   }
-  if (!(await resolveUnsavedChanges())) {
+  await prepareToLeaveCurrent();
+  if (restoreUnsavedDocument("library:" + uri)) {
     return;
   }
   await loadLibraryObject(uri).catch((error) => {
@@ -1503,9 +1635,7 @@ async function openChatAttachment(payload) {
   }
   state.pendingChatAttachmentId = attachmentId;
   try {
-    if (!(await resolveUnsavedChanges())) {
-      throw new Error("Opening cancelled in Documents.");
-    }
+    await prepareToLeaveCurrent();
     resetPendingSaveIntent();
     const mime = String(payload && payload.mimeType ? payload.mimeType : "application/octet-stream");
     if (!isTextMimeType(mime)) {
@@ -1523,12 +1653,16 @@ async function openChatAttachment(payload) {
     if (!document || !document.doc_did) {
       throw new Error("Documents could not import this file.");
     }
-    if (state.current && state.current.doc_did === document.doc_did && !state.dirty) {
+    if (state.current && state.current.doc_did === document.doc_did) {
       return true;
     }
     state.mode = "shell";
     elements.shareShell.classList.add("hidden");
     elements.documentsShell.classList.remove("hidden");
+    if (restoreUnsavedDocument("document:" + document.doc_did)) {
+      return true;
+    }
+    keepUnsavedCurrent();
     replaceCurrentDocument(document);
     upsertDocumentListItem(document);
     renderDocumentsList();
@@ -1563,18 +1697,27 @@ async function selectDocument(docDid, options) {
   const sequence = ++documentSelectionSequence;
   const force = !!(options && options.force);
   const sameDocument = !!state.current && state.current.doc_did === docDid;
-  // Clicking the open document keeps the editor as it is. Only an explicit
-  // reload, or opening the stored copy after a save conflict, replaces it, and
-  // unsaved edits ask first.
+  // Clicking the open document keeps the editor as it is. An explicit reload,
+  // or opening the stored copy after a save conflict, replaces the text here,
+  // so it asks first; any other switch keeps the unsaved text in this window.
   const storedCopyWanted = sameDocument && state.dirty &&
     saveRecovery?.target.sessionId === state.currentSessionId;
   if (sameDocument && !force && !storedCopyWanted) {
     return;
   }
-  if (state.current && state.dirty) {
+  const replacesText = sameDocument && state.dirty;
+  if (replacesText) {
     const sessionBeforePrompt = state.currentSessionId;
     const proceed = await resolveUnsavedChanges();
     if (!proceed || sequence !== documentSelectionSequence || sessionBeforePrompt !== state.currentSessionId) {
+      return;
+    }
+  } else {
+    await prepareToLeaveCurrent();
+    if (sequence !== documentSelectionSequence) {
+      return;
+    }
+    if (restoreUnsavedDocument("document:" + docDid)) {
       return;
     }
   }
@@ -1589,6 +1732,9 @@ async function selectDocument(docDid, options) {
   if (sequence !== documentSelectionSequence || sessionId !== state.currentSessionId ||
       title !== elements.titleInput.value || body !== elements.editor.value) return;
   requireSavedWorkingCopy(response.document, docDid);
+  if (!replacesText) {
+    keepUnsavedCurrent();
+  }
   replaceCurrentDocument(response.document);
   upsertDocumentListItem(response.document);
   renderDocumentsList();
@@ -1596,9 +1742,8 @@ async function selectDocument(docDid, options) {
 }
 
 async function createDocument(title) {
-  if (!(await resolveUnsavedChanges())) {
-    return;
-  }
+  await prepareToLeaveCurrent();
+  keepUnsavedCurrent();
   startDraftDocument({ focusTitle: !title, focusEditor: !!title });
   if (title) {
     elements.titleInput.value = title;
@@ -1608,7 +1753,10 @@ async function createDocument(title) {
 }
 
 function applySavedDocumentState(persistedDocument, saveTarget, requestedTitle, requestedBody) {
-  if (!isCurrentDocumentTarget(saveTarget)) return;
+  if (!isCurrentDocumentTarget(saveTarget)) {
+    reconcileKeptAfterSave(saveTarget.identity, persistedDocument, requestedTitle, requestedBody);
+    return;
+  }
   const libraryProjection = isLibraryFileProjection(persistedDocument);
   if (libraryProjection) {
     const listItem = state.documents.find((item) => item.library_object_uri === persistedDocument.library_object_uri);
@@ -1884,7 +2032,7 @@ async function requestHomeWindowCloseDecision(closeTarget) {
       resumeAutosaveForHomeWindowClose(autosaveSuspension);
       return { ok: false, reason: "stale_request" };
     }
-    if (!state.dirty) {
+    if (!hasUnsavedDocuments()) {
       resumeAutosaveForHomeWindowClose(autosaveSuspension);
       return { ok: true, reason: "" };
     }
@@ -1893,7 +2041,7 @@ async function requestHomeWindowCloseDecision(closeTarget) {
     resumeAutosaveForHomeWindowClose(autosaveSuspension);
     return { ok: false, reason: "stale_request" };
   }
-  if (!state.dirty) {
+  if (!hasUnsavedDocuments()) {
     resumeAutosaveForHomeWindowClose(autosaveSuspension);
     return { ok: true, reason: "" };
   }
@@ -1901,10 +2049,14 @@ async function requestHomeWindowCloseDecision(closeTarget) {
     resumeAutosaveForHomeWindowClose(autosaveSuspension);
     return { ok: false, reason: "stale_request" };
   }
+  // One question for every unsaved document in this window.
+  const names = unsavedDocumentNames();
   const decision = await chooseInCapsule({
-    title: "Save changes to " + unsavedDocumentName() + "?",
+    title: names.length === 1
+      ? "Save changes to " + names[0] + "?"
+      : "Save changes to " + names.length + " documents?",
     message: "Your changes will be lost if you don't save them.",
-    confirmLabel: "Save",
+    confirmLabel: names.length === 1 ? "Save" : "Save all",
     secondaryLabel: "Don't save",
     defaultFocus: "cancel",
   });
@@ -1920,12 +2072,9 @@ async function requestHomeWindowCloseDecision(closeTarget) {
     return { ok: false, reason: "cancelled" };
   }
   try {
-    await saveCurrent();
-    if (!sameHomeWindowCloseTarget(closeTarget)) {
-      resumeAutosaveForHomeWindowClose(autosaveSuspension);
-      return { ok: false, reason: "stale_request" };
-    }
-    if (state.dirty) {
+    // Saving every document switches between them on purpose, so the window's
+    // own session check does not apply here.
+    if (!(await saveAllUnsaved())) {
       resumeAutosaveForHomeWindowClose(autosaveSuspension);
       return { ok: false, reason: "save_incomplete" };
     }
@@ -2338,7 +2487,7 @@ function wireShellEvents() {
     }
   });
   window.addEventListener("beforeunload", (event) => {
-    if (!state.dirty) {
+    if (!hasUnsavedDocuments()) {
       return;
     }
     event.preventDefault();

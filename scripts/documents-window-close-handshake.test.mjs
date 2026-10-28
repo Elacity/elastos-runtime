@@ -78,6 +78,9 @@ const documentsHarnessSource = [
   "suspendAutosaveForHomeWindowClose",
   "resumeAutosaveForHomeWindowClose",
   "requestHomeWindowCloseDecision",
+  "hasUnsavedDocuments",
+  "unsavedDocumentNames",
+  "saveAllUnsaved",
   "postHomeWindowCloseResult",
   "handleHomeWindowCloseRequest",
 ]
@@ -98,10 +101,14 @@ const documentsSaveHarnessSource = [
   "suspendAutosaveForHomeWindowClose",
   "resumeAutosaveForHomeWindowClose",
   "applySavedDocumentState",
+  "reconcileKeptAfterSave",
   "requireSavedWorkingCopy",
   "saveCurrent",
   "requestHomeWindowCloseDecision",
   "unsavedDocumentName",
+  "hasUnsavedDocuments",
+  "unsavedDocumentNames",
+  "saveAllUnsaved",
 ]
   .map((name) => extractFunction(documentsSource, name))
   .join("\n");
@@ -282,6 +289,7 @@ function createDocumentsSaveHarness() {
     saveRecovery: null,
     savedWorkingCopy: { ...state.current },
     pendingHomeWindowCloseTarget: null,
+    unsavedDocuments: new Map(),
     saveInFlight: null,
     window: {
       setTimeout(callback, delay) {
@@ -378,6 +386,7 @@ function createDocumentsHarness({
   savePlan = "success",
   queuedAutosave = false,
   autosave = true,
+  kept = [],
 } = {}) {
   const posted = [];
   const focused = [];
@@ -438,6 +447,16 @@ function createDocumentsHarness({
     saveRecovery: null,
     pendingHomeWindowCloseTarget: null,
     saveInFlight: null,
+    // Documents kept unsaved in this window while another is open.
+    unsavedDocuments: new Map(kept.map((title) => [`document:${title}`, { document: { doc_did: title, title, file_name: "" } }])),
+    restoreUnsavedDocument(key) {
+      const kept = context.unsavedDocuments.get(key);
+      context.unsavedDocuments.delete(key);
+      state.current = kept.document;
+      elements.titleInput.value = kept.document.title;
+      state.dirty = true;
+      return true;
+    },
     reportSaveFailure() {
       reportedSaveFailure += 1;
     },
@@ -479,6 +498,7 @@ function createDocumentsHarness({
     timers,
     state,
     saveCalls: () => saveCalls,
+    kept: () => [...context.unsavedDocuments.keys()],
     reportedSaveFailure: () => reportedSaveFailure,
     async request(requestId = "documents-close-request-1") {
       const pending = context.api.handleHomeWindowCloseRequest({
@@ -940,4 +960,45 @@ test("a Documents request that never answers fails at its deadline and keeps the
   );
   assert.deepEqual(fetchCalls, ["/api/provider/documents/save"]);
   assert.equal(numericConstant(documentsSource, "DOCUMENTS_REQUEST_DEADLINE_MS"), 20_000);
+});
+
+test("closing asks once for every unsaved document in the window and Save all saves each", async () => {
+  const harness = createDocumentsHarness({ dirty: true, autosave: false, kept: ["Plan", "Notes"] });
+  const pending = harness.request();
+  await Promise.resolve();
+  assert.equal(harness.elements.confirmTitle.textContent, "Save changes to 3 documents?");
+  assert.equal(harness.elements.confirmAction.textContent, "Save all");
+  assert.equal(harness.elements.confirmSecondaryAction.textContent, "Don't save");
+  harness.respond("confirm");
+  await pending;
+  assert.equal(harness.saveCalls(), 3);
+  assert.deepEqual(harness.kept(), []);
+  assert.equal(harness.posted.at(-1).message.ok, true);
+});
+
+test("a window whose open document is saved still asks for the documents it keeps", async () => {
+  const cancelled = createDocumentsHarness({ dirty: false, autosave: false, kept: ["Plan"] });
+  const pending = cancelled.request();
+  await Promise.resolve();
+  assert.equal(cancelled.elements.confirmTitle.textContent, "Save changes to Plan?");
+  assert.equal(cancelled.elements.confirmAction.textContent, "Save");
+  cancelled.respond("cancel");
+  await pending;
+  assert.equal(cancelled.posted.at(-1).message.reason, "cancelled");
+  assert.deepEqual(cancelled.kept(), ["document:Plan"]);
+  assert.equal(cancelled.saveCalls(), 0);
+
+  const dropped = createDocumentsHarness({ dirty: false, autosave: false, kept: ["Plan"] });
+  const discard = dropped.request();
+  dropped.respond("secondary");
+  await discard;
+  assert.equal(dropped.posted.at(-1).message.reason, "discarded");
+  assert.equal(dropped.saveCalls(), 0);
+
+  const failing = createDocumentsHarness({ dirty: false, autosave: false, kept: ["Plan"], savePlan: "failure" });
+  const failed = failing.request();
+  failing.respond("confirm");
+  await failed;
+  assert.equal(failing.posted.at(-1).message.ok, false);
+  assert.equal(failing.posted.at(-1).message.reason, "save_failed");
 });

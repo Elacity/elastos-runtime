@@ -2823,7 +2823,7 @@ const documentApp = vm.createContext({
   state: { current: { doc_did: "did:document-a" }, currentSessionId: 1, dirty: false, homeToken: navigationToken },
   elements: { titleInput: { value: "A" }, editor: { value: "Body A" } },
   documentSelectionSequence: 0, autosaveQueued: false, queuedSaveTarget: null,
-  saveRecovery: null, savedWorkingCopy: null,
+  saveRecovery: null, savedWorkingCopy: null, saveInFlight: null, unsavedDocuments: new Map(),
   clearAutosaveTimer() {}, upsertDocumentListItem() {}, renderDocumentsList() {},
   renderCurrentDocument() {}, showError() {},
   baseName: (uri) => uri.split("/").pop(), base64ToUtf8: () => "Library text",
@@ -2838,7 +2838,7 @@ const documentApp = vm.createContext({
     deliverNavigation(data);
   } } },
 });
-vm.runInContext(["hasExactKeys", "updateDocumentsNavigation",
+vm.runInContext(["hasExactKeys", "updateDocumentsNavigation", "prepareToLeaveCurrent", "keepUnsavedCurrent", "restoreUnsavedDocument",
   "resetPendingSaveIntent", "replaceCurrentDocument", "requireSavedWorkingCopy", "selectDocument", "loadLibraryObject"]
   .map(documentFunction).join("\n"), documentApp);
 let documentClient = navigationClientFixture({ homeToken: navigationToken, homeOrigin: hostWindow.location.origin,

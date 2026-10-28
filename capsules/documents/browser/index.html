@@ -815,6 +815,23 @@ a {
   transition: background 120ms ease;
 }
 
+/* Save shows a dot while the open document has unsaved changes. */
+#save-button {
+  position: relative;
+}
+
+#save-button.has-unsaved::after {
+  content: "";
+  position: absolute;
+  top: 0.28rem;
+  right: 0.28rem;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--warning);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
 .switch-knob {
   position: absolute;
   top: 0.15rem;

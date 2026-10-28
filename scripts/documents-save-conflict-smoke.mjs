@@ -39,11 +39,13 @@ function backend() {
 function editor(server, current = server.docs.get("did:one")) {
   const context = vm.createContext({
     state: { current: { ...current }, currentSessionId: 1, dirty: true, documents: [], mode: "shell", homeToken: "fixture-token" },
-    elements: { titleInput: { value: current.title }, editor: { value: current.body } },
+    elements: { titleInput: { value: current.title }, editor: { value: current.body },
+      shareShell: { classList: { add() {}, remove() {} } }, documentsShell: { classList: { add() {}, remove() {} } } },
     saveInFlight: null, autosaveQueued: false, pendingHomeWindowCloseTarget: null,
     saveRecovery: null, documentSelectionSequence: 0, queuedSaveTarget: null, savedWorkingCopy: { ...current },
+    unsavedDocuments: new Map(),
     isLibraryFileProjection: () => false, isDraftDocument: (doc) => doc.doc_did.startsWith("draft:"),
-    documentIdentity: (doc) => doc.doc_did,
+    documentIdentity: (doc) => (doc.doc_did ? "document:" + doc.doc_did : "draft"),
     documentsProviderApi: (...args) => server.request(...args),
     clearAutosaveTimer() {}, showError() {}, clearStatus() {},
     renderDocumentsList() {}, renderCurrentDocument() { context.state.dirty = false; context.elements.titleInput.value = context.state.current.title; context.elements.editor.value = context.state.current.body; }, refreshPreviewFromEditor() {}, renderHistory() {},
@@ -54,7 +56,7 @@ function editor(server, current = server.docs.get("did:one")) {
     confirmInCapsule: async () => false,
     chooseInCapsule: async () => "cancel",
   });
-  vm.runInContext(["updateDocumentsNavigation", "isCurrentSessionTarget", "isCurrentDocumentTarget", "resetPendingSaveIntent", "replaceCurrentDocument", "applySavedDocumentState", "requireSavedWorkingCopy", "saveCurrent", "selectDocument", "saveAsCurrent", "summaryListItems"].map(functionSource).join("\n"), context);
+  vm.runInContext(["updateDocumentsNavigation", "isCurrentSessionTarget", "isCurrentDocumentTarget", "resetPendingSaveIntent", "replaceCurrentDocument", "applySavedDocumentState", "reconcileKeptAfterSave", "requireSavedWorkingCopy", "saveCurrent", "unsavedKey", "keepUnsavedCurrent", "prepareToLeaveCurrent", "restoreUnsavedDocument", "selectDocument", "saveAsCurrent", "summaryListItems"].map(functionSource).join("\n"), context);
   return context;
 }
 
@@ -215,12 +217,37 @@ test("selection GET keeps edits made while awaiting replies", async () => {
   app.state.dirty = false;
   server.request = async (op, payload) => { const result = await request(op, payload); if (op === "get") await held.promise; return result; };
   const selecting = app.selectDocument("did:two");
+  await new Promise(setImmediate);
+  assert.ok(server.requests.some(({ op }) => op === "get"), "the selection GET is under way");
   app.elements.editor.value = "Edited during selection";
   app.state.dirty = true;
   held.resolve();
   await selecting;
   assert.equal(app.state.current.doc_did, "did:one");
   assert.equal(app.elements.editor.value, "Edited during selection");
+});
+
+test("switching documents keeps unsaved text in this window and brings it back without asking", async () => {
+  const server = backend(), app = editor(server);
+  server.put({ doc_did: "did:two", title: "Two", body: "Two" });
+  const firstRevision = server.docs.get("did:one").revision;
+  app.chooseInCapsule = async () => { throw new Error("switching must not ask"); };
+  app.elements.editor.value = "Kept while away";
+  app.state.dirty = true;
+  await app.selectDocument("did:two");
+  assert.equal(app.state.current.doc_did, "did:two");
+  assert.equal(app.state.dirty, false);
+  assert.equal(app.unsavedDocuments.get("document:did:one").document.body, "Kept while away");
+  const reads = server.requests.filter(({ op }) => op === "get").length;
+  await app.selectDocument("did:one");
+  assert.equal(server.requests.filter(({ op }) => op === "get").length, reads, "coming back reads nothing");
+  assert.equal(app.state.current.doc_did, "did:one");
+  assert.equal(app.state.dirty, true);
+  assert.equal(app.elements.editor.value, "Kept while away");
+  assert.equal(app.unsavedDocuments.size, 0);
+  await app.saveCurrent();
+  assert.equal(server.docs.get("did:one").body, "Kept while away");
+  assert.equal(server.requests.find(({ op }) => op === "save").if_revision, firstRevision);
 });
 
 test("late save recovery GET cannot replace or write into a newer selection", async () => {
@@ -293,7 +320,7 @@ function libraryEditor(file) {
     setDirty(value) { context.state.dirty = value; },
   });
   vm.runInContext(["base64ToUtf8", "utf8ToBase64", "updateDocumentsNavigation", "isCurrentSessionTarget", "isCurrentDocumentTarget",
-    "applySavedDocumentState", "saveCurrent"].map(functionSource).join("\n"), context);
+    "applySavedDocumentState", "reconcileKeptAfterSave", "saveCurrent"].map(functionSource).join("\n"), context);
   return context;
 }
 
@@ -354,4 +381,33 @@ test("a Library-file save that never landed retries, and a file changed meanwhil
   assert.equal(other.body, "Theirs");
   assert.equal(stuck.elements.editor.value, "Mine");
   assert.equal(stuck.state.dirty, true);
+});
+
+test("a save that finishes after its document was left settles the kept text", async () => {
+  for (const editedAfterSave of [false, true]) {
+    const server = backend(), app = editor(server), held = deferred(), request = server.request;
+    server.put({ doc_did: "did:two", title: "Two", body: "Two" });
+    server.request = async (op, payload) => { const result = await request(op, payload); if (op === "save") await held.promise; return result; };
+    app.elements.editor.value = "Sent";
+    const saving = app.saveCurrent();
+    if (editedAfterSave) app.elements.editor.value = "Sent, then more";
+    server.request = async (op, payload) => {
+      const result = await request(op, payload);
+      if (op === "save" && payload.body === "Sent") await held.promise;
+      return result;
+    };
+    await app.selectDocument("did:two");
+    assert.equal(app.state.current.doc_did, "did:two", "leaving does not wait for a stored document's save");
+    held.resolve();
+    await saving;
+    assert.equal(server.docs.get("did:one").body, "Sent");
+    if (!editedAfterSave) {
+      assert.equal(app.unsavedDocuments.size, 0, "the kept text was what saved");
+      continue;
+    }
+    assert.equal(app.unsavedDocuments.get("document:did:one").document.revision, server.docs.get("did:one").revision);
+    await app.selectDocument("did:one");
+    await app.saveCurrent();
+    assert.equal(server.docs.get("did:one").body, "Sent, then more", "the later edit saves on the new revision");
+  }
 });
