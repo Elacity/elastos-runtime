@@ -524,7 +524,7 @@ async function framePublicCopyState(tabId, targetId) {
   return frameState(tabId, targetId, `(() => {
     const text = doc.body?.innerText?.replace(/\\s+/g, " ").trim() || "";
     const headings = [...doc.querySelectorAll("h1, h2, h3")]
-      .filter((node) => node.offsetParent !== null && !node.closest("#technical-details, .technical-details, [data-tab=technical]"))
+      .filter((node) => node.offsetParent !== null && !node.closest("#technical-details, .technical-details"))
       .map((node) => node.textContent?.replace(/\\s+/g, " ").trim() || "")
       .filter(Boolean);
     return { ok: true, text, headings };
@@ -541,7 +541,7 @@ async function directPublicCopyState(tabId, path) {
   await delay(600);
   return evaluate(tabId, `(() => {
     const headings = [...document.querySelectorAll("h1, h2, h3")]
-      .filter((node) => node.offsetParent !== null && !node.closest("#technical-details, .technical-details, [data-tab=technical]"))
+      .filter((node) => node.offsetParent !== null && !node.closest("#technical-details, .technical-details"))
       .map((node) => node.textContent?.replace(/\\s+/g, " ").trim() || "")
       .filter(Boolean);
     return {
