@@ -83,11 +83,11 @@ function validatedSharedResult(result, uri) {
 export function requestHomeSharedContent({ context, data, prompt, fetchJson }) {
   const source = data.source;
   const keys = ["type", "uri", "homeToken", ...(source === undefined ? [] : ["source"])];
-  if (context.kind !== "app-frame" || !["chat-room", "documents"].includes(context.targetId)
+  if (context.kind !== "app-frame" || context.targetId !== "chat-room"
     || !hasExactKeys(data, keys) || data.type !== "home:open-uri"
     || data.homeToken !== context.homeToken || typeof data.uri !== "string"
     || !data.uri.startsWith("elastos://") || data.uri.length > MAX_EXTERNAL_LINK_LENGTH
-    || (source !== undefined && (context.targetId !== "chat-room" || !source
+    || (source !== undefined && (!source
       || typeof source !== "object" || Array.isArray(source)
       || !hasExactKeys(source, ["conversation_id", "message_id"])
       || ![source.conversation_id, source.message_id].every(value => typeof value === "string" && value.length > 0)))) return false;

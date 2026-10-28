@@ -384,12 +384,7 @@ pub(super) async fn home_shared_content_check(
         Ok(found) => found,
         Err(err) => return (StatusCode::FORBIDDEN, err.to_string()).into_response(),
     };
-    let source_allowed = match app.id.as_str() {
-        CHAT_ROOM_CAPSULE_ID => true,
-        DOCUMENTS_CAPSULE_ID => input.source.is_none(),
-        _ => false,
-    };
-    if !source_allowed {
+    if app.id != CHAT_ROOM_CAPSULE_ID {
         return (StatusCode::FORBIDDEN, "this app cannot open shared files").into_response();
     }
     let cid = match exact_shared_content_cid(&input.uri) {

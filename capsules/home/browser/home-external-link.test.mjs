@@ -162,6 +162,7 @@ test('the Home handoff refuses extra fields, malformed source and unauthorized a
     [context, { ...message(), source: { conversation_id: 'file-community', message_id: '' } }],
     [context, { ...message(), homeToken: 'wrong' }],
     [{ ...context, targetId: 'documents' }, message()],
+    [{ ...context, targetId: 'documents' }, (({ source, ...ownFile }) => ownFile)(message())],
     [{ ...context, targetId: 'wallet' }, message()], [{ ...context, kind: 'shell-frame' }, message()],
   ]) {
     const h = harness();
@@ -170,10 +171,12 @@ test('the Home handoff refuses extra fields, malformed source and unauthorized a
   }
 });
 
-test('Documents checks without a source and a network error offers retry', async () => {
+test('Chat checks its own file without a source and a network error offers retry', async () => {
   const h = harness(), data = message(); delete data.source;
-  assert.equal(requestHomeSharedContent({ context: { ...context, targetId: 'documents' }, data,
-    prompt: h.prompt, fetchJson: async () => { throw new Error('offline'); } }), true);
+  const calls = [];
+  assert.equal(requestHomeSharedContent({ context, data, prompt: h.prompt,
+    fetchJson: async (route, init) => { calls.push(JSON.parse(init.body)); throw new Error('offline'); } }), true);
+  assert.deepEqual(calls[0], { schema: 'elastos.home.shared-content.check/v1', app_token: 'launch', uri });
   await settle(); assert.match(h.status.textContent, /could not check/); assert.equal(h.openButton.disabled, false);
 });
 

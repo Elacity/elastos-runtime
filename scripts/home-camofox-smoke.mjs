@@ -489,9 +489,9 @@ async function confirmSharedFile(tabId, uri, allowMissing = false) {
 }
 
 async function openElastosUri(tabId, uri) {
-  await openShellTarget(tabId, "documents");
+  await openShellTarget(tabId, "chat-room");
   const sent = await waitFor(async () => {
-    const result = await frameState(tabId, "documents", `(() => {
+    const result = await frameState(tabId, "chat-room", `(() => {
       const homeToken = new URLSearchParams(win.location.hash.slice(1)).get("home_token") || "";
       if (!homeToken) return { ok: false };
       const message = { type: "home:open-uri", uri: ${JSON.stringify(uri)}, homeToken };
@@ -500,7 +500,7 @@ async function openElastosUri(tabId, uri) {
     })()`);
     return result.ok;
   }, 7000, 300);
-  assert(sent, "Documents could not request the shared file");
+  assert(sent, "Chat could not request the shared file");
   return confirmSharedFile(tabId, uri, true);
 }
 
@@ -1612,9 +1612,10 @@ async function main() {
       );
 
       const uri = `elastos://${TEST_DOCUMENT_CID}`;
+      await openShellTarget(tabId, "chat-room");
       let authorized = null;
       const authorizedSent = await waitFor(async () => {
-        authorized = await frameState(tabId, "documents", `(() => {
+        authorized = await frameState(tabId, "chat-room", `(() => {
           const homeToken = new URLSearchParams(win.location.hash.slice(1)).get("home_token") || "";
           const message = {
             type: "home:open-uri",
@@ -1626,7 +1627,7 @@ async function main() {
         })()`);
         return authorized.ok;
       }, 7000, 300);
-      assert(authorizedSent, "Documents frame could not send authorized open-uri message", authorized);
+      assert(authorizedSent, "Chat frame could not send authorized open-uri message", authorized);
       if (!await confirmSharedFile(tabId, uri, true)) return;
       const opened = await waitFor(async () => {
         const routes = await evaluate(tabId, `(() => [...document.querySelectorAll('.window[data-target="documents"] .window-frame')]
@@ -1637,7 +1638,7 @@ async function main() {
         ));
       }, 12000, 500);
       state = await shellState(tabId);
-      assert(opened, "Home rejected an authorized Documents open-uri message", state);
+      assert(opened, "Home rejected an authorized Chat open-uri message", state);
     });
 
     await runCase("documents-delete-removes-current-document", async (tabId) => {

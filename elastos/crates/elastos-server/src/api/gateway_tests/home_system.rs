@@ -13233,6 +13233,19 @@ async fn home_shared_content_check_then_get_fetches_a_contacts_linked_file_once(
         home_shared_content_post(&app, &home_token, CHECK, check(&other_cid, &shared)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
+    // Only Chat opens shared files; another app's source-less request is refused.
+    let documents_token = projection_launch_token_for_authority_context(
+        alice_dir.path(),
+        DOCUMENTS_CAPSULE_ID,
+        &alice.authority,
+    );
+    let mut own_file = check(&cid, &shared);
+    own_file.as_object_mut().unwrap().remove("source");
+    own_file["app_token"] = json!(documents_token);
+    let (status, body) = home_shared_content_post(&app, &home_token, CHECK, own_file).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body, "this app cannot open shared files");
+
     // A pin that failed leaves a `repair_needed` receipt and no bytes here.
     // That is not "local": check and get still go to Bob's Home.
     let ensured = alice
