@@ -131,6 +131,14 @@ product or Browser support.
 [ROADMAP.md](ROADMAP.md) links planned work;
 [elastos/CHANGELOG.md](elastos/CHANGELOG.md) records release history.
 
+## Known limitations
+
+The 0.8.0 limits are listed in [Known limitations](docs/KNOWN-LIMITATIONS.md):
+items the changelog still marks not done, the open findings in
+[SECURITY.md](SECURITY.md), and how confinement differs by operating system.
+The [threat model](docs/THREAT-MODEL.md) states who mints capability tokens and
+which checks this tree performs.
+
 For command ownership across Home and operator lanes, see the [command
 matrix](docs/COMMAND_MATRIX.md).
 

@@ -181,3 +181,4 @@ typed app projections. These checks complement the current browser boundary
 and do not establish provider process confinement or a separate Home authority.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full trust model.
+See the [threat model](docs/THREAT-MODEL.md) and [known limitations](docs/KNOWN-LIMITATIONS.md).
