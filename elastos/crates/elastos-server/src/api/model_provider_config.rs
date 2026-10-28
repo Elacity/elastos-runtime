@@ -679,7 +679,6 @@ pub(crate) struct AiProviderConnection {
     pub processor_kind: String,
     pub selected_model: Option<String>,
     pub key_present: bool,
-    pub share_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub privacy: Option<String>,
 }
@@ -793,7 +792,6 @@ fn connection_from_offer(offer: &serde_json::Value) -> Option<AiProviderConnecti
         processor_kind: "external".to_string(),
         selected_model,
         key_present,
-        share_enabled: hosted_share_enabled(offer),
         privacy,
     })
 }

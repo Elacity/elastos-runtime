@@ -202,7 +202,7 @@ async fn non_assistant_capsule_cannot_invoke_model_provider() {
 }
 
 #[tokio::test]
-async fn marketplace_reads_model_offers_and_services_without_run_or_grant_authority() {
+async fn marketplace_reads_model_offers_without_services_run_or_grant_authority() {
     let dir = tempfile::tempdir().unwrap();
     let provider = RecordingModelProvider::default();
     *provider.response.lock().await = json!({"status":"ok", "data":{"offers":[]}});
@@ -222,6 +222,7 @@ async fn marketplace_reads_model_offers_and_services_without_run_or_grant_author
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{operation}");
     }
+    // Marketplace lists only granted shared models, not contacts' Services offers.
     let response = app
         .clone()
         .oneshot(
@@ -233,7 +234,7 @@ async fn marketplace_reads_model_offers_and_services_without_run_or_grant_author
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let response = app
         .oneshot(
             test_browser_request("localhost:61180", "null")

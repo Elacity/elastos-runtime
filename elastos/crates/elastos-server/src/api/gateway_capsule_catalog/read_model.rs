@@ -34,6 +34,8 @@ pub(in crate::api::gateway) fn capsule_catalog_summary_for(
         .into_iter()
         // Assistant owns new launches even while a retired app tree remains.
         .filter(|manifest| manifest.name != "home-agent")
+        // Services is hidden until sharing moves into People.
+        .filter(|manifest| manifest.name != SERVICES_CAPSULE_ID)
         // A directory or component entry cannot authenticate model content.
         .filter(|manifest| manifest.model_content.is_none())
         .filter(|manifest| {

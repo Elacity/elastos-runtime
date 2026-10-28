@@ -1641,19 +1641,10 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert_eq!(system["route"], "/apps/system/");
     assert_eq!(system["attach_kind"], "iframe");
     assert_eq!(system["target_kind"], "app");
-    let services = targets
-        .iter()
-        .find(|target| target["target"] == "services")
-        .expect("services target");
-    assert_eq!(services["role"], "app");
-    assert_eq!(services["title"], "Services");
-    assert_eq!(
-        services["description"],
-        "Manage Browser Exit Node sharing and subscriptions."
+    assert!(
+        targets.iter().all(|target| target["target"] != "services"),
+        "Services is hidden until sharing moves into People"
     );
-    assert_eq!(services["route"], "/apps/services/");
-    assert_eq!(services["attach_kind"], "iframe");
-    assert_eq!(services["target_kind"], "app");
     assert!(targets
         .iter()
         .any(|target| target["target"] == "chat-room" && target["role"] == "app"));
@@ -1760,13 +1751,6 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
         targets
             .iter()
             .filter(|target| target["target"] == "inbox")
-            .count(),
-        1
-    );
-    assert_eq!(
-        targets
-            .iter()
-            .filter(|target| target["target"] == "services")
             .count(),
         1
     );
@@ -8724,6 +8708,91 @@ async fn test_home_drops_a_saved_archive_window_and_library_still_opens_archive(
     assert!(home_launch_target(dir.path(), "archive-manager").is_some());
 }
 
+/// Services is hidden until sharing moves into People: it is not in the
+/// launcher, on the desktop or in Marketplace, and a window, shortcut or recent
+/// entry an earlier release saved for it is dropped when Home loads its state.
+#[tokio::test]
+async fn test_home_drops_a_saved_services_window_and_marketplace_does_not_list_services() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    write_test_browser_capsule(dir.path(), SERVICES_CAPSULE_ID, "app", "Services", None);
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let state_uri = format!("{localhost_root}/.AppData/ElastOS/Home/browser-state.json");
+    let state_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &state_uri).unwrap();
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    crate::auth::write_principal_root_object(
+        dir.path(),
+        &authority.principal_id,
+        &localhost_root,
+        &state_uri,
+        &state_path,
+        &serde_json::to_vec(&json!({
+            "schema": "elastos.home.browser-state/v1",
+            "principal_id": authority.principal_id.clone(),
+            "localhost_root": localhost_root.clone(),
+            "layout": {
+                "desktop": {
+                    "services": { "x": 12, "y": 12 },
+                    "system": { "x": 18, "y": 18 }
+                },
+                "taskbar": ["services", "system"]
+            },
+            "session": {
+                "browser_context_id": "browser:test",
+                "windows": [
+                    { "target": "services", "active": true },
+                    { "target": "system", "active": false }
+                ]
+            },
+            "recent_targets": ["services", "system"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let get = |uri: &'static str| {
+        app.clone().oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri(uri)
+                .header("x-elastos-home-token", authority.home_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+
+    let loaded = get("/api/apps/home/state").await.unwrap();
+    assert_eq!(loaded.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(loaded.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        state["session"]["windows"],
+        json!([{ "target": "system", "active": false }])
+    );
+    assert_eq!(state["recent_targets"], json!(["system"]));
+    assert!(state["layout"]["desktop"].get("services").is_none());
+    assert_eq!(state["layout"]["taskbar"], json!(["system"]));
+
+    let summary = get("/api/apps/home/summary").await.unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let targets = summary["targets"].as_array().unwrap();
+    assert!(targets.iter().any(|target| target["target"] == "system"));
+    assert!(!targets.iter().any(|target| target["target"] == "services"));
+    assert!(
+        !capsule_catalog_summary(dir.path())
+            .capsules
+            .iter()
+            .any(|capsule| capsule.name == SERVICES_CAPSULE_ID),
+        "Marketplace must not list Services"
+    );
+}
+
 #[tokio::test]
 async fn test_home_browser_state_defaults_preserve_malformed_state_and_refuse_overwrite() {
     let dir = tempfile::tempdir().unwrap();
@@ -9870,9 +9939,10 @@ async fn test_private_engine_request_requires_share_before_inbox_approval() {
             .iter()
             .find(|entry| entry["kind"] == "service_access_request")
             .unwrap();
-        assert!(request["body"].as_str().unwrap().contains(
-            "Your Browser Engine is private. Share it in Services before approving this request."
-        ));
+        assert!(request["body"]
+            .as_str()
+            .unwrap()
+            .contains("Your Browser Engine is not shared, so this request cannot be approved."));
         let action = request["action_ref"]["action_id"]
             .as_str()
             .unwrap()
@@ -9886,7 +9956,7 @@ async fn test_private_engine_request_requires_share_before_inbox_approval() {
         .await;
         assert!(!status.is_success());
         assert!(
-            message.contains("Your Browser Engine is private. Share it in Services"),
+            message.contains("Your Browser Engine is not shared"),
             "{message}"
         );
         let (_, still_pending) =
@@ -10008,8 +10078,9 @@ async fn test_services_inbox_request_copy_matches_engine_or_exit_and_exact_appro
             entry["body"],
             format!("Alice wants to use {offer_name}. {approval_text}")
         );
-        assert_eq!(entry["source_app"], SERVICES_CAPSULE_ID);
-        assert_eq!(entry["action_ref"]["app"], SERVICES_CAPSULE_ID);
+        // Inbox owns the decision; Services is hidden, so nothing points at it.
+        assert_eq!(entry["source_app"], INBOX_CAPSULE_ID);
+        assert_eq!(entry["action_ref"]["app"], INBOX_CAPSULE_ID);
         assert_eq!(entry["action_ref"]["action_id"], action);
         assert_eq!(
             entry["id"],
@@ -10138,7 +10209,6 @@ async fn test_inbox_projects_approved_model_grant_outside_pending_counts() {
     assert_eq!(grants.len(), 1, "{inbox}");
     let grant = grants[0];
     assert_eq!(grant["id"], "service-access-grant:approved-model-1");
-    assert_eq!(grant["source_app"], SERVICES_CAPSULE_ID);
     assert_eq!(grant["title"], "Seed may use your AI model");
     assert_eq!(
         grant["body"],
@@ -10148,7 +10218,8 @@ async fn test_inbox_projects_approved_model_grant_outside_pending_counts() {
         grant["action_ref"]["action_id"],
         "service-deny-request:approved-model-1"
     );
-    assert_eq!(grant["action_ref"]["app"], SERVICES_CAPSULE_ID);
+    assert_eq!(grant["source_app"], INBOX_CAPSULE_ID);
+    assert_eq!(grant["action_ref"]["app"], INBOX_CAPSULE_ID);
     assert_eq!(grant["read"], true);
     assert_eq!(grant["severity"], "info");
     assert!(

@@ -710,7 +710,7 @@ async function main() {
     }
 
     await runCase("ordinary-app-copy-stays-plain-and-heading-unique", async (tabId) => {
-      for (const target of ["system", "marketplace", "services", "inbox", "library", "documents", "wallet", "browser"]) {
+      for (const target of ["system", "marketplace", "inbox", "library", "documents", "wallet", "browser"]) {
         await openShellTarget(tabId, target);
         const ready = await waitFor(async () => (await framePublicCopyState(tabId, target)).ok, 15_000, 300);
         assert(ready, `${target} did not render for the public-copy visual check`, await shellState(tabId));
@@ -1902,6 +1902,8 @@ async function main() {
       assert(desktopTargets.includes("library"), "Library should be exposed as a Home desktop shortcut", desktopTargets);
       assert(!launcherTargets.includes("archive-manager"), "Archive opens from Library and must not be in the Home launcher", launcherTargets);
       assert(!desktopTargets.includes("archive-manager"), "Archive opens from Library and must not be a Home desktop shortcut", desktopTargets);
+      assert(!launcherTargets.includes("services"), "Services is hidden and must not be in the Home launcher", launcherTargets);
+      assert(!desktopTargets.includes("services"), "Services is hidden and must not be a Home desktop shortcut", desktopTargets);
       assert(state.launcherHeading === "Apps", "Home launcher heading should match the canonical Apps launcher", state);
       assert(state.launcherSearchPlaceholder === "Search", "Home launcher search placeholder should match the canonical launcher copy", state);
       assert(!state.launcherGroupHeadings.includes("All Apps"), "Home launcher should not describe mixed targets as apps", state);

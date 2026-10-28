@@ -42,7 +42,7 @@ pub(super) const PROFILE_REQUIRED_DISCOVERY_MESSAGE: &str =
 const PROFILE_REQUIRED_PEOPLE_CONTACTS_MESSAGE: &str =
     "Save your Profile before using People contacts";
 const PROFILE_REQUIRED_SERVICES_MESSAGE: &str =
-    "Save your Profile before using Services with other people";
+    "Save your Profile before sharing with other people";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ProfileRequiredError(&'static str);
@@ -2628,14 +2628,11 @@ pub(super) async fn services_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_home_launch_token_binding(
-        &state.data_dir,
-        &headers,
-        &[SERVICES_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
-    ) {
-        Ok(binding) => binding.context,
-        Err(err) => return home_error_response(err),
-    };
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, SERVICES_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return home_error_response(err),
+        };
     let data_dir = state.data_dir.clone();
     let discovery_service = state.collaboration_discovery_service.clone();
     let provider_registry = state.provider_registry.clone();
@@ -5149,7 +5146,7 @@ fn home_services_request_notification_copy(kind: &str, uri: &str) -> (&'static s
 }
 
 const PRIVATE_ENGINE_APPROVAL_COPY: &str =
-    "Your Browser Engine is private. Share it in Services before approving this request.";
+    "Your Browser Engine is not shared, so this request cannot be approved.";
 const HOSTED_MODEL_APPROVAL_COPY: &str =
     "Only an admin can approve use of this Home's hosted AI connection.";
 
@@ -5224,14 +5221,16 @@ pub(super) fn append_home_service_access_notifications(
             match home_services_local_engine_shared(data_dir, context) {
                 Ok(false) => PRIVATE_ENGINE_APPROVAL_COPY.to_string(),
                 Ok(true) => approval_effect.to_string(),
-                Err(_) => "Check Browser Engine sharing in Services before approval.".to_string(),
+                Err(_) => {
+                    "This Home could not check whether your Browser Engine is shared.".to_string()
+                }
             }
         } else {
             approval_effect.to_string()
         };
         notifications.entries.push(HomeNotificationEntrySummary {
             id,
-            source_app: SERVICES_CAPSULE_ID.to_string(),
+            source_app: INBOX_CAPSULE_ID.to_string(),
             kind: "service_access_request".to_string(),
             title: format!(
                 "{} requests your {service_noun}",
@@ -5242,7 +5241,7 @@ pub(super) fn append_home_service_access_notifications(
                 request.requester_display_name, request.service_display_name
             ),
             action_ref: Some(HomeNotificationActionSummary {
-                app: SERVICES_CAPSULE_ID.to_string(),
+                app: INBOX_CAPSULE_ID.to_string(),
                 action_id: format!("service-approve-request:{}", request.request_id),
             }),
             severity: "attention".to_string(),
@@ -5259,7 +5258,7 @@ pub(super) fn append_home_service_access_notifications(
             home_services_request_notification_copy(&request.service_kind, &request.service_uri);
         notifications.entries.push(HomeNotificationEntrySummary {
             id,
-            source_app: SERVICES_CAPSULE_ID.to_string(),
+            source_app: INBOX_CAPSULE_ID.to_string(),
             kind: "service_access_grant".to_string(),
             title: format!(
                 "{} may use your {service_noun}",
@@ -5270,7 +5269,7 @@ pub(super) fn append_home_service_access_notifications(
                 request.requester_display_name, request.service_display_name
             ),
             action_ref: Some(HomeNotificationActionSummary {
-                app: SERVICES_CAPSULE_ID.to_string(),
+                app: INBOX_CAPSULE_ID.to_string(),
                 action_id: format!("service-deny-request:{}", request.request_id),
             }),
             severity: "info".to_string(),

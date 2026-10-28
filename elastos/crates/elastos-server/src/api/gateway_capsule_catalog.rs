@@ -1457,10 +1457,14 @@ mod tests {
             })
             // WalletConnect stays out until an operator pins its config.
             .filter(|name| *name != WALLET_WALLETCONNECT_CAPSULE_ID)
+            // Services is hidden until sharing moves into People.
+            .filter(|name| *name != SERVICES_CAPSULE_ID)
             .collect::<BTreeSet<_>>();
         assert_eq!(catalog_names, expected);
         assert!(active_names.contains(WALLET_WALLETCONNECT_CAPSULE_ID));
         assert!(!catalog_names.contains(WALLET_WALLETCONNECT_CAPSULE_ID));
+        assert!(active_names.contains(SERVICES_CAPSULE_ID));
+        assert!(!catalog_names.contains(SERVICES_CAPSULE_ID));
         assert!(!catalog_names.contains("bus-v1-conformance"));
 
         let catalog_interface_count = catalog
@@ -1484,7 +1488,6 @@ mod tests {
             "browser",
             "wallet",
             "inbox",
-            "services",
             SYSTEM_CAPSULE_ID,
             "library",
             "documents",
