@@ -331,8 +331,8 @@ function contactRequestMessage(result) {
   const unknown = name === "Name not known yet";
   switch (result?.status) {
     case "requested": return unknown
-      ? "Request sent. Name not known yet. They'll see it in Inbox when their Home is online."
-      : `Request sent. ${name} sees it in Inbox when their Home is online.`;
+      ? "Request sent. Name not known yet. They'll see it in Inbox when they next open Home."
+      : `Request sent. ${name} sees it in Inbox when they next open Home.`;
     case "already_requested": return unknown
       ? "Request sent. Name not known yet. Waiting for them to accept."
       : `Request sent. Waiting for ${name} to accept.`;

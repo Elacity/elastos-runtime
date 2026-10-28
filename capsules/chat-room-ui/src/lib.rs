@@ -9167,9 +9167,9 @@ impl ContactRequestResponse {
         let name = &self.display_name;
         match self.status {
             ContactRequestStatus::Requested if name == "Name not known yet" =>
-                "Request sent. Name not known yet. They'll see it in Inbox when their Home is online.".to_string(),
+                "Request sent. Name not known yet. They'll see it in Inbox when they next open Home.".to_string(),
             ContactRequestStatus::Requested =>
-                format!("Request sent. {name} sees it in Inbox when their Home is online."),
+                format!("Request sent. {name} sees it in Inbox when they next open Home."),
             ContactRequestStatus::AlreadyRequested if name == "Name not known yet" =>
                 "Request sent. Name not known yet. Waiting for them to accept.".to_string(),
             ContactRequestStatus::AlreadyRequested => format!("Request sent. Waiting for {name} to accept."),
@@ -9833,7 +9833,7 @@ mod participant_card_tests {
             (
                 "requested",
                 "requested",
-                "Request sent. Alma sees it in Inbox when their Home is online.",
+                "Request sent. Alma sees it in Inbox when they next open Home.",
             ),
             (
                 "already_requested",
@@ -9861,7 +9861,7 @@ mod participant_card_tests {
         .unwrap();
         assert_eq!(
             response.message(),
-            "Request sent. Name not known yet. They'll see it in Inbox when their Home is online."
+            "Request sent. Name not known yet. They'll see it in Inbox when they next open Home."
         );
         assert!(
             serde_json::from_value::<ContactRequestResponse>(serde_json::json!({

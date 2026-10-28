@@ -437,7 +437,7 @@ async function runScenario(name) {
     await settle();
     assert.deepEqual(environment.copies, [{ text: "did:key:zLocalProfile", purpose: "profile.id" }]);
     const expected = {
-      requested: "Request sent. Alma sees it in Inbox when their Home is online.",
+      requested: "Request sent. Alma sees it in Inbox when they next open Home.",
       already_requested: "Request sent. Waiting for Alma to accept.",
       already_contact: "Alma is already a contact.",
       pending_from_them: "Alma already asked to connect. Open Inbox to answer.",
@@ -457,7 +457,7 @@ async function runScenario(name) {
       assert.deepEqual(JSON.parse(request.options.body), { profile_id: "did:key:zRemoteProfile" });
     }
     for (const [status, ending] of [
-      ["requested", "They'll see it in Inbox when their Home is online."],
+      ["requested", "They'll see it in Inbox when they next open Home."],
       ["already_requested", "Waiting for them to accept."],
     ]) {
       environment.replies.push(response(200, { status, display_name: "Name not known yet" }), ready());

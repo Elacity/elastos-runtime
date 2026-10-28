@@ -1809,7 +1809,7 @@ async function runScenario(scenario) {
         await frame.locator("#participant-card-action").click();
       }
       const messages = {
-        requested: "Request sent. Fixture Friend sees it in Inbox when their Home is online.",
+        requested: "Request sent. Fixture Friend sees it in Inbox when they next open Home.",
         already_requested: "Request sent. Waiting for Fixture Friend to accept.",
         already_contact: "Fixture Friend is already a contact.",
         pending_from_them: "Fixture Friend already asked to connect. Open Inbox to answer.",
