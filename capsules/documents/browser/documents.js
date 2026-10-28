@@ -1090,9 +1090,10 @@ function renderDocumentsList() {
       classes.push("active");
     }
     button.className = classes.join(" ");
-    button.dataset.docDid = item.doc_did;
     if (item.library_object_uri) {
       button.dataset.objectUri = item.library_object_uri;
+    } else {
+      button.dataset.docDid = item.doc_did;
     }
     const dirtyMarker = isCurrent && state.dirty ? " • unsaved" : "";
     button.innerHTML =
@@ -1209,10 +1210,10 @@ function startDraftDocument(options) {
 }
 
 // Documents' own objects, then plain .md and .txt files in the Documents
-// folder that have none (made in Library, say); those open as Library files.
+// folder that have none (made in Library, say); those open as Library files
+// and are known by their URI only (no doc_did, which a new draft also lacks).
 function summaryListItems(summary) {
   const files = (summary.files || []).map((file) => ({
-    doc_did: "",
     library_object_uri: file.uri,
     title: file.name,
     file_name: file.path,
@@ -1278,8 +1279,12 @@ async function loadSummary() {
 async function loadLibraryObject(uri) {
   const sequence = ++documentSelectionSequence;
   const sessionId = state.currentSessionId;
+  const title = elements.titleInput.value;
+  const body = elements.editor.value;
   const response = await libraryObjectApi("read", { uri });
-  if (sequence !== documentSelectionSequence || sessionId !== state.currentSessionId) return;
+  // Edits made while the file was read stay; the file does not replace them.
+  if (sequence !== documentSelectionSequence || sessionId !== state.currentSessionId ||
+      title !== elements.titleInput.value || body !== elements.editor.value) return;
   const object = response.object || {};
   const name = object.name || baseName(object.uri || uri);
   replaceCurrentDocument({

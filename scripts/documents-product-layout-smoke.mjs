@@ -29,6 +29,7 @@ const saveCalls = [];
 const publishedFixtureCid = "bafypublishedfixture";
 const publishedWebLink = "https://example.invalid/published-link";
 let delayNextSave = false;
+let heldLibraryRead = null;
 let delayedSaveStart = null;
 let delayedSaveRelease = null;
 let activeSaveCalls = 0;
@@ -292,6 +293,12 @@ function createAppServer() {
         res.writeHead(404);
         res.end("Library object not found");
         return;
+      }
+      if (heldLibraryRead) {
+        const held = heldLibraryRead;
+        heldLibraryRead = null;
+        held.started.resolve();
+        await held.release.promise;
       }
       json(res, {
         object: { uri: folderFile.uri, name: folderFile.name, revision: "fixture-revision", mime: "text/plain", modified_at: folderFile.updated_at },
@@ -881,6 +888,30 @@ async function run() {
       assert(JSON.stringify(searched) === JSON.stringify([folderFile.uri]),
         `Documents search must filter folder files by name and path. Got ${JSON.stringify(searched)}`);
       await filesPage.locator("#sidebar-search").fill("");
+
+      // Edits made while a listed file is still being read stay in the editor.
+      await filesPage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
+      await filesPage.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
+      heldLibraryRead = { started: createDeferred(), release: createDeferred() };
+      const held = heldLibraryRead;
+      await fileItem.click();
+      await held.started.promise;
+      const typedBody = `${documents.get("doc-beta").body}\n\nTyped while the file opened.`;
+      await filesPage.locator("#editor").fill(typedBody);
+      held.release.resolve();
+      await waitForCondition(
+        () => saveCalls.some((call) => call.docDid === "doc-beta" && call.body === typedBody),
+        4000,
+        `Documents must keep and save edits made while a listed file was read. Got ${JSON.stringify(saveCalls)}`,
+      );
+      const kept = await filesPage.evaluate(() => ({
+        title: document.getElementById("title-input")?.value || "",
+        body: document.getElementById("editor")?.value || "",
+      }));
+      assert(kept.title === "Beta" && kept.body === typedBody,
+        `Documents must not replace edits made while a listed file was read. Got ${JSON.stringify(kept)}`);
+
+      await filesPage.waitForFunction(() => document.getElementById("save-button")?.disabled === true);
       await fileItem.click();
       await filesPage.waitForFunction((body) => document.getElementById("editor")?.value === body, folderFileBody);
       const opened = await filesPage.evaluate(() => ({
@@ -889,6 +920,12 @@ async function run() {
       }));
       assert(opened.title === folderFile.name && opened.active === folderFile.uri,
         `Documents must open a folder file from the list as the Library file. Got ${JSON.stringify(opened)}`);
+
+      // Naming a new draft names only the draft, never a listed plain file.
+      await filesPage.locator("#new-document").click();
+      await filesPage.locator("#title-input").fill("Draft name");
+      const fileTitle = await fileItem.locator(".document-list-title").textContent();
+      assert(fileTitle === folderFile.name, `Naming a new draft must not rename a listed file. Got ${fileTitle}`);
     } finally {
       await filesPage.close();
     }
