@@ -538,9 +538,16 @@ function publishHarness({ confirm = true, failures = {}, clipboardFails = false,
     },
     async providerApi(op, payload) {
       requests.push({ op, payload });
-      const code = failures[payload.uri];
-      if (code) throw Object.assign(new Error(`provider said ${code}`), { code });
+      const failure = failures[payload.uri];
+      if (failure) {
+        const { code, reason } = typeof failure === "string" ? { code: failure } : failure;
+        throw Object.assign(new Error(`provider said ${code}`), { code, reason });
+      }
       return { uri: "elastos://bafkreipublished" };
+    },
+    // A folder reload writes its own status, as Library's does.
+    async loadCurrentFolder() {
+      statuses.push("3 items");
     },
     selectedObjects: () => selection,
     setStatus(status) {
@@ -607,14 +614,18 @@ test("Library Publish Selected reports partial success in plain words", async ()
   });
   await harness.actions.publishSelectedObjects();
   assert.equal(harness.requests.length, 3);
-  assert.equal(harness.statuses.at(-1), "Published 2 of 3 files. Empty.md: Empty files can't be published.");
+  assert.equal(harness.statuses.at(-1), "Published 2 of 3 files. Empty.md: Empty files can't be published.",
+    "the result must stay visible after the folder reloads");
 
   const two = publishHarness({
     selection: [file("A.md"), file("Big.bin"), file("Old.md")],
     failures: { [`${DOCS}/Big.bin`]: "too_large", [`${DOCS}/Old.md`]: "stale_revision" },
   });
   await two.actions.publishSelectedObjects();
-  assert.equal(two.statuses.at(-1), "Published 1 of 3 files. Not published: Big.bin, Old.md.");
+  assert.equal(
+    two.statuses.at(-1),
+    "Published 1 of 3 files. Big.bin: This file is too large to publish. Files up to 8 MiB can be published. Old.md: This file changed. Refresh Library and try again.",
+  );
 });
 
 test("Library Publish maps each error code to plain words", async () => {
@@ -622,7 +633,7 @@ test("Library Publish maps each error code to plain words", async () => {
     empty_file: "Empty files can't be published.",
     too_large: "This file is too large to publish. Files up to 8 MiB can be published.",
     stale_revision: "This file changed. Refresh Library and try again.",
-    unsupported: "Folders can't be published.",
+    unsupported: "This file can't be published from here.",
     unavailable: "Publishing isn't available right now. Try again.",
     changed_since_publish: "This file changed after it was published. Unpublish it first, then publish it again.",
     library_error: "Guide.md could not be published. Try again.",
@@ -632,6 +643,18 @@ test("Library Publish maps each error code to plain words", async () => {
     await harness.actions.publishObject(file("Guide.md"));
     assert.equal(harness.statuses.at(-1), text, code);
   }
+  for (const [reason, text] of [
+    ["folder", "Folders can't be published."],
+    ["protected", "Protected files can't be published."],
+    ["symlink", "This file can't be published from here."],
+  ]) {
+    const harness = publishHarness({ failures: { [`${DOCS}/Guide.md`]: { code: "unsupported", reason } } });
+    await harness.actions.publishObject(file("Guide.md"));
+    assert.equal(harness.statuses.at(-1), text, reason);
+  }
+  const ok = publishHarness();
+  await ok.actions.publishObject(file("Guide.md"));
+  assert.equal(ok.statuses.at(-1), "Published Guide.md.", "success must stay visible after the folder reloads");
 });
 
 test("Library Copy Link copies the recorded publication, never the current file CID", async () => {

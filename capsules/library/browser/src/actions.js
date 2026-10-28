@@ -441,8 +441,16 @@ export function createLibraryActions({
       setStatus(publishFailureText(error, object.name));
       return;
     }
-    setStatus(`Published ${object.name}.`);
-    await loadCurrentFolder();
+    await showAfterReload(`Published ${object.name}.`);
+  }
+
+  // Reloading the folder writes its own status, so a result shows after it.
+  async function showAfterReload(status) {
+    try {
+      await loadCurrentFolder();
+    } finally {
+      setStatus(status);
+    }
   }
 
   // One confirmation for the whole selection: it lists the files that will be
@@ -469,13 +477,11 @@ export function createLibraryActions({
     const published = files.length - failed.length;
     const count = (value) => `${value} file${value === 1 ? "" : "s"}`;
     if (!failed.length) {
-      setStatus(`Published ${count(published)}.`);
-    } else if (failed.length === 1) {
-      setStatus(`Published ${published} of ${count(files.length)}. ${failed[0].object.name}: ${failed[0].text}`);
-    } else {
-      setStatus(`Published ${published} of ${count(files.length)}. Not published: ${failed.map(({ object }) => object.name).join(", ")}.`);
+      await showAfterReload(`Published ${count(published)}.`);
+      return;
     }
-    await loadCurrentFolder();
+    const details = failed.map(({ object, text }) => `${object.name}: ${text}`).join(" ");
+    await showAfterReload(`Published ${published} of ${count(files.length)}. ${details}`);
   }
 
   // Copies the recorded publication link. When the clipboard refuses, the link

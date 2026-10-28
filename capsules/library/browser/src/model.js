@@ -155,7 +155,7 @@ export function publishedLink(object) {
 }
 
 export const PUBLISH_CONFIRM_BODY =
-  "Anyone with the link may download and keep a copy. Unpublish removes it from your Home. Copies elsewhere may remain.";
+  "Anyone with the link can download a copy. Unpublishing later stops sharing this file from your Home, but copies people already have stay.";
 
 export function canPublishObject(object) {
   return !!object &&
@@ -170,15 +170,25 @@ const LIBRARY_ERROR_TEXT = {
   empty_file: "Empty files can't be published.",
   too_large: "This file is too large to publish. Files up to 8 MiB can be published.",
   stale_revision: "This file changed. Refresh Library and try again.",
-  unsupported: "Folders can't be published.",
+  unsupported: "This file can't be published from here.",
   unavailable: "Publishing isn't available right now. Try again.",
   changed_since_publish: "This file changed after it was published. Unpublish it first, then publish it again.",
   published_withdraw_first: "Unpublish this file before deleting it.",
 };
 
+// Why the provider refused with `unsupported`, in plain words.
+const UNSUPPORTED_REASON_TEXT = {
+  folder: "Folders can't be published.",
+  protected: "Protected files can't be published.",
+};
+
 // Plain words for a Library error code; empty for an unknown code.
 export function libraryErrorText(error) {
-  return LIBRARY_ERROR_TEXT[String(error?.code || "")] || "";
+  const code = String(error?.code || "");
+  if (code === "unsupported") {
+    return UNSUPPORTED_REASON_TEXT[String(error?.reason || "")] || LIBRARY_ERROR_TEXT.unsupported;
+  }
+  return LIBRARY_ERROR_TEXT[code] || "";
 }
 
 export function publishFailureText(error, name) {

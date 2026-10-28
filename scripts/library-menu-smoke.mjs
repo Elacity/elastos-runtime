@@ -2811,7 +2811,7 @@ async function run() {
     const publishDialog = page.locator(".dialog-card").filter({ hasText: "Publish publicly?" }).first();
     await publishDialog.waitFor();
     assert(
-      (await publishDialog.textContent()).includes("Anyone with the link may download and keep a copy. Unpublish removes it from your Home. Copies elsewhere may remain."),
+      (await publishDialog.textContent()).includes("Anyone with the link can download a copy. Unpublishing later stops sharing this file from your Home, but copies people already have stay."),
       "Publish confirmation must say what publishing does",
     );
     await publishDialog.locator("[data-dialog-close]").click();
