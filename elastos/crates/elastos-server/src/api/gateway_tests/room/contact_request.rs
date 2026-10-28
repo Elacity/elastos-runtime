@@ -594,7 +594,7 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
         ]
     );
     assert!(rows.iter().all(|row| row.get("delivery_detail").is_none()));
-    home.service.set_profile_relay_refusals_for_test(3);
+    home.service.set_profile_relay_unsupported_for_test();
     for row in requested_rows().await {
         assert_eq!(
             row["delivery_detail"],
@@ -607,7 +607,7 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(
         body,
-        "Contact requests can't be delivered right now. Try again later."
+        "They may be on an older version. Ask them to update, or turn on Discovery in People on both Homes."
     );
     assert_eq!(home.outgoing_requests().len(), 2);
 }

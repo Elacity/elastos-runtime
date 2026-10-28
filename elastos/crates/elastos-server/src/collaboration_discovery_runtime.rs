@@ -105,9 +105,12 @@ const MAX_PROFILE_DECISIONS_PER_REQUESTER: usize = 32;
 const MAX_PROFILE_TOTAL_DECISIONS: usize = 512;
 /// One new request by DID per device per this many seconds.
 const PROFILE_REQUEST_DEVICE_INTERVAL_SECS: u64 = 5;
-/// Consecutive relay refusals of a profile-contact operation before People
-/// says requests can't be delivered (the Community node is too old).
-const PROFILE_RELAY_REFUSALS_BEFORE_UNDELIVERABLE: usize = 3;
+/// What the Community node last answered to a Profile-contact operation.
+const PROFILE_RELAY_SUPPORT_UNKNOWN: u8 = 0;
+const PROFILE_RELAY_SUPPORTED: u8 = 1;
+/// It answered "unsupported operation": it runs a release older than 0.8.0,
+/// so a request by DID would never be delivered.
+const PROFILE_RELAY_UNSUPPORTED: u8 = 2;
 const UNSUPPORTED_RELAY_OPERATION: &str = "unsupported collaboration discovery operation";
 /// A signed Profile beside a decision larger than this is refused unparsed.
 const MAX_RELAY_SIGNED_PROFILE_BYTES: usize = 64 * 1024;
@@ -127,9 +130,10 @@ pub struct CollaborationDiscoveryService {
     intent_mutex: Arc<Mutex<()>>,
     direct_messages: CollaborationDirectMessageService,
     profile_updates: crate::collaboration_profile_updates::CollaborationProfileUpdateService,
-    /// Consecutive relay refusals of profile-contact operations ("unsupported
-    /// operation" from a Community node older than 0.8.0); reset by success.
-    profile_relay_refusals: Arc<std::sync::atomic::AtomicUsize>,
+    /// What the Community node last answered to a Profile-contact operation:
+    /// unknown until it answers, then supported or unsupported ("unsupported
+    /// operation" from a node older than 0.8.0). Any success sets supported.
+    profile_relay_support: Arc<std::sync::atomic::AtomicU8>,
     /// What the Community relay has accepted from this Home's Profile-contact
     /// outbox, so delivered items leave it and the rest rotate.
     profile_outbox: Arc<Mutex<ProfileContactOutbox>>,
@@ -296,20 +300,18 @@ impl std::fmt::Display for ProfileContactRequestRefusal {
             Self::CommunityLeft => {
                 formatter.write_str(crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL)
             }
-            Self::Undeliverable => write!(
-                formatter,
-                "{PROFILE_CONTACT_UNDELIVERABLE_DETAIL} Try again later."
-            ),
+            Self::Undeliverable => formatter.write_str(PROFILE_CONTACT_UNDELIVERABLE_DETAIL),
         }
     }
 }
 
 impl std::error::Error for ProfileContactRequestRefusal {}
 
-/// What People shows on a waiting request by DID while the Community node
-/// refuses the Profile-contact operations; the outbox keeps retrying.
+/// Why a request by DID would not arrive while the Community node refuses the
+/// Profile-contact operations: the refusal's text, and what People shows on a
+/// waiting request then. Discovery-bound requests still reach older Homes.
 pub(crate) const PROFILE_CONTACT_UNDELIVERABLE_DETAIL: &str =
-    "Contact requests can't be delivered right now.";
+    "They may be on an older version. Ask them to update, or turn on Discovery in People on both Homes.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveryVisiblePerson {
@@ -626,7 +628,9 @@ impl CollaborationDiscoveryService {
             intent_mutex: Arc::new(Mutex::new(())),
             direct_messages,
             profile_updates,
-            profile_relay_refusals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            profile_relay_support: Arc::new(std::sync::atomic::AtomicU8::new(
+                PROFILE_RELAY_SUPPORT_UNKNOWN,
+            )),
             profile_outbox: Arc::new(Mutex::new(ProfileContactOutbox::default())),
         })
     }
@@ -1589,37 +1593,67 @@ impl CollaborationDiscoveryService {
         Ok(ProfileContactRequestOutcome::Requested)
     }
 
-    /// True after the Community node refused consecutive profile-contact
-    /// operations as unsupported: requests by DID would not be delivered, so
-    /// sending is refused and People says so on the waiting rows.
+    /// True while the Community node refuses the Profile-contact operations
+    /// as unsupported: requests by DID would not be delivered, so sending is
+    /// refused and People says so on the waiting rows.
     pub(crate) fn profile_contact_delivery_unavailable(&self) -> bool {
-        self.profile_relay_refusals
+        self.profile_relay_support
             .load(std::sync::atomic::Ordering::SeqCst)
-            >= PROFILE_RELAY_REFUSALS_BEFORE_UNDELIVERABLE
+            == PROFILE_RELAY_UNSUPPORTED
     }
 
-    /// As if the Community node had refused `refusals` profile-contact
-    /// operations in a row.
+    /// As if the Community node had refused the Profile-contact operations.
     #[cfg(test)]
-    pub(crate) fn set_profile_relay_refusals_for_test(&self, refusals: usize) {
-        self.profile_relay_refusals
-            .store(refusals, std::sync::atomic::Ordering::SeqCst);
+    pub(crate) fn set_profile_relay_unsupported_for_test(&self) {
+        self.profile_relay_support.store(
+            PROFILE_RELAY_UNSUPPORTED,
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
 
-    /// Counts a relay answer to a profile-contact operation: only an
-    /// "unsupported operation" refusal says the Community node is too old;
-    /// any success resets the count.
-    fn note_profile_relay_result<T>(&self, result: &anyhow::Result<T>) {
-        match result {
-            Ok(_) => self
-                .profile_relay_refusals
-                .store(0, std::sync::atomic::Ordering::SeqCst),
-            Err(err) if format!("{err:#}").contains(UNSUPPORTED_RELAY_OPERATION) => {
-                self.profile_relay_refusals
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            Err(_) => {}
+    /// Before the first request by DID since this Runtime started, reads this
+    /// Profile's own request mailbox once, so a Community node that refuses
+    /// the operations is known before anything is queued. After any answer
+    /// the regular passes keep the support state current. A transport error
+    /// leaves it unknown and the request is queued as usual.
+    pub(crate) async fn check_profile_relay_support(
+        &self,
+        store: &CollaborationContactStore,
+        profile: &VerifiedCollaborationProfileDocument,
+        now: u64,
+    ) {
+        if self
+            .profile_relay_support
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != PROFILE_RELAY_SUPPORT_UNKNOWN
+            || !self.community_joined()
+        {
+            return;
         }
+        let polled = self
+            .poll_profile_mailbox(
+                store,
+                profile,
+                CollaborationDiscoveryMailboxKind::Requests,
+                now,
+            )
+            .await;
+        self.note_profile_relay_result(&polled);
+    }
+
+    /// Records a relay answer to a Profile-contact operation: only an
+    /// "unsupported operation" refusal says the Community node is too old;
+    /// any success says it is not. Other failures say nothing.
+    fn note_profile_relay_result<T>(&self, result: &anyhow::Result<T>) {
+        let support = match result {
+            Ok(_) => PROFILE_RELAY_SUPPORTED,
+            Err(err) if format!("{err:#}").contains(UNSUPPORTED_RELAY_OPERATION) => {
+                PROFILE_RELAY_UNSUPPORTED
+            }
+            Err(_) => return,
+        };
+        self.profile_relay_support
+            .store(support, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// One pass of the Profile-contact plane, run on every joined pass
@@ -6233,6 +6267,109 @@ pub(crate) mod tests {
         assert_eq!(relayed(), 0);
     }
 
+    /// A Community node older than 0.8.0: the v1 Discovery ops work, the
+    /// Profile-contact ops are unknown to it.
+    struct OlderCommunityNode(CollaborationDiscoveryRelayProvider);
+
+    #[async_trait]
+    impl Provider for OlderCommunityNode {
+        async fn handle(
+            &self,
+            request: elastos_runtime::provider::ResourceRequest,
+        ) -> Result<elastos_runtime::provider::ResourceResponse, ProviderError> {
+            self.0.handle(request).await
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            self.0.schemes()
+        }
+
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            match request["op"].as_str() {
+                Some(
+                    PROFILE_CONTACT_SEND_OP | PROFILE_CONTACT_POLL_OP | PROFILE_CONTACT_DECISION_OP,
+                ) => Err(ProviderError::Provider(
+                    UNSUPPORTED_RELAY_OPERATION.to_string(),
+                )),
+                _ => self.0.send_raw(request).await,
+            }
+        }
+    }
+
+    /// Behind a Community node older than 0.8.0, the first request by DID is
+    /// refused before anything is queued, with the text that says why; once
+    /// the node answers the operations, requests go out.
+    #[tokio::test]
+    async fn older_community_node_refuses_the_first_request_by_did_before_queueing() {
+        let temp = tempfile::tempdir().unwrap();
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let seed = ProfileRelaySeed::start(temp.path(), &trusted).await;
+        seed.registry
+            .register(Arc::new(OlderCommunityNode(
+                CollaborationDiscoveryRelayProvider::new(seed.network.clone()),
+            )) as Arc<dyn Provider>)
+            .await;
+        let (_registry, service, store, _node) = discovery_service(
+            &temp.path().join("home"),
+            &trusted,
+            &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
+            vec![seed.ticket.clone()],
+        )
+        .await;
+        let profile = service_profile(&service, "Alma", Some("alma"));
+        let recipient = ProfileContactParty::new(&seed.network, "Bo").did();
+
+        service
+            .check_profile_relay_support(&store, &profile, current_timestamp())
+            .await;
+        let err = service
+            .send_profile_contact_request(&store, &recipient, &[], &profile, current_timestamp())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ProfileContactRequestRefusal>(),
+            Some(&ProfileContactRequestRefusal::Undeliverable)
+        );
+        assert_eq!(
+            err.to_string(),
+            "They may be on an older version. Ask them to update, or turn on Discovery in People on both Homes."
+        );
+        assert_eq!(
+            store
+                .waiting_outgoing_profile_request_count(current_timestamp())
+                .unwrap(),
+            0
+        );
+
+        // The node is upgraded; the next pass hears it and requests go out.
+        seed.restart_relay().await;
+        service
+            .refresh(&store, &profile, current_timestamp())
+            .await
+            .unwrap();
+        assert!(!service.profile_contact_delivery_unavailable());
+        assert_eq!(
+            service
+                .send_profile_contact_request(
+                    &store,
+                    &recipient,
+                    &[],
+                    &profile,
+                    current_timestamp()
+                )
+                .await
+                .unwrap(),
+            ProfileContactRequestOutcome::Requested
+        );
+    }
+
     /// Another Home's device DID — a contact's, or a Community member's
     /// seen in presence — is refused like this Home's own, and nothing is
     /// queued; an unknown did:key is still asked.
@@ -8595,7 +8732,7 @@ pub(crate) mod tests {
             sync_pass_lock: local_service.sync_pass_lock.clone(),
             intent_mutex: local_service.intent_mutex.clone(),
             direct_messages: local_service.direct_messages.clone(),
-            profile_relay_refusals: local_service.profile_relay_refusals.clone(),
+            profile_relay_support: local_service.profile_relay_support.clone(),
             profile_outbox: local_service.profile_outbox.clone(),
         };
         let error = bad_service
@@ -8813,7 +8950,7 @@ pub(crate) mod tests {
             sync_pass_lock: service.sync_pass_lock.clone(),
             intent_mutex: service.intent_mutex.clone(),
             direct_messages: service.direct_messages.clone(),
-            profile_relay_refusals: service.profile_relay_refusals.clone(),
+            profile_relay_support: service.profile_relay_support.clone(),
             profile_outbox: service.profile_outbox.clone(),
         };
         let error = mismatched

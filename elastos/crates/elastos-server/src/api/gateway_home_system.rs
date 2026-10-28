@@ -878,6 +878,11 @@ pub(super) async fn send_profile_contact_request_response(
         }
         None => Vec::new(),
     };
+    // A Community node that refuses requests by DID is known before anything
+    // is queued, so the first request is refused like the later ones.
+    service
+        .check_profile_relay_support(authority.store.as_ref(), &authority.profile, now)
+        .await;
     let outcome = match service
         .send_profile_contact_request(
             authority.store.as_ref(),
