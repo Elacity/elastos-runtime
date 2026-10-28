@@ -1205,6 +1205,11 @@ function renderDocumentsList() {
   });
 }
 
+// Every Documents request ends within this deadline, so a save that never
+// answers fails, keeps the edits (a later Save checks what was stored), and
+// frees a Lock or sign-out that waits on it.
+const DOCUMENTS_REQUEST_DEADLINE_MS = 20_000;
+
 async function documentsApi(path, options) {
   const request = { method: "GET", ...(options || {}) };
   request.headers = {
@@ -1214,19 +1219,30 @@ async function documentsApi(path, options) {
   if (request.body && !request.headers["content-type"]) {
     request.headers["content-type"] = "application/json";
   }
-  const response = await fetch(path, request);
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || "Documents request failed");
+  const controller = new AbortController();
+  const deadline = window.setTimeout(() => controller.abort(), DOCUMENTS_REQUEST_DEADLINE_MS);
+  try {
+    const response = await fetch(path, { ...request, signal: controller.signal });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || "Documents request failed");
+    }
+    if (response.status === 204) {
+      return null;
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      return await response.json();
+    }
+    return await response.text();
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error("Documents did not answer in time. Your edits are kept.");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(deadline);
   }
-  if (response.status === 204) {
-    return null;
-  }
-  const contentType = response.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) {
-    return response.json();
-  }
-  return response.text();
 }
 
 async function documentsProviderApi(op, payload) {

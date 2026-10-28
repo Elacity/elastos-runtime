@@ -912,3 +912,32 @@ test("Documents applies Home's remembered choice and turning it on restores the 
   assert.equal(has900(), false);
   assert.deepEqual({ ...posted.at(-1) }, { type: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_SET_TYPE"), homeToken: "tok", autosave: false });
 });
+
+test("a Documents request that never answers fails at its deadline and keeps the edits", async () => {
+  const fetchCalls = [];
+  const context = vm.createContext({
+    state: { homeToken: "tok" },
+    DOCUMENTS_REQUEST_DEADLINE_MS: 20,
+    AbortController,
+    window: { setTimeout, clearTimeout },
+    fetch(path, init) {
+      fetchCalls.push(path);
+      // A server that never answers: only the deadline ends the request.
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    },
+  });
+  vm.runInContext(
+    ["documentsApi", "documentsProviderApi"].map((name) => extractFunction(documentsSource, name)).join("\n") +
+      "\nthis.api = { documentsProviderApi };",
+    context,
+  );
+  const guard = new Promise((_resolve, reject) => setTimeout(() => reject(new Error("no deadline")), 2000));
+  await assert.rejects(
+    Promise.race([context.api.documentsProviderApi("save", { doc_did: "doc-1" }), guard]),
+    /did not answer in time\. Your edits are kept\./,
+  );
+  assert.deepEqual(fetchCalls, ["/api/provider/documents/save"]);
+  assert.equal(numericConstant(documentsSource, "DOCUMENTS_REQUEST_DEADLINE_MS"), 20_000);
+});
