@@ -7059,10 +7059,11 @@ async fn test_library_provider_publish_fails_closed_without_content_provider() {
     .await;
     assert_eq!(publish_status, StatusCode::OK);
     assert_eq!(publish["status"], "error");
-    assert!(publish["message"]
-        .as_str()
-        .unwrap()
-        .contains("content provider unavailable"));
+    assert_eq!(publish["code"], "unavailable");
+    assert_eq!(
+        publish["message"],
+        "Publishing isn't available right now. Try again."
+    );
 }
 
 #[tokio::test]
