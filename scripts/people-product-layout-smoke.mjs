@@ -736,6 +736,15 @@ async function assertVisibleDiscoveryScenario(frame, page, width, trace) {
     && peopleState.rows[1] === "Request sent" && peopleState.rows[2] === "Sam Waiting|Not delivered",
   "each row is a name and one short status", peopleState);
   await assertVisible(frame, ['#people-requests [data-action="open-inbox"]'], `People requests at ${width}px`);
+  // Not delivered keeps the row short; Why? shows what to do.
+  const why = frame.locator('.person-why[data-contact-id="contact:stuck"]');
+  assert(!(await why.locator("p").isVisible()), "the delivery reason must stay folded until asked");
+  await why.locator("summary").click();
+  assert(await why.locator("p").innerText()
+    === "They may be on an older version. Ask them to update, or turn on Public in People on both Homes.",
+  "Why? must show the recovery line");
+  await assertNoOverflow(frame, `Why? open at ${width}px`);
+  await why.locator("summary").click();
   await screenshotPages(page, frame, width);
 
   await openSection(frame, "discovery");

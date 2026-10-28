@@ -421,8 +421,11 @@ function renderPeople(people) {
   if (peopleCountNode) {
     peopleCountNode.textContent = String(contacts.length);
   }
+  // A refresh redraws the rows; a Why? the person opened stays open.
+  const openWhy = new Set([...peopleList.querySelectorAll("details.person-why[open]")]
+    .map((node) => node.dataset.contactId));
   peopleList.innerHTML = contacts.length
-    ? contacts.map(contactMarkup).join("")
+    ? contacts.map((contact) => contactMarkup(contact, openWhy)).join("")
     : emptyMarkup("No contacts yet.");
 }
 
@@ -559,12 +562,12 @@ function reachabilityLabel(contact) {
   return "";
 }
 
-function contactMarkup(contact) {
+function contactMarkup(contact, openWhy = new Set()) {
   const name = readText(contact?.display_name);
   const relationship = readText(contact?.relationship);
   // Each row is a name and one short status. A request the Community node
-  // cannot deliver says Not delivered; the reason was shown once, when it
-  // was sent. Presence is shown only for a connected contact.
+  // cannot deliver says Not delivered. Presence is shown only for a
+  // connected contact.
   const status = relationship === "requested"
     ? (readText(contact.delivery_detail) ? "Not delivered" : "Request sent")
     : (relationship === "connected" ? reachabilityLabel(contact) : relationshipLabel(relationship));
@@ -572,6 +575,12 @@ function contactMarkup(contact) {
   // name to show, so the status stands in its place.
   const unnamed = !name && relationship === "requested";
   const details = status && !unnamed ? `<span>${escapeHtml(status)}</span>` : "";
+  // Not delivered says what happened; Why? holds what to do, for the person
+  // who wants it, since sending again only answers that it was sent.
+  const deliveryDetail = relationship === "requested" ? readText(contact.delivery_detail) : "";
+  const more = deliveryDetail
+    ? `<details class="person-why" data-contact-id="${escapeHtml(readText(contact.contact_id))}"${openWhy.has(readText(contact.contact_id)) ? " open" : ""}><summary>Why?</summary><p>${escapeHtml(deliveryDetail)}</p></details>`
+    : "";
   const conversationId = readText(contact?.conversation_id);
   const chat = contact?.can_message === true && conversationId
     ? `<button type="button" data-action="chat" data-conversation-id="${escapeHtml(conversationId)}">Message</button>`
@@ -597,6 +606,7 @@ function contactMarkup(contact) {
     name: unnamed ? status : name,
     initial: unnamed ? "" : name,
     details,
+    more,
     actions: confirming ? "" : `${chat}${remove}`,
     confirmation,
   });
@@ -639,7 +649,7 @@ function focusContactAction(action, contactId) {
     && button.dataset.contactId === contactId)?.focus();
 }
 
-function personCard({ name, initial, details, actions, confirmation = "" }) {
+function personCard({ name, initial, details, more = "", actions, confirmation = "" }) {
   const displayName = readText(name);
   if (!displayName) {
     return "";
@@ -650,6 +660,7 @@ function personCard({ name, initial, details, actions, confirmation = "" }) {
       <div class="person-copy">
         <h4>${escapeHtml(displayName)}</h4>
         ${details ? `<p class="person-details">${details}</p>` : ""}
+        ${more}
       </div>
       <div class="person-actions">${actions}</div>
       ${confirmation}

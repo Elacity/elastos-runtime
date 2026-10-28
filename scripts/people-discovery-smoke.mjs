@@ -422,8 +422,12 @@ async function runScenario(name) {
       ["Bea", "Offline"],
       ["Cy", "Not delivered"],
     ]);
-    assert.doesNotMatch(markup, /a1b2c3|…|not known|can&#039;t be delivered|script/,
-      "Rows must not show DID fields or the delivery explanation");
+    // The reason sits behind Why? on a request that was not delivered, and
+    // only there; it stays text.
+    const why = cards.map((card) => card.match(/<details class="person-why"[^>]*><summary>Why\?<\/summary><p>([^<]*)<\/p><\/details>/)?.[1] ?? "");
+    assert.deepEqual(why, ["Contact requests can&#039;t be delivered right now.", "", "",
+      "&lt;script&gt;alert(&quot;fixture&quot;)&lt;/script&gt;"]);
+    assert.doesNotMatch(markup, /a1b2c3|…|not known|<script>/, "Rows must not show DID fields or raw markup");
     return;
   }
   if (name === "add_by_did") {
