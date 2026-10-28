@@ -49,8 +49,8 @@ function discoverySummary({
   status = configured ? (enabled ? "visible" : "off") : "unconfigured",
   statusMessage = configured
     ? (enabled
-      ? "Public is on for up to ten minutes."
-      : "Public is off. Turn it on for ten minutes to see who else is public.")
+      ? "Public is on."
+      : "Public is off.")
     : "Public isn’t available on this Home.",
   discoveredPeers = [],
   pendingRequestCount = 0,
@@ -174,7 +174,7 @@ function scenarioSummary(state) {
           configured: true,
           enabled: false,
           status: "off",
-          statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
+          statusMessage: "Public is off.",
         }),
     });
   }
@@ -203,7 +203,7 @@ function scenarioSummary(state) {
         configured: true,
         enabled: true,
         status: "visible",
-        statusMessage: "Public is on for up to ten minutes.",
+        statusMessage: "Public is on.",
         discoveredPeers: [visibleDiscoveryPeer()],
         pendingRequestCount: 1,
         remainingSeconds: 540,
@@ -219,7 +219,7 @@ function scenarioSummary(state) {
           configured: true,
           enabled: false,
           status: "off",
-          statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
+          statusMessage: "Public is off.",
         }),
       })
       : summary({
@@ -693,7 +693,7 @@ async function assertReadyOffScenario(frame, page, width) {
     refreshDisabled: document.querySelector("#discovery-refresh")?.disabled === true,
     listHidden: document.querySelector("#discovery-people")?.hidden === true,
   }));
-  assert(offState.status === "Public is off. Turn it on for ten minutes to see who else is public.",
+  assert(offState.status === "Public is off." && await frame.locator("#discovery-note").isHidden(),
     "ready/off should show the off Public state", offState);
   assert(offState.toggle === "Turn On", "ready/off should offer Public opt-in", offState);
   assert(offState.refreshDisabled === false, "ready/off should keep Refresh usable", offState);
@@ -705,12 +705,14 @@ async function assertReadyOffScenario(frame, page, width) {
   const toggled = await frame.evaluate(() => ({
     status: document.querySelector("#discovery-status")?.textContent?.trim() || "",
     toggle: document.querySelector("#discovery-toggle")?.textContent?.trim() || "",
+    note: document.querySelector("#discovery-note")?.hidden ? "" : document.querySelector("#discovery-note")?.textContent?.trim(),
     list: document.querySelector("#discovery-list")?.textContent?.trim() || "",
     count: document.querySelector("#discovery-visible-count")?.textContent?.trim() || "",
     flashed: document.querySelector("#people-status")?.hidden === false,
   }));
   assert(
-    toggled.status === "Public is on. 10 minutes left." && toggled.toggle === "Turn Off"
+    toggled.status === "Public is on." && toggled.note === "People can find you while you are signed in to Home."
+      && toggled.toggle === "Turn Off"
       && toggled.list === "No one else is public right now." && toggled.count === "0" && !toggled.flashed,
     "ready/off controls did not stay usable after opt-in",
     toggled,
@@ -762,7 +764,7 @@ async function assertVisibleDiscoveryScenario(frame, page, width, trace) {
     addContact: document.querySelector('#discovery-list [data-action="discovery-request"]')?.textContent?.trim() || "",
     visibleCount: document.querySelector("#discovery-visible-count")?.textContent?.trim() || "",
   }));
-  assert(discoveryState.status === "Public is on. 9 minutes left.", "visible Public should show the bounded window", discoveryState);
+  assert(discoveryState.status === "Public is on.", "visible Public shows no countdown", discoveryState);
   assert(discoveryState.addContact === "Add contact", "visible Public action is wrong", discoveryState);
   assert(discoveryState.visibleCount === "1", "visible Public count is wrong", discoveryState);
 

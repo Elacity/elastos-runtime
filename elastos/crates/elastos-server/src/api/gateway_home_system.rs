@@ -1365,23 +1365,20 @@ fn configured_people_discovery_summary(
             crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL.to_string(),
         )
     } else if !status.enabled() && remote_visibility_may_remain_until.is_some() {
-        let remaining = remote_visibility_remaining_seconds.expect("derived from deadline");
+        // The last listing outlives the switch until it expires; no countdown,
+        // since the person cannot act on the seconds.
         (
             "off_pending_expiry",
-            format!("Public is off. Others may still see you for {remaining} more seconds."),
+            "Public is off. You may stay listed for a few minutes.".to_string(),
         )
     } else if !status.enabled() {
-        (
-            "off",
-            "Public is off. Turn it on for ten minutes to see who else is public.".to_string(),
-        )
+        ("off", "Public is off.".to_string())
     } else if status.connecting() {
-        (
-            "connecting",
-            "Public is on. Looking for people.".to_string(),
-        )
+        ("connecting", "Public is on.".to_string())
     } else if status.available() {
-        ("visible", "Public is on for up to ten minutes.".to_string())
+        // The listing lasts ten minutes and renews while a signed-in session
+        // keeps this Profile's sync registered, so it reads as plain on.
+        ("visible", "Public is on.".to_string())
     } else {
         (
             "relay_unavailable",
@@ -1505,10 +1502,7 @@ mod discovery_summary_tests {
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["request_count"], 1);
         assert!(json.get("requests").is_none());
-        assert!(json["status_message"]
-            .as_str()
-            .unwrap()
-            .contains("ten minutes"));
+        assert_eq!(json["status_message"], "Public is on.");
         assert_eq!(json["discovered_peers"][0]["advertisement_id"], "ad-123");
         assert!(json["discovered_peers"][0].get("peer_id").is_none());
     }
@@ -1591,7 +1585,7 @@ mod discovery_summary_tests {
         assert_eq!(json["remote_visibility_remaining_seconds"], 600);
         assert_eq!(
             json["status_message"],
-            "Public is off. Others may still see you for 600 more seconds."
+            "Public is off. You may stay listed for a few minutes."
         );
     }
 
@@ -1634,7 +1628,7 @@ mod discovery_summary_tests {
 
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["status"], "connecting");
-        assert_eq!(json["status_message"], "Public is on. Looking for people.");
+        assert_eq!(json["status_message"], "Public is on.");
     }
 
     #[test]

@@ -58,8 +58,8 @@ function discoverySummary({
   status = configured ? (enabled ? "visible" : "off") : "unconfigured",
   statusMessage = configured
     ? (enabled
-      ? "Public is on for up to ten minutes."
-      : "Public is off. Turn it on for ten minutes to see who else is public.")
+      ? "Public is on."
+      : "Public is off.")
     : "Public isn’t available on this Home.",
   discoveredPeers = [],
   pendingRequestCount = 0,
@@ -146,6 +146,7 @@ function setupEnvironment(name, replies) {
     ["people-list", new FakeElement()],
     ["discovery-list", new FakeElement()],
     ["discovery-people", new FakeElement()],
+    ["discovery-note", new FakeElement()],
     ["people-requests", new FakeElement()],
     ["people-requests-count", new FakeElement()],
     ["people-undelivered", new FakeElement()],
@@ -642,14 +643,14 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
+        statusMessage: "Public is off.",
         discoveredPeers: [],
       }),
       summary("Runtime Name", discoverySummary({
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
+        statusMessage: "Public is off.",
         discoveredPeers: [],
       }), {
         profile: { display_name: "Mac Profile" },
@@ -729,7 +730,9 @@ async function runScenario(name) {
     assert.equal(environment.nodes.get("people-requests-count").textContent, "1 contact request waiting.");
     assert.doesNotMatch(environment.nodes.get("discovery-list").innerHTML, /must-not-render/);
     assertNoDiscoveryFallbacks(environment.nodes.get("discovery-list").innerHTML, "configured discovery list");
-    assert.equal(environment.nodes.get("discovery-status").textContent, "Public is on for up to ten minutes.");
+    assert.equal(environment.nodes.get("discovery-status").textContent, "Public is on.");
+    assert.equal(environment.nodes.get("discovery-note").hidden, false, "On says how long: while signed in");
+    assert.doesNotMatch(environment.nodes.get("discovery-status").textContent, /\d|minute|second/);
     assert.equal(environment.nodes.get("discovery-people").hidden, false);
     assertNoRawIdentityLeak(environment.nodes.get("discovery-status").textContent, "configured discovery status");
 
@@ -905,7 +908,7 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
+        statusMessage: "Public is off.",
       }), {
         profile: { display_name: "Ready Profile" },
       }, "ready"),
@@ -913,7 +916,7 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off_pending_expiry",
-        statusMessage: "Public is off. Others may still see you for 600 more seconds.",
+        statusMessage: "Public is off. You may stay listed for a few minutes.",
         remoteVisibilityMayRemainUntil: 700,
         remoteVisibilityRemainingSeconds: 600,
       }),
@@ -921,7 +924,7 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off_pending_expiry",
-        statusMessage: "Public is off. Others may still see you for 600 more seconds.",
+        statusMessage: "Public is off. You may stay listed for a few minutes.",
         remoteVisibilityMayRemainUntil: 700,
         remoteVisibilityRemainingSeconds: 600,
       }), {
@@ -931,13 +934,13 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
+        statusMessage: "Public is off.",
       }),
       summary("Runtime Name", discoverySummary({
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
+        statusMessage: "Public is off.",
       }), {
         profile: { display_name: "Ready Profile" },
       }, "ready"),
@@ -945,13 +948,13 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
+        statusMessage: "Public is off.",
       }),
       summary("Runtime Name", discoverySummary({
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
+        statusMessage: "Public is off.",
       }), {
         profile: { display_name: "Ready Profile" },
       }, "ready"),
@@ -960,7 +963,7 @@ async function runScenario(name) {
     await settle();
 
     // Off: the status line explains; no empty list shows under it.
-    const off = "Public is off. Turn it on for ten minutes to see who else is public.";
+    const off = "Public is off.";
     const assertOff = () => {
       assert.equal(environment.nodes.get("discovery-status").textContent, off);
       assert.equal(environment.nodes.get("discovery-people").hidden, true);
@@ -969,7 +972,8 @@ async function runScenario(name) {
     assertOff();
 
     await triggerAction(environment, "discovery-refresh");
-    assert.equal(environment.nodes.get("discovery-status").textContent, "Public is off. Others may still see you for 600 more seconds.");
+    assert.equal(environment.nodes.get("discovery-status").textContent, "Public is off. You may stay listed for a few minutes.");
+    assert.equal(environment.nodes.get("discovery-note").hidden, true);
     assert.equal(environment.nodes.get("discovery-people").hidden, true);
 
     await triggerAction(environment, "discovery-refresh");
@@ -987,7 +991,7 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
+        statusMessage: "Public is off.",
       }), {
         profile: { display_name: "Ready Profile" },
       }, "ready"),
@@ -995,8 +999,7 @@ async function runScenario(name) {
     await loadPeople();
     await settle();
 
-    assert.equal(environment.nodes.get("discovery-status").textContent,
-      "Public is off. Turn it on for ten minutes to see who else is public.");
+    assert.equal(environment.nodes.get("discovery-status").textContent, "Public is off.");
     assert.equal(environment.nodes.get("discovery-people").hidden, true);
     assertNoRawIdentityLeak(environment.nodes.get("discovery-status").textContent, "reload off discovery status");
     return;

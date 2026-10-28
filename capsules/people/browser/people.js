@@ -23,6 +23,7 @@ const peopleUndelivered = document.getElementById("people-undelivered");
 const discoveryPeople = document.getElementById("discovery-people");
 const discoveryList = document.getElementById("discovery-list");
 const discoveryStatusNode = document.getElementById("discovery-status");
+const discoveryNoteNode = document.getElementById("discovery-note");
 const discoveryToggleButton = document.getElementById("discovery-toggle");
 const discoveryRefreshButton = document.getElementById("discovery-refresh");
 const peopleCountNode = document.getElementById("people-count");
@@ -444,6 +445,10 @@ function renderDiscovery(discovery) {
   if (discoveryStatusNode) {
     discoveryStatusNode.textContent = safeDiscovery.statusMessage;
   }
+  // The listing renews itself while you are signed in, so on is plain on.
+  if (discoveryNoteNode) {
+    discoveryNoteNode.hidden = !(enabled && ["visible", "connecting"].includes(safeDiscovery.status));
+  }
   if (discoveryToggleButton) {
     discoveryToggleButton.hidden = !configured;
     discoveryToggleButton.dataset.enabled = enabled ? "true" : "false";
@@ -491,12 +496,8 @@ function normalizeDiscoverySummary(discovery) {
     configured: discovery.configured,
     enabled: discovery.enabled === true,
     status,
-    statusMessage: normalizeDiscoveryStatusMessage(
-      status,
-      readText(discovery.status_message),
-      readPositiveInteger(discovery.remaining_seconds),
-      readPositiveInteger(discovery.remote_visibility_remaining_seconds),
-    ),
+    statusMessage: PUBLIC_STATUS_TEXT[status] || readText(discovery.status_message)
+      || "Public isn’t available right now.",
     discoveredPeers: arrayValue(discovery.discovered_peers).filter((peer) => {
       return peer && typeof peer === "object" && readText(peer.display_name) && readText(peer.advertisement_id);
     }),
@@ -504,31 +505,14 @@ function normalizeDiscoverySummary(discovery) {
   };
 }
 
-function normalizeDiscoveryStatusMessage(status, runtimeMessage, remainingSeconds, remoteVisibilityRemainingSeconds) {
-  if (status === "visible") {
-    if (remainingSeconds === null) {
-      return "Public is on for up to ten minutes.";
-    }
-    const minutes = Math.max(1, Math.ceil(remainingSeconds / 60));
-    return `Public is on. ${minutes} minute${minutes === 1 ? "" : "s"} left.`;
-  }
-  if (status === "off_pending_expiry") {
-    if (runtimeMessage) {
-      return runtimeMessage;
-    }
-    if (remoteVisibilityRemainingSeconds !== null) {
-      return `Public is off. Others may still see you for ${remoteVisibilityRemainingSeconds} more seconds.`;
-    }
-    return "Public is off. Others may still see you for a short time.";
-  }
-  if (status === "off") {
-    return "Public is off. Turn it on for ten minutes to see who else is public.";
-  }
-  if (status === "connecting") {
-    return "Public is on. Looking for people.";
-  }
-  return runtimeMessage || "Public isn’t available right now.";
-}
+// No countdown: a listing renews while you are signed in, and the seconds
+// left after turning off are nothing a person can act on.
+const PUBLIC_STATUS_TEXT = {
+  visible: "Public is on.",
+  connecting: "Public is on.",
+  off_pending_expiry: "Public is off. You may stay listed for a few minutes.",
+  off: "Public is off.",
+};
 
 /* The Runtime emits exactly these today. A state this build does not know is
    a state it cannot describe, so it says so rather than picking the friendliest
@@ -791,11 +775,6 @@ function objectValue(value) {
 
 function arrayValue(value) {
   return Array.isArray(value) ? value : [];
-}
-
-// A missing count (null) is no count, not zero seconds left.
-function readPositiveInteger(value) {
-  return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
 function readText(value) {

@@ -350,9 +350,19 @@ button:disabled {
 }
 
 .people-requests p,
-.public-head p {
+.public-state {
   flex: 1 1 160px;
+  min-width: 0;
+}
+
+.people-section .people-requests p,
+.people-section #discovery-status {
   color: var(--el-text);
+}
+
+.people-section #discovery-note {
+  margin-top: 2px;
+  font-size: 12px;
 }
 
 .public-actions,

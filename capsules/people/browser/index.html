@@ -6,7 +6,7 @@
   <title>People · ElastOS</title>
   <script src="./elastos-theme.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css">
-  <link rel="stylesheet" href="./style.css?v=people-20261028d">
+  <link rel="stylesheet" href="./style.css?v=people-20261028e">
 </head>
 <body>
   <section id="locked-shell" class="locked-shell hidden">
@@ -84,7 +84,10 @@
 
           <section id="discovery" class="people-section" aria-label="Public" hidden>
             <div class="public-head">
-              <p id="discovery-status"></p>
+              <div class="public-state">
+                <p id="discovery-status"></p>
+                <p id="discovery-note" hidden>People can find you while you are signed in to Home.</p>
+              </div>
               <div class="public-actions">
                 <button id="discovery-toggle" type="button" data-action="discovery-toggle">Turn On</button>
                 <button id="discovery-refresh" type="button" data-action="discovery-refresh">Refresh</button>
@@ -103,6 +106,6 @@
     </section>
   </main>
 
-  <script type="module" src="./people.js?v=people-20261028d"></script>
+  <script type="module" src="./people.js?v=people-20261028e"></script>
 </body>
 </html>
