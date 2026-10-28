@@ -48,6 +48,8 @@ const elements = {
   sidebarToggle: document.getElementById("sidebar-toggle"),
   sidebarShow: document.getElementById("sidebar-show"),
   saveButton: document.getElementById("save-button"),
+  sharedRow: document.getElementById("shared-row"),
+  saveToLibrary: document.getElementById("save-to-library"),
   autosaveToggle: document.getElementById("autosave-toggle"),
   saveAsButton: document.getElementById("save-as-button"),
   deleteButton: document.getElementById("delete-button"),
@@ -314,16 +316,6 @@ function renderMarkdownDocument(source, options) {
   };
 }
 
-function shortCid(cid) {
-  if (!cid) {
-    return "";
-  }
-  if (cid.length <= 18) {
-    return cid;
-  }
-  return cid.slice(0, 10) + "…" + cid.slice(-6);
-}
-
 function documentUri(docDid) {
   return docDid ? "localhost://ElastOS/Documents/" + docDid : "";
 }
@@ -349,21 +341,6 @@ function baseName(uri) {
   } catch (_error) {
     return name;
   }
-}
-
-function formatBytes(bytes) {
-  const value = Number(bytes || 0);
-  if (!Number.isFinite(value) || value <= 0) {
-    return "0 B";
-  }
-  const units = ["B", "KB", "MB", "GB"];
-  let amount = value;
-  let unitIndex = 0;
-  while (amount >= 1024 && unitIndex < units.length - 1) {
-    amount /= 1024;
-    unitIndex += 1;
-  }
-  return (unitIndex === 0 ? String(amount) : amount.toFixed(amount >= 10 ? 1 : 2)) + " " + units[unitIndex];
 }
 
 function looksLikeTextContent(contentType, buffer) {
@@ -984,6 +961,10 @@ function syncEditorMutation() {
 }
 
 function setTaskLineChecked(lineNumber, checked) {
+  if (state.current?.shared) {
+    refreshPreviewFromEditor();
+    return;
+  }
   const lines = String(elements.editor.value || "").replace(/\r\n/g, "\n").split("\n");
   if (lineNumber < 0 || lineNumber >= lines.length) {
     return;
@@ -1000,6 +981,7 @@ function setTaskLineChecked(lineNumber, checked) {
 }
 
 function toggleTaskAtCursor() {
+  if (state.current?.shared) return;
   const source = String(elements.editor.value || "");
   const selectionStart = elements.editor.selectionStart || 0;
   const selectionEnd = elements.editor.selectionEnd || selectionStart;
@@ -1079,7 +1061,7 @@ function setDirty(dirty) {
   const hasCurrent = !!state.current;
   const hasPersistedCurrent = hasCurrent && !isDraftDocument(state.current);
   const isLibraryFile = isLibraryFileProjection(state.current);
-  elements.saveButton.disabled = !hasCurrent || !state.dirty;
+  elements.saveButton.disabled = !hasCurrent || !state.dirty || !!state.current.shared;
   elements.saveAsButton.disabled = !hasPersistedCurrent || isLibraryFile;
   elements.deleteButton.disabled = !hasPersistedCurrent || isLibraryFile;
   if (hasCurrent && !state.dirty) {
@@ -1125,6 +1107,7 @@ function renderCurrentDocument() {
     elements.titleInput.disabled = true;
     elements.editor.value = "";
     elements.editor.disabled = true;
+    elements.sharedRow.hidden = true;
     elements.preview.innerHTML = '<div class="empty-state">Create or open a document.</div>';
     renderOutline([]);
     clearStatus();
@@ -1132,8 +1115,12 @@ function renderCurrentDocument() {
     return;
   }
 
+  const shared = !!state.current.shared;
   elements.titleInput.disabled = isLibraryFileProjection(state.current);
+  elements.titleInput.readOnly = shared;
   elements.editor.disabled = false;
+  elements.editor.readOnly = shared;
+  elements.sharedRow.hidden = !shared;
   elements.titleInput.value = state.current.title;
   elements.editor.value = state.current.body;
   refreshPreviewFromEditor();
@@ -1324,8 +1311,8 @@ async function loadSummary() {
       await selectDocument(requested.doc_did);
       setWorkspaceView(preferredWorkspaceView(state.initialView));
     } else {
-      elements.documentsShell.classList.add("hidden");
-      await loadPublishedRevisionMode(requestedCid);
+      await loadSharedFile(requestedCid);
+      setWorkspaceView(preferredWorkspaceView(state.initialView));
     }
     return;
   }
@@ -1380,6 +1367,50 @@ async function loadLibraryObject(uri) {
   });
   renderDocumentsList();
   renderCurrentDocument();
+}
+
+// A file shared in Chat opens in the normal layout as a read-only copy; Save
+// to Library keeps a private copy. Documents shows the content only: no CID,
+// address, type or size. Home opens Documents for a shared file only after it
+// read the bytes as text (home-external-link.js), so the bytes are the file.
+async function readSharedText(cid) {
+  const response = await fetch("/content/" + encodeURIComponent(cid), { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error("This shared file could not be opened.");
+  }
+  const buffer = await response.arrayBuffer();
+  if (!looksLikeTextContent(response.headers.get("content-type") || "", buffer)) {
+    throw new Error("Documents can open text files only.");
+  }
+  return new TextDecoder("utf-8").decode(buffer);
+}
+
+async function loadSharedFile(cid) {
+  const sessionId = state.currentSessionId;
+  let body;
+  try {
+    body = await readSharedText(cid);
+  } catch (error) {
+    if (sessionId !== state.currentSessionId) return;
+    replaceCurrentDocument(null);
+    renderDocumentsList();
+    renderCurrentDocument();
+    showError(readableDocumentsError(error, "This shared file could not be opened."));
+    return;
+  }
+  if (sessionId !== state.currentSessionId) return;
+  replaceCurrentDocument({ ...createDraftDocument(), title: "Shared file", body, shared: true });
+  renderDocumentsList();
+  renderCurrentDocument();
+}
+
+async function saveSharedCopy() {
+  const shared = state.current;
+  if (!shared?.shared) return;
+  replaceCurrentDocument({ ...createDraftDocument(), title: shared.title, body: shared.body });
+  renderCurrentDocument();
+  setDirty(true);
+  await saveCurrent();
 }
 
 async function selectLibraryFile(uri) {
@@ -1547,7 +1578,7 @@ function requireSavedWorkingCopy(document, expectedId) {
 }
 
 async function saveCurrent(options) {
-  if (!state.current) return;
+  if (!state.current || state.current.shared) return;
   const saveTarget = {
     sessionId: state.currentSessionId,
     identity: documentIdentity(state.current),
@@ -2048,6 +2079,11 @@ function wireShellEvents() {
     });
   });
   elements.autosaveToggle.addEventListener("click", toggleAutosavePreference);
+  elements.saveToLibrary.addEventListener("click", () => {
+    void saveSharedCopy().catch((error) => {
+      reportSaveFailure(error, "Save failed.");
+    });
+  });
   elements.saveAsButton.addEventListener("click", openSaveAsModal);
   elements.deleteButton.addEventListener("click", requestDeleteCurrent);
   elements.sidebarToggle.addEventListener("click", () => {
@@ -2301,8 +2337,6 @@ function setSharePreview(title, markdown, subtitle, pills) {
 async function loadShareBundle(options) {
   const basePath = options && options.basePath ? options.basePath : "";
   const sourceUri = options && options.sourceUri ? options.sourceUri : "";
-  const rawCid = options && options.rawCid ? String(options.rawCid || "").trim() : "";
-  const allowRawCidFallback = !!(options && options.allowRawCidFallback && rawCid);
   state.mode = "share";
   elements.shareShell.classList.remove("hidden");
 
@@ -2366,83 +2400,12 @@ async function loadShareBundle(options) {
     setSharePreview(title, markdown, "Immutable shared revision.", pills);
     return;
   } catch (error) {
-    if (allowRawCidFallback) {
-      try {
-        await loadRawCidMode(rawCid, sourceUri);
-        return;
-      } catch (fallbackError) {
-        elements.sharePreview.innerHTML = '<div class="error-state">' + escapeHtml(readableDocumentsError(fallbackError, "Shared content could not be loaded.")) + "</div>";
-        return;
-      }
-    }
     elements.sharePreview.innerHTML = '<div class="error-state">' + escapeHtml(readableDocumentsError(error, "Shared document could not be loaded.")) + "</div>";
   }
 }
 
-async function loadRawCidMode(cid, sourceUri) {
-  const cleanCid = String(cid || "").trim();
-  if (!cleanCid) {
-    throw new Error("This shared file link is incomplete.");
-  }
-  state.mode = "share";
-  elements.shareShell.classList.remove("hidden");
-  elements.shareSidebar.classList.add("hidden");
-  elements.shareSidebarMeta.textContent = "";
-  elements.shareDocList.innerHTML = "";
-
-  const contentPath = "/content/" + encodeURIComponent(cleanCid);
-  const response = await fetch(contentPath, { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error("Could not load " + contentPath);
-  }
-  const contentType = response.headers.get("content-type") || "application/octet-stream";
-  const buffer = await response.arrayBuffer();
-  const pills = [
-    { label: "Content", value: sourceUri || "elastos://" + cleanCid },
-    { label: "Type", value: contentType },
-    { label: "Size", value: formatBytes(buffer.byteLength) },
-  ];
-  if (looksLikeTextContent(contentType, buffer)) {
-    const markdown = new TextDecoder("utf-8").decode(buffer);
-    const title = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim() || shortCid(cleanCid);
-    setSharePreview(title, markdown, "Shared file.", pills);
-    return;
-  }
-
-  document.title = shortCid(cleanCid) + " · Documents";
-  elements.shareTitle.textContent = shortCid(cleanCid);
-  elements.shareSubtitle.textContent = "Shared binary file.";
-  elements.shareTopline.innerHTML = "";
-  pills.forEach((pill) => {
-    const span = document.createElement("span");
-    span.className = "share-token";
-    span.innerHTML = "<strong>" + escapeHtml(pill.label) + "</strong><span>" + escapeHtml(pill.value) + "</span>";
-    elements.shareTopline.appendChild(span);
-  });
-  const download = document.createElement("a");
-  download.className = "action-primary";
-  download.href = contentPath;
-  download.download = cleanCid;
-  download.textContent = "Download content";
-  elements.sharePreview.innerHTML = '<div class="empty-document"><h2>Binary file</h2><p>This link points to a file that Documents cannot preview.</p></div>';
-  elements.sharePreview.querySelector(".empty-document").appendChild(download);
-}
-
 async function loadShareMode() {
   await loadShareBundle({ basePath: "", sourceUri: "" });
-}
-
-async function loadPublishedRevisionMode(cid) {
-  const cleanCid = String(cid || "").trim();
-  if (!cleanCid) {
-    throw new Error("This published document link is incomplete.");
-  }
-  await loadShareBundle({
-    basePath: "/s/" + encodeURIComponent(cleanCid) + "/",
-    sourceUri: "elastos://" + cleanCid,
-    rawCid: cleanCid,
-    allowRawCidFallback: true,
-  });
 }
 
 function loadLockedMode() {

@@ -329,16 +329,27 @@ function createAppServer() {
     if (url.pathname === "/home-fixture") {
       // Documents framed as Home frames it; the page records what it asks Home.
       // ?without_origin drops home_origin, so Documents has no Home bridge;
-      // ?cid opens a published revision that is not in the local list.
+      // ?cid opens a file shared in Chat that is not in the local list.
       const homeOrigin = `http://${req.headers.host}`;
       const params = new URLSearchParams();
       if (!url.searchParams.has("without_origin")) params.set("home_origin", homeOrigin);
-      if (url.searchParams.has("cid")) params.set("cid", url.searchParams.get("cid"));
+      if (url.searchParams.has("cid")) {
+        // As Home opens a shared text file (home-external-link.js).
+        params.set("cid", url.searchParams.get("cid"));
+        params.set("view", "read");
+      }
       const query = params.size ? `?${params}` : "";
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       res.end(`<!doctype html><script>window.homeMessages = [];
 addEventListener("message", (event) => window.homeMessages.push(event.data));</script>
 <iframe title="Documents" style="width:1200px;height:850px" src="/apps/documents/${query}#home_token=documents-link-token"></iframe>`);
+      return;
+    }
+    if (url.pathname === `/content/${publishedFixtureCid}`) {
+      // Raw shared bytes carry no name, so the gateway calls them octet-stream.
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      res.end(`# Shared note\n\n[Out](${publishedWebLink}) [Same](http://${req.headers.host}/s/${publishedFixtureCid}/_share.json) [Jump](#notes-2) [Rel](/apps/documents/)\n\n`
+        + Array.from({ length: 80 }, (_, index) => `Filler line ${index}`).join("\n\n") + "\n\n# Notes\n\nEnd.");
       return;
     }
     if (url.pathname.startsWith(`/s/${publishedFixtureCid}/`)) {
@@ -1102,45 +1113,72 @@ async function run() {
       }
     }
 
-    // Published revision Home opens (not in the local list), with the
-    // sequence found in review: follow a fragment, switch file, then a
-    // same-origin link.
+    // A text file shared in Chat opens in the normal layout, read-only, with
+    // no CID, address, type or size, and Save to Library keeps a copy.
     resetDocumentsFixture();
     const publishedPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
     trackPage(publishedPage, consoleErrors, pageErrors, failedRequests, errorResponses);
     try {
       await publishedPage.goto(`http://127.0.0.1:${port}/home-fixture?cid=${publishedFixtureCid}`);
       const frame = await (await publishedPage.locator('iframe[title="Documents"]').elementHandle()).contentFrame();
-      await frame.locator("#share-preview h1").first().waitFor({ state: "visible" });
+      await frame.locator("#preview h1").first().waitFor({ state: "visible" });
       const origin = new URL(frame.url()).origin;
       const launch = { url: frame.url(), pages: pageCount() };
-      await assertHomeFrameInvariant(frame, launch, "published render");
-      const controls = frame.locator("#share-preview a[data-open-external]");
+      const view = await frame.evaluate(() => ({
+        shellVisible: !document.getElementById("documents-shell").classList.contains("hidden"),
+        shareVisible: !document.getElementById("share-shell").classList.contains("hidden"),
+        listed: document.querySelectorAll(".document-list-item").length,
+        title: document.getElementById("title-input").value,
+        titleReadOnly: document.getElementById("title-input").readOnly,
+        editorReadOnly: document.getElementById("editor").readOnly,
+        sharedRowVisible: !document.getElementById("shared-row").hidden,
+        sharedText: document.getElementById("shared-row").innerText,
+        saveDisabled: document.getElementById("save-button").disabled,
+        mainText: document.querySelector(".documents-main").innerText,
+      }));
+      assert(view.shellVisible && !view.shareVisible && view.listed > 0,
+        `A shared file must open in the normal layout with the list. Got ${JSON.stringify(view)}`);
+      assert(view.title === "Shared file" && view.titleReadOnly && view.editorReadOnly && view.saveDisabled,
+        `A shared file must open read-only, titled Shared file. Got ${JSON.stringify(view)}`);
+      assert(view.sharedRowVisible && view.sharedText.includes("Read-only copy from Chat") && view.sharedText.includes("Save to Library"),
+        `A shared file must say it is a read-only copy and offer Save to Library. Got ${JSON.stringify(view)}`);
+      for (const hidden of [publishedFixtureCid, "elastos://", "octet-stream", "application/", " B\n", "Size", "Type"]) {
+        assert(!view.mainText.includes(hidden), `A shared file must not show ${JSON.stringify(hidden)}. Got ${JSON.stringify(view.mainText.slice(0, 400))}`);
+      }
+      await assertHomeFrameInvariant(frame, launch, "shared render");
+      const controls = frame.locator("#preview a[data-open-external]");
       assert(JSON.stringify(await controls.evaluateAll((nodes) => nodes.map((node) => node.dataset.openExternal)))
         === JSON.stringify([publishedWebLink, `${origin}/s/${publishedFixtureCid}/_share.json`]),
-        "Published preview web links inside Home, same origin included, must be Home controls.");
-      assert(await frame.getByText("Rel", { exact: true }).evaluate((node) => !node.closest("a")),
-        "A relative link in the published preview inside Home must be plain text.");
+        "Shared preview web links inside Home, same origin included, must be Home controls.");
+      assert(await frame.locator("#preview").getByText("Rel", { exact: true }).evaluate((node) => !node.closest("a")),
+        "A relative link in the shared preview inside Home must be plain text.");
       await controls.nth(0).click();
       await controls.nth(1).focus();
       await publishedPage.keyboard.press("Enter");
-      await frame.getByText("Rel", { exact: true }).click();
       await publishedPage.waitForTimeout(200);
-      await assertHomeFrameInvariant(frame, launch, "published web links");
-      await scrollsTo(frame, "notes-2", () => frame.getByText("Jump", { exact: true }).click());
-      await assertHomeFrameInvariant(frame, launch, "published follow fragment");
-      await frame.locator(".share-doc-link").nth(1).click();
-      await frame.waitForFunction(() => document.getElementById("share-title")?.textContent === "Second file");
-      await assertHomeFrameInvariant(frame, launch, "switch published file");
-      await frame.getByText("Same second", { exact: true }).click();
-      await publishedPage.waitForTimeout(300);
-      await assertHomeFrameInvariant(frame, launch, "published same-origin link");
+      await assertHomeFrameInvariant(frame, launch, "shared web links");
+      await scrollsTo(frame, "notes-2", () => frame.locator("#preview").getByText("Jump", { exact: true }).click());
+      await assertHomeFrameInvariant(frame, launch, "shared follow fragment");
       const requests = await publishedPage.evaluate(() => window.homeMessages
         .filter((message) => message?.type === "home:open-external"));
       const request = (url) => ({ type: "home:open-external", url, homeToken: "documents-link-token" });
       assert(JSON.stringify(requests) === JSON.stringify([request(publishedWebLink),
-        request(`${origin}/s/${publishedFixtureCid}/_share.json`), request(`${origin}/s/${publishedFixtureCid}/_share.json`)]),
-      `Published preview links must send exact Home requests. Got ${JSON.stringify(requests)}`);
+        request(`${origin}/s/${publishedFixtureCid}/_share.json`)]),
+      `Shared preview links must send exact Home requests. Got ${JSON.stringify(requests)}`);
+
+      // Save to Library keeps a private copy that then edits like any document.
+      const before = documents.size;
+      await frame.getByRole("button", { name: "Save to Library", exact: true }).click();
+      await waitForCondition(() => documents.size === before + 1 && saveCalls.length === 1, 5000,
+        `Save to Library must create and save a copy. Got ${JSON.stringify(saveCalls)}`);
+      await frame.waitForFunction(() => document.getElementById("shared-row").hidden &&
+        !document.getElementById("editor").readOnly && !document.getElementById("title-input").readOnly &&
+        document.getElementById("save-button").disabled);
+      const copy = [...documents.values()].at(-1);
+      assert(copy.title === "Shared file" && copy.body.startsWith("# Shared note"),
+        `Save to Library must keep the shared text. Got ${JSON.stringify(copy)}`);
+      assert(await frame.locator(`.document-list-item[data-doc-did="${copy.doc_did}"].active`).count() === 1,
+        "The saved copy must be listed and selected.");
     } finally {
       await publishedPage.close();
     }

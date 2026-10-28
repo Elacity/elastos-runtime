@@ -656,6 +656,23 @@ a {
   font-size: 0.88rem;
 }
 
+.shared-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.7rem;
+  padding: 0.35rem 0 0.05rem;
+}
+
+.shared-row[hidden] {
+  display: none;
+}
+
+.shared-text {
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
 .find-bar {
   display: flex;
   align-items: center;
@@ -1512,6 +1529,10 @@ a {
         </div>
       </header>
 
+      <div id="shared-row" class="shared-row" hidden>
+        <span class="shared-text">Read-only copy from Chat</span>
+        <button id="save-to-library" class="action-primary" type="button">Save to Library</button>
+      </div>
       <div id="status-row" class="status-row hidden">
         <span id="status-text" class="status-text"></span>
       </div>
