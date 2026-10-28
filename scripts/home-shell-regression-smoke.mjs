@@ -2825,7 +2825,7 @@ const documentApp = vm.createContext({
   documentSelectionSequence: 0, autosaveQueued: false, queuedSaveTarget: null,
   saveRecovery: null, savedWorkingCopy: null,
   clearAutosaveTimer() {}, upsertDocumentListItem() {}, renderDocumentsList() {},
-  renderCurrentDocument() {}, setStatus() {}, scheduleStatusClear() {},
+  renderCurrentDocument() {}, showError() {},
   baseName: (uri) => uri.split("/").pop(), base64ToUtf8: () => "Library text",
   documentsProviderApi: async (op, payload) => {
     selectionReads.push({ op, ...payload });

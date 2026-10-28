@@ -781,6 +781,16 @@ async function run() {
       await parserPage.waitForFunction(() => (document.getElementById("preview")?.textContent || "").includes("# "));
 
       const incrementalBody = "# Typed heading\n\nBody after incremental edit.";
+      // Autosave stays quiet: the line under the title shows errors only.
+      await parserPage.evaluate(() => {
+        window.__statusShown = [];
+        const row = document.getElementById("status-row");
+        new MutationObserver(() => {
+          if (!row.classList.contains("hidden")) {
+            window.__statusShown.push(row.textContent.trim());
+          }
+        }).observe(row, { attributes: true, childList: true, subtree: true, characterData: true });
+      });
       await parserPage.locator("#editor").fill(incrementalBody);
       await parserPage.waitForFunction(() => document.querySelector("#preview h1")?.textContent === "Typed heading");
       await waitForCondition(
@@ -792,6 +802,9 @@ async function run() {
         documents.get("doc-beta")?.body === incrementalBody,
         `Documents incremental autosave must preserve the final markdown body. Got ${JSON.stringify(documents.get("doc-beta"))}`,
       );
+      await parserPage.waitForFunction(() => document.getElementById("save-button")?.disabled === true);
+      const statusShown = await parserPage.evaluate(() => window.__statusShown);
+      assert(statusShown.length === 0, `Documents typing and autosave must not flash a status line. Got ${JSON.stringify(statusShown)}`);
     } finally {
       await parserPage.close();
     }

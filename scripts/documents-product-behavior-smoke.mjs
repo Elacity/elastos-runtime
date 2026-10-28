@@ -47,8 +47,11 @@ assert(
   source.includes('id="status-row" class="status-row hidden"') &&
     source.includes('function clearStatus()') &&
     source.includes('elements.statusRow.classList.add("hidden");') &&
+    source.includes("function showError(message)") &&
+    !source.includes("setStatus(") &&
+    !source.includes("Unsaved local changes.") &&
     source.includes('workspaceView: "write"'),
-  "Documents must hide idle status and default to Write when no authoritative preference exists.",
+  "Documents must hide idle status, show only errors under the title, and default to Write when no authoritative preference exists.",
 );
 assert(
   !!announceMatch &&
@@ -119,15 +122,13 @@ assert(
   "Documents find must stay source-driven, move the editor selection, and keep the current Home menu or keyboard flow.",
 );
 assert(
-  source.includes('void saveCurrent({ quiet: true, autosave: true }).catch((error) => {') &&
+  source.includes('void saveCurrent({ autosave: true }).catch((error) => {') &&
     source.includes('reportSaveFailure(error, "Autosave failed.");') &&
     source.includes('currentSessionId: 0,') &&
     source.includes("function replaceCurrentDocument(document)") &&
     source.includes("function isCurrentDocumentTarget(target)") &&
     source.includes("if (!isCurrentDocumentTarget(saveTarget)) {") &&
     source.includes("if (state.dirty) {") &&
-    source.includes("if (!quiet) {") &&
-    source.includes('setStatus("Saving…");') &&
     source.includes("if (saveInFlight) {") &&
     source.includes("autosaveQueued = true;") &&
     source.includes("if (changedDuringSave) {") &&

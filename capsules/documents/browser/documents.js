@@ -84,7 +84,6 @@ const elements = {
 };
 
 let autosaveTimerId = 0;
-let statusClearTimerId = 0;
 let saveInFlight = null;
 let autosaveQueued = false;
 let queuedSaveTarget = null;
@@ -445,26 +444,8 @@ function preferredWorkspaceView(view) {
   return view === "read" ? "read" : view === "split" ? "split" : "write";
 }
 
-function clearStatusTimer() {
-  if (statusClearTimerId) {
-    window.clearTimeout(statusClearTimerId);
-    statusClearTimerId = 0;
-  }
-}
-
-function scheduleStatusClear(delay = 1600) {
-  clearStatusTimer();
-  statusClearTimerId = window.setTimeout(() => {
-    if (!state.dirty) {
-      clearStatus();
-    }
-  }, delay);
-}
-
 function clearStatus() {
-  clearStatusTimer();
   elements.statusText.textContent = "";
-  elements.statusText.className = "status-text";
   elements.statusRow.classList.add("hidden");
 }
 
@@ -524,7 +505,7 @@ function scheduleAutosave() {
     return;
   }
   autosaveTimerId = window.setTimeout(() => {
-    void saveCurrent({ quiet: true, autosave: true }).catch((error) => {
+    void saveCurrent({ autosave: true }).catch((error) => {
       reportSaveFailure(error, "Autosave failed.");
     });
   }, 900);
@@ -532,7 +513,7 @@ function scheduleAutosave() {
 
 function reportSaveFailure(error, fallback) {
   if (error?.documentsTarget && !isCurrentDocumentTarget(error.documentsTarget)) return;
-  setStatus(readableDocumentsError(error, fallback), "warning");
+  showError(readableDocumentsError(error, fallback));
 }
 
 function canAnnounceHomeChrome() {
@@ -622,7 +603,7 @@ function activateMarkdownLink(event) {
     if (state.mode === "share") {
       elements.shareSubtitle.textContent = message;
     } else {
-      setStatus(message, "warning");
+      showError(message);
     }
     return;
   }
@@ -1013,14 +994,11 @@ function setInspectorView(view) {
   }
 }
 
-function setStatus(message, type) {
-  clearStatusTimer();
-  const text = type === "warning"
-    ? readableDocumentsError(message, "Documents action could not be completed.")
-    : String(message || "");
-  elements.statusText.textContent = text;
-  elements.statusText.className = "status-text" + (type === "warning" ? " warning" : "");
-  elements.statusRow.classList.toggle("hidden", !text);
+// The line under the title carries errors only; saving and other progress stay
+// quiet (the Save button and the list's "unsaved" marker show the dirty state).
+function showError(message) {
+  elements.statusText.textContent = readableDocumentsError(message, "Documents action could not be completed.");
+  elements.statusRow.classList.remove("hidden");
 }
 
 function setDirty(dirty) {
@@ -1031,9 +1009,7 @@ function setDirty(dirty) {
   elements.saveButton.disabled = !hasCurrent || !state.dirty;
   elements.saveAsButton.disabled = !hasPersistedCurrent || isLibraryFile;
   elements.deleteButton.disabled = !hasPersistedCurrent || isLibraryFile;
-  if (hasCurrent && state.dirty) {
-    setStatus("Unsaved local changes.", "warning");
-  } else if (hasCurrent) {
+  if (hasCurrent && !state.dirty) {
     clearStatus();
   }
   renderDocumentsList();
@@ -1078,7 +1054,7 @@ function renderCurrentDocument() {
     elements.editor.disabled = true;
     elements.preview.innerHTML = '<div class="empty-state">Create or open a document.</div>';
     renderOutline([]);
-    setStatus("No document selected.");
+    clearStatus();
     setDirty(false);
     return;
   }
@@ -1268,7 +1244,7 @@ async function loadSummary() {
       renderDocumentsList();
       renderCurrentDocument();
       elements.preview.innerHTML = '<div class="error-state">Document not found. Nothing opened.</div>';
-      setStatus("Document not found: " + requestedUri + ". Nothing opened.", "warning");
+      showError("Document not found: " + requestedUri + ". Nothing opened.");
     }
     state.initialDocDid = "";
     return;
@@ -1305,8 +1281,6 @@ async function loadLibraryObject(uri) {
   });
   renderDocumentsList();
   renderCurrentDocument();
-  setStatus("Opened from Library.");
-  scheduleStatusClear();
 }
 
 async function openChatAttachment(payload) {
@@ -1354,8 +1328,6 @@ async function openChatAttachment(payload) {
     renderDocumentsList();
     renderCurrentDocument();
     setWorkspaceView(preferredWorkspaceView(state.initialView));
-    setStatus("Opened the Chat attachment.");
-    scheduleStatusClear();
     return true;
   } finally {
     state.pendingChatAttachmentId = "";
@@ -1433,8 +1405,7 @@ async function createDocument(title) {
   clearStatus();
 }
 
-function applySavedDocumentState(persistedDocument, saveTarget, requestedTitle, requestedBody, successMessage, options) {
-  const quiet = !!(options && options.quiet);
+function applySavedDocumentState(persistedDocument, saveTarget, requestedTitle, requestedBody) {
   if (!isCurrentDocumentTarget(saveTarget)) return;
   const libraryProjection = isLibraryFileProjection(persistedDocument);
   if (!libraryProjection) {
@@ -1463,12 +1434,6 @@ function applySavedDocumentState(persistedDocument, saveTarget, requestedTitle, 
     return;
   }
   renderCurrentDocument();
-  if (quiet) {
-    clearStatus();
-    return;
-  }
-  setStatus(successMessage);
-  scheduleStatusClear();
 }
 
 function requireSavedWorkingCopy(document, expectedId) {
@@ -1497,13 +1462,9 @@ async function saveCurrent(options) {
   }
   let saveDocument = { ...state.current };
   const baseline = { ...(savedWorkingCopy || saveDocument) };
-  const quiet = !!options?.quiet;
   clearAutosaveTimer();
   const requestedTitle = elements.titleInput.value;
   const requestedBody = elements.editor.value;
-  if (!quiet) {
-    setStatus("Saving…");
-  }
   saveInFlight = (async () => {
     if (isLibraryFileProjection(saveDocument)) {
       const response = await libraryObjectApi("write", {
@@ -1523,7 +1484,7 @@ async function saveCurrent(options) {
         body: requestedBody,
         mime: object.mime || saveDocument.mime,
         updated_at: object.modified_at || saveDocument.updated_at,
-      }, saveTarget, requestedTitle, requestedBody, "Saved to Library.", options);
+      }, saveTarget, requestedTitle, requestedBody);
       return;
     }
     if (saveRecovery && isCurrentDocumentTarget(saveRecovery.target)) {
@@ -1551,7 +1512,7 @@ async function saveCurrent(options) {
         if (!isCurrentDocumentTarget(saveTarget)) return;
         const observed = requireSavedWorkingCopy(response.document, recovery.base.doc_did);
         if (observed.title === recovery.title && observed.body === recovery.body) {
-          applySavedDocumentState(observed, saveTarget, recovery.inputTitle, recovery.body, "Saved document confirmed.", options);
+          applySavedDocumentState(observed, saveTarget, recovery.inputTitle, recovery.body);
           return;
         }
         if (observed.revision !== recovery.base.revision ||
@@ -1590,7 +1551,7 @@ async function saveCurrent(options) {
     if (persisted.title !== (requestedTitle.trim() || "Untitled") || persisted.body !== requestedBody) {
       throw new Error("Save result could not be confirmed. Your edits are kept.");
     }
-    applySavedDocumentState(persisted, saveTarget, requestedTitle, requestedBody, "Saved.", options);
+    applySavedDocumentState(persisted, saveTarget, requestedTitle, requestedBody);
   })();
   try {
     await saveInFlight;
@@ -1608,7 +1569,7 @@ async function saveCurrent(options) {
         saveRecovery?.target.sessionId !== state.currentSessionId &&
         pendingHomeWindowCloseTarget?.sessionId !== state.currentSessionId
       ) {
-        void saveCurrent({ quiet: true, autosave: true }).catch((error) => {
+        void saveCurrent({ autosave: true }).catch((error) => {
           reportSaveFailure(error, "Autosave failed.");
         });
       }
@@ -1809,7 +1770,6 @@ async function saveAsCurrent(title, fileName) {
   const target = { sessionId: state.currentSessionId, identity: documentIdentity(state.current) };
   const requestedTitle = elements.titleInput.value;
   const requestedBody = elements.editor.value;
-  setStatus("Creating new document…");
   const response = await documentsProviderApi("save_as", {
     doc_did: state.current.doc_did,
     title: title || null,
@@ -1821,15 +1781,13 @@ async function saveAsCurrent(title, fileName) {
   if (elements.titleInput.value !== requestedTitle || elements.editor.value !== requestedBody) {
     upsertDocumentListItem(response.document);
     renderDocumentsList();
-    setStatus("Copy saved. Newer edits are kept in this document.", "warning");
+    showError("Copy saved. Newer edits are kept in this document.");
     return;
   }
   replaceCurrentDocument(response.document);
   upsertDocumentListItem(response.document);
   renderDocumentsList();
   renderCurrentDocument();
-  setStatus("New document created.");
-  scheduleStatusClear();
 }
 
 async function unpublishCurrent() {
@@ -1842,16 +1800,13 @@ async function unpublishCurrent() {
     return;
   }
   try {
-    setStatus("Unpublishing…");
     await documentsProviderApi("unpublish", {
       doc_did: state.current.doc_did,
     });
     await selectDocument(state.current.doc_did, { force: true });
-    setStatus("Unpublished.");
-    scheduleStatusClear();
   } catch (error) {
     console.error("documents unpublish failed", error);
-    setStatus(readableDocumentsError(error, "Unpublish failed."), "warning");
+    showError(readableDocumentsError(error, "Unpublish failed."));
   }
 }
 
@@ -1871,7 +1826,6 @@ async function requestDeleteCurrent() {
     return;
   }
   try {
-    setStatus("Deleting…");
     await documentsProviderApi("delete", { doc_did: deletedDocDid });
     state.documents = state.documents.filter((document) => document.doc_did !== deletedDocDid);
     if (state.current && state.current.doc_did === deletedDocDid) {
@@ -1879,11 +1833,9 @@ async function requestDeleteCurrent() {
     }
     renderDocumentsList();
     renderCurrentDocument();
-    setStatus("Deleted.");
-    scheduleStatusClear();
   } catch (error) {
     console.error("documents delete failed", error);
-    setStatus(readableDocumentsError(error, "Document could not be deleted."), "warning");
+    showError(readableDocumentsError(error, "Document could not be deleted."));
   }
 }
 
@@ -2073,7 +2025,7 @@ function wireShellEvents() {
         } catch (error) {
           console.error("documents open chat attachment failed", error);
           const message = readableDocumentsError(error, "Could not open Chat attachment.");
-          setStatus(message, "warning");
+          showError(message);
           sendChatAttachmentOpenResult({
             attachmentId: data.attachmentId,
             ok: false,
@@ -2103,7 +2055,7 @@ function wireShellEvents() {
     try {
       await saveAsCurrent(title, fileName);
     } catch (error) {
-      setStatus(error.message || "Save as failed.", "warning");
+      showError(error.message || "Save as failed.");
     }
   });
   document.addEventListener("keydown", async (event) => {
@@ -2196,7 +2148,7 @@ async function loadShellMode() {
     elements.documentsList.innerHTML = "";
     const message = readableDocumentsError(error, "Documents could not be loaded.");
     elements.preview.innerHTML = '<div class="error-state">' + escapeHtml(message) + "</div>";
-    setStatus(message, "warning");
+    showError(message);
   }
 }
 

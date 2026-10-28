@@ -45,7 +45,7 @@ function editor(server, current = server.docs.get("did:one")) {
     isLibraryFileProjection: () => false, isDraftDocument: (doc) => doc.doc_did.startsWith("draft:"),
     documentIdentity: (doc) => doc.doc_did,
     documentsProviderApi: (...args) => server.request(...args),
-    clearAutosaveTimer() {}, setStatus() {}, clearStatus() {}, scheduleStatusClear() {},
+    clearAutosaveTimer() {}, showError() {}, clearStatus() {},
     renderDocumentsList() {}, renderCurrentDocument() { context.state.dirty = false; context.elements.titleInput.value = context.state.current.title; context.elements.editor.value = context.state.current.body; }, refreshPreviewFromEditor() {}, renderHistory() {},
     upsertDocumentListItem() {}, reportSaveFailure() {}, scheduleAutosave() {},
     navigationMessages: [],

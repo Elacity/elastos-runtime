@@ -1422,7 +1422,7 @@ async function main() {
           activeDocDid: doc.querySelector(".document-list-item.active")?.dataset.docDid || "",
           saveDisabled: doc.querySelector("#save-button")?.disabled ?? false,
         })`);
-        return savedDocument.ok && savedDocument.status === "Saved." && savedDocument.activeDocDid.length > 0 && savedDocument.saveDisabled;
+        return savedDocument.ok && savedDocument.status === "" && savedDocument.activeDocDid.length > 0 && savedDocument.saveDisabled;
       }, 12000, 500);
       assert(savedDocument?.activeDocDid, "Documents did not expose the saved document DID", savedDocument);
 
@@ -1721,7 +1721,7 @@ async function main() {
           deleteDisabled: !!doc.querySelector("#delete-button")?.disabled,
         })`);
         return viewer.ok
-          && viewer.status === "Deleted."
+          && viewer.status === ""
           && viewer.activeDocDid === ""
           && !viewer.docDids.includes(created.activeDocDid)
           && !viewer.titleDisabled
