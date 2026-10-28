@@ -3188,28 +3188,35 @@ assert(JSON.stringify(preferenceWindows[1].frameWindow.posted.at(-1)) ===
 const closeRequestType = "elastos.documents.window-close.request/v1";
 const answerClose = (win, ok, reason) => {
   const request = win.frameWindow.posted.at(-1);
-  assert(request?.type === closeRequestType && request.homeToken === win.token, "sign-out must ask the Documents window", win.frameWindow.posted);
+  assert(request?.type === closeRequestType && request.homeToken === win.token, "Lock and sign-out must ask the Documents window", win.frameWindow.posted);
   for (const [state, settledOk, settledReason] of [["pending", false, "awaiting_decision"], ["terminal", ok, reason]]) {
     sendWindowEvent("message", { origin: "null", source: win.frameWindow, data: {
       type: "elastos.documents.window-close.result/v1", requestId: request.requestId, homeToken: win.token,
       state, ok: settledOk, reason: settledReason, sessionId: 1 } });
   }
 };
-// Cancel in the second window stops the sign-out and keeps that window.
-const cancelledSignOut = shellWindows.closeDocumentsWindowsBeforeSignOut();
+// Lock and sign-out run through the same step in Home's desktop: Cancel in the
+// second window stops it and keeps that window; settled windows let it go on.
+const sessionEnd = vm.createContext({ sessionEndPending: false,
+  closeDocumentsWindowsBeforeSessionEnd: shellWindows.closeDocumentsWindowsBeforeSessionEnd });
+vm.runInContext(navigationFunction(guiSource, "endHomeSessionAfterDocuments"), sessionEnd);
+let lockRequests = 0;
+const lock = () => sessionEnd.endHomeSessionAfterDocuments(() => { lockRequests += 1; });
+const cancelledLock = lock();
 await settleOpen();
 assert(preferenceWindows[1].frameWindow.posted.at(-1)?.type !== closeRequestType,
-  "sign-out must ask one Documents window at a time");
+  "Lock must ask one Documents window at a time");
+assert(await lock() === false && lockRequests === 0, "a second Lock press must wait for the first");
 answerClose(preferenceWindows[0], true, "");
 await settleOpen();
 answerClose(preferenceWindows[1], false, "cancelled");
-assert(await cancelledSignOut === false, "Cancel in a Documents window must stop the sign-out");
+assert(await cancelledLock === false && lockRequests === 0, "Cancel in a Documents window must stop the Lock");
 assert(!shellCore.shellState.windows.has(preferenceWindows[0].entry.id) &&
   shellCore.shellState.windows.has(preferenceWindows[1].entry.id),
   "the cancelled Documents window must stay open");
-const settledSignOut = shellWindows.closeDocumentsWindowsBeforeSignOut();
+const settledLock = lock();
 await settleOpen();
 answerClose(preferenceWindows[1], true, "");
-assert(await settledSignOut === true, "settled Documents windows must let sign-out go on");
-console.log("[home-shell-regression] Documents preference reaches every window, survives reload, and sign-out asks first: PASS");
+assert(await settledLock === true && lockRequests === 1, "settled Documents windows must let the Lock go on");
+console.log("[home-shell-regression] Documents preference reaches every window, survives reload, and Lock and sign-out ask first: PASS");
 console.log("[home-shell-regression] PASS");

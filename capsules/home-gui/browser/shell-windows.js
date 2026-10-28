@@ -2164,12 +2164,12 @@ function hideWindow(id) {
   hideWindowEntries([entry]);
 }
 
-// Sign-out ends the session, so every open Documents window settles its
-// unsaved changes first, one at a time and in view, through the same close
+// Lock and sign-out unload the desktop, so every open Documents window settles
+// its unsaved changes first, one at a time and in view, through the same close
 // handshake: Save, Don't save or Cancel. Cancel or a failed save keeps that
-// window open and stops the sign-out. A window whose frame never loaded holds
-// no edits.
-export async function closeDocumentsWindowsBeforeSignOut() {
+// window open and stops the lock or sign-out. A window whose frame never
+// loaded holds no edits.
+export async function closeDocumentsWindowsBeforeSessionEnd() {
   for (const entry of [...shellState.windows.values()]) {
     if (entry.targetId !== "documents" || shellState.windows.get(entry.id) !== entry ||
         !documentsWindowCloseContext(entry)) {

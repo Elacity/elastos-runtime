@@ -69,7 +69,7 @@ import {
 import {
   attachAuthorizedTarget,
   closeWindow,
-  closeDocumentsWindowsBeforeSignOut,
+  closeDocumentsWindowsBeforeSessionEnd,
   cleanupBeforeUnload,
   configureWindowHooks,
   handleShellResize,
@@ -1192,6 +1192,26 @@ function bindLauncherViewToggle() {
   });
 }
 
+// Lock and sign-out both unload this desktop (Home's host clears the shell
+// frame, home-shell-host.js enterHostAuthGate), so unsaved Documents edits are
+// settled first, while the session still works. Returns whether it went on.
+let sessionEndPending = false;
+async function endHomeSessionAfterDocuments(end) {
+  if (sessionEndPending) {
+    return false;
+  }
+  sessionEndPending = true;
+  try {
+    if (!(await closeDocumentsWindowsBeforeSessionEnd())) {
+      return false;
+    }
+  } finally {
+    sessionEndPending = false;
+  }
+  end();
+  return true;
+}
+
 export function bindHomeGuiInteractions(options = {}) {
   if (homeGuiInteractionsBound) {
     return;
@@ -1267,33 +1287,22 @@ export function bindHomeGuiInteractions(options = {}) {
   });
 
   document.querySelector("#identity-menu-lock")?.addEventListener("click", () => {
-    homeGuiHostActions.requestHomeUnlock?.();
+    void endHomeSessionAfterDocuments(() => homeGuiHostActions.requestHomeUnlock?.());
   });
 
   bindAboutOverlay();
 
-  let signOutPending = false;
-  toolbarSignOutButton?.addEventListener("click", async () => {
-    if (signOutPending) {
-      return;
-    }
-    signOutPending = true;
-    try {
-      // Unsaved Documents edits are settled while the session still works.
-      if (!(await closeDocumentsWindowsBeforeSignOut())) {
-        return;
-      }
-    } finally {
-      signOutPending = false;
-    }
-    document.body.dataset.homeStatus = "booting";
-    signOut()
-      .catch((error) => {
-        console.error("home-gui sign out failed", error);
-      })
-      .finally(() => {
-        window.location.reload();
-      });
+  toolbarSignOutButton?.addEventListener("click", () => {
+    void endHomeSessionAfterDocuments(() => {
+      document.body.dataset.homeStatus = "booting";
+      signOut()
+        .catch((error) => {
+          console.error("home-gui sign out failed", error);
+        })
+        .finally(() => {
+          window.location.reload();
+        });
+    });
   });
 
   document.querySelector("#toolbar-spotlight")?.addEventListener("click", () => {
