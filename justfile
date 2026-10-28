@@ -217,6 +217,7 @@ product-ui-source:
     node --test scripts/chat-room-reconnect.test.mjs
 
 product-ui-browser:
+    node scripts/wallet-product-layout-smoke.mjs
     node scripts/people-product-layout-smoke.mjs
     node scripts/inbox-product-layout-smoke.mjs
     node scripts/archive-product-layout-smoke.mjs
