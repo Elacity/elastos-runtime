@@ -1505,8 +1505,9 @@ impl CollaborationDiscoveryService {
     /// Queues one contact request addressed to `recipient_profile_did`, with
     /// or without Discovery. It only records intent; the outbox delivers it
     /// through the Community relay and the recipient decides in Inbox.
-    /// `seen_device_dids` are the device DIDs of Community members whose
-    /// presence this Home holds; they and contacts' device DIDs are refused.
+    /// `seen_device_dids` are the device DIDs this Home knows from Community
+    /// (presence and signed posts); they, and every device DID in a signed
+    /// Profile the contact store holds, are refused.
     /// Refusals are `ProfileContactRequestRefusal` errors, so a caller can
     /// downcast them for the exact text a person sees.
     pub(crate) async fn send_profile_contact_request(
@@ -1530,14 +1531,13 @@ impl CollaborationDiscoveryService {
         if recipient_profile_did == self.authority.local_device_did() {
             return Err(ProfileContactRequestRefusal::OwnDeviceId.into());
         }
-        let contact_device = store.snapshot()?.contacts().iter().any(|contact| {
-            contact.remote_presence_device_did() == recipient_profile_did
-                && contact.remote_profile_did() != recipient_profile_did
-        });
-        if contact_device
-            || seen_device_dids
-                .iter()
-                .any(|did| did == recipient_profile_did)
+        if seen_device_dids
+            .iter()
+            .any(|did| did == recipient_profile_did)
+            || store
+                .read_only_snapshot()?
+                .known_device_dids()
+                .contains(recipient_profile_did)
         {
             return Err(ProfileContactRequestRefusal::OtherHomeDeviceId.into());
         }
@@ -6429,6 +6429,64 @@ pub(crate) mod tests {
                 .waiting_outgoing_profile_request_count(now)
                 .unwrap(),
             1
+        );
+    }
+
+    /// The box journey: Alma removes Bruno, asks him again, then pastes the
+    /// device DID his System > About shows (the device his Home signs with).
+    /// No contact or presence names it any more, but the signed Profile from
+    /// their earlier chain does, so it is refused and nothing is queued.
+    #[tokio::test]
+    async fn profile_request_refuses_a_removed_contacts_device_did() {
+        let temp = tempfile::tempdir().unwrap();
+        let pair = direct_peer_pair(temp.path()).await;
+        let bruno_device = crate::crypto::encode_signing_key_did(&pair.key_b);
+        assert_eq!(pair.service_b.authority.local_device_did(), bruno_device);
+        assert!(pair.profile_b.authorizes_endpoint(&bruno_device));
+        let bruno = pair.profile_b.document().profile_did.clone();
+        pair.service_a
+            .remove_contact(&pair.store_a, &pair.profile_a, &bruno, current_timestamp())
+            .await
+            .unwrap();
+        assert!(pair.store_a.snapshot().unwrap().contacts().is_empty());
+        assert_eq!(
+            pair.service_a
+                .send_profile_contact_request(
+                    &pair.store_a,
+                    &bruno,
+                    &[],
+                    &pair.profile_a,
+                    current_timestamp()
+                )
+                .await
+                .unwrap(),
+            ProfileContactRequestOutcome::Requested
+        );
+        let waiting = pair
+            .store_a
+            .waiting_outgoing_profile_request_count(current_timestamp())
+            .unwrap();
+
+        let err = pair
+            .service_a
+            .send_profile_contact_request(
+                &pair.store_a,
+                &bruno_device,
+                &[],
+                &pair.profile_a,
+                current_timestamp(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ProfileContactRequestRefusal>(),
+            Some(&ProfileContactRequestRefusal::OtherHomeDeviceId)
+        );
+        assert_eq!(
+            pair.store_a
+                .waiting_outgoing_profile_request_count(current_timestamp())
+                .unwrap(),
+            waiting
         );
     }
 

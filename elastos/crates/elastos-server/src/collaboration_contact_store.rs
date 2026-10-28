@@ -677,6 +677,19 @@ impl CollaborationContactReadSnapshot<'_> {
             .unwrap_or(CollaborationContactRelationship::None))
     }
 
+    /// Every device DID named by a signed Profile this Home holds for another
+    /// person: contacts, removed and declined pairs, requests either way and
+    /// their answers. A request to one of them would reach nobody.
+    pub(crate) fn known_device_dids(&self) -> HashSet<String> {
+        let Some(loaded) = self.loaded.as_ref() else {
+            return HashSet::new();
+        };
+        held_profiles(loaded)
+            .filter(|profile| profile.document().profile_did != self.store.local_profile_did)
+            .flat_map(|profile| profile.device_dids().map(str::to_string))
+            .collect()
+    }
+
     /// Every Profile DID this Home has a relationship with, keyed by DID,
     /// with the precedence documented on `CollaborationContactRelationship`.
     pub(crate) fn relationships(
@@ -3872,38 +3885,44 @@ fn declined_within_cool_down(
         })
 }
 
+/// Every signed Profile this Home holds: retained contact heads, and the
+/// Profiles inside advertisements, requests and answers of both kinds.
+fn held_profiles(
+    loaded: &LoadedState,
+) -> impl Iterator<Item = &VerifiedCollaborationProfileDocument> {
+    loaded
+        .accepted_profile_heads
+        .values()
+        .map(|(head, _)| head)
+        .chain(
+            loaded
+                .advertisements
+                .values()
+                .map(|advertisement| advertisement.profile()),
+        )
+        .chain(loaded.requests.values().map(|request| request.profile()))
+        .chain(
+            loaded
+                .profile_requests
+                .values()
+                .map(|request| request.profile()),
+        )
+        .chain(
+            loaded
+                .profile_decisions
+                .values()
+                .map(|(_, profile)| profile),
+        )
+}
+
 /// A signed Profile this Home already holds for `profile_did`, newest
 /// revision first, from any chain, request, advertisement or retained head.
 fn known_profile(
     loaded: &LoadedState,
     profile_did: &str,
 ) -> Option<VerifiedCollaborationProfileDocument> {
-    let mut candidates: Vec<&VerifiedCollaborationProfileDocument> = Vec::new();
-    if let Some((head, _)) = loaded.accepted_profile_heads.get(profile_did) {
-        candidates.push(head);
-    }
-    candidates.extend(
-        loaded
-            .advertisements
-            .values()
-            .map(|advertisement| advertisement.profile())
-            .chain(loaded.requests.values().map(|request| request.profile()))
-            .chain(
-                loaded
-                    .profile_requests
-                    .values()
-                    .map(|request| request.profile()),
-            )
-            .chain(
-                loaded
-                    .profile_decisions
-                    .values()
-                    .map(|(_, profile)| profile),
-            )
-            .filter(|profile| profile.document().profile_did == profile_did),
-    );
-    candidates
-        .into_iter()
+    held_profiles(loaded)
+        .filter(|profile| profile.document().profile_did == profile_did)
         .max_by_key(|profile| profile.document().revision)
         .cloned()
 }

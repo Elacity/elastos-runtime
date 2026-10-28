@@ -613,6 +613,28 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
 }
 
 #[tokio::test]
+async fn test_people_refuses_the_device_did_of_someone_who_posted_in_community() {
+    // Not a contact and no presence: only their signed Community post names
+    // the device their Home signs with, which System > About shows them.
+    let home = ContactRequestHome::new().await;
+    let device = home.remote.chat.test_core().test_local_device_did();
+    assert!(home.remote.profile.authorizes_endpoint(&device));
+    let (status, body) = home
+        .post(
+            PEOPLE_REQUEST_PATH,
+            Some(&home.authority.people_token),
+            serde_json::json!({ "profile_id": device }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body,
+        "That's a Home's device DID. Use the DID shown in their People."
+    );
+    assert!(home.outgoing_requests().is_empty());
+}
+
+#[tokio::test]
 async fn left_home_refuses_new_contact_intent_and_both_inbox_decisions_without_mutation() {
     let mut home = ContactRequestHome::new().await;
     let membership = Arc::new(

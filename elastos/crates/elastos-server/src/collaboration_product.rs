@@ -286,6 +286,17 @@ impl CollaborationChatProductPort {
         self.core.conversation_scope()
     }
 
+    /// Every device DID named by the signed Profiles on the Community posts
+    /// this Home retains, including its own. Read only.
+    pub(crate) fn community_device_dids(&self, now: u64) -> anyhow::Result<Vec<String>> {
+        let mut dids = Vec::new();
+        for envelope in self.core.conversation_history(now)? {
+            let message = self.core.authorize_stored_product_message(&envelope)?;
+            dids.extend(message.sender_profile().device_dids().map(str::to_string));
+        }
+        Ok(dids)
+    }
+
     pub(crate) fn local_device_did(&self) -> String {
         self.core.local_device_did()
     }

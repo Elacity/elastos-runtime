@@ -828,7 +828,7 @@ pub(super) async fn people_contact_request_create(
     let community_names = community_member_names_or_none(&state).await;
     send_profile_contact_request_response(
         &service,
-        state.collaboration_presence_product_port.as_ref(),
+        &state,
         &community_names,
         &context,
         &authority,
@@ -857,27 +857,36 @@ pub(super) async fn community_member_names_or_none(
 /// this Home holds for the DID (its contact store first, then the Community
 /// names Chat shows), else `CONTACT_NAME_NOT_KNOWN`. A refusal is a
 /// 400 or 409 whose body is the refusal's text, and never echoes the DID.
-/// `presence` supplies the device DIDs of Community members seen live, so
-/// one of them is refused like a contact's device DID.
+/// The device DIDs this Home knows from Community, presence and signed
+/// posts, are refused like a contact's device DID.
 pub(super) async fn send_profile_contact_request_response(
     service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
-    presence: Option<&crate::collaboration_presence::CollaborationPresenceProductPort>,
+    state: &GatewayState,
     community_names: &std::collections::HashMap<String, String>,
     context: &HomeLaunchTokenContext,
     authority: &ConfiguredContactAuthority,
     recipient_profile_did: &str,
 ) -> Response {
     let now = now_ts();
-    // The seen-device check only adds a refusal; an unreadable presence store
+    // The device check only adds a refusal; an unreadable Community store
     // must not block a request by DID.
-    let seen_device_dids = match presence.map(|port| port.seen_device_dids(now)) {
-        Some(Ok(dids)) => dids,
-        Some(Err(err)) => {
-            tracing::warn!(error = %format!("{err:#}"), "contact request could not read Community presence");
-            Vec::new()
+    let mut seen_device_dids = Vec::new();
+    if let Some(port) = state.collaboration_presence_product_port.as_ref() {
+        match port.seen_device_dids(now) {
+            Ok(dids) => seen_device_dids.extend(dids),
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "contact request could not read Community presence")
+            }
         }
-        None => Vec::new(),
-    };
+    }
+    if let Some(port) = state.collaboration_chat_product_port.as_ref() {
+        match port.community_device_dids(now) {
+            Ok(dids) => seen_device_dids.extend(dids),
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "contact request could not read Community posts")
+            }
+        }
+    }
     // A Community node that refuses requests by DID is known before anything
     // is queued, so the first request is refused like the later ones.
     service

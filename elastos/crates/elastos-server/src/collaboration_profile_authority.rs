@@ -140,6 +140,25 @@ impl VerifiedCollaborationProfileDocument {
                 .any(|binding| binding.endpoint_did == endpoint_did)
     }
 
+    /// Every device DID this Profile names: its delivery endpoints and the
+    /// devices it lets sign, never the Profile DID itself.
+    pub(crate) fn device_dids(&self) -> impl Iterator<Item = &str> {
+        let profile_did = self.document.profile_did.as_str();
+        self.document
+            .collaboration_endpoint
+            .bindings
+            .iter()
+            .map(|binding| binding.endpoint_did.as_str())
+            .chain(
+                self.document
+                    .collaboration_signers
+                    .iter()
+                    .flat_map(|signers| signers.delegations.iter())
+                    .map(|delegation| delegation.signer_did.as_str()),
+            )
+            .filter(move |did| *did != profile_did)
+    }
+
     /// Return the only routable endpoint declared by this Profile.
     ///
     /// The initial collaboration protocol has no endpoint-selection policy.

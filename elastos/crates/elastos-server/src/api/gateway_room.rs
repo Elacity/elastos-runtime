@@ -1749,7 +1749,7 @@ pub(super) async fn chat_room_contact_request(
     }
     gateway_home_system::send_profile_contact_request_response(
         &service,
-        state.collaboration_presence_product_port.as_ref(),
+        &state,
         &community_names,
         &context,
         &authority,
