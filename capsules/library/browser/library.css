@@ -1418,16 +1418,14 @@
 
     .preview-frame img,
     .preview-frame video,
-    .preview-frame audio,
-    .preview-frame iframe {
+    .preview-frame audio {
       display: block;
       width: 100%;
       border: 0;
     }
 
     .preview-frame img,
-    .preview-frame video,
-    .preview-frame iframe {
+    .preview-frame video {
       max-height: min(62vh, 620px);
     }
 
