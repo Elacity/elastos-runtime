@@ -2,7 +2,7 @@
 
 ## Reporting
 
-If you find a security vulnerability, please report it privately via [GitHub Security Advisories](https://github.com/Elacity/elastos-runtime/security/advisories/new). Do not open a public issue.
+If you find a security vulnerability, please report it privately via [GitHub Security Advisories](https://github.com/Elacity/elastos-runtime/security/advisories/new) or by email to [security@ela.city](mailto:security@ela.city). Do not open a public issue.
 
 Do not describe an unfixed issue in a public issue, pull request, commit message, or branch name.
 
