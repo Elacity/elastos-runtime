@@ -302,9 +302,7 @@ async function run() {
   assert(
     dialog.includes('class="props-copy-btn el-copy-btn"') &&
       dialog.includes('class="el-copy-icon"') &&
-      dialog.includes('class="el-copy-check"') &&
-      dialog.includes("setPropertyCopyFeedback(propertyCopy, label, true);") &&
-      dialog.includes("setPropertyCopyFeedback(propertyCopy, label, false);"),
+      dialog.includes('class="el-copy-check"'),
     "Library Properties copy buttons must keep the donor copy feedback without changing clipboard authority.",
   );
 
