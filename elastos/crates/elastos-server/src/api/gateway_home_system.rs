@@ -675,11 +675,7 @@ pub(super) async fn people_discovery_request_create(
 ) -> Response {
     let advertisement_id = body.advertisement_id.trim().to_string();
     if advertisement_id.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "discovery advertisement id is required",
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, "Choose someone on Public to add.").into_response();
     }
     let summary = match configured_people_discovery_action(
         &state,
@@ -1285,11 +1281,7 @@ where
     let presentation = match authenticated_presence_presentation_for_context(state, &context) {
         Ok(presentation) => presentation,
         Err(HomePresenceAuthenticationError::Denied) => {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "People discovery authorization denied",
-            )
-                .into_response());
+            return Err((StatusCode::FORBIDDEN, "Public isn’t allowed here.").into_response());
         }
         Err(HomePresenceAuthenticationError::ProfileRequired) => {
             return Err((StatusCode::CONFLICT, PROFILE_REQUIRED_DISCOVERY_MESSAGE).into_response());
@@ -1297,7 +1289,7 @@ where
         Err(HomePresenceAuthenticationError::Internal) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "People discovery presentation is unavailable",
+                "Public isn’t available right now.",
             )
                 .into_response());
         }
@@ -1307,7 +1299,7 @@ where
         if require_configured {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "collaboration discovery is not configured",
+                "Public isn’t available on this Home.",
             )
                 .into_response());
         }

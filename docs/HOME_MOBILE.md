@@ -616,8 +616,9 @@ A first-party capsule fits the phone stage when:
   from `capsules/_shared/elastos-ui.css`, vendored with `just vendor-ui`;
   never edit the generated per-capsule copies);
 - text inputs are 16 px on the phone stage so iOS does not zoom the page;
-- a sidebar or navigation column becomes a sheet or drawer on the phone stage and
-  content comes first;
+- a sidebar or navigation column becomes a sheet or drawer on the phone stage,
+  or a segmented row above the content when it has only a few pages (People),
+  and content comes first;
 - rows are at least 48 px tall;
 - the capsule needs no keyboard code: the shell ends its frame above the soft
   keyboard (a framed `visualViewport` never sees the keyboard, so capsule-side

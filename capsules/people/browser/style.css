@@ -36,7 +36,6 @@ button {
 button:hover:not(:disabled),
 button:focus-visible:not(:disabled) {
   background: var(--el-inset);
-  outline: none;
 }
 
 button:focus-visible {
