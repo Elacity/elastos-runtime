@@ -398,9 +398,15 @@ function startServer(scenario) {
       if (url.pathname === "/api/apps/chat-room/attach-library" && request.method === "POST") {
         const chunks = []; for await (const chunk of request) chunks.push(chunk);
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        // The first post fails after publishing; a retry with the same request id posts.
-        const posted = trace.attachLibrary.some(previous => previous.body.request_id === body.request_id);
+        // Per request id: the first answer is lost behind a proxy error page,
+        // the second reports a failed post after publishing, the third posts.
+        const attempt = trace.attachLibrary.filter(previous => previous.body.request_id === body.request_id).length + 1;
+        const posted = attempt >= 3;
         trace.attachLibrary.push({ body, posted, token: request.headers['x-elastos-home-token'] });
+        if (attempt === 1) {
+          response.writeHead(502, { "access-control-allow-origin": "null", "content-type": "text/html" }).end("<h1>Bad gateway</h1>");
+          return;
+        }
         const publication = { object: { uri: body.uri }, uri: sharedUri, cid: sharedCid, published_at: 1780000000 };
         if (posted) json(response, { status: "ok", data: { publication, posted: true, name: "attached.txt", size_bytes: 30 } });
         else json(response, { status: "error", code: "post_failed", message: "Community send failed",
@@ -1125,7 +1131,7 @@ async function runScenario(scenario) {
       await panel.waitFor({ state: 'visible' });
       assert(await page.evaluate(() => window.fixturePickerReplies.length) === 1, "a replayed picker delivery was answered again");
       assert(await frame.locator('#library-post-title').innerText() === 'Post publicly?', "Post confirmation title differs");
-      assert((await panelText()).includes('Anyone with the link may download and keep a copy. Unpublish removes it from your Home. Copies elsewhere may remain.'),
+      assert((await panelText()).includes('Anyone with the link can download a copy. Unpublishing later stops sharing this file from your Home, but copies people already have stay.'),
         "Post confirmation body differs");
       await frame.locator('#library-post-cancel').click();
       await panel.waitFor({ state: 'hidden' });
@@ -1134,19 +1140,28 @@ async function runScenario(scenario) {
       await frame.locator('#attach-button').click();
       await panel.waitFor({ state: 'visible' });
       await frame.locator('#library-post-confirm').click();
-      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Published, not posted');
+      // A lost answer is an unknown outcome, never "Not posted", and Try again
+      // reuses the request id so the file cannot be posted twice.
+      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Post not confirmed');
+      assert((await panelText()).includes("Couldn't confirm the post. Check Community, or try again."), "a lost answer must say the outcome is unknown");
+      assert(await frame.locator('#library-post-retry').innerText() === 'Try again', "a lost answer must offer Try again");
       assert(trace.attachLibrary.length === 1, "Post must call attach-library once", trace.attachLibrary);
       const [first] = trace.attachLibrary;
       assert(first.body.uri === 'localhost://Users/alma/Documents/attached.txt' && first.body.if_revision === 'rev:attached'
         && typeof first.body.request_id === 'string' && first.body.request_id.length > 0
         && Object.keys(first.body).sort().join(',') === 'if_revision,request_id,uri', "attach-library body differs", first.body);
       assert(first.token === 'test-token', "attach-library launch authority missing");
+      await frame.locator('#library-post-retry').click();
+      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Published, not posted');
+      assert(trace.attachLibrary.length === 2 && trace.attachLibrary[1].body.request_id === first.body.request_id,
+        "Try again must reuse the request id", trace.attachLibrary);
       assert((await panelText()).includes(`Published: ${sharedUri}`), "a failed post must still show the publication");
-      assert(await frame.locator('#library-post-retry').isVisible() && await frame.locator('#library-post-open-library').isVisible(),
+      assert((await panelText()).includes('Published in Library. You can unpublish it there.'), "a failed post must point to Library");
+      assert(await frame.locator('#library-post-retry').innerText() === 'Retry post' && await frame.locator('#library-post-open-library').isVisible(),
         "a failed post must offer Retry post and Open in Library");
       await frame.locator('#library-post-retry').click();
       await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Posted publicly');
-      assert(trace.attachLibrary.length === 2 && trace.attachLibrary[1].body.request_id === first.body.request_id,
+      assert(trace.attachLibrary.length === 3 && trace.attachLibrary[2].body.request_id === first.body.request_id,
         "Retry post must reuse the request id", trace.attachLibrary);
       assert((await panelText()).includes(`Published: ${sharedUri}`) && (await panelText()).includes('Posted in Community.'),
         "publication and posting must show apart");

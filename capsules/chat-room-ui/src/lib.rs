@@ -663,7 +663,10 @@ fn validate_attachment_size(size: u64) -> Result<(), String> {
 }
 
 /// The same words Library shows before it publishes a file.
-const POST_PUBLICLY_BODY: &str = "Anyone with the link may download and keep a copy. Unpublish removes it from your Home. Copies elsewhere may remain.";
+const POST_PUBLICLY_BODY: &str = "Anyone with the link can download a copy. Unpublishing later stops sharing this file from your Home, but copies people already have stay.";
+
+/// Shown when Home's answer was lost: the post may or may not have gone out.
+const POST_OUTCOME_UNKNOWN: &str = "Couldn't confirm the post. Check Community, or try again.";
 
 /// A Library file Community posts publicly: Chat asks once, then Home
 /// publishes the file from Library and posts its link. Publishing and
@@ -685,9 +688,21 @@ struct LibraryPost {
 enum LibraryPostPhase {
     Confirm,
     Working,
-    Posted { link: String },
-    PostFailed { link: String, detail: String },
-    Failed { detail: String },
+    Posted {
+        link: String,
+    },
+    PostFailed {
+        link: String,
+        detail: String,
+    },
+    Failed {
+        detail: String,
+    },
+    /// Home's answer was lost. Trying again reuses the request id, so Home
+    /// cannot post the file twice.
+    Unknown {
+        link: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -712,6 +727,9 @@ struct LibraryPostView {
     title: &'static str,
     lines: Vec<String>,
     actions: &'static [LibraryPostAction],
+    /// The Retry button's words: "Retry post" after a failed post, "Try
+    /// again" when the outcome is unknown.
+    retry_label: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -753,16 +771,22 @@ fn library_post_from_selection(
     })
 }
 
-fn attach_library_error_text(code: &str) -> &'static str {
-    match code {
-        "empty_file" => "Empty files can't be published.",
-        "too_large" => "This file is too large to publish. Files up to 8 MiB can be published.",
-        "stale_revision" => "This file changed. Choose it again in Library.",
-        "unsupported" => "Folders can't be posted. Choose a file.",
-        "unavailable" => "Publishing isn't available right now. Try again.",
-        "changed_since_publish" => {
+fn attach_library_error_text(code: &str, reason: &str) -> &'static str {
+    match (code, reason) {
+        ("empty_file", _) => "Empty files can't be published.",
+        ("too_large", _) => {
+            "This file is too large to publish. Files up to 8 MiB can be published."
+        }
+        ("stale_revision", _) => "This file changed. Choose it again in Library.",
+        ("unsupported", "folder") => "Folders can't be posted. Choose a file.",
+        ("unsupported", "protected") => "Protected files can't be posted.",
+        ("unsupported", _) => "This file can't be posted from here.",
+        ("unavailable", _) => "Publishing isn't available right now. Try again.",
+        ("changed_since_publish", _) => {
             "This file changed after it was published. Unpublish it in Library, then post it again."
         }
+        ("withdrawn", _) => "This file was unpublished in Library, so it was not posted.",
+        ("request_id_reused", _) => "This post can't be sent again. Attach the file again.",
         _ => "This file could not be posted. Try again.",
     }
 }
@@ -778,6 +802,16 @@ fn library_post_outcome(http_status: u16, body: &serde_json::Value) -> LibraryPo
         .to_string();
     let ok = (200..300).contains(&http_status)
         && body.get("status").and_then(serde_json::Value::as_str) == Some("ok");
+    // A body that is not Home's answer (a proxy error page, an empty reply)
+    // says nothing about whether the post went out.
+    if !matches!(
+        body.get("status").and_then(serde_json::Value::as_str),
+        Some("ok" | "error")
+    ) {
+        return LibraryPostPhase::Unknown {
+            link: (!link.is_empty()).then_some(link),
+        };
+    }
     if ok
         && body.pointer("/data/posted") == Some(&serde_json::Value::Bool(true))
         && !link.is_empty()
@@ -799,8 +833,12 @@ fn library_post_outcome(http_status: u16, body: &serde_json::Value) -> LibraryPo
             detail: detail.to_string(),
         };
     }
+    let reason = body
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
     LibraryPostPhase::Failed {
-        detail: attach_library_error_text(code).to_string(),
+        detail: attach_library_error_text(code, reason).to_string(),
     }
 }
 
@@ -812,11 +850,13 @@ fn library_post_view(post: &LibraryPost) -> LibraryPostView {
             title: "Post publicly?",
             lines: vec![file, POST_PUBLICLY_BODY.to_string()],
             actions: &[Cancel, Post],
+            retry_label: "Retry post",
         },
         LibraryPostPhase::Working => LibraryPostView {
             title: "Post publicly?",
             lines: vec![file, "Publishing and posting...".to_string()],
             actions: &[],
+            retry_label: "Retry post",
         },
         LibraryPostPhase::Posted { link } => LibraryPostView {
             title: "Posted publicly",
@@ -826,6 +866,7 @@ fn library_post_view(post: &LibraryPost) -> LibraryPostView {
                 "Posted in Community.".to_string(),
             ],
             actions: &[OpenLibrary, Close],
+            retry_label: "Retry post",
         },
         LibraryPostPhase::PostFailed { link, detail } => LibraryPostView {
             title: "Published, not posted",
@@ -833,15 +874,30 @@ fn library_post_view(post: &LibraryPost) -> LibraryPostView {
                 file,
                 format!("Published: {link}"),
                 detail.clone(),
-                "To stop sharing it, Unpublish it in Library.".to_string(),
+                "Published in Library. You can unpublish it there.".to_string(),
             ],
             actions: &[Retry, OpenLibrary, Close],
+            retry_label: "Retry post",
         },
         LibraryPostPhase::Failed { detail } => LibraryPostView {
             title: "Not posted",
             lines: vec![file, detail.clone()],
             actions: &[Close],
+            retry_label: "Retry post",
         },
+        LibraryPostPhase::Unknown { link } => {
+            let mut lines = vec![file];
+            if let Some(link) = link {
+                lines.push(format!("Published: {link}"));
+            }
+            lines.push(POST_OUTCOME_UNKNOWN.to_string());
+            LibraryPostView {
+                title: "Post not confirmed",
+                lines,
+                actions: &[Retry, OpenLibrary, Close],
+                retry_label: "Try again",
+            }
+        }
     }
 }
 
@@ -3482,7 +3538,9 @@ impl App {
                 Some(post)
                     if matches!(
                         post.phase,
-                        LibraryPostPhase::Confirm | LibraryPostPhase::PostFailed { .. }
+                        LibraryPostPhase::Confirm
+                            | LibraryPostPhase::PostFailed { .. }
+                            | LibraryPostPhase::Unknown { .. }
                     ) =>
                 {
                     allowed.then(|| {
@@ -3518,19 +3576,20 @@ impl App {
                         link,
                         detail: "Reconnect, then retry the post.".to_string(),
                     },
+                    unknown @ LibraryPostPhase::Unknown { .. } => unknown,
                     _ => LibraryPostPhase::Failed {
                         detail: "Reconnect, then attach the file again.".to_string(),
                     },
                 }
             }
             Ok((status, body)) => library_post_outcome(status, &body),
-            Err(_) => match previous {
-                LibraryPostPhase::PostFailed { link, .. } => LibraryPostPhase::PostFailed {
-                    link,
-                    detail: "Home could not be reached. Retry the post.".to_string(),
-                },
-                _ => LibraryPostPhase::Failed {
-                    detail: "Home could not be reached. Check Library, then try again.".to_string(),
+            // The request may have reached Home: the outcome is unknown, and
+            // trying again reuses this request id so the file is posted once.
+            Err(_) => LibraryPostPhase::Unknown {
+                link: match previous {
+                    LibraryPostPhase::PostFailed { link, .. } => Some(link),
+                    LibraryPostPhase::Unknown { link } => link,
+                    _ => None,
                 },
             },
         };
@@ -3568,6 +3627,9 @@ impl App {
         }
         for (action, button) in &self.library_post_buttons {
             set_hidden(button.unchecked_ref(), !view.actions.contains(action))?;
+            if *action == LibraryPostAction::Retry {
+                button.set_text_content(Some(view.retry_label));
+            }
         }
         Ok(())
     }
@@ -8262,7 +8324,7 @@ mod tests {
 
     #[test]
     fn library_post_outcome_reports_publication_and_posting_apart() {
-        use super::LibraryPostPhase::{Failed, PostFailed, Posted};
+        use super::LibraryPostPhase::{Failed, PostFailed, Posted, Unknown};
         let publication =
             serde_json::json!({ "uri": "elastos://bafkreipublished", "cid": "bafkreipublished" });
         let link = "elastos://bafkreipublished".to_string();
@@ -8297,10 +8359,12 @@ mod tests {
             ("empty_file", "Empty files can't be published."),
             ("too_large", "This file is too large to publish. Files up to 8 MiB can be published."),
             ("stale_revision", "This file changed. Choose it again in Library."),
-            ("unsupported", "Folders can't be posted. Choose a file."),
+            ("unsupported", "This file can't be posted from here."),
             ("unavailable", "Publishing isn't available right now. Try again."),
             ("changed_since_publish", "This file changed after it was published. Unpublish it in Library, then post it again."),
             ("post_failed", "This file could not be posted. Try again."),
+            ("withdrawn", "This file was unpublished in Library, so it was not posted."),
+            ("request_id_reused", "This post can't be sent again. Attach the file again."),
             ("library_error", "This file could not be posted. Try again."),
         ] {
             let body = serde_json::json!({ "status": "error", "code": code, "message": "engine_internal detail" });
@@ -8315,19 +8379,43 @@ mod tests {
                 detail: "This file could not be posted. Try again.".to_string()
             }
         );
+        for (reason, detail) in [
+            ("folder", "Folders can't be posted. Choose a file."),
+            ("protected", "Protected files can't be posted."),
+            ("not_allowed_here", "This file can't be posted from here."),
+        ] {
+            let body = serde_json::json!({ "status": "error", "code": "unsupported", "reason": reason, "message": "x" });
+            assert_eq!(
+                super::library_post_outcome(400, &body),
+                Failed {
+                    detail: detail.to_string()
+                },
+                "{reason}"
+            );
+        }
+        // An answer that is not Home's (a proxy page, an empty reply) leaves the
+        // outcome unknown rather than claiming the file was not posted.
+        assert_eq!(
+            super::library_post_outcome(502, &serde_json::Value::Null),
+            Unknown { link: None }
+        );
+        assert_eq!(
+            super::library_post_outcome(504, &serde_json::json!({ "error": "gateway timeout" })),
+            Unknown { link: None }
+        );
     }
 
     #[test]
     fn library_post_view_asks_once_then_offers_retry_and_library() {
         use super::LibraryPostAction::{Cancel, Close, OpenLibrary, Post, Retry};
-        use super::LibraryPostPhase::{Confirm, Failed, PostFailed, Posted, Working};
+        use super::LibraryPostPhase::{Confirm, Failed, PostFailed, Posted, Unknown, Working};
         let confirm = super::library_post_view(&library_post_fixture(Confirm));
         assert_eq!(confirm.title, "Post publicly?");
         assert_eq!(
             confirm.lines,
             vec![
                 "notes.txt · 30 bytes".to_string(),
-                "Anyone with the link may download and keep a copy. Unpublish removes it from your Home. Copies elsewhere may remain.".to_string(),
+                "Anyone with the link can download a copy. Unpublishing later stops sharing this file from your Home, but copies people already have stay.".to_string(),
             ]
         );
         assert_eq!(confirm.actions, &[Cancel, Post]);
@@ -8345,7 +8433,7 @@ mod tests {
         );
         assert_eq!(posted.actions, &[OpenLibrary, Close]);
         let failed_post = super::library_post_view(&library_post_fixture(PostFailed {
-            link,
+            link: link.clone(),
             detail: "Posting to Community failed. Retry the post.".to_string(),
         }));
         assert_eq!(failed_post.title, "Published, not posted");
@@ -8354,6 +8442,32 @@ mod tests {
             "Published: elastos://bafkreipublished"
         );
         assert_eq!(failed_post.actions, &[Retry, OpenLibrary, Close]);
+        assert_eq!(failed_post.retry_label, "Retry post");
+        assert_eq!(
+            failed_post.lines[3],
+            "Published in Library. You can unpublish it there."
+        );
+        assert!(!failed_post
+            .lines
+            .iter()
+            .any(|line| line.contains("stop sharing")));
+        let unknown = super::library_post_view(&library_post_fixture(Unknown { link: None }));
+        assert_eq!(unknown.title, "Post not confirmed");
+        assert_eq!(
+            unknown.lines,
+            vec![
+                "notes.txt · 30 bytes".to_string(),
+                "Couldn't confirm the post. Check Community, or try again.".to_string(),
+            ]
+        );
+        assert_eq!(unknown.actions, &[Retry, OpenLibrary, Close]);
+        assert_eq!(unknown.retry_label, "Try again");
+        let unknown_published =
+            super::library_post_view(&library_post_fixture(Unknown { link: Some(link) }));
+        assert_eq!(
+            unknown_published.lines[1],
+            "Published: elastos://bafkreipublished"
+        );
         let failed = super::library_post_view(&library_post_fixture(Failed {
             detail: "x".to_string(),
         }));
