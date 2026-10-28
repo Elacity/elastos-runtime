@@ -46,6 +46,7 @@ struct BridgeConfig {
     replace_existing_socket: bool,
     #[serde(default = "default_buffer_bytes")]
     buffer_bytes: usize,
+    // Finite runs are for tests and smoke runs. The guest service uses zero.
     #[serde(default)]
     max_sessions: usize,
     #[serde(default = "default_control_socket_ready_timeout_ms")]
@@ -125,11 +126,13 @@ fn run_bridge(config: &BridgeConfig, stdout: &mut dyn Write) -> Result<(), Strin
 
     let mut accepted = 0_usize;
     let mut workers = Vec::new();
+    let mut worker_error = None;
     loop {
         if config.max_sessions > 0 && accepted >= config.max_sessions {
             break;
         }
         let host_stream = listener.accept()?;
+        reap_finished_workers(&mut workers, &mut worker_error);
         accepted += 1;
         let session_id = accepted;
         eprintln!("browser VM guest control bridge accepted session {session_id}");
@@ -137,7 +140,7 @@ fn run_bridge(config: &BridgeConfig, stdout: &mut dyn Write) -> Result<(), Strin
         let buffer_bytes = config.buffer_bytes;
         let control_socket_ready_timeout_ms = config.control_socket_ready_timeout_ms;
         let control_request_timeout = Duration::from_millis(config.control_request_timeout_ms);
-        workers.push(thread::spawn(move || {
+        workers.push((session_id, thread::spawn(move || {
             let guest_stream = match connect_guest_control_socket(
                 &guest_control_path,
                 Duration::from_millis(control_socket_ready_timeout_ms),
@@ -166,15 +169,71 @@ fn run_bridge(config: &BridgeConfig, stdout: &mut dyn Write) -> Result<(), Strin
                 eprintln!("browser VM guest control bridge session {session_id} failed: {err}");
             }
             Ok(())
-        }));
+        })));
+        #[cfg(test)]
+        tests::observe_retained_workers(&workers);
     }
 
+    finish_workers_in_accept_order(workers, worker_error)
+}
+
+type ControlWorker = (usize, thread::JoinHandle<Result<(), String>>);
+
+fn finish_workers_in_accept_order(
+    mut workers: Vec<ControlWorker>,
+    mut first_error: Option<(usize, String)>,
+) -> Result<(), String> {
+    // Only tests and smoke runs set max_sessions for this finite shutdown path.
+    // Reaping can reorder retained workers: resolve earlier sessions, then
+    // return the first error without waiting for later requests.
+    workers.sort_unstable_by_key(|(session_id, _)| *session_id);
     for worker in workers {
-        worker
-            .join()
-            .map_err(|_| "browser VM guest control bridge worker panicked".to_string())??;
+        if first_error
+            .as_ref()
+            .is_some_and(|(failed_session, _)| worker.0 > *failed_session)
+        {
+            break;
+        }
+        record_worker_result(worker, &mut first_error);
     }
-    Ok(())
+    match first_error {
+        Some((_, error)) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn reap_finished_workers(
+    workers: &mut Vec<ControlWorker>,
+    first_error: &mut Option<(usize, String)>,
+) {
+    let mut index = 0;
+    while index < workers.len() {
+        if workers[index].1.is_finished() {
+            record_worker_result(workers.swap_remove(index), first_error);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn record_worker_result(
+    (session_id, worker): ControlWorker,
+    first_error: &mut Option<(usize, String)>,
+) {
+    let result = worker
+        .join()
+        .unwrap_or_else(|_| Err("browser VM guest control bridge worker panicked".to_string()));
+    if let Err(error) = result {
+        eprintln!("browser VM guest control bridge session {session_id} worker failed: {error}");
+        // Finite runs report the first failed accepted session even when later
+        // sessions finish first. A completed failure does not stop accepting.
+        if first_error
+            .as_ref()
+            .is_none_or(|(first_session, _)| session_id < *first_session)
+        {
+            *first_error = Some((session_id, error));
+        }
+    }
 }
 
 fn proxy_http_control_request(
@@ -706,6 +765,343 @@ fn accept_vsock(_listener_fd: RawFd) -> Result<File, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static RETAINED_WORKER_COUNTS: std::cell::RefCell<Option<Vec<usize>>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) fn observe_retained_workers(workers: &[ControlWorker]) {
+        RETAINED_WORKER_COUNTS.with_borrow_mut(|counts| {
+            if let Some(counts) = counts {
+                counts.push(workers.len());
+                // Make the next production accept see completed handles. This
+                // observes the actual vector and never removes a handle.
+                for (_, worker) in workers {
+                    wait_until_finished(worker);
+                }
+            }
+        });
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("eb-{}-{nonce:x}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn accept_test_session(listener: &UnixListener) -> UnixStream {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "guest session was not accepted");
+                    thread::yield_now();
+                }
+                Err(error) => panic!("guest accept failed: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn run_bridge_reclaims_completed_handles_between_sessions() {
+        let directory = TestDirectory::new();
+        let guest_path = directory.0.join("guest.sock");
+        let host_path = directory.0.join("host.sock");
+        let guest_listener = UnixListener::bind(&guest_path).unwrap();
+        guest_listener.set_nonblocking(true).unwrap();
+        let guest = thread::spawn(move || {
+            for _ in 0..3 {
+                let mut stream = DuplexStream::Unix(accept_test_session(&guest_listener));
+                let request = read_one_http_request(
+                    &mut stream,
+                    1024,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .unwrap();
+                assert!(request.starts_with(b"GET /status HTTP/1.1\r\n"));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+            }
+        });
+        let client_path = host_path.clone();
+        let client = thread::spawn(move || {
+            for _ in 0..3 {
+                let mut stream = connect_guest_control_socket(
+                    client_path.to_str().unwrap(),
+                    Duration::from_secs(5),
+                )
+                .unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .write_all(b"GET /status HTTP/1.1\r\nHost: browser-vm\r\n\r\n")
+                    .unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                assert_eq!(response, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+
+        let mut bridge = config(HostListenConfig::UnixListen {
+            path: host_path.to_str().unwrap().to_string(),
+        });
+        bridge.guest_control_socket_path = guest_path.to_str().unwrap().to_string();
+        bridge.max_sessions = 3;
+        bridge.control_socket_ready_timeout_ms = 5000;
+        bridge.control_request_timeout_ms = 5000;
+        RETAINED_WORKER_COUNTS.with_borrow_mut(|counts| *counts = Some(Vec::new()));
+        let result = run_bridge(&bridge, &mut Vec::new());
+        let retained = RETAINED_WORKER_COUNTS
+            .with_borrow_mut(Option::take)
+            .unwrap();
+        let client_result = client.join();
+        let guest_result = guest.join();
+
+        assert_eq!(result, Ok(()));
+        client_result.unwrap();
+        guest_result.unwrap();
+        assert_eq!(
+            retained,
+            vec![1, 1, 1],
+            "completed handles survived the next accept"
+        );
+    }
+
+    #[test]
+    fn reaped_worker_failures_are_logged() {
+        for (test, messages) in [
+            (
+                "tests::reaped_failures_keep_accept_order_until_final_join",
+                vec![
+                    "session 2 worker failed: later accepted failure",
+                    "session 1 worker failed: first accepted failure",
+                ],
+            ),
+            (
+                "tests::reaped_worker_panics_preserve_bridge_error",
+                vec!["session 1 worker failed: browser VM guest control bridge worker panicked"],
+            ),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            for message in messages {
+                assert!(
+                    stderr.contains(message),
+                    "missing worker log: {message}\n{stderr}"
+                );
+            }
+        }
+    }
+
+    fn wait_until_finished(worker: &thread::JoinHandle<Result<(), String>>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline, "worker did not finish");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn reaping_finished_workers_keeps_active_requests() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let active = thread::spawn(move || {
+            blocked.recv().map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        let finished = thread::spawn(|| Ok(()));
+        wait_until_finished(&finished);
+        let another_finished = thread::spawn(|| Ok(()));
+        wait_until_finished(&another_finished);
+        let (reported, observation) = std::sync::mpsc::channel();
+        let reaper = thread::spawn(move || {
+            let mut workers = vec![(1, active), (2, finished), (3, another_finished)];
+            let mut first_error = None;
+            reap_finished_workers(&mut workers, &mut first_error);
+            reported.send((workers, first_error)).unwrap();
+        });
+
+        let result = observation.recv_timeout(Duration::from_secs(5));
+        // Release and join every worker even if a regression made reaping wait
+        // for the active request to finish.
+        release.send(()).unwrap();
+        reaper.join().unwrap();
+        let (workers, mut first_error) = result.expect("reaping waited for an active request");
+        let retained_sessions: Vec<_> = workers.iter().map(|(id, _)| *id).collect();
+        for worker in workers {
+            record_worker_result(worker, &mut first_error);
+        }
+        assert_eq!(retained_sessions, vec![1]);
+        assert!(first_error.is_none());
+    }
+
+    #[test]
+    fn reaped_failures_keep_accept_order_until_final_join() {
+        let first = thread::spawn(|| Err("first accepted failure".to_string()));
+        let later = thread::spawn(|| Err("later accepted failure".to_string()));
+        wait_until_finished(&first);
+        wait_until_finished(&later);
+        let mut workers = vec![(2, later)];
+        let mut first_error = None;
+        reap_finished_workers(&mut workers, &mut first_error);
+        let earlier_failure = first_error.clone();
+        record_worker_result((1, first), &mut first_error);
+        assert_eq!(earlier_failure, Some((2, "later accepted failure".into())));
+        assert_eq!(first_error, Some((1, "first accepted failure".into())));
+    }
+
+    #[test]
+    fn finite_shutdown_does_not_wait_for_requests_after_the_first_failure() {
+        for reap_failure_first in [false, true] {
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (completed, completion) = std::sync::mpsc::channel();
+            let active = thread::spawn(move || {
+                blocked.recv().map_err(|error| error.to_string())?;
+                completed.send(()).unwrap();
+                Ok(())
+            });
+            let failed = thread::spawn(|| Err("first accepted failure".to_string()));
+            wait_until_finished(&failed);
+            // Reaping can leave a later active session ahead of an earlier one.
+            let mut workers = vec![(2, active), (1, failed)];
+            let mut first_error = None;
+            if reap_failure_first {
+                reap_finished_workers(&mut workers, &mut first_error);
+            }
+            let (reported, observation) = std::sync::mpsc::channel();
+            let finisher = thread::spawn(move || {
+                reported
+                    .send(finish_workers_in_accept_order(workers, first_error))
+                    .unwrap();
+            });
+
+            let result = observation.recv_timeout(Duration::from_secs(5));
+            // Release the later worker before assertions, including when a
+            // regression caused finalization to wait for it.
+            release.send(()).unwrap();
+            finisher.join().unwrap();
+            completion.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                result.expect("finalization waited for a later active request"),
+                Err("first accepted failure".to_string()),
+                "reap_failure_first={reap_failure_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn finite_shutdown_resolves_earlier_requests_before_a_reaped_failure() {
+        let (release_earlier, earlier_blocked) = std::sync::mpsc::channel();
+        let (release_later, later_blocked) = std::sync::mpsc::channel();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let earlier_completed = completed.clone();
+        let earlier = thread::spawn(move || {
+            earlier_blocked.recv().map_err(|error| error.to_string())?;
+            earlier_completed.send(()).unwrap();
+            Err("earlier accepted failure".to_string())
+        });
+        let later = thread::spawn(move || {
+            later_blocked.recv().map_err(|error| error.to_string())?;
+            completed.send(()).unwrap();
+            Ok(())
+        });
+        let (reported, observation) = std::sync::mpsc::channel();
+        let finisher = thread::spawn(move || {
+            reported
+                .send(finish_workers_in_accept_order(
+                    vec![(3, later), (1, earlier)],
+                    Some((2, "already reaped failure".to_string())),
+                ))
+                .unwrap();
+        });
+
+        let premature = observation.recv_timeout(Duration::from_millis(20));
+        let returned_before_earlier_finished = premature.is_ok();
+        release_earlier.send(()).unwrap();
+        let result = match premature {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                observation.recv_timeout(Duration::from_secs(5))
+            }
+            other => other,
+        };
+        // Finalization must resolve session 1, but must not wait for session 3.
+        release_later.send(()).unwrap();
+        finisher.join().unwrap();
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!returned_before_earlier_finished);
+        assert_eq!(
+            result.expect("finalization waited for a later active request"),
+            Err("earlier accepted failure".to_string())
+        );
+    }
+
+    #[test]
+    fn finite_shutdown_joins_active_requests_when_none_has_failed() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (completed, completion) = std::sync::mpsc::channel();
+        let active = thread::spawn(move || {
+            blocked.recv().map_err(|error| error.to_string())?;
+            completed.send(()).unwrap();
+            Ok(())
+        });
+        let (reported, observation) = std::sync::mpsc::channel();
+        let finisher = thread::spawn(move || {
+            reported
+                .send(finish_workers_in_accept_order(vec![(1, active)], None))
+                .unwrap();
+        });
+
+        let premature = observation.recv_timeout(Duration::from_millis(20));
+        let returned_before_request_finished = premature.is_ok();
+        release.send(()).unwrap();
+        finisher.join().unwrap();
+        completion.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = match premature {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                observation.recv_timeout(Duration::from_secs(5))
+            }
+            other => other,
+        };
+        assert!(!returned_before_request_finished);
+        assert_eq!(result.expect("finalization did not report success"), Ok(()));
+    }
+
+    #[test]
+    fn reaped_worker_panics_preserve_bridge_error() {
+        let panicked = thread::spawn(|| panic!("test worker panic"));
+        wait_until_finished(&panicked);
+        let mut workers = vec![(1, panicked)];
+        let mut first_error = None;
+        reap_finished_workers(&mut workers, &mut first_error);
+        assert!(workers.is_empty());
+        assert_eq!(
+            first_error,
+            Some((1, "browser VM guest control bridge worker panicked".into()))
+        );
+    }
 
     fn config(transport: HostListenConfig) -> BridgeConfig {
         BridgeConfig {
