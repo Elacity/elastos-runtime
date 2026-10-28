@@ -439,7 +439,7 @@ function startServer(scenario) {
           <section id="shared-sheet" role="dialog" hidden style="position:fixed;inset:20%;background:white;color:black;padding:20px;z-index:10;overflow-wrap:anywhere">
             <p id="kind"></p><h1 id="title"></h1><p><span id="app"></span><span id="asker"></span></p>
             <p id="host"></p><p id="address"></p><p id="size"></p><p id="status"></p>
-            <button id="open">Get and open</button><button id="cancel">Cancel</button>
+            <button id="open">Get</button><button id="cancel">Cancel</button>
           </section><script type="module">
           import { createHomeExternalLinkPrompt, requestHomeSharedContent } from '/home-external-link.js';
           const node = id => document.getElementById(id);
@@ -1031,12 +1031,38 @@ async function runScenario(scenario) {
       for (const gesture of ['click', 'Enter', ' ']) {
         if (gesture === 'click') await link.click(); else { await link.focus(); await link.press(gesture); }
         await page.locator('#shared-sheet').waitFor({ state: 'visible' });
-        assert(await page.locator('#address').innerText() === sharedUri, "sheet changed the address");
-        assert(await page.locator('#host').innerText() === 'From: Alma', "presence hint must not report offline");
+        assert(await page.locator('#title').innerText() === 'Get this file from Alma?', "contact sheet title differs");
+        assert(await page.locator('#size').innerText() === '30 bytes', "contact sheet size differs");
+        assert(await page.locator('#open').innerText() === 'Get', "contact sheet button differs");
+        for (const hidden of ['#address', '#host', '#kind', '#status']) {
+          assert(!(await page.locator(hidden).isVisible()), `contact sheet shows ${hidden}`);
+        }
+        assert(!(await page.locator('#shared-sheet').innerText()).includes('elastos://'), "sheet shows the raw address");
+        if (gesture === 'click' && process.env.CHAT_LAYOUT_SCREENSHOT_DIR) {
+          await mkdir(process.env.CHAT_LAYOUT_SCREENSHOT_DIR, { recursive: true });
+          await page.screenshot({ path: join(process.env.CHAT_LAYOUT_SCREENSHOT_DIR, 'shared-file-contact.png') });
+        }
         assert(trace.sharedGets.length === 0, "link fetched before Get");
         await page.locator('#cancel').click();
         await page.waitForTimeout(3100);
       }
+      // A non-contact's file: one plain line and OK, which only closes.
+      await page.evaluate(({ cid, uri }) => {
+        const id = window.fixturePrompt.begin({ homeToken: 'test-token', appId: 'non-contact', kind: 'shared', uri });
+        window.fixturePrompt.show(id, { schema: 'elastos.home.shared-content.result/v1', cid, uri,
+          sender_display_name: 'Alma', size_bytes: 30, state: 'not_contact', check_id: 'none' });
+      }, { cid: sharedCid, uri: sharedUri });
+      await page.locator('#shared-sheet').waitFor({ state: 'visible' });
+      assert(await page.locator('#title').innerText() === 'Only contacts can send you files', "non-contact title differs");
+      assert(await page.locator('#status').innerText() === 'Add Alma as a contact to get this file.', "non-contact line differs");
+      assert(!(await page.locator('#open').isVisible()) && !(await page.locator('#size').isVisible()), "non-contact sheet offers Get");
+      assert(await page.locator('#cancel').innerText() === 'OK', "non-contact sheet button differs");
+      if (process.env.CHAT_LAYOUT_SCREENSHOT_DIR) {
+        await page.screenshot({ path: join(process.env.CHAT_LAYOUT_SCREENSHOT_DIR, 'shared-file-non-contact.png') });
+      }
+      await page.locator('#cancel').click();
+      await page.locator('#shared-sheet').waitFor({ state: 'hidden' });
+      assert(trace.sharedGets.length === 0, "non-contact sheet fetched");
       assert(trace.sharedChecks.every(check => check.token === 'home-authority'
         && JSON.stringify(check.body) === JSON.stringify({ schema: 'elastos.home.shared-content.check/v1', app_token: 'test-token', uri: sharedUri,
           source: { conversation_id: 'test-conversation', message_id: 'sha256:message-1' } })), "check contract differs", trace.sharedChecks);

@@ -32,15 +32,18 @@ function harness() {
 }
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
-test('shared file shows the exact checked address, sender, size and online state', () => {
+test('shared file asks one short question naming the sender, with the stated size', () => {
   const h = harness();
   assert.equal(h.prompt.show(h.begin(), result()), true);
-  assert.equal(h.eyebrow.textContent, 'Shared file');
-  assert.equal(h.title.textContent, 'Get this file?');
-  assert.equal(h.address.textContent, uri);
-  assert.equal(h.host.textContent, 'From: Alma · online');
-  assert.equal(h.size.textContent, 'Size: 30 bytes');
-  assert.equal(h.openButton.textContent, 'Get and open');
+  assert.equal(h.eyebrow.hidden, true);
+  assert.equal(h.title.textContent, 'Get this file from Alma?');
+  assert.equal(h.address.hidden, true);
+  assert.equal(h.address.textContent, '');
+  assert.equal(h.host.hidden, true);
+  assert.equal(h.size.textContent, '30 bytes');
+  assert.equal(h.status.hidden, true);
+  assert.equal(h.openButton.textContent, 'Get');
+  assert.equal(h.cancelButton.textContent, 'Cancel');
   assert.equal(h.begin(), '');
 });
 
@@ -53,20 +56,30 @@ test('the guard and trusted click protect Get; local success opens once', async 
   assert.equal(h.root.hidden, true);
 });
 
-test('already local opens without a get and missing size stays explicit', async () => {
+test('already local opens without a get and an unknown size shows nothing', async () => {
   const h = harness(), local = result('local'); delete local.size_bytes; delete local.check_id;
   assert.equal(h.prompt.show(h.begin(), local), true);
   assert.equal(h.title.textContent, 'Open this file?');
   assert.equal(h.openButton.textContent, 'Open');
-  assert.match(h.size.textContent, /shown after download, at most 64 MB/);
+  assert.equal(h.size.hidden, true);
   h.tick(); h.click(); await settle(); assert.equal(h.gets.length, 0); assert.equal(h.opened.length, 1);
 });
 
+test('a non-contact sees one plain line and OK', () => {
+  const h = harness(); h.prompt.show(h.begin(), result('not_contact'));
+  assert.equal(h.title.textContent, 'Only contacts can send you files');
+  assert.equal(h.status.textContent, 'Add Alma as a contact to get this file.');
+  assert.equal(h.size.hidden, true);
+  assert.equal(h.openButton.hidden, true);
+  assert.equal(h.cancelButton.textContent, 'OK');
+  h.cancelButton.fire('click'); assert.equal(h.root.hidden, true); assert.equal(h.opened.length, 0);
+});
+
 for (const [state, copy, retry] of [
-  ['sender_offline', "Alma's Home is offline", true], ['not_contact', 'Add Alma as a contact first', false],
-  ['not_here', "This file isn't on your Home.", false], ['not_shared', "no longer shares this file", false],
-  ['too_large', 'larger than 64 MB', false], ['mismatch', "didn't match its link", false],
-  ['timeout', 'took too long', true],
+  ['sender_offline', 'Alma is offline. Try again later.', true], ['not_contact', 'Add Alma as a contact to get this file.', false],
+  ['not_here', "This file isn't on your Home.", false], ['not_shared', 'Alma no longer shares this file.', false],
+  ['too_large', 'This file is too large to get.', false], ['mismatch', "didn't match its link", false],
+  ['timeout', 'This took too long. Try again.', true],
 ]) test(`shared file state ${state} has clear copy and action`, async () => {
   const h = harness();
   if (['not_contact', 'not_here'].includes(state)) h.prompt.show(h.begin(), result(state));
@@ -89,7 +102,9 @@ test('retry checks again before redeeming a fresh check id', async () => {
 test('Cancel aborts Get, drops its late result and applies the shared cooldown', async () => {
   const h = harness(); let finish, signal;
   h.prompt.show(h.begin({ get: (_id, s) => { signal = s; return new Promise(resolve => { finish = resolve; }); } }), result());
-  h.tick(); h.click(); assert.equal(h.status.textContent, 'Getting file…');
+  h.tick(); h.click(); assert.equal(h.openButton.textContent, 'Getting…');
+  assert.equal(h.openButton.hidden, false); assert.equal(h.openButton.disabled, true);
+  assert.equal(h.cancelButton.textContent, 'Cancel');
   h.cancelButton.fire('click'); assert.equal(signal.aborted, true); assert.equal(h.root.hidden, true);
   finish({ state: 'local' }); await settle(); assert.equal(h.opened.length, 0);
   assert.equal(h.begin(), ''); h.tick(3000); assert.ok(h.begin());
@@ -189,9 +204,9 @@ test('Tab keeps focus on Cancel when the shared file has no available action', (
 test('stale presence still offers Get and only a failed Get reports offline', async () => {
   const h = harness();
   assert.equal(h.prompt.show(h.begin(), result('sender_offline')), true);
-  assert.equal(h.openButton.textContent, 'Get and open');
+  assert.equal(h.openButton.textContent, 'Get');
   assert.equal(h.openButton.disabled, false);
-  assert.equal(h.host.textContent, 'From: Alma');
+  assert.equal(h.title.textContent, 'Get this file from Alma?');
   assert.equal(h.status.textContent, '');
   h.tick(); h.click(); await settle();
   assert.equal(h.gets.length, 1);
@@ -226,12 +241,12 @@ for (const [label, bytes, target] of [
 test('shared file sheet uses the byte count shown in a Chat post', () => {
   for (const [bytes, size] of [[30, '30 bytes'], [1024, '1.0 KB'], [3328, '3.2 KB'], [3840, '3.8 KB'], [3565158, '3.4 MB'], [1073741824, '1.0 GB']]) {
     const h = harness(); h.prompt.show(h.begin(), { ...result(), size_bytes: bytes });
-    assert.equal(h.size.textContent, `Size: ${size}`);
+    assert.equal(h.size.textContent, size);
   }
 });
 test('an unnamed sender uses natural contact instructions', () => {
   const h = harness(); h.prompt.show(h.begin(), { ...result('not_contact'), sender_display_name: undefined });
-  assert.match(h.status.textContent, /Add this person as a contact first/);
+  assert.equal(h.status.textContent, 'Add this person as a contact to get this file.');
 });
 
 test('Home opens binary shared content in Library by CID', async () => {

@@ -193,37 +193,48 @@ export function createHomeExternalLinkPrompt({
     cooldownUntil.set(request.appId, now() + cooldownMs);
   }
 
+  // One short sheet: a title naming the sender, at most one quiet line, and
+  // the buttons. The address stays out of view; Home already checked it.
   function renderShared(request) {
     const value = request.result;
-    const name = value?.sender_display_name || "The sender";
+    const sender = value?.sender_display_name || "";
+    const name = sender || "The sender";
     const state = request.state;
-    eyebrow.textContent = "Shared file";
-    title.textContent = state === "local" ? "Open this file?" : "Get this file?";
-    appName.textContent = value?.sender_display_name || "";
-    asker.textContent = value?.sender_display_name ? " shared this in Chat." : "";
-    host.textContent = value?.sender_display_name
-      ? `From: ${name}${state === "available" && value.state === "available" ? " · online" : state === "sender_offline" ? " · offline" : ""}` : "";
-    address.textContent = request.uri;
-    if (linkLabel) linkLabel.hidden = false;
-    size.hidden = false;
-    size.textContent = value?.size_bytes === undefined ? "Size: shown after download, at most 64 MB"
-      : `Size: ${formatSize(value.size_bytes)}`;
+    if (eyebrow) eyebrow.hidden = true;
+    if (appName.parentElement) appName.parentElement.hidden = true;
+    appName.textContent = "";
+    if (asker) asker.textContent = "";
+    host.hidden = true;
+    host.textContent = "";
+    address.hidden = true;
+    address.textContent = "";
+    if (linkLabel) linkLabel.hidden = true;
+    title.textContent = state === "local" ? "Open this file?"
+      : state === "not_contact" ? "Only contacts can send you files"
+      : sender ? `Get this file from ${sender}?` : "Get this file?";
+    const ready = ["local", "available", "getting"].includes(state);
+    size.textContent = ready && value?.size_bytes !== undefined ? formatSize(value.size_bytes) : "";
+    size.hidden = !size.textContent;
     const messages = {
-      sender_offline: `${name}'s Home is offline. Try again when ${name} is online.`,
-      not_contact: `Files come only from your contacts. Add ${value?.sender_display_name || "this person"} as a contact first.`,
-      not_here: "This file isn't on your Home.", getting: "Getting file…", checking: "Checking file…",
-      not_shared: `${name}'s Home no longer shares this file.`, too_large: "This file is larger than 64 MB.",
+      sender_offline: `${name} is offline. Try again later.`,
+      not_contact: `Add ${sender || "this person"} as a contact to get this file.`,
+      not_here: "This file isn't on your Home.",
+      not_shared: `${name} no longer shares this file.`,
+      too_large: "This file is too large to get.",
       mismatch: "This file didn't match its link, so Home discarded it.",
-      timeout: "Getting the file took too long. Try again.",
+      timeout: "This took too long. Try again.",
       check_failed: "Home could not check this file. Try again.",
       get_failed: "Home could not get this file. Try again.",
       open_failed: "Home could not open this file. Try again.",
     };
     status.textContent = messages[state] || "";
     status.hidden = !status.textContent;
-    openButton.textContent = state === "local" ? "Open" : state === "available" ? "Get and open" : "Try again";
-    openButton.disabled = request.busy || !["local", "available", "sender_offline", "timeout", "check_failed", "get_failed", "open_failed"].includes(state);
-    openButton.hidden = openButton.disabled;
+    openButton.textContent = state === "local" ? "Open" : state === "available" ? "Get"
+      : state === "getting" ? "Getting…" : state === "checking" ? "Checking…" : "Try again";
+    const actionable = ["local", "available", "sender_offline", "timeout", "check_failed", "get_failed", "open_failed"].includes(state);
+    openButton.hidden = !actionable && !request.busy;
+    openButton.disabled = request.busy || !actionable;
+    cancelButton.textContent = actionable || request.busy ? "Cancel" : "OK";
   }
 
   async function activateShared(request) {
@@ -409,16 +420,20 @@ export function createHomeExternalLinkPrompt({
         renderShared(active);
       } else {
         active.href = checked.href;
-        if (eyebrow) eyebrow.textContent = "Web link";
+        if (eyebrow) { eyebrow.hidden = false; eyebrow.textContent = "Web link"; }
         if (title) title.textContent = "Open this link?";
+        if (appName.parentElement) appName.parentElement.hidden = false;
         if (asker) asker.textContent = " wants to open this address in your browser.";
         appName.textContent = checked.appTitle;
+        host.hidden = false;
         host.textContent = checked.host;
+        address.hidden = false;
         address.textContent = checked.href;
         if (linkLabel) linkLabel.hidden = true;
         if (size) size.hidden = true;
         if (status) status.hidden = true;
         openButton.textContent = "Open link";
+        cancelButton.textContent = "Cancel";
         openButton.hidden = false;
         openButton.disabled = false;
       }
