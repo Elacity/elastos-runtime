@@ -252,6 +252,7 @@ const summary = {
     { target: "marketplace", title: "Marketplace", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "system", title: "System", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "wallet", title: "Wallet", attach_kind: "iframe", role: "app", target_kind: "app" },
+    { target: "library", title: "Library", attach_kind: "iframe", role: "app", target_kind: "app" },
   ],
 };
 let activeShellName = "home-cli";
@@ -604,6 +605,10 @@ globalThis.fetch = async (url, init = {}) => {
         target: "wallet-unisat",
         title: "UniSat",
       });
+    }
+    if (["library", "archive-manager"].includes(body?.target)) {
+      return jsonResponse({ attach_kind: "iframe", target: body.target, title: body.target === "library" ? "Library" : "Archive",
+        route: `/apps/${body.target}/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=${body.target}-token` });
     }
     throw new Error(`unexpected launch target: ${body?.target || "missing"}`);
   }
@@ -1599,6 +1604,41 @@ assert(
   "Home GUI obtained hidden connector launch authority",
   shellMessages,
 );
+
+{
+  // Archive is not a Home target: the GUI launches it only for the exact open
+  // Library just asked for, and only once.
+  const reply = (requestId) => shellMessages.find((message) =>
+    message.payload?.type === "home:shell-response" && message.payload?.requestId === requestId)?.payload;
+  const settle = async (requestId) => {
+    for (let i = 0; i < 50 && !reply(requestId); i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    return reply(requestId) || null;
+  };
+  const guiLaunch = (requestId, target, query) => sendChildMessage("null", shellFrameWindow,
+    { type: "home:launch-target", requestId, target, query, homeToken: "gui-token" });
+  const zip = "localhost://Users/bridge/Documents/Bundle.zip";
+  const archiveQuery = { objectUri: zip, uri: zip, name: "Bundle.zip", mime: "application/zip" };
+  const denied = "Home denied the shell launch";
+  guiLaunch("archive-unasked", "archive-manager", archiveQuery);
+  assert((await settle("archive-unasked"))?.error === denied, "Home GUI launched Archive that Library did not ask for", shellMessages);
+  guiLaunch("library-launch", "library", {});
+  assert((await settle("library-launch"))?.result?.target === "library", "Home GUI could not launch Library", shellMessages);
+  const librarySource = { postMessage() {} };
+  sendChildMessage("null", librarySource, { type: "home:app-ready", homeToken: "library-token" });
+  sendChildMessage("null", { postMessage() {} }, { type: "home:open-target", target: "archive-manager", query: archiveQuery, homeToken: "people-token" });
+  sendChildMessage("null", librarySource, { type: "home:open-target", target: "archive-manager", query: archiveQuery, homeToken: "library-token" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert(shellMessages.some((message) => message.payload?.command === "open-target" &&
+    message.payload?.target === "archive-manager" && message.payload?.query?.objectUri === zip),
+  "Library's Archive open did not reach the Home GUI", shellMessages);
+  guiLaunch("archive-other", "archive-manager", { ...archiveQuery, objectUri: `${zip}.other` });
+  assert((await settle("archive-other"))?.error === denied, "Library's grant opened a different object", shellMessages);
+  guiLaunch("archive-asked", "archive-manager", { mime: "application/zip", name: "Bundle.zip", uri: zip, objectUri: zip });
+  const asked = await settle("archive-asked");
+  assert(asked?.result?.target === "archive-manager" && asked.result.title === "Archive", "Library's Archive open was refused", asked);
+  guiLaunch("archive-replay", "archive-manager", archiveQuery);
+  assert((await settle("archive-replay"))?.error === denied, "Library's Archive grant was reusable", shellMessages);
+}
 
 async function launchConnectorFromWallet(target, token) {
   const launchesBefore = requests.filter(

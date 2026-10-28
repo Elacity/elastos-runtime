@@ -110,6 +110,11 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
 });
 const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
 const launchedAppContexts = new Map();
+// Archive is launchable but not in the Home summary, so the GUI may launch it
+// only for the exact open its owner app (Library) just asked for.
+const ownerLaunchGrants = [];
+const OWNER_LAUNCH_GRANT_MS = 15000;
+const OWNER_LAUNCH_GRANT_LIMIT = 8;
 const pendingBrowserAuthorityRenewals = new Map();
 let homeEventsReconnectAttempts = 0;
 let homeEventsReconnectInFlight = null;
@@ -1808,7 +1813,8 @@ window.addEventListener("message", (event) => {
       ![HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID].includes(context.targetId) ||
       !requestId ||
       !target ||
-      !canOpenTargetFromHomeMessage(context, target)
+      !(canOpenTargetFromHomeMessage(context, target) ||
+        (context.targetId === HOME_GUI_SHELL_ID && consumeOwnerLaunchGrant(target, data.query)))
     ) {
       replyToShellRequest(event, requestId, null, new Error("Home denied the shell launch"));
       return;
@@ -2117,6 +2123,10 @@ window.addEventListener("message", (event) => {
     }
     return;
   }
+  if (context.kind === "app-frame" && SHELL_MESSAGE_OPEN_TARGET_SOURCES[context.targetId] instanceof Set &&
+      !targetById(shellState.currentSummary, target)) {
+    grantOwnerLaunch(target, query);
+  }
   openTargetFromHomeGui(target, { query }).catch((error) => {
     console.error("home open-target failed", error);
   });
@@ -2346,6 +2356,29 @@ function canOpenTargetFromHomeMessage(context, target) {
     return normalizedActiveShellName(target) !== HOME_GUI_SHELL_ID;
   }
   return policy.has(target);
+}
+
+function ownerLaunchGrantKey(target, query) {
+  const entries = Object.entries(query && typeof query === "object" ? query : {})
+    .filter(([key]) => key.trim())
+    .map(([key, value]) => [key, typeof value === "string" ? value : String(value ?? "")])
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  return JSON.stringify([target, entries]);
+}
+
+function grantOwnerLaunch(target, query) {
+  const now = Date.now();
+  const live = ownerLaunchGrants.filter((grant) => grant.expiresAt > now).slice(1 - OWNER_LAUNCH_GRANT_LIMIT);
+  ownerLaunchGrants.splice(0, ownerLaunchGrants.length, ...live,
+    { key: ownerLaunchGrantKey(target, query), expiresAt: now + OWNER_LAUNCH_GRANT_MS });
+}
+
+function consumeOwnerLaunchGrant(target, query) {
+  const key = ownerLaunchGrantKey(target, query);
+  const index = ownerLaunchGrants.findIndex((grant) => grant.key === key && grant.expiresAt > Date.now());
+  if (index < 0) return false;
+  ownerLaunchGrants.splice(index, 1);
+  return true;
 }
 
 function canDeliverTargetFromHomeMessage(context, target) {
