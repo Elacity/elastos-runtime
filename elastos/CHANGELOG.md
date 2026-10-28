@@ -35,9 +35,9 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   Technical details, with Get, Retry, Stop or Open in Assistant beside Close.
   Shared model details show where prompts go.
 - Content links (`/s/`, `/ipfs/`, `/content/` and published sites) open only
-  what this Home's IPFS store holds or can fetch; it checks every block it
-  fetches against the link. Content that only a Carrier peer offers no longer
-  opens from such a link. The gateway no longer keeps its own copy of what it
+  what this Home's IPFS store already holds, checking every block against the
+  link. Content it does not hold, including content only a Carrier peer
+  offers, does not open. The gateway no longer keeps its own copy of what it
   serves, so copies saved by earlier versions are not used, and a single file
   larger than 100 MiB is refused.
 - Library no longer offers Share or Copy Published Link, and Properties no
