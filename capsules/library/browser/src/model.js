@@ -154,8 +154,7 @@ export function publishedLink(object) {
   return cid ? `elastos://${cid}` : "";
 }
 
-export const PUBLISH_CONFIRM_BODY =
-  "Anyone with the link can download a copy. Unpublishing later stops sharing this file from your Home, but copies people already have stay.";
+export const PUBLISH_CONFIRM_BODY = "Anyone with the link can download a copy.";
 
 export function canPublishObject(object) {
   return !!object &&

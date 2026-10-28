@@ -568,7 +568,7 @@ test("Library Publish asks once and sends nothing when cancelled", async () => {
   const one = publishHarness({ confirm: false });
   await one.actions.publishObject(file("Guide.md"));
   assert.equal(one.confirmations.length, 1);
-  assert.equal(one.confirmations[0].title, "Publish publicly?");
+  assert.deepEqual(one.confirmations[0].files.map((object) => object.name), ["Guide.md"]);
   assert.deepEqual(one.requests, []);
 
   const many = publishHarness({ confirm: false, selection: [file("A.md"), file("B.md")] });

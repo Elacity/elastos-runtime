@@ -595,23 +595,25 @@ export function createLibraryDialog({
     });
   }
 
-  // One public-sharing confirmation per action: the files it publishes and,
-  // for a selection, the items it leaves out.
-  function confirmPublish({ title, files, excluded = [] }) {
-    const excludedHtml = excluded.length
-      ? `<p class="dialog-hint">Not included:</p>${nameList(
-        excluded.map((object) => `${object.name || object.uri} (${publishExclusionReason(object)})`),
-        "data-publish-excluded",
-      )}`
-      : "";
+  // The same confirmation as Delete's, without the eyebrow: the title names
+  // the file, or the count with the names on one line beneath.
+  function confirmPublish({ files, excluded = [] }) {
+    const names = files.map((object) => object.name || object.uri);
+    const lines = [];
+    if (files.length > 1) lines.push({ text: compactNames(names), attribute: "data-publish-files" });
+    if (excluded.length) {
+      lines.push({
+        text: `Not included: ${compactNames(excluded.map((object) => `${object.name || object.uri} (${publishExclusionReason(object)})`))}`,
+        attribute: "data-publish-excluded",
+      });
+    }
     return confirmDecision({
-      eyebrow: "Confirm",
-      title,
+      title: files.length === 1 ? `Publish "${names[0]}"?` : `Publish ${files.length} files?`,
       message: PUBLISH_CONFIRM_BODY,
+      lines,
       confirmLabel: "Publish",
       confirmClass: "btn-primary",
       targetUris: files.map((object) => object.uri),
-      detailsHtml: nameList(files.map((object) => object.name || object.uri), "data-publish-files") + excludedHtml,
     });
   }
 
@@ -621,10 +623,9 @@ export function createLibraryDialog({
     return "can't be published";
   }
 
-  function nameList(names, attribute, limit = 8) {
-    const shown = names.slice(0, limit).map((name) => `<li>${escapeHtml(name)}</li>`);
-    if (names.length > limit) shown.push(`<li>and ${names.length - limit} more</li>`);
-    return `<ul class="publish-list" ${attribute}>${shown.join("")}</ul>`;
+  function compactNames(names, limit = 5) {
+    const shown = names.slice(0, limit).join(", ");
+    return names.length > limit ? `${shown} and ${names.length - limit} more` : shown;
   }
 
   // Shown when the clipboard refuses a published link: the link stays
@@ -654,7 +655,7 @@ export function createLibraryDialog({
     input?.select();
   }
 
-  function confirmDecision({ eyebrow, title, message, confirmLabel, confirmClass, targetUris, detailsHtml = "" }) {
+  function confirmDecision({ eyebrow = "", title, message, lines = [], confirmLabel, confirmClass, targetUris }) {
     hideMenu();
     hideDialog();
     decisionTargetUris = targetUris;
@@ -663,11 +664,11 @@ export function createLibraryDialog({
       dialog.innerHTML = `
         <div class="dialog-card">
           <div>
-            <p class="eyebrow">${escapeHtml(eyebrow)}</p>
+            ${eyebrow ? `<p class="eyebrow">${escapeHtml(eyebrow)}</p>` : ""}
             <h2>${escapeHtml(title)}</h2>
             <p class="subtitle">${escapeHtml(message)}</p>
+            ${lines.map(({ text, attribute }) => `<p class="subtitle" ${attribute}>${escapeHtml(text)}</p>`).join("")}
           </div>
-          ${detailsHtml}
           <div class="button-row">
             <button class="btn" type="button" data-dialog-close>Cancel</button>
             <button class="btn ${confirmClass}" type="button" data-dialog-confirm>${escapeHtml(confirmLabel)}</button>

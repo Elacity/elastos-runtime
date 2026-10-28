@@ -1130,9 +1130,11 @@ async function runScenario(scenario) {
       await page.waitForFunction(() => window.fixturePickerReplies.some(reply => reply.accepted));
       await panel.waitFor({ state: 'visible' });
       assert(await page.evaluate(() => window.fixturePickerReplies.length) === 1, "a replayed picker delivery was answered again");
-      assert(await frame.locator('#library-post-title').innerText() === 'Post publicly?', "Post confirmation title differs");
-      assert((await panelText()).includes('Anyone with the link can download a copy. Unpublishing later stops sharing this file from your Home, but copies people already have stay.'),
-        "Post confirmation body differs");
+      assert(await frame.locator('#library-post-title').innerText() === 'Post "attached.txt" publicly?', "Post confirmation title differs");
+      assert(await frame.locator('#library-post-lines').innerText() === 'Anyone with the link can download a copy.',
+        "Post confirmation must have one line");
+      assert(await frame.locator('.library-post-actions button:not([hidden])').allInnerTexts().then((labels) => labels.join('|')) === 'Cancel|Post',
+        "Post confirmation buttons differ");
       await frame.locator('#library-post-cancel').click();
       await panel.waitFor({ state: 'hidden' });
       assert(trace.attachLibrary.length === 0, "Cancel must send nothing");

@@ -663,7 +663,7 @@ fn validate_attachment_size(size: u64) -> Result<(), String> {
 }
 
 /// The same words Library shows before it publishes a file.
-const POST_PUBLICLY_BODY: &str = "Anyone with the link can download a copy. Unpublishing later stops sharing this file from your Home, but copies people already have stay.";
+const POST_PUBLICLY_BODY: &str = "Anyone with the link can download a copy.";
 
 /// Shown when Home's answer was lost: the post may or may not have gone out.
 const POST_OUTCOME_UNKNOWN: &str = "Couldn't confirm the post. Check Community, or try again.";
@@ -724,7 +724,7 @@ const LIBRARY_POST_ACTIONS: [(LibraryPostAction, &str); 5] = [
 
 #[derive(Debug, PartialEq, Eq)]
 struct LibraryPostView {
-    title: &'static str,
+    title: String,
     lines: Vec<String>,
     actions: &'static [LibraryPostAction],
     /// The Retry button's words: "Retry post" after a failed post, "Try
@@ -847,19 +847,19 @@ fn library_post_view(post: &LibraryPost) -> LibraryPostView {
     let file = format!("{} · {}", post.file_name, format_bytes(post.size_bytes));
     match &post.phase {
         LibraryPostPhase::Confirm => LibraryPostView {
-            title: "Post publicly?",
-            lines: vec![file, POST_PUBLICLY_BODY.to_string()],
+            title: format!("Post \"{}\" publicly?", post.file_name),
+            lines: vec![POST_PUBLICLY_BODY.to_string()],
             actions: &[Cancel, Post],
             retry_label: "Retry post",
         },
         LibraryPostPhase::Working => LibraryPostView {
-            title: "Post publicly?",
-            lines: vec![file, "Publishing and posting...".to_string()],
+            title: format!("Post \"{}\" publicly?", post.file_name),
+            lines: vec!["Publishing and posting...".to_string()],
             actions: &[],
             retry_label: "Retry post",
         },
         LibraryPostPhase::Posted { link } => LibraryPostView {
-            title: "Posted publicly",
+            title: "Posted publicly".to_string(),
             lines: vec![
                 file,
                 format!("Published: {link}"),
@@ -869,7 +869,7 @@ fn library_post_view(post: &LibraryPost) -> LibraryPostView {
             retry_label: "Retry post",
         },
         LibraryPostPhase::PostFailed { link, detail } => LibraryPostView {
-            title: "Published, not posted",
+            title: "Published, not posted".to_string(),
             lines: vec![
                 file,
                 format!("Published: {link}"),
@@ -880,7 +880,7 @@ fn library_post_view(post: &LibraryPost) -> LibraryPostView {
             retry_label: "Retry post",
         },
         LibraryPostPhase::Failed { detail } => LibraryPostView {
-            title: "Not posted",
+            title: "Not posted".to_string(),
             lines: vec![file, detail.clone()],
             actions: &[Close],
             retry_label: "Retry post",
@@ -892,7 +892,7 @@ fn library_post_view(post: &LibraryPost) -> LibraryPostView {
             }
             lines.push(POST_OUTCOME_UNKNOWN.to_string());
             LibraryPostView {
-                title: "Post not confirmed",
+                title: "Post not confirmed".to_string(),
                 lines,
                 actions: &[Retry, OpenLibrary, Close],
                 retry_label: "Try again",
@@ -3607,7 +3607,7 @@ impl App {
             return Ok(());
         };
         let view = library_post_view(post);
-        self.library_post_title.set_text_content(Some(view.title));
+        self.library_post_title.set_text_content(Some(&view.title));
         let signature = view.lines.join("\n");
         if self
             .library_post_lines
@@ -8410,13 +8410,10 @@ mod tests {
         use super::LibraryPostAction::{Cancel, Close, OpenLibrary, Post, Retry};
         use super::LibraryPostPhase::{Confirm, Failed, PostFailed, Posted, Unknown, Working};
         let confirm = super::library_post_view(&library_post_fixture(Confirm));
-        assert_eq!(confirm.title, "Post publicly?");
+        assert_eq!(confirm.title, "Post \"notes.txt\" publicly?");
         assert_eq!(
             confirm.lines,
-            vec![
-                "notes.txt · 30 bytes".to_string(),
-                "Anyone with the link can download a copy. Unpublishing later stops sharing this file from your Home, but copies people already have stay.".to_string(),
-            ]
+            vec!["Anyone with the link can download a copy.".to_string()]
         );
         assert_eq!(confirm.actions, &[Cancel, Post]);
         assert!(super::library_post_view(&library_post_fixture(Working))

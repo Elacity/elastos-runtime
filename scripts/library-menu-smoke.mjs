@@ -2808,11 +2808,22 @@ async function run() {
     const guidePublishes = () => ops.filter((entry) => entry.op === "publish" && entry.payload.uri === `${documentsUri}/Guide.md`).length;
     await openItemMenu(page, "Guide.md");
     await clickMenuExact(page, "Publish");
-    const publishDialog = page.locator(".dialog-card").filter({ hasText: "Publish publicly?" }).first();
+    const publishDialog = page.locator(".dialog-card").filter({ has: page.locator("[data-dialog-confirm]", { hasText: "Publish" }) }).first();
     await publishDialog.waitFor();
+    const publishLayout = await publishDialog.evaluate((card) => ({
+      eyebrow: card.querySelectorAll(".eyebrow").length,
+      title: card.querySelector("h2")?.textContent,
+      lines: Array.from(card.querySelectorAll(".subtitle")).map((line) => line.textContent),
+      buttons: Array.from(card.querySelectorAll(".button-row button")).map((button) => `${button.textContent}:${button.className}`),
+    }));
     assert(
-      (await publishDialog.textContent()).includes("Anyone with the link can download a copy. Unpublishing later stops sharing this file from your Home, but copies people already have stay."),
-      "Publish confirmation must say what publishing does",
+      JSON.stringify(publishLayout) === JSON.stringify({
+        eyebrow: 0,
+        title: 'Publish "Guide.md"?',
+        lines: ["Anyone with the link can download a copy."],
+        buttons: ["Cancel:btn", "Publish:btn btn-primary"],
+      }),
+      `Publish must use Library's confirmation layout with one line; got ${JSON.stringify(publishLayout)}`,
     );
     await publishDialog.locator("[data-dialog-close]").click();
     await publishDialog.waitFor({ state: "detached" });
@@ -2853,10 +2864,10 @@ async function run() {
     includesAll(batchRows, ["Publish Selected"], "file and folder selection menu");
     await clickMenuExact(page, "Publish Selected");
     await publishDialog.waitFor();
-    assert(await publishDialog.locator("[data-publish-files] li").allTextContents().then((rows) => rows.join("|")) === "Guide.md",
-      "Publish Selected must list only the selected files");
-    assert(await publishDialog.locator("[data-publish-excluded] li").allTextContents().then((rows) => rows.join("|")) === "Work (folder)",
-      "Publish Selected must list the folders it leaves out");
+    assert(await publishDialog.locator("h2").textContent() === 'Publish "Guide.md"?', "Publish Selected must name its one file");
+    assert(await publishDialog.locator("[data-publish-files]").count() === 0, "One file needs no list");
+    assert(await publishDialog.locator("[data-publish-excluded]").textContent() === "Not included: Work (folder)",
+      "Publish Selected must name the folders it leaves out on one line");
     await publishDialog.locator("[data-dialog-close]").click();
     assert(guidePublishes() === publishesBeforeBatch, "Cancelling Publish Selected must not publish");
     await page.locator(`.item[data-uri="${documentsUri}/Guide.md"]`).click();

@@ -433,7 +433,7 @@ export function createLibraryActions({
 
   async function publishObject(object) {
     if (!canPublishObject(object)) return;
-    if (!await confirmPublish({ title: "Publish publicly?", files: [object], excluded: [] })) return;
+    if (!await confirmPublish({ files: [object], excluded: [] })) return;
     setStatus(`Publishing ${object.name}...`);
     try {
       await providerApi("publish", { uri: object.uri, if_revision: object.revision });
@@ -463,7 +463,7 @@ export function createLibraryActions({
       return;
     }
     const excluded = selection.filter((object) => !files.includes(object));
-    if (!await confirmPublish({ title: "Publish publicly?", files, excluded })) return;
+    if (!await confirmPublish({ files, excluded })) return;
     const failed = [];
     for (const object of files) {
       setStatus(`Publishing ${object.name}...`);
