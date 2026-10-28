@@ -1258,6 +1258,9 @@ async function run() {
       ["Report.MD", "Report.MD", "Report.MD", "text/markdown"],
       ["report.pdf", "report.pdf", "report.pdf.txt", "text/plain"],
       ["../evil.txt", "Shared file", "Shared file.txt", "text/plain"],
+      // Names stay within 200 UTF-8 bytes, cut before the extension.
+      ["中".repeat(80) + ".txt", "中".repeat(65) + ".txt", "中".repeat(65) + ".txt", "text/plain"],
+      ["中".repeat(70) + ".pdf", "中".repeat(65) + ".pdf", "中".repeat(65) + ".txt", "text/plain"],
     ]) {
       resetDocumentsFixture();
       const namedPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });

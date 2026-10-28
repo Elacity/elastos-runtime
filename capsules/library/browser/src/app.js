@@ -1,4 +1,4 @@
-import { sharedFileMarkup, sharedFileName } from "./shared-file.js?v=library-links-20261028a";
+import { sharedFileMarkup, sharedFileName } from "./shared-file.js?v=library-links-20261028b";
 import {
   archiveLibraryObjectPayload,
   escapeHtml,

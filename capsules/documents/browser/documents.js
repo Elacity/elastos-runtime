@@ -334,12 +334,26 @@ function documentIdentity(document) {
   return "draft";
 }
 
-// The same rule as Home's sharedFileName (home-external-link.js): no path
-// separators, control characters or leading dots, at most 120 characters.
+// The same rule as Home's sharedFileName (home-external-link.js, which names
+// the Runtime limit it follows): no path separators, control characters or
+// leading dots, at most 200 UTF-8 bytes, cut before the extension.
 function sharedFileName(value) {
   if (typeof value !== "string" || /[/\\]/.test(value)) return "";
-  const cleaned = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").replace(/^[.\s]+/, "");
-  return [...cleaned].slice(0, 120).join("").trimEnd();
+  const name = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").replace(/^[.\s]+/, "").trimEnd();
+  const encoder = new TextEncoder();
+  const bytes = (text) => encoder.encode(text).length;
+  if (bytes(name) <= 200) return name;
+  const dot = name.lastIndexOf(".");
+  const extension = dot > 0 && bytes(name.slice(dot)) <= 16 ? name.slice(dot) : "";
+  let stem = "";
+  let used = bytes(extension);
+  for (const character of extension ? name.slice(0, dot) : name) {
+    used += bytes(character);
+    if (used > 200) break;
+    stem += character;
+  }
+  stem = stem.replace(/[\s.]+$/, "");
+  return stem ? stem + extension : "";
 }
 
 function baseName(uri) {
@@ -1429,7 +1443,7 @@ async function loadSharedFile(cid) {
 // The default name for a saved shared file: .md and .txt stay, anything else
 // becomes a .txt file, since Documents keeps text only.
 function sharedSaveFileName(title) {
-  return /\.(md|txt)$/i.test(title) ? title : title + ".txt";
+  return sharedFileName(/\.(md|txt)$/i.test(title) ? title : title + ".txt");
 }
 
 // Save to Library keeps the shared file under its own name in the Documents

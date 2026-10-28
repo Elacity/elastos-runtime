@@ -9,14 +9,31 @@
 
 // The file name a Chat post states for a shared file, fit to show and to
 // suggest when saving: no path separators, control characters or leading
-// dots, at most 120 characters. Only a title and default name; it never
-// decides the type or the app. Chat (shared_file_display_name), Documents and
-// Library apply the same rule; documents-shared-file-name.test.mjs checks they
-// agree.
+// dots, and at most 200 UTF-8 bytes, cut on a character boundary before the
+// extension. Only a title and default name; it never decides the type or the
+// app. The bound is what the Runtime can store: it writes a file through a
+// temporary ".<name>.<16 hex>.tmp" (auth.rs atomic_write) under the 255-byte
+// file-name limit, so a name may take 233 bytes, and 200 leaves room for the
+// "-2" a duplicate gets (documents.rs documents_reserve_import_file_name).
+// Chat (shared_file_display_name), Documents and Library apply the same rule;
+// documents-shared-file-name.test.mjs checks they agree.
 export function sharedFileName(value) {
   if (typeof value !== "string" || /[/\\]/.test(value)) return "";
-  const cleaned = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").replace(/^[.\s]+/, "");
-  return [...cleaned].slice(0, 120).join("").trimEnd();
+  const name = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").replace(/^[.\s]+/, "").trimEnd();
+  const encoder = new TextEncoder();
+  const bytes = (text) => encoder.encode(text).length;
+  if (bytes(name) <= 200) return name;
+  const dot = name.lastIndexOf(".");
+  const extension = dot > 0 && bytes(name.slice(dot)) <= 16 ? name.slice(dot) : "";
+  let stem = "";
+  let used = bytes(extension);
+  for (const character of extension ? name.slice(0, dot) : name) {
+    used += bytes(character);
+    if (used > 200) break;
+    stem += character;
+  }
+  stem = stem.replace(/[\s.]+$/, "");
+  return stem ? stem + extension : "";
 }
 
 export const HOME_OPEN_EXTERNAL_TYPE = "home:open-external";

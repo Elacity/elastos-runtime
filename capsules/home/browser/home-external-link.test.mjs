@@ -263,7 +263,7 @@ test('Home opens binary shared content in Library by CID', async () => {
 
 test('a Chat post file name rides along as a title only, never in the check', async () => {
   for (const [name, expected] of [['omp-test-note.txt', 'omp-test-note.txt'], ['..x\u0007.txt', 'x.txt'],
-    ['../x.txt', ''], ['a\\b', ''], ['n'.repeat(300), 'n'.repeat(120)]]) {
+    ['../x.txt', ''], ['a\\b', ''], ['n'.repeat(300), 'n'.repeat(200)], ['中'.repeat(80) + '.txt', '中'.repeat(65) + '.txt']]) {
     const h = harness(), calls = [];
     const fetchJson = async (route, init) => { calls.push(JSON.parse(init.body));
       return route.endsWith('/check') ? result() : { state: 'local' }; };

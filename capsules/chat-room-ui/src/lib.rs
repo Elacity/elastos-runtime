@@ -5488,24 +5488,45 @@ fn direct_message_reference(
     Some(format!("{conversation_id}/{message_id}"))
 }
 
-/// The longest file name Chat passes to Home with a shared file link.
-const SHARED_FILE_NAME_MAX_CHARS: usize = 120;
+/// The longest file name, in UTF-8 bytes, Chat passes to Home with a shared
+/// file link. The Runtime writes a file through a temporary
+/// `.<name>.<16 hex>.tmp` (elastos-server auth.rs `atomic_write`) under the
+/// 255-byte file-name limit, so a name may take 233 bytes; 200 leaves room for
+/// the `-2` a duplicate gets. Home, Documents and Library apply the same rule.
+const SHARED_FILE_NAME_MAX_BYTES: usize = 200;
+/// An extension longer than this is part of the name when a name is cut.
+const SHARED_FILE_EXTENSION_MAX_BYTES: usize = 16;
 
 /// A file name fit to show and to suggest when saving: no path separators,
-/// control characters or leading dots, at most 120 characters. It is only a
-/// title and default name; it never decides the type or the app.
+/// control characters or leading dots, at most 200 UTF-8 bytes, cut on a
+/// character boundary before the extension. It is only a title and default
+/// name; it never decides the type or the app.
 fn shared_file_display_name(raw: &str) -> Option<String> {
     if raw.contains(['/', '\\']) {
         return None;
     }
     let cleaned: String = raw.chars().filter(|ch| !ch.is_control()).collect();
-    let name: String = cleaned
+    let name = cleaned
         .trim_start_matches(|ch: char| ch == '.' || ch.is_whitespace())
-        .chars()
-        .take(SHARED_FILE_NAME_MAX_CHARS)
-        .collect();
-    let name = name.trim_end();
-    (!name.is_empty()).then(|| name.to_string())
+        .trim_end();
+    if name.len() <= SHARED_FILE_NAME_MAX_BYTES {
+        return (!name.is_empty()).then(|| name.to_string());
+    }
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 && name.len() - dot <= SHARED_FILE_EXTENSION_MAX_BYTES => {
+            name.split_at(dot)
+        }
+        _ => (name, ""),
+    };
+    let budget = SHARED_FILE_NAME_MAX_BYTES - extension.len();
+    let end = stem
+        .char_indices()
+        .map(|(index, ch)| index + ch.len_utf8())
+        .take_while(|end| *end <= budget)
+        .last()
+        .unwrap_or(0);
+    let stem = stem[..end].trim_end_matches(|ch: char| ch == '.' || ch.is_whitespace());
+    (!stem.is_empty()).then(|| format!("{stem}{extension}"))
 }
 
 /// The file name a Chat file post states (`name · size · elastos://<cid>`),
@@ -7735,10 +7756,41 @@ mod tests {
             super::shared_file_display_name("..hidden\u{7}.txt"),
             Some("hidden.txt".to_string())
         );
-        assert_eq!(
-            super::shared_file_display_name(&"n".repeat(300)),
-            Some("n".repeat(120))
-        );
+        // At most 200 UTF-8 bytes, cut on a character boundary before the
+        // extension; the same cases as documents-shared-file-name.test.mjs.
+        let wide = |count: usize| "中".repeat(count);
+        for (raw, expected) in [
+            ("n".repeat(300), "n".repeat(200)),
+            (format!("{}.txt", wide(80)), format!("{}.txt", wide(65))),
+            (format!("{}.txt", wide(66)), format!("{}.txt", wide(65))),
+            (format!("{}.txt", wide(65)), format!("{}.txt", wide(65))),
+            (
+                format!("{}.txt", "a".repeat(196)),
+                format!("{}.txt", "a".repeat(196)),
+            ),
+            (
+                format!("{}.txt", "a".repeat(197)),
+                format!("{}.txt", "a".repeat(196)),
+            ),
+            (wide(300), wide(66)),
+            (
+                format!("{}.{}", "a".repeat(190), "b".repeat(20)),
+                format!("{}.{}", "a".repeat(190), "b".repeat(9)),
+            ),
+            (
+                format!("{}.md", "😀".repeat(60)),
+                format!("{}.md", "😀".repeat(49)),
+            ),
+            (format!("{}.pdf.txt", wide(65)), format!("{}.txt", wide(65))),
+            (
+                format!("{} {}.txt", "a".repeat(195), wide(10)),
+                format!("{}.txt", "a".repeat(195)),
+            ),
+        ] {
+            let name = super::shared_file_display_name(&raw).unwrap();
+            assert!(name.len() <= 200, "{raw}");
+            assert_eq!(name, expected, "{raw}");
+        }
         assert_eq!(super::shared_file_display_name(" \u{1b} "), None);
         assert_eq!(super::shared_file_display_name("dir/x.txt"), None);
     }
