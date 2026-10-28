@@ -441,17 +441,37 @@ function createDraftDocument() {
   };
 }
 
-function formatTime(timestamp) {
+// A list row's title: the document's title, or a plain file's name, without a
+// .md or .txt ending, the same rule for both.
+function listTitle(item) {
+  const title = String(item.title || "").trim();
+  return title.replace(/\.(md|txt)$/i, "") || title || "Untitled";
+}
+
+// The folder a file sits in, when that is a folder inside Documents.
+function listFolder(item) {
+  const parts = String(item.file_name || "").split("/");
+  return parts.length > 1 ? parts[parts.length - 2] : "";
+}
+
+// When a row last changed, short: "Today 4:41 PM", "Yesterday", "Oct 26"
+// (with the year when it is not this year).
+function shortTime(timestamp, now = new Date()) {
   if (!timestamp) {
     return "";
   }
-  return new Date(timestamp * 1000).toLocaleString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  const date = new Date(timestamp * 1000);
+  const startOfDay = (value) => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+  const daysAgo = Math.round((startOfDay(now) - startOfDay(date)) / 86_400_000);
+  if (daysAgo === 0) {
+    return "Today " + date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  }
+  if (daysAgo === 1) {
+    return "Yesterday";
+  }
+  return date.toLocaleDateString(undefined, date.getFullYear() === now.getFullYear()
+    ? { month: "short", day: "numeric" }
+    : { month: "short", day: "numeric", year: "numeric" });
 }
 
 function preferredWorkspaceView(view) {
@@ -1291,7 +1311,7 @@ function renderDocumentsList() {
   const keptDrafts = [...unsavedDocuments.values()]
     .filter((kept) => isDraftDocument(kept.document))
     .map((kept) => ({ draft_key: kept.document.draft_key, title: kept.document.title.trim() || "Untitled",
-      file_name: "New document", updated_at: 0 }));
+      file_name: "", updated_at: 0 }));
   const visibleDocuments = [...keptDrafts, ...state.documents].filter((item) => {
     if (!query) {
       return true;
@@ -1321,11 +1341,15 @@ function renderDocumentsList() {
       button.dataset.docDid = item.doc_did;
     }
     const unsaved = (isCurrent && state.dirty) || unsavedDocuments.has(listItemUnsavedKey(item));
-    const dirtyMarker = unsaved ? " • unsaved" : "";
+    const meta = [listFolder(item), shortTime(item.updated_at)].filter(Boolean).join(" · ");
+    if (item.file_name) {
+      button.title = item.file_name;
+    }
     button.innerHTML =
-      '<span class="document-list-title-row"><span class="document-list-title">' + escapeHtml(item.title) + "</span></span>" +
-      '<span class="document-list-meta">' + escapeHtml(item.file_name + dirtyMarker) + "</span>" +
-      '<span class="document-list-row"><span class="document-list-updated">' + escapeHtml(formatTime(item.updated_at)) + '</span></span>';
+      '<span class="document-list-title-row"><span class="document-list-title">' + escapeHtml(listTitle(item)) + "</span>" +
+      (unsaved ? '<span class="document-list-unsaved" role="img" aria-label="Unsaved changes" title="Unsaved changes"></span>' : "") +
+      "</span>" +
+      (meta ? '<span class="document-list-meta">' + escapeHtml(meta) + "</span>" : "");
     button.addEventListener("click", () => item.draft_key
       ? openKeptDraft(item.draft_key)
       : item.library_object_uri

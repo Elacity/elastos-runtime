@@ -508,17 +508,13 @@ a {
   font-size: 0.82rem;
 }
 
-.document-list-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.7rem;
-  margin-top: 0.4rem;
-}
-
-.document-list-updated {
-  color: var(--sidebar-muted);
-  font-size: 0.77rem;
+/* A dot after the title marks a document with unsaved changes. */
+.document-list-unsaved {
+  flex: 0 0 auto;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--warning);
 }
 
 .sidebar-note {

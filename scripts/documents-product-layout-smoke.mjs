@@ -930,8 +930,9 @@ async function run() {
       await manualPage.locator("#editor").fill("# Beta\n\nFirst manual edit.");
       await manualPage.waitForTimeout(1500);
       assert(saveCalls.length === 0, `With Save automatically off nothing may save without an action. Got ${JSON.stringify(saveCalls)}`);
-      const unsavedMeta = await manualPage.locator('.document-list-item[data-doc-did="doc-beta"] .document-list-meta').textContent();
-      assert(unsavedMeta.includes("unsaved"), `The list must mark unsaved changes. Got ${unsavedMeta}`);
+      const unsavedDot = manualPage.locator('.document-list-item[data-doc-did="doc-beta"] .document-list-unsaved');
+      assert(await unsavedDot.count() === 1 && await unsavedDot.getAttribute("aria-label") === "Unsaved changes",
+        "The list must mark unsaved changes.");
       // Clicking the open document's own row keeps the editor and its edits.
       await manualPage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
       await manualPage.waitForTimeout(300);
@@ -949,8 +950,8 @@ async function run() {
       const marked = await saveMark();
       assert(marked.unsaved && marked.dot && marked.title === "Save (unsaved changes)",
         `Save must show unsaved changes. Got ${JSON.stringify(marked)}`);
-      const unsavedMark = (selector) => manualPage.locator(`${selector} .document-list-meta`).textContent()
-        .then((meta) => meta.includes("• unsaved"));
+      const unsavedMark = async (selector) => (await manualPage.locator(`${selector} .document-list-unsaved`).count()) === 1 &&
+        (await manualPage.locator(`${selector} .document-list-unsaved`).getAttribute("aria-label")) === "Unsaved changes";
 
       // Switching documents keeps the text in this window without asking.
       await manualPage.locator('.document-list-item[data-doc-did="doc-alpha"]').click();
@@ -1020,10 +1021,19 @@ async function run() {
       await filesPage.goto(`http://127.0.0.1:${port}/apps/documents/?home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
       const fileItem = filesPage.locator(`.document-list-item[data-object-uri="${folderFile.uri}"]`);
       await fileItem.waitFor();
-      const listed = await filesPage.evaluate(() => [...document.querySelectorAll(".document-list-item")]
-        .map((item) => item.querySelector(".document-list-title")?.textContent || ""));
-      assert(JSON.stringify(listed) === JSON.stringify(["Alpha", "Beta", "Plain.txt"]),
-        `Documents list must show the folder's .txt file, sorted with the rest by time. Got ${JSON.stringify(listed)}`);
+      const rows = await filesPage.evaluate(() => [...document.querySelectorAll(".document-list-item")]
+        .map((item) => ({ text: item.innerText.replace(/\s+/g, " ").trim(), tooltip: item.title,
+          title: item.querySelector(".document-list-title")?.textContent || "",
+          meta: item.querySelector(".document-list-meta")?.textContent || "" })));
+      assert(JSON.stringify(rows.map((row) => row.title)) === JSON.stringify(["Alpha", "Beta", "Plain"]),
+        `Each row shows its title once, without .md or .txt, sorted by time. Got ${JSON.stringify(rows)}`);
+      // One quiet line: the time, short; the folder only for a subfolder of Documents.
+      const shortDate = (seconds) => new Date(seconds * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+      assert(rows[0].meta === shortDate(1_780_000_600) && rows[0].text === `Alpha ${rows[0].meta}` && rows[0].tooltip === "alpha.md",
+        `A Documents row shows its title and time only. Got ${JSON.stringify(rows[0])}`);
+      assert(rows[2].meta === `Notes · ${shortDate(folderFile.updated_at)}` && rows[2].text === `Plain ${rows[2].meta}` &&
+        rows[2].tooltip === folderFile.path,
+        `A file in a subfolder shows the folder before the time. Got ${JSON.stringify(rows[2])}`);
       await filesPage.locator("#sidebar-search").fill("notes/plain");
       const searched = await filesPage.evaluate(() => [...document.querySelectorAll(".document-list-item")]
         .map((item) => item.dataset.objectUri || item.dataset.docDid));
@@ -1068,7 +1078,7 @@ async function run() {
       await filesPage.locator("#new-document").click();
       await filesPage.locator("#title-input").fill("Draft name");
       const fileTitle = await fileItem.locator(".document-list-title").textContent();
-      assert(fileTitle === folderFile.name, `Naming a new draft must not rename a listed file. Got ${fileTitle}`);
+      assert(fileTitle === "Plain", `Naming a new draft must not rename a listed file. Got ${fileTitle}`);
     } finally {
       await filesPage.close();
     }
@@ -1339,8 +1349,7 @@ async function run() {
       assert(saveCalls[1].docDid === "doc-beta", `Queued autosave must keep Beta identity second. Got ${JSON.stringify(saveCalls)}`);
       assert(saveCalls[1].body === betaSavedBody, `Queued autosave must send only Beta's saved body second. Got ${JSON.stringify(saveCalls)}`);
       assert(maxConcurrentSaveCalls === 1, `Documents saves must remain serial with no overlap. Got ${JSON.stringify({ maxConcurrentSaveCalls, saveCalls })}`);
-      await racePage.waitForFunction(() => !document.querySelector('.document-list-item[data-doc-did="doc-alpha"] .document-list-meta')
-        ?.textContent.includes("unsaved"));
+      await racePage.waitForFunction(() => !document.querySelector('.document-list-item[data-doc-did="doc-alpha"] .document-list-unsaved'));
       const alphaStored = documents.get("doc-alpha");
       const betaStored = documents.get("doc-beta");
       assert(alphaStored?.body === alphaSavedBody, `Delayed autosave must persist only Alpha's body. Got ${JSON.stringify({ alphaStored, saveCalls })}`);
