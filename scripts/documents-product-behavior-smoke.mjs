@@ -125,7 +125,7 @@ assert(
     source.includes("function replaceCurrentDocument(document)") &&
     source.includes("function isCurrentDocumentTarget(target)") &&
     source.includes("if (!isCurrentDocumentTarget(saveTarget)) {") &&
-    source.includes("if (state.dirty) {") &&
+    source.includes("function keepUnsavedCurrent()") &&
     source.includes("if (saveInFlight) {") &&
     source.includes("autosaveQueued = true;") &&
     source.includes("if (changedDuringSave) {") &&
