@@ -1604,10 +1604,10 @@ mod discovery_summary_tests {
         assert!(json["expires_at"].is_null());
         assert_eq!(json["remote_visibility_may_remain_until"], 700);
         assert_eq!(json["remote_visibility_remaining_seconds"], 600);
-        assert!(json["status_message"]
-            .as_str()
-            .unwrap()
-            .contains("another 600 seconds"));
+        assert_eq!(
+            json["status_message"],
+            "Public is off. Others may still see you for 600 more seconds."
+        );
     }
 
     #[test]
