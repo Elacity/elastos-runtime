@@ -715,9 +715,9 @@ pub(super) async fn serve_cid_file(
     }
 }
 
-/// Fetch a single file through the local content backend only. Kubo checks each
-/// block it fetches against its CID, so the gateway serves only bytes that match
-/// the requested CID; content held only by availability replicas is not served.
+/// Fetch a single file from this node's IPFS repo only: no network search, pin
+/// or gateway fallback, and content held only by availability replicas is not
+/// served.
 /// The gateway keeps no copy: earlier releases' cache entries are never read.
 /// The local backend refuses a file past `MAX_GATEWAY_FILE_SIZE` while reading.
 async fn fetch_file_inline(state: &GatewayState, cid: &str, path: &str) -> anyhow::Result<Vec<u8>> {

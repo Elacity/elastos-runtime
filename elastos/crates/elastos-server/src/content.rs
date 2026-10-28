@@ -2864,9 +2864,9 @@ pub async fn fetch_bytes_via_provider(
     fetch_bytes_via_content(registry, cid, path, None).await
 }
 
-/// Read through the local backend only (Kubo, which checks every block it
-/// fetches against its CID), refused once the file passes `max_bytes`; a local
-/// miss never reaches availability holders.
+/// Read from this node's IPFS repo only, refused once the file passes
+/// `max_bytes`; a local miss never searches the network or reaches
+/// availability holders.
 pub(crate) async fn fetch_verified_local_bytes_via_provider(
     registry: &ProviderRegistry,
     cid: &str,
