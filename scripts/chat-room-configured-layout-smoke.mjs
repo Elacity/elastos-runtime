@@ -242,7 +242,7 @@ function startServer(scenario) {
     stallPoll: false,
     stalledMarkerReady: false,
     attachmentRequests: [],
-    uploads: [], sharedChecks: [], sharedGets: [],
+    uploads: [], attachLibrary: [], sharedChecks: [], sharedGets: [],
     attachmentMarkerReady: false,
     attachmentMarkerPolled: false,
     lastPollSince: null,
@@ -292,7 +292,7 @@ function startServer(scenario) {
           link: { url: sharedUri, host: sharedCid, title: "Local file link" } });
         poll.latest_seq = 2;
       }
-      if (trace.uploads.some(upload => upload.path.endsWith('/finish'))) {
+      if (trace.attachLibrary.some(request => request.posted)) {
         poll.objects.push(historyMessage(3, `attached.txt · 30 bytes · ${sharedUri}`, "2026-03-09T12:02:00Z"));
         poll.latest_seq = 3;
       }
@@ -395,6 +395,18 @@ function startServer(scenario) {
         }
         return;
       }
+      if (url.pathname === "/api/apps/chat-room/attach-library" && request.method === "POST") {
+        const chunks = []; for await (const chunk of request) chunks.push(chunk);
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        // The first post fails after publishing; a retry with the same request id posts.
+        const posted = trace.attachLibrary.some(previous => previous.body.request_id === body.request_id);
+        trace.attachLibrary.push({ body, posted, token: request.headers['x-elastos-home-token'] });
+        const publication = { object: { uri: body.uri }, uri: sharedUri, cid: sharedCid, published_at: 1780000000 };
+        if (posted) json(response, { status: "ok", data: { publication, posted: true, name: "attached.txt", size_bytes: 30 } });
+        else json(response, { status: "error", code: "post_failed", message: "Community send failed",
+          data: { publication, posted: false } }, 502);
+        return;
+      }
       if (url.pathname.startsWith("/api/apps/chat-room/upload/")) {
         const chunks = []; for await (const chunk of request) chunks.push(chunk);
         const bytes = Buffer.concat(chunks);
@@ -444,7 +456,7 @@ function startServer(scenario) {
           import { createHomeExternalLinkPrompt, requestHomeSharedContent } from '/home-external-link.js';
           const node = id => document.getElementById(id);
           window.fixtureSharedMessages = []; window.fixtureFileOpens = []; window.fixturePickerReplies = [];
-          window.fixtureFileSize = 30;
+          window.fixtureLibraryOpens = []; window.fixtureFileSize = 30;
           const prompt = createHomeExternalLinkPrompt({ root: node('shared-sheet'), appName: node('app'),
             host: node('host'), address: node('address'), openButton: node('open'), cancelButton: node('cancel'),
             eyebrow: node('kind'), title: node('title'), asker: node('asker'), size: node('size'), status: node('status'),
@@ -460,10 +472,17 @@ function startServer(scenario) {
                 data, prompt, fetchJson: async (url, init) => (await fetch(url, { ...init,
                   headers: { 'content-type': 'application/json', 'x-elastos-home-token': 'home-authority', ...init.headers } })).json() });
             }
-            if (data.type === 'home:open-target' && data.target === 'library') {
-              event.source.postMessage({ type: 'chat-room:attach-library-item', requestId: data.requestId,
+            if (data.type === 'home:open-target' && data.target === 'library' && data.query?.mode === 'attach') {
+              // Library sends the file's address and revision; the picker message is
+              // delivered twice so a replay can be checked.
+              const selection = { type: 'chat-room:attach-library-item', requestId: data.requestId,
                 documentNonce: data.documentNonce, pickerId: 'picker', deliveryId: 'delivery', fileName: 'attached.txt',
-                mimeType: 'text/plain', blob: new Blob(['x'.repeat(window.fixtureFileSize)], { type: 'text/plain' }) }, '*');
+                mimeType: 'text/plain', objectUri: 'localhost://Users/alma/Documents/attached.txt', revision: 'rev:attached',
+                sizeBytes: window.fixtureFileSize };
+              event.source.postMessage(selection, '*');
+              event.source.postMessage(selection, '*');
+            } else if (data.type === 'home:open-target' && data.target === 'library') {
+              window.fixtureLibraryOpens.push(data.query);
             }
             if (data.type === 'home:picker-accepted') window.fixturePickerReplies.push(data);
           });
@@ -1087,21 +1106,57 @@ async function runScenario(scenario) {
     }
     if (scenario === "community-attach") {
       await waitForConfiguredChatWithoutLegacyFlash(frame, "Community Attach");
-      assert(await frame.locator('#community-files-public').count() === 0, "standing public file note is shown");
+      assert(await frame.locator('#community-files-public').count() === 0, "the standing public-files note must be gone");
+      const panel = frame.locator('#library-post');
+      const panelText = () => panel.innerText();
       for (const [size, error] of [[0, "Empty files can't be sent."], [8 * 1024 * 1024 + 1, "Choose a file of 8 MB or less."]]) {
-        await page.evaluate(size => { window.fixtureFileSize = size; }, size);
+        await page.evaluate(size => { window.fixtureFileSize = size; window.fixturePickerReplies = []; }, size);
         await frame.locator('#attach-button').click();
         await frame.waitForFunction(error => document.querySelector('#error-text').textContent === error, error);
-        assert(trace.uploads.length === 0, "invalid file uploaded");
+        await page.waitForFunction(() => window.fixturePickerReplies.length === 1);
+        assert(await page.evaluate(() => window.fixturePickerReplies[0].accepted === false), "an invalid file was accepted");
+        assert(await panel.isHidden(), "an invalid file must not ask to post");
       }
-      await page.evaluate(() => { window.fixtureFileSize = 30; });
+      // Chat acknowledges the picker before it asks, so Home's 30-second delivery
+      // never waits on the person; the replayed delivery is ignored.
+      await page.evaluate(() => { window.fixtureFileSize = 30; window.fixturePickerReplies = []; });
       await frame.locator('#attach-button').click();
       await page.waitForFunction(() => window.fixturePickerReplies.some(reply => reply.accepted));
-      assert(trace.uploads.length === 4, "expected start, two chunks and finish", trace.uploads);
-      const [start, ...rest] = trace.uploads;
-      assert(JSON.stringify(JSON.parse(start.bytes)) === JSON.stringify({ file_name: 'attached.txt', mime_type: 'text/plain', size_bytes: 30 }), "upload start differs");
-      assert(rest[0].offset === '0' && rest[1].offset === '16' && Buffer.concat(rest.slice(0, 2).map(item => item.bytes)).equals(Buffer.from('x'.repeat(30))), "upload chunks differ");
-      assert(trace.uploads.every(item => item.token === 'test-token'), "upload launch authority missing");
+      await panel.waitFor({ state: 'visible' });
+      assert(await page.evaluate(() => window.fixturePickerReplies.length) === 1, "a replayed picker delivery was answered again");
+      assert(await frame.locator('#library-post-title').innerText() === 'Post publicly?', "Post confirmation title differs");
+      assert((await panelText()).includes('Anyone with the link may download and keep a copy. Unpublish removes it from your Home. Copies elsewhere may remain.'),
+        "Post confirmation body differs");
+      await frame.locator('#library-post-cancel').click();
+      await panel.waitFor({ state: 'hidden' });
+      assert(trace.attachLibrary.length === 0, "Cancel must send nothing");
+
+      await frame.locator('#attach-button').click();
+      await panel.waitFor({ state: 'visible' });
+      await frame.locator('#library-post-confirm').click();
+      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Published, not posted');
+      assert(trace.attachLibrary.length === 1, "Post must call attach-library once", trace.attachLibrary);
+      const [first] = trace.attachLibrary;
+      assert(first.body.uri === 'localhost://Users/alma/Documents/attached.txt' && first.body.if_revision === 'rev:attached'
+        && typeof first.body.request_id === 'string' && first.body.request_id.length > 0
+        && Object.keys(first.body).sort().join(',') === 'if_revision,request_id,uri', "attach-library body differs", first.body);
+      assert(first.token === 'test-token', "attach-library launch authority missing");
+      assert((await panelText()).includes(`Published: ${sharedUri}`), "a failed post must still show the publication");
+      assert(await frame.locator('#library-post-retry').isVisible() && await frame.locator('#library-post-open-library').isVisible(),
+        "a failed post must offer Retry post and Open in Library");
+      await frame.locator('#library-post-retry').click();
+      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Posted publicly');
+      assert(trace.attachLibrary.length === 2 && trace.attachLibrary[1].body.request_id === first.body.request_id,
+        "Retry post must reuse the request id", trace.attachLibrary);
+      assert((await panelText()).includes(`Published: ${sharedUri}`) && (await panelText()).includes('Posted in Community.'),
+        "publication and posting must show apart");
+      await frame.locator('#library-post-open-library').click();
+      await page.waitForFunction(() => window.fixtureLibraryOpens.length === 1);
+      assert(await page.evaluate(() => JSON.stringify(window.fixtureLibraryOpens[0])) ===
+        JSON.stringify({ uri: 'localhost://Users/alma/Documents' }), "Open in Library must open the file's folder");
+      await frame.locator('#library-post-close').click();
+      await panel.waitFor({ state: 'hidden' });
+      assert(trace.uploads.length === 0, "Community must not upload file bytes");
       assert(!trace.requests.some(value => value.endsWith('/objects/send')), "Chat duplicated Runtime's post");
       await notifyChatRuntime(page);
       await frame.waitForFunction(() => document.querySelector('#message-list').textContent.includes('attached.txt'));

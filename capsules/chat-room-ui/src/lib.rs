@@ -146,6 +146,8 @@ struct AppState {
     /// Attachments whose download failed, keyed by attachment id.
     attachment_retry: BTreeMap<String, AttachmentRetry>,
     attachment_downloads_running: bool,
+    /// The Library file Community is about to post, or has just posted.
+    library_post: Option<LibraryPost>,
     join_invite_url: Option<String>,
     direct: DirectUiState,
     /// The conversation whose text the composer shows: `None` is the shared
@@ -260,6 +262,10 @@ struct App {
     composer_form: HtmlFormElement,
     message_input: HtmlTextAreaElement,
     attach_button: HtmlButtonElement,
+    library_post_panel: HtmlElement,
+    library_post_title: HtmlElement,
+    library_post_lines: HtmlElement,
+    library_post_buttons: Vec<(LibraryPostAction, HtmlButtonElement)>,
     send_button: HtmlButtonElement,
     participant_toggle: HtmlButtonElement,
     room_access_toggle: HtmlButtonElement,
@@ -646,16 +652,6 @@ struct AttachmentUploadStartResponse {
     chunk_size_bytes: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct CommunityUploadFinish {
-    #[serde(rename = "cid")]
-    _cid: String,
-    #[serde(rename = "name")]
-    _name: String,
-    #[serde(rename = "size_bytes")]
-    _size_bytes: u64,
-}
-
 fn validate_attachment_size(size: u64) -> Result<(), String> {
     if size == 0 {
         return Err("Empty files can't be sent.".into());
@@ -664,6 +660,196 @@ fn validate_attachment_size(size: u64) -> Result<(), String> {
         return Err("Choose a file of 8 MB or less.".into());
     }
     Ok(())
+}
+
+/// The same words Library shows before it publishes a file.
+const POST_PUBLICLY_BODY: &str = "Anyone with the link may download and keep a copy. Unpublish removes it from your Home. Copies elsewhere may remain.";
+
+/// A Library file Community posts publicly: Chat asks once, then Home
+/// publishes the file from Library and posts its link. Publishing and
+/// posting are reported apart, so a failed post can be retried without
+/// publishing again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LibraryPost {
+    /// Names this post to Home; a retry reuses it.
+    request_id: String,
+    object_uri: String,
+    revision: String,
+    file_name: String,
+    size_bytes: u64,
+    selection: SelectionGuard,
+    phase: LibraryPostPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LibraryPostPhase {
+    Confirm,
+    Working,
+    Posted { link: String },
+    PostFailed { link: String, detail: String },
+    Failed { detail: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibraryPostAction {
+    Cancel,
+    Post,
+    Retry,
+    OpenLibrary,
+    Close,
+}
+
+const LIBRARY_POST_ACTIONS: [(LibraryPostAction, &str); 5] = [
+    (LibraryPostAction::Cancel, "library-post-cancel"),
+    (LibraryPostAction::Post, "library-post-confirm"),
+    (LibraryPostAction::Retry, "library-post-retry"),
+    (LibraryPostAction::OpenLibrary, "library-post-open-library"),
+    (LibraryPostAction::Close, "library-post-close"),
+];
+
+#[derive(Debug, PartialEq, Eq)]
+struct LibraryPostView {
+    title: &'static str,
+    lines: Vec<String>,
+    actions: &'static [LibraryPostAction],
+}
+
+#[derive(Debug, Serialize)]
+struct AttachLibraryInput<'a> {
+    uri: &'a str,
+    if_revision: &'a str,
+    request_id: &'a str,
+}
+
+/// A Community picker selection: the Library file's address, revision, name
+/// and size. Bytes never travel through Chat for a Community post.
+fn library_post_from_selection(
+    request_id: String,
+    object_uri: Option<String>,
+    revision: Option<String>,
+    file_name: String,
+    size_bytes: Option<f64>,
+    selection: SelectionGuard,
+) -> Result<LibraryPost, String> {
+    let (Some(object_uri), Some(revision)) = (object_uri, revision) else {
+        return Err("Choose the file again in Library.".to_string());
+    };
+    if !object_uri.starts_with("localhost://") {
+        return Err("Choose the file again in Library.".to_string());
+    }
+    let size_bytes = size_bytes
+        .filter(|size| size.is_finite() && *size >= 0.0 && size.fract() == 0.0)
+        .map(|size| size as u64)
+        .ok_or_else(|| "Choose the file again in Library.".to_string())?;
+    validate_attachment_size(size_bytes)?;
+    Ok(LibraryPost {
+        request_id,
+        object_uri,
+        revision,
+        file_name,
+        size_bytes,
+        selection,
+        phase: LibraryPostPhase::Confirm,
+    })
+}
+
+fn attach_library_error_text(code: &str) -> &'static str {
+    match code {
+        "empty_file" => "Empty files can't be published.",
+        "too_large" => "This file is too large to publish. Files up to 8 MiB can be published.",
+        "stale_revision" => "This file changed. Choose it again in Library.",
+        "unsupported" => "Folders can't be posted. Choose a file.",
+        "unavailable" => "Publishing isn't available right now. Try again.",
+        "changed_since_publish" => {
+            "This file changed after it was published. Unpublish it in Library, then post it again."
+        }
+        _ => "This file could not be posted. Try again.",
+    }
+}
+
+/// Home's answer to one attach-library request, read whatever its HTTP
+/// status: a failed post after a successful publish keeps the published link.
+fn library_post_outcome(http_status: u16, body: &serde_json::Value) -> LibraryPostPhase {
+    let link = body
+        .pointer("/data/publication/uri")
+        .and_then(serde_json::Value::as_str)
+        .filter(|link| link.starts_with("elastos://"))
+        .unwrap_or_default()
+        .to_string();
+    let ok = (200..300).contains(&http_status)
+        && body.get("status").and_then(serde_json::Value::as_str) == Some("ok");
+    if ok
+        && body.pointer("/data/posted") == Some(&serde_json::Value::Bool(true))
+        && !link.is_empty()
+    {
+        return LibraryPostPhase::Posted { link };
+    }
+    let code = body
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if code == "post_failed" && !link.is_empty() {
+        let detail = if http_status == 429 {
+            "Community is busy. Wait a moment, then retry the post."
+        } else {
+            "Posting to Community failed. Retry the post."
+        };
+        return LibraryPostPhase::PostFailed {
+            link,
+            detail: detail.to_string(),
+        };
+    }
+    LibraryPostPhase::Failed {
+        detail: attach_library_error_text(code).to_string(),
+    }
+}
+
+fn library_post_view(post: &LibraryPost) -> LibraryPostView {
+    use LibraryPostAction::{Cancel, Close, OpenLibrary, Post, Retry};
+    let file = format!("{} · {}", post.file_name, format_bytes(post.size_bytes));
+    match &post.phase {
+        LibraryPostPhase::Confirm => LibraryPostView {
+            title: "Post publicly?",
+            lines: vec![file, POST_PUBLICLY_BODY.to_string()],
+            actions: &[Cancel, Post],
+        },
+        LibraryPostPhase::Working => LibraryPostView {
+            title: "Post publicly?",
+            lines: vec![file, "Publishing and posting...".to_string()],
+            actions: &[],
+        },
+        LibraryPostPhase::Posted { link } => LibraryPostView {
+            title: "Posted publicly",
+            lines: vec![
+                file,
+                format!("Published: {link}"),
+                "Posted in Community.".to_string(),
+            ],
+            actions: &[OpenLibrary, Close],
+        },
+        LibraryPostPhase::PostFailed { link, detail } => LibraryPostView {
+            title: "Published, not posted",
+            lines: vec![
+                file,
+                format!("Published: {link}"),
+                detail.clone(),
+                "To stop sharing it, Unpublish it in Library.".to_string(),
+            ],
+            actions: &[Retry, OpenLibrary, Close],
+        },
+        LibraryPostPhase::Failed { detail } => LibraryPostView {
+            title: "Not posted",
+            lines: vec![file, detail.clone()],
+            actions: &[Close],
+        },
+    }
+}
+
+/// The Library folder that holds a posted file.
+fn library_folder_uri(object_uri: &str) -> &str {
+    object_uri
+        .rsplit_once('/')
+        .map_or(object_uri, |(folder, _)| folder)
 }
 
 #[derive(Debug, Serialize)]
@@ -765,6 +951,13 @@ pub fn start() -> Result<(), JsValue> {
         composer_form: form_by_id(&document, "composer-form")?,
         message_input: textarea_by_id(&document, "message-input")?,
         attach_button: button_by_id(&document, "attach-button")?,
+        library_post_panel: element_by_id(&document, "library-post")?,
+        library_post_title: element_by_id(&document, "library-post-title")?,
+        library_post_lines: element_by_id(&document, "library-post-lines")?,
+        library_post_buttons: LIBRARY_POST_ACTIONS
+            .iter()
+            .map(|(action, id)| Ok((*action, button_by_id(&document, id)?)))
+            .collect::<Result<Vec<_>, JsValue>>()?,
         send_button: button_by_id(&document, "send-button")?,
         participant_toggle: button_by_id(&document, "participant-toggle")?,
         room_access_toggle: button_by_id(&document, "room-access-toggle")?,
@@ -1514,6 +1707,18 @@ impl App {
             .add_event_listener_with_callback("click", attach_click.as_ref().unchecked_ref())?;
         attach_click.forget();
 
+        for (action, button) in &self.library_post_buttons {
+            let action = *action;
+            let post_app = Rc::clone(self);
+            let post_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |event: Event| {
+                event.prevent_default();
+                post_app.library_post_action(action);
+            }));
+            button
+                .add_event_listener_with_callback("click", post_click.as_ref().unchecked_ref())?;
+            post_click.forget();
+        }
+
         let toggle_app = Rc::clone(self);
         let toggle_click = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
             {
@@ -1919,13 +2124,46 @@ impl App {
                     request.consumed = true;
                     request.clone()
                 };
-                let blob = js_blob_field(&data, "blob");
                 let file_name = js_string_field(&data, "fileName")
                     .or_else(|| js_string_field(&data, "title"))
                     .unwrap_or_else(|| "Library item".to_string());
                 let mime_type = js_string_field(&data, "mimeType")
                     .unwrap_or_else(|| "application/octet-stream".to_string());
                 let app = Rc::clone(&library_attach_app);
+                if app.state.borrow().collaboration_configured {
+                    // Community asks before it posts, so it acknowledges the
+                    // picker at once: Home's delivery expires after 30 seconds.
+                    app.clear_error();
+                    let post = new_chat_message_request_id().and_then(|post_id| {
+                        library_post_from_selection(
+                            post_id,
+                            js_string_field(&data, "objectUri"),
+                            js_string_field(&data, "revision"),
+                            file_name,
+                            js_number_field(&data, "sizeBytes"),
+                            request.selection.clone(),
+                        )
+                    });
+                    let accepted = match post {
+                        Ok(post) if app.library_picker_is_current(&request) => {
+                            app.state.borrow_mut().library_post = Some(post);
+                            true
+                        }
+                        Ok(_) => false,
+                        Err(err) => {
+                            app.set_error(Some(err));
+                            false
+                        }
+                    };
+                    let _ = app.post_library_picker_message(serde_json::json!({
+                        "type": "home:picker-accepted", "homeToken": app.home_token(),
+                        "pickerId": picker_id, "requestId": request_id,
+                        "documentNonce": document_nonce, "deliveryId": delivery_id, "accepted": accepted,
+                    }));
+                    let _ = app.render();
+                    return;
+                }
+                let blob = js_blob_field(&data, "blob");
                 spawn_local(async move {
                     app.clear_error();
                     let result = if let Some(blob) = blob {
@@ -3133,6 +3371,8 @@ impl App {
             .await
     }
 
+    /// A room on this Home only: Community posts Library files by publishing
+    /// them (`run_library_post`), never by uploading bytes.
     async fn send_attachment_bytes(
         &self,
         file_name: &str,
@@ -3144,7 +3384,6 @@ impl App {
             return Err("Open a new Library picker in the current conversation.".to_string());
         }
         validate_attachment_size(bytes.len() as u64)?;
-        let configured = self.state.borrow().collaboration_configured;
         let headers = self.room_request_headers();
         let start: AttachmentUploadStartResponse = api_post_session_json(
             &self.room_api_url("/upload/start"),
@@ -3189,14 +3428,146 @@ impl App {
         if !self.library_picker_is_current(request) {
             return Err("The selected conversation changed.".to_string());
         }
-        if configured {
-            // Runtime posts the Text message; the next poll owns its row.
-            let _: CommunityUploadFinish = serde_json::from_value(sent)
-                .map_err(|_| "Home could not confirm the file post.".to_string())?;
-        } else {
-            let object = serde_json::from_value(sent)
-                .map_err(|_| "Home could not confirm the attachment.".to_string())?;
-            record_own_shared_send(&mut self.state.borrow_mut(), object);
+        let object = serde_json::from_value(sent)
+            .map_err(|_| "Home could not confirm the attachment.".to_string())?;
+        record_own_shared_send(&mut self.state.borrow_mut(), object);
+        Ok(())
+    }
+
+    fn library_post_action(self: &Rc<Self>, action: LibraryPostAction) {
+        match action {
+            LibraryPostAction::Cancel | LibraryPostAction::Close => {
+                self.state.borrow_mut().library_post = None;
+                let _ = self.render();
+            }
+            LibraryPostAction::Post | LibraryPostAction::Retry => {
+                let app = Rc::clone(self);
+                spawn_local(async move { app.run_library_post().await });
+            }
+            LibraryPostAction::OpenLibrary => {
+                let Some(object_uri) = self
+                    .state
+                    .borrow()
+                    .library_post
+                    .as_ref()
+                    .map(|post| post.object_uri.clone())
+                else {
+                    return;
+                };
+                let opened = self.post_home_message(&serde_json::json!({
+                    "type": "home:open-target", "target": "library", "homeToken": self.home_token(),
+                    "query": { "uri": library_folder_uri(&object_uri) },
+                }));
+                if !matches!(opened, Ok(true)) {
+                    self.set_error(Some("Open Home to open Library.".to_string()));
+                    let _ = self.render();
+                }
+            }
+        }
+    }
+
+    /// Asks Home to publish the chosen Library file and post its link. A
+    /// retry after a failed post reuses the request id, so Home posts the
+    /// same publication instead of publishing again.
+    async fn run_library_post(self: &Rc<Self>) {
+        let started = {
+            let mut state = self.state.borrow_mut();
+            let allowed = state.community_send_enabled()
+                && state.direct.selected_conversation_id.is_none()
+                && state
+                    .library_post
+                    .as_ref()
+                    .is_some_and(|post| selection_guard_matches(&state, &post.selection));
+            match state.library_post.as_mut() {
+                Some(post)
+                    if matches!(
+                        post.phase,
+                        LibraryPostPhase::Confirm | LibraryPostPhase::PostFailed { .. }
+                    ) =>
+                {
+                    allowed.then(|| {
+                        let previous =
+                            std::mem::replace(&mut post.phase, LibraryPostPhase::Working);
+                        (post.clone(), previous)
+                    })
+                }
+                _ => return,
+            }
+        };
+        let Some((post, previous)) = started else {
+            self.set_error(Some("Open Community to post this file.".to_string()));
+            let _ = self.render();
+            return;
+        };
+        let _ = self.render();
+        let result = api_post_session_envelope(
+            &self.room_api_url("/attach-library"),
+            &AttachLibraryInput {
+                uri: &post.object_uri,
+                if_revision: &post.revision,
+                request_id: &post.request_id,
+            },
+            &self.room_request_headers(),
+        )
+        .await;
+        let phase = match result {
+            Ok((401, _)) => {
+                self.handle_session_loss(self.session_loss_detail());
+                match previous {
+                    LibraryPostPhase::PostFailed { link, .. } => LibraryPostPhase::PostFailed {
+                        link,
+                        detail: "Reconnect, then retry the post.".to_string(),
+                    },
+                    _ => LibraryPostPhase::Failed {
+                        detail: "Reconnect, then attach the file again.".to_string(),
+                    },
+                }
+            }
+            Ok((status, body)) => library_post_outcome(status, &body),
+            Err(_) => match previous {
+                LibraryPostPhase::PostFailed { link, .. } => LibraryPostPhase::PostFailed {
+                    link,
+                    detail: "Home could not be reached. Retry the post.".to_string(),
+                },
+                _ => LibraryPostPhase::Failed {
+                    detail: "Home could not be reached. Check Library, then try again.".to_string(),
+                },
+            },
+        };
+        if let Some(current) = self.state.borrow_mut().library_post.as_mut() {
+            if current.request_id == post.request_id {
+                current.phase = phase;
+            }
+        }
+        let _ = self.render();
+    }
+
+    fn render_library_post(&self, post: Option<&LibraryPost>) -> Result<(), JsValue> {
+        set_hidden(&self.library_post_panel, post.is_none())?;
+        let Some(post) = post else {
+            return Ok(());
+        };
+        let view = library_post_view(post);
+        self.library_post_title.set_text_content(Some(view.title));
+        let signature = view.lines.join("\n");
+        if self
+            .library_post_lines
+            .get_attribute("data-lines")
+            .as_deref()
+            != Some(signature.as_str())
+        {
+            self.library_post_lines
+                .set_attribute("data-lines", &signature)?;
+            self.library_post_lines.set_text_content(None);
+            for line in &view.lines {
+                let paragraph = self.document.create_element("p")?;
+                paragraph.set_class_name("detail");
+                paragraph.set_text_content(Some(line));
+                self.library_post_lines.append_child(&paragraph)?;
+            }
+        }
+        for (action, button) in &self.library_post_buttons {
+            set_hidden(button.unchecked_ref(), !view.actions.contains(action))?;
         }
         Ok(())
     }
@@ -4261,6 +4632,11 @@ impl App {
         // control says so where the person meets it — visibly unavailable,
         // never silently missing.
         set_hidden(&self.attach_button, !direct_mode && !controls.show_attach)?;
+        let library_post = state
+            .library_post
+            .as_ref()
+            .filter(|post| !direct_mode && selection_guard_matches(&state, &post.selection));
+        self.render_library_post(library_post)?;
         self.attach_button
             .set_disabled(direct_mode || !controls.enable_attach);
         if direct_mode {
@@ -6267,6 +6643,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         attachment_urls: BTreeMap::new(),
         attachment_retry: BTreeMap::new(),
         attachment_downloads_running: false,
+        library_post: None,
         join_invite_url: None,
         direct: DirectUiState::default(),
         composer_conversation: None,
@@ -7817,7 +8194,7 @@ mod tests {
     }
 
     #[test]
-    fn community_attachment_sizes_and_finish_match_the_upload_contract() {
+    fn attachment_sizes_match_the_upload_contract() {
         assert_eq!(
             super::validate_attachment_size(0).unwrap_err(),
             "Empty files can't be sent."
@@ -7827,11 +8204,163 @@ mod tests {
             super::validate_attachment_size(8 * 1024 * 1024 + 1).unwrap_err(),
             "Choose a file of 8 MB or less."
         );
-        assert!(
-            serde_json::from_value::<super::CommunityUploadFinish>(serde_json::json!({
-                "cid": "cid", "name": "hello.txt", "size_bytes": 30,
-            }))
-            .is_ok()
+    }
+
+    fn library_post_fixture(phase: super::LibraryPostPhase) -> super::LibraryPost {
+        super::LibraryPost {
+            request_id: "post-1".to_string(),
+            object_uri: "localhost://Users/alma/Documents/notes.txt".to_string(),
+            revision: "rev:1".to_string(),
+            file_name: "notes.txt".to_string(),
+            size_bytes: 30,
+            selection: super::SelectionGuard {
+                generation: 0,
+                selected_conversation_id: None,
+            },
+            phase,
+        }
+    }
+
+    #[test]
+    fn community_picker_selection_names_a_library_file_by_address_and_revision() {
+        let guard = super::SelectionGuard {
+            generation: 0,
+            selected_conversation_id: None,
+        };
+        let select = |uri: Option<&str>, revision: Option<&str>, size: Option<f64>| {
+            super::library_post_from_selection(
+                "post-1".to_string(),
+                uri.map(str::to_string),
+                revision.map(str::to_string),
+                "notes.txt".to_string(),
+                size,
+                guard.clone(),
+            )
+        };
+        let uri = Some("localhost://Users/alma/Documents/notes.txt");
+        assert_eq!(
+            select(uri, Some("rev:1"), Some(30.0)).unwrap(),
+            library_post_fixture(super::LibraryPostPhase::Confirm)
+        );
+        let again = "Choose the file again in Library.";
+        assert_eq!(select(uri, None, Some(30.0)).unwrap_err(), again);
+        assert_eq!(select(None, Some("rev:1"), Some(30.0)).unwrap_err(), again);
+        assert_eq!(
+            select(Some("elastos://bafy"), Some("rev:1"), Some(30.0)).unwrap_err(),
+            again
+        );
+        assert_eq!(select(uri, Some("rev:1"), None).unwrap_err(), again);
+        assert_eq!(
+            select(uri, Some("rev:1"), Some(0.0)).unwrap_err(),
+            "Empty files can't be sent."
+        );
+        assert_eq!(
+            select(uri, Some("rev:1"), Some((8 * 1024 * 1024 + 1) as f64)).unwrap_err(),
+            "Choose a file of 8 MB or less."
+        );
+    }
+
+    #[test]
+    fn library_post_outcome_reports_publication_and_posting_apart() {
+        use super::LibraryPostPhase::{Failed, PostFailed, Posted};
+        let publication =
+            serde_json::json!({ "uri": "elastos://bafkreipublished", "cid": "bafkreipublished" });
+        let link = "elastos://bafkreipublished".to_string();
+        assert_eq!(
+            super::library_post_outcome(
+                200,
+                &serde_json::json!({
+                    "status": "ok", "data": { "publication": publication, "posted": true, "name": "notes.txt", "size_bytes": 30 },
+                })
+            ),
+            Posted { link: link.clone() }
+        );
+        let post_failed = serde_json::json!({
+            "status": "error", "code": "post_failed", "message": "send failed",
+            "data": { "publication": publication, "posted": false },
+        });
+        assert_eq!(
+            super::library_post_outcome(502, &post_failed),
+            PostFailed {
+                link: link.clone(),
+                detail: "Posting to Community failed. Retry the post.".to_string()
+            }
+        );
+        assert_eq!(
+            super::library_post_outcome(429, &post_failed),
+            PostFailed {
+                link,
+                detail: "Community is busy. Wait a moment, then retry the post.".to_string()
+            }
+        );
+        for (code, detail) in [
+            ("empty_file", "Empty files can't be published."),
+            ("too_large", "This file is too large to publish. Files up to 8 MiB can be published."),
+            ("stale_revision", "This file changed. Choose it again in Library."),
+            ("unsupported", "Folders can't be posted. Choose a file."),
+            ("unavailable", "Publishing isn't available right now. Try again."),
+            ("changed_since_publish", "This file changed after it was published. Unpublish it in Library, then post it again."),
+            ("post_failed", "This file could not be posted. Try again."),
+            ("library_error", "This file could not be posted. Try again."),
+        ] {
+            let body = serde_json::json!({ "status": "error", "code": code, "message": "engine_internal detail" });
+            assert_eq!(super::library_post_outcome(400, &body), Failed { detail: detail.to_string() }, "{code}");
+        }
+        assert_eq!(
+            super::library_post_outcome(
+                200,
+                &serde_json::json!({ "status": "ok", "data": { "posted": false } })
+            ),
+            Failed {
+                detail: "This file could not be posted. Try again.".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn library_post_view_asks_once_then_offers_retry_and_library() {
+        use super::LibraryPostAction::{Cancel, Close, OpenLibrary, Post, Retry};
+        use super::LibraryPostPhase::{Confirm, Failed, PostFailed, Posted, Working};
+        let confirm = super::library_post_view(&library_post_fixture(Confirm));
+        assert_eq!(confirm.title, "Post publicly?");
+        assert_eq!(
+            confirm.lines,
+            vec![
+                "notes.txt · 30 bytes".to_string(),
+                "Anyone with the link may download and keep a copy. Unpublish removes it from your Home. Copies elsewhere may remain.".to_string(),
+            ]
+        );
+        assert_eq!(confirm.actions, &[Cancel, Post]);
+        assert!(super::library_post_view(&library_post_fixture(Working))
+            .actions
+            .is_empty());
+        let link = "elastos://bafkreipublished".to_string();
+        let posted = super::library_post_view(&library_post_fixture(Posted { link: link.clone() }));
+        assert_eq!(
+            posted.lines[1..],
+            [
+                "Published: elastos://bafkreipublished".to_string(),
+                "Posted in Community.".to_string()
+            ]
+        );
+        assert_eq!(posted.actions, &[OpenLibrary, Close]);
+        let failed_post = super::library_post_view(&library_post_fixture(PostFailed {
+            link,
+            detail: "Posting to Community failed. Retry the post.".to_string(),
+        }));
+        assert_eq!(failed_post.title, "Published, not posted");
+        assert_eq!(
+            failed_post.lines[1],
+            "Published: elastos://bafkreipublished"
+        );
+        assert_eq!(failed_post.actions, &[Retry, OpenLibrary, Close]);
+        let failed = super::library_post_view(&library_post_fixture(Failed {
+            detail: "x".to_string(),
+        }));
+        assert_eq!(failed.actions, &[Close]);
+        assert_eq!(
+            super::library_folder_uri("localhost://Users/alma/Documents/notes.txt"),
+            "localhost://Users/alma/Documents"
         );
     }
 
@@ -9581,6 +10110,31 @@ async fn api_post_session_json<TReq: Serialize, TResp: DeserializeOwned>(
         .map_err(|err| request_error(err, deadline.as_ref()))
 }
 
+/// Reads the JSON body whatever the HTTP status: attach-library answers a
+/// refusal as JSON with a code, and a failed post with the publication.
+async fn api_post_session_envelope<TReq: Serialize>(
+    path: &str,
+    body: &TReq,
+    extra_headers: &[(&str, String)],
+) -> Result<(u16, serde_json::Value), String> {
+    let mut request = Request::post(path).credentials(RequestCredentials::SameOrigin);
+    for (name, value) in extra_headers {
+        request = request.header(name, value);
+    }
+    let response = request
+        .json(body)
+        .map_err(|err| err.to_string())?
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let status = response.status();
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    Ok((status, body))
+}
+
 async fn api_get_session_bytes(
     path: &str,
     extra_headers: &[(&str, String)],
@@ -9808,6 +10362,12 @@ fn js_string_field(data: &JsValue, key: &str) -> Option<String> {
         .and_then(|value| value.as_string())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn js_number_field(data: &JsValue, key: &str) -> Option<f64> {
+    Reflect::get(data, &JsValue::from_str(key))
+        .ok()
+        .and_then(|value| value.as_f64())
 }
 
 fn js_blob_field(data: &JsValue, key: &str) -> Option<Blob> {
