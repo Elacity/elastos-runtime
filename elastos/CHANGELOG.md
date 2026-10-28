@@ -39,25 +39,33 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   including content only a Carrier peer offers, does not open. The gateway no
   longer keeps its own copy of what it serves, so copies saved by earlier
   versions are not used, and a single file larger than 100 MiB is refused.
-- Library no longer offers Share or Copy Published Link, and Properties no
-  longer shows the published CID or `elastos://` text. Documents no longer
-  offers Copy Published Link or Copy link on a revision.
-  Library and Documents no longer offer Publish, and Documents drops its
-  History tab and Published icon. A file published earlier opens from this
-  Home's own copy and can still be unpublished from its menu. Library's
-  sidebar shows the Public place only while it holds items.
+- Library no longer offers Share, and Properties no longer shows the published
+  CID or `elastos://` text. Documents no longer offers Publish, Copy Published
+  Link or Copy link on a revision, and drops its History tab and Published
+  icon. Library's Publish (item menu, or Publish Selected for several files)
+  asks once before it shares: anyone with the link may download and keep a
+  copy. It shares from this Home only, without waiting for a seed copy, files
+  up to 8 MiB; a selection's folders are named and left out. A published file
+  offers Copy Link (the link to the version you published), Status, Repair and
+  Unpublish, and opens from this Home's own copy. Unpublish a file before you
+  delete it or publish a changed version. Library's sidebar shows the Public
+  place only while it holds items.
 - Archive no longer has a Home launcher tile, desktop shortcut or Marketplace
   Open button. Double-click a ZIP in Library, or use Open With, to open it in
   Archive; Library's Compress and Extract are unchanged. An Archive window saved
   by an earlier version is not reopened when Home starts.
-- Chat can share files in Community: an attached file (up to 8 MiB) is pinned
-  on your Home and posted as `name · size · elastos://<cid>`. Files you post in
-  Community are public: anyone with the link can get them. A contact who clicks
-  the link gets the file from your Home (up to 64 MiB) after Home checks that
-  its bytes match the link. Direct messages still carry no files.
+- Chat can share files in Community: Attach picks a Library file (up to
+  8 MiB), asks once ("Post publicly?"), publishes it from Library and posts
+  `name · size · elastos://<cid>`. Chat shows publishing and posting apart: if
+  posting fails, Retry post posts the same publication, and Open in Library
+  shows the file. The file shows as Published in Library, where Unpublish
+  removes it from your Home. A contact who clicks the link gets the file from
+  your Home (up to 64 MiB) after Home checks that its bytes match the link.
+  Direct messages still carry no files.
 - A Home now gives other Homes only files it has pinned (published, posted or
-  received); Unpublish stops sharing at once. People who already got a file
-  keep their copy.
+  received). Unpublish removes that publication's pin; the file stays pinned
+  while another publication of the same bytes on this Home holds it. People
+  who already got a file keep their copy, and copies elsewhere may remain.
 - In this release the seed accepts no new copies of a Home's files; copies it
   already holds stay. Your own devices accept new copies of a Home's files only
   when you allow it: on each device, run
