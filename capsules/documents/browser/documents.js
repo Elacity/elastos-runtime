@@ -1532,7 +1532,16 @@ function sendChatAttachmentOpenResult({ attachmentId, ok, message }) {
 async function selectDocument(docDid, options) {
   const sequence = ++documentSelectionSequence;
   const force = !!(options && options.force);
-  if (state.current && state.current.doc_did !== docDid && state.dirty) {
+  const sameDocument = !!state.current && state.current.doc_did === docDid;
+  // Clicking the open document keeps the editor as it is. Only an explicit
+  // reload, or opening the stored copy after a save conflict, replaces it, and
+  // unsaved edits ask first.
+  const storedCopyWanted = sameDocument && state.dirty &&
+    saveRecovery?.target.sessionId === state.currentSessionId;
+  if (sameDocument && !force && !storedCopyWanted) {
+    return;
+  }
+  if (state.current && state.dirty) {
     const sessionBeforePrompt = state.currentSessionId;
     const proceed = await resolveUnsavedChanges();
     if (!proceed || sequence !== documentSelectionSequence || sessionBeforePrompt !== state.currentSessionId) {
@@ -1542,9 +1551,6 @@ async function selectDocument(docDid, options) {
   const sessionId = state.currentSessionId;
   const title = elements.titleInput.value;
   const body = elements.editor.value;
-  if (!force && state.current && state.current.doc_did === docDid && !state.dirty) {
-    return;
-  }
   resetPendingSaveIntent();
   const response = await documentsProviderApi("get", { doc_did: docDid }).catch((error) => {
     if (sequence !== documentSelectionSequence || sessionId !== state.currentSessionId) return null;

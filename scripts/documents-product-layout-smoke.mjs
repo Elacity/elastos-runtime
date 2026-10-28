@@ -932,6 +932,13 @@ async function run() {
       assert(saveCalls.length === 0, `With Save automatically off nothing may save without an action. Got ${JSON.stringify(saveCalls)}`);
       const unsavedMeta = await manualPage.locator('.document-list-item[data-doc-did="doc-beta"] .document-list-meta').textContent();
       assert(unsavedMeta.includes("unsaved"), `The list must mark unsaved changes. Got ${unsavedMeta}`);
+      // Clicking the open document's own row keeps the editor and its edits.
+      await manualPage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
+      await manualPage.waitForTimeout(300);
+      assert(!(await manualPage.locator("#confirm-modal.open").count()) &&
+        await manualPage.locator("#editor").inputValue() === "# Beta\n\nFirst manual edit." &&
+        await manualPage.getByRole("button", { name: "Save", exact: true }).isEnabled(),
+        "Clicking the open document must keep its unsaved edits.");
 
       // Switching asks; Cancel keeps the edit and the document.
       await manualPage.locator('.document-list-item[data-doc-did="doc-alpha"]').click();
@@ -1353,6 +1360,14 @@ async function run() {
       assert(documents.get("doc-alpha").body === "Winning body", "Paused draft changed the stored winner.");
       assert(await windows[0].locator("#editor").inputValue() === "Newer losing draft", "Paused autosave erased newer edits.");
       assert(saveCalls.every((call) => /^[0-9a-f]{64}$/.test(call.if_revision)), "Every page save must carry a revision.");
+      // Opening the stored document after the conflict asks first; Don't save
+      // shows the stored winner.
+      await windows[0].locator('.document-list-item[data-doc-did="doc-alpha"]').click();
+      await windows[0].locator("#confirm-modal.open").waitFor();
+      await windows[0].locator("#confirm-secondary-action").click();
+      await windows[0].waitForFunction(() => document.getElementById("editor").value === "Winning body");
+      assert(await windows[0].getByRole("button", { name: "Save", exact: true }).isDisabled(),
+        "The reloaded stored document must be clean.");
     } finally {
       await Promise.all(windows.map((page) => page.close()));
     }
