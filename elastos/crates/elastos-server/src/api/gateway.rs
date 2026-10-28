@@ -1207,6 +1207,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(room_service_objects_send),
         )
         .route(
+            "/api/apps/chat-room/attach-library",
+            post(chat_room_attach_library),
+        )
+        .route(
             "/api/apps/chat-room/upload/start",
             post(room_service_upload_start),
         )

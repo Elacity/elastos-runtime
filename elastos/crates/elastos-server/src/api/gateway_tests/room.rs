@@ -1042,31 +1042,24 @@ async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_po
         .unwrap();
     assert_eq!(forged.status(), StatusCode::FORBIDDEN);
 
-    // Community accepts attachments; an empty file is refused in plain words.
-    let start = |body: &'static str| {
-        app.clone().oneshot(
+    // Community takes files only through Library attach: the staged upload
+    // path stays the plain local room's.
+    let upload = app
+        .clone()
+        .oneshot(
             test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/chat-room/upload/start")
                 .header("x-elastos-home-token", token.as_str())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(body))
+                .body(Body::from(
+                    r#"{"file_name":"notes.txt","mime_type":"text/plain","size_bytes":4}"#,
+                ))
                 .unwrap(),
         )
-    };
-    let empty = start(r#"{"file_name":"empty.txt","mime_type":"text/plain","size_bytes":0}"#)
         .await
         .unwrap();
-    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
-    let text = axum::body::to_bytes(empty.into_body(), 4096).await.unwrap();
-    assert_eq!(
-        &text[..],
-        crate::room_service::EMPTY_FILE_REFUSAL.as_bytes()
-    );
-    let upload = start(r#"{"file_name":"notes.txt","mime_type":"text/plain","size_bytes":4}"#)
-        .await
-        .unwrap();
-    assert_eq!(upload.status(), StatusCode::OK);
+    assert_eq!(upload.status(), StatusCode::CONFLICT);
 
     let leave = app
         .clone()
@@ -2941,9 +2934,16 @@ impl Provider for RecordingPublishContent {
     }
 }
 
-#[tokio::test]
-async fn community_upload_finish_pins_the_file_here_then_posts_its_link() {
-    const CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+struct AttachFixture {
+    dir: tempfile::TempDir,
+    app: Router,
+    token: String,
+    principal_id: String,
+    content: Arc<RecordingPublishContent>,
+    port: crate::collaboration_product::CollaborationChatProductPort,
+}
+
+async fn attach_fixture() -> AttachFixture {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_profile(dir.path(), "owner");
     let port = crate::collaboration_product::test_chat_product_port(
@@ -2965,84 +2965,157 @@ async fn community_upload_finish_pins_the_file_here_then_posts_its_link() {
     let app = gateway_router(state);
     let token =
         projection_launch_token_for_authority_context(dir.path(), CHAT_ROOM_CAPSULE_ID, &authority);
-    let call = |uri: String, body: Body, offset: Option<&'static str>| {
-        let mut request = test_browser_request("localhost:61180", "null")
-            .method("POST")
-            .uri(uri)
-            .header("x-elastos-home-token", token.as_str());
-        if let Some(offset) = offset {
-            request = request.header("x-elastos-upload-offset", offset);
-        } else {
-            request = request.header(CONTENT_TYPE, "application/json");
-        }
-        let app = app.clone();
-        async move {
-            let response = app.oneshot(request.body(body).unwrap()).await.unwrap();
-            let status = response.status();
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            (status, String::from_utf8(body.to_vec()).unwrap())
-        }
-    };
+    AttachFixture {
+        dir,
+        app,
+        token,
+        principal_id: authority.principal_id.clone(),
+        content,
+        port,
+    }
+}
 
-    let (status, body) = call(
-        "/api/apps/chat-room/upload/start".into(),
-        Body::from(r#"{"file_name":"notes\n.txt","mime_type":"text/plain","size_bytes":4}"#),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let upload_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["upload_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let (status, body) = call(
-        format!("/api/apps/chat-room/upload/{upload_id}/chunk"),
-        Body::from("abcd"),
-        Some("0"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(content.requests.lock().unwrap().is_empty());
-
-    let finish = || {
-        call(
-            format!("/api/apps/chat-room/upload/{upload_id}/finish"),
-            Body::empty(),
-            None,
+impl AttachFixture {
+    fn uri(&self, path: &str) -> String {
+        format!(
+            "{}/{path}",
+            crate::auth::principal_localhost_root(&self.principal_id)
         )
-    };
-    let (status, body) = finish().await;
+    }
+
+    fn library(&self, op: &str, mut body: serde_json::Value) -> serde_json::Value {
+        body["op"] = json!(op);
+        body["principal_id"] = json!(self.principal_id);
+        crate::library::handle_object_provider_raw_request(self.dir.path(), &body)
+    }
+
+    fn write(&self, path: &str, bytes: &[u8]) -> String {
+        let write = self.library(
+            "write",
+            json!({
+                "uri": self.uri(path),
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        );
+        assert_eq!(write["status"], "ok", "{write}");
+        write["data"]["object"]["revision"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn post(&self, path: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let response = self
+            .app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri(path)
+                    .header("x-elastos-home-token", self.token.as_str())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| json!({ "text": String::from_utf8_lossy(&bytes).to_string() })),
+        )
+    }
+
+    async fn attach(&self, path: &str, request_id: &str) -> (StatusCode, serde_json::Value) {
+        self.post(
+            "/api/apps/chat-room/attach-library",
+            json!({ "uri": self.uri(path), "request_id": request_id }),
+        )
+        .await
+    }
+
+    async fn fill_send_window(&self, from: usize) {
+        for index in from..crate::collaboration_rate_limit::COMMUNITY_SENDS_PER_WINDOW {
+            let (status, body) = self
+                .post(
+                    "/api/apps/chat-room/objects/send",
+                    json!({
+                        "request_id": format!("chat-message:{index:032x}"),
+                        "body": format!("message {index}"),
+                    }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    }
+
+    fn publishes(&self) -> Vec<serde_json::Value> {
+        self.content
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["op"] == "publish")
+            .cloned()
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn community_attach_publishes_the_library_file_then_posts_its_link_once() {
+    const CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+    let home = attach_fixture().await;
+    let revision = home.write("Documents/notes.txt", b"abcd");
+
+    let (status, body) = home
+        .post(
+            "/api/apps/chat-room/attach-library",
+            json!({
+                "uri": home.uri("Documents/notes.txt"),
+                "if_revision": revision,
+                "request_id": "chat-attach:notes",
+            }),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["data"]["posted"], true);
+    assert_eq!(body["data"]["name"], "notes.txt");
+    assert_eq!(body["data"]["size_bytes"], 4);
+    assert_eq!(body["data"]["publication"]["cid"], CID);
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
-        json!({ "cid": CID, "name": "notes.txt", "size_bytes": 4 })
+        body["data"]["publication"]["uri"],
+        format!("elastos://{CID}")
     );
-    // Published once, pinned on this Home only, as this principal.
-    let requests = content.requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 1, "{requests:?}");
-    assert_eq!(requests[0]["op"], "publish");
-    assert_eq!(requests[0]["pin"], true);
+    // The one Library publish: pinned here only, as this principal, under its
+    // own owner.
+    let publishes = home.publishes();
+    assert_eq!(publishes.len(), 1, "{publishes:?}");
     assert_eq!(
-        requests[0]["availability_policy"],
+        publishes[0]["availability_policy"],
         crate::content::LOCAL_PIN_AVAILABILITY_POLICY
     );
-    assert_eq!(requests[0]["data"], "YWJjZA==");
-    assert_eq!(
-        requests[0]["publisher_did"],
-        authority.principal_id.as_str()
-    );
+    assert_eq!(publishes[0]["data"], "YWJjZA==");
+    assert_eq!(publishes[0]["publisher_did"], home.principal_id.as_str());
+    assert!(publishes[0]["owner"]
+        .as_str()
+        .unwrap()
+        .starts_with("library:"));
+
+    // Library shows it published, so Unpublish there controls it.
+    let stat = home.library("stat", json!({ "uri": home.uri("Documents/notes.txt") }));
+    assert_eq!(stat["data"]["object"]["published"], true, "{stat}");
+    assert_eq!(stat["data"]["object"]["publication"]["cid"], CID);
 
     // The link is posted as one ordinary Text message.
-    let (status, body) = call(
-        "/api/apps/chat-room/poll".into(),
-        Body::from(r#"{"since":0}"#),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let poll: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let (status, poll) = home
+        .post("/api/apps/chat-room/poll", json!({ "since": 0 }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{poll}");
     let objects = poll["objects"].as_array().unwrap();
     assert_eq!(objects.len(), 1, "{objects:?}");
     assert_eq!(objects[0]["kind"], "text");
@@ -3050,72 +3123,152 @@ async fn community_upload_finish_pins_the_file_here_then_posts_its_link() {
         objects[0]["body"],
         format!("notes.txt · 4 bytes · elastos://{CID}")
     );
-    // A link opened from the row cites it by these two ids.
-    assert!(objects[0]["message_id"]
-        .as_str()
-        .is_some_and(|id| id.starts_with("sha256:")));
     assert_eq!(objects[0]["conversation_id"], "file-community");
-    assert!(objects[0].get("attachment").is_none_or(|a| a.is_null()));
-    assert_eq!(port.test_live_unresolved_outgoing().unwrap(), 1);
+    assert_eq!(home.port.test_live_unresolved_outgoing().unwrap(), 1);
 
-    // The staged bytes are gone: the same upload cannot post twice.
-    let (status, _) = finish().await;
-    assert_ne!(status, StatusCode::OK);
-    assert_eq!(content.requests.lock().unwrap().len(), 1);
+    // A retry with the same request_id publishes and posts nothing new.
+    let (status, again) = home
+        .attach("Documents/notes.txt", "chat-attach:notes")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["data"]["posted"], true);
+    assert_eq!(home.publishes().len(), 1);
+    assert_eq!(home.port.test_live_unresolved_outgoing().unwrap(), 1);
+}
 
-    // A finish the send rate limit refuses publishes nothing and keeps the
-    // upload, so it can be finished once the window has passed.
-    let (status, body) = call(
-        "/api/apps/chat-room/upload/start".into(),
-        Body::from(r#"{"file_name":"later.txt","mime_type":"text/plain","size_bytes":2}"#),
-        None,
-    )
+#[tokio::test]
+async fn community_attach_checks_the_send_limit_before_publishing() {
+    let home = attach_fixture().await;
+    home.write("Documents/later.txt", b"later");
+    home.fill_send_window(0).await;
+
+    let (status, body) = home
+        .attach("Documents/later.txt", "chat-attach:later")
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "rate_limited");
+    assert!(home.publishes().is_empty());
+    let stat = home.library("stat", json!({ "uri": home.uri("Documents/later.txt") }));
+    assert_eq!(stat["data"]["object"]["published"], false, "{stat}");
+}
+
+#[tokio::test]
+async fn community_attach_keeps_the_publication_when_the_post_fails_and_retries_the_post() {
+    let home = attach_fixture().await;
+    home.write("Documents/report.txt", b"report");
+    // The first attach publishes and posts; that post and four more fill the
+    // send window.
+    let (status, first) = home
+        .attach("Documents/report.txt", "chat-attach:report-0")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    home.fill_send_window(1).await;
+
+    // The post is refused by the send limit; the publication stays.
+    let (status, failed) = home
+        .attach("Documents/report.txt", "chat-attach:report")
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{failed}");
+    assert_eq!(failed["code"], "post_failed");
+    assert_eq!(failed["data"]["posted"], false);
+    assert_eq!(
+        failed["data"]["publication"]["cid"],
+        first["data"]["publication"]["cid"]
+    );
+    assert_eq!(home.publishes().len(), 1);
+    let stat = home.library("stat", json!({ "uri": home.uri("Documents/report.txt") }));
+    assert_eq!(stat["data"]["object"]["published"], true, "{stat}");
+
+    // Once the window has passed, the same request posts the same link.
+    tokio::time::sleep(std::time::Duration::from_secs(
+        crate::collaboration_rate_limit::COMMUNITY_RATE_WINDOW_SECS + 1,
+    ))
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let later = serde_json::from_str::<serde_json::Value>(&body).unwrap()["upload_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let (status, body) = call(
-        format!("/api/apps/chat-room/upload/{later}/chunk"),
-        Body::from("ok"),
-        Some("0"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    // The file post counts toward the window; fill the rest of it.
-    for index in 1..crate::collaboration_rate_limit::COMMUNITY_SENDS_PER_WINDOW {
-        let (status, body) = call(
-            "/api/apps/chat-room/objects/send".into(),
-            Body::from(
-                json!({
-                    "request_id": format!("chat-message:{index:032x}"),
-                    "body": format!("message {index}"),
-                })
-                .to_string(),
-            ),
-            None,
+    let (status, retried) = home
+        .attach("Documents/report.txt", "chat-attach:report")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{retried}");
+    assert_eq!(retried["data"]["posted"], true);
+    assert_eq!(home.publishes().len(), 1);
+}
+
+#[tokio::test]
+async fn community_attach_refuses_files_it_must_not_publish() {
+    let home = attach_fixture().await;
+    home.write("Documents/empty.txt", b"");
+    let (status, body) = home
+        .attach("Documents/empty.txt", "chat-attach:empty")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "empty_file");
+    assert_eq!(body["message"], "Empty files can't be published.");
+
+    let revision = home.write("Documents/stale.txt", b"one");
+    home.write("Documents/stale.txt", b"two");
+    let (status, body) = home
+        .post(
+            "/api/apps/chat-room/attach-library",
+            json!({
+                "uri": home.uri("Documents/stale.txt"),
+                "if_revision": revision,
+                "request_id": "chat-attach:stale",
+            }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stale_revision");
+
+    let cap = crate::library::LIBRARY_PUBLISH_MAX_BYTES as usize;
+    home.write("Documents/big.bin", &vec![1; cap + 1]);
+    let (status, body) = home.attach("Documents/big.bin", "chat-attach:big").await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["code"], "too_large");
+
+    let other = crate::auth::principal_localhost_root("did:key:z6MkNotThisPrincipal");
+    for uri in [
+        format!("{other}/Documents/notes.txt"),
+        home.uri("Documents/../Documents/stale.txt"),
+        "https://example.com/file.txt".to_string(),
+    ] {
+        let (status, body) = home
+            .post(
+                "/api/apps/chat-room/attach-library",
+                json!({ "uri": uri, "request_id": "chat-attach:outside" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert_eq!(body["status"], "error");
     }
-    let uploads = || {
-        room_store_snapshot(dir.path())
-            .into_iter()
-            .filter(|(path, _)| path.contains("upload"))
-            .collect::<Vec<_>>()
-    };
-    let staged = uploads();
-    assert!(!staged.is_empty());
-    let (status, body) = call(
-        format!("/api/apps/chat-room/upload/{later}/finish"),
-        Body::empty(),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
-    assert_eq!(content.requests.lock().unwrap().len(), 1);
-    assert_eq!(uploads(), staged);
+    let (status, body) = home.attach("Documents/stale.txt", "bad id").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+
+    let unsigned = home
+        .app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/attach-library")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "uri": home.uri("Documents/stale.txt"), "request_id": "chat-attach:x" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            unsigned.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "{}",
+        unsigned.status()
+    );
+    assert!(home.publishes().is_empty());
+    assert_eq!(home.port.test_live_unresolved_outgoing().unwrap(), 0);
 }
 
 #[tokio::test]

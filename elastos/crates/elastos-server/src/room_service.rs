@@ -3670,45 +3670,6 @@ pub fn finish_attachment_upload(
     Ok(output)
 }
 
-/// Hands a complete staged upload's name and bytes to its caller and forgets
-/// it: the record and the staged file are gone when this returns. Community
-/// Chat publishes the bytes instead of keeping a Room attachment.
-pub(crate) fn take_completed_attachment_upload(
-    data_dir: &Path,
-    token: &str,
-    upload_id: &str,
-) -> anyhow::Result<(String, Vec<u8>)> {
-    let (file_name, staged_path) = with_locked_state(data_dir, |paths, state| {
-        let session = validate_session(state, token)?;
-        session.last_seen_at = now_ts();
-        let upload_index = state
-            .uploads
-            .iter()
-            .position(|upload| upload.upload_id == upload_id && upload.token == token)
-            .ok_or_else(|| anyhow::anyhow!("upload not found"))?;
-        let upload = &state.uploads[upload_index];
-        if upload.received_bytes != upload.size_bytes {
-            anyhow::bail!(
-                "upload incomplete: received {} of {} bytes",
-                upload.received_bytes,
-                upload.size_bytes
-            );
-        }
-        let upload = state.uploads.remove(upload_index);
-        Ok((
-            upload.file_name,
-            upload_staging_path(paths, &upload.upload_id),
-        ))
-    })?;
-    let bytes = fs::read(&staged_path);
-    let _ = fs::remove_file(&staged_path);
-    let bytes = bytes.context("failed to read staged upload")?;
-    if bytes.is_empty() {
-        anyhow::bail!(EMPTY_FILE_REFUSAL);
-    }
-    Ok((file_name, bytes))
-}
-
 pub fn read_attachment(
     data_dir: &Path,
     token: &str,

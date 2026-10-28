@@ -457,6 +457,15 @@ pub(super) struct RoomSendBody {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct ChatRoomAttachLibraryBody {
+    uri: String,
+    #[serde(default)]
+    if_revision: Option<String>,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ChatRoomAccessPolicyBody {
     allow_guest_invites: bool,
     allow_member_invites: bool,
@@ -2140,8 +2149,11 @@ pub(super) async fn room_service_upload_start(
     headers: HeaderMap,
     Json(body): Json<RoomUploadStartBody>,
 ) -> Response {
+    if state.collaboration_chat_product_port.is_some() {
+        return configured_attachment_unsupported_response();
+    }
     let data_dir = state.data_dir.clone();
-    let token = match room_upload_token(&state, &headers) {
+    let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
         Ok(token) => token,
         Err(err) => return room_service_error_response(err),
     };
@@ -2168,8 +2180,11 @@ pub(super) async fn room_service_upload_chunk(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if state.collaboration_chat_product_port.is_some() {
+        return configured_attachment_unsupported_response();
+    }
     let data_dir = state.data_dir.clone();
-    let token = match room_upload_token(&state, &headers) {
+    let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
         Ok(token) => token,
         Err(err) => return room_service_error_response(err),
     };
@@ -2197,7 +2212,7 @@ pub(super) async fn room_service_upload_finish(
     headers: HeaderMap,
 ) -> Response {
     if state.collaboration_chat_product_port.is_some() {
-        return community_upload_finish(state, headers, upload_id).await;
+        return configured_attachment_unsupported_response();
     }
     let data_dir = state.data_dir.clone();
     let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
@@ -2213,17 +2228,6 @@ pub(super) async fn room_service_upload_finish(
         Ok(Err(err)) => room_service_error_response(err),
         Err(err) => room_service_join_error_response(err),
     }
-}
-
-/// The upload session: Community uploads act under Chat's signed Home launch;
-/// the plain local room keeps its session cookie.
-fn room_upload_token(state: &GatewayState, headers: &HeaderMap) -> anyhow::Result<String> {
-    if state.collaboration_chat_product_port.is_none() {
-        return chat_room_access_token_from_headers(&state.data_dir, headers);
-    }
-    let context =
-        require_home_launch_token_context(&state.data_dir, headers, CHAT_ROOM_CAPSULE_ID)?;
-    Ok(start_configured_chat_room_session(&state.data_dir, &context)?.token)
 }
 
 #[cfg(test)]
@@ -2280,106 +2284,183 @@ fn community_file_post(name: &str, size_bytes: u64, cid: &str) -> (String, Strin
     (format!("{name}{tail}"), name)
 }
 
-/// Community finish: the file is pinned on this Home only (no wait on any
-/// seed), the staged bytes are gone, and the Runtime posts the link as an
-/// ordinary Text message through the normal send path and its rate limit.
-async fn community_upload_finish(
-    state: GatewayState,
+/// Community attach: the sender's own Library file goes through the one
+/// Library publish (pinned on this Home only, Published in Library, withdrawn
+/// with Unpublish), then its link is posted through the normal signed Chat
+/// send. A post that fails keeps the publication: the same `request_id` posts
+/// it again without publishing anything new.
+pub(super) async fn chat_room_attach_library(
+    State(state): State<GatewayState>,
     headers: HeaderMap,
-    upload_id: String,
+    Json(body): Json<ChatRoomAttachLibraryBody>,
 ) -> Response {
+    if let Err(err) = validate_room_send_request_id(&body.request_id) {
+        return attach_library_response(
+            StatusCode::BAD_REQUEST,
+            None,
+            attach_library_error_body("invalid_request", &err.to_string()),
+        );
+    }
     let data_dir = state.data_dir.clone();
     let (Some(port), Some(registry)) = (
         state.collaboration_chat_product_port.clone(),
         state.provider_registry.clone(),
     ) else {
-        return configured_attachment_unsupported_response();
+        return attach_library_response(
+            StatusCode::CONFLICT,
+            None,
+            attach_library_error_body("unsupported", "Files can be posted only in Community."),
+        );
     };
     let context = match require_home_launch_token_context(&data_dir, &headers, CHAT_ROOM_CAPSULE_ID)
     {
         Ok(context) => context,
-        Err(err) => return room_service_error_response(err),
+        Err(err) => return attach_library_chat_error(err),
     };
     let profile = match gateway_home_system::load_profile_authority_for_context(&data_dir, &context)
     {
         Ok(Some(profile)) => profile,
         Ok(None) => {
-            return room_service_error_response(anyhow::anyhow!("Chat requires a signed Profile"))
+            return attach_library_chat_error(anyhow::anyhow!("Chat requires a signed Profile"))
         }
-        Err(err) => return room_service_error_response(err),
+        Err(err) => return attach_library_chat_error(err),
     };
     let token = match start_configured_chat_room_session(&data_dir, &context) {
         Ok(session) => session.token,
-        Err(err) => return room_service_error_response(err),
+        Err(err) => return attach_library_chat_error(err),
     };
-    // A send the rate limit would refuse is refused before the upload is
-    // taken or published, so the sender can finish it again later.
+    let ChatRoomAttachLibraryBody {
+        uri,
+        if_revision,
+        request_id,
+    } = body;
+    // The send rate limit is checked before anything is published. A retry
+    // whose publication already exists publishes nothing new, so it goes on
+    // to the send path, which replays an earlier post or refuses a new one.
     if let Err(err) = port.check_message_allowed(&profile, now_ts()) {
-        return room_service_error_response(err);
-    }
-    let taken = {
-        let (data_dir, token, upload_id) = (data_dir.clone(), token.clone(), upload_id.clone());
-        tokio::task::spawn_blocking(move || {
-            crate::room_service::take_completed_attachment_upload(&data_dir, &token, &upload_id)
+        let (data_dir, principal_id, uri, if_revision) = (
+            data_dir.clone(),
+            context.principal_id.clone(),
+            uri.clone(),
+            if_revision.clone(),
+        );
+        let current = tokio::task::spawn_blocking(move || {
+            crate::library::library_file_publication_is_current(
+                &data_dir,
+                &principal_id,
+                &uri,
+                if_revision.as_deref(),
+            )
         })
         .await
-    };
-    let (file_name, bytes) = match taken {
-        Ok(Ok(taken)) => taken,
-        Ok(Err(err)) => return room_service_error_response(err),
-        Err(err) => return room_service_join_error_response(err),
-    };
-    let size_bytes = bytes.len() as u64;
-    let publish = serde_json::json!({
-        "op": "publish",
-        "kind": "file",
-        "filename": file_name.replace(['"', '\\'], "_"),
-        "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
-        "pin": true,
-        "availability_policy": crate::content::LOCAL_PIN_AVAILABILITY_POLICY,
-        "publisher_did": context.principal_id,
-    });
-    drop(bytes);
-    let cid = match registry.send_raw("content", &publish).await {
-        Ok(response) if response["status"] == "ok" => match response["data"]["cid"].as_str() {
-            Some(cid) => cid.to_string(),
-            None => {
-                return room_service_error_response(anyhow::anyhow!(
-                    "content publish returned no CID"
-                ))
-            }
-        },
-        Ok(response) => {
-            return room_service_error_response(anyhow::anyhow!(
-                "content publish failed: {}",
-                response["message"].as_str().unwrap_or("unknown error")
-            ))
+        .unwrap_or(false);
+        if !current {
+            return attach_library_chat_error(err);
         }
-        Err(err) => return room_service_error_response(anyhow::anyhow!("{err}")),
+    }
+    let publication = match crate::library::publish_library_file(
+        &data_dir,
+        &registry,
+        &context.principal_id,
+        &uri,
+        if_revision.as_deref(),
+    )
+    .await
+    {
+        Ok(publication) => publication,
+        Err(err) => return attach_library_publish_error(err),
     };
-    let (body, name) = community_file_post(&file_name, size_bytes, &cid);
+    let (post, name) =
+        community_file_post(&publication.name, publication.size_bytes, &publication.cid);
+    let size_bytes = publication.size_bytes;
+    let principal_id = context.principal_id;
     let now = now_ts();
     let posted = tokio::task::spawn_blocking(move || {
         let operation = crate::collaboration_product::chat_message_request_binding(
-            &format!("chat-message:{upload_id}"),
-            &context.principal_id,
-            &body,
+            &request_id,
+            &principal_id,
+            &post,
             &profile,
         )?;
-        let prepared = port.prepare_message(operation, &body, &profile, now)?;
+        let prepared = port.prepare_message(operation, &post, &profile, now)?;
         port.project_prepared_message(&data_dir, &prepared, Some(&token))
     })
     .await;
-    match posted {
-        Ok(Ok(_)) => Json(serde_json::json!({
-            "cid": cid,
-            "name": name,
-            "size_bytes": size_bytes,
-        }))
-        .into_response(),
-        Ok(Err(err)) => room_service_error_response(err),
-        Err(err) => room_service_join_error_response(err),
+    let failure = match posted {
+        Ok(Ok(_)) => {
+            return Json(serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "publication": publication.data,
+                    "posted": true,
+                    "name": name,
+                    "size_bytes": size_bytes,
+                },
+            }))
+            .into_response()
+        }
+        Ok(Err(err)) => err,
+        Err(err) => anyhow::anyhow!("group chat task failed: {err}"),
+    };
+    let (status, retry_after, _) = room_service_error_parts(&failure);
+    let mut body = attach_library_error_body(
+        "post_failed",
+        "Your file is published, but the post did not go through. Try again.",
+    );
+    body["data"] = serde_json::json!({
+        "publication": publication.data,
+        "posted": false,
+    });
+    attach_library_response(status, retry_after, body)
+}
+
+fn attach_library_error_body(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({ "status": "error", "code": code, "message": message })
+}
+
+fn attach_library_response(
+    status: StatusCode,
+    retry_after: Option<u64>,
+    body: serde_json::Value,
+) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    if let Some(secs) = retry_after {
+        response
+            .headers_mut()
+            .insert("retry-after", axum::http::HeaderValue::from(secs));
     }
+    response
+}
+
+/// A Chat authority or send refusal before anything is published.
+fn attach_library_chat_error(err: anyhow::Error) -> Response {
+    let (status, retry_after, message) = room_service_error_parts(&err);
+    let code = if retry_after.is_some() {
+        "rate_limited"
+    } else {
+        "chat_error"
+    };
+    attach_library_response(
+        status,
+        retry_after,
+        attach_library_error_body(code, &message),
+    )
+}
+
+fn attach_library_publish_error(err: anyhow::Error) -> Response {
+    let code = crate::library::library_refusal_code(&err).unwrap_or("library_error");
+    let status = match code {
+        "too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+        "stale_revision" | "changed_since_publish" => StatusCode::CONFLICT,
+        "not_found" => StatusCode::NOT_FOUND,
+        "unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    attach_library_response(
+        status,
+        None,
+        attach_library_error_body(code, &err.to_string()),
+    )
 }
 
 pub(super) async fn room_service_attachment_get(
@@ -2554,15 +2635,25 @@ fn upload_offset_from_headers(headers: &HeaderMap) -> anyhow::Result<u64> {
 }
 
 pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
+    match room_service_error_parts(&err) {
+        (status, Some(retry_after), text) => {
+            (status, [("retry-after", retry_after.to_string())], text).into_response()
+        }
+        (status, None, text) => (status, text).into_response(),
+    }
+}
+
+/// The HTTP status, any retry-after seconds, and the plain words for a Chat
+/// room failure.
+fn room_service_error_parts(err: &anyhow::Error) -> (StatusCode, Option<u64>, String) {
     if let Some(limited) =
         err.downcast_ref::<crate::collaboration_rate_limit::CommunitySendRateLimited>()
     {
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            [("retry-after", limited.retry_after_secs.to_string())],
+            Some(limited.retry_after_secs),
             limited.to_string(),
-        )
-            .into_response();
+        );
     }
     if let Some(refusal) =
         err.downcast_ref::<crate::collaboration_discovery_runtime::ProfileContactRequestRefusal>()
@@ -2576,9 +2667,9 @@ pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
             | ProfileContactRequestRefusal::CommunityLeft
             | ProfileContactRequestRefusal::Undeliverable => StatusCode::CONFLICT,
         };
-        return (status, refusal.to_string()).into_response();
+        return (status, None, refusal.to_string());
     }
-    let profile_required = gateway_home_system::profile_required_message(&err);
+    let profile_required = gateway_home_system::profile_required_message(err);
     let text = profile_required
         .map(str::to_string)
         .unwrap_or_else(|| err.to_string());
@@ -2609,7 +2700,7 @@ pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    (status, text).into_response()
+    (status, None, text)
 }
 
 pub(super) fn room_service_join_error_response(err: tokio::task::JoinError) -> Response {

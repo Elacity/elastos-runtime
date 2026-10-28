@@ -618,7 +618,11 @@ tickets, peer handles, or Kubo authority.
 Peer `content/fetch` admission: every peer read is `local_only`. An ordinary
 Home serves it only for a CID pinned there now (Kubo `pin/ls`); pinned content
 is public by link, and unpinned or cached blocks are never served to peers.
-Unpublish stops new transfers. The answer goes out in one message after a
+Content keeps the publication owners of each CID: identical bytes published
+twice share one pin, and Unpublish releases one owner. The pin goes, and new
+transfers stop, when the last owner releases it. Library Publish and its
+Repair pin on this Home only (`local_pin`), with no availability wait. The
+answer goes out in one message after a
 second pin check, so a read under way when the pin goes is refused; bytes
 already sent can't be recalled. A seed serves as before. A whole read past the
 requested `whole_max_bytes` answers the fixed token `content_too_large`, and
