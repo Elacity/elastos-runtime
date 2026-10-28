@@ -5,9 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>People · ElastOS</title>
   <script src="./elastos-theme.js"></script>
-  <script src="./elastos-drawer.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css">
-  <link rel="stylesheet" href="./style.css?v=people-20260812a">
+  <link rel="stylesheet" href="./style.css?v=people-20261028a">
 </head>
 <body>
   <section id="locked-shell" class="locked-shell hidden">
@@ -19,89 +18,83 @@
   </section>
 
   <main id="people-shell" class="people-shell hidden" aria-label="People">
-    <aside id="people-sidebar" class="people-sidebar" aria-label="People sections" data-el-drawer>
-      <button class="people-sidebar-item active" type="button" data-el-drawer-close data-section-target="people">
+    <nav id="people-sidebar" class="people-sidebar" aria-label="People pages">
+      <button class="people-sidebar-item active" type="button" data-section-target="people">
         <span class="people-sidebar-icon people-sidebar-icon-people" aria-hidden="true"></span>
         <span>People</span>
       </button>
-      <button class="people-sidebar-item" type="button" data-el-drawer-close data-section-target="discovery">
-        <span class="people-sidebar-icon people-sidebar-icon-discovery" aria-hidden="true"></span>
-        <span>Discovery</span>
+      <button class="people-sidebar-item" type="button" data-section-target="profile">
+        <span class="people-sidebar-icon people-sidebar-icon-profile" aria-hidden="true"></span>
+        <span>Profile</span>
       </button>
-    </aside>
+      <button class="people-sidebar-item" type="button" data-section-target="discovery">
+        <span class="people-sidebar-icon people-sidebar-icon-public" aria-hidden="true"></span>
+        <span>Public</span>
+      </button>
+    </nav>
 
-    <section class="people-main" data-el-drawer-room="people-sidebar">
+    <section class="people-main">
       <div class="people-content">
         <div class="people-content-inner">
-          <div class="people-page-head">
-            <button type="button" class="el-drawer-toggle" data-el-drawer-toggle="people-sidebar" aria-label="Show sections"></button>
-            <h1 class="people-page-title">People</h1>
-          </div>
+          <h1 class="people-page-title">People</h1>
           <div id="people-status" class="people-status" role="status" hidden></div>
 
           <section id="people" class="people-section" aria-label="People">
-            <section class="profile-card" aria-labelledby="profile-title">
-              <div>
-                <h2 id="profile-title">Create your Profile</h2>
-                <p id="profile-description">Your Profile is your signed identity for People and Chat.</p>
-              </div>
-              <form id="profile-form" class="profile-form">
-                <label for="profile-name">Display name</label>
-                <input id="profile-name" type="text" maxlength="32" autocomplete="nickname" placeholder="Your name">
-                <button id="profile-submit" type="submit">Create Profile</button>
-              </form>
-              <div id="profile-id" class="profile-id" hidden>
-                <h3>Your DID</h3>
-                <code id="profile-id-value"></code>
-                <button id="profile-id-copy" type="button">Copy</button>
-                <p>Share it so people can add you. It doesn't let anyone read your messages.</p>
-              </div>
-            </section>
-            <form id="add-contact-form" class="profile-card add-contact-form" hidden>
+            <form id="add-contact-form" class="people-form" hidden>
               <label for="add-contact-id">Add by DID</label>
-              <input id="add-contact-id" type="text" placeholder="Paste a DID" autocomplete="off" autocapitalize="none" spellcheck="false" required>
-              <button id="add-contact-submit" type="submit">Send request</button>
+              <div class="people-field-row">
+                <input id="add-contact-id" type="text" placeholder="Paste a DID" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+                <button id="add-contact-submit" type="submit">Send request</button>
+              </div>
               <p id="add-contact-result" role="status"></p>
               <button id="add-contact-inbox" type="button" data-action="open-inbox" hidden>Open Inbox</button>
             </form>
-            <div class="people-section-head">
-              <h3 id="people-list-title">Contacts</h3>
-              <span id="people-count" class="people-section-count" aria-live="polite">0 contacts</span>
+            <div id="people-requests" class="people-requests" hidden>
+              <p id="people-requests-count"></p>
+              <button type="button" data-action="open-inbox">Open Inbox</button>
             </div>
-            <div id="people-list" class="people-list"></div>
+            <div class="people-list-section">
+              <div class="people-section-head">
+                <h2>Contacts</h2>
+                <span id="people-count" class="people-section-count" aria-live="polite">0</span>
+              </div>
+              <div id="people-list" class="people-list"></div>
+            </div>
           </section>
 
-          <section id="discovery" class="people-section" aria-label="Discovery" hidden>
-            <div class="discovery-header">
-              <div>
-                <p>Choose whether other people can find you in Discovery. Anyone with your DID can send a contact request.</p>
+          <section id="profile" class="people-section" aria-label="Profile" hidden>
+            <form id="profile-form" class="people-form">
+              <h2 id="profile-title" hidden></h2>
+              <p id="profile-description" hidden></p>
+              <label for="profile-name">Display name</label>
+              <div class="people-field-row">
+                <input id="profile-name" type="text" maxlength="32" autocomplete="nickname" placeholder="Your name">
+                <button id="profile-submit" type="submit">Create Profile</button>
               </div>
-              <div class="discovery-actions">
+            </form>
+            <div id="profile-id" class="people-form" hidden>
+              <span class="people-label">Your DID</span>
+              <div class="people-field-row">
+                <code id="profile-id-value"></code>
+                <button id="profile-id-copy" type="button">Copy</button>
+              </div>
+            </div>
+          </section>
+
+          <section id="discovery" class="people-section" aria-label="Public" hidden>
+            <div class="public-head">
+              <p id="discovery-status"></p>
+              <div class="public-actions">
                 <button id="discovery-toggle" type="button" data-action="discovery-toggle">Turn On</button>
                 <button id="discovery-refresh" type="button" data-action="discovery-refresh">Refresh</button>
               </div>
             </div>
-            <section class="profile-card" aria-labelledby="discovery-status-title">
-              <div>
-                <h3 id="discovery-status-title">Status</h3>
-                <p id="discovery-status"></p>
+            <div id="discovery-people" class="people-list-section" hidden>
+              <div class="people-section-head">
+                <h2>Public now</h2>
+                <span id="discovery-visible-count" class="people-section-count" aria-live="polite">0</span>
               </div>
-            </section>
-            <div class="discovery-grid">
-              <section class="people-list-section" aria-labelledby="discovery-visible-title">
-                <div class="people-section-head">
-                  <h3 id="discovery-visible-title">Visible people</h3>
-                  <span id="discovery-visible-count" class="people-section-count" aria-live="polite">0 visible</span>
-                </div>
-                <div id="discovery-list" class="people-list"></div>
-              </section>
-              <section class="people-list-section" aria-labelledby="discovery-requests-title">
-                <div class="people-section-head">
-                  <h3 id="discovery-requests-title">Requests</h3>
-                  <span id="discovery-requests-count" class="people-section-count" aria-live="polite">0 requests</span>
-                </div>
-                <div id="discovery-requests-list" class="people-list"></div>
-              </section>
+              <div id="discovery-list" class="people-list"></div>
             </div>
           </section>
         </div>
@@ -109,6 +102,6 @@
     </section>
   </main>
 
-  <script type="module" src="./people.js?v=people-20260805a"></script>
+  <script type="module" src="./people.js?v=people-20261028a"></script>
 </body>
 </html>

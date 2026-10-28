@@ -58,9 +58,9 @@ function discoverySummary({
   status = configured ? (enabled ? "visible" : "off") : "unconfigured",
   statusMessage = configured
     ? (enabled
-      ? "Discovery is on. Visibility lasts up to ten minutes, and both people must be visible at the same time."
-      : "Discovery is off.")
-    : "Discovery is unavailable.",
+      ? "Public is on for up to ten minutes."
+      : "Public is off. Turn it on for ten minutes to see who else is public.")
+    : "Public isn’t available on this Home.",
   discoveredPeers = [],
   pendingRequestCount = 0,
   remainingSeconds = null,
@@ -145,13 +145,14 @@ function setupEnvironment(name, replies) {
     ["profile-submit", new FakeElement()],
     ["people-list", new FakeElement()],
     ["discovery-list", new FakeElement()],
-    ["discovery-requests-list", new FakeElement()],
+    ["discovery-people", new FakeElement()],
+    ["people-requests", new FakeElement()],
+    ["people-requests-count", new FakeElement()],
     ["discovery-status", new FakeElement()],
     ["discovery-toggle", new FakeElement()],
     ["discovery-refresh", new FakeElement()],
     ["people-count", new FakeElement()],
     ["discovery-visible-count", new FakeElement()],
-    ["discovery-requests-count", new FakeElement()],
     ["people-page-title", new FakeElement()],
   ]);
   for (const id of ["profile-id", "profile-id-value", "profile-id-copy", "add-contact-form", "add-contact-id", "add-contact-submit", "add-contact-result", "add-contact-inbox"]) nodes.set(id, new FakeElement());
@@ -396,8 +397,9 @@ async function runScenario(name) {
   if (name === "request_delivery_detail") {
     const detail = "Contact requests can't be delivered right now.";
     const contacts = [
-      { contact_id: "contact:waiting", display_name: "Name not known yet", relationship: "requested", delivery_detail: detail,
+      { contact_id: "contact:waiting", display_name: "", relationship: "requested", delivery_detail: detail,
         remote_profile_did: "did:key:z6Mka1b2c3" },
+      { contact_id: "contact:nameless", display_name: "", relationship: "connected" },
       { contact_id: "contact:normal", display_name: "Alma", relationship: "requested" },
       { contact_id: "contact:connected", display_name: "Bea", relationship: "connected", delivery_detail: detail },
       { contact_id: "contact:escaped", display_name: "Cy", relationship: "requested", delivery_detail: '<script>alert("fixture")</script>' },
@@ -407,11 +409,11 @@ async function runScenario(name) {
     await settle();
     const markup = environment.nodes.get("people-list").innerHTML;
     const cards = markup.match(/<article[\s\S]*?<\/article>/g);
-    assert.equal(cards.length, 4);
+    assert.equal(cards.length, 4, "Only a waiting request may lack a name");
     assert.ok(cards[0].includes("Contact requests can&#039;t be delivered right now."), "Requested row lost its delivery detail");
-    assert.ok(cards[0].includes("Request sent"));
-    assert.match(cards[0], />Name not known yet</, "Unknown rows use the name supplied by Runtime");
-    assert.doesNotMatch(cards[0], /a1b2c3|…/, "Unknown rows must ignore unpublished DID fields");
+    assert.match(cards[0], /<h4>Request sent<\/h4>/, "A waiting request without a name says Request sent");
+    assert.equal((cards[0].match(/Request sent/g) || []).length, 1, "Request sent must not repeat as a detail");
+    assert.doesNotMatch(cards[0], /a1b2c3|…|not known/, "Unknown rows must ignore unpublished DID fields");
     assert.ok(cards[1].includes("Request sent"));
     assert.ok(!cards[1].includes("delivered"), "Normal requested row invented a delivery failure");
     assert.ok(!cards[2].includes("delivered"), "Delivery detail belongs only to requested rows");
@@ -423,7 +425,7 @@ async function runScenario(name) {
     const ready = () => response(200, {
       profile_id: "did:key:zLocalProfile",
       identity: { profile: { display_name: "Local" }, profile_readiness: { schema: "elastos.profile.readiness/v1", status: "ready" } },
-      people: { contacts: [{ contact_id: "contact:unknown", display_name: "Name not known yet", relationship: "requested" }] },
+      people: { contacts: [{ contact_id: "contact:unknown", display_name: "", relationship: "requested" }] },
       discovery: discoverySummary({ configured: true, enabled: false }),
     });
     const environment = setupEnvironment(name, [ready()]);
@@ -432,7 +434,7 @@ async function runScenario(name) {
     const node = (id) => environment.nodes.get(id);
     assert.equal(node("profile-id-value").textContent, "did:key:zLocalProfile");
     assert.equal(node("profile-id").hidden, false);
-    assert.match(node("people-list").innerHTML, /Name not known yet/);
+    assert.match(node("people-list").innerHTML, /<h4>Request sent<\/h4>/);
     await node("profile-id-copy").listeners.get("click")();
     await settle();
     assert.deepEqual(environment.copies, [{ text: "did:key:zLocalProfile", purpose: "profile.id" }]);
@@ -630,14 +632,14 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Discovery is off.",
+        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
         discoveredPeers: [],
       }),
       summary("Runtime Name", discoverySummary({
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Discovery is off.",
+        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
         discoveredPeers: [],
       }), {
         profile: { display_name: "Mac Profile" },
@@ -685,13 +687,15 @@ async function runScenario(name) {
     assert.equal(environment.nodes.get("profile-submit").textContent, "Create Profile");
     assert.equal(
       environment.nodes.get("profile-description").textContent,
-      "Confirm the name people will see in People and Chat. Discovery stays off until you enable it.",
+      "Choose the name people see. Public stays off until you turn it on.",
     );
+    assert.equal(environment.nodes.get("profile-title").hidden, false);
+    assert.equal(environment.nodes.get("profile-description").hidden, false);
     assert.doesNotMatch(environment.nodes.get("people-list").innerHTML, /Person/);
     assert.doesNotMatch(environment.nodes.get("people-list").innerHTML, /Stale Profile/);
     assert.doesNotMatch(environment.nodes.get("people-list").innerHTML, /Missing contact id/);
     assert.doesNotMatch(environment.nodes.get("people-list").innerHTML, /person-card/);
-    assert.match(environment.nodes.get("people-list").innerHTML, /Accepted contacts appear here/);
+    assert.equal(environment.nodes.get("people-list").innerHTML, '<p class="empty-state">No contacts yet.</p>');
     assert.match(environment.nodes.get("discovery-list").innerHTML, /ESPFix/);
     // Only the person with no relationship yet is offered Add contact.
     const discoveryCards = environment.nodes.get("discovery-list").innerHTML.split("<article").slice(1);
@@ -705,22 +709,18 @@ async function runScenario(name) {
       [
         ["ESPFix", "espfix", true],
         ["Already Added", "Contact", false],
-        ["Asked Already", "Contact request sent", false],
-        ["Asking Me", "Wants to add you as a contact", false],
+        ["Asked Already", "Request sent", false],
+        ["Asking Me", "Wants to add you", false],
       ],
     );
     assert.doesNotMatch(environment.nodes.get("discovery-list").innerHTML, />Request</);
-    assert.match(environment.nodes.get("discovery-requests-list").innerHTML, /Open Inbox/);
-    assert.match(environment.nodes.get("discovery-requests-list").innerHTML, /for your Profile are decided in Inbox/);
-    assert.doesNotMatch(environment.nodes.get("discovery-requests-list").innerHTML, /Accept|Decline/);
+    // Requests to you are pointed to from People and answered in Inbox.
+    assert.equal(environment.nodes.get("people-requests").hidden, false);
+    assert.equal(environment.nodes.get("people-requests-count").textContent, "1 contact request waiting.");
     assert.doesNotMatch(environment.nodes.get("discovery-list").innerHTML, /must-not-render/);
     assertNoDiscoveryFallbacks(environment.nodes.get("discovery-list").innerHTML, "configured discovery list");
-    assertNoDiscoveryFallbacks(
-      environment.nodes.get("discovery-requests-list").innerHTML,
-      "configured discovery requests",
-    );
-    assert.match(environment.nodes.get("discovery-status").textContent, /ten minutes/);
-    assert.match(environment.nodes.get("discovery-status").textContent, /same time/);
+    assert.equal(environment.nodes.get("discovery-status").textContent, "Public is on for up to ten minutes.");
+    assert.equal(environment.nodes.get("discovery-people").hidden, false);
     assertNoRawIdentityLeak(environment.nodes.get("discovery-status").textContent, "configured discovery status");
 
     await triggerProfileInput(environment, "Typing My Name");
@@ -749,9 +749,11 @@ async function runScenario(name) {
     assert.equal(environment.timers.size, 0, "manual Refresh must only wake Runtime sync");
     assert.equal(environment.nodes.get("profile-name").value, "Typing My Name");
     assert.equal(environment.nodes.get("profile-name").placeholder, "Your name");
-    assert.equal(environment.nodes.get("profile-title").textContent, "My Profile");
+    // A saved Profile shows no heading or explanation of its own.
+    assert.equal(environment.nodes.get("profile-title").hidden, true);
+    assert.equal(environment.nodes.get("profile-description").hidden, true);
+    assert.equal(environment.nodes.get("profile-description").textContent, "");
     assert.equal(environment.nodes.get("profile-submit").textContent, "Save");
-    assert.match(environment.nodes.get("profile-description").textContent, /Shown to people/);
     assert.match(environment.nodes.get("people-list").innerHTML, /Mac/);
     assert.match(environment.nodes.get("people-list").innerHTML, />Message</);
     assert.match(environment.nodes.get("people-list").innerHTML, /data-conversation-id="direct:opaque:remote"/);
@@ -760,13 +762,9 @@ async function runScenario(name) {
     assert.match(environment.nodes.get("people-list").innerHTML, /No selector/);
     assert.doesNotMatch(environment.nodes.get("people-list").innerHTML, /Missing contact id/);
     assert.doesNotMatch(environment.nodes.get("people-list").innerHTML, /Stale Profile/);
-    assert.match(environment.nodes.get("discovery-list").innerHTML, /No one visible right now/);
-    assert.match(environment.nodes.get("discovery-requests-list").innerHTML, /No requests/);
-    assertNoDiscoveryFallbacks(environment.nodes.get("discovery-list").innerHTML, "refreshed discovery list");
-    assertNoDiscoveryFallbacks(
-      environment.nodes.get("discovery-requests-list").innerHTML,
-      "refreshed discovery requests",
-    );
+    assert.equal(environment.nodes.get("discovery-list").innerHTML, '<p class="empty-state">No one else is public right now.</p>');
+    assert.equal(environment.nodes.get("people-requests").hidden, true);
+    assert.equal(environment.nodes.get("people-status").textContent, "", "Refresh must not flash a status line");
 
     const summaryCallsBeforeMenuRefresh = environment.calls.filter(
       ({ path }) => path === "/api/apps/people/summary",
@@ -827,7 +825,7 @@ async function runScenario(name) {
     const toggleCalls = environment.calls.filter(({ path }) => path === "/api/apps/people/discovery");
     assert.equal(toggleCalls.length, 1);
     assert.equal(JSON.parse(toggleCalls[0].options.body).enabled, false);
-    assert.match(environment.nodes.get("discovery-status").textContent, /Discovery is off/);
+    assert.match(environment.nodes.get("discovery-status").textContent, /Public is off/);
 
     await triggerAction(environment, "discovery-toggle", { enabled: "false" });
     assert.equal(toggleCalls.length + 1, environment.calls.filter(({ path }) => path === "/api/apps/people/discovery").length);
@@ -897,7 +895,7 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Discovery is off.",
+        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
       }), {
         profile: { display_name: "Ready Profile" },
       }, "ready"),
@@ -905,7 +903,7 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off_pending_expiry",
-        statusMessage: "Discovery is off on this Home. It stopped advertising locally, but may remain visible for another 600 seconds.",
+        statusMessage: "Public is off. Others may still see you for 600 more seconds.",
         remoteVisibilityMayRemainUntil: 700,
         remoteVisibilityRemainingSeconds: 600,
       }),
@@ -913,7 +911,7 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off_pending_expiry",
-        statusMessage: "Discovery is off on this Home. It stopped advertising locally, but may remain visible for another 600 seconds.",
+        statusMessage: "Public is off. Others may still see you for 600 more seconds.",
         remoteVisibilityMayRemainUntil: 700,
         remoteVisibilityRemainingSeconds: 600,
       }), {
@@ -923,13 +921,13 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Discovery is off.",
+        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
       }),
       summary("Runtime Name", discoverySummary({
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Discovery is off.",
+        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
       }), {
         profile: { display_name: "Ready Profile" },
       }, "ready"),
@@ -937,13 +935,13 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Discovery is off.",
+        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
       }),
       summary("Runtime Name", discoverySummary({
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Discovery is off.",
+        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
       }), {
         profile: { display_name: "Ready Profile" },
       }, "ready"),
@@ -951,29 +949,24 @@ async function runScenario(name) {
     await loadPeople();
     await settle();
 
-    assert.equal(environment.nodes.get("discovery-status").textContent, "Discovery is off.");
-    assert.match(
-      environment.nodes.get("discovery-list").innerHTML,
-      /Turn Discovery on when you want a ten-minute visibility window/,
-    );
+    // Off: the status line explains; no empty list shows under it.
+    const off = "Public is off. Turn it on for ten minutes to see who else is public.";
+    const assertOff = () => {
+      assert.equal(environment.nodes.get("discovery-status").textContent, off);
+      assert.equal(environment.nodes.get("discovery-people").hidden, true);
+      assert.equal(environment.nodes.get("discovery-list").innerHTML, "");
+    };
+    assertOff();
 
     await triggerAction(environment, "discovery-refresh");
-    assert.match(environment.nodes.get("discovery-status").textContent, /another 600 seconds/);
-    assert.match(environment.nodes.get("discovery-list").innerHTML, /Visibility is expiring/);
+    assert.equal(environment.nodes.get("discovery-status").textContent, "Public is off. Others may still see you for 600 more seconds.");
+    assert.equal(environment.nodes.get("discovery-people").hidden, true);
 
     await triggerAction(environment, "discovery-refresh");
-    assert.equal(environment.nodes.get("discovery-status").textContent, "Discovery is off.");
-    assert.match(
-      environment.nodes.get("discovery-list").innerHTML,
-      /Turn Discovery on when you want a ten-minute visibility window/,
-    );
+    assertOff();
 
     await triggerAction(environment, "discovery-refresh");
-    assert.equal(environment.nodes.get("discovery-status").textContent, "Discovery is off.");
-    assert.match(
-      environment.nodes.get("discovery-list").innerHTML,
-      /Turn Discovery on when you want a ten-minute visibility window/,
-    );
+    assertOff();
     assertNoRawIdentityLeak(environment.nodes.get("discovery-status").textContent, "off discovery status");
     return;
   }
@@ -984,7 +977,7 @@ async function runScenario(name) {
         configured: true,
         enabled: false,
         status: "off",
-        statusMessage: "Discovery is off.",
+        statusMessage: "Public is off. Turn it on for ten minutes to see who else is public.",
       }), {
         profile: { display_name: "Ready Profile" },
       }, "ready"),
@@ -992,11 +985,9 @@ async function runScenario(name) {
     await loadPeople();
     await settle();
 
-    assert.equal(environment.nodes.get("discovery-status").textContent, "Discovery is off.");
-    assert.match(
-      environment.nodes.get("discovery-list").innerHTML,
-      /Turn Discovery on when you want a ten-minute visibility window/,
-    );
+    assert.equal(environment.nodes.get("discovery-status").textContent,
+      "Public is off. Turn it on for ten minutes to see who else is public.");
+    assert.equal(environment.nodes.get("discovery-people").hidden, true);
     assertNoRawIdentityLeak(environment.nodes.get("discovery-status").textContent, "reload off discovery status");
     return;
   }
@@ -1060,7 +1051,7 @@ async function runScenario(name) {
 
     await triggerProfileSubmit(environment);
     assert.equal(environment.nodes.get("profile-form").dataset.profileState, "saved");
-    assert.equal(environment.nodes.get("profile-title").textContent, "My Profile");
+    assert.equal(environment.nodes.get("profile-title").hidden, true);
     assert.equal(environment.nodes.get("profile-name").value, "Recovered Profile");
     assert.equal(environment.replies.length, 0);
     assertRequestAuthority(environment);
@@ -1074,8 +1065,9 @@ async function runScenario(name) {
   await loadPeople();
   await settle();
   assert.equal(environment.timers.size, 0);
-  assert.match(environment.nodes.get("discovery-list").innerHTML, /Discovery unavailable/);
-  assert.match(environment.nodes.get("discovery-requests-list").innerHTML, /Discovery requests are unavailable/);
+  assert.equal(environment.nodes.get("discovery-status").textContent, "Public isn’t available on this Home.");
+  assert.equal(environment.nodes.get("discovery-people").hidden, true);
+  assert.equal(environment.nodes.get("discovery-toggle").hidden, true);
   assert.equal(environment.clearCount(), 0);
   assert.equal(environment.replies.length, 0);
   assertRequestAuthority(environment);
@@ -1087,7 +1079,6 @@ if (!scenario) {
     new URL("../capsules/people/browser/people.js", import.meta.url),
     "utf8",
   );
-  const peopleHtml = readFileSync("capsules/people/browser/index.html", "utf8");
   assert.doesNotMatch(peopleUi, /hasVerifiedContactDisplayName/);
   assert.doesNotMatch(peopleUi, /displayName\(contact, "Person"\)/);
   assert.doesNotMatch(peopleUi, /\|\| readText\(identity\?\.profile_setup_display_name\)/);
@@ -1100,9 +1091,6 @@ if (!scenario) {
   assert.match(peopleUi, /Add contact/);
   assert.match(peopleUi, /data-conversation-id/);
   assert.doesNotMatch(peopleUi, /data-contact-route|contact\?\.route|new URL\(route/);
-  assert.match(peopleHtml, /id="profile-title">Create your Profile/);
-  assert.match(peopleHtml, /id="profile-description">Your Profile is your signed identity for People and Chat\./);
-  assert.match(peopleHtml, /id="profile-submit" type="submit">Create Profile/);
   for (const childScenario of [
     ...didLaunchValues.map((_, index) => `did_launch_${index}`),
     "did_navigation",

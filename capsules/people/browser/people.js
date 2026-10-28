@@ -17,14 +17,15 @@ const addContactSubmit = document.getElementById("add-contact-submit");
 const addContactResult = document.getElementById("add-contact-result");
 const addContactInbox = document.getElementById("add-contact-inbox");
 const peopleList = document.getElementById("people-list");
+const peopleRequests = document.getElementById("people-requests");
+const peopleRequestsCount = document.getElementById("people-requests-count");
+const discoveryPeople = document.getElementById("discovery-people");
 const discoveryList = document.getElementById("discovery-list");
-const discoveryRequestsList = document.getElementById("discovery-requests-list");
 const discoveryStatusNode = document.getElementById("discovery-status");
 const discoveryToggleButton = document.getElementById("discovery-toggle");
 const discoveryRefreshButton = document.getElementById("discovery-refresh");
 const peopleCountNode = document.getElementById("people-count");
 const discoveryVisibleCountNode = document.getElementById("discovery-visible-count");
-const discoveryRequestsCountNode = document.getElementById("discovery-requests-count");
 const pageTitle = document.querySelector(".people-page-title");
 const launchParams = new URLSearchParams(window.location.search);
 const homeToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
@@ -32,7 +33,8 @@ const homeParentOrigin = launchParams.get("home_origin") || "";
 const DISCOVERY_SCHEMA = "elastos.people.discovery/v1";
 const SECTION_TITLES = {
   people: "People",
-  discovery: "Discovery",
+  profile: "Profile",
+  discovery: "Public",
 };
 
 const homeClipboard = createHomeClipboardClient({
@@ -48,6 +50,8 @@ let profileDraftValue = "";
 let currentContacts = [];
 let pendingRemoveId = "";
 let removingContactId = "";
+let currentSection = "";
+let sectionChosen = false;
 
 announceReady();
 
@@ -73,6 +77,7 @@ function prefillContactFromLaunch() {
   const did = launchParams.get("did");
   if (!localProfileId || sendingContact || !addContactInput || !did || did !== did.trim()
       || !/^did:key:z[1-9A-HJ-NP-Za-km-z]+$/.test(did)) return;
+  sectionChosen = true;
   activateSection("people");
   addContactInput.value = did;
   addContactInput.scrollIntoView({ block: "center" });
@@ -113,6 +118,7 @@ function announceReady() {
 function bindNavigation() {
   for (const button of document.querySelectorAll("[data-section-target]")) {
     button.addEventListener("click", () => {
+      sectionChosen = true;
       activateSection(readText(button.dataset.sectionTarget));
     });
   }
@@ -120,7 +126,8 @@ function bindNavigation() {
 }
 
 // The sidebar reads as tabs, so it behaves as tabs: one section at a time,
-// with the page title naming the one you are looking at.
+// with the page title naming the one you are looking at. A status line
+// belongs to the page it came from.
 function activateSection(targetId) {
   if (!SECTION_TITLES[targetId]) {
     return;
@@ -140,6 +147,10 @@ function activateSection(targetId) {
   if (pageTitle) {
     pageTitle.textContent = SECTION_TITLES[targetId];
   }
+  if (currentSection && currentSection !== targetId) {
+    showStatus("");
+  }
+  currentSection = targetId;
 }
 
 function bindActions() {
@@ -251,32 +262,21 @@ async function handleAction(button) {
   }
   if (action === "discovery-toggle") {
     const enabled = button.dataset.enabled === "true";
-    await mutateDiscovery(
-      "/api/apps/people/discovery",
-      { enabled: !enabled },
-      !enabled ? "Discovery is on." : "Discovery is off.",
-      button,
-    );
+    await mutateDiscovery("/api/apps/people/discovery", { enabled: !enabled }, button);
     return;
   }
   if (action === "discovery-refresh") {
-    await mutateDiscovery(
-      "/api/apps/people/discovery/refresh",
-      {},
-      "Refresh requested.",
-      button,
-    );
+    await mutateDiscovery("/api/apps/people/discovery/refresh", {}, button);
     return;
   }
   if (action === "discovery-request") {
     const advertisementId = readText(button.dataset.advertisementId);
     if (!advertisementId) {
-      throw new Error("Discovery person is unavailable.");
+      throw new Error("This person is no longer public.");
     }
     await mutateDiscovery(
       "/api/apps/people/discovery/requests",
       { advertisement_id: advertisementId },
-      "Contact request queued.",
       button,
     );
     return;
@@ -316,6 +316,12 @@ function renderSummary(summary) {
   renderProfileId(summary?.profile_id);
   renderPeople(people);
   renderDiscovery(summary?.discovery);
+  // Without a Profile there is nothing to do on People yet, so the first
+  // load opens Profile; after that the person picks the page.
+  if (!sectionChosen) {
+    sectionChosen = true;
+    activateSection(profileForm?.dataset.profileState === "saved" ? "people" : "profile");
+  }
 }
 
 function renderProfileId(profileId) {
@@ -333,7 +339,7 @@ async function sendContactRequest() {
   addContactSubmit.disabled = true;
   addContactInput.disabled = true;
   addContactInbox.hidden = true;
-  addContactResult.textContent = "Sending request…";
+  addContactResult.textContent = "";
   try {
     const result = await fetchJson("/api/apps/people/contacts/request", {
       method: "POST", body: JSON.stringify({ profile_id: profileId }),
@@ -379,17 +385,21 @@ function renderProfile(identity) {
     profileInput.value = hasProfile ? displayName : profileDraftValue;
     profileInput.placeholder = "Your name";
   }
+  // A saved Profile needs no heading or explanation: the page title says
+  // Profile and the field holds the name.
   if (profileTitle) {
     profileTitle.textContent = hasProfile
-      ? "My Profile"
+      ? ""
       : (unavailable ? "Profile unavailable" : "Create your Profile");
+    profileTitle.hidden = hasProfile;
   }
   if (profileDescription) {
     profileDescription.textContent = hasProfile
-      ? "Shown to people you connect with."
+      ? ""
       : (unavailable
         ? "Profile could not be verified. Use System Recovery before continuing."
-        : "Confirm the name people will see in People and Chat. Discovery stays off until you enable it.");
+        : "Choose the name people see. Public stays off until you turn it on.");
+    profileDescription.hidden = hasProfile;
   }
   if (profileSubmit) {
     profileSubmit.textContent = hasProfile
@@ -409,24 +419,20 @@ function renderPeople(people) {
     pendingRemoveId = "";
   }
   if (peopleCountNode) {
-    peopleCountNode.textContent = `${contacts.length} contact${contacts.length === 1 ? "" : "s"}`;
+    peopleCountNode.textContent = String(contacts.length);
   }
   peopleList.innerHTML = contacts.length
     ? contacts.map(contactMarkup).join("")
-    : emptyMarkup("No contacts yet", "Accepted contacts appear here.");
+    : emptyMarkup("No contacts yet.");
 }
 
 function renderDiscovery(discovery) {
   const safeDiscovery = normalizeDiscoverySummary(discovery);
   const configured = safeDiscovery.configured;
   const enabled = safeDiscovery.enabled;
+  const peers = safeDiscovery.discoveredPeers;
   if (discoveryVisibleCountNode) {
-    discoveryVisibleCountNode.textContent =
-      `${safeDiscovery.discoveredPeers.length} visible`;
-  }
-  if (discoveryRequestsCountNode) {
-    discoveryRequestsCountNode.textContent =
-      `${safeDiscovery.pendingRequestCount} request${safeDiscovery.pendingRequestCount === 1 ? "" : "s"}`;
+    discoveryVisibleCountNode.textContent = String(peers.length);
   }
   if (discoveryStatusNode) {
     discoveryStatusNode.textContent = safeDiscovery.statusMessage;
@@ -441,25 +447,25 @@ function renderDiscovery(discovery) {
     discoveryRefreshButton.hidden = !configured;
     discoveryRefreshButton.disabled = !configured || safeDiscovery.status === "community_left";
   }
-
-  discoveryList.innerHTML = safeDiscovery.discoveredPeers.length
-    ? safeDiscovery.discoveredPeers.map(discoveryPeerMarkup).join("")
-    : emptyMarkup(
-        safeDiscovery.emptyTitle,
-        safeDiscovery.emptyCopy,
-      );
-  discoveryRequestsList.innerHTML = safeDiscovery.pendingRequestCount > 0
-    ? personCard({
-      name: `${safeDiscovery.pendingRequestCount} request${safeDiscovery.pendingRequestCount === 1 ? "" : "s"} waiting`,
-      details: "<span>Contact requests for your Profile are decided in Inbox.</span>",
-      actions: '<button type="button" data-action="open-inbox">Open Inbox</button>',
-    })
-    : emptyMarkup(
-        "No requests",
-        configured
-          ? "Contact requests for your Profile are decided in Inbox."
-          : "Discovery requests are unavailable until collaboration is configured.",
-      );
+  // The list shows while you are public; otherwise the status line says why
+  // there is no one to show.
+  const showList = peers.length > 0 || safeDiscovery.status === "visible";
+  if (discoveryPeople) {
+    discoveryPeople.hidden = !showList;
+  }
+  discoveryList.innerHTML = peers.length
+    ? peers.map(discoveryPeerMarkup).join("")
+    : (showList ? emptyMarkup("No one else is public right now.") : "");
+  // Requests to you are answered in Inbox; People only points there.
+  const requests = safeDiscovery.pendingRequestCount;
+  if (peopleRequests) {
+    peopleRequests.hidden = requests === 0;
+  }
+  if (peopleRequestsCount) {
+    peopleRequestsCount.textContent = requests
+      ? `${requests} contact request${requests === 1 ? "" : "s"} waiting.`
+      : "";
+  }
 }
 
 function normalizeDiscoverySummary(discovery) {
@@ -468,103 +474,53 @@ function normalizeDiscoverySummary(discovery) {
       configured: false,
       enabled: false,
       status: "unavailable",
-      statusMessage: "Discovery is unavailable.",
+      statusMessage: "Public isn’t available here yet.",
       discoveredPeers: [],
       pendingRequestCount: 0,
-      emptyTitle: "Discovery unavailable",
-      emptyCopy: "Discovery isn’t available here yet.",
     };
   }
-  const configured = discovery.configured;
-  const enabled = discovery.enabled === true;
   const status = readText(discovery.status);
-  const remainingSeconds = readPositiveInteger(discovery.remaining_seconds);
-  const remoteVisibilityRemainingSeconds =
-    readPositiveInteger(discovery.remote_visibility_remaining_seconds);
   return {
-    configured,
-    enabled,
+    configured: discovery.configured,
+    enabled: discovery.enabled === true,
     status,
     statusMessage: normalizeDiscoveryStatusMessage(
       status,
       readText(discovery.status_message),
-      remainingSeconds,
-      remoteVisibilityRemainingSeconds,
+      readPositiveInteger(discovery.remaining_seconds),
+      readPositiveInteger(discovery.remote_visibility_remaining_seconds),
     ),
     discoveredPeers: arrayValue(discovery.discovered_peers).filter((peer) => {
       return peer && typeof peer === "object" && readText(peer.display_name) && readText(peer.advertisement_id);
     }),
     pendingRequestCount: Math.max(0, Number(discovery.request_count || 0)),
-    ...discoveryEmptyState(status, configured, enabled),
   };
 }
 
 function normalizeDiscoveryStatusMessage(status, runtimeMessage, remainingSeconds, remoteVisibilityRemainingSeconds) {
   if (status === "visible") {
     if (remainingSeconds === null) {
-      return "Discovery is on. Visibility lasts up to ten minutes, and both people must be visible at the same time.";
+      return "Public is on for up to ten minutes.";
     }
-    return `Discovery is on. Visibility lasts up to ten minutes. This window has ${remainingSeconds} seconds left, and both people must be visible at the same time.`;
+    const minutes = Math.max(1, Math.ceil(remainingSeconds / 60));
+    return `Public is on. ${minutes} minute${minutes === 1 ? "" : "s"} left.`;
   }
   if (status === "off_pending_expiry") {
     if (runtimeMessage) {
       return runtimeMessage;
     }
     if (remoteVisibilityRemainingSeconds !== null) {
-      return `Discovery is off on this Home. It stopped advertising locally, but may remain visible for another ${remoteVisibilityRemainingSeconds} seconds.`;
+      return `Public is off. Others may still see you for ${remoteVisibilityRemainingSeconds} more seconds.`;
     }
-    return "Discovery is off on this Home. It stopped advertising locally, but may remain visible for a short time.";
+    return "Public is off. Others may still see you for a short time.";
   }
   if (status === "off") {
-    return "Discovery is off.";
+    return "Public is off. Turn it on for ten minutes to see who else is public.";
   }
   if (status === "connecting") {
-    return "Discovery is connecting. People who are visible appear here in a few seconds.";
+    return "Public is on. Looking for people.";
   }
-  return runtimeMessage || "Discovery is unavailable.";
-}
-
-function discoveryEmptyState(status, configured, enabled) {
-  if (!configured) {
-    return {
-      emptyTitle: "Discovery unavailable",
-      emptyCopy: "Discovery is not configured on this Home.",
-    };
-  }
-  if (status === "visible") {
-    return {
-      emptyTitle: "No one visible right now",
-      emptyCopy: "People appear here only while your visibility windows overlap.",
-    };
-  }
-  if (status === "off_pending_expiry") {
-    return {
-      emptyTitle: "Visibility is expiring",
-      emptyCopy: "Your last visibility window is closing.",
-    };
-  }
-  if (status === "connecting") {
-    return {
-      emptyTitle: "Connecting…",
-      emptyCopy: "Looking for people who are visible right now.",
-    };
-  }
-  if (status === "off") {
-    return {
-      emptyTitle: "Discovery is off",
-      emptyCopy: "Turn Discovery on when you want a ten-minute visibility window.",
-    };
-  }
-  if (enabled) {
-    return {
-      emptyTitle: "Discovery unavailable",
-      emptyCopy: "Your Home will retry when Discovery is unavailable.",
-    };
-  }
-  return {
-    emptyTitle: "Discovery unavailable",
-    emptyCopy: "Discovery isn’t available here yet.",
-  };
+  return runtimeMessage || "Public isn’t available right now.";
 }
 
 /* The Runtime emits exactly these today. A state this build does not know is
@@ -605,10 +561,15 @@ function reachabilityLabel(contact) {
 
 function contactMarkup(contact) {
   const name = readText(contact?.display_name);
-  const relationship = relationshipLabel(contact?.relationship);
+  const relationship = readText(contact?.relationship);
+  // A request sent by DID before this Home holds their signed Profile has no
+  // name to show, so the row says what is known: the request is sent.
+  const unnamed = !name && relationship === "requested";
+  // Connected is the usual state and Message and Remove already say so.
+  const state = relationship === "connected" || unnamed ? "" : relationshipLabel(relationship);
   const handle = readText(contact?.handle);
-  const deliveryDetail = contact?.relationship === "requested" ? readText(contact.delivery_detail) : "";
-  const details = [relationship, deliveryDetail, reachabilityLabel(contact), handle && handle !== name ? handle : ""]
+  const deliveryDetail = relationship === "requested" ? readText(contact.delivery_detail) : "";
+  const details = [state, deliveryDetail, reachabilityLabel(contact), handle && handle !== name ? handle : ""]
     .filter(Boolean)
     .map((value) => `<span>${escapeHtml(value)}</span>`)
     .join("");
@@ -634,7 +595,8 @@ function contactMarkup(contact) {
       </div>
     </div>` : "";
   return personCard({
-    name,
+    name: unnamed ? "Request sent" : name,
+    initial: unnamed ? "" : name,
     details,
     actions: confirming ? "" : `${chat}${remove}`,
     confirmation,
@@ -642,15 +604,16 @@ function contactMarkup(contact) {
 }
 
 function isValidContact(contact) {
-  return Boolean(readText(contact?.contact_id) && readText(contact?.display_name));
+  return Boolean(readText(contact?.contact_id)
+    && (readText(contact?.display_name) || readText(contact?.relationship) === "requested"));
 }
 
-// Runtime stamps each visible person with their relationship; only someone
+// Runtime stamps each public person with their relationship; only someone
 // with none yet (`visible`) can be added.
 const DISCOVERY_RELATIONSHIP_TEXT = {
   contact: "Contact",
-  requested: "Contact request sent",
-  pending: "Wants to add you as a contact",
+  requested: "Request sent",
+  pending: "Wants to add you",
 };
 
 function discoveryPeerMarkup(person) {
@@ -659,11 +622,12 @@ function discoveryPeerMarkup(person) {
   const status = readText(person.status);
   const addable = status === "visible";
   const detail = addable
-    ? (handle && handle !== name ? handle : "Visible now")
-    : (Object.hasOwn(DISCOVERY_RELATIONSHIP_TEXT, status) ? DISCOVERY_RELATIONSHIP_TEXT[status] : "Visible now");
+    ? (handle && handle !== name ? handle : "")
+    : (Object.hasOwn(DISCOVERY_RELATIONSHIP_TEXT, status) ? DISCOVERY_RELATIONSHIP_TEXT[status] : "");
   return personCard({
     name,
-    details: `<span>${escapeHtml(detail)}</span>`,
+    initial: name,
+    details: detail ? `<span>${escapeHtml(detail)}</span>` : "",
     actions: addable
       ? `<button type="button" data-action="discovery-request" data-advertisement-id="${escapeHtml(readText(person.advertisement_id))}">Add contact</button>`
       : "",
@@ -676,17 +640,17 @@ function focusContactAction(action, contactId) {
     && button.dataset.contactId === contactId)?.focus();
 }
 
-function personCard({ name, details, actions, confirmation = "" }) {
+function personCard({ name, initial, details, actions, confirmation = "" }) {
   const displayName = readText(name);
   if (!displayName) {
     return "";
   }
   return `
     <article class="person-card${confirmation ? " is-confirming" : ""}">
-      <div class="person-avatar" aria-hidden="true">${escapeHtml(displayName.slice(0, 1).toUpperCase())}</div>
+      <div class="person-avatar" aria-hidden="true">${escapeHtml(readText(initial).slice(0, 1).toUpperCase())}</div>
       <div class="person-copy">
         <h4>${escapeHtml(displayName)}</h4>
-        <p class="person-details">${details}</p>
+        ${details ? `<p class="person-details">${details}</p>` : ""}
       </div>
       <div class="person-actions">${actions}</div>
       ${confirmation}
@@ -694,8 +658,8 @@ function personCard({ name, details, actions, confirmation = "" }) {
   `;
 }
 
-function emptyMarkup(title, copy) {
-  return `<div class="empty-state"><div><h4>${escapeHtml(title)}</h4><p>${escapeHtml(copy)}</p></div></div>`;
+function emptyMarkup(text) {
+  return `<p class="empty-state">${escapeHtml(text)}</p>`;
 }
 
 async function saveProfile() {
@@ -741,7 +705,7 @@ async function mutatePeople(path, body, message, button) {
   }
 }
 
-async function mutateDiscovery(path, body, message, button) {
+async function mutateDiscovery(path, body, button) {
   button.disabled = true;
   try {
     const discovery = await fetchJson(path, {
@@ -750,7 +714,6 @@ async function mutateDiscovery(path, body, message, button) {
     });
     renderDiscovery(discovery);
     await refreshPeople({ quiet: true });
-    showStatus(message, "ok");
   } finally {
     button.disabled = false;
   }
@@ -767,7 +730,6 @@ function openChat(conversationId) {
     query: { conversation_id: selector },
     homeToken,
   }, homeParentOrigin);
-  showStatus("Opening Chat.", "ok");
 }
 
 function setBusy(busy) {
@@ -825,9 +787,9 @@ function arrayValue(value) {
   return Array.isArray(value) ? value : [];
 }
 
+// A missing count (null) is no count, not zero seconds left.
 function readPositiveInteger(value) {
-  const number = Number(value);
-  return Number.isInteger(number) && number >= 0 ? number : null;
+  return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
 function readText(value) {

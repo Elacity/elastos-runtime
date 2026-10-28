@@ -426,7 +426,6 @@ async function peopleSnapshot(frame) {
       discoveryToggle: text(document.querySelector("#discovery-toggle")),
       contacts: cards(document.querySelector("#people-list")),
       discovered: cards(document.querySelector("#discovery-list")),
-      requests: cards(document.querySelector("#discovery-requests-list")),
       bodyText: (document.body?.innerText || "").replace(/\s+/g, " ").trim(),
     };
   });
@@ -545,7 +544,7 @@ async function completeRecoverySetup(side) {
 
 async function saveProfile(side, frame, name) {
   await frame.evaluate(() => {
-    document.querySelector('[data-section-target="people"]')?.click();
+    document.querySelector('[data-section-target="profile"]')?.click();
   });
   await frame.locator("#profile-name").waitFor({ state: "visible", timeout: 10_000 });
   await frame.locator("#profile-name").fill(name);
@@ -564,7 +563,7 @@ async function saveProfile(side, frame, name) {
 }
 
 async function enableDiscovery(side, frame) {
-  // Discovery lives behind the People sidebar's Discovery tab.
+  // Discovery lives behind the People sidebar's Public tab.
   await frame.evaluate(() => {
     document.querySelector('[data-section-target="discovery"]')?.click();
   });
