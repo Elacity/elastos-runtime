@@ -108,10 +108,15 @@ const PROFILE_REQUEST_DEVICE_INTERVAL_SECS: u64 = 5;
 /// What the Community node is known to do with Profile-contact operations.
 const PROFILE_RELAY_SUPPORT_UNKNOWN: u8 = 0;
 const PROFILE_RELAY_SUPPORTED: u8 = 1;
-/// It answers the v1 Discovery poll but not this Profile's own mailbox poll:
-/// it runs a release older than 0.8.0, so a request by DID would never be
-/// delivered.
+/// It answered the v1 Discovery poll but not this Profile's own mailbox poll
+/// twice in a row: it runs a release older than 0.8.0, so a request by DID
+/// would never be delivered.
 const PROFILE_RELAY_UNSUPPORTED: u8 = 2;
+/// The same, once so far: maybe a passing failure, so still as unknown.
+const PROFILE_RELAY_SUSPECT: u8 = 3;
+/// Before the first request by DID, the gap between the two mailbox reads
+/// that tell an older node from a passing failure.
+const PROFILE_RELAY_RECHECK_MILLIS: u64 = 500;
 const UNSUPPORTED_RELAY_OPERATION: &str = "unsupported collaboration discovery operation";
 /// A signed Profile beside a decision larger than this is refused unparsed.
 const MAX_RELAY_SIGNED_PROFILE_BYTES: usize = 64 * 1024;
@@ -1613,35 +1618,47 @@ impl CollaborationDiscoveryService {
     }
 
     /// Before the first request by DID since this Runtime started, reads this
-    /// Profile's own request mailbox once, so a Community node that refuses
-    /// the operations is known before anything is queued. After any answer
-    /// the regular passes keep the support state current. An unreachable
-    /// node leaves it unknown and the request is queued as usual.
+    /// Profile's own request mailbox, twice if the first read fails while the
+    /// node answers v1 Discovery, so a Community node that refuses the
+    /// operations is known before anything is queued. After any answer the
+    /// regular passes keep the support state current. An unreachable node
+    /// leaves it unknown and the request is queued as usual.
     pub(crate) async fn check_profile_relay_support(
         &self,
         store: &CollaborationContactStore,
         profile: &VerifiedCollaborationProfileDocument,
         now: u64,
     ) {
-        if self
-            .profile_relay_support
-            .load(std::sync::atomic::Ordering::SeqCst)
-            != PROFILE_RELAY_SUPPORT_UNKNOWN
-            || !self.community_joined()
-        {
-            return;
-        }
-        let polled = self
-            .poll_profile_mailbox(
-                store,
-                profile,
-                CollaborationDiscoveryMailboxKind::Requests,
-                now,
-            )
-            .await;
-        self.note_profile_relay_result(&polled);
-        if polled.is_err() {
-            self.note_profile_poll_refused(profile, now).await;
+        for attempt in 0..2 {
+            let support = self
+                .profile_relay_support
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if !matches!(
+                support,
+                PROFILE_RELAY_SUPPORT_UNKNOWN | PROFILE_RELAY_SUSPECT
+            ) || !self.community_joined()
+                || (attempt > 0 && support != PROFILE_RELAY_SUSPECT)
+            {
+                return;
+            }
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    PROFILE_RELAY_RECHECK_MILLIS,
+                ))
+                .await;
+            }
+            let polled = self
+                .poll_profile_mailbox(
+                    store,
+                    profile,
+                    CollaborationDiscoveryMailboxKind::Requests,
+                    now,
+                )
+                .await;
+            self.note_profile_relay_result(&polled);
+            if polled.is_err() {
+                self.note_profile_poll_refused(profile, now).await;
+            }
         }
     }
 
@@ -1658,9 +1675,9 @@ impl CollaborationDiscoveryService {
 
     /// After this Profile's own mailbox poll failed: if the same node answers
     /// the v1 Discovery poll, which every release has, it is reachable and
-    /// does not know the Profile-contact operations, so it is older than
-    /// 0.8.0. If the v1 poll fails too, the node is unreachable and nothing
-    /// is learned.
+    /// may not know the Profile-contact operations. Twice in a row says it is
+    /// older than 0.8.0; once may be a passing failure. If the v1 poll fails
+    /// too, the node is unreachable, nothing is learned and the run restarts.
     async fn note_profile_poll_refused(
         &self,
         profile: &VerifiedCollaborationProfileDocument,
@@ -1686,12 +1703,15 @@ impl CollaborationDiscoveryService {
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        if answered.is_ok() {
-            self.profile_relay_support.store(
-                PROFILE_RELAY_UNSUPPORTED,
-                std::sync::atomic::Ordering::SeqCst,
-            );
-        }
+        let support = &self.profile_relay_support;
+        let ordering = std::sync::atomic::Ordering::SeqCst;
+        let next = match (answered.is_ok(), support.load(ordering)) {
+            (true, PROFILE_RELAY_SUSPECT | PROFILE_RELAY_UNSUPPORTED) => PROFILE_RELAY_UNSUPPORTED,
+            (true, _) => PROFILE_RELAY_SUSPECT,
+            (false, PROFILE_RELAY_SUSPECT) => PROFILE_RELAY_SUPPORT_UNKNOWN,
+            (false, current) => current,
+        };
+        support.store(next, ordering);
     }
 
     /// One pass of the Profile-contact plane, run on every joined pass
@@ -6308,9 +6328,19 @@ pub(crate) mod tests {
         assert_eq!(relayed(), 0);
     }
 
-    /// A Community node older than 0.8.0: the v1 Discovery ops work, the
-    /// Profile-contact ops are unknown to it.
-    struct OlderCommunityNode(CollaborationDiscoveryRelayProvider);
+    /// A Community node whose v1 Discovery ops work while it refuses the
+    /// next `refusals` Profile-contact ops: `usize::MAX` is a node older than
+    /// 0.8.0, a small number a passing failure.
+    struct OlderCommunityNode(CollaborationDiscoveryRelayProvider, AtomicUsize);
+
+    impl OlderCommunityNode {
+        fn refusing(network: &VerifiedCollaborationNetworkProfile, refusals: usize) -> Self {
+            Self(
+                CollaborationDiscoveryRelayProvider::new(network.clone()),
+                AtomicUsize::new(refusals),
+            )
+        }
+    }
 
     #[async_trait]
     impl Provider for OlderCommunityNode {
@@ -6336,9 +6366,17 @@ pub(crate) mod tests {
             match request["op"].as_str() {
                 Some(
                     PROFILE_CONTACT_SEND_OP | PROFILE_CONTACT_POLL_OP | PROFILE_CONTACT_DECISION_OP,
-                ) => Err(ProviderError::Provider(
-                    UNSUPPORTED_RELAY_OPERATION.to_string(),
-                )),
+                ) if self
+                    .1
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok() =>
+                {
+                    Err(ProviderError::Provider(
+                        UNSUPPORTED_RELAY_OPERATION.to_string(),
+                    ))
+                }
                 _ => self.0.send_raw(request).await,
             }
         }
@@ -6353,9 +6391,10 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed = ProfileRelaySeed::start(temp.path(), &trusted).await;
         seed.registry
-            .register(Arc::new(OlderCommunityNode(
-                CollaborationDiscoveryRelayProvider::new(seed.network.clone()),
-            )) as Arc<dyn Provider>)
+            .register(
+                Arc::new(OlderCommunityNode::refusing(&seed.network, usize::MAX))
+                    as Arc<dyn Provider>,
+            )
             .await;
         let (_registry, service, store, _node) = discovery_service(
             &temp.path().join("home"),
@@ -6409,6 +6448,57 @@ pub(crate) mod tests {
                 .unwrap(),
             ProfileContactRequestOutcome::Requested
         );
+    }
+
+    /// One failed read of this Profile's mailbox while the node answers v1
+    /// Discovery may be passing: the first request is queued, not refused,
+    /// and a node refusing twice in a row on two passes is then refused.
+    #[tokio::test]
+    async fn one_failed_mailbox_read_does_not_mark_a_current_node_older() {
+        let temp = tempfile::tempdir().unwrap();
+        let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let seed = ProfileRelaySeed::start(temp.path(), &trusted).await;
+        seed.registry
+            .register(Arc::new(OlderCommunityNode::refusing(&seed.network, 1)) as Arc<dyn Provider>)
+            .await;
+        let (_registry, service, store, _node) = discovery_service(
+            &temp.path().join("home"),
+            &trusted,
+            &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
+            vec![seed.ticket.clone()],
+        )
+        .await;
+        let profile = service_profile(&service, "Alma", Some("alma"));
+        let recipient = ProfileContactParty::new(&seed.network, "Bo").did();
+        service
+            .check_profile_relay_support(&store, &profile, current_timestamp())
+            .await;
+        assert!(!service.profile_contact_delivery_unavailable());
+        assert_eq!(
+            service
+                .send_profile_contact_request(
+                    &store,
+                    &recipient,
+                    &[],
+                    &profile,
+                    current_timestamp()
+                )
+                .await
+                .unwrap(),
+            ProfileContactRequestOutcome::Requested
+        );
+
+        // The node now refuses for good: one pass is not enough, two are.
+        seed.registry
+            .register(
+                Arc::new(OlderCommunityNode::refusing(&seed.network, usize::MAX))
+                    as Arc<dyn Provider>,
+            )
+            .await;
+        let _ = service.refresh(&store, &profile, current_timestamp()).await;
+        assert!(!service.profile_contact_delivery_unavailable());
+        let _ = service.refresh(&store, &profile, current_timestamp()).await;
+        assert!(service.profile_contact_delivery_unavailable());
     }
 
     /// Another Home's device DID — a contact's, or a Community member's
