@@ -582,13 +582,13 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
         json(&body),
         serde_json::json!({
             "status": "requested",
-            "message": "Request sent. Name not known yet. They'll see it in Inbox when they next open Home.",
+            "message": "Request sent.",
         })
     );
     assert_eq!(home.outgoing_requests().len(), 2);
 
-    // People shows the waiting rows with the same names, and says when the
-    // Community node cannot deliver requests by DID.
+    // People shows the waiting rows with the same names, an unknown one with
+    // none, and says when the Community node cannot deliver requests by DID.
     let requested_rows = || async {
         let (status, summary) =
             home_test_get_json(&home.app, "/api/apps/people/summary", &token, "null").await;
@@ -613,13 +613,7 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
         .iter()
         .map(|row| row["display_name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(
-        names,
-        vec![
-            crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN,
-            "Remote"
-        ]
-    );
+    assert_eq!(names, vec!["", "Remote"]);
     assert!(rows.iter().all(|row| row.get("delivery_detail").is_none()));
     home.service.set_profile_relay_unsupported_for_test();
     for row in requested_rows().await {
@@ -634,7 +628,7 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(
         body,
-        "They may be on an older version. Ask them to update, or turn on Discovery in People on both Homes."
+        "They may be on an older version. Ask them to update, or turn on Public in People on both Homes."
     );
     assert_eq!(home.outgoing_requests().len(), 2);
 }

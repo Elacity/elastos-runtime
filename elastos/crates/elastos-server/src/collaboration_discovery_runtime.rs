@@ -317,7 +317,7 @@ impl std::error::Error for ProfileContactRequestRefusal {}
 /// Profile-contact operations: the refusal's text, and what People shows on a
 /// waiting request then. Discovery-bound requests still reach older Homes.
 pub(crate) const PROFILE_CONTACT_UNDELIVERABLE_DETAIL: &str =
-    "They may be on an older version. Ask them to update, or turn on Discovery in People on both Homes.";
+    "They may be on an older version. Ask them to update, or turn on Public in People on both Homes.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveryVisiblePerson {
@@ -6419,7 +6419,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "They may be on an older version. Ask them to update, or turn on Discovery in People on both Homes."
+            "They may be on an older version. Ask them to update, or turn on Public in People on both Homes."
         );
         assert_eq!(
             store

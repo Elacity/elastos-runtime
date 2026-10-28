@@ -38,7 +38,7 @@ const HOME_BROWSER_EXIT_LOCAL_OFFER_ID: &str = "local:provider:browser-exit";
 const HOME_BROWSER_EXIT_PEER_SERVICE_URI: &str = "elastos://peer/browser-exit";
 const HOME_REMOTE_EXIT_SERVICE_KIND: &str = "remote_exit";
 pub(super) const PROFILE_REQUIRED_DISCOVERY_MESSAGE: &str =
-    "Save your Profile before turning on Discovery";
+    "Save your Profile before turning on Public";
 const PROFILE_REQUIRED_PEOPLE_CONTACTS_MESSAGE: &str =
     "Save your Profile before using People contacts";
 const PROFILE_REQUIRED_SERVICES_MESSAGE: &str =
@@ -943,15 +943,12 @@ pub(super) fn contact_request_answer(
         (Outcome::Requested, Some(name)) => {
             format!("Request sent. {name} sees it in Inbox when they next open Home.")
         }
-        (Outcome::Requested, None) => {
-            "Request sent. Name not known yet. They'll see it in Inbox when they next open Home."
-                .to_string()
-        }
+        (Outcome::Requested, None) => "Request sent.".to_string(),
         (Outcome::AlreadyRequested, Some(name)) => {
             format!("Request sent. Waiting for {name} to accept.")
         }
         (Outcome::AlreadyRequested, None) => {
-            "Request sent. Name not known yet. Waiting for them to accept.".to_string()
+            "Request sent. Waiting for them to accept.".to_string()
         }
         (Outcome::AlreadyContact { .. }, Some(name)) => format!("{name} is already a contact."),
         (Outcome::AlreadyContact { .. }, None) => "They're already a contact.".to_string(),
@@ -1018,9 +1015,9 @@ fn configured_people_summary_from_snapshot(
             remote_profile_did: Some(requested.recipient_profile_did),
             added_at: requested.created_at,
             conversation_id: None,
-            display_name: requested.display_name.unwrap_or_else(|| {
-                crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN.to_string()
-            }),
+            // Empty while this Home holds no signed Profile for them; People
+            // then shows the row as Request sent.
+            display_name: requested.display_name.unwrap_or_default(),
             handle: requested.handle,
             relationship: "requested".to_string(),
             can_message: false,
@@ -1386,28 +1383,24 @@ fn configured_people_discovery_summary(
         let remaining = remote_visibility_remaining_seconds.expect("derived from deadline");
         (
             "off_pending_expiry",
-            format!(
-                "Discovery is off on this Home. It stopped advertising locally, but may remain visible for another {remaining} seconds while withdrawal is unavailable.",
-            ),
+            format!("Public is off. Others may still see you for {remaining} more seconds."),
         )
     } else if !status.enabled() {
-        ("off", "Discovery is off.".to_string())
+        (
+            "off",
+            "Public is off. Turn it on for ten minutes to see who else is public.".to_string(),
+        )
     } else if status.connecting() {
         (
             "connecting",
-            "Discovery is connecting. People who are visible appear here in a few seconds."
-                .to_string(),
+            "Public is on. Looking for people.".to_string(),
         )
     } else if status.available() {
-        (
-            "visible",
-            "Discovery is on. Visibility lasts up to ten minutes, and both people must be visible at the same time."
-                .to_string(),
-        )
+        ("visible", "Public is on for up to ten minutes.".to_string())
     } else {
         (
             "relay_unavailable",
-            "Discovery is temporarily unavailable. Runtime will retry.".to_string(),
+            "Public isn’t working right now. Your Home will try again.".to_string(),
         )
     };
     HomePeopleDiscoverySummary {
@@ -1436,7 +1429,7 @@ fn unconfigured_people_discovery_summary() -> HomePeopleDiscoverySummary {
         remote_visibility_may_remain_until: None,
         remote_visibility_remaining_seconds: None,
         status: "unconfigured".to_string(),
-        status_message: "Discovery isn’t available on this Home.".to_string(),
+        status_message: "Public isn’t available on this Home.".to_string(),
         discovered_count: 0,
         discovered_peers: Vec::new(),
         request_count: 0,
@@ -1656,10 +1649,7 @@ mod discovery_summary_tests {
 
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["status"], "connecting");
-        assert_eq!(
-            json["status_message"],
-            "Discovery is connecting. People who are visible appear here in a few seconds."
-        );
+        assert_eq!(json["status_message"], "Public is on. Looking for people.");
     }
 
     #[test]
@@ -1690,7 +1680,7 @@ mod discovery_summary_tests {
         assert_eq!(json["status"], "relay_unavailable");
         assert_eq!(
             json["status_message"],
-            "Discovery is temporarily unavailable. Runtime will retry."
+            "Public isn’t working right now. Your Home will try again."
         );
         assert_eq!(json["request_count"], 1);
         assert!(json.get("pending_request_count").is_none());

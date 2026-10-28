@@ -222,14 +222,10 @@ pub(crate) struct CollaborationRelationshipEvent {
     pub(crate) occurred_at: u64,
 }
 
-/// Shown where a name would be when this Home holds no signed Profile for
-/// the DID yet (a request sent to a pasted DID before any answer).
-pub(crate) const CONTACT_NAME_NOT_KNOWN: &str = "Name not known yet";
-
 /// An unexpired outgoing request with no decision yet, over both request
 /// kinds: bound to a Discovery advertisement (v1) or addressed to a Profile
 /// DID. `display_name` is `None` when this Home holds no signed Profile for
-/// the recipient; callers show `CONTACT_NAME_NOT_KNOWN`.
+/// the recipient; People then shows the row as Request sent, with no name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CollaborationOutgoingContactRequest {
     pub(crate) request_hash: String,

@@ -537,7 +537,7 @@ async fn collaboration_presence_routes_are_capsule_scoped_and_unconfigured_is_pu
     assert_eq!(heartbeat.status(), StatusCode::CONFLICT);
     assert_eq!(
         response_text(heartbeat).await,
-        "Save your Profile before turning on Discovery"
+        "Save your Profile before turning on Public"
     );
     assert_eq!(file_snapshot(dir.path()), before);
 
