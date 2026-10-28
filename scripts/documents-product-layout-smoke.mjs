@@ -78,6 +78,7 @@ function resetDocumentsFixture() {
   documents.clear();
   documents.set("doc-alpha", createDocument("doc-alpha", "Alpha", "alpha.md", "# Alpha\n\n- [ ] Check this item\n- [x] Keep this item\n\n## Notes\n\nShared notes here.", "bafyalpha"));
   documents.set("doc-beta", createDocument("doc-beta", "Beta", "beta.md", "# Beta\n\nRegular paragraph text.", null));
+  changePlainFile(folderFileBody);
   saveCalls.length = 0;
   importCalls.length = 0;
   delayNextSave = false;
@@ -126,6 +127,12 @@ const folderFile = {
   updated_at: 1_779_000_000,
 };
 const folderFileBody = "Plain text from Library.";
+// The plain file as stored now; another window may change it.
+const plainFile = { body: folderFileBody, revision: "" };
+function changePlainFile(body) {
+  plainFile.body = body;
+  plainFile.revision = createHash("sha256").update(body).digest("hex");
+}
 
 function contentType(filePath) {
   if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
@@ -317,9 +324,24 @@ function createAppServer() {
         await held.release.promise;
       }
       json(res, {
-        object: { uri: folderFile.uri, name: folderFile.name, revision: "fixture-revision", mime: "text/plain", modified_at: folderFile.updated_at },
-        data: Buffer.from(folderFileBody).toString("base64"),
+        object: { uri: folderFile.uri, name: folderFile.name, revision: plainFile.revision, mime: "text/plain", modified_at: folderFile.updated_at },
+        data: Buffer.from(plainFile.body).toString("base64"),
       });
+      return;
+    }
+    if (url.pathname === "/api/viewers/documents/library-object" && req.method === "PUT") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const payload = JSON.parse(body);
+      if (url.searchParams.get("uri") !== folderFile.uri || payload.if_revision !== plainFile.revision) {
+        // As the provider reports a stale revision (a JSON error keeps the console quiet).
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "error", code: "revision_conflict", message: "The file changed in another window." }));
+        return;
+      }
+      changePlainFile(Buffer.from(payload.data, "base64").toString());
+      json(res, { object: { uri: folderFile.uri, name: folderFile.name, revision: plainFile.revision, mime: "text/plain",
+        modified_at: folderFile.updated_at } });
       return;
     }
     if (url.pathname === "/apps/home/home-navigation-client.js") {
@@ -1278,6 +1300,62 @@ async function run() {
         "The saved copy must be listed and selected.");
     } finally {
       await publishedPage.close();
+    }
+
+    // A Library file changed in another window: Save reports it and offers
+    // Load saved version (asks first, drops only this file's edits); Save as
+    // keeps the edits as a copy in Documents.
+    resetDocumentsFixture();
+    const conflictPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    trackPage(conflictPage, consoleErrors, pageErrors, failedRequests, errorResponses);
+    try {
+      await conflictPage.goto(`http://127.0.0.1:${port}/apps/documents/?home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
+      const plainRow = conflictPage.locator(`.document-list-item[data-object-uri="${folderFile.uri}"]`);
+      const conflict = async (edit) => {
+        await plainRow.click();
+        await conflictPage.waitForFunction((body) => document.getElementById("editor")?.value === body, plainFile.body);
+        await conflictPage.locator("#editor").fill(edit);
+        changePlainFile(`Changed elsewhere: ${edit}`);
+        await conflictPage.getByRole("button", { name: "Save", exact: true }).click();
+        await conflictPage.locator("#status-action:not(.hidden)").waitFor();
+      };
+      // Another document kept unsaved meanwhile must not be touched.
+      await conflictPage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
+      await conflictPage.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
+      await conflictPage.locator("#editor").fill("# Beta\n\nKept elsewhere.");
+      await conflict("My edit");
+      assert(await conflictPage.locator("#status-action").textContent() === "Load saved version" &&
+        await conflictPage.locator("#editor").inputValue() === "My edit",
+        "A Library-file conflict keeps the edits and offers Load saved version.");
+      // The file's own row asks too; Cancel keeps the edits.
+      await plainRow.click();
+      await conflictPage.locator("#confirm-modal.open").waitFor();
+      assert(await conflictPage.locator("#confirm-action").textContent() === "Load saved version", "The row offers Load saved version.");
+      await conflictPage.locator("#confirm-cancel").click();
+      assert(await conflictPage.locator("#editor").inputValue() === "My edit", "Cancel keeps the edits.");
+      await conflictPage.locator("#status-action").click();
+      await conflictPage.locator("#confirm-modal.open").waitFor();
+      await conflictPage.locator("#confirm-action").click();
+      await conflictPage.waitForFunction((body) => document.getElementById("editor")?.value === body, plainFile.body);
+      assert(!(await plainRow.locator(".document-list-unsaved").count()) &&
+        await conflictPage.locator('.document-list-item[data-doc-did="doc-beta"] .document-list-unsaved').count() === 1,
+        "Loading the saved version drops only this file's edits.");
+
+      // Save as keeps the edits as a copy beside it, and the copy opens.
+      await conflict("Edit to keep as a copy");
+      assert(await conflictPage.locator("#save-as-button").isEnabled(), "Save as must stay possible for a Library file.");
+      await conflictPage.locator("#save-as-button").click();
+      assert(await conflictPage.locator("#save-as-file-input").inputValue() === "Plain copy.txt", "Save as suggests a copy name.");
+      await conflictPage.locator('#save-as-form button[type="submit"]').click();
+      await waitForCondition(() => importCalls.length === 1, 5000, "Save as did not save a copy.");
+      assert(importCalls[0].file_name === "Plain copy.txt" && importCalls[0].body === "Edit to keep as a copy" &&
+        importCalls[0].mime === "text/plain" && importCalls[0].attachment_id.startsWith("copy-"),
+        `Save as must save the edits as a new file. Got ${JSON.stringify(importCalls)}`);
+      await conflictPage.waitForFunction(() => document.getElementById("title-input")?.value === "Plain copy.txt");
+      assert(plainFile.body === "Changed elsewhere: Edit to keep as a copy", "Save as never overwrites the changed file.");
+      assert(!(await plainRow.locator(".document-list-unsaved").count()), "After Save as the file keeps what is stored.");
+    } finally {
+      await conflictPage.close();
     }
 
     // The name the Chat post states is the title and the default save name;

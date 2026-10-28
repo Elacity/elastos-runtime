@@ -56,6 +56,7 @@ const elements = {
   deleteButton: document.getElementById("delete-button"),
   statusRow: document.getElementById("status-row"),
   statusText: document.getElementById("status-text"),
+  statusAction: document.getElementById("status-action"),
   findBar: document.getElementById("find-bar"),
   findInput: document.getElementById("find-input"),
   findCount: document.getElementById("find-count"),
@@ -481,6 +482,55 @@ function preferredWorkspaceView(view) {
 function clearStatus() {
   elements.statusText.textContent = "";
   elements.statusRow.classList.add("hidden");
+  elements.statusAction.classList.add("hidden");
+}
+
+// A Library file whose save failed (most often because it changed in another
+// window) can be reloaded from what is stored, here or from its list row.
+function libraryFileSaveFailed() {
+  return isLibraryFileProjection(state.current) && state.dirty &&
+    saveRecovery?.phase === "library" && isCurrentSessionTarget(saveRecovery.target);
+}
+
+async function loadSavedLibraryVersion() {
+  const current = state.current;
+  if (!isLibraryFileProjection(current)) {
+    return;
+  }
+  const confirmed = await confirmInCapsule({
+    title: "Load the saved version?",
+    message: "Your edits to " + (current.file_name || "this file") + " will be lost.",
+    confirmLabel: "Load saved version",
+    danger: true,
+  });
+  if (!confirmed || state.current !== current) {
+    return;
+  }
+  unsavedDocuments.delete(unsavedKey(current));
+  state.dirty = false;
+  await loadLibraryObject(current.library_object_uri).catch((error) => {
+    showError(readableDocumentsError(error, "This file could not be opened."));
+  });
+}
+
+// Save as copy for a Library file: the edits become a new file in Documents,
+// through the same import Chat attachments use, and that copy opens.
+async function saveLibraryFileCopy(fileName) {
+  const target = { sessionId: state.currentSessionId, identity: documentIdentity(state.current) };
+  const name = String(fileName || "").trim() || suggestedDuplicateFileName(state.current) || "Copy.txt";
+  const response = await documentsProviderApi("import_chat_attachment", {
+    attachment_id: "copy-" + window.crypto.randomUUID(),
+    file_name: name,
+    mime: /\.md$/i.test(name) ? "text/markdown" : "text/plain",
+    body: elements.editor.value,
+  });
+  if (!isCurrentDocumentTarget(target)) return;
+  const copy = requireSavedWorkingCopy(response.document);
+  // The edits now live in the copy; the original file keeps what is stored.
+  replaceCurrentDocument(copy);
+  upsertDocumentListItem(copy);
+  renderDocumentsList();
+  renderCurrentDocument();
 }
 
 function clearAutosaveTimer() {
@@ -711,21 +761,29 @@ function unsavedDocumentNames() {
 // Save all, from closing the window: the open document, then each kept one.
 // Stops at the first that does not save, which stays open with its text.
 async function saveAllUnsaved() {
-  if (state.dirty) {
-    await saveCurrent();
-    if (state.dirty) return false;
-  }
-  for (const key of [...unsavedDocuments.keys()]) {
+  // Edits made while a save runs, in any document, are saved too: close only
+  // when nothing in the window is left unsaved. Each round saves one document.
+  for (let round = 0; round < 100; round += 1) {
+    if (state.dirty && state.current && !state.current.shared) {
+      await saveCurrent();
+      continue;
+    }
+    const key = unsavedDocuments.keys().next().value;
+    if (key === undefined) {
+      return true;
+    }
     restoreUnsavedDocument(key);
-    await saveCurrent();
-    if (state.dirty) return false;
   }
-  return true;
+  return !hasUnsavedDocuments();
 }
 
 function reportSaveFailure(error, fallback) {
   if (error?.documentsTarget && !isCurrentDocumentTarget(error.documentsTarget)) return;
   showError(readableDocumentsError(error, fallback));
+  if (libraryFileSaveFailed()) {
+    elements.statusAction.textContent = "Load saved version";
+    elements.statusAction.classList.remove("hidden");
+  }
 }
 
 function canAnnounceHomeChrome() {
@@ -1237,7 +1295,7 @@ function setDirty(dirty) {
   const unsaved = !elements.saveButton.disabled;
   elements.saveButton.classList.toggle("has-unsaved", unsaved);
   elements.saveButton.title = unsaved ? "Save (unsaved changes)" : "Save";
-  elements.saveAsButton.disabled = !hasPersistedCurrent || isLibraryFile;
+  elements.saveAsButton.disabled = !hasPersistedCurrent;
   elements.deleteButton.disabled = !hasPersistedCurrent || isLibraryFile;
   if (hasCurrent && !state.dirty) {
     clearStatus();
@@ -1641,6 +1699,10 @@ async function saveSharedCopy() {
 
 async function selectLibraryFile(uri) {
   if (state.current && state.current.library_object_uri === uri) {
+    // The open file's own row reloads it only after its save failed.
+    if (libraryFileSaveFailed()) {
+      await loadSavedLibraryVersion();
+    }
     return;
   }
   await prepareToLeaveCurrent();
@@ -1930,6 +1992,9 @@ async function saveCurrent(options) {
       savedWorkingCopy = { ...saveDocument };
       saveTarget.identity = documentIdentity(state.current);
       updateDocumentsNavigation(saveDocument);
+      // Listed from now on, so its text stays reachable if the save below fails.
+      upsertDocumentListItem(saveDocument);
+      renderDocumentsList();
     }
     requireSavedWorkingCopy(saveDocument);
     saveRecovery = {
@@ -1974,11 +2039,14 @@ async function saveCurrent(options) {
 }
 
 function openSaveAsModal() {
-  if (!state.current || isDraftDocument(state.current) || isLibraryFileProjection(state.current)) {
+  if (!state.current || isDraftDocument(state.current)) {
     return;
   }
   elements.saveAsTitleInput.value = elements.titleInput.value || state.current.title || "";
-  elements.saveAsFileInput.value = state.current.file_name || "";
+  // A Library file is saved as a copy beside the others in Documents.
+  elements.saveAsFileInput.value = isLibraryFileProjection(state.current)
+    ? suggestedDuplicateFileName(state.current)
+    : state.current.file_name || "";
   elements.saveAsModal.classList.add("open");
   elements.saveAsModal.setAttribute("aria-hidden", "false");
   window.setTimeout(() => elements.saveAsTitleInput.focus(), 10);
@@ -2161,7 +2229,11 @@ async function handleHomeWindowCloseRequest(event) {
 }
 
 async function saveAsCurrent(title, fileName) {
-  if (!state.current || isDraftDocument(state.current) || isLibraryFileProjection(state.current)) {
+  if (!state.current || isDraftDocument(state.current)) {
+    return;
+  }
+  if (isLibraryFileProjection(state.current)) {
+    await saveLibraryFileCopy(fileName);
     return;
   }
   const target = { sessionId: state.currentSessionId, identity: documentIdentity(state.current) };
@@ -2351,6 +2423,9 @@ function wireShellEvents() {
     });
   });
   elements.saveAsButton.addEventListener("click", openSaveAsModal);
+  elements.statusAction.addEventListener("click", () => {
+    void loadSavedLibraryVersion();
+  });
   elements.deleteButton.addEventListener("click", requestDeleteCurrent);
   elements.sidebarToggle.addEventListener("click", () => {
     setSidebarCollapsed(true);

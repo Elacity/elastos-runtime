@@ -411,3 +411,19 @@ test("a save that finishes after its document was left settles the kept text", a
     assert.equal(server.docs.get("did:one").body, "Sent, then more", "the later edit saves on the new revision");
   }
 });
+
+test("a new document created before its first save failed is listed, with its text kept", async () => {
+  const server = backend(), app = editor(server, { doc_did: "draft:one", title: "Draft", body: "Keep me" });
+  const listed = [];
+  app.upsertDocumentListItem = (document) => listed.push(document.doc_did);
+  const request = server.request;
+  server.request = async (op, payload) => { if (op === "save") throw new Error("save failed"); return request(op, payload); };
+  await assert.rejects(app.saveCurrent());
+  assert.deepEqual(listed, ["did:created-1"], "the created document is listed as soon as it exists");
+  server.request = request;
+  await app.selectDocument("did:one");
+  assert.equal(app.unsavedDocuments.get("document:did:created-1").document.body, "Keep me");
+  await app.selectDocument("did:created-1");
+  assert.equal(app.elements.editor.value, "Keep me");
+  assert.equal(app.state.dirty, true);
+});

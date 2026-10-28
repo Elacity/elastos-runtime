@@ -387,6 +387,7 @@ function createDocumentsHarness({
   queuedAutosave = false,
   autosave = true,
   kept = [],
+  onSave = null,
 } = {}) {
   const posted = [];
   const focused = [];
@@ -462,6 +463,9 @@ function createDocumentsHarness({
     },
     saveCurrent: async () => {
       saveCalls += 1;
+      if (onSave?.({ state, elements, unsavedDocuments: context.unsavedDocuments, call: saveCalls }) === "handled") {
+        return;
+      }
       if (savePlan === "failure") {
         throw new Error("save failed");
       }
@@ -1001,4 +1005,26 @@ test("a window whose open document is saved still asks for the documents it keep
   await failed;
   assert.equal(failing.posted.at(-1).message.ok, false);
   assert.equal(failing.posted.at(-1).message.reason, "save_failed");
+});
+
+test("Save all keeps saving until nothing in the window is unsaved, edits made during a save included", async () => {
+  // Kept "Plan" saves; while it saves, the person edits Plan again and moves to
+  // a saved document, so Plan is kept unsaved once more.
+  const harness = createDocumentsHarness({
+    dirty: false, autosave: false, kept: ["Plan"],
+    onSave({ state, elements, unsavedDocuments, call }) {
+      if (call !== 1) return "";
+      unsavedDocuments.set("document:Plan", { document: { doc_did: "Plan", title: "Plan", file_name: "", body: "newer" } });
+      state.current = { doc_did: "clean" };
+      elements.titleInput.value = "Clean";
+      state.dirty = false;
+      return "handled";
+    },
+  });
+  const pending = harness.request();
+  harness.respond("confirm");
+  await pending;
+  assert.equal(harness.saveCalls(), 2, "the newer edit must be saved too");
+  assert.deepEqual(harness.kept(), []);
+  assert.equal(harness.posted.at(-1).message.ok, true);
 });
