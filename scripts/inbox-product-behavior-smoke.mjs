@@ -475,7 +475,7 @@ async function runInboxHomeChromeSmoke() {
     return jsonResponse({ notifications: { entries: [{
       id: "entry-service", kind: "service_access_request", title: "Browser Exit access",
       body: "A contact requests Browser Exit access.", severity: "attention", read: false,
-      source_app: "services", action_ref: { action_id: "service-approve-request:service-1" },
+      source_app: "inbox", action_ref: { app: "inbox", action_id: "service-approve-request:service-1" },
     }] } });
   };
   for (const callback of windowListeners.get("message") || []) {
@@ -484,8 +484,9 @@ async function runInboxHomeChromeSmoke() {
   }
   await settle();
   const buttons = descendants(nodes.get("entry-rows")).filter(node => node.tagName === "BUTTON");
-  assert.deepEqual(buttons.map(button => button.textContent), ["Open", "Approve", "Deny"]);
-  assert.deepEqual(serviceActions, [], "Viewing a Services request must preserve its pending state");
+  // Services is hidden, so a service request offers no Open; Inbox decides it.
+  assert.deepEqual(buttons.map(button => button.textContent), ["Approve", "Deny"]);
+  assert.deepEqual(serviceActions, [], "Viewing a service request must preserve its pending state");
   for (const label of ["Approve", "Deny"]) {
     const button = descendants(nodes.get("entry-rows")).find(node => node.tagName === "BUTTON" && node.textContent === label);
     for (const callback of button.listeners.get("click") || []) callback();
@@ -502,7 +503,7 @@ async function runInboxHomeChromeSmoke() {
     body: "Seed may use Mac model. Revoke access to stop new runs and cancel open runs.",
     severity: "info",
     read: true,
-    source_app: "services",
+    source_app: "inbox",
     action_ref: { action_id: "service-deny-request:grant-1" },
   };
   context.fetch = async (path, options = {}) => {
@@ -537,7 +538,7 @@ async function runInboxHomeChromeSmoke() {
   assert.equal(nodes.get("list-title").textContent, "All");
   assert.equal(nodes.get("review-count").textContent, "0");
   const grantButtons = descendants(nodes.get("entry-rows")).filter(node => node.tagName === "BUTTON");
-  assert.deepEqual(grantButtons.map(button => button.textContent), ["Open", "Revoke access"]);
+  assert.deepEqual(grantButtons.map(button => button.textContent), ["Revoke access"]);
   assert.deepEqual(grantActions, [], "Viewing an approved grant must preserve its access");
   const revoke = grantButtons.find(button => button.textContent === "Revoke access");
   for (const callback of revoke.listeners.get("click") || []) callback();
@@ -568,7 +569,7 @@ async function runInboxHomeChromeSmoke() {
         body: "A contact requests Browser Exit access.",
         severity: "attention",
         read: false,
-        source_app: "services",
+        source_app: "inbox",
         action_ref: { action_id: "service-approve-request:service-1" },
       },
       {
@@ -578,7 +579,7 @@ async function runInboxHomeChromeSmoke() {
         body: "Seed may use Mac model. Revoke access to stop new runs and cancel open runs.",
         severity: "info",
         read: true,
-        source_app: "services",
+        source_app: "inbox",
         action_ref: { action_id: "service-deny-request:grant-1" },
       },
     ],

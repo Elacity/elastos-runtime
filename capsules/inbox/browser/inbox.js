@@ -499,7 +499,8 @@
 
     function fillEntryActions(actions, entry) {
       const actionId = entry.action_ref && entry.action_ref.action_id;
-      if (typeof entry.source_app === "string" && entry.source_app.trim()) {
+      // A request Inbox decides itself has no other app to open.
+      if (typeof entry.source_app === "string" && entry.source_app.trim() && entry.source_app.trim() !== "inbox") {
         // A direct-message notice opens its own conversation in Chat.
         const query = typeof actionId === "string" && actionId.startsWith("chat-open-direct:")
           ? { conversation_id: actionId.slice("chat-open-direct:".length) } : {};
