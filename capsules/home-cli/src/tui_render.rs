@@ -595,7 +595,6 @@ fn people_debug_lines(snapshot: &HomeSnapshot) -> Vec<String> {
         format!("Identity   {}", identity_summary(snapshot)),
         format!("ContactsSchema {}", snapshot.people.schema),
         format!("Contacts   {}", snapshot.people.contact_count),
-        format!("Services   {}", snapshot.people.service_offer_count),
         format!("Network    {}", network_summary(snapshot)),
         format!(
             "Source     {}",

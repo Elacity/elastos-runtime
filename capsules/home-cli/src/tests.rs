@@ -1764,7 +1764,6 @@ fn people_tab_uses_people_model_and_keeps_transport_in_debug() {
             profile_card: None,
             last_seen_at: Some(10),
         }],
-        service_offer_count: 0,
     };
 
     let ids: Vec<String> = people_actions(&snapshot)
@@ -1818,7 +1817,8 @@ fn people_tab_uses_people_model_and_keeps_transport_in_debug() {
     assert!(debug.contains("RoomWeb"));
     assert!(debug.contains("ContactsSchema"));
     assert!(debug.contains("Source"));
-    assert!(debug.contains("Services"));
+    // Services is hidden, so People's debug view does not count its offers.
+    assert!(!debug.contains("Services"));
 }
 
 #[test]
