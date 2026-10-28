@@ -487,7 +487,139 @@ function handleHomeUiPreferenceMessage(event, context, data) {
     .catch((error) => replyToShellRequest(event, requestId, null, error));
 }
 
+// When the session ends without asking (it expired, was refused or locked),
+// Home blanks the desktop and every app window with it. Unsaved Documents
+// edits are rescued first: each Documents window hands over its unsaved text,
+// Home keeps it in this page's memory only, for the same person, and offers it
+// back in Documents once that person is signed in again.
+const DOCUMENTS_DRAFT_COLLECT_MS = 1_500;
+const DOCUMENTS_DRAFT_RESTORE_MS = 30_000;
+const MAX_RESCUED_DRAFT_CHARS = 8 * 1024 * 1024;
+const pendingDocumentsDraftRequests = new Map();
+let rescuedDocumentsDrafts = null;
+let documentsDraftRescue = null;
+
+function currentHomePrincipalId() {
+  const principalId = shellState.currentSummary?.browser_state?.principal_id;
+  return typeof principalId === "string" ? principalId.trim() : "";
+}
+
+function validDocumentsDraft(draft) {
+  const keys = ["title", "body", "doc_did", "library_object_uri", "revision", "file_name"];
+  if (!draft || typeof draft !== "object" || Array.isArray(draft) || !hasExactMessageKeys(draft, keys) ||
+      !keys.every((key) => typeof draft[key] === "string") || draft.body.length > MAX_RESCUED_DRAFT_CHARS ||
+      keys.some((key) => key !== "body" && draft[key].length > 4096)) {
+    return null;
+  }
+  return { ...draft };
+}
+
+function askDocumentsWindow(context, message, timeoutMs) {
+  return new Promise((resolve) => {
+    const requestId = window.crypto.randomUUID();
+    const settle = (value) => {
+      window.clearTimeout(timer);
+      pendingDocumentsDraftRequests.delete(requestId);
+      resolve(value);
+    };
+    const timer = window.setTimeout(() => settle(null), timeoutMs);
+    pendingDocumentsDraftRequests.set(requestId, { homeToken: context.homeToken, type: message.replyType, settle });
+    try {
+      context.source.postMessage({ type: message.type, requestId, ...message.fields }, OPAQUE_FRAME_TARGET);
+    } catch (_error) {
+      settle(null);
+    }
+  });
+}
+
+// A Documents window's answer to collect-draft or restore-draft.
+function acceptDocumentsDraftReply(context, data) {
+  const pending = pendingDocumentsDraftRequests.get(data.requestId);
+  if (context.kind !== "app-frame" || context.targetId !== "documents" || !pending ||
+      pending.homeToken !== context.homeToken || pending.type !== data.type) {
+    return;
+  }
+  if (data.type === "documents:draft" && hasExactMessageKeys(data, ["type", "requestId", "homeToken", "draft"])) {
+    pending.settle(data.draft === null ? null : validDocumentsDraft(data.draft));
+  } else if (data.type === "documents:draft-restored" && hasExactMessageKeys(data, ["type", "requestId", "homeToken", "ok"])) {
+    pending.settle(data.ok === true);
+  }
+}
+
+async function collectDocumentsDrafts() {
+  const contexts = [...launchedAppContexts.values()]
+    .filter((context) => context.targetId === "documents" && context.source);
+  const drafts = await Promise.all(contexts.map((context) => askDocumentsWindow(context,
+    { type: "documents:collect-draft", replyType: "documents:draft", fields: {} }, DOCUMENTS_DRAFT_COLLECT_MS)));
+  return drafts.filter(Boolean);
+}
+
+function rescueDocumentsDrafts() {
+  if (!documentsDraftRescue) {
+    documentsDraftRescue = (async () => {
+      const principalId = currentHomePrincipalId();
+      const drafts = principalId ? await collectDocumentsDrafts() : [];
+      if (drafts.length) {
+        const earlier = rescuedDocumentsDrafts?.principalId === principalId ? rescuedDocumentsDrafts.drafts : [];
+        rescuedDocumentsDrafts = { principalId, drafts: [...earlier, ...drafts] };
+      }
+    })().finally(() => {
+      documentsDraftRescue = null;
+    });
+  }
+  return documentsDraftRescue;
+}
+
+// Offers rescued drafts back, one at a time, once the same person's desktop is
+// ready. A different person never sees them; they are dropped.
+async function restoreDocumentsDrafts() {
+  const held = rescuedDocumentsDrafts;
+  if (!held || documentsDraftRescue) {
+    return;
+  }
+  if (held.principalId !== currentHomePrincipalId()) {
+    if (homeSummarySignedIn(shellState.currentSummary)) {
+      rescuedDocumentsDrafts = null;
+    }
+    return;
+  }
+  while (rescuedDocumentsDrafts === held && held.drafts.length) {
+    const requestId = window.crypto.randomUUID();
+    const restored = new Promise((resolve) => {
+      const settle = (value) => {
+        window.clearTimeout(timer);
+        pendingDocumentsDraftRequests.delete(requestId);
+        resolve(value);
+      };
+      const timer = window.setTimeout(() => settle(false), DOCUMENTS_DRAFT_RESTORE_MS);
+      pendingDocumentsDraftRequests.set(requestId, { homeToken: "", type: "documents:draft-restored", settle });
+    });
+    let delivered = false;
+    try {
+      delivered = await openHomeGuiTargetWithPayload("documents",
+        { type: "documents:restore-draft", requestId, draft: held.drafts[0] });
+    } catch (_error) {
+      delivered = false;
+    }
+    const record = pendingDocumentsDraftRequests.get(requestId);
+    if (record) {
+      const context = [...launchedAppContexts.values()].reverse()
+        .find((candidate) => candidate.targetId === "documents" && candidate.source);
+      record.homeToken = context?.homeToken || "";
+    }
+    if (!delivered || !(await restored)) {
+      record?.settle(false);
+      return;
+    }
+    held.drafts.shift();
+  }
+  if (rescuedDocumentsDrafts === held && !held.drafts.length) {
+    rescuedDocumentsDrafts = null;
+  }
+}
+
 async function showHostAuthGate(options = {}) {
+  await rescueDocumentsDrafts();
   enterHostAuthGate();
   const personName = options?.preserveSignedProfileLabel ? currentSignedProfileDisplayName() : "";
   const unlockReady = showHomeUnlock(async (response, flow) => {
@@ -1384,6 +1516,12 @@ async function signOutFromShellHostRecovery() {
     shellHostRecoverySignOutButton.disabled = true;
   }
   try {
+    // This sign-out cannot reach Documents' Save, so unsaved edits are not
+    // dropped without the person saying so.
+    if ((await collectDocumentsDrafts()).length > 0 &&
+        !window.confirm("Documents has unsaved changes. Signing out discards them. Sign out anyway?")) {
+      return;
+    }
     clearLaunchedAppContexts();
     await signOutHome();
     reloadHomeShellHost();
@@ -1643,6 +1781,14 @@ shellHostRecoverySignOutButton?.addEventListener("click", () => {
   });
 });
 
+// Rescued Documents drafts live only in this page; leaving it asks first.
+window.addEventListener("beforeunload", (event) => {
+  if (rescuedDocumentsDrafts?.drafts.length) {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
+
 window.addEventListener("message", (event) => {
   const data = event.data;
   const context = homeMessageContext(event, data);
@@ -1651,6 +1797,10 @@ window.addEventListener("message", (event) => {
   }
   if (data.type === "home:navigation-hint") {
     relayHomeNavigation(context, data);
+    return;
+  }
+  if (data.type === "documents:draft" || data.type === "documents:draft-restored") {
+    acceptDocumentsDraftReply(context, data);
     return;
   }
   if (data.type === FORM_FACTOR_MESSAGE) {
@@ -1683,6 +1833,9 @@ window.addEventListener("message", (event) => {
       }
       if (shellState.currentSummary) {
         postToActiveShell({ type: "home:shell-summary", summary: shellState.currentSummary });
+      }
+      if (context.targetId === HOME_GUI_SHELL_ID) {
+        void restoreDocumentsDrafts();
       }
     }
     return;
