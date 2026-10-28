@@ -687,11 +687,35 @@ impl CollaborationPresenceProductPort {
     }
 
     pub(crate) fn history_participants(&self, now: u64) -> anyhow::Result<Vec<HistoryParticipant>> {
+        let mut peers = self
+            .live_presence_endpoints(now)?
+            .into_iter()
+            .map(|(_, endpoint_did)| HistoryParticipant { endpoint_did })
+            .collect::<Vec<_>>();
+        peers.sort_by(|left, right| left.endpoint_did.cmp(&right.endpoint_did));
+        peers.dedup_by(|left, right| left.endpoint_did == right.endpoint_did);
+        Ok(peers)
+    }
+
+    /// The device DIDs of the Community members whose live presence this
+    /// Home holds, leaving out one that is also that member's Profile DID.
+    pub(crate) fn seen_device_dids(&self, now: u64) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .live_presence_endpoints(now)?
+            .into_iter()
+            .filter(|(profile_did, endpoint_did)| profile_did != endpoint_did)
+            .map(|(_, endpoint_did)| endpoint_did)
+            .collect())
+    }
+
+    /// `(Profile DID, sole endpoint DID)` of every live, non-bootstrap
+    /// presence this Home holds.
+    fn live_presence_endpoints(&self, now: u64) -> anyhow::Result<Vec<(String, String)>> {
         let state = self
             .read_model
             .load_state()?
             .unwrap_or_else(|| self.read_model.empty_state());
-        let mut peers = Vec::new();
+        let mut endpoints = Vec::new();
         for record in state.records {
             let presence = self.read_model.verify_record(&record)?;
             if presence.expires_at <= now
@@ -706,14 +730,10 @@ impl CollaborationPresenceProductPort {
                 if self.core.is_bootstrap_endpoint(endpoint) {
                     continue;
                 }
-                peers.push(HistoryParticipant {
-                    endpoint_did: endpoint.to_string(),
-                });
+                endpoints.push((presence.sender_profile_did, endpoint.to_string()));
             }
         }
-        peers.sort_by(|left, right| left.endpoint_did.cmp(&right.endpoint_did));
-        peers.dedup_by(|left, right| left.endpoint_did == right.endpoint_did);
-        Ok(peers)
+        Ok(endpoints)
     }
 
     /// The request carries its own live signed presence, avoiding a race with
@@ -1889,6 +1909,45 @@ mod tests {
             .data_root
             .join(PRESENCE_STATE_PARENT)
             .exists());
+    }
+
+    /// A member seen live in presence yields their device DID, never their
+    /// Profile DID, until the presence expires.
+    #[test]
+    fn seen_device_dids_are_live_members_device_dids() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = fixture_at(temp.path());
+        assert!(fixture.presence.seen_device_dids(NOW).unwrap().is_empty());
+        let (remote, remote_profile) = remote_authority(&fixture, "Seen", None);
+        let message = remote
+            .prepare_profile_outgoing(
+                &remote_profile,
+                CHAT_SERVICE,
+                PRESENCE_PAYLOAD_TYPE,
+                serde_json::json!({}),
+                NOW,
+                PRESENCE_TTL_SECS,
+            )
+            .unwrap();
+        fixture
+            .core
+            .accept_incoming_from_signed_source_for_test(message.envelope_bytes(), NOW)
+            .unwrap();
+        let handoffs = fixture.presence.pending_presences().unwrap();
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(
+            fixture.presence.project_handoff(&handoffs[0], NOW).unwrap(),
+            CollaborationPresenceProjectionOutcome::Applied
+        );
+        assert_eq!(
+            fixture.presence.seen_device_dids(NOW + 1).unwrap(),
+            vec![remote_profile.sole_endpoint_did().unwrap().to_string()]
+        );
+        assert!(fixture
+            .presence
+            .seen_device_dids(NOW + PRESENCE_TTL_SECS)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

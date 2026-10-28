@@ -89,6 +89,9 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Runtime refuses a resource request whose body is not a JSON object, and ends
   a component activation cleanly when it finishes, including a failed or
   panicked host call (#194).
+- People > Add by DID refuses the device DID of another Home this Home knows,
+  a contact's or one seen in Community, and says "That's a Home's device DID.
+  Use the DID shown in their People."
 
 ### Developer detail
 

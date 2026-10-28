@@ -469,6 +469,7 @@ async function runScenario(name) {
     for (const [status, message] of [
       [400, "That isn't a DID. A DID starts with did:key:z."],
       [400, "That's this Home's device DID. Use the DID shown in People."],
+      [400, "That's a Home's device DID. Use the DID shown in their People."],
       [409, "You have 16 requests waiting. Wait for answers before sending more."],
       [409, "Contact requests can't be delivered right now. Try again later."],
       [409, "This Home left Community. Rejoin in System → Security, under Community. Contacts, Direct messages and history remain available."],

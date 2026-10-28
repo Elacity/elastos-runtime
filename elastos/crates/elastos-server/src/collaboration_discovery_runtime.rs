@@ -264,6 +264,9 @@ pub(crate) enum ProfileContactRequestRefusal {
     InvalidProfileId,
     /// This Home's own device DID (System shows it), not a Profile DID.
     OwnDeviceId,
+    /// Another Home's device DID this Home knows — a contact's or a
+    /// Community member's in presence — not a Profile DID.
+    OtherHomeDeviceId,
     /// The local Profile already has the maximum of undecided outgoing
     /// requests by DID.
     TooManyWaiting,
@@ -283,6 +286,8 @@ impl std::fmt::Display for ProfileContactRequestRefusal {
             Self::OwnDeviceId => {
                 formatter.write_str("That's this Home's device DID. Use the DID shown in People.")
             }
+            Self::OtherHomeDeviceId => formatter
+                .write_str("That's a Home's device DID. Use the DID shown in their People."),
             Self::TooManyWaiting => write!(
                 formatter,
                 "You have {} requests waiting. Wait for answers before sending more.",
@@ -1496,12 +1501,15 @@ impl CollaborationDiscoveryService {
     /// Queues one contact request addressed to `recipient_profile_did`, with
     /// or without Discovery. It only records intent; the outbox delivers it
     /// through the Community relay and the recipient decides in Inbox.
+    /// `seen_device_dids` are the device DIDs of Community members whose
+    /// presence this Home holds; they and contacts' device DIDs are refused.
     /// Refusals are `ProfileContactRequestRefusal` errors, so a caller can
     /// downcast them for the exact text a person sees.
     pub(crate) async fn send_profile_contact_request(
         &self,
         store: &CollaborationContactStore,
         recipient_profile_did: &str,
+        seen_device_dids: &[String],
         profile: &VerifiedCollaborationProfileDocument,
         now: u64,
     ) -> anyhow::Result<ProfileContactRequestOutcome> {
@@ -1517,6 +1525,17 @@ impl CollaborationDiscoveryService {
         }
         if recipient_profile_did == self.authority.local_device_did() {
             return Err(ProfileContactRequestRefusal::OwnDeviceId.into());
+        }
+        let contact_device = store.snapshot()?.contacts().iter().any(|contact| {
+            contact.remote_presence_device_did() == recipient_profile_did
+                && contact.remote_profile_did() != recipient_profile_did
+        });
+        if contact_device
+            || seen_device_dids
+                .iter()
+                .any(|did| did == recipient_profile_did)
+        {
+            return Err(ProfileContactRequestRefusal::OtherHomeDeviceId.into());
         }
         if !self.community_joined() {
             return Err(ProfileContactRequestRefusal::CommunityLeft.into());
@@ -6177,6 +6196,7 @@ pub(crate) mod tests {
                     .send_profile_contact_request(
                         &store,
                         &recipient.did(),
+                        &[],
                         &profile,
                         current_timestamp()
                     )
@@ -6211,6 +6231,68 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(relayed(), 0);
+    }
+
+    /// Another Home's device DID — a contact's, or a Community member's
+    /// seen in presence — is refused like this Home's own, and nothing is
+    /// queued; an unknown did:key is still asked.
+    #[tokio::test]
+    async fn profile_request_refuses_another_known_homes_device_did() {
+        let temp = tempfile::tempdir().unwrap();
+        let pair = direct_peer_pair(temp.path()).await;
+        let contact_device = pair.store_a.snapshot().unwrap().contacts()[0]
+            .remote_presence_device_did()
+            .to_string();
+        assert_ne!(contact_device, pair.profile_b.document().profile_did);
+        let seen_device = crate::crypto::encode_signing_key_did(&SigningKey::from_bytes(
+            &generate_keypair().0.to_bytes(),
+        ));
+        let seen = vec![seen_device.clone()];
+        for device in [contact_device, seen_device] {
+            let err = pair
+                .service_a
+                .send_profile_contact_request(
+                    &pair.store_a,
+                    &device,
+                    &seen,
+                    &pair.profile_a,
+                    current_timestamp(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<ProfileContactRequestRefusal>(),
+                Some(&ProfileContactRequestRefusal::OtherHomeDeviceId)
+            );
+            assert_eq!(
+                err.to_string(),
+                "That's a Home's device DID. Use the DID shown in their People."
+            );
+        }
+        let now = current_timestamp();
+        assert_eq!(
+            pair.store_a
+                .waiting_outgoing_profile_request_count(now)
+                .unwrap(),
+            0
+        );
+
+        let unknown = crate::crypto::encode_signing_key_did(&SigningKey::from_bytes(
+            &generate_keypair().0.to_bytes(),
+        ));
+        assert_eq!(
+            pair.service_a
+                .send_profile_contact_request(&pair.store_a, &unknown, &seen, &pair.profile_a, now)
+                .await
+                .unwrap(),
+            ProfileContactRequestOutcome::Requested
+        );
+        assert_eq!(
+            pair.store_a
+                .waiting_outgoing_profile_request_count(now)
+                .unwrap(),
+            1
+        );
     }
 
     /// Two Homes with Discovery off add each other by Profile DID through
@@ -6249,7 +6331,13 @@ pub(crate) mod tests {
         // Alma's outbox delivers it again.
         assert_eq!(
             a_service
-                .send_profile_contact_request(&a_store, &b_did, &a_profile, current_timestamp())
+                .send_profile_contact_request(
+                    &a_store,
+                    &b_did,
+                    &[],
+                    &a_profile,
+                    current_timestamp()
+                )
                 .await
                 .unwrap(),
             ProfileContactRequestOutcome::Requested
@@ -6308,7 +6396,13 @@ pub(crate) mod tests {
         // interval passes, but Bo's Home drops it during the cool-down.
         assert_eq!(
             a_service
-                .send_profile_contact_request(&a_store, &b_did, &a_profile, current_timestamp())
+                .send_profile_contact_request(
+                    &a_store,
+                    &b_did,
+                    &[],
+                    &a_profile,
+                    current_timestamp()
+                )
                 .await
                 .unwrap(),
             ProfileContactRequestOutcome::Requested
@@ -6366,7 +6460,13 @@ pub(crate) mod tests {
         // the relay restarts while that decision waits in Alma's outbox.
         assert_eq!(
             b_service
-                .send_profile_contact_request(&b_store, &a_did, &b_profile, current_timestamp())
+                .send_profile_contact_request(
+                    &b_store,
+                    &a_did,
+                    &[],
+                    &b_profile,
+                    current_timestamp()
+                )
                 .await
                 .unwrap(),
             ProfileContactRequestOutcome::Requested

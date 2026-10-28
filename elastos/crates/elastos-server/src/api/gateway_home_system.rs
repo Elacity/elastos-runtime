@@ -823,7 +823,14 @@ pub(super) async fn people_contact_request_create(
         Err(err) => return room_service_join_error_response(err),
     };
     let recipient = body.profile_id.trim().to_string();
-    send_profile_contact_request_response(&service, &context, &authority, &recipient).await
+    send_profile_contact_request_response(
+        &service,
+        state.collaboration_presence_product_port.as_ref(),
+        &context,
+        &authority,
+        &recipient,
+    )
+    .await
 }
 
 /// Queues a request by Profile DID and answers `{status, display_name}`.
@@ -831,17 +838,31 @@ pub(super) async fn people_contact_request_create(
 /// `pending_from_them` or `own_profile`; `display_name` is the signed name
 /// this Home holds for the DID, else `CONTACT_NAME_NOT_KNOWN`. A refusal is a
 /// 400 or 409 whose body is the refusal's text, and never echoes the DID.
+/// `presence` supplies the device DIDs of Community members seen live, so
+/// one of them is refused like a contact's device DID.
 pub(super) async fn send_profile_contact_request_response(
     service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
+    presence: Option<&crate::collaboration_presence::CollaborationPresenceProductPort>,
     context: &HomeLaunchTokenContext,
     authority: &ConfiguredContactAuthority,
     recipient_profile_did: &str,
 ) -> Response {
     let now = now_ts();
+    // The seen-device check only adds a refusal; an unreadable presence store
+    // must not block a request by DID.
+    let seen_device_dids = match presence.map(|port| port.seen_device_dids(now)) {
+        Some(Ok(dids)) => dids,
+        Some(Err(err)) => {
+            tracing::warn!(error = %format!("{err:#}"), "contact request could not read Community presence");
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
     let outcome = match service
         .send_profile_contact_request(
             authority.store.as_ref(),
             recipient_profile_did,
+            &seen_device_dids,
             &authority.profile,
             now,
         )

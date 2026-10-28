@@ -1733,6 +1733,7 @@ pub(super) async fn chat_room_contact_request(
     }
     gateway_home_system::send_profile_contact_request_response(
         &service,
+        state.collaboration_presence_product_port.as_ref(),
         &context,
         &authority,
         &member_did,
@@ -2553,7 +2554,8 @@ pub(super) fn room_service_error_response(err: anyhow::Error) -> Response {
         use crate::collaboration_discovery_runtime::ProfileContactRequestRefusal;
         let status = match refusal {
             ProfileContactRequestRefusal::InvalidProfileId
-            | ProfileContactRequestRefusal::OwnDeviceId => StatusCode::BAD_REQUEST,
+            | ProfileContactRequestRefusal::OwnDeviceId
+            | ProfileContactRequestRefusal::OtherHomeDeviceId => StatusCode::BAD_REQUEST,
             ProfileContactRequestRefusal::TooManyWaiting
             | ProfileContactRequestRefusal::CommunityLeft
             | ProfileContactRequestRefusal::Undeliverable => StatusCode::CONFLICT,
