@@ -70,6 +70,7 @@ const documentsHarnessSource = [
   "hasExactKeys",
   "clearAutosaveTimer",
   "scheduleAutosave",
+  "unsavedDocumentName",
   "chooseInCapsule",
   "confirmInCapsule",
   "closeConfirmModal",
@@ -100,6 +101,7 @@ const documentsSaveHarnessSource = [
   "requireSavedWorkingCopy",
   "saveCurrent",
   "requestHomeWindowCloseDecision",
+  "unsavedDocumentName",
 ]
   .map((name) => extractFunction(documentsSource, name))
   .join("\n");
@@ -138,7 +140,9 @@ function createShellHarness() {
   };
   const shellState = {
     windows: new Map([[entry.id, entry]]),
+    shellLayoutState: { documentsAutosave: false },
   };
+  const savedLayouts = [];
   const context = vm.createContext({
     DOCUMENTS_WINDOW_CLOSE_TIMEOUT_MS: numericConstant(
       shellWindowsSource,
@@ -156,6 +160,12 @@ function createShellHarness() {
     URL,
     URLSearchParams,
     pendingDocumentsWindowCloses: new Map(),
+    DOCUMENTS_PREFERENCES_REQUEST_TYPE: stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_REQUEST_TYPE"),
+    DOCUMENTS_PREFERENCES_SET_TYPE: stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_SET_TYPE"),
+    DOCUMENTS_PREFERENCES_TYPE: stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_TYPE"),
+    saveShellLayoutState() {
+      savedLayouts.push({ ...shellState.shellLayoutState });
+    },
     shellState,
     removeWindowEntries(entries) {
       removed.push(entries.map((candidate) => candidate.id));
@@ -183,7 +193,7 @@ function createShellHarness() {
     },
   });
   vm.runInContext(
-    `${shellHarnessSource}\nthis.api = { closeWindow, handleDocumentsWindowCloseResult };`,
+    `${shellHarnessSource}\n${extractFunction(shellWindowsSource, "documentsPreferenceMessage")}\n${extractFunction(shellWindowsSource, "handleDocumentsPreferenceMessage")}\nthis.api = { closeWindow, handleDocumentsWindowCloseResult, handleDocumentsPreferenceMessage };`,
     context,
   );
   return {
@@ -191,6 +201,14 @@ function createShellHarness() {
     posts,
     removed,
     shellState,
+    savedLayouts,
+    preference(message, options = {}) {
+      return context.api.handleDocumentsPreferenceMessage({
+        origin: options.origin || "null",
+        source: options.source || frameWindow,
+        data: message,
+      });
+    },
     frame,
     frameWindow,
     timerCount() {
@@ -228,6 +246,7 @@ function createDocumentsSaveHarness() {
     },
     currentSessionId: 1,
     mode: "shell",
+    autosave: true,
     dirty: true,
     pendingConfirmation: null,
   };
@@ -358,6 +377,7 @@ function createDocumentsHarness({
   currentSessionId = 1,
   savePlan = "success",
   queuedAutosave = false,
+  autosave = true,
 } = {}) {
   const posted = [];
   const focused = [];
@@ -371,10 +391,12 @@ function createDocumentsHarness({
     current: { doc_did: "doc-1" },
     currentSessionId,
     mode: "shell",
+    autosave,
     dirty,
     pendingConfirmation: null,
   };
   const elements = {
+    titleInput: { value: "Audit notes" },
     confirmModal: {
       classList: { add() {}, remove() {} },
       setAttribute() {},
@@ -453,6 +475,7 @@ function createDocumentsHarness({
   return {
     focused,
     posted,
+    elements,
     timers,
     state,
     saveCalls: () => saveCalls,
@@ -779,4 +802,113 @@ test("real save requeue paths stay suspended while the close decision is open", 
   harness.respond("cancel");
   await decision;
   assert.equal(harness.hasTimer(900), true);
+});
+
+test("with Save automatically off, edits start no timer and closing asks to save by name", async () => {
+  const harness = createDocumentsHarness({ dirty: true, autosave: false });
+  harness.scheduleAutosave();
+  assert.equal([...harness.timers.values()].some((timer) => timer.delay === 900), false);
+  const cancelled = harness.request();
+  await Promise.resolve();
+  assert.equal(harness.elements.confirmTitle.textContent, "Save changes to Audit notes?");
+  assert.equal(harness.elements.confirmAction.textContent, "Save");
+  assert.equal(harness.elements.confirmSecondaryAction.textContent, "Don't save");
+  assert.equal(harness.elements.confirmSecondaryAction.hidden, false);
+  harness.respond("cancel");
+  await cancelled;
+  assert.equal(harness.posted.at(-1).message.reason, "cancelled");
+  assert.equal(harness.saveCalls(), 0);
+  assert.equal([...harness.timers.values()].some((timer) => timer.delay === 900), false);
+
+  const dropped = harness.request("documents-close-request-2");
+  harness.respond("secondary");
+  await dropped;
+  assert.equal(harness.posted.at(-1).message.ok, true);
+  assert.equal(harness.posted.at(-1).message.reason, "discarded");
+  assert.equal(harness.saveCalls(), 0);
+
+  const saving = createDocumentsHarness({ dirty: true, autosave: false });
+  const saved = saving.request();
+  saving.respond("confirm");
+  await saved;
+  assert.equal(saving.saveCalls(), 1);
+  assert.equal(saving.posted.at(-1).message.ok, true);
+});
+
+test("Home remembers the Documents Save automatically choice and tells every Documents window", () => {
+  const harness = createShellHarness();
+  const requestType = stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_REQUEST_TYPE");
+  const setType = stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_SET_TYPE");
+  const type = stringConstant(shellWindowsSource, "DOCUMENTS_PREFERENCES_TYPE");
+  assert.equal(stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_TYPE"), type);
+  assert.equal(stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_SET_TYPE"), setType);
+  assert.equal(stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_REQUEST_TYPE"), requestType);
+  const token = "documents-close-token";
+
+  harness.preference({ type: requestType, homeToken: token });
+  assert.deepEqual({ ...harness.posts.at(-1).message }, { type, homeToken: token, autosave: false });
+
+  // Wrong token, wrong sender or wrong shape change nothing.
+  harness.preference({ type: setType, homeToken: "other", autosave: true });
+  harness.preference({ type: setType, homeToken: token, autosave: true }, { source: {} });
+  harness.preference({ type: setType, homeToken: token, autosave: "yes" });
+  harness.preference({ type: setType, homeToken: token, autosave: true }, { origin: "https://evil.example" });
+  assert.equal(harness.shellState.shellLayoutState.documentsAutosave, false);
+  assert.equal(harness.savedLayouts.length, 0);
+
+  harness.preference({ type: setType, homeToken: token, autosave: true });
+  assert.equal(harness.shellState.shellLayoutState.documentsAutosave, true);
+  assert.deepEqual(harness.savedLayouts, [{ documentsAutosave: true }]);
+  assert.deepEqual({ ...harness.posts.at(-1).message }, { type, homeToken: token, autosave: true });
+
+  harness.preference({ type: requestType, homeToken: token });
+  assert.equal(harness.posts.at(-1).message.autosave, true);
+});
+
+test("Documents applies Home's remembered choice and turning it on restores the 900 ms autosave", () => {
+  const timers = new Map();
+  let nextTimerId = 1;
+  const posted = [];
+  const toggle = { attributes: {}, title: "", setAttribute(name, value) { this.attributes[name] = value; } };
+  const state = { homeToken: "tok", autosave: false, current: { doc_did: "doc-1" }, mode: "shell", dirty: true, currentSessionId: 1 };
+  const context = vm.createContext({
+    state,
+    elements: { autosaveToggle: toggle },
+    autosaveTimerId: 0,
+    saveRecovery: null,
+    pendingHomeWindowCloseTarget: null,
+    DOCUMENTS_PREFERENCES_TYPE: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_TYPE"),
+    DOCUMENTS_PREFERENCES_SET_TYPE: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_SET_TYPE"),
+    DOCUMENTS_PREFERENCES_REQUEST_TYPE: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_REQUEST_TYPE"),
+    window: {
+      parent: { postMessage(message) { posted.push(message); } },
+      setTimeout(callback, delay) { const id = nextTimerId++; timers.set(id, { callback, delay }); return id; },
+      clearTimeout(id) { timers.delete(id); },
+    },
+    saveCurrent: async () => {},
+    reportSaveFailure() {},
+  });
+  vm.runInContext(
+    ["hasExactKeys", "clearAutosaveTimer", "scheduleAutosave", "applyAutosavePreference", "toggleAutosavePreference",
+      "requestAutosavePreference", "handleAutosavePreferenceMessage"].map((name) => extractFunction(documentsSource, name)).join("\n") +
+      "\nthis.api = { scheduleAutosave, toggleAutosavePreference, requestAutosavePreference, handleAutosavePreferenceMessage };",
+    context,
+  );
+  const has900 = () => [...timers.values()].some((timer) => timer.delay === 900);
+  context.api.scheduleAutosave();
+  assert.equal(has900(), false);
+  context.api.requestAutosavePreference();
+  assert.deepEqual({ ...posted.at(-1) }, { type: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_REQUEST_TYPE"), homeToken: "tok" });
+
+  assert.equal(context.api.handleAutosavePreferenceMessage({ type: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_TYPE"), homeToken: "other", autosave: true }), false);
+  assert.equal(state.autosave, false);
+  assert.equal(context.api.handleAutosavePreferenceMessage({ type: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_TYPE"), homeToken: "tok", autosave: true }), true);
+  assert.equal(state.autosave, true);
+  assert.equal(toggle.attributes["aria-pressed"], "true");
+  assert.equal(has900(), true);
+
+  context.api.toggleAutosavePreference();
+  assert.equal(state.autosave, false);
+  assert.equal(has900(), false);
+  assert.deepEqual({ ...posted.at(-1) }, { type: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_SET_TYPE"), homeToken: "tok", autosave: false });
 });

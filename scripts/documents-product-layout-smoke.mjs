@@ -434,9 +434,9 @@ async function assertPhoneMoreMenu(page) {
   const ids = open.items.map((item) => item.id);
   assert(
     open.menuOpen && open.menuOnTop && open.expanded === "true" && open.menuInViewport
-      && ["save-as-button", "delete-button"].every((id) => ids.includes(id))
+      && ["autosave-toggle", "save-as-button", "delete-button"].every((id) => ids.includes(id))
       && !ids.some((id) => ["publish-button", "unpublish-button"].includes(id)),
-    `Documents phone: More must open on screen with Save as and Delete, and no Publish or Unpublish. Got ${JSON.stringify(open)}`,
+    `Documents phone: More must open on screen with Save automatically, Save as and Delete, and no Publish or Unpublish. Got ${JSON.stringify(open)}`,
   );
   assert(
     open.items.every((item) => item.height >= PHONE_TOUCH_TARGET_PX && item.label.length > 0),
@@ -841,6 +841,10 @@ async function run() {
       await parserPage.waitForFunction(() => (document.getElementById("preview")?.textContent || "").includes("# "));
 
       const incrementalBody = "# Typed heading\n\nBody after incremental edit.";
+      // "Save automatically" on brings back the 900 ms autosave.
+      await parserPage.locator("#autosave-toggle").click();
+      assert(await parserPage.locator("#autosave-toggle").getAttribute("aria-pressed") === "true",
+        "Save automatically must show it is on after it is turned on.");
       // Autosave stays quiet: the line under the title shows errors only.
       await parserPage.evaluate(() => {
         window.__statusShown = [];
@@ -869,6 +873,75 @@ async function run() {
       await parserPage.close();
     }
 
+    // "Save automatically" is off by default: edits wait for Save, Cmd/Ctrl+S
+    // or the unsaved-changes prompt when switching documents.
+    resetDocumentsFixture();
+    const manualPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    trackPage(manualPage, consoleErrors, pageErrors, failedRequests, errorResponses);
+    try {
+      await manualPage.goto(`http://127.0.0.1:${port}/apps/documents/?home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
+      await manualPage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
+      await manualPage.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
+      assert(await manualPage.locator("#autosave-toggle").getAttribute("aria-pressed") === "false",
+        "Save automatically must be off by default.");
+      await manualPage.locator("#editor").fill("# Beta\n\nFirst manual edit.");
+      await manualPage.waitForTimeout(1500);
+      assert(saveCalls.length === 0, `With Save automatically off nothing may save without an action. Got ${JSON.stringify(saveCalls)}`);
+      const unsavedMeta = await manualPage.locator('.document-list-item[data-doc-did="doc-beta"] .document-list-meta').textContent();
+      assert(unsavedMeta.includes("unsaved"), `The list must mark unsaved changes. Got ${unsavedMeta}`);
+
+      // Switching asks; Cancel keeps the edit and the document.
+      await manualPage.locator('.document-list-item[data-doc-did="doc-alpha"]').click();
+      await manualPage.locator("#confirm-modal.open").waitFor();
+      const prompt = await manualPage.evaluate(() => ({
+        title: document.getElementById("confirm-title")?.textContent || "",
+        save: document.getElementById("confirm-action")?.textContent || "",
+        dontSave: document.getElementById("confirm-secondary-action")?.textContent || "",
+        secondaryHidden: document.getElementById("confirm-secondary-action")?.hidden,
+        cancel: document.getElementById("confirm-cancel")?.textContent || "",
+      }));
+      assert(prompt.title === "Save changes to Beta?" && prompt.save === "Save" && prompt.dontSave === "Don't save" &&
+        prompt.secondaryHidden === false && prompt.cancel === "Cancel",
+        `Switching with unsaved changes must ask Save, Don't save or Cancel. Got ${JSON.stringify(prompt)}`);
+      await manualPage.locator("#confirm-cancel").click();
+      assert(await manualPage.locator("#title-input").inputValue() === "Beta" &&
+        await manualPage.locator("#editor").inputValue() === "# Beta\n\nFirst manual edit.",
+        "Cancel must keep the document and its edits.");
+      assert(saveCalls.length === 0, "Cancel must not save.");
+
+      // Save in the prompt saves, then switches.
+      await manualPage.locator('.document-list-item[data-doc-did="doc-alpha"]').click();
+      await manualPage.locator("#confirm-modal.open").waitFor();
+      await manualPage.locator("#confirm-action").click();
+      await manualPage.waitForFunction(() => document.getElementById("title-input")?.value === "Alpha");
+      assert(saveCalls.length === 1 && saveCalls[0].docDid === "doc-beta" && saveCalls[0].body === "# Beta\n\nFirst manual edit.",
+        `Save in the prompt must save the edits before switching. Got ${JSON.stringify(saveCalls)}`);
+
+      // Don't save drops the edit and switches.
+      await manualPage.locator("#editor").fill("# Alpha\n\nDropped edit.");
+      await manualPage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
+      await manualPage.locator("#confirm-modal.open").waitFor();
+      await manualPage.locator("#confirm-secondary-action").click();
+      await manualPage.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
+      assert(saveCalls.length === 1, "Don't save must not save.");
+      assert(!documents.get("doc-alpha").body.includes("Dropped edit."), "Don't save must leave the stored document unchanged.");
+
+      // Cmd/Ctrl+S saves.
+      await manualPage.locator("#editor").fill("# Beta\n\nKeyboard save.");
+      await manualPage.locator("#editor").press("ControlOrMeta+s");
+      await waitForCondition(() => saveCalls.length === 2 && saveCalls[1].body === "# Beta\n\nKeyboard save.", 4000,
+        `Cmd/Ctrl+S must save. Got ${JSON.stringify(saveCalls)}`);
+      await manualPage.waitForFunction(() => document.getElementById("save-button")?.disabled === true);
+
+      // The Save button saves.
+      await manualPage.locator("#editor").fill("# Beta\n\nButton save.");
+      await manualPage.getByRole("button", { name: "Save", exact: true }).click();
+      await waitForCondition(() => saveCalls.length === 3 && saveCalls[2].body === "# Beta\n\nButton save.", 4000,
+        `The Save button must save. Got ${JSON.stringify(saveCalls)}`);
+    } finally {
+      await manualPage.close();
+    }
+
     // Plain .md and .txt files in the Documents folder list beside Documents'
     // own, by the same sort and search, and open as Library files.
     resetDocumentsFixture();
@@ -891,6 +964,7 @@ async function run() {
 
       // Edits made while a listed file is still being read stay in the editor.
       await filesPage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
+      await filesPage.locator("#autosave-toggle").click();
       await filesPage.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
       heldLibraryRead = { started: createDeferred(), release: createDeferred() };
       const held = heldLibraryRead;
@@ -1079,6 +1153,7 @@ async function run() {
       await racePage.goto(`http://127.0.0.1:${port}/apps/documents/?home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
       await racePage.locator(".document-list-item").first().waitFor();
       await racePage.locator('.document-list-item[data-doc-did="doc-alpha"]').click();
+      await racePage.locator("#autosave-toggle").click();
       await racePage.waitForFunction(() => document.getElementById("title-input")?.value === "Alpha");
       const alphaSavedBody = "# Alpha\n\nThis autosave belongs to Alpha only.";
       const betaSavedBody = "# Beta\n\nThis autosave belongs to Beta only.";
@@ -1086,7 +1161,7 @@ async function run() {
       await delayedSave.started;
       await racePage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
       await racePage.locator("#confirm-modal.open").waitFor();
-      await racePage.locator("#confirm-action").click();
+      await racePage.locator("#confirm-secondary-action").click();
       await racePage.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
       await racePage.locator("#editor").fill(betaSavedBody);
       await racePage.waitForTimeout(1200);
@@ -1142,6 +1217,8 @@ async function run() {
       assert(documents.get("doc-alpha").body === "Winning body", "Stale page overwrote the winner.");
       assert(await windows[0].locator("#editor").inputValue() === "Keep losing draft", "Conflict erased the losing page draft.");
       assert(await windows[0].getByRole("button", { name: "Save", exact: true }).isEnabled(), "Conflicted draft must remain dirty and explicitly recoverable.");
+      // Even with Save automatically on, a conflict pauses automatic writes.
+      await windows[0].locator("#autosave-toggle").click();
       await windows[0].locator("#editor").fill("Newer losing draft");
       // Observe beyond the actual 900 ms autosave interval after another edit.
       await windows[0].waitForTimeout(1200);

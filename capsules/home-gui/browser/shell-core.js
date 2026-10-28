@@ -528,6 +528,8 @@ export function initializeShellLayout(summary) {
     desktopHidden: normalizedDesktopHidden,
     desktopIconsVisible: normalizeDesktopIconsVisible(stored ? stored.desktopIconsVisible : null),
     setupReminderDismissed: stored?.setupReminderDismissed === true,
+    // Documents "Save automatically"; off unless the person turned it on.
+    documentsAutosave: stored?.documentsAutosave === true,
   };
   // The phone arrangement, once the person has made one (shell-phone-home.js).
   const homeDock = normalizePhoneHomeIds(stored?.homeDock);

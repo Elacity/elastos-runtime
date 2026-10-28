@@ -357,6 +357,12 @@ const DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.documents.window-close.request/v1";
 const DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE =
   "elastos.documents.window-close.result/v1";
+const DOCUMENTS_PREFERENCES_REQUEST_TYPE =
+  "elastos.documents.preferences.request/v1";
+const DOCUMENTS_PREFERENCES_SET_TYPE =
+  "elastos.documents.preferences.set/v1";
+const DOCUMENTS_PREFERENCES_TYPE =
+  "elastos.documents.preferences/v1";
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const HOME_AGENT_TARGET_ID = "assistant";
 const MAX_SESSION_WINDOWS = 24;
@@ -396,6 +402,7 @@ const pendingDocumentsWindowCloses = new Map();
 
 window.addEventListener("message", handleBrowserWindowCloseResult);
 window.addEventListener("message", handleDocumentsWindowCloseResult);
+window.addEventListener("message", handleDocumentsPreferenceMessage);
 
 export function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
@@ -1239,6 +1246,53 @@ function handleDocumentsWindowCloseResult(event) {
     return;
   }
   settleDocumentsWindowClose(record, message.ok === true);
+}
+
+// Documents keeps its "Save automatically" choice in this person's Home
+// layout; its opaque frame owns no storage. A Documents window asks for the
+// choice or changes it; every open Documents window hears the result.
+function documentsPreferenceMessage(homeToken) {
+  return {
+    type: DOCUMENTS_PREFERENCES_TYPE,
+    homeToken,
+    autosave: shellState.shellLayoutState?.documentsAutosave === true,
+  };
+}
+
+function handleDocumentsPreferenceMessage(event) {
+  const message = event.data;
+  if (event.origin !== OPAQUE_CAPSULE_ORIGIN || !message || typeof message !== "object") {
+    return;
+  }
+  const isRequest = message.type === DOCUMENTS_PREFERENCES_REQUEST_TYPE &&
+    hasExactKeys(message, ["type", "homeToken"]);
+  const isUpdate = message.type === DOCUMENTS_PREFERENCES_SET_TYPE &&
+    hasExactKeys(message, ["type", "homeToken", "autosave"]) &&
+    typeof message.autosave === "boolean";
+  if (!isRequest && !isUpdate) {
+    return;
+  }
+  const contexts = [...shellState.windows.values()]
+    .map((entry) => documentsWindowCloseContext(entry))
+    .filter(Boolean);
+  const sender = contexts.find((context) => context.frameWindow === event.source);
+  if (!sender || sender.homeToken !== message.homeToken) {
+    return;
+  }
+  if (isRequest) {
+    sender.frameWindow.postMessage(documentsPreferenceMessage(sender.homeToken), "*");
+    return;
+  }
+  if (!shellState.shellLayoutState) {
+    return;
+  }
+  if (shellState.shellLayoutState.documentsAutosave !== message.autosave) {
+    shellState.shellLayoutState.documentsAutosave = message.autosave;
+    saveShellLayoutState();
+  }
+  for (const context of contexts) {
+    context.frameWindow.postMessage(documentsPreferenceMessage(context.homeToken), "*");
+  }
 }
 
 function requestBrowserWindowClose(entry) {

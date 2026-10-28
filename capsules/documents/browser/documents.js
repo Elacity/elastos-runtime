@@ -15,6 +15,8 @@ const state = {
   current: null,
   currentSessionId: 0,
   dirty: false,
+  // "Save automatically"; Home remembers the person's choice (off by default).
+  autosave: false,
   workspaceView: "write",
   inspectorView: "preview",
   sidebarCollapsed: false,
@@ -31,6 +33,12 @@ const DOCUMENTS_WINDOW_CLOSE_REQUEST_TYPE =
   "elastos.documents.window-close.request/v1";
 const DOCUMENTS_WINDOW_CLOSE_RESULT_TYPE =
   "elastos.documents.window-close.result/v1";
+const DOCUMENTS_PREFERENCES_REQUEST_TYPE =
+  "elastos.documents.preferences.request/v1";
+const DOCUMENTS_PREFERENCES_SET_TYPE =
+  "elastos.documents.preferences.set/v1";
+const DOCUMENTS_PREFERENCES_TYPE =
+  "elastos.documents.preferences/v1";
 
 const elements = {
   documentsShell: document.getElementById("documents-shell"),
@@ -40,6 +48,7 @@ const elements = {
   sidebarToggle: document.getElementById("sidebar-toggle"),
   sidebarShow: document.getElementById("sidebar-show"),
   saveButton: document.getElementById("save-button"),
+  autosaveToggle: document.getElementById("autosave-toggle"),
   saveAsButton: document.getElementById("save-as-button"),
   deleteButton: document.getElementById("delete-button"),
   statusRow: document.getElementById("status-row"),
@@ -497,6 +506,7 @@ function isCurrentDocumentTarget(target) {
 function scheduleAutosave() {
   clearAutosaveTimer();
   if (
+    !state.autosave ||
     !state.current ||
     state.mode !== "shell" ||
     !state.dirty ||
@@ -510,6 +520,72 @@ function scheduleAutosave() {
       reportSaveFailure(error, "Autosave failed.");
     });
   }, 900);
+}
+
+function applyAutosavePreference(enabled) {
+  state.autosave = enabled === true;
+  if (elements.autosaveToggle) {
+    elements.autosaveToggle.setAttribute("aria-pressed", String(state.autosave));
+    elements.autosaveToggle.title = state.autosave ? "Save automatically: on" : "Save automatically: off";
+  }
+  scheduleAutosave();
+}
+
+function toggleAutosavePreference() {
+  const enabled = !state.autosave;
+  applyAutosavePreference(enabled);
+  if (state.homeToken && window.parent !== window) {
+    window.parent.postMessage({ type: DOCUMENTS_PREFERENCES_SET_TYPE, homeToken: state.homeToken, autosave: enabled }, "*");
+  }
+}
+
+function requestAutosavePreference() {
+  if (state.homeToken && window.parent !== window) {
+    window.parent.postMessage({ type: DOCUMENTS_PREFERENCES_REQUEST_TYPE, homeToken: state.homeToken }, "*");
+  }
+}
+
+function handleAutosavePreferenceMessage(data) {
+  if (!hasExactKeys(data, ["type", "homeToken", "autosave"]) ||
+      data.type !== DOCUMENTS_PREFERENCES_TYPE ||
+      data.homeToken !== state.homeToken ||
+      typeof data.autosave !== "boolean") {
+    return false;
+  }
+  applyAutosavePreference(data.autosave);
+  return true;
+}
+
+function unsavedDocumentName() {
+  return elements.titleInput.value.trim() || state.current?.file_name || "Untitled";
+}
+
+// Unsaved edits ask before they leave the editor: Save keeps them, Don't save
+// drops them, Cancel stays. Resolves true when the caller may go on.
+async function resolveUnsavedChanges() {
+  if (!state.current || !state.dirty) return true;
+  const sessionId = state.currentSessionId;
+  clearAutosaveTimer();
+  const choice = await chooseInCapsule({
+    title: "Save changes to " + unsavedDocumentName() + "?",
+    message: "Your changes will be lost if you don't save them.",
+    confirmLabel: "Save",
+    secondaryLabel: "Don't save",
+    defaultFocus: "cancel",
+  });
+  if (sessionId !== state.currentSessionId) return false;
+  if (choice === "secondary") return true;
+  if (choice !== "confirm") {
+    scheduleAutosave();
+    return false;
+  }
+  try {
+    await saveCurrent();
+  } catch (error) {
+    reportSaveFailure(error, "Save failed.");
+    return false;
+  }
+  return sessionId === state.currentSessionId && !state.dirty;
 }
 
 function reportSaveFailure(error, fallback) {
@@ -1310,15 +1386,8 @@ async function selectLibraryFile(uri) {
   if (state.current && state.current.library_object_uri === uri) {
     return;
   }
-  if (state.current && state.dirty) {
-    const confirmed = await confirmInCapsule({
-      title: "Discard changes?",
-      message: "Open another document without saving this draft?",
-      confirmLabel: "Discard",
-    });
-    if (!confirmed) {
-      return;
-    }
+  if (!(await resolveUnsavedChanges())) {
+    return;
   }
   await loadLibraryObject(uri).catch((error) => {
     showError(readableDocumentsError(error, "This file could not be opened."));
@@ -1332,15 +1401,8 @@ async function openChatAttachment(payload) {
   }
   state.pendingChatAttachmentId = attachmentId;
   try {
-    if (state.current && state.dirty) {
-      const confirmed = await confirmInCapsule({
-        title: "Discard changes?",
-        message: "Open this Chat attachment without saving the current draft?",
-        confirmLabel: "Discard",
-      });
-      if (!confirmed) {
-        throw new Error("Opening cancelled in Documents.");
-      }
+    if (!(await resolveUnsavedChanges())) {
+      throw new Error("Opening cancelled in Documents.");
     }
     resetPendingSaveIntent();
     const mime = String(payload && payload.mimeType ? payload.mimeType : "application/octet-stream");
@@ -1397,20 +1459,17 @@ function sendChatAttachmentOpenResult({ attachmentId, ok, message }) {
 
 async function selectDocument(docDid, options) {
   const sequence = ++documentSelectionSequence;
-  const sessionId = state.currentSessionId;
-  const title = elements.titleInput.value;
-  const body = elements.editor.value;
   const force = !!(options && options.force);
   if (state.current && state.current.doc_did !== docDid && state.dirty) {
-    const confirmed = await confirmInCapsule({
-      title: "Discard changes?",
-      message: "Open another document without saving this draft?",
-      confirmLabel: "Discard",
-    });
-    if (!confirmed || sequence !== documentSelectionSequence || sessionId !== state.currentSessionId) {
+    const sessionBeforePrompt = state.currentSessionId;
+    const proceed = await resolveUnsavedChanges();
+    if (!proceed || sequence !== documentSelectionSequence || sessionBeforePrompt !== state.currentSessionId) {
       return;
     }
   }
+  const sessionId = state.currentSessionId;
+  const title = elements.titleInput.value;
+  const body = elements.editor.value;
   if (!force && state.current && state.current.doc_did === docDid && !state.dirty) {
     return;
   }
@@ -1429,15 +1488,8 @@ async function selectDocument(docDid, options) {
 }
 
 async function createDocument(title) {
-  if (state.current && state.dirty) {
-    const confirmed = await confirmInCapsule({
-      title: "Discard changes?",
-      message: "Create a new document without saving this draft?",
-      confirmLabel: "Discard",
-    });
-    if (!confirmed) {
-      return;
-    }
+  if (!(await resolveUnsavedChanges())) {
+    return;
   }
   startDraftDocument({ focusTitle: !title, focusEditor: !!title });
   if (title) {
@@ -1726,10 +1778,10 @@ async function requestHomeWindowCloseDecision(closeTarget) {
     return { ok: false, reason: "stale_request" };
   }
   const decision = await chooseInCapsule({
-    title: "Save changes before closing?",
-    message: "Save this document, discard your edits, or keep the window open.",
+    title: "Save changes to " + unsavedDocumentName() + "?",
+    message: "Your changes will be lost if you don't save them.",
     confirmLabel: "Save",
-    secondaryLabel: "Discard",
+    secondaryLabel: "Don't save",
     defaultFocus: "cancel",
   });
   if (!sameHomeWindowCloseTarget(closeTarget)) {
@@ -1995,6 +2047,7 @@ function wireShellEvents() {
       reportSaveFailure(error, "Save failed.");
     });
   });
+  elements.autosaveToggle.addEventListener("click", toggleAutosavePreference);
   elements.saveAsButton.addEventListener("click", openSaveAsModal);
   elements.deleteButton.addEventListener("click", requestDeleteCurrent);
   elements.sidebarToggle.addEventListener("click", () => {
@@ -2097,6 +2150,10 @@ function wireShellEvents() {
       void handleHomeWindowCloseRequest(event);
       return;
     }
+    if (data && typeof data === "object" && data.type === DOCUMENTS_PREFERENCES_TYPE) {
+      handleAutosavePreferenceMessage(data);
+      return;
+    }
     if (!data || typeof data !== "object" || data.type !== "elastos:menu-command" || typeof data.cmd !== "string") {
       return;
     }
@@ -2197,6 +2254,7 @@ async function loadShellMode() {
   setInspectorView("preview");
   wireShellEvents();
   announceHomeChrome();
+  requestAutosavePreference();
   try {
     await loadSummary();
   } catch (error) {
