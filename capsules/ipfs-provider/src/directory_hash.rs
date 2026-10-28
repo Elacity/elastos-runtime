@@ -1303,6 +1303,7 @@ mod tests {
                 gateway_port: 0,
                 started_at: 1,
                 last_used: 1,
+                offline: true,
             },
         );
         assert_eq!(
@@ -1467,6 +1468,7 @@ mod tests {
                 gateway_port: 0,
                 started_at: 1,
                 last_used: 1,
+                offline: true,
             },
         );
         let ready =
@@ -1815,6 +1817,7 @@ mod tests {
                 gateway_port: 0,
                 started_at: 1,
                 last_used: crate::now_unix_secs(),
+                offline: true,
             },
         );
         // One check every 500 ms, as a download does per window, for three idle limits.

@@ -20,6 +20,9 @@ mod directory_hash;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const KUBO_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const KUBO_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+// An online daemon from an earlier release may be closing many connections.
+const KUBO_MIGRATION_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const KUBO_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // Tests shorten the idle stop so it can be observed.
 #[cfg(not(test))]
 const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
@@ -548,6 +551,11 @@ struct CoordFile {
     gateway_port: u16,
     started_at: u64,
     last_used: u64,
+    /// Set only for a daemon started with `--offline`. A coord file without it
+    /// names a daemon from a release that ran Kubo online; it is never borrowed
+    /// and is stopped under the startup lock so the repo restarts offline.
+    #[serde(default)]
+    offline: bool,
 }
 
 // ── Provider ────────────────────────────────────────────────────────
@@ -583,10 +591,6 @@ impl IpfsProvider {
 
     fn api_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.api_port)
-    }
-
-    fn root_cid(arg: &str) -> &str {
-        arg.split('/').next().unwrap_or(arg)
     }
 
     fn kubo_cat_bytes(
@@ -625,48 +629,12 @@ impl IpfsProvider {
         }
     }
 
-    fn kubo_prefetch_cid(&mut self, cid: &str) -> Result<(), String> {
-        let url = kubo_rpc_url(self.api_port, "pin/add", &[("arg", cid)]);
-        match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
-            Ok(resp) if resp.status() == 200 => {
-                update_coord_last_used(&self.data_dir);
-                Ok(())
-            }
-            Ok(resp) => Err(format!("kubo pin -> HTTP {} for {}", resp.status(), cid)),
-            Err(e) => Err(format!("kubo pin -> {} for {}", e, cid)),
-        }
-    }
-
-    /// One whole read of `arg`, refused once it passes `limit` bytes.
+    /// One whole read of `arg` from this node's repo, refused once it passes
+    /// `limit` bytes. Kubo runs offline, so a miss fails at once and Content
+    /// goes to Carrier; no pin or gateway retry could find more.
     fn fetch_bytes(&mut self, arg: &str, limit: u64) -> Result<Vec<u8>, String> {
-        let mut failures = Vec::new();
-
-        if self.ensure_kubo().is_ok() {
-            match self.kubo_cat_bytes(arg, LARGE_HTTP_TIMEOUT, limit) {
-                Ok(bytes) => return Ok(bytes),
-                Err(err) if is_whole_content_too_large(&err) => return Err(err),
-                Err(err) => failures.push(err),
-            }
-
-            let root_cid = Self::root_cid(arg);
-            match self.kubo_prefetch_cid(root_cid) {
-                Ok(()) => match self.kubo_cat_bytes(arg, LARGE_HTTP_TIMEOUT, limit) {
-                    Ok(bytes) => return Ok(bytes),
-                    Err(err) if is_whole_content_too_large(&err) => return Err(err),
-                    Err(err) => failures.push(err),
-                },
-                Err(err) => failures.push(err),
-            }
-        }
-
-        match self.fetch_from_local_gateway_with_timeout(arg, LARGE_HTTP_TIMEOUT, limit) {
-            Ok(bytes) => Ok(bytes),
-            Err(err) if is_whole_content_too_large(&err) => Err(err),
-            Err(err) => {
-                failures.push(err);
-                Err(failures.join("; "))
-            }
-        }
+        self.ensure_kubo()?;
+        self.kubo_cat_bytes(arg, LARGE_HTTP_TIMEOUT, limit)
     }
 
     /// One whole read of `arg` from this node's repo only, refused once it
@@ -720,7 +688,7 @@ impl IpfsProvider {
 
     fn fetch_to_path(&mut self, arg: &str, dest: &Path) -> Result<u64, String> {
         // Dest copies borrow a local repo hit, then Content fails over to
-        // Carrier. Pin/add and gateway fallback search the public swarm.
+        // Carrier.
         if self.ensure_kubo().is_ok() {
             self.kubo_cat_to_path(arg, dest, LARGE_HTTP_TIMEOUT)
         } else {
@@ -938,9 +906,17 @@ impl IpfsProvider {
             }
         }
 
-        // Check coord file for running Kubo instance
+        // Borrow a running offline Kubo. One an earlier release started online
+        // is stopped now, so an update ends its public-network activity; the
+        // next operation starts the repo offline.
         if let Some(coord) = read_coord_file(&self.data_dir) {
-            if is_pid_alive(coord.kubo_pid) {
+            if !is_pid_alive(coord.kubo_pid) {
+                eprintln!(
+                    "ipfs-provider: stale coord file (pid {} dead), removing",
+                    coord.kubo_pid
+                );
+                remove_coord_file(&self.data_dir);
+            } else if coord.offline {
                 eprintln!(
                     "ipfs-provider: reusing existing Kubo (pid={}, api={})",
                     coord.kubo_pid, coord.api_port
@@ -949,12 +925,8 @@ impl IpfsProvider {
                 self.gateway_port = coord.gateway_port;
                 self.state = KuboState::Ready;
                 update_coord_last_used(&self.data_dir);
-            } else {
-                eprintln!(
-                    "ipfs-provider: stale coord file (pid {} dead), removing",
-                    coord.kubo_pid
-                );
-                remove_coord_file(&self.data_dir);
+            } else if let Err(error) = stop_online_kubo_with_lock(&self.data_dir) {
+                eprintln!("ipfs-provider: {error}");
             }
         }
 
@@ -987,20 +959,23 @@ impl IpfsProvider {
             self.kubo_child = None;
         }
         if self.state == KuboState::Ready {
-            // Verify still alive
+            // Verify still alive and offline
             if let Some(coord) = read_coord_file(&self.data_dir) {
-                if is_pid_alive(coord.kubo_pid) {
+                let alive = is_pid_alive(coord.kubo_pid);
+                if alive && coord.offline {
                     self.api_port = coord.api_port;
                     self.gateway_port = coord.gateway_port;
                     update_coord_last_used(&self.data_dir);
                     return Ok(());
                 }
-                // PID died — remove stale coord and re-start
-                eprintln!(
-                    "ipfs-provider: Kubo pid {} died, restarting",
-                    coord.kubo_pid
-                );
-                remove_coord_file(&self.data_dir);
+                if !alive {
+                    // PID died — remove stale coord and re-start
+                    eprintln!(
+                        "ipfs-provider: Kubo pid {} died, restarting",
+                        coord.kubo_pid
+                    );
+                    remove_coord_file(&self.data_dir);
+                }
             }
             self.state = KuboState::Cold;
         }
@@ -1019,28 +994,22 @@ impl IpfsProvider {
     }
 
     fn start_kubo_with_lock(&mut self) -> Result<(), String> {
-        let lockfile_path = self.data_dir.join("ipfs-startup.lock");
-        fs::create_dir_all(&self.data_dir)
-            .map_err(|e| format!("Failed to create data dir: {}", e))?;
-
-        let lockfile = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&lockfile_path)
-            .map_err(|e| format!("Failed to open lockfile: {}", e))?;
+        let lockfile = open_startup_lock(&self.data_dir)?;
 
         // Try exclusive lock (non-blocking)
         if try_flock_exclusive(&lockfile) {
             // We got the lock — check coord file again (another process may have finished)
             if let Some(coord) = read_coord_file(&self.data_dir) {
                 if is_pid_alive(coord.kubo_pid) {
-                    self.api_port = coord.api_port;
-                    self.gateway_port = coord.gateway_port;
-                    self.state = KuboState::Ready;
-                    update_coord_last_used(&self.data_dir);
-                    // Lock is released on drop
-                    return Ok(());
+                    if coord.offline {
+                        self.api_port = coord.api_port;
+                        self.gateway_port = coord.gateway_port;
+                        self.state = KuboState::Ready;
+                        update_coord_last_used(&self.data_dir);
+                        // Lock is released on drop
+                        return Ok(());
+                    }
+                    stop_online_kubo(coord.kubo_pid)?;
                 }
                 remove_coord_file(&self.data_dir);
             }
@@ -1054,7 +1023,7 @@ impl IpfsProvider {
             loop {
                 std::thread::sleep(LOCKFILE_POLL_INTERVAL);
                 if let Some(coord) = read_coord_file(&self.data_dir) {
-                    if is_pid_alive(coord.kubo_pid) {
+                    if coord.offline && is_pid_alive(coord.kubo_pid) {
                         self.api_port = coord.api_port;
                         self.gateway_port = coord.gateway_port;
                         self.state = KuboState::Ready;
@@ -1099,29 +1068,16 @@ impl IpfsProvider {
         let gw_port =
             bind_free_port().map_err(|e| format!("Failed to bind gateway port: {}", e))?;
 
-        // Kubo v0.40.x does not support --gateway CLI flag, so set gateway in repo config.
-        let gw_addr = format!("/ip4/127.0.0.1/tcp/{}", gw_port);
-        let gw_cfg = Command::new(binary)
-            .args(["config", "Addresses.Gateway", &gw_addr])
-            .env("IPFS_PATH", &self.repo_dir)
-            .output()
-            .map_err(|e| format!("Failed to set Kubo gateway address: {}", e))?;
-        if !gw_cfg.status.success() {
-            let stderr = String::from_utf8_lossy(&gw_cfg.stderr);
-            return Err(format!(
-                "kubo config Addresses.Gateway failed: {}",
-                stderr.trim()
-            ));
+        // Kubo v0.40.x has no --gateway flag, so the loopback gateway lives in
+        // the repo config, rewritten with the local-store settings each start.
+        if let Err(error) = write_local_store_config(&self.repo_dir, gw_port) {
+            self.state = KuboState::Error;
+            return Err(error);
         }
 
         // Start Kubo daemon
         let child = Command::new(binary)
-            .args([
-                "daemon",
-                "--api",
-                &format!("/ip4/127.0.0.1/tcp/{}", api_port),
-                "--enable-gc",
-            ])
+            .args(kubo_daemon_args(api_port))
             .env("IPFS_PATH", &self.repo_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1197,6 +1153,7 @@ impl IpfsProvider {
             gateway_port: gw_port,
             started_at: now_unix_secs(),
             last_used: now_unix_secs(),
+            offline: true,
         };
         write_coord_file(&self.data_dir, &coord);
 
@@ -1364,8 +1321,8 @@ impl IpfsProvider {
             if self.state != KuboState::Ready || self.api_port == 0 {
                 return Err("bounded read backend is not ready".into());
             }
-            let coord =
-                read_coord_file(&self.data_dir).filter(|coord| is_pid_alive(coord.kubo_pid));
+            let coord = read_coord_file(&self.data_dir)
+                .filter(|coord| coord.offline && is_pid_alive(coord.kubo_pid));
             let Some(coord) = coord else {
                 self.state = KuboState::Cold;
                 return Err("bounded read backend is not ready".into());
@@ -1515,33 +1472,29 @@ impl IpfsProvider {
     }
 
     fn ls(&mut self, cid: &str) -> Response {
-        // Try Kubo first
-        if self.ensure_kubo().is_ok() {
-            let url = kubo_rpc_url(self.api_port, "ls", &[("arg", cid)]);
-            if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
-                if resp.status() == 200 {
-                    if let Ok(body) = resp.into_string() {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                            let mut entries = Vec::new();
-                            collect_ls_entries(&json, "", &mut entries);
-                            update_coord_last_used(&self.data_dir);
-                            return Response::ok(serde_json::json!({ "entries": entries }));
-                        }
-                    }
-                }
-            }
-        }
-
-        match self.fetch_local_files_json(cid) {
-            Ok(files) => {
-                let entries: Vec<serde_json::Value> = files
-                    .iter()
-                    .map(|f| serde_json::json!({"name": f, "hash": "", "size": 0, "type": "file"}))
-                    .collect();
+        match self.kubo_ls(cid) {
+            Ok(json) => {
+                let mut entries = Vec::new();
+                collect_ls_entries(&json, "", &mut entries);
+                update_coord_last_used(&self.data_dir);
                 Response::ok(serde_json::json!({ "entries": entries }))
             }
             Err(e) => Response::error("ls_failed", &e),
         }
+    }
+
+    /// Kubo's listing of `cid` from this node's repo (Kubo runs offline).
+    fn kubo_ls(&mut self, cid: &str) -> Result<serde_json::Value, String> {
+        self.ensure_kubo()?;
+        let url = kubo_rpc_url(self.api_port, "ls", &[("arg", cid)]);
+        let resp = ureq::post(&url)
+            .timeout(HTTP_TIMEOUT)
+            .call()
+            .map_err(|e| format!("kubo ls -> {e} for {cid}"))?;
+        let body = resp
+            .into_string()
+            .map_err(|e| format!("kubo ls -> {e} for {cid}"))?;
+        serde_json::from_str(&body).map_err(|e| format!("kubo ls -> {e} for {cid}"))
     }
 
     fn download_directory(&mut self, cid: &str, dest: &str) -> Response {
@@ -1586,34 +1539,11 @@ impl IpfsProvider {
 
             let arg = format!("{}/{}", cid, file_path);
 
-            let bytes = if self.ensure_kubo().is_ok() {
-                let url = kubo_rpc_url(self.api_port, "cat", &[("arg", &arg)]);
-                match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
-                    Ok(resp) if resp.status() == 200 => {
-                        let mut buf = Vec::new();
-                        resp.into_reader().read_to_end(&mut buf).ok();
-                        Some(buf)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            let bytes = match bytes {
-                Some(b) => b,
-                None => {
-                    match self.fetch_from_local_gateway_with_timeout(
-                        &arg,
-                        LARGE_HTTP_TIMEOUT,
-                        WHOLE_CONTENT_CEILING,
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            errors.push(format!("{}: {}", file_path, e));
-                            continue;
-                        }
-                    }
+            let bytes = match self.fetch_bytes(&arg, WHOLE_CONTENT_CEILING) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    errors.push(format!("{}: {}", file_path, e));
+                    continue;
                 }
             };
 
@@ -1936,95 +1866,14 @@ impl IpfsProvider {
         )
     }
 
-    // ── Internal: local IPFS gateway only ──────────────────────────
-
-    fn fetch_from_local_gateway_with_timeout(
-        &self,
-        arg: &str,
-        timeout: Duration,
-        limit: u64,
-    ) -> Result<Vec<u8>, String> {
-        if self.gateway_port == 0 {
-            return Err(format!(
-                "local Elastos IPFS gateway unavailable for {}. No HTTP fallback is allowed.",
-                arg
-            ));
-        }
-
-        let url = local_gateway_url(self.gateway_port, arg);
-        match ureq::get(&url).timeout(timeout).call() {
-            Ok(resp) if resp.status() == 200 => {
-                read_whole_content(resp.into_reader(), "local Elastos IPFS gateway", limit)
-            }
-            Ok(resp) => Err(format!(
-                "local Elastos IPFS gateway -> HTTP {} for {}. No HTTP fallback is allowed.",
-                resp.status(),
-                arg
-            )),
-            Err(e) => Err(format!(
-                "local Elastos IPFS gateway -> {} for {}. No HTTP fallback is allowed.",
-                e, arg
-            )),
-        }
-    }
-
-    fn fetch_local_files_json(&self, cid: &str) -> Result<Vec<String>, String> {
-        if self.gateway_port == 0 {
-            return Err(format!(
-                "local Elastos IPFS gateway unavailable for {}/_files.json. No HTTP fallback is allowed.",
-                cid
-            ));
-        }
-
-        let url = local_gateway_url(self.gateway_port, &format!("{cid}/_files.json"));
-        let resp = ureq::get(&url).timeout(HTTP_TIMEOUT).call().map_err(|e| {
-            format!(
-                "local Elastos IPFS gateway -> {} for {}/_files.json. No HTTP fallback is allowed.",
-                e, cid
-            )
-        })?;
-
-        if resp.status() != 200 {
-            return Err(format!(
-                "local Elastos IPFS gateway -> HTTP {} for {}/_files.json. No HTTP fallback is allowed.",
-                resp.status(),
-                cid
-            ));
-        }
-
-        let body = resp
-            .into_string()
-            .map_err(|e| format!("Failed to read _files.json: {}", e))?;
-        let mut files = serde_json::from_str::<Vec<String>>(&body)
-            .map_err(|e| format!("Invalid _files.json for {}: {}", cid, e))?;
-        for f in ["index.html", "_files.json"] {
-            if !files.contains(&f.to_string()) {
-                files.push(f.to_string());
-            }
+    fn list_dir_files(&mut self, cid: &str) -> Result<Vec<String>, String> {
+        let json = self.kubo_ls(cid)?;
+        let mut files = Vec::new();
+        collect_ls_files_recursive(self, &json, "", &mut files);
+        if files.is_empty() {
+            return Err(format!("kubo ls -> no files under {cid}"));
         }
         Ok(files)
-    }
-
-    fn list_dir_files(&mut self, cid: &str) -> Result<Vec<String>, String> {
-        // Try Kubo API first
-        if self.ensure_kubo().is_ok() {
-            let url = kubo_rpc_url(self.api_port, "ls", &[("arg", cid)]);
-            if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
-                if resp.status() == 200 {
-                    if let Ok(body) = resp.into_string() {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                            let mut files = Vec::new();
-                            collect_ls_files_recursive(self, &json, "", &mut files);
-                            if !files.is_empty() {
-                                return Ok(files);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        self.fetch_local_files_json(cid)
     }
 }
 
@@ -2221,17 +2070,210 @@ fn try_flock_exclusive(_file: &fs::File) -> bool {
     true
 }
 
+fn open_startup_lock(data_dir: &Path) -> Result<fs::File, String> {
+    fs::create_dir_all(data_dir).map_err(|e| format!("Failed to create data dir: {}", e))?;
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(data_dir.join("ipfs-startup.lock"))
+        .map_err(|e| format!("Failed to open lockfile: {}", e))
+}
+
+// ── Offline Kubo ────────────────────────────────────────────────────
+
+/// `--offline` runs Kubo with no swarm, bitswap, DHT or provide, so this repo
+/// is a local content store and a missing CID fails at once. Content moves
+/// between Homes only over Carrier.
+fn kubo_daemon_args(api_port: u16) -> [String; 5] {
+    [
+        "daemon".into(),
+        "--offline".into(),
+        "--api".into(),
+        format!("/ip4/127.0.0.1/tcp/{api_port}"),
+        "--enable-gc".into(),
+    ]
+}
+
+/// Sets the repo config so Kubo neither announces nor routes even if someone
+/// starts it without `--offline`: no swarm listener, bootstrap, routing,
+/// provide, LAN discovery, AutoConf fetch or telemetry; the gateway stays on
+/// loopback. Kubo refuses AutoConf `auto` placeholders once AutoConf is off,
+/// so DNS keeps only explicitly configured resolvers.
+fn apply_local_store_config(
+    config: &mut serde_json::Value,
+    gateway_port: u16,
+) -> Result<(), String> {
+    use serde_json::json;
+    let settings: [(&[&str], serde_json::Value); 10] = [
+        (
+            &["Addresses", "Gateway"],
+            json!(format!("/ip4/127.0.0.1/tcp/{gateway_port}")),
+        ),
+        (&["Addresses", "Swarm"], json!([])),
+        (&["Bootstrap"], json!([])),
+        (&["Routing", "Type"], json!("none")),
+        (&["Routing", "DelegatedRouters"], json!([])),
+        (&["Ipns", "DelegatedPublishers"], json!([])),
+        (&["Provide", "Enabled"], json!(false)),
+        (&["Discovery", "MDNS", "Enabled"], json!(false)),
+        (&["AutoConf", "Enabled"], json!(false)),
+        (
+            &["Plugins", "Plugins", "telemetry", "Config", "Mode"],
+            json!("off"),
+        ),
+    ];
+    for (path, value) in settings {
+        *kubo_config_entry(config, path)? = value;
+    }
+    let resolvers = kubo_config_entry(config, &["DNS", "Resolvers"])?;
+    match resolvers.as_object_mut() {
+        Some(resolvers) => resolvers.retain(|_, resolver| resolver.as_str() != Some("auto")),
+        None => *resolvers = json!({}),
+    }
+    Ok(())
+}
+
+/// The config value at `path`, creating missing or null objects on the way
+/// (`kubo init` writes `"Plugins": {"Plugins": null}`).
+fn kubo_config_entry<'a>(
+    config: &'a mut serde_json::Value,
+    path: &[&str],
+) -> Result<&'a mut serde_json::Value, String> {
+    let mut node = config;
+    for key in path {
+        if node.is_null() {
+            *node = serde_json::Value::Object(Default::default());
+        }
+        node = node
+            .as_object_mut()
+            .ok_or_else(|| format!("Kubo config above {} is not an object", path.join(".")))?
+            .entry(*key)
+            .or_insert(serde_json::Value::Null);
+    }
+    Ok(node)
+}
+
+/// Rewrites `repo/config` with `apply_local_store_config`, keeping it
+/// owner-only (it holds the node key). Runs with no daemon on the repo.
+fn write_local_store_config(repo_dir: &Path, gateway_port: u16) -> Result<(), String> {
+    let path = repo_dir.join("config");
+    let bytes = fs::read(&path).map_err(|e| format!("Failed to read Kubo config: {e}"))?;
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("Invalid Kubo config: {e}"))?;
+    apply_local_store_config(&mut config, gateway_port)?;
+    let body =
+        serde_json::to_vec_pretty(&config).map_err(|e| format!("Kubo config encode: {e}"))?;
+    let tmp = repo_dir.join("config.elastos-tmp");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&tmp)
+        .map_err(|e| format!("Failed to write Kubo config: {e}"))?;
+    file.write_all(&body)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&tmp, &path))
+        .map_err(|e| format!("Failed to write Kubo config: {e}"))
+}
+
+/// Init's migration: stops an online daemon now unless another process holds
+/// the startup lock, which then replaces it on its own start.
+fn stop_online_kubo_with_lock(data_dir: &Path) -> Result<(), String> {
+    let lockfile = open_startup_lock(data_dir)?;
+    if !try_flock_exclusive(&lockfile) {
+        return Ok(());
+    }
+    if let Some(coord) = read_coord_file(data_dir) {
+        if coord.offline {
+            return Ok(());
+        }
+        if is_pid_alive(coord.kubo_pid) {
+            stop_online_kubo(coord.kubo_pid)?;
+        }
+        remove_coord_file(data_dir);
+    }
+    Ok(())
+}
+
+/// Stops a daemon an earlier release started online, under the startup lock,
+/// so the same repo restarts offline. SIGTERM lets Kubo close the repo
+/// cleanly; a daemon still running after `KUBO_MIGRATION_STOP_TIMEOUT` is
+/// killed. One that never exits keeps its coord and the restart is refused,
+/// so a second daemon never opens the repo.
+fn stop_online_kubo(pid: u32) -> Result<(), String> {
+    eprintln!("ipfs-provider: stopping online Kubo pid={pid}; it restarts offline");
+    for (force, timeout) in [
+        (false, KUBO_MIGRATION_STOP_TIMEOUT),
+        (true, KUBO_STOP_TIMEOUT),
+    ] {
+        signal_stop(pid, force);
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if pid_exited(pid) {
+                return Ok(());
+            }
+            std::thread::sleep(KUBO_STOP_POLL_INTERVAL);
+        }
+    }
+    if pid_exited(pid) {
+        return Ok(());
+    }
+    Err(format!(
+        "online Kubo pid {pid} did not stop; offline restart refused"
+    ))
+}
+
+fn signal_stop(pid: u32, force: bool) {
+    #[cfg(unix)]
+    {
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+        unsafe { libc::kill(pid as i32, signal) };
+    }
+    #[cfg(not(unix))]
+    {
+        let pid = pid.to_string();
+        let mut args = vec!["/PID", pid.as_str()];
+        if force {
+            args.push("/F");
+        }
+        let _ = Command::new("taskkill").args(args).output();
+    }
+}
+
+/// Whether `pid` no longer runs. A stopped daemon whose parent has not reaped
+/// it yet is a zombie: it holds no repo lock and counts as exited.
+fn pid_exited(pid: u32) -> bool {
+    if !is_pid_alive(pid) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .trim_start()
+                    .starts_with('Z')
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// The largest file any whole read may return (one shared constant with
 /// Runtime's Carrier transfers).
 const WHOLE_CONTENT_CEILING: u64 = elastos_common::MAX_WHOLE_CONTENT_BYTES as u64;
 
-// Starts every refusal of content past a whole read's limit. That refusal is
-// final: another route would read the same content again.
+// Starts every refusal of content past a whole read's limit.
 use elastos_common::WHOLE_CONTENT_TOO_LARGE;
-
-fn is_whole_content_too_large(error: &str) -> bool {
-    error.starts_with(WHOLE_CONTENT_TOO_LARGE)
-}
 
 /// Read one whole file into memory, refusing it once it passes `limit`, before
 /// more than `limit` bytes are buffered.
@@ -2260,29 +2302,6 @@ fn kubo_rpc_url(api_port: u16, command: &str, query: &[(&str, &str)]) -> String 
     if !query.is_empty() {
         url.query_pairs_mut().extend_pairs(query);
     }
-    url.into()
-}
-
-/// Local Kubo gateway URL for the IPFS path `arg` (`cid` or `cid/path`). Each
-/// segment is percent-encoded on its own, so query, fragment and escape
-/// characters stay part of the file name.
-fn local_gateway_url(gateway_port: u16, arg: &str) -> String {
-    const SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
-        .remove(b'-')
-        .remove(b'.')
-        .remove(b'_')
-        .remove(b'~');
-    let path: String = std::iter::once("ipfs")
-        .chain(arg.split('/'))
-        .map(|segment| {
-            format!(
-                "/{}",
-                percent_encoding::utf8_percent_encode(segment, SEGMENT)
-            )
-        })
-        .collect();
-    let mut url = local_backend_url(gateway_port);
-    url.set_path(&path);
     url.into()
 }
 
@@ -3184,6 +3203,7 @@ mod tests {
                 gateway_port: port,
                 started_at: 1,
                 last_used: 1,
+                offline: true,
             },
         );
         IpfsProvider {
@@ -3312,49 +3332,43 @@ mod tests {
     #[test]
     fn whole_read_past_its_limit_is_refused_while_reading() {
         let limit = elastos_common::MAX_WHOLE_CONTENT_BYTES as u64;
-        // The direct Kubo read and the local gateway once Kubo and pinning
-        // fail; a read carrying its own limit is in
+        // The local Kubo read; a read carrying its own limit is in
         // `whole_bounded_cat_hit_past_its_limit_is_refused_while_reading`.
-        for (case, served_by) in [("kubo", "POST /api/v0/cat"), ("gateway", "GET /ipfs/")] {
-            let root = tempfile::tempdir().unwrap();
-            // One answer of three times the limit, with no declared length.
-            let (port, backend) = kubo_answering(served_by, move |socket| {
-                if socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
-                    .is_err()
-                {
-                    return 0;
-                }
-                write_body(socket, 3 * limit, |_| b'a')
-            });
-            let mut provider = bounded_cat_fixture_provider(root.path(), port);
-            let request = serde_json::json!({"op": "cat", "cid": "large-cid"});
-            let response = provider.handle(serde_json::from_value(request).unwrap());
-            let (requests, sent) = backend.join().unwrap();
-            match &response {
-                Response::Error { code, message } => {
-                    assert_eq!(code, "cat_failed", "{case}");
-                    assert_eq!(
-                        message,
-                        &format!("{WHOLE_CONTENT_TOO_LARGE} of {limit} bytes"),
-                        "{case}"
-                    );
-                }
-                Response::Ok { .. } => panic!("{case}: content past the limit was returned"),
+        let served_by = "POST /api/v0/cat";
+        let root = tempfile::tempdir().unwrap();
+        // One answer of three times the limit, with no declared length.
+        let (port, backend) = kubo_answering(served_by, move |socket| {
+            if socket
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .is_err()
+            {
+                return 0;
             }
-            assert!(
-                sent < 2 * limit,
-                "{case}: the provider read on past the limit ({sent} bytes sent)"
-            );
-            assert_eq!(
-                requests
-                    .iter()
-                    .filter(|line| line.starts_with(served_by))
-                    .count(),
-                1,
-                "{case}: a refused read is not repeated: {requests:?}"
-            );
+            write_body(socket, 3 * limit, |_| b'a')
+        });
+        let mut provider = bounded_cat_fixture_provider(root.path(), port);
+        let request = serde_json::json!({"op": "cat", "cid": "large-cid"});
+        let response = provider.handle(serde_json::from_value(request).unwrap());
+        let (requests, sent) = backend.join().unwrap();
+        match &response {
+            Response::Error { code, message } => {
+                assert_eq!(code, "cat_failed");
+                assert_eq!(
+                    message,
+                    &format!("{WHOLE_CONTENT_TOO_LARGE} of {limit} bytes")
+                );
+            }
+            Response::Ok { .. } => panic!("content past the limit was returned"),
         }
+        assert!(
+            sent < 2 * limit,
+            "the provider read on past the limit ({sent} bytes sent)"
+        );
+        assert_eq!(
+            requests,
+            [format!("{served_by}?arg=large-cid HTTP/1.1")],
+            "a refused read is not repeated"
+        );
     }
 
     #[test]
@@ -3389,8 +3403,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn immediate_recovery_read_reaps_delayed_previous_daemon_before_replacement() {
-        use std::os::unix::fs::PermissionsExt;
-
         let root = tempfile::tempdir().unwrap();
         let mut previous = Command::new("sh")
             .args(["-c", "trap 'sleep 1; exit 0' TERM; printf ready; read line"])
@@ -3412,10 +3424,7 @@ mod tests {
         remove_coord_file(root.path());
 
         // The replacement fixture exposes only the startup health and cat calls.
-        let kubo = root.path().join("kubo-fixture");
-        fs::write(&kubo, "#!/bin/sh\ncase \"$1\" in\ndaemon) printf '%s' \"$3\" > \"$IPFS_PATH.started\"; exec sleep 60;;\n*) exit 0;;\nesac\n").unwrap();
-        fs::set_permissions(&kubo, fs::Permissions::from_mode(0o700)).unwrap();
-        provider.kubo_binary = Some(kubo);
+        provider.kubo_binary = Some(kubo_fixture(root.path()));
         let started_path = provider.repo_dir.with_extension("started");
         let backend = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(12);
@@ -3488,6 +3497,430 @@ mod tests {
         assert!(elapsed >= KUBO_STOP_TIMEOUT);
         assert!(elapsed < KUBO_STOP_TIMEOUT * 2 + LOCKFILE_POLL_INTERVAL);
         assert!(!is_pid_alive(previous_pid));
+    }
+
+    /// A Kubo stand-in: `init` writes a config with an identity, `daemon`
+    /// records its arguments and API address, then sleeps; others succeed.
+    #[cfg(unix)]
+    fn kubo_fixture(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let kubo = root.join("kubo-fixture");
+        fs::write(
+            &kubo,
+            "#!/bin/sh\ncase \"$1\" in\n\
+             init) mkdir -p \"$IPFS_PATH\" && printf '%s' '{\"Identity\":{\"PeerID\":\"fixture-peer\"},\"Bootstrap\":[\"auto\"],\"DNS\":{\"Resolvers\":{\".\":\"auto\",\"eth.\":\"https://dns.example/dns-query\"}}}' > \"$IPFS_PATH/config\";;\n\
+             daemon) printf '%s' \"$*\" > \"$IPFS_PATH.args\"; printf '%s' \"$4\" > \"$IPFS_PATH.started\"; exec sleep 60;;\n\
+             *) exit 0;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&kubo, fs::Permissions::from_mode(0o700)).unwrap();
+        kubo
+    }
+
+    /// Answers the health call of the daemon `kubo_fixture` starts for
+    /// `repo_dir`; returns its API port.
+    fn answer_fixture_health(repo_dir: PathBuf) -> std::thread::JoinHandle<u16> {
+        std::thread::spawn(move || {
+            let started_path = repo_dir.with_extension("started");
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let port = loop {
+                if let Some(port) = fs::read_to_string(&started_path)
+                    .ok()
+                    .and_then(|address| address.rsplit('/').next()?.parse::<u16>().ok())
+                {
+                    break port;
+                }
+                assert!(Instant::now() < deadline, "offline daemon was not started");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut health = accept_bounded_fixture(&listener);
+            assert!(read_bounded_fixture_headers(&mut health).starts_with("POST /api/v0/id"));
+            health
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+            port
+        })
+    }
+
+    fn cold_fixture_provider(root: &Path) -> IpfsProvider {
+        let mut provider = bounded_cat_fixture_provider(root, 0);
+        remove_coord_file(root);
+        provider.state = KuboState::Cold;
+        provider.repo_dir = root.join("ipfs-repo");
+        provider.api_port = 0;
+        provider.gateway_port = 0;
+        provider
+    }
+
+    /// Stops the daemon a fixture provider started.
+    fn stop_fixture_daemon(provider: &mut IpfsProvider) {
+        if let Some(mut child) = provider.kubo_child.take() {
+            let _ = child.kill();
+            child.wait().unwrap();
+        }
+    }
+
+    /// A live process standing in for an online daemon an earlier release
+    /// started, recorded in a coord file without `offline`.
+    fn online_daemon_coord(root: &Path, api_port: u16) -> Child {
+        let daemon = Command::new("sleep").arg("60").spawn().unwrap();
+        fs::write(
+            coord_file_path(root),
+            serde_json::to_vec(&serde_json::json!({
+                "kubo_pid": daemon.id(), "api_port": api_port, "gateway_port": api_port,
+                "started_at": 1, "last_used": now_unix_secs(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        daemon
+    }
+
+    #[test]
+    fn kubo_daemon_runs_offline() {
+        assert_eq!(
+            kubo_daemon_args(5001),
+            [
+                "daemon",
+                "--offline",
+                "--api",
+                "/ip4/127.0.0.1/tcp/5001",
+                "--enable-gc"
+            ]
+        );
+    }
+
+    #[test]
+    fn local_store_config_neither_announces_nor_routes() {
+        // As `kubo init` 0.40.1 writes it, with its AutoConf placeholders.
+        let mut config = serde_json::json!({
+            "Identity": {"PeerID": "12D3KooWfixture", "PrivKey": "secret"},
+            "Addresses": {"API": "/ip4/127.0.0.1/tcp/5001", "Gateway": "/ip4/127.0.0.1/tcp/8080",
+                "Swarm": ["/ip4/0.0.0.0/tcp/4001", "/ip6/::/udp/4001/quic-v1"]},
+            "Bootstrap": ["auto"],
+            "DNS": {"Resolvers": {".": "auto", "eth.": "https://dns.example/dns-query"}},
+            "Ipns": {"DelegatedPublishers": ["auto"], "ResolveCacheSize": 128},
+            "Routing": {"DelegatedRouters": ["auto"]},
+            "Provide": {"DHT": {}},
+            "Discovery": {"MDNS": {"Enabled": true}},
+            "AutoConf": {},
+            "Plugins": {"Plugins": null},
+            "Datastore": {"StorageMax": "10GB"},
+        });
+        apply_local_store_config(&mut config, 4242).unwrap();
+        let expected = serde_json::json!({
+            "Identity": {"PeerID": "12D3KooWfixture", "PrivKey": "secret"},
+            "Addresses": {"API": "/ip4/127.0.0.1/tcp/5001", "Gateway": "/ip4/127.0.0.1/tcp/4242",
+                "Swarm": []},
+            "Bootstrap": [],
+            "DNS": {"Resolvers": {"eth.": "https://dns.example/dns-query"}},
+            "Ipns": {"DelegatedPublishers": [], "ResolveCacheSize": 128},
+            "Routing": {"DelegatedRouters": [], "Type": "none"},
+            "Provide": {"DHT": {}, "Enabled": false},
+            "Discovery": {"MDNS": {"Enabled": false}},
+            "AutoConf": {"Enabled": false},
+            "Plugins": {"Plugins": {"telemetry": {"Config": {"Mode": "off"}}}},
+            "Datastore": {"StorageMax": "10GB"},
+        });
+        assert_eq!(config, expected);
+        // A repeated start changes only the gateway port.
+        apply_local_store_config(&mut config, 4243).unwrap();
+        assert_eq!(config["Addresses"]["Gateway"], "/ip4/127.0.0.1/tcp/4243");
+        assert!(apply_local_store_config(&mut serde_json::json!({"Routing": 1}), 1).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn started_daemon_is_offline_on_a_local_store_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let mut provider = cold_fixture_provider(root.path());
+        provider.kubo_binary = Some(kubo_fixture(root.path()));
+        let health = answer_fixture_health(provider.repo_dir.clone());
+        let result = provider.ensure_kubo();
+        let args = fs::read_to_string(provider.repo_dir.with_extension("args"));
+        stop_fixture_daemon(&mut provider);
+        result.unwrap();
+        let port = health.join().unwrap();
+        assert_eq!(
+            args.unwrap(),
+            format!("daemon --offline --api /ip4/127.0.0.1/tcp/{port} --enable-gc")
+        );
+        let coord = read_coord_file(root.path()).unwrap();
+        assert!(coord.offline);
+        assert_eq!(coord.api_port, port);
+        let config_path = provider.repo_dir.join("config");
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(config["Identity"]["PeerID"], "fixture-peer");
+        assert_eq!(config["Routing"]["Type"], "none");
+        assert_eq!(config["Provide"]["Enabled"], false);
+        assert_eq!(config["Bootstrap"], serde_json::json!([]));
+        assert_eq!(
+            config["Addresses"]["Gateway"],
+            format!("/ip4/127.0.0.1/tcp/{}", coord.gateway_port)
+        );
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// An update leaves the online daemon of an earlier release running. Every
+    /// path that borrows a running daemon must stop it and start the same repo
+    /// offline instead.
+    #[test]
+    #[cfg(unix)]
+    fn online_daemon_is_stopped_and_the_repo_restarted_offline() {
+        for path in ["init", "ready reuse", "lock acquisition"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut provider = cold_fixture_provider(root.path());
+            provider.kubo_binary = Some(kubo_fixture(root.path()));
+            fs::create_dir_all(provider.repo_dir.join("blocks")).unwrap();
+            fs::write(provider.repo_dir.join("blocks/held.data"), b"held block").unwrap();
+            fs::write(
+                provider.repo_dir.join("config"),
+                br#"{"Identity":{"PeerID":"kept"}}"#,
+            )
+            .unwrap();
+            let mut online = online_daemon_coord(root.path(), 1);
+            let online_pid = online.id();
+            match path {
+                "init" => {
+                    provider.initialized = false;
+                    let config = serde_json::json!({"base_path": root.path()});
+                    assert!(matches!(provider.init(config), Response::Ok { .. }));
+                    // Init stops it at once; the next operation starts offline.
+                    assert_eq!(provider.state, KuboState::Cold, "{path}");
+                    assert!(read_coord_file(root.path()).is_none(), "{path}");
+                    assert!(
+                        online.try_wait().unwrap().is_some(),
+                        "{path}: still running"
+                    );
+                    // Init may find this machine's own Kubo; keep the stand-in.
+                    provider.kubo_binary = Some(kubo_fixture(root.path()));
+                }
+                "ready reuse" => {
+                    provider.state = KuboState::Ready;
+                    provider.api_port = 1;
+                }
+                _ => {}
+            }
+            let health = answer_fixture_health(provider.repo_dir.clone());
+            let result = provider.ensure_kubo();
+            stop_fixture_daemon(&mut provider);
+            let online_exited = online.try_wait().unwrap().is_some();
+            let _ = online.kill();
+            online.wait().unwrap();
+            result.unwrap_or_else(|e| panic!("{path}: {e}"));
+            let port = health.join().unwrap();
+            assert!(
+                online_exited,
+                "{path}: online daemon {online_pid} kept running"
+            );
+            let coord = read_coord_file(root.path()).unwrap();
+            assert!(coord.offline && coord.api_port == port, "{path}: {coord:?}");
+            assert_eq!(provider.api_port, port, "{path}");
+            assert!(fs::read_to_string(provider.repo_dir.with_extension("args"))
+                .unwrap()
+                .contains("--offline"));
+            // The repo survives: blocks untouched, identity kept.
+            assert_eq!(
+                fs::read(provider.repo_dir.join("blocks/held.data")).unwrap(),
+                b"held block"
+            );
+            let config: serde_json::Value =
+                serde_json::from_slice(&fs::read(provider.repo_dir.join("config")).unwrap())
+                    .unwrap();
+            assert_eq!(config["Identity"]["PeerID"], "kept", "{path}");
+        }
+    }
+
+    /// While another process holds the startup lock, a waiting provider never
+    /// borrows the online daemon; it takes the offline one that process starts.
+    #[test]
+    #[cfg(unix)]
+    fn lock_waiter_borrows_only_an_offline_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let mut provider = cold_fixture_provider(root.path());
+        provider.kubo_binary = Some(root.path().join("must-not-execute"));
+        let held = open_startup_lock(root.path()).unwrap();
+        assert!(try_flock_exclusive(&held));
+        let mut online = online_daemon_coord(root.path(), 1);
+        let data_dir = root.path().to_path_buf();
+        let starter = std::thread::spawn(move || {
+            std::thread::sleep(LOCKFILE_POLL_INTERVAL * 3);
+            write_coord_file(
+                &data_dir,
+                &CoordFile {
+                    kubo_pid: std::process::id(),
+                    api_port: 2,
+                    gateway_port: 3,
+                    started_at: 1,
+                    last_used: 1,
+                    offline: true,
+                },
+            );
+            drop(held);
+        });
+        let result = provider.ensure_kubo();
+        starter.join().unwrap();
+        let _ = online.kill();
+        online.wait().unwrap();
+        result.unwrap();
+        assert_eq!((provider.api_port, provider.gateway_port), (2, 3));
+    }
+
+    /// Kubo runs offline, so a CID this repo lacks fails on its one local
+    /// read: no pin/add or gateway retry follows, and Content reaches Carrier
+    /// at once.
+    #[test]
+    fn missing_cid_fails_on_one_local_read() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let backend = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let mut idle_since = Instant::now();
+            while idle_since.elapsed() < Duration::from_millis(500) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        let headers = read_bounded_fixture_headers(&mut socket);
+                        requests.push(headers.lines().next().unwrap_or_default().to_string());
+                        let body = br#"{"Message":"block was not found locally (offline)","Code":0,"Type":"error"}"#;
+                        let _ = socket.write_all(
+                            format!(
+                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                        let _ = socket.write_all(body);
+                        idle_since = Instant::now();
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            requests
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut provider = bounded_cat_fixture_provider(root.path(), port);
+        let started = Instant::now();
+        let read = provider.cat("bafkreimissing", None, None);
+        let listed = provider.ls("bafkreimissing");
+        let elapsed = started.elapsed();
+        let requests = backend.join().unwrap();
+        assert!(matches!(read, Response::Error { ref code, .. } if code == "cat_failed"));
+        assert!(matches!(listed, Response::Error { ref code, .. } if code == "ls_failed"));
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[0].starts_with("POST /api/v0/cat?arg=bafkreimissing"));
+        assert!(requests[1].starts_with("POST /api/v0/ls?arg=bafkreimissing"));
+    }
+
+    /// The shipped Kubo, run as the provider runs it. Needs
+    /// `ELASTOS_TEST_KUBO=<kubo 0.40.1 binary>`: an online daemon (as an
+    /// earlier release left it) is replaced by an offline one on the same repo,
+    /// which has no swarm and fails a missing CID at once.
+    #[test]
+    #[ignore = "needs ELASTOS_TEST_KUBO"]
+    #[cfg(unix)]
+    fn real_kubo_online_daemon_is_restarted_offline_and_misses_fast() {
+        let kubo = PathBuf::from(std::env::var("ELASTOS_TEST_KUBO").expect("ELASTOS_TEST_KUBO"));
+        let root = tempfile::tempdir().unwrap();
+        let mut provider = cold_fixture_provider(root.path());
+        provider.kubo_binary = Some(kubo.clone());
+        let run = |args: &[&str]| {
+            let out = Command::new(&kubo)
+                .args(args)
+                .env("IPFS_PATH", &provider.repo_dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        // The test profile keeps the old online daemon off the public network.
+        run(&["init", "--profile=test"]);
+        let held = run(&["add", "-Q", "--cid-version=1", "--pin=true", "Cargo.toml"]);
+        let held = held.trim().to_string();
+        let old_port = bind_free_port().unwrap();
+        let mut online = Command::new(&kubo)
+            .args(["daemon", "--api", &format!("/ip4/127.0.0.1/tcp/{old_port}")])
+            .env("IPFS_PATH", &provider.repo_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let id = kubo_rpc_url(old_port, "id", &[]);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while ureq::post(&id).call().is_err() {
+            assert!(Instant::now() < deadline, "online daemon did not start");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ureq::post(&kubo_rpc_url(old_port, "swarm/peers", &[]))
+            .call()
+            .is_ok());
+        fs::write(
+            coord_file_path(root.path()),
+            serde_json::to_vec(&serde_json::json!({
+                "kubo_pid": online.id(), "api_port": old_port, "gateway_port": 0,
+                "started_at": 1, "last_used": now_unix_secs(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let migrated = provider.ensure_kubo();
+        let online_exited = online.try_wait().unwrap().is_some();
+        let _ = online.kill();
+        online.wait().unwrap();
+        let checks = (|| -> Result<(), String> {
+            migrated?;
+            if !online_exited {
+                return Err("online daemon kept running".into());
+            }
+            let coord = read_coord_file(root.path()).ok_or("no coord")?;
+            if !coord.offline || coord.api_port == old_port {
+                return Err(format!("not restarted offline: {coord:?}"));
+            }
+            match ureq::post(&kubo_rpc_url(coord.api_port, "swarm/peers", &[])).call() {
+                Err(ureq::Error::Status(_, resp)) => {
+                    let body = resp.into_string().unwrap_or_default();
+                    if !body.contains("online mode") {
+                        return Err(format!("swarm/peers: {body}"));
+                    }
+                }
+                other => return Err(format!("swarm/peers answered offline daemon: {other:?}")),
+            }
+            let Response::Ok { data: Some(data) } = provider.cat(&held, None, None) else {
+                return Err("held CID not readable after migration".into());
+            };
+            if BASE64
+                .decode(data["data"].as_str().unwrap_or_default())
+                .ok()
+                != fs::read("Cargo.toml").ok()
+            {
+                return Err("held CID bytes changed".into());
+            }
+            let missing = "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
+            let started = Instant::now();
+            let read = provider.cat(missing, None, None);
+            let pinned = provider.pin(missing);
+            let listed = provider.ls(missing);
+            let elapsed = started.elapsed();
+            if [read, pinned, listed]
+                .iter()
+                .any(|response| matches!(response, Response::Ok { .. }))
+                || elapsed > Duration::from_secs(2)
+            {
+                return Err(format!("missing CID did not fail fast: {elapsed:?}"));
+            }
+            Ok(())
+        })();
+        stop_fixture_daemon(&mut provider);
+        checks.unwrap();
     }
 
     fn complete_metadata_request(max: u64) -> serde_json::Value {
@@ -3972,13 +4405,24 @@ mod tests {
             gateway_port: 8080,
             started_at: 1000,
             last_used: 2000,
+            offline: true,
         };
 
         write_coord_file(&data_dir, &coord);
+        update_coord_last_used(&data_dir);
         let read = read_coord_file(&data_dir).expect("Should read coord file");
         assert_eq!(read.kubo_pid, 12345);
         assert_eq!(read.api_port, 5001);
         assert_eq!(read.gateway_port, 8080);
+        assert!(read.offline, "a last-used refresh keeps the offline mark");
+
+        // A coord file an earlier release wrote names an online daemon.
+        fs::write(
+            coord_file_path(&data_dir),
+            br#"{"kubo_pid":1,"api_port":5001,"gateway_port":8080,"started_at":1,"last_used":2}"#,
+        )
+        .unwrap();
+        assert!(!read_coord_file(&data_dir).unwrap().offline);
 
         remove_coord_file(&data_dir);
         assert!(read_coord_file(&data_dir).is_none());
@@ -4690,13 +5134,10 @@ mod tests {
     }
 
     /// A Kubo double that reads requests as Kubo does: RPC query pairs are
-    /// form-decoded and `offset`/`length` are honoured; gateway paths are
-    /// percent-decoded per segment. `files` maps literal `cid/path` to bytes.
-    /// With `rpc_answers` only RPC reads answer, otherwise only gateway reads
-    /// do, so each provider read route is checked on its own.
+    /// form-decoded and `offset`/`length` are honoured. `files` maps literal
+    /// `cid/path` to bytes.
     fn literal_path_kubo(
         files: std::collections::HashMap<String, Vec<u8>>,
-        rpc_answers: bool,
     ) -> (
         u16,
         Arc<std::sync::atomic::AtomicBool>,
@@ -4720,7 +5161,7 @@ mod tests {
                 let headers = read_bounded_fixture_headers(&mut socket);
                 let target = headers.split(' ').nth(1).unwrap_or_default();
                 let url = url::Url::parse(&format!("http://kubo{target}")).unwrap();
-                let body = if url.path() == "/api/v0/cat" && rpc_answers {
+                let body = if url.path() == "/api/v0/cat" {
                     let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
                     let value = |name: &str| {
                         pairs
@@ -4731,14 +5172,13 @@ mod tests {
                     value("arg").and_then(|arg| files.get(&arg)).map(|bytes| {
                         let offset = value("offset").map_or(0, |v| v.parse().unwrap_or(0));
                         let length = value("length").map_or(usize::MAX, |v| v.parse().unwrap_or(0));
-                        bytes.iter().skip(offset).take(length).copied().collect()
+                        bytes
+                            .iter()
+                            .skip(offset)
+                            .take(length)
+                            .copied()
+                            .collect::<Vec<u8>>()
                     })
-                } else if let Some(rest) =
-                    url.path().strip_prefix("/ipfs/").filter(|_| !rpc_answers)
-                {
-                    let literal: Vec<String> =
-                        rest.split('/').map(percent_decode_fixture).collect();
-                    files.get(&literal.join("/")).cloned()
                 } else {
                     None
                 };
@@ -4760,29 +5200,6 @@ mod tests {
         (port, stop, serving)
     }
 
-    fn percent_decode_fixture(segment: &str) -> String {
-        let bytes = segment.as_bytes();
-        let mut decoded = Vec::new();
-        let mut index = 0;
-        while index < bytes.len() {
-            let escaped = (bytes[index] == b'%')
-                .then(|| bytes.get(index + 1..index + 3))
-                .flatten()
-                .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
-            match escaped {
-                Some(byte) => {
-                    decoded.push(byte);
-                    index += 3;
-                }
-                None => {
-                    decoded.push(bytes[index]);
-                    index += 1;
-                }
-            }
-        }
-        String::from_utf8(decoded).unwrap()
-    }
-
     #[test]
     fn literal_file_paths_reach_kubo_unchanged_on_every_read_route() {
         const CID: &str = "bafyliteralpaths";
@@ -4793,8 +5210,8 @@ mod tests {
             .map(|path| (format!("{CID}/{path}"), expected(path)))
             .collect();
         let mut failures = Vec::new();
-        for route in ["kubo cat", "kubo cat to path", "local gateway"] {
-            let (port, stop, serving) = literal_path_kubo(files.clone(), route != "local gateway");
+        for route in ["kubo cat", "kubo cat to path"] {
+            let (port, stop, serving) = literal_path_kubo(files.clone());
             let root = tempfile::tempdir().unwrap();
             let root_path = fs::canonicalize(root.path()).unwrap();
             let mut provider = bounded_cat_fixture_provider(&root_path, port);
@@ -4827,7 +5244,7 @@ mod tests {
             failures.is_empty(),
             "{} of {} literal path reads changed:\n{}",
             failures.len(),
-            paths.len() * 3,
+            paths.len() * 2,
             failures.join("\n")
         );
     }

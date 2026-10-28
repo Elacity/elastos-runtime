@@ -455,19 +455,19 @@ fn read_coord_file(data_dir: &Path) -> Option<CoordFile> {
     serde_json::from_str(&content).ok()
 }
 
+/// Refreshes `last_used` and keeps every other field ipfs-provider wrote,
+/// such as `offline`, which marks a daemon it may keep borrowing.
 fn update_coord_last_used(data_dir: &Path) {
-    let Some(mut coord) = read_coord_file(data_dir) else {
+    let path = coord_file_path(data_dir);
+    let Some(mut coord) = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(Value::is_object)
+    else {
         return;
     };
-    coord.last_used = now_unix_secs();
-    let path = coord_file_path(data_dir);
-    let Ok(json) = serde_json::to_string_pretty(&json!({
-        "kubo_pid": coord.kubo_pid,
-        "api_port": coord.api_port,
-        "gateway_port": coord.gateway_port,
-        "started_at": coord.started_at,
-        "last_used": coord.last_used,
-    })) else {
+    coord["last_used"] = json!(now_unix_secs());
+    let Ok(json) = serde_json::to_string_pretty(&coord) else {
         return;
     };
     let tmp = path.with_extension("tmp");
@@ -630,5 +630,21 @@ mod tests {
             _runtime_transfer: None,
         });
         assert_eq!(response["code"], "cid_mismatch");
+    }
+
+    #[test]
+    fn last_used_refresh_keeps_the_offline_mark() {
+        let data_dir = temp_dir("coord-offline");
+        fs::write(
+            coord_file_path(&data_dir),
+            r#"{"kubo_pid":1,"api_port":2,"gateway_port":3,"started_at":4,"last_used":5,"offline":true}"#,
+        )
+        .unwrap();
+        update_coord_last_used(&data_dir);
+        let coord: Value =
+            serde_json::from_slice(&fs::read(coord_file_path(&data_dir)).unwrap()).unwrap();
+        assert_eq!(coord["offline"], true);
+        assert_eq!(coord["api_port"], 2);
+        assert!(coord["last_used"].as_u64().unwrap() > 5);
     }
 }
