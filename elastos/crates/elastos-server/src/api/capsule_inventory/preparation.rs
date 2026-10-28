@@ -10322,39 +10322,73 @@ server.serve_forever()
             )
         }
 
-        fn loopback_listener(address: &str) {
-            let port = address
-                .strip_prefix("/ip4/127.0.0.1/tcp/")
-                .and_then(|port| port.parse::<u16>().ok())
-                .unwrap();
-            assert_ne!(port, 0, "fixture listener must have a bound loopback port");
+        /// The publisher's Home as a Carrier holder answers a model read:
+        /// every bounded read comes from its own offline repo. The Carrier hop
+        /// itself is covered by the `SlowHolderPreparation` tests.
+        struct OfflineRepoHolder {
+            api_port: u16,
+            client: reqwest::Client,
+            reads: std::sync::atomic::AtomicUsize,
         }
 
-        async fn require_peer(
-            kubo: &Path,
-            root: &Path,
-            repo: &Path,
-            expected: &str,
-            deadline: Instant,
-        ) {
-            loop {
-                let peers = run(
-                    command(kubo, root, repo, root, &["swarm", "peers"]),
-                    root,
-                    deadline,
-                )
-                .await;
-                let peers: Vec<_> = peers.lines().collect();
-                if peers.is_empty() {
-                    assert!(Instant::now() < deadline, "fixture peer readiness deadline");
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
+        #[async_trait::async_trait]
+        impl elastos_runtime::provider::Provider for OfflineRepoHolder {
+            fn name(&self) -> &'static str {
+                "offline-repo-holder-fixture"
+            }
+            fn schemes(&self) -> Vec<&'static str> {
+                vec!["availability"]
+            }
+            async fn handle(
+                &self,
+                _: elastos_runtime::provider::ResourceRequest,
+            ) -> Result<
+                elastos_runtime::provider::ResourceResponse,
+                elastos_runtime::provider::ProviderError,
+            > {
+                panic!("preparation reads availability through send_raw")
+            }
+            async fn send_raw(
+                &self,
+                request: &serde_json::Value,
+            ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+                use base64::Engine as _;
+                let failed =
+                    |error: String| elastos_runtime::provider::ProviderError::Provider(error);
+                assert_eq!(request["bounded_read"], true);
+                let arg = format!(
+                    "{}/{}",
+                    request["cid"].as_str().unwrap(),
+                    request["path"].as_str().unwrap()
+                );
+                let range = &request["range"];
+                let (offset, length) = match (range["start"].as_u64(), range["end"].as_u64()) {
+                    (Some(start), Some(end)) => (start, end - start + 1),
+                    _ => (0, request["max_bytes"].as_u64().unwrap()),
+                };
+                let response = self
+                    .client
+                    .post(format!("http://127.0.0.1:{}/api/v0/cat", self.api_port))
+                    .query(&[
+                        ("arg", arg),
+                        ("offline", "true".into()),
+                        ("offset", offset.to_string()),
+                        ("length", length.to_string()),
+                    ])
+                    .send()
+                    .await
+                    .map_err(|error| failed(error.to_string()))?;
+                if !response.status().is_success() {
+                    return Ok(serde_json::json!({"status":"error",
+                        "code":"carrier_fetch_failed", "message":"holder repo miss"}));
                 }
-                assert_eq!(peers.len(), 1, "fixture must have only its exact peer");
-                let (address, peer) = peers[0].rsplit_once("/p2p/").unwrap();
-                loopback_listener(address);
-                assert_eq!(peer, expected);
-                return;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|error| failed(error.to_string()))?;
+                self.reads.fetch_add(1, Ordering::AcqRel);
+                Ok(serde_json::json!({"status":"ok",
+                    "data":{"data":base64::engine::general_purpose::STANDARD.encode(bytes)}}))
             }
         }
 
@@ -10362,13 +10396,10 @@ server.serve_forever()
             kubo: &Path,
             root: &Path,
             repo: &Path,
-            cold: bool,
             deadline: Instant,
         ) -> (OwnedChild, File, File, u16) {
-            let mut args = vec!["daemon", "--routing=none", "--enable-gc=false"];
-            if !cold {
-                args.push("--offline");
-            }
+            // As ipfs-provider runs Kubo: offline, a local content store only.
+            let args = ["daemon", "--offline", "--routing=none", "--enable-gc=false"];
             let stdout = tempfile::tempfile_in(root).unwrap();
             let stderr = tempfile::tempfile_in(root).unwrap();
             let mut daemon = OwnedChild(
@@ -10432,7 +10463,7 @@ server.serve_forever()
         }
 
         #[tokio::test]
-        #[ignore = "requires explicit pinned binaries and isolated loopback peers; parent runs cold process proof"]
+        #[ignore = "requires explicit pinned binaries and an isolated offline holder repo; parent runs cold process proof"]
         async fn model_preparation_real_content_native_process_cold_64mib() {
             preparation_process(true).await;
         }
@@ -10554,25 +10585,10 @@ server.serve_forever()
                 config["Bootstrap"] = serde_json::json!([]);
                 config["Addresses"]["API"] = serde_json::json!("/ip4/127.0.0.1/tcp/0");
                 config["Addresses"]["Gateway"] = serde_json::json!("");
-                config["Addresses"]["Swarm"] = if cold {
-                    serde_json::json!(["/ip4/127.0.0.1/tcp/0"])
-                } else {
-                    serde_json::json!([])
-                };
+                config["Addresses"]["Swarm"] = serde_json::json!([]);
                 config["Routing"]["Type"] = serde_json::json!("none");
                 config["Discovery"]["MDNS"]["Enabled"] = serde_json::json!(false);
                 config["AutoConf"]["Enabled"] = serde_json::json!(false);
-                if cold {
-                    config["Swarm"]["DisableNatPortMap"] = serde_json::json!(true);
-                    config["Swarm"]["RelayClient"]["Enabled"] = serde_json::json!(false);
-                    config["Swarm"]["RelayService"]["Enabled"] = serde_json::json!(false);
-                    config["Swarm"]["EnableHolePunching"] = serde_json::json!(false);
-                    config["AutoNAT"]["ServiceMode"] = serde_json::json!("disabled");
-                    config["Swarm"]["Transports"]["Network"] = serde_json::json!({
-                        "TCP":true,"Relay":false,"QUIC":false,"Websocket":false,
-                        "WebTransport":false,"WebRTCDirect":false
-                    });
-                }
                 config["Import"] = proof_import_profile();
                 fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
             }
@@ -10675,7 +10691,7 @@ server.serve_forever()
                     )
                     .await,
                     baseline,
-                    "consumer block set changed before peer connection"
+                    "consumer block set changed before Use"
                 );
             }
             assert!(
@@ -10685,64 +10701,26 @@ server.serve_forever()
             let backend_before = disk_bytes(&repo);
             let seed_disk = disk_bytes(&seed);
             let (mut daemon, stdout, stderr, port) =
-                start_daemon(&kubo, &root_path, &repo, cold, deadline).await;
+                start_daemon(&kubo, &root_path, &repo, deadline).await;
             let mut publisher = if cold {
-                Some(start_daemon(&kubo, &root_path, &publisher_repo, true, deadline).await)
+                Some(start_daemon(&kubo, &root_path, &publisher_repo, deadline).await)
             } else {
                 None
             };
-            let mut peer_ids = Vec::new();
-            if cold {
-                let mut listeners = Vec::new();
-                for fixture_repo in [&repo, &publisher_repo] {
-                    let config: serde_json::Value =
-                        serde_json::from_slice(&fs::read(fixture_repo.join("config")).unwrap())
-                            .unwrap();
-                    peer_ids.push(config["Identity"]["PeerID"].as_str().unwrap().to_owned());
-                    let listener = run(
-                        command(
-                            &kubo,
-                            &root_path,
-                            fixture_repo,
-                            &root_path,
-                            &["swarm", "addrs", "listen"],
-                        ),
-                        &root_path,
-                        deadline,
-                    )
-                    .await;
-                    loopback_listener(&listener);
-                    listeners.push(listener);
-                    assert!(run(
-                        command(
-                            &kubo,
-                            &root_path,
-                            fixture_repo,
-                            &root_path,
-                            &["swarm", "peers"]
-                        ),
-                        &root_path,
-                        deadline
-                    )
-                    .await
-                    .is_empty());
-                }
-                let address = format!("{}/p2p/{}", listeners[1], peer_ids[1]);
-                run(
-                    command(
-                        &kubo,
-                        &root_path,
-                        &repo,
-                        &root_path,
-                        &["swarm", "connect", &address],
-                    ),
-                    &root_path,
-                    deadline,
-                )
-                .await;
-                require_peer(&kubo, &root_path, &repo, &peer_ids[1], deadline).await;
-                require_peer(&kubo, &root_path, &publisher_repo, &peer_ids[0], deadline).await;
-            }
+            // Kubo runs offline, so the consumer's repo never reaches the
+            // publisher's; a cold Get reads every part from the holder.
+            let holder = publisher.as_ref().map(|(_, _, _, api_port)| {
+                Arc::new(OfflineRepoHolder {
+                    api_port: *api_port,
+                    client: reqwest::Client::builder()
+                        .no_proxy()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .timeout(Duration::from_secs(10))
+                        .build()
+                        .unwrap(),
+                    reads: Default::default(),
+                })
+            });
             let setup_ms = setup_started.elapsed().as_millis();
             let publisher_before = if cold && pinned.is_none() {
                 disk_bytes(&publisher_repo)
@@ -10750,7 +10728,8 @@ server.serve_forever()
                 (0, 0)
             };
             fs::write(data.join("ipfs-coords.json"), serde_json::to_vec(&serde_json::json!({
-                "kubo_pid":daemon.0.id(),"api_port":port,"gateway_port":0,"started_at":now().unwrap(),"last_used":now().unwrap()
+                "kubo_pid":daemon.0.id(),"api_port":port,"gateway_port":0,"started_at":now().unwrap(),
+                "last_used":now().unwrap(),"offline":true
             })).unwrap()).unwrap();
             let bridge = Arc::new(
                 ProviderBridge::spawn(
@@ -10775,6 +10754,13 @@ server.serve_forever()
                 .await
                 .unwrap();
             register_content(&registry, &data).await;
+            if let Some(holder) = &holder {
+                registry
+                    .register_sub_provider("availability", holder.clone())
+                    .await
+                    .unwrap();
+            }
+            let test_holder = holder.clone();
             let owner = Arc::new(test_owner());
             let running_owner = owner.clone();
             let test_data = data.clone();
@@ -10907,16 +10893,8 @@ server.serve_forever()
                     publisher_peak.0.max(publisher_after.0),
                     publisher_peak.1.max(publisher_after.1),
                 );
-                if cold && !real_model {
-                    assert!(
-                        backend_after.0 >= backend_before.0 + weights_size as u64,
-                        "cold transfer must grow consumer backend logical bytes"
-                    );
-                    assert!(
-                        backend_after.1 > backend_before.1,
-                        "cold transfer must allocate consumer backend blocks"
-                    );
-                }
+                // A Get stages the package outside Kubo and only hashes it
+                // there, so the consumer's repo need not grow.
                 combined_allocated_peak = combined_allocated_peak
                     .max(admitted_disk.1 + backend_after.1 + publisher_after.1 + seed_disk.1);
                 minimum_free = minimum_free.min(volume_bytes(&test_volume).1);
@@ -10933,7 +10911,14 @@ server.serve_forever()
                         .filter(|(path, _)| *path != "_elastos_object.json")
                         .map(|(_, bytes)| bytes.len().div_ceil(65536))
                         .sum::<usize>();
-                assert_eq!(reads, expected_reads);
+                if let Some(holder) = &test_holder {
+                    // One local miss (repeated once after backend preparation),
+                    // then every part comes from the holder's offline repo.
+                    assert!((1..=2).contains(&reads), "local reads: {reads}");
+                    assert_eq!(holder.reads.load(Ordering::Acquire), expected_reads);
+                } else {
+                    assert_eq!(reads, expected_reads);
+                }
                 // The real engine enables activation composition after admission;
                 // both independently verify the exact stored package CID.
                 let admission_and_activation_hashes = if real_model { 2 } else { 1 };
@@ -11039,6 +11024,7 @@ server.serve_forever()
                 );
                 serde_json::json!({"cold":cold,"setup_ms":setup_ms,"elapsed_preparation_ms":elapsed_ms,
                     "reuse_ms":reuse_ms,"content_reads":reads,
+                    "holder_reads":test_holder.as_ref().map(|holder| holder.reads.load(Ordering::Acquire)),
                     "layout_preflight_bytes":layout_charge,"minimum_sampled_free_bytes":minimum_free,
                     "sample_interval_ms":if real_model {1000} else {10},"samples":samples,"max_sample_gap_ms":max_sample_gap_ms,
                     "test_process_sampled_rss_peak_kib":rss_peak_kib,"inference":inference,
@@ -11082,23 +11068,6 @@ server.serve_forever()
             drop(registry);
             drop(backend);
             drop(bridge);
-            // Perform peer assertions in a task so an assertion still reaches
-            // the exact-child cleanup below.
-            let peer_check = if cold {
-                let kubo = kubo.clone();
-                let root = root_path.clone();
-                let repo = repo.clone();
-                let publisher_repo = publisher_repo.clone();
-                Some(
-                    tokio::spawn(async move {
-                        require_peer(&kubo, &root, &repo, &peer_ids[1], deadline).await;
-                        require_peer(&kubo, &root, &publisher_repo, &peer_ids[0], deadline).await;
-                    })
-                    .await,
-                )
-            } else {
-                None
-            };
             for result in [daemon.0.kill(), daemon.0.wait().map(|_| ())] {
                 if let Err(error) = result {
                     cleanup_errors.push(format!("consumer cleanup: {error}"));
@@ -11126,9 +11095,6 @@ server.serve_forever()
             }
             assert!(cleanup_errors.is_empty(), "{cleanup_errors:?}");
             assert!(!root_path.exists());
-            if let Some(peer_check) = peer_check {
-                peer_check.unwrap();
-            }
             let mut receipt = outcome
                 .expect("production preparation deadline")
                 .expect("production preparation task");
@@ -11136,7 +11102,7 @@ server.serve_forever()
             receipt["native_shutdown_reap"] = serde_json::json!(true);
             receipt["kubo_reaped"] = serde_json::json!(true);
             receipt["kubo_children_reaped"] = serde_json::json!(if cold { 2 } else { 1 });
-            receipt["consumer_package_absent_before_connect"] = serde_json::json!(cold);
+            receipt["consumer_package_absent_before_use"] = serde_json::json!(cold);
             receipt["consumer_init_block"] = serde_json::json!(consumer_baseline);
             if let Some(pinned) = &pinned {
                 // Volume samples replace recursive large-backend scans. Do not
@@ -11164,9 +11130,9 @@ server.serve_forever()
                 );
             }
             receipt["proof_limit"] = serde_json::json!(if pinned.is_some() {
-                "Exact pinned model, isolated publisher-attested catalog, cold loopback Content admission and native model reply/restart. Volume/RSS are samples, not continuous peaks; GUI, installed acceptance and eviction remain open."
+                "Exact pinned model, isolated publisher-attested catalog, cold Get from a holder's offline Kubo through the availability plane, Content admission and native model reply/restart. The Carrier hop is covered by the holder tests. Volume/RSS are samples, not continuous peaks; GUI, installed acceptance and eviction remain open."
             } else if cold {
-                "64 MiB-capped signed synthetic cold loopback delivery through Content/native Use/admission/reuse. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Public-network, exact pinned models and inference remain open."
+                "64 MiB-capped signed synthetic cold Get: one local miss on the consumer's offline Kubo, then every part from the holder's offline Kubo through the availability plane, Content/native Use/admission/reuse. The Carrier hop is covered by the holder tests. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Exact pinned models and inference remain open."
             } else {
                 "8 MiB signed synthetic seeded offline Kubo proof through Content/native Use/admission/reuse. Allocations are sampled peaks; whole-buffer fixture memory is harness-only. Cold-network, exact pinned models and inference remain open."
             });

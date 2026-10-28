@@ -34,6 +34,15 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   About, Status with the download size and memory fit, Available actions and
   Technical details, with Get, Retry, Stop or Open in Assistant beside Close.
   Shared model details show where prompts go.
+- Each Home's IPFS store now runs offline. It no longer joins, announces to or
+  fetches from the public IPFS network; content moves between Homes only over
+  Carrier. A Home that already runs IPFS from an earlier version restarts it
+  offline after the update, keeping everything it holds. Content a Home lacks
+  now fails at once locally and comes from Carrier instead of waiting minutes
+  on a network search. Copying content to your other devices works up to
+  64 MiB per object (200 MiB for a single file); larger items are refused
+  straight away until #498 lands. Content held only outside ElastOS, such as a
+  pasted ipfs.io link, no longer opens.
 - Content links (`/s/`, `/ipfs/`, `/content/` and published sites) open only
   what this Home's IPFS store already holds. Content it does not hold,
   including content only a Carrier peer offers, does not open. The gateway no

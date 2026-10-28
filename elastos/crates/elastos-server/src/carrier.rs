@@ -124,6 +124,7 @@ const MAX_CARRIER_REPLICATION_CANDIDATES: usize = 8;
 const MAX_CARRIER_AVAILABILITY_TICKET_LEN: usize = 8192;
 const MAX_CARRIER_AVAILABILITY_ENDPOINT_ID_LEN: usize = 256;
 const MAX_CARRIER_OBJECT_IMPORT_FILES: usize = 512;
+// The largest object one Carrier import request carries (see #498).
 const MAX_CARRIER_OBJECT_IMPORT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REMOTE_RECEIPT_REPLICA_SUMMARY_ROWS: usize = 5;
 const GOSSIP_SEND_TIMEOUT: Duration = Duration::from_millis(1_500);
@@ -5830,6 +5831,9 @@ async fn import_content_via_carrier_provider_invocation(
                 .to_string()
                 .contains("local content object import exceeds") =>
         {
+            // Kubo is offline, so the replica cannot pin this itself and no
+            // Carrier import carries an object past the cap; it is refused at
+            // once. Ranged pull replication for big objects is #498.
             Err(object_err)
         }
         Err(object_err) => import_exact_content_via_carrier_provider_invocation(
@@ -10291,6 +10295,61 @@ pub(crate) mod tests {
         }
     }
 
+    /// Local Content holding one object whose manifest declares more bytes
+    /// than a Carrier object import carries; it records every path it reads.
+    struct MockCarrierOversizedObjectContentProvider {
+        paths: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MockCarrierOversizedObjectContentProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("raw operations only".into()))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-carrier-oversized-object-content-provider"
+        }
+
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            let path = request["path"].as_str().unwrap_or_default().to_string();
+            self.paths.lock().unwrap().push(path.clone());
+            if path != CONTENT_OBJECT_MANIFEST_PATH {
+                return Ok(serde_json::json!({
+                    "status": "error", "code": "unexpected", "message": "only the manifest is read"
+                }));
+            }
+            let manifest = serde_json::to_vec(&ContentObjectManifest {
+                schema: "elastos.content.object.manifest/v1".into(),
+                kind: "model".into(),
+                content_digest: "sha256:00".into(),
+                files: vec![crate::content::ContentObjectFile {
+                    path: "weights.gguf".into(),
+                    sha256: "00".into(),
+                    size: MAX_CARRIER_OBJECT_IMPORT_BYTES as u64 + 1,
+                }],
+                links: Vec::new(),
+                object_did: None,
+                publisher_did: None,
+            })
+            .unwrap();
+            Ok(serde_json::json!({
+                "status": "ok",
+                "data": { "cid": request["cid"].clone(), "stream": carrier_test_stream_payload(&manifest) }
+            }))
+        }
+    }
+
     #[async_trait::async_trait]
     impl Provider for MockCarrierBlockGraphProvider {
         async fn handle(
@@ -10485,13 +10544,28 @@ pub(crate) mod tests {
                     .iter()
                     .filter(|request| request["op"] == "ensure")
                     .count();
-                if (self.fail_ensure && ensure_attempts == 1)
-                    || self.fail_tickets.iter().any(|dead| dead == ticket)
-                {
+                if self.fail_tickets.iter().any(|dead| dead == ticket) {
                     return Ok(serde_json::json!({
                         "status": "error",
                         "code": "pin_failed",
                         "message": "mock remote pin failed"
+                    }));
+                }
+                if self.fail_ensure && ensure_attempts == 1 {
+                    // A replica whose offline Kubo lacks the CID: Content
+                    // answers its ensure with a repair-needed receipt.
+                    return Ok(serde_json::json!({
+                        "status": "ok",
+                        "data": {
+                            "cid": request.get("cid").cloned().unwrap_or(serde_json::Value::Null),
+                            "availability": {
+                                "status": "repair_needed",
+                                "provider": "ipfs-provider",
+                                "policy": "carrier_replica",
+                                "replicas": 0,
+                                "reason": "pin: block was not found locally (offline)"
+                            }
+                        }
                     }));
                 }
                 return Ok(serde_json::json!({
@@ -14225,9 +14299,11 @@ pub(crate) mod tests {
         shutdown_test_carrier_node(fixture.local_node).await;
     }
 
-    /// Kubo stand-in for a replica: `pin` succeeds, every op is recorded.
+    /// Kubo stand-in for an offline replica: `pin` succeeds only when the
+    /// replica's repo already holds the CID, every op is recorded.
     struct ReplicaIpfs {
         ops: Arc<StdMutex<Vec<String>>>,
+        holds: bool,
     }
 
     #[async_trait::async_trait]
@@ -14251,7 +14327,11 @@ pub(crate) mod tests {
             let op = request["op"].as_str().unwrap_or_default().to_string();
             self.ops.lock().unwrap().push(op.clone());
             Ok(match op.as_str() {
-                "pin" => serde_json::json!({ "status": "ok", "data": {} }),
+                "pin" if self.holds => serde_json::json!({ "status": "ok", "data": {} }),
+                "pin" => serde_json::json!({
+                    "status": "error", "code": "pin_failed",
+                    "message": "pin: block was not found locally (offline)"
+                }),
                 _ => serde_json::json!({
                     "status": "error", "code": "unsupported", "message": "unsupported mock op"
                 }),
@@ -14260,100 +14340,119 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_granted_peer_ensures_a_large_file_without_import() {
+    async fn carrier_granted_peer_pins_a_large_file_only_from_its_own_repo() {
         let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
-        // Replica: real Content behind Carrier; its Kubo pins by CID.
-        let replica_dir = tempfile::tempdir().unwrap();
-        let replica_registry = Arc::new(ProviderRegistry::new());
-        replica_registry
-            .register_sub_provider(
-                "content",
-                Arc::new(crate::content::ContentProvider::new(
-                    replica_dir.path().to_path_buf(),
-                    Arc::downgrade(&replica_registry),
-                )),
+        for (holds, seed) in [(true, 156u8), (false, 158u8)] {
+            // Replica: real Content behind Carrier; its Kubo pins by CID.
+            let replica_dir = tempfile::tempdir().unwrap();
+            let replica_registry = Arc::new(ProviderRegistry::new());
+            replica_registry
+                .register_sub_provider(
+                    "content",
+                    Arc::new(crate::content::ContentProvider::new(
+                        replica_dir.path().to_path_buf(),
+                        Arc::downgrade(&replica_registry),
+                    )),
+                )
+                .await
+                .unwrap();
+            let replica_ops = Arc::new(StdMutex::new(Vec::new()));
+            replica_registry
+                .register_sub_provider(
+                    "ipfs",
+                    Arc::new(ReplicaIpfs {
+                        ops: replica_ops.clone(),
+                        holds,
+                    }),
+                )
+                .await
+                .unwrap();
+            let (replica_sk, replica_did) = elastos_identity::derive_did(&[seed; 32]);
+            let replica_node = start_isolated_carrier_node_with_registry(
+                &replica_sk,
+                &replica_did,
+                replica_dir.path().to_path_buf(),
+                Some(Arc::downgrade(&replica_registry)),
             )
             .await
             .unwrap();
-        let replica_ops = Arc::new(StdMutex::new(Vec::new()));
-        replica_registry
-            .register_sub_provider(
-                "ipfs",
-                Arc::new(ReplicaIpfs {
-                    ops: replica_ops.clone(),
-                }),
-            )
-            .await
-            .unwrap();
-        let (replica_sk, replica_did) = elastos_identity::derive_did(&[156u8; 32]);
-        let replica_node = start_isolated_carrier_node_with_registry(
-            &replica_sk,
-            &replica_did,
-            replica_dir.path().to_path_buf(),
-            Some(Arc::downgrade(&replica_registry)),
-        )
-        .await
-        .unwrap();
-        let replica_addr = wait_for_direct_endpoint_addr(&replica_node.endpoint).await;
+            let replica_addr = wait_for_direct_endpoint_addr(&replica_node.endpoint).await;
 
-        // Home: the replica's owner granted it content.replica.
-        let home_dir = tempfile::tempdir().unwrap();
-        let home_registry = Arc::new(ProviderRegistry::new());
-        let (home_sk, home_did) = elastos_identity::derive_did(&[157u8; 32]);
-        let home_node = start_isolated_carrier_node_with_registry(
-            &home_sk,
-            &home_did,
-            home_dir.path().to_path_buf(),
-            Some(Arc::downgrade(&home_registry)),
-        )
-        .await
-        .unwrap();
-        home_registry
-            .set_carrier_invoker(Arc::new(
-                CarrierProviderInvoker::with_carrier_endpoint_and_registry(
-                    home_node.endpoint.clone(),
-                    Arc::downgrade(&home_registry),
-                ),
-            ))
+            // Home: the replica's owner granted it content.replica.
+            let home_dir = tempfile::tempdir().unwrap();
+            let home_registry = Arc::new(ProviderRegistry::new());
+            let (home_sk, home_did) = elastos_identity::derive_did(&[seed + 1; 32]);
+            let home_node = start_isolated_carrier_node_with_registry(
+                &home_sk,
+                &home_did,
+                home_dir.path().to_path_buf(),
+                Some(Arc::downgrade(&home_registry)),
+            )
+            .await
+            .unwrap();
+            home_registry
+                .set_carrier_invoker(Arc::new(
+                    CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                        home_node.endpoint.clone(),
+                        Arc::downgrade(&home_registry),
+                    ),
+                ))
+                .await;
+            grant_peer(
+                replica_dir.path(),
+                &public_key_to_did(&home_node.endpoint.id()).unwrap(),
+                &["content.replica"],
+            );
+            let replica = CarrierAvailabilityReplica {
+                node_did: replica_did.clone(),
+                endpoint_id: None,
+                connect_ticket: encode_ticket_for(replica_addr),
+                announced_at: 0,
+                score: 0,
+                selection_reason: "operator_peer_store".to_string(),
+                reputation_score: 0,
+                reputation_reason: String::new(),
+            };
+            // Far larger than any request line, so only a replica that already
+            // holds it can pin it; Kubo is offline and fetches nothing.
+            let source_request = serde_json::json!({
+                "op": "ensure",
+                "cid": cid,
+                "publisher_did": home_did,
+                "estimated_content_bytes": 512u64 << 20,
+                "requirements": { "min_replicas": 2, "max_replicas": 2 },
+            });
+
+            let started = std::time::Instant::now();
+            let result = ensure_content_via_carrier_provider_invocation(
+                &home_registry,
+                &replica,
+                cid,
+                &source_request,
+            )
             .await;
-        grant_peer(
-            replica_dir.path(),
-            &public_key_to_did(&home_node.endpoint.id()).unwrap(),
-            &["content.replica"],
-        );
-        let replica = CarrierAvailabilityReplica {
-            node_did: replica_did.clone(),
-            endpoint_id: None,
-            connect_ticket: encode_ticket_for(replica_addr),
-            announced_at: 0,
-            score: 0,
-            selection_reason: "operator_peer_store".to_string(),
-            reputation_score: 0,
-            reputation_reason: String::new(),
-        };
-        // Far larger than any request line: it must travel as a pin, not bytes.
-        let source_request = serde_json::json!({
-            "op": "ensure",
-            "cid": cid,
-            "publisher_did": home_did,
-            "estimated_content_bytes": 512u64 << 20,
-            "requirements": { "min_replicas": 2, "max_replicas": 2 },
-        });
+            let elapsed = started.elapsed();
+            let ops = replica_ops.lock().unwrap().clone();
+            shutdown_test_carrier_node(replica_node).await;
+            shutdown_test_carrier_node(home_node).await;
 
-        ensure_content_via_carrier_provider_invocation(
-            &home_registry,
-            &replica,
-            cid,
-            &source_request,
-        )
-        .await
-        .expect("a granted replica pins the file itself");
-        let ops = replica_ops.lock().unwrap().clone();
-        assert!(ops.iter().any(|op| op == "pin"), "{ops:?}");
-        assert!(!ops.iter().any(|op| op.starts_with("add_")), "{ops:?}");
-
-        shutdown_test_carrier_node(replica_node).await;
-        shutdown_test_carrier_node(home_node).await;
+            assert!(
+                ops.iter().any(|op| op == "pin")
+                    && ops.iter().all(|op| op == "pin" || op == "pin_status"),
+                "holds={holds}: the replica only reads its own pin set: {ops:?}"
+            );
+            if holds {
+                result.expect("a replica that holds the file pins it itself");
+            } else {
+                // The home has no local copy to import either; the miss is final
+                // at once instead of waiting on a network search.
+                assert!(
+                    result.is_err(),
+                    "a replica that lacks the file cannot pin it"
+                );
+                assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+            }
+        }
     }
 
     /// Kubo stand-in that answers `pin_status` with `pinned`, or fails when
@@ -16264,6 +16363,62 @@ pub(crate) mod tests {
         assert!(!requests[2]["request"]
             .to_string()
             .contains("ticket:internal-secret"));
+    }
+
+    /// An object past the Carrier import cap that the replica's offline Kubo
+    /// lacks is refused at once: no file is read or sent, no exact import is
+    /// tried (#498 adds ranged pull replication for it).
+    #[tokio::test]
+    async fn test_carrier_replication_refuses_an_object_past_the_import_cap_at_once() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            requests: Mutex::new(Vec::new()),
+            fail_ensure: true,
+            ..Default::default()
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let paths = Arc::new(StdMutex::new(Vec::new()));
+        registry
+            .register_sub_provider(
+                "content",
+                Arc::new(MockCarrierOversizedObjectContentProvider {
+                    paths: paths.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        let replica = CarrierAvailabilityReplica {
+            node_did: "did:key:zRemote".to_string(),
+            endpoint_id: Some("remote-endpoint".to_string()),
+            connect_ticket: "ticket:internal-secret".to_string(),
+            announced_at: 1_700_000_000,
+            score: 90,
+            selection_reason: "operator_peer_store".to_string(),
+            reputation_score: 0,
+            reputation_reason: "no_local_history".to_string(),
+        };
+
+        let err = ensure_content_via_carrier_provider_invocation(
+            &registry,
+            &replica,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("local content object import exceeds"),
+            "{err}"
+        );
+        assert_eq!(*paths.lock().unwrap(), [CONTENT_OBJECT_MANIFEST_PATH]);
+        let requests = invoker.requests.lock().await;
+        let ops: Vec<&str> = requests
+            .iter()
+            .map(|request| request["op"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(ops, ["admission", "ensure"]);
     }
 
     #[tokio::test]
