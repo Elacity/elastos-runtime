@@ -8,14 +8,20 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Added
 
-- Add someone by their DID, with or without Discovery: People shows Your DID
-  to copy and has an Add form, and a Chat profile card offers Add contact and
-  Copy DID. They answer in Inbox; after a Decline, your new requests to them
-  are dropped for 7 days. Requests go through the seed's Community node and
-  reach only Homes on this version. Undo to 0.8.0-alpha.25 keeps the contacts
-  added through Discovery but not the ones added by DID.
+- Add someone by their DID, with or without Public: People's Profile page
+  shows Your DID to copy, People has an Add form, and a Chat profile card
+  offers Add contact and Copy DID. They answer in Inbox; after a Decline, your
+  new requests to them are dropped for 7 days. Requests go through the seed's
+  Community node and reach only Homes on this version. Undo to 0.8.0-alpha.25
+  keeps the contacts added through Public but not the ones added by DID.
 
 ### Changed
+
+- People has three pages: People (contacts, requests and Add by DID), Profile
+  (your name and Your DID) and Public, which is what Discovery was called.
+  Every place that said Discovery now says Public, including System and the
+  hint on a request that cannot be delivered. A request to someone whose
+  name this Home does not know yet shows as Request sent, with no name.
 
 - Setup tries a component download once more, 5 seconds later, when the
   source stops answering, so one stalled download no longer ends the install.

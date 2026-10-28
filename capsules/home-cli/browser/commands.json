@@ -31,8 +31,8 @@
       "name": "people",
       "aliases": ["contacts", "contact", "discovery"],
       "usage": "people",
-      "summary": "People and discovery",
-      "description": "Show your profile, contacts, pending requests, discovery, and People actions.",
+      "summary": "People and Public",
+      "description": "Show your profile, contacts, pending requests, Public, and People actions.",
       "surface": ["home-cli"]
     },
     {

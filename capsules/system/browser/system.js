@@ -763,7 +763,7 @@ async function updateCommunityMembership() {
       body: JSON.stringify({ joined: !communityMembership.joined }),
     }, "/api/apps/system/community");
     renderCommunityMembership(membership);
-    setTextFields("community-status", membership.joined ? "Community rejoined. Discovery uses its saved preference." : "Community and Discovery stopped on this Home.");
+    setTextFields("community-status", membership.joined ? "Community rejoined. Public keeps its saved setting." : "Community and Public stopped on this Home.");
     setHiddenFields("community-status", false);
   } catch (error) {
     setTextFields("community-status", publicSystemError(error, "Community setting could not be changed."));
