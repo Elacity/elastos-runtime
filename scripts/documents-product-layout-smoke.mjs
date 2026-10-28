@@ -695,6 +695,15 @@ async function run() {
     const expanded = await desktopLayout();
     assert(expanded.toggleInList && expanded.sidebar && !expanded.showList && expanded.mainLeft >= 200,
       `Documents desktop: Hide list belongs to the open list. Got ${JSON.stringify(expanded)}`);
+    const searchFits = await page.evaluate(() => {
+      const input = document.getElementById("sidebar-search");
+      const style = getComputedStyle(input);
+      const context = document.createElement("canvas").getContext("2d");
+      context.font = style.font;
+      const room = input.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      return context.measureText(input.placeholder).width <= room;
+    });
+    assert(searchFits, "Documents desktop: the list's search placeholder must fit beside New and Hide list.");
     await page.locator("#sidebar-toggle").click();
     const collapsed = await desktopLayout();
     assert(!collapsed.sidebar && collapsed.showList && collapsed.mainLeft === 0,
