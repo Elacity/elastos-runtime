@@ -150,18 +150,7 @@ export function publishedCid(object) {
 export function visibilityContract(object) {
   const visibility = object?.metadata?.visibility;
   if (visibility && typeof visibility === "object") return visibility;
-  return {
-    schema: "elastos.library.visibility/v1",
-    placement: inTrash(object) ? "trash" : "private_folder",
-    placement_label: inTrash(object) ? "Trash" : "Private folder",
-    effective_access: object?.published ? "public_content_link" : "principal_private",
-    published: !!object?.published,
-    published_cid: publishedCid(object) || null,
-    shared: !!object?.shared,
-    share_policy: object?.shared ? "shared" : "not_shared",
-    public_folder_policy: "placement_only",
-    publish_required_for_public_link: !isDirectory(object) && !object?.published,
-  };
+  return { placement: inTrash(object) ? "trash" : "private_folder" };
 }
 
 export function previewKind(object) {
