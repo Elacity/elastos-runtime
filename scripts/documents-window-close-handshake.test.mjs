@@ -904,7 +904,7 @@ test("Documents applies Home's remembered choice and turning it on restores the 
   assert.equal(state.autosave, false);
   assert.equal(context.api.handleAutosavePreferenceMessage({ type: stringConstant(documentsSource, "DOCUMENTS_PREFERENCES_TYPE"), homeToken: "tok", autosave: true }), true);
   assert.equal(state.autosave, true);
-  assert.equal(toggle.attributes["aria-pressed"], "true");
+  assert.equal(toggle.attributes["aria-checked"], "true");
   assert.equal(has900(), true);
 
   context.api.toggleAutosavePreference();

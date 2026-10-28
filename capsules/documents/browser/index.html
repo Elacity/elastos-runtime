@@ -656,23 +656,6 @@ a {
   font-size: 0.88rem;
 }
 
-.shared-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.7rem;
-  padding: 0.35rem 0 0.05rem;
-}
-
-.shared-row[hidden] {
-  display: none;
-}
-
-.shared-text {
-  color: var(--muted);
-  font-size: 0.88rem;
-}
-
 .find-bar {
   display: flex;
   align-items: center;
@@ -813,10 +796,42 @@ a {
   color: var(--accent-deep);
 }
 
-.autosave-toggle[aria-pressed="true"] {
-  background: var(--accent-soft);
-  border-color: rgba(125, 149, 240, 0.35);
-  color: var(--accent-deep);
+/* Text controls in the toolbar row: as tall as the icon buttons. */
+.toolbar-text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  height: 2.35rem;
+  padding: 0 0.9rem;
+  white-space: nowrap;
+}
+
+.switch-track {
+  position: relative;
+  width: 1.9rem;
+  height: 1.1rem;
+  border-radius: 999px;
+  background: var(--line);
+  transition: background 120ms ease;
+}
+
+.switch-knob {
+  position: absolute;
+  top: 0.15rem;
+  left: 0.15rem;
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 50%;
+  background: #f8fbff;
+  transition: transform 120ms ease;
+}
+
+.autosave-switch[aria-checked="true"] .switch-track {
+  background: var(--accent);
+}
+
+.autosave-switch[aria-checked="true"] .switch-knob {
+  transform: translateX(0.8rem);
 }
 
 .view-toggle-button .action-icon,
@@ -1420,6 +1435,21 @@ a {
   font-weight: 500;
 }
 
+:root[data-el-form-factor="phone"] .toolbar-text-button {
+  height: var(--el-touch-target);
+}
+
+:root[data-el-form-factor="phone"] .more-menu .autosave-switch {
+  justify-content: space-between;
+  width: 100%;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  font-size: 16px;
+  font-weight: 500;
+}
+
 :root[data-el-form-factor="phone"] .action-icon-button {
   width: var(--el-touch-target);
   height: var(--el-touch-target);
@@ -1503,6 +1533,7 @@ a {
             <button id="save-button" class="action-primary action-icon-button" type="button" aria-label="Save" title="Save">
               <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h12l2 2v14H5z"></path><path d="M8 4v6h8V4"></path><path d="M8 20v-6h8v6"></path></svg>
             </button>
+            <button id="save-to-library" class="action-primary toolbar-text-button hidden" type="button">Save to Library</button>
           </div>
           <div class="toolbar-more">
             <button id="more-button" class="action-secondary action-icon-button more-button" type="button" aria-label="More actions" title="More actions" aria-expanded="false" aria-controls="more-menu">
@@ -1510,8 +1541,9 @@ a {
             </button>
             <div id="more-menu" class="more-menu" role="group" aria-label="More actions">
               <div class="toolbar-group">
-                <button id="autosave-toggle" class="action-secondary action-icon-button autosave-toggle" type="button" aria-label="Save automatically" title="Save automatically: off" aria-pressed="false">
-                  <svg class="action-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"></path><path d="M20 4v5h-5"></path><path d="M12 8v4l2.5 2.5"></path></svg>
+                <button id="autosave-toggle" class="action-secondary toolbar-text-button autosave-switch" type="button" role="switch" aria-checked="false">
+                  <span class="switch-label">Autosave</span>
+                  <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
                 </button>
               </div>
               <div class="toolbar-group">
@@ -1529,10 +1561,6 @@ a {
         </div>
       </header>
 
-      <div id="shared-row" class="shared-row" hidden>
-        <span class="shared-text">Read-only copy from Chat</span>
-        <button id="save-to-library" class="action-primary" type="button">Save to Library</button>
-      </div>
       <div id="status-row" class="status-row hidden">
         <span id="status-text" class="status-text"></span>
       </div>

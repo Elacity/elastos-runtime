@@ -48,7 +48,6 @@ const elements = {
   sidebarToggle: document.getElementById("sidebar-toggle"),
   sidebarShow: document.getElementById("sidebar-show"),
   saveButton: document.getElementById("save-button"),
-  sharedRow: document.getElementById("shared-row"),
   saveToLibrary: document.getElementById("save-to-library"),
   autosaveToggle: document.getElementById("autosave-toggle"),
   saveAsButton: document.getElementById("save-as-button"),
@@ -502,8 +501,7 @@ function scheduleAutosave() {
 function applyAutosavePreference(enabled) {
   state.autosave = enabled === true;
   if (elements.autosaveToggle) {
-    elements.autosaveToggle.setAttribute("aria-pressed", String(state.autosave));
-    elements.autosaveToggle.title = state.autosave ? "Save automatically: on" : "Save automatically: off";
+    elements.autosaveToggle.setAttribute("aria-checked", String(state.autosave));
   }
   scheduleAutosave();
 }
@@ -1016,8 +1014,21 @@ function sortDocuments() {
   });
 }
 
+// A shared file shows the reading view and Save to Library only; every other
+// document gets Write, Split and Save back.
+function setSharedChrome(shared) {
+  elements.modeWrite.classList.toggle("hidden", shared);
+  elements.modeSplit.classList.toggle("hidden", shared);
+  elements.saveButton.classList.toggle("hidden", shared);
+  elements.saveToLibrary.classList.toggle("hidden", !shared);
+  if (shared) {
+    setWorkspaceView("read");
+  }
+}
+
 function setWorkspaceView(view) {
-  state.workspaceView = preferredWorkspaceView(view);
+  // A shared read-only file has the reading view only.
+  state.workspaceView = state.current?.shared ? "read" : preferredWorkspaceView(view);
   if (state.workspaceView === "read") {
     setInspectorView("preview");
   }
@@ -1107,7 +1118,7 @@ function renderCurrentDocument() {
     elements.titleInput.disabled = true;
     elements.editor.value = "";
     elements.editor.disabled = true;
-    elements.sharedRow.hidden = true;
+    setSharedChrome(false);
     elements.preview.innerHTML = '<div class="empty-state">Create or open a document.</div>';
     renderOutline([]);
     clearStatus();
@@ -1120,7 +1131,7 @@ function renderCurrentDocument() {
   elements.titleInput.readOnly = shared;
   elements.editor.disabled = false;
   elements.editor.readOnly = shared;
-  elements.sharedRow.hidden = !shared;
+  setSharedChrome(shared);
   elements.titleInput.value = state.current.title;
   elements.editor.value = state.current.body;
   refreshPreviewFromEditor();

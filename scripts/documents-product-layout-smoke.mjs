@@ -404,7 +404,9 @@ async function assertPhoneMoreMenu(page) {
     const items = [...menu.querySelectorAll("button")].filter(visible).map((button) => ({
       id: button.id,
       height: Math.round(button.getBoundingClientRect().height),
-      label: getComputedStyle(button, "::after").content.replace(/^"|"$/g, ""),
+      label: button.getAttribute("role") === "switch"
+        ? button.textContent.trim()
+        : getComputedStyle(button, "::after").content.replace(/^"|"$/g, ""),
     }));
     return {
       rowOverflow: row.scrollWidth - row.clientWidth,
@@ -854,7 +856,7 @@ async function run() {
       const incrementalBody = "# Typed heading\n\nBody after incremental edit.";
       // "Save automatically" on brings back the 900 ms autosave.
       await parserPage.locator("#autosave-toggle").click();
-      assert(await parserPage.locator("#autosave-toggle").getAttribute("aria-pressed") === "true",
+      assert(await parserPage.locator("#autosave-toggle").getAttribute("aria-checked") === "true",
         "Save automatically must show it is on after it is turned on.");
       // Autosave stays quiet: the line under the title shows errors only.
       await parserPage.evaluate(() => {
@@ -893,8 +895,21 @@ async function run() {
       await manualPage.goto(`http://127.0.0.1:${port}/apps/documents/?home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
       await manualPage.locator('.document-list-item[data-doc-did="doc-beta"]').click();
       await manualPage.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
-      assert(await manualPage.locator("#autosave-toggle").getAttribute("aria-pressed") === "false",
+      assert(await manualPage.locator("#autosave-toggle").getAttribute("aria-checked") === "false",
         "Save automatically must be off by default.");
+      const switchView = await manualPage.evaluate(() => {
+        const toggle = document.getElementById("autosave-toggle");
+        return {
+          role: toggle.getAttribute("role"),
+          label: toggle.innerText.trim(),
+          visible: toggle.getClientRects().length > 0,
+          height: Math.round(toggle.getBoundingClientRect().height),
+          toolbarHeight: Math.round(document.querySelector(".workspace-toggle").getBoundingClientRect().height),
+        };
+      });
+      assert(switchView.role === "switch" && switchView.label === "Autosave" && switchView.visible &&
+        switchView.height === switchView.toolbarHeight,
+        `Autosave must be a labeled switch as tall as the toolbar controls. Got ${JSON.stringify(switchView)}`);
       await manualPage.locator("#editor").fill("# Beta\n\nFirst manual edit.");
       await manualPage.waitForTimeout(1500);
       assert(saveCalls.length === 0, `With Save automatically off nothing may save without an action. Got ${JSON.stringify(saveCalls)}`);
@@ -1131,8 +1146,23 @@ async function run() {
         title: document.getElementById("title-input").value,
         titleReadOnly: document.getElementById("title-input").readOnly,
         editorReadOnly: document.getElementById("editor").readOnly,
-        sharedRowVisible: !document.getElementById("shared-row").hidden,
-        sharedText: document.getElementById("shared-row").innerText,
+        visibleModes: ["mode-write", "mode-split", "mode-read"].filter((id) => document.getElementById(id).getClientRects().length > 0),
+        workspaceView: document.getElementById("documents-shell").dataset.workspaceView,
+        saveVisible: document.getElementById("save-button").getClientRects().length > 0,
+        saveToLibraryVisible: document.getElementById("save-to-library").getClientRects().length > 0,
+        spacing: (() => {
+          const actions = document.querySelector(".toolbar-actions");
+          const button = document.getElementById("save-to-library").getBoundingClientRect();
+          const toggle = document.querySelector(".workspace-toggle");
+          const views = toggle.getBoundingClientRect();
+          // The same space the Save button gets after the view modes.
+          return {
+            gap: Math.round(parseFloat(getComputedStyle(actions).columnGap) + parseFloat(getComputedStyle(toggle).marginRight)),
+            before: Math.round(button.left - views.right),
+            height: Math.round(button.height),
+            viewsHeight: Math.round(views.height),
+          };
+        })(),
         saveDisabled: document.getElementById("save-button").disabled,
         mainText: document.querySelector(".documents-main").innerText,
       }));
@@ -1140,8 +1170,14 @@ async function run() {
         `A shared file must open in the normal layout with the list. Got ${JSON.stringify(view)}`);
       assert(view.title === "Shared file" && view.titleReadOnly && view.editorReadOnly && view.saveDisabled,
         `A shared file must open read-only, titled Shared file. Got ${JSON.stringify(view)}`);
-      assert(view.sharedRowVisible && view.sharedText.includes("Read-only copy from Chat") && view.sharedText.includes("Save to Library"),
-        `A shared file must say it is a read-only copy and offer Save to Library. Got ${JSON.stringify(view)}`);
+      assert(view.saveToLibraryVisible && !view.saveVisible && JSON.stringify(view.visibleModes) === JSON.stringify(["mode-read"]) &&
+        view.workspaceView === "read",
+        `A shared file must offer the reading view and Save to Library only. Got ${JSON.stringify(view)}`);
+      assert(view.spacing.before === view.spacing.gap && view.spacing.height === view.spacing.viewsHeight,
+        `Save to Library must sit in the toolbar with its spacing and height. Got ${JSON.stringify(view.spacing)}`);
+      for (const hidden of ["Read-only copy from Chat", "History"]) {
+        assert(!view.mainText.includes(hidden), `A shared file must not show ${JSON.stringify(hidden)}.`);
+      }
       for (const hidden of [publishedFixtureCid, "elastos://", "octet-stream", "application/", " B\n", "Size", "Type"]) {
         assert(!view.mainText.includes(hidden), `A shared file must not show ${JSON.stringify(hidden)}. Got ${JSON.stringify(view.mainText.slice(0, 400))}`);
       }
@@ -1171,9 +1207,13 @@ async function run() {
       await frame.getByRole("button", { name: "Save to Library", exact: true }).click();
       await waitForCondition(() => documents.size === before + 1 && saveCalls.length === 1, 5000,
         `Save to Library must create and save a copy. Got ${JSON.stringify(saveCalls)}`);
-      await frame.waitForFunction(() => document.getElementById("shared-row").hidden &&
+      await frame.waitForFunction(() => document.getElementById("save-to-library").getClientRects().length === 0 &&
+        ["mode-write", "mode-split", "mode-read", "save-button"].every((id) => document.getElementById(id).getClientRects().length > 0) &&
         !document.getElementById("editor").readOnly && !document.getElementById("title-input").readOnly &&
         document.getElementById("save-button").disabled);
+      await frame.locator("#mode-write").click();
+      assert(await frame.evaluate(() => document.getElementById("documents-shell").dataset.workspaceView) === "write",
+        "After Save to Library the copy must offer Write again.");
       const copy = [...documents.values()].at(-1);
       assert(copy.title === "Shared file" && copy.body.startsWith("# Shared note"),
         `Save to Library must keep the shared text. Got ${JSON.stringify(copy)}`);
