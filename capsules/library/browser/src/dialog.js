@@ -636,7 +636,6 @@ export function createLibraryDialog({
     dialog.innerHTML = `
       <div class="dialog-card" data-published-link>
         <div>
-          <p class="eyebrow">Copy link</p>
           <h2>${escapeHtml(name || "Published file")}</h2>
           <p class="subtitle">Copying didn't work. Select the link and copy it.</p>
         </div>
@@ -653,6 +652,43 @@ export function createLibraryDialog({
     const input = dialog.querySelector("[data-published-link-text]");
     input?.focus();
     input?.select();
+  }
+
+  // A published file's sharing for someone who knows nothing about how it
+  // works: since when, who can get it, and what they can do. Resolves to
+  // "copy", "fix", "unpublish" or false.
+  function showSharingDialog({ object, shared, broken, since, canCopy }) {
+    hideMenu();
+    hideDialog();
+    decisionTargetUris = [object.uri];
+    const first = !shared
+      ? "Not shared right now."
+      : since
+        ? `Shared publicly since ${since.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })}.`
+        : "Shared publicly.";
+    const lead = broken
+      ? '<button class="btn btn-primary" type="button" data-sharing-action="fix">Fix</button>'
+      : canCopy
+        ? '<button class="btn btn-primary" type="button" data-sharing-action="copy">Copy link</button>'
+        : "";
+    return new Promise((resolve) => {
+      pendingDialogResolve = resolve;
+      dialog.innerHTML = `
+        <div class="dialog-card" data-sharing>
+          <div>
+            <h2>${escapeHtml(object.name || "File")}</h2>
+            <p class="subtitle">${escapeHtml(first)}</p>
+            <p class="subtitle">Anyone with the link can download it while your Home is online.</p>
+          </div>
+          <div class="button-row">
+            ${lead}
+            <button class="btn" type="button" data-sharing-action="unpublish">Unpublish</button>
+            <button class="btn" type="button" data-dialog-close>Close</button>
+          </div>
+        </div>
+      `;
+      dialog.classList.remove("hidden");
+    });
   }
 
   function confirmDecision({ eyebrow = "", title, message, lines = [], confirmLabel, confirmClass, targetUris }) {
@@ -736,6 +772,12 @@ export function createLibraryDialog({
     });
 
     dialog.addEventListener("click", (event) => {
+      const sharingAction = event.target.closest("[data-sharing-action]");
+      if (sharingAction) {
+        resolveDialogDecision(sharingAction.getAttribute("data-sharing-action"));
+        hideDialog();
+        return;
+      }
       if (event.target.closest("[data-dialog-confirm]")) {
         resolveDialogDecision(true);
         hideDialog();
@@ -780,6 +822,7 @@ export function createLibraryDialog({
     showObjectStatus,
     showProperties,
     showPublishedLink,
+    showSharingDialog,
     showSharedAccessReceipt,
   };
 }

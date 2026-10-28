@@ -15,9 +15,11 @@ import {
   isTrashRootUri,
   isTrashUri,
   isWebSpaceUri,
+  libraryErrorText,
   parentUri,
   publishFailureText,
   publishedLink,
+  sharingState,
   viewerOptions,
 } from "./model.js";
 
@@ -45,6 +47,7 @@ export function createLibraryActions({
   showProtectAndListDialog,
   showProperties,
   showPublishedLink,
+  showSharingDialog,
   showSharedAccessReceipt,
   startCreateObject,
   state,
@@ -499,6 +502,37 @@ export function createLibraryActions({
     setStatus(`Copied the link to ${object.name}.`);
   }
 
+  // Sharing for a plain published file: one plain dialog, whose buttons run
+  // Copy link, Fix (the existing repair) or Unpublish.
+  async function showSharing(object) {
+    let status;
+    try {
+      status = await providerApi("status", { uri: object.uri });
+    } catch (error) {
+      setStatus(libraryErrorText(error) || "Sharing details aren't available right now. Try again.");
+      return;
+    }
+    const action = await showSharingDialog({
+      object,
+      ...sharingState(object, status),
+      canCopy: !!publishedLink(object),
+    });
+    if (action === "copy") {
+      await copyPublishedLink(object);
+    } else if (action === "fix") {
+      setStatus(`Fixing sharing for ${object.name}...`);
+      try {
+        await providerApi("repair", { uri: object.uri });
+      } catch (error) {
+        setStatus(libraryErrorText(error) || `${object.name} could not be fixed. Try again.`);
+        return;
+      }
+      await showAfterReload(`${object.name} is shared again.`);
+    } else if (action === "unpublish") {
+      await unpublishObject(object);
+    }
+  }
+
   async function repairObject(object) {
     setStatus(`Repairing availability for ${object.name}...`);
     await providerApi("repair", { uri: object.uri });
@@ -791,6 +825,7 @@ export function createLibraryActions({
     restoreObject,
     restoreSelectedObjects,
     setClipboard,
+    showSharing,
     showStatusObject,
     trashObject,
     trashSelectedObjects,

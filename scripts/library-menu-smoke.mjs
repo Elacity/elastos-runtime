@@ -2422,12 +2422,11 @@ async function run() {
       "Download",
       "Compress to ZIP",
       "Copy Link",
-      "Status",
-      "Repair",
+      "Sharing...",
       "Unpublish",
       "Properties",
     ], "published file menu");
-    excludesAll(publishedRows, ["Publish", "Share", "Copy Content CID"], "published file menu");
+    excludesAll(publishedRows, ["Publish", "Share", "Copy Content CID", "Status", "Repair"], "published file menu");
     // Copy Link copies the recorded publication link, never the file's current CID.
     await clickMenuExact(page, "Copy Link");
     await page.waitForFunction((link) => window.__clipboardText === link, `elastos://${SMOKE_PUBLISHED_CID}`);
@@ -2460,23 +2459,40 @@ async function run() {
     assertPropertyLabels(publishedProperties.details, ["Object URI", "Content ID"], "Published.md Details");
     await page.locator(".properties-window-actions [data-dialog-close]").click();
     await openItemMenu(page, "Published.md");
-    await clickMenu(page, "Status");
-    await page.locator(".dialog-card").filter({ hasText: "Availability" }).first().waitFor();
-    await page.locator(".dialog-card details").filter({ hasText: "Technical details" }).first().locator("summary").click();
-    await page.locator(".dialog-card").filter({ hasText: "Share Grants / Key Release" }).first().waitFor();
-    await page.locator(".dialog-card").filter({ hasText: "plain_content" }).first().waitFor();
-    await page.locator(".dialog-card").filter({ hasText: "Publish Receipt" }).first().waitFor();
-    assert(ops.some((entry) => entry.op === "status" && entry.payload.uri.endsWith("/Published.md")), "Status must call status");
-    await page.locator("[data-dialog-close]").click();
+    // Sharing is one plain dialog: no CID, link text, receipts or technical details.
+    await clickMenuExact(page, "Sharing...");
+    const sharingDialog = page.locator("[data-sharing]");
+    const readSharing = () => sharingDialog.evaluate((card) => ({
+      eyebrow: card.querySelectorAll(".eyebrow, details").length,
+      title: card.querySelector("h2")?.textContent,
+      lines: Array.from(card.querySelectorAll(".subtitle")).map((line) => line.textContent),
+      buttons: Array.from(card.querySelectorAll(".button-row button")).map((button) => button.textContent),
+      text: card.textContent,
+    }));
+    await sharingDialog.waitFor();
+    const sharing = await readSharing();
+    assert(
+      sharing.eyebrow === 0 && sharing.title === "Published.md" && sharing.lines.length === 2
+        && /^Shared publicly since [^\d]*\d.*\.$/.test(sharing.lines[0]) && !/\d{4}-\d{2}-\d{2}/.test(sharing.lines[0])
+        && sharing.lines[1] === "Anyone with the link can download it while your Home is online."
+        && sharing.buttons.join("|") === "Copy link|Unpublish|Close",
+      `Sharing dialog differs: ${JSON.stringify(sharing)}`,
+    );
+    assert(!/elastos:\/\/|bafy|baf[a-z0-9]{20}|replica|receipt|availability|provider/i.test(sharing.text),
+      `Sharing must not show technical details: ${sharing.text}`);
+    assert(ops.some((entry) => entry.op === "status" && entry.payload.uri.endsWith("/Published.md")), "Sharing must read the publication");
+    await sharingDialog.locator("[data-dialog-close]").click();
+    // A failed last repair shows Fix, which runs the existing repair.
+    findObject(`${documentsUri}/Published.md`).availability = "repair_needed";
     await openItemMenu(page, "Published.md");
-    const repaired = page.waitForResponse(response => {
-      const request = response.request();
-      return new URL(response.url()).pathname === "/api/provider/object/repair" &&
-        request.method() === "POST" && request.postDataJSON()?.uri === `${documentsUri}/Published.md`;
-    });
-    await clickMenu(page, "Repair");
-    assert((await repaired).ok(), "Repair response must succeed");
-    assert(ops.some((entry) => entry.op === "repair" && entry.payload.uri.endsWith("/Published.md")), "Repair must call repair");
+    await clickMenuExact(page, "Sharing...");
+    await sharingDialog.waitFor();
+    const broken = await readSharing();
+    assert(broken.lines[0] === "Not shared right now." && broken.buttons.join("|") === "Fix|Unpublish|Close",
+      `Broken sharing differs: ${JSON.stringify(broken)}`);
+    await sharingDialog.locator('[data-sharing-action="fix"]').click();
+    await waitForOp((entry) => entry.op === "repair" && entry.payload.uri.endsWith("/Published.md"), "Fix must run repair");
+    await page.waitForFunction(() => document.querySelector("#status-text")?.textContent === "Published.md is shared again.");
     // Unpublish withdraws the publication and offers Publish again.
     await openItemMenu(page, "Published.md");
     await clickMenu(page, "Unpublish");
@@ -2837,7 +2853,7 @@ async function run() {
     );
     await page.locator(".item").filter({ hasText: "Guide.md" }).locator(".badge-published").first().waitFor();
     const guidePublishedRows = await openItemMenu(page, "Guide.md");
-    includesAll(guidePublishedRows, ["Copy Link", "Status", "Repair", "Unpublish"], "published Guide menu");
+    includesAll(guidePublishedRows, ["Copy Link", "Sharing...", "Unpublish"], "published Guide menu");
     excludesAll(guidePublishedRows, ["Publish", "Share", "Copy Content CID"], "published Guide menu");
     await clickMenu(page, "Unpublish");
     await waitForOp((entry) => entry.op === "unpublish" && entry.payload.uri === `${documentsUri}/Guide.md`, "Unpublish must call unpublish");

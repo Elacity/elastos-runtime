@@ -156,6 +156,26 @@ export function publishedLink(object) {
 
 export const PUBLISH_CONFIRM_BODY = "Anyone with the link can download a copy.";
 
+// A published file's sharing in plain terms, from Library's own record:
+// whether it is shared, since when, and whether its last repair failed.
+// The record is the last known state; it does not check the pin itself.
+export function sharingState(object, status) {
+  const record = status?.published || null;
+  const active = !!object?.published && !!record;
+  const availability = record?.availability;
+  const availabilityStatus = typeof availability === "string" ? availability : availability?.status;
+  const publishedAt = Number(object?.publication?.published_at ?? record?.published_at);
+  return {
+    shared: active && availabilityStatus !== "repair_needed",
+    broken: !!object?.published && (!record || availabilityStatus === "repair_needed"),
+    since: Number.isFinite(publishedAt) && publishedAt > 0 ? new Date(publishedAt * 1000) : null,
+  };
+}
+
+export function isProtectedContent(object) {
+  return !!(object?.metadata?.protected_content || object?.protected_content);
+}
+
 export function canPublishObject(object) {
   return !!object &&
     !isDirectory(object) &&

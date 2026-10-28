@@ -7,6 +7,7 @@ import {
   inTrash,
   isBlockedObject,
   isDirectory,
+  isProtectedContent,
   isRuntimeCustodyProtectableVideo,
   isTrashRootUri,
   isTrashUri,
@@ -152,6 +153,7 @@ import {
     let restoreObject = async () => {};
     let restoreSelectedObjects = async () => {};
     let setClipboard = () => {};
+    let showSharing = async () => {};
     let showStatusObject = async () => {};
     let trashObject = async () => {};
     let trashSelectedObjects = async () => {};
@@ -227,6 +229,7 @@ import {
       showProtectAndListDialog,
       showProperties,
       showPublishedLink,
+      showSharingDialog,
       showSharedAccessReceipt,
     } = createLibraryDialog({
       allVisible,
@@ -314,6 +317,7 @@ import {
       restoreObject,
       restoreSelectedObjects,
       setClipboard,
+      showSharing,
       showStatusObject,
       trashObject,
       trashSelectedObjects,
@@ -344,6 +348,7 @@ import {
       showProtectAndListDialog,
       showProperties,
       showPublishedLink,
+      showSharingDialog,
       showSharedAccessReceipt,
       startCreateObject,
       state,
@@ -1051,11 +1056,15 @@ import {
           } else if (isPolicyGatedArchive(object)) {
             actions.push(menuAction("Archive Support", () => showArchiveSupport(object)));
           }
-          if (object.published) {
-            if (publishedLink(object)) actions.push(menuAction("Copy Link", () => copyPublishedLink(object)));
+          if (object.published && isProtectedContent(object)) {
+            // Protected content keeps its own status and repair actions.
             actions.push(menuAction("Status", () => showStatusObject(object)));
             if (hasCapability(object, "repair")) actions.push(menuAction("Repair", () => repairObject(object)));
             if (object.shared) actions.push(menuAction("Check My Access", () => checkMyAccess(object)));
+            if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
+          } else if (object.published) {
+            if (publishedLink(object)) actions.push(menuAction("Copy Link", () => copyPublishedLink(object)));
+            actions.push(menuAction("Sharing...", () => showSharing(object)));
             if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
           } else {
             if (canPublishObject(object)) actions.push(menuAction("Publish", () => publishObject(object)));

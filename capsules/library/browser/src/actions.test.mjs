@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createLibraryActions } from "./actions.js";
-import { decimalIntegerToHexQuantity } from "./model.js";
+import { decimalIntegerToHexQuantity, sharingState } from "./model.js";
 
 function makeActions(overrides = {}) {
   return createLibraryActions({
@@ -712,4 +712,48 @@ test("Library gives Chat the file's address and revision, and Browser the file's
   assert.equal(browser.payload.type, "browser:file-picker-selection");
   assert.equal(await browser.payload.blob.text(), "hello");
   assert.equal(browser.payload.revision, undefined);
+});
+
+test("Library Sharing reads the record in plain terms and offers Fix only when the last repair failed", () => {
+  const object = file("Guide.md", { published: true, published_cid: "bafkreirecorded" });
+  const record = (status) => ({ published: { published_at: 1780000000, availability: { status } } });
+  assert.deepEqual(sharingState(object, record("local_pinned")), {
+    shared: true, broken: false, since: new Date(1780000000 * 1000),
+  });
+  assert.deepEqual(sharingState(object, record("unknown")).broken, false);
+  assert.deepEqual(sharingState(object, record("repair_needed")), {
+    shared: false, broken: true, since: new Date(1780000000 * 1000),
+  });
+  assert.deepEqual(sharingState(object, { published: null }), { shared: false, broken: true, since: null });
+});
+
+test("Library Sharing runs Copy link, Fix or Unpublish from its one dialog", async () => {
+  for (const [choice, expectedOps, expectedClipboard] of [
+    ["copy", ["status"], ["elastos://bafkreirecorded"]],
+    ["fix", ["status", "repair"], []],
+    ["unpublish", ["status", "unpublish"], []],
+    [false, ["status"], []],
+  ]) {
+    const ops = [];
+    const clipboard = [];
+    const dialogs = [];
+    const actions = makeActions({
+      async providerApi(op) {
+        ops.push(op);
+        return op === "status" ? { published: { published_at: 1780000000, availability: { status: "local_pinned" } } } : {};
+      },
+      async showSharingDialog(request) {
+        dialogs.push(request);
+        return choice;
+      },
+      async writeResourceUri(value) {
+        clipboard.push(value);
+      },
+    });
+    await actions.showSharing(file("Guide.md", { published: true, published_cid: "bafkreirecorded" }));
+    assert.deepEqual(ops, expectedOps, String(choice));
+    assert.deepEqual(clipboard, expectedClipboard, String(choice));
+    assert.equal(dialogs[0].canCopy, true);
+    assert.equal(dialogs[0].shared, true);
+  }
 });
