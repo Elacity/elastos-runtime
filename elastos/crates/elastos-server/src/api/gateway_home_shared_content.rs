@@ -133,12 +133,101 @@ fn exact_shared_content_cid(uri: &str) -> anyhow::Result<String> {
     Ok(cid.to_string())
 }
 
-/// Whether `body` carries `uri` as one link token (trailing punctuation as
-/// Chat trims it).
+/// Whether `body` carries `uri` as a link Chat shows (`split_web_links` in the
+/// Chat app): the extracted link must equal `uri` exactly.
 fn body_cites(body: &str, uri: &str) -> bool {
-    body.split_whitespace().any(|word| {
-        word.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '\'', '"']) == uri
+    chat_links(body).any(|link| link == uri)
+}
+
+/// The web and shared-file links Chat renders in `text`, with Chat's rules:
+/// a scheme that does not continue an ASCII word starts an address, which runs
+/// to whitespace or full-width punctuation, minus trailing sentence
+/// punctuation, quotes and unbalanced closing brackets. A shared-file link is
+/// a canonical bare CID with no path, query or fragment.
+fn chat_links(text: &str) -> impl Iterator<Item = &str> {
+    let mut cursor = 0;
+    std::iter::from_fn(move || {
+        while let Some((start, scheme_len)) = next_link_scheme(text, cursor) {
+            let rest = &text[start..];
+            let run_end = start + rest.find(ends_link_run).unwrap_or(rest.len());
+            let end = start + trim_link_end(&text[start..run_end]).len();
+            if end > start + scheme_len
+                && (scheme_len != "elastos://".len()
+                    || (exact_shared_content_cid(&text[start..end]).is_ok()
+                        && !text[start + scheme_len..run_end].contains(['/', '?', '#'])))
+            {
+                cursor = end;
+                return Some(&text[start..end]);
+            }
+            cursor = start + scheme_len;
+        }
+        None
     })
+}
+
+fn next_link_scheme(text: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    (from..bytes.len()).find_map(|index| {
+        if !text.is_char_boundary(index)
+            || text[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|before| before.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        ["https://", "http://", "elastos://"]
+            .into_iter()
+            .find_map(|scheme| {
+                bytes
+                    .get(index..index + scheme.len())
+                    .filter(|candidate| candidate.eq_ignore_ascii_case(scheme.as_bytes()))
+                    .map(|_| (index, scheme.len()))
+            })
+    })
+}
+
+fn ends_link_run(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '。' | '、'
+                | '，'
+                | '．'
+                | '：'
+                | '；'
+                | '！'
+                | '？'
+                | '）'
+                | '」'
+                | '』'
+                | '】'
+                | '〉'
+                | '》'
+        )
+}
+
+fn trim_link_end(candidate: &str) -> &str {
+    const CLOSERS: [char; 4] = [')', ']', '}', '>'];
+    const OPENERS: [char; 4] = ['(', '[', '{', '<'];
+    let openers = OPENERS.map(|opener| candidate.matches(opener).count());
+    let mut closers = CLOSERS.map(|closer| candidate.matches(closer).count());
+    let mut link = candidate;
+    while let Some(last) = link.chars().next_back() {
+        if let Some(pair) = CLOSERS.iter().position(|closer| *closer == last) {
+            if openers[pair] >= closers[pair] {
+                break;
+            }
+            closers[pair] -= 1;
+        } else if !matches!(
+            last,
+            '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | '\u{2019}' | '\u{201D}' | '\u{BB}'
+        ) {
+            break;
+        }
+        link = &link[..link.len() - last.len_utf8()];
+    }
+    link
 }
 
 /// The size a Chat file post states (`name · size · elastos://<cid>`), in
@@ -467,7 +556,13 @@ mod tests {
         let body = format!("notes.txt · 1.0 MB · {uri}");
         assert!(body_cites(&body, &uri));
         assert!(body_cites(&format!("see {uri}."), &uri));
+        assert!(body_cites(&format!("See ({uri})."), &uri));
+        assert!(body_cites(&format!("「{uri}」。"), &uri));
+        assert!(body_cites(&format!("\"{uri}\"!"), &uri));
         assert!(!body_cites(&format!("see {uri}/a"), &uri));
+        assert!(!body_cites(&format!("see x{uri}"), &uri));
+        assert!(!body_cites(&format!("https://a.example/{uri}"), &uri));
+        assert!(!body_cites(&format!("ELASTOS://{V1}"), &uri));
         assert_eq!(stated_post_size(&body, &uri), Some(1024 * 1024));
         assert_eq!(
             stated_post_size(&format!("a · b · 30 bytes · {uri}"), &uri),
