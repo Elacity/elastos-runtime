@@ -1251,67 +1251,6 @@ async function run() {
       await publishedPage.close();
     }
 
-    // When the session ends without asking, Home collects each window's unsaved
-    // text and, after sign-in, hands it back; it saves against the revision it
-    // was edited from.
-    resetDocumentsFixture();
-    const rescuePage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-    trackPage(rescuePage, consoleErrors, pageErrors, failedRequests, errorResponses);
-    let rescued;
-    try {
-      await rescuePage.goto(`http://127.0.0.1:${port}/home-fixture`);
-      const frame = await (await rescuePage.locator('iframe[title="Documents"]').elementHandle()).contentFrame();
-      await frame.locator('.document-list-item[data-doc-did="doc-beta"]').click();
-      await frame.waitForFunction(() => document.getElementById("title-input")?.value === "Beta");
-      const collect = async (requestId) => {
-        await rescuePage.evaluate((id) => document.querySelector("iframe").contentWindow.postMessage(
-          { type: "documents:collect-draft", requestId: id }, "*"), requestId);
-        await rescuePage.waitForFunction((id) => window.homeMessages.some((message) => message?.requestId === id), requestId);
-        return rescuePage.evaluate((id) => window.homeMessages.find((message) => message?.requestId === id), requestId);
-      };
-      const clean = await collect("collect-clean");
-      assert(clean.type === "documents:draft" && clean.homeToken === "documents-link-token" && clean.draft === null,
-        `A window without unsaved changes hands over nothing. Got ${JSON.stringify(clean)}`);
-      await frame.locator("#editor").fill("# Beta\n\nWords written before the session ended.");
-      const dirty = await collect("collect-dirty");
-      rescued = dirty.draft;
-      assert(rescued?.doc_did === "doc-beta" && rescued.body === "# Beta\n\nWords written before the session ended." &&
-        rescued.title === "Beta" && rescued.revision === documents.get("doc-beta").revision && rescued.file_name === "beta.md" &&
-        rescued.library_object_uri === "",
-        `A window hands over its unsaved text and what it was edited from. Got ${JSON.stringify(dirty)}`);
-    } finally {
-      await rescuePage.close();
-    }
-    const restorePage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-    trackPage(restorePage, consoleErrors, pageErrors, failedRequests, errorResponses);
-    try {
-      await restorePage.goto(`http://127.0.0.1:${port}/home-fixture`);
-      const frame = await (await restorePage.locator('iframe[title="Documents"]').elementHandle()).contentFrame();
-      await frame.locator(".document-list-item").first().waitFor();
-      await restorePage.evaluate((draft) => document.querySelector("iframe").contentWindow.postMessage(
-        { type: "documents:restore-draft", requestId: "restore-1", draft }, "*"), rescued);
-      await restorePage.waitForFunction(() => window.homeMessages.some((message) => message?.requestId === "restore-1"));
-      const reply = await restorePage.evaluate(() => window.homeMessages.find((message) => message?.requestId === "restore-1"));
-      assert(reply.type === "documents:draft-restored" && reply.ok === true, `Restoring must succeed. Got ${JSON.stringify(reply)}`);
-      const restored = await frame.evaluate(() => ({
-        title: document.getElementById("title-input").value,
-        body: document.getElementById("editor").value,
-        status: document.getElementById("status-text").textContent,
-        saveEnabled: !document.getElementById("save-button").disabled,
-        active: document.querySelector(".document-list-item.active")?.dataset.docDid || "",
-      }));
-      assert(restored.title === "Beta" && restored.body === rescued.body && restored.saveEnabled && restored.active === "doc-beta" &&
-        restored.status === "Your unsaved changes are back. Save to keep them.",
-        `The rescued text must come back unsaved in its document. Got ${JSON.stringify(restored)}`);
-      assert(saveCalls.length === 0, "Restoring must not save by itself.");
-      await frame.getByRole("button", { name: "Save", exact: true }).click();
-      await waitForCondition(() => saveCalls.length === 1, 5000, "Save after restoring did not save.");
-      assert(saveCalls[0].docDid === "doc-beta" && saveCalls[0].body === rescued.body && saveCalls[0].if_revision === rescued.revision,
-        `Saving the restored text must use the revision it was edited from. Got ${JSON.stringify(saveCalls)}`);
-    } finally {
-      await restorePage.close();
-    }
-
     // The name the Chat post states is the title and the default save name;
     // .md and .txt stay, anything else becomes .txt, a bad name is dropped.
     for (const [name, title, fileName, mime] of [

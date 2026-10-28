@@ -1390,95 +1390,6 @@ async function loadSummary() {
   startDraftDocument({ focusTitle: true });
 }
 
-let firstLoad = Promise.resolve();
-
-// The unsaved text Home rescues when the session ends without asking, so it
-// can be offered back after sign-in. A shared read-only copy has none.
-function unsavedDraft() {
-  const current = state.current;
-  if (!current || !state.dirty || current.shared) {
-    return null;
-  }
-  return {
-    title: elements.titleInput.value,
-    body: elements.editor.value,
-    doc_did: current.doc_did || "",
-    library_object_uri: current.library_object_uri || "",
-    revision: current.revision || "",
-    file_name: current.file_name || "",
-  };
-}
-
-function isUnsavedDraft(draft) {
-  const keys = ["title", "body", "doc_did", "library_object_uri", "revision", "file_name"];
-  return !!draft && typeof draft === "object" && hasExactKeys(draft, keys) &&
-    keys.every((key) => typeof draft[key] === "string");
-}
-
-// Opens a rescued draft over what is stored now. It saves against the revision
-// it was edited from, so a document changed meanwhile reports the conflict
-// instead of being overwritten.
-async function restoreUnsavedDraft(draft) {
-  // A window just opened for the draft finishes its first load before the
-  // draft goes in, so that load cannot replace it.
-  await firstLoad;
-  if (!(await resolveUnsavedChanges())) {
-    return false;
-  }
-  try {
-    if (draft.library_object_uri) {
-      await loadLibraryObject(draft.library_object_uri);
-    } else if (draft.doc_did) {
-      const response = await documentsProviderApi("get", { doc_did: draft.doc_did });
-      const stored = requireSavedWorkingCopy(response.document, draft.doc_did);
-      replaceCurrentDocument(stored);
-      upsertDocumentListItem(stored);
-    } else {
-      replaceCurrentDocument(createDraftDocument());
-    }
-  } catch (_error) {
-    // The stored file is gone or unreadable: keep the text as a new draft.
-    replaceCurrentDocument(createDraftDocument());
-  }
-  state.mode = "shell";
-  elements.shareShell.classList.add("hidden");
-  elements.documentsShell.classList.remove("hidden");
-  const sameStoredDocument = draft.doc_did
-    ? state.current.doc_did === draft.doc_did
-    : !!draft.library_object_uri && state.current.library_object_uri === draft.library_object_uri;
-  state.current = {
-    ...state.current,
-    ...(sameStoredDocument && draft.revision ? { revision: draft.revision } : {}),
-    title: draft.title,
-    body: draft.body,
-  };
-  renderDocumentsList();
-  renderCurrentDocument();
-  setDirty(true);
-  scheduleAutosave();
-  showError("Your unsaved changes are back. Save to keep them.");
-  return true;
-}
-
-async function handleHomeDraftMessage(data) {
-  if (data.type === "documents:collect-draft") {
-    if (!hasExactKeys(data, ["type", "requestId"]) || typeof data.requestId !== "string") return;
-    window.top.postMessage({ type: "documents:draft", requestId: data.requestId, homeToken: state.homeToken,
-      draft: unsavedDraft() }, homeOrigin);
-    return;
-  }
-  if (!hasExactKeys(data, ["type", "requestId", "draft"]) || typeof data.requestId !== "string" ||
-      !isUnsavedDraft(data.draft)) return;
-  let ok = false;
-  try {
-    ok = await restoreUnsavedDraft(data.draft);
-  } catch (error) {
-    showError(readableDocumentsError(error, "Your unsaved changes could not be opened."));
-  }
-  window.top.postMessage({ type: "documents:draft-restored", requestId: data.requestId, homeToken: state.homeToken,
-    ok }, homeOrigin);
-}
-
 async function loadLibraryObject(uri) {
   const sequence = ++documentSelectionSequence;
   const sessionId = state.currentSessionId;
@@ -2318,11 +2229,6 @@ function wireShellEvents() {
   window.addEventListener("message", (event) => {
     const data = event.data;
     if (event.origin === homeOrigin && event.source === window.top) {
-      if (data && typeof data === "object" &&
-          (data.type === "documents:collect-draft" || data.type === "documents:restore-draft")) {
-        void handleHomeDraftMessage(data);
-        return;
-      }
       if (!data || typeof data !== "object" || data.type !== "documents:open-chat-attachment") {
         return;
       }
@@ -2462,10 +2368,6 @@ async function loadShellMode() {
   wireShellEvents();
   announceHomeChrome();
   requestAutosavePreference();
-  let finishFirstLoad;
-  firstLoad = new Promise((resolve) => {
-    finishFirstLoad = resolve;
-  });
   try {
     await loadSummary();
   } catch (error) {
@@ -2473,8 +2375,6 @@ async function loadShellMode() {
     const message = readableDocumentsError(error, "Documents could not be loaded.");
     elements.preview.innerHTML = '<div class="error-state">' + escapeHtml(message) + "</div>";
     showError(message);
-  } finally {
-    finishFirstLoad();
   }
 }
 
