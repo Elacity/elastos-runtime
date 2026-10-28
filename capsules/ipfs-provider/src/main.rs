@@ -38,6 +38,10 @@ const ADD_PATH_CHUNK: usize = 1024 * 1024;
 const BOUNDED_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const BOUNDED_READ_KUBO_TIMEOUT: &str = "100ms";
 const MAX_BOUNDED_READ_BYTES: u64 = 64 * 1024;
+// A whole-bounded read only reads this node's repo; 60 s covers a local read
+// of the whole-content ceiling and keeps the one-at-a-time provider free.
+const LOCAL_WHOLE_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const LOCAL_WHOLE_READ_KUBO_TIMEOUT: &str = "60s";
 const MAX_CAPACITY_REQUIRED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 // The upload reads one opened file. A short read or changed file cannot
@@ -662,6 +666,55 @@ impl IpfsProvider {
                 failures.push(err);
                 Err(failures.join("; "))
             }
+        }
+    }
+
+    /// One whole read of `arg` from this node's repo only, refused once it
+    /// passes `limit` bytes. No network search, pin or gateway fallback. Kubo
+    /// path cat of a missing DAG can keep an offline call open, so a short
+    /// probe (as in `cat_bounded`) fails a miss before the full read.
+    fn local_whole_bytes(&mut self, arg: &str, limit: u64) -> Result<Vec<u8>, String> {
+        self.ensure_kubo()
+            .map_err(|e| format!("local content backend is not ready: {e}"))?;
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .try_proxy_from_env(false)
+            .build();
+        let probe = kubo_rpc_url(
+            self.api_port,
+            "cat",
+            &[
+                ("arg", arg),
+                ("offline", "true"),
+                ("timeout", BOUNDED_READ_KUBO_TIMEOUT),
+                ("length", "1"),
+            ],
+        );
+        match agent.post(&probe).timeout(BOUNDED_READ_TIMEOUT).call() {
+            Ok(resp) if resp.status() == 200 => {}
+            _ => return Err(format!("{arg} is not in this node's IPFS repo")),
+        }
+        let url = kubo_rpc_url(
+            self.api_port,
+            "cat",
+            &[
+                ("arg", arg),
+                ("offline", "true"),
+                ("timeout", LOCAL_WHOLE_READ_KUBO_TIMEOUT),
+            ],
+        );
+        match agent.post(&url).timeout(LOCAL_WHOLE_READ_TIMEOUT).call() {
+            Ok(resp) if resp.status() == 200 => {
+                let bytes = read_whole_content(resp.into_reader(), "kubo local cat", limit)?;
+                update_coord_last_used(&self.data_dir);
+                Ok(bytes)
+            }
+            Ok(resp) => Err(format!(
+                "kubo local cat -> HTTP {} for {}",
+                resp.status(),
+                arg
+            )),
+            Err(e) => Err(format!("kubo local cat -> {} for {}", e, arg)),
         }
     }
 
@@ -1412,7 +1465,8 @@ impl IpfsProvider {
     }
 
     /// One whole file, refused once it passes `whole_max_bytes` (when given)
-    /// or the shared whole-content ceiling.
+    /// or the shared whole-content ceiling. A read with `whole_max_bytes`
+    /// comes from this node's repo only.
     fn cat(&mut self, cid: &str, path: Option<&str>, whole_max_bytes: Option<u64>) -> Response {
         let limit = match whole_max_bytes {
             None => WHOLE_CONTENT_CEILING,
@@ -1429,7 +1483,12 @@ impl IpfsProvider {
             _ => cid.to_string(),
         };
 
-        match self.fetch_bytes(&arg, limit) {
+        let result = if whole_max_bytes.is_some() {
+            self.local_whole_bytes(&arg, limit)
+        } else {
+            self.fetch_bytes(&arg, limit)
+        };
+        match result {
             Ok(bytes) => Response::ok(serde_json::json!({
                 "data": BASE64.encode(&bytes)
             })),
@@ -3252,20 +3311,11 @@ mod tests {
 
     #[test]
     fn whole_read_past_its_limit_is_refused_while_reading() {
-        let ceiling = elastos_common::MAX_WHOLE_CONTENT_BYTES as u64;
-        let gateway_file_limit = 100 * 1024 * 1024;
-        // The direct Kubo read, the local gateway once Kubo and pinning fail,
-        // and a read whose request carries its own smaller limit.
-        for (case, served_by, requested) in [
-            ("kubo", "POST /api/v0/cat", None),
-            ("gateway", "GET /ipfs/", None),
-            (
-                "requested limit",
-                "POST /api/v0/cat",
-                Some(gateway_file_limit),
-            ),
-        ] {
-            let limit = requested.unwrap_or(ceiling);
+        let limit = elastos_common::MAX_WHOLE_CONTENT_BYTES as u64;
+        // The direct Kubo read and the local gateway once Kubo and pinning
+        // fail; a read carrying its own limit is in
+        // `whole_bounded_cat_hit_past_its_limit_is_refused_while_reading`.
+        for (case, served_by) in [("kubo", "POST /api/v0/cat"), ("gateway", "GET /ipfs/")] {
             let root = tempfile::tempdir().unwrap();
             // One answer of three times the limit, with no declared length.
             let (port, backend) = kubo_answering(served_by, move |socket| {
@@ -3278,10 +3328,7 @@ mod tests {
                 write_body(socket, 3 * limit, |_| b'a')
             });
             let mut provider = bounded_cat_fixture_provider(root.path(), port);
-            let mut request = serde_json::json!({"op": "cat", "cid": "large-cid"});
-            if let Some(requested) = requested {
-                request["whole_max_bytes"] = serde_json::json!(requested);
-            }
+            let request = serde_json::json!({"op": "cat", "cid": "large-cid"});
             let response = provider.handle(serde_json::from_value(request).unwrap());
             let (requests, sent) = backend.join().unwrap();
             match &response {
@@ -4281,6 +4328,176 @@ mod tests {
         assert!(headers.contains("offline=true"));
         assert!(!headers.contains("/api/v0/pin/add"));
         assert_eq!(std::fs::read(&dest).unwrap(), b"GGUF");
+    }
+
+    /// Port, stop flag and serving thread of `kubo_serving_all`.
+    type ServingKubo = (
+        u16,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<(Vec<String>, u64)>,
+    );
+
+    /// A Kubo double that serves every request with `answer` until the
+    /// caller sets the returned stop flag. The thread returns each request's
+    /// first line and the body bytes the answers managed to send.
+    fn kubo_serving_all<F>(answer: F) -> ServingKubo
+    where
+        F: Fn(&str, &mut std::net::TcpStream) -> u64 + Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let serving = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let mut sent = 0;
+            while !stopped.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        let headers = read_bounded_fixture_headers(&mut socket);
+                        requests.push(headers.lines().next().unwrap_or_default().to_string());
+                        socket
+                            .set_write_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        sent += answer(&headers, &mut socket);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("fixture accept failed: {e}"),
+                }
+            }
+            (requests, sent)
+        });
+        (port, stop, serving)
+    }
+
+    fn whole_bounded_cat(provider: &mut IpfsProvider, whole_max_bytes: u64) -> Response {
+        provider.handle(
+            serde_json::from_value(serde_json::json!({
+                "op": "cat",
+                "cid": "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+                "path": "index.html",
+                "whole_max_bytes": whole_max_bytes,
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn whole_bounded_cat_miss_reads_only_the_local_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let (port, stop, backend) = kubo_serving_all(|_, socket| {
+            let body =
+                br#"{"Message":"block was not found locally (offline)","Code":0,"Type":"error"}"#;
+            let head = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes());
+            let _ = socket.write_all(body);
+            0
+        });
+        let mut provider = bounded_cat_fixture_provider(root.path(), port);
+        let started = Instant::now();
+        let response = whole_bounded_cat(&mut provider, 1024 * 1024);
+        let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (requests, _) = backend.join().unwrap();
+        assert!(
+            matches!(&response, Response::Error { code, .. } if code == "cat_failed"),
+            "{response:?}"
+        );
+        assert!(!requests.is_empty());
+        for request in &requests {
+            assert!(
+                request.starts_with("POST /api/v0/cat?") && request.contains("offline=true"),
+                "a whole-bounded read only reads the local repo: {requests:?}"
+            );
+        }
+        assert!(elapsed < BOUNDED_READ_TIMEOUT, "{elapsed:?}");
+    }
+
+    /// Answers the local-repo probe with one byte, as Kubo does for a hit.
+    fn answer_local_probe(headers: &str, socket: &mut std::net::TcpStream) -> bool {
+        if !headers.contains("length=1") {
+            return false;
+        }
+        let _ =
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n<");
+        true
+    }
+
+    #[test]
+    fn whole_bounded_cat_hit_returns_the_local_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let (port, stop, backend) = kubo_serving_all(|headers, socket| {
+            if !answer_local_probe(headers, socket) {
+                let _ = socket.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n<html>hi</html>",
+                );
+            }
+            0
+        });
+        let mut provider = bounded_cat_fixture_provider(root.path(), port);
+        let response = whole_bounded_cat(&mut provider, 1024);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (requests, _) = backend.join().unwrap();
+        let Response::Ok { data: Some(data) } = &response else {
+            panic!("local hit failed: {response:?}")
+        };
+        assert_eq!(data["data"], BASE64.encode(b"<html>hi</html>"));
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        let (probe, read) = (&requests[0], &requests[1]);
+        assert!(probe.starts_with("POST /api/v0/cat?") && read.starts_with("POST /api/v0/cat?"));
+        assert!(
+            probe.contains("offline=true&timeout=100ms&length=1"),
+            "{probe}"
+        );
+        assert!(read.contains("offline=true&timeout=60s") && !read.contains("length="));
+    }
+
+    #[test]
+    fn whole_bounded_cat_hit_past_its_limit_is_refused_while_reading() {
+        let root = tempfile::tempdir().unwrap();
+        let limit = 100 * 1024 * 1024;
+        // One answer of three times the limit, with no declared length.
+        let (port, stop, backend) = kubo_serving_all(move |headers, socket| {
+            if answer_local_probe(headers, socket)
+                || socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                    .is_err()
+            {
+                return 0;
+            }
+            write_body(socket, 3 * limit, |_| b'a')
+        });
+        let mut provider = bounded_cat_fixture_provider(root.path(), port);
+        let response = whole_bounded_cat(&mut provider, limit);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (requests, sent) = backend.join().unwrap();
+        match &response {
+            Response::Error { code, message } => {
+                assert_eq!(code, "cat_failed");
+                assert_eq!(
+                    message,
+                    &format!("{WHOLE_CONTENT_TOO_LARGE} of {limit} bytes")
+                );
+            }
+            Response::Ok { .. } => panic!("content past the limit was returned"),
+        }
+        assert!(
+            sent < 2 * limit,
+            "the provider read on past the limit ({sent} bytes sent)"
+        );
+        assert_eq!(
+            requests.len(),
+            2,
+            "a refused read is not repeated: {requests:?}"
+        );
+        assert!(requests.iter().all(|r| r.contains("offline=true")));
     }
 
     #[test]
