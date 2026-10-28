@@ -2003,7 +2003,7 @@ function syncLauncherVisibility(isVisible) {
     taskbar?.style.removeProperty("--shelf-face-w");
   }
   taskbar?.classList.toggle("is-launcher-face", isVisible);
-  easeDockPillWidth(dockWidthBefore, "--shelf-face-ms");
+  easeDockPillWidth(dockWidthBefore, "--launcher-face-ms");
   setOverlayOpen(launcher, isVisible, {
     invoker: launcherToggleButton,
     focusEl: isVisible && shouldFocusLauncherSearch() ? launcherSearch : undefined,

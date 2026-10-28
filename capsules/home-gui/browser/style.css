@@ -60,6 +60,8 @@
      Apps face grows up out of the dock at the dock's own width. */
   --dock-width-ms: 780ms;
   --shelf-face-ms: 950ms;
+  /* The Apps face (launcher drawer) runs at half the Assistant stretch. */
+  --launcher-face-ms: 475ms;
   --shelf-face-ease: cubic-bezier(0.42, 0, 0.58, 1);
   --desktop-wallpaper: url("./wallpaper.webp");
   /* Shell chrome motion — water, not switches. */
@@ -4543,7 +4545,7 @@ body.dragging-target {
      (height only, width locked), the content fades in where it lives near the
      end of the stretch; closing lets the content leave first, then collapses.
      This rule's transition is the closing leg (content leave, then height). */
-  transition: max-height var(--shelf-face-ms) var(--shelf-face-ease) 140ms;
+  transition: max-height var(--launcher-face-ms) var(--shelf-face-ease) 70ms;
 }
 
 .launcher-header,
@@ -4552,9 +4554,9 @@ body.dragging-target {
   transform: translateY(12px) scale(0.97);
   filter: blur(6px);
   transition:
-    opacity 140ms var(--shelf-face-ease),
-    transform 140ms var(--shelf-face-ease),
-    filter 140ms var(--shelf-face-ease);
+    opacity 70ms var(--shelf-face-ease),
+    transform 70ms var(--shelf-face-ease),
+    filter 70ms var(--shelf-face-ease);
 }
 
 /* Opening leg: height now, content enters at 82% of the stretch, header then grid. */
@@ -4564,14 +4566,14 @@ body.dragging-target {
   transform: translateY(0) scale(1);
   filter: blur(0);
   transition:
-    opacity 320ms var(--shelf-face-ease) calc(var(--shelf-face-ms) * 0.82),
-    transform 320ms var(--shelf-face-ease) calc(var(--shelf-face-ms) * 0.82),
-    filter 320ms var(--shelf-face-ease) calc(var(--shelf-face-ms) * 0.82);
+    opacity 160ms var(--shelf-face-ease) calc(var(--launcher-face-ms) * 0.82),
+    transform 160ms var(--shelf-face-ease) calc(var(--launcher-face-ms) * 0.82),
+    filter 160ms var(--shelf-face-ease) calc(var(--launcher-face-ms) * 0.82);
 }
 
 .taskbar.is-launcher-face .launcher-scroll {
-  transition-duration: 360ms;
-  transition-delay: calc(var(--shelf-face-ms) * 0.82 + 70ms);
+  transition-duration: 180ms;
+  transition-delay: calc(var(--launcher-face-ms) * 0.82 + 35ms);
 }
 
 .taskbar .launcher[hidden] {
@@ -4583,7 +4585,7 @@ body.dragging-target {
      clipped region so it collapses with the face instead of ticking. */
   max-height: calc(min(56vh, 520px) + 10px);
   pointer-events: auto;
-  transition: max-height var(--shelf-face-ms) var(--shelf-face-ease) 0ms;
+  transition: max-height var(--launcher-face-ms) var(--shelf-face-ease) 0ms;
 }
 
 .launcher-popover {
@@ -6812,6 +6814,7 @@ body.assistant-space-active #inbox-rail {
      pill grows into a phone-height face. */
   :root {
     --shelf-face-ms: 1100ms;
+    --launcher-face-ms: 550ms;
   }
 
   .taskbar-item-assistant .taskbar-item-icon.assistant-mark {
