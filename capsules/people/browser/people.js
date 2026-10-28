@@ -562,17 +562,16 @@ function reachabilityLabel(contact) {
 function contactMarkup(contact) {
   const name = readText(contact?.display_name);
   const relationship = readText(contact?.relationship);
+  // Each row is a name and one short status. A request the Community node
+  // cannot deliver says Not delivered; the reason was shown once, when it
+  // was sent. Presence is shown only for a connected contact.
+  const status = relationship === "requested"
+    ? (readText(contact.delivery_detail) ? "Not delivered" : "Request sent")
+    : (relationship === "connected" ? reachabilityLabel(contact) : relationshipLabel(relationship));
   // A request sent by DID before this Home holds their signed Profile has no
-  // name to show, so the row says what is known: the request is sent.
+  // name to show, so the status stands in its place.
   const unnamed = !name && relationship === "requested";
-  // Connected is the usual state and Message and Remove already say so.
-  const state = relationship === "connected" || unnamed ? "" : relationshipLabel(relationship);
-  const handle = readText(contact?.handle);
-  const deliveryDetail = relationship === "requested" ? readText(contact.delivery_detail) : "";
-  const details = [state, deliveryDetail, reachabilityLabel(contact), handle && handle !== name ? handle : ""]
-    .filter(Boolean)
-    .map((value) => `<span>${escapeHtml(value)}</span>`)
-    .join("");
+  const details = status && !unnamed ? `<span>${escapeHtml(status)}</span>` : "";
   const conversationId = readText(contact?.conversation_id);
   const chat = contact?.can_message === true && conversationId
     ? `<button type="button" data-action="chat" data-conversation-id="${escapeHtml(conversationId)}">Message</button>`
@@ -595,7 +594,7 @@ function contactMarkup(contact) {
       </div>
     </div>` : "";
   return personCard({
-    name: unnamed ? "Request sent" : name,
+    name: unnamed ? status : name,
     initial: unnamed ? "" : name,
     details,
     actions: confirming ? "" : `${chat}${remove}`,
@@ -618,12 +617,12 @@ const DISCOVERY_RELATIONSHIP_TEXT = {
 
 function discoveryPeerMarkup(person) {
   const name = readText(person.display_name);
-  const handle = readText(person.handle);
   const status = readText(person.status);
   const addable = status === "visible";
-  const detail = addable
-    ? (handle && handle !== name ? handle : "")
-    : (Object.hasOwn(DISCOVERY_RELATIONSHIP_TEXT, status) ? DISCOVERY_RELATIONSHIP_TEXT[status] : "");
+  // Add contact says what can be done; others get one relationship word.
+  const detail = !addable && Object.hasOwn(DISCOVERY_RELATIONSHIP_TEXT, status)
+    ? DISCOVERY_RELATIONSHIP_TEXT[status]
+    : "";
   return personCard({
     name,
     initial: name,

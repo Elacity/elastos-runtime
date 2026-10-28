@@ -400,8 +400,8 @@ async function runScenario(name) {
       { contact_id: "contact:waiting", display_name: "", relationship: "requested", delivery_detail: detail,
         remote_profile_did: "did:key:z6Mka1b2c3" },
       { contact_id: "contact:nameless", display_name: "", relationship: "connected" },
-      { contact_id: "contact:normal", display_name: "Alma", relationship: "requested" },
-      { contact_id: "contact:connected", display_name: "Bea", relationship: "connected", delivery_detail: detail },
+      { contact_id: "contact:normal", display_name: "Alma", relationship: "requested", reachable: true },
+      { contact_id: "contact:connected", display_name: "Bea", relationship: "connected", delivery_detail: detail, reachable: false },
       { contact_id: "contact:escaped", display_name: "Cy", relationship: "requested", delivery_detail: '<script>alert("fixture")</script>' },
     ];
     const environment = setupEnvironment(name, [response(200, { people: { contacts } })]);
@@ -410,15 +410,20 @@ async function runScenario(name) {
     const markup = environment.nodes.get("people-list").innerHTML;
     const cards = markup.match(/<article[\s\S]*?<\/article>/g);
     assert.equal(cards.length, 4, "Only a waiting request may lack a name");
-    assert.ok(cards[0].includes("Contact requests can&#039;t be delivered right now."), "Requested row lost its delivery detail");
-    assert.match(cards[0], /<h4>Request sent<\/h4>/, "A waiting request without a name says Request sent");
-    assert.equal((cards[0].match(/Request sent/g) || []).length, 1, "Request sent must not repeat as a detail");
-    assert.doesNotMatch(cards[0], /a1b2c3|…|not known/, "Unknown rows must ignore unpublished DID fields");
-    assert.ok(cards[1].includes("Request sent"));
-    assert.ok(!cards[1].includes("delivered"), "Normal requested row invented a delivery failure");
-    assert.ok(!cards[2].includes("delivered"), "Delivery detail belongs only to requested rows");
-    assert.ok(cards[3].includes("&lt;script&gt;"), "Runtime detail must remain text");
-    assert.ok(!cards[3].includes("<script>"));
+    // Each row is a name and one short status; the delivery reason and
+    // presence never ride along on a waiting request.
+    const rows = cards.map((card) => [
+      card.match(/<h4>([^<]*)<\/h4>/)[1],
+      ...[...card.matchAll(/<span>([^<]*)<\/span>/g)].map((match) => match[1]),
+    ]);
+    assert.deepEqual(rows, [
+      ["Not delivered"],
+      ["Alma", "Request sent"],
+      ["Bea", "Offline"],
+      ["Cy", "Not delivered"],
+    ]);
+    assert.doesNotMatch(markup, /a1b2c3|…|not known|can&#039;t be delivered|script/,
+      "Rows must not show DID fields or the delivery explanation");
     return;
   }
   if (name === "add_by_did") {
@@ -703,11 +708,11 @@ async function runScenario(name) {
     assert.deepEqual(
       discoveryCards.map((card) => [
         card.match(/<h4>([^<]*)<\/h4>/)[1],
-        card.match(/<p class="person-details"><span>([^<]*)<\/span>/)[1],
+        card.match(/<p class="person-details"><span>([^<]*)<\/span>/)?.[1] ?? "",
         /data-action="discovery-request"/.test(card),
       ]),
       [
-        ["ESPFix", "espfix", true],
+        ["ESPFix", "", true],
         ["Already Added", "Contact", false],
         ["Asked Already", "Request sent", false],
         ["Asking Me", "Wants to add you", false],

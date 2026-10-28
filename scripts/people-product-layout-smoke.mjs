@@ -196,6 +196,8 @@ function scenarioSummary(state) {
       contacts: [
         { ...acceptedContact(), reachable: true },
         { contact_id: "contact:waiting", display_name: "", relationship: "requested", can_message: false },
+        { contact_id: "contact:stuck", display_name: "Sam Waiting", relationship: "requested", can_message: false,
+          reachable: true, delivery_detail: "They may be on an older version. Ask them to update, or turn on Public in People on both Homes." },
       ],
       discovery: discoverySummary({
         configured: true,
@@ -730,8 +732,9 @@ async function assertVisibleDiscoveryScenario(frame, page, width, trace) {
     ].join("|")),
   }));
   assert(peopleState.requests === "1 contact request waiting.", "People must point to the waiting request", peopleState);
-  assert(peopleState.rows.length === 2 && peopleState.rows[0] === "Ari Contact|Online now|ari|Message|Remove"
-    && peopleState.rows[1] === "Request sent", "a waiting request without a name says only Request sent", peopleState);
+  assert(peopleState.rows.length === 3 && peopleState.rows[0] === "Ari Contact|Online now|Message|Remove"
+    && peopleState.rows[1] === "Request sent" && peopleState.rows[2] === "Sam Waiting|Not delivered",
+  "each row is a name and one short status", peopleState);
   await assertVisible(frame, ['#people-requests [data-action="open-inbox"]'], `People requests at ${width}px`);
   await screenshotPages(page, frame, width);
 

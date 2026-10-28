@@ -461,10 +461,6 @@ button:disabled {
   font-size: 12px;
 }
 
-.person-details span + span::before {
-  content: " · ";
-}
-
 .danger {
   color: var(--el-danger);
 }
