@@ -2336,49 +2336,28 @@ pub(super) async fn chat_room_attach_library(
     } = body;
     // The request_id is checked against its saved binding before anything
     // happens: another file under the same id, or a publication withdrawn
-    // since, is refused; a saved publication is posted as it was published.
-    let lookup = {
-        let (data_dir, principal_id, request_id, uri, if_revision) = (
-            data_dir.clone(),
-            context.principal_id.clone(),
-            request_id.clone(),
-            uri.clone(),
-            if_revision.clone(),
-        );
-        tokio::task::spawn_blocking(move || {
-            crate::library::chat_attach_lookup(
-                &data_dir,
-                &principal_id,
-                &request_id,
-                &uri,
-                if_revision.as_deref(),
-            )
-        })
-        .await
-    };
-    let publication = match lookup {
-        Ok(Ok(crate::library::ChatAttachLookup::Published(publication))) => publication,
-        Ok(Ok(crate::library::ChatAttachLookup::New)) => {
-            // The send rate limit is checked before anything is published.
-            if let Err(err) = port.check_message_allowed(&profile, now_ts()) {
-                return attach_library_chat_error(err);
-            }
-            match crate::library::chat_attach_publish(
-                &data_dir,
-                &registry,
-                &context.principal_id,
-                &request_id,
-                &uri,
-                if_revision.as_deref(),
-            )
-            .await
-            {
-                Ok(publication) => publication,
-                Err(err) => return attach_library_publish_error(err),
-            }
+    // since, is refused; a saved publication is posted as it was published;
+    // a new one passes the send rate limit before it is published.
+    let publication = match crate::library::chat_attach_publication(
+        &data_dir,
+        &registry,
+        &context.principal_id,
+        &request_id,
+        &uri,
+        if_revision.as_deref(),
+        || port.check_message_allowed(&profile, now_ts()),
+    )
+    .await
+    {
+        Ok(publication) => publication,
+        Err(err)
+            if err
+                .downcast_ref::<crate::collaboration_rate_limit::CommunitySendRateLimited>()
+                .is_some() =>
+        {
+            return attach_library_chat_error(err)
         }
-        Ok(Err(err)) => return attach_library_publish_error(err),
-        Err(err) => return attach_library_chat_error(anyhow::anyhow!("Chat task failed: {err}")),
+        Err(err) => return attach_library_publish_error(err),
     };
     let (post, name) =
         community_file_post(&publication.name, publication.size_bytes, &publication.cid);

@@ -11715,3 +11715,58 @@ async fn test_library_provider_unpublish_and_repair_update_status() {
         "local_pinned"
     );
 }
+
+#[tokio::test]
+async fn unpublishing_one_persons_publication_keeps_another_persons_identical_bytes_shared() {
+    // Publishes here count in the shared mock Content the protected tests check.
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let alma = passkey_authority_with_name(dir.path(), Some("alma"));
+    let bruno = passkey_authority_with_name_role(
+        dir.path(),
+        Some("bruno"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    assert_ne!(alma.principal_id, bruno.principal_id);
+    let mut people = Vec::new();
+    for authority in [&alma, &bruno] {
+        let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, authority);
+        let root = crate::auth::principal_localhost_root(&authority.principal_id);
+        let uri = format!("{root}/Documents/same.txt");
+        let (_, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": uri,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"same bytes"),
+            }),
+        )
+        .await;
+        assert_eq!(write["status"], "ok", "{write}");
+        let (_, publish) =
+            post_library(app.clone(), &token, "publish", json!({ "uri": uri })).await;
+        assert_eq!(publish["data"]["cid"], TEST_CIDV1, "{publish}");
+        people.push((token, uri));
+    }
+
+    // Alma withdraws: Bruno's publication of the same CID keeps it pinned.
+    let (token, uri) = &people[0];
+    let (_, unpublish) = post_library(app.clone(), token, "unpublish", json!({ "uri": uri })).await;
+    assert_eq!(unpublish["status"], "ok", "{unpublish}");
+    assert_eq!(
+        unpublish["data"]["availability"]["status"],
+        "publication_released"
+    );
+    let (token, uri) = &people[1];
+    let (_, status) = post_library(app.clone(), token, "status", json!({ "uri": uri })).await;
+    assert_eq!(status["data"]["object"]["published"], true, "{status}");
+
+    // Bruno withdraws last: the CID is unpinned.
+    let (_, unpublish) = post_library(app.clone(), token, "unpublish", json!({ "uri": uri })).await;
+    assert_eq!(
+        unpublish["data"]["availability"]["status"],
+        "local_unpinned"
+    );
+}

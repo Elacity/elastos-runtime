@@ -3093,8 +3093,7 @@ async fn community_attach_publishes_the_library_file_then_posts_its_link_once() 
         body["data"]["publication"]["uri"],
         format!("elastos://{CID}")
     );
-    // The one Library publish: pinned here only, as this principal, under its
-    // own owner.
+    // The one Library publish: pinned here only, as this principal.
     let publishes = home.publishes();
     assert_eq!(publishes.len(), 1, "{publishes:?}");
     assert_eq!(
@@ -3103,10 +3102,6 @@ async fn community_attach_publishes_the_library_file_then_posts_its_link_once() 
     );
     assert_eq!(publishes[0]["data"], "YWJjZA==");
     assert_eq!(publishes[0]["publisher_did"], home.principal_id.as_str());
-    assert!(publishes[0]["owner"]
-        .as_str()
-        .unwrap()
-        .starts_with("library:"));
 
     // Library shows it published, so Unpublish there controls it.
     let stat = home.library("stat", json!({ "uri": home.uri("Documents/notes.txt") }));
@@ -3166,13 +3161,14 @@ async fn community_attach_keeps_the_publication_when_the_post_fails_and_retries_
     let home = attach_fixture().await;
     home.write("Documents/report.txt", b"report");
     // Published and bound, but the post never went out (a lost post).
-    let published = crate::library::chat_attach_publish(
+    let published = crate::library::chat_attach_publication(
         home.dir.path(),
         &home.registry,
         &home.principal_id,
         "chat-attach:report",
         &home.uri("Documents/report.txt"),
         None,
+        || Ok(()),
     )
     .await
     .unwrap();
