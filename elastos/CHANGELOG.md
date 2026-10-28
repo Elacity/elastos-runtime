@@ -43,8 +43,9 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   CID or `elastos://` text. Documents no longer offers Publish, Copy Published
   Link or Copy link on a revision, and drops its History tab and Published
   icon. Library's Publish (item menu, or Publish Selected for several files)
-  asks once before it shares: anyone with the link may download and keep a
-  copy. It shares from this Home only, without waiting for a seed copy, files
+  asks once before it shares: anyone with the link can download a copy, and
+  copies people already have stay after you unpublish. It shares from this
+  Home only, without waiting for a seed copy, files
   up to 8 MiB; a selection's folders are named and left out. A published file
   offers Copy Link (the link to the version you published), Status, Repair and
   Unpublish, and opens from this Home's own copy. Unpublish a file before you
@@ -57,15 +58,16 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Chat can share files in Community: Attach picks a Library file (up to
   8 MiB), asks once ("Post publicly?"), publishes it from Library and posts
   `name · size · elastos://<cid>`. Chat shows publishing and posting apart: if
-  posting fails, Retry post posts the same publication, and Open in Library
-  shows the file. The file shows as Published in Library, where Unpublish
-  removes it from your Home. A contact who clicks the link gets the file from
+  posting fails, Retry post posts the same publication; if Home's answer is
+  lost, Chat says it couldn't confirm the post, and Try again cannot post it
+  twice. Open in Library shows the file, which is Published there and can be
+  unpublished. A contact who clicks the link gets the file from
   your Home (up to 64 MiB) after Home checks that its bytes match the link.
   Direct messages still carry no files.
 - A Home now gives other Homes only files it has pinned (published, posted or
-  received). Unpublish removes that publication's pin; the file stays pinned
-  while another publication of the same bytes on this Home holds it. People
-  who already got a file keep their copy, and copies elsewhere may remain.
+  received). Unpublishing releases that one publication: the file stays shared
+  while another publication of the same bytes on this Home holds it, and
+  copies people already have stay.
 - In this release the seed accepts no new copies of a Home's files; copies it
   already holds stay. Your own devices accept new copies of a Home's files only
   when you allow it: on each device, run
