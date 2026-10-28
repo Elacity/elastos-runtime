@@ -156,7 +156,7 @@ export function inertSystemApiResponse(pathname) {
           connected: true, egress_state: "paused" },
         { id: "model:hosted-22222222222222222222222222222222", name: "VeniceQwen3.8F", provider: "venice",
           processor_label: "Venice", selected_model: "qwen-3-8-flash", operation: "text.generate",
-          connected: true, approval_state: "approved", share_enabled: true, egress_state: "paused" },
+          connected: true, approval_state: "approved", egress_state: "paused" },
       ],
     };
   }

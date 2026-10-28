@@ -1028,11 +1028,6 @@ function configureAiProvider() {
       useButton.dataset.egressPaused = connection.egress_state === "paused" ? "true" : "false";
       useButton.disabled = connection.egress_state === "paused";
       useButton.addEventListener("click", () => openCapsuleTarget("assistant", { offer_id: connection.id }));
-      const shareButton = document.createElement("button");
-      shareButton.className = "pc2-btn pc2-btn-secondary";
-      shareButton.type = "button";
-      shareButton.textContent = connection.share_enabled ? "Shared as service" : "Share as service";
-      shareButton.addEventListener("click", () => openCapsuleTarget("services"));
       const replaceButton = document.createElement("button");
       replaceButton.className = "pc2-btn pc2-btn-secondary";
       replaceButton.type = "button";
@@ -1077,7 +1072,6 @@ function configureAiProvider() {
       summary.textContent = "Details and access";
       const secondary = document.createElement("div");
       secondary.className = "system-inline-row";
-      secondary.append(shareButton);
       if (connection.approval_state === "approved" || ["pending", "approved"].includes(connection.egress_approval_state)) {
         const endApproval = document.createElement("button");
         endApproval.className = "pc2-btn pc2-btn-secondary";

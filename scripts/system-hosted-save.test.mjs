@@ -148,6 +148,10 @@ test("saved hosted card labels only states that need attention", async () => {
   const labels = f.node("#ai-provider-instances").children
     .map(node => node.children[0].children.map(child => child.textContent));
   assert.deepEqual(labels, [["Hosted approval ended"], ["External HTTPS paused"], []]);
+  // Services is hidden, so a card shared by an earlier version offers no way into it.
+  const shared = f.node("#ai-provider-instances").children[2];
+  assert.deepEqual([...shared.children[2].children, ...shared.children[3].children[1].children].map(node => node.textContent),
+    ["Use in Assistant", "Edit", "End hosted approval", "Disconnect"]);
 });
 
 test("Inbox approval prompts are neutral; real failures are errors", async () => {
@@ -327,7 +331,7 @@ test("an Inbox decision reaches open System through Home's inbox event or System
   const venice = veniceCard();
   const f = fixture([venice]);
   await new Promise(setImmediate);
-  assert.deepEqual(accessLabels(f), ["Share as service", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["Disconnect"]);
   const reads = f.reads.length;
   Object.assign(venice, APPROVED); // The person approves the new request in Inbox.
   f.message({ source: f.top, origin: "https://foreign.example", data: INBOX_CHANGED });
@@ -337,12 +341,12 @@ test("an Inbox decision reaches open System through Home's inbox event or System
     data: homeEvents({ scope: "chat-room", kind: "chat-room.changed" }, { scope: "people", kind: "people.changed" }) });
   await f.runTimers();
   assert.equal(f.reads.length, reads, "foreign, framed-sibling, malformed and unrelated messages do not read");
-  assert.deepEqual(accessLabels(f), ["Share as service", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["Disconnect"]);
   f.message({ source: f.top, origin: HOME_ORIGIN, data: INBOX_CHANGED });
   f.message({ source: f.top, origin: HOME_ORIGIN, data: homeEvents({ scope: "inbox", kind: "inbox.changed" }) });
   await f.runTimers();
   assert.equal(f.reads.length, reads + 1, "a burst of Inbox events shares one read");
-  assert.deepEqual(accessLabels(f), ["Share as service", "End hosted approval", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["End hosted approval", "Disconnect"]);
   Object.assign(venice, ENDED); // Ended in another window while System was hidden.
   f.document.hidden = true;
   f.shown();
@@ -353,7 +357,7 @@ test("an Inbox decision reaches open System through Home's inbox event or System
   f.shown();
   await f.runTimers();
   assert.equal(f.reads.length, reads + 2);
-  assert.deepEqual(accessLabels(f), ["Share as service", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["Disconnect"]);
 });
 
 test("a live refresh waits for the person's open form and for the page's own request", async () => {
@@ -375,7 +379,7 @@ test("a live refresh waits for the person's open form and for the page's own req
   f.node("#ai-provider-cancel").handlers.click();
   await f.runTimers();
   assert.equal(f.reads.length, reads + 1, "closing the form catches up once");
-  assert.deepEqual(accessLabels(f), ["Share as service", "End hosted approval", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["End hosted approval", "Disconnect"]);
 
   const card = f.node("#ai-provider-instances").children[0];
   const end = accessControls(f).find(node => node.textContent === "End hosted approval");
@@ -392,7 +396,7 @@ test("a live refresh waits for the person's open form and for the page's own req
   await f.runTimers();
   assert.deepEqual(f.revoked, [venice.id]);
   assert.equal(f.reads.length, reads + 3, "End reads once, then the held Inbox event reads once");
-  assert.deepEqual(accessLabels(f), ["Share as service", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["Disconnect"]);
 });
 
 test("a key the provider rejects is not kept staged; a check waiting for Inbox keeps its key behind Close", async () => {
@@ -500,7 +504,7 @@ test("a live refresh that changes the cards clears an earlier success line; a ne
   Object.assign(venice, APPROVED);
   f.message({ source: f.top, origin: HOME_ORIGIN, data: INBOX_CHANGED });
   await f.runTimers();
-  assert.deepEqual(accessLabels(f), ["Share as service", "End hosted approval", "Disconnect"]);
+  assert.deepEqual(accessLabels(f), ["End hosted approval", "Disconnect"]);
   assert.equal(f.messages.at(-1), "", "the success line no longer describes the cards");
 
   const other = { ...veniceCard(), ...APPROVED };
@@ -513,7 +517,7 @@ test("a live refresh that changes the cards clears an earlier success line; a ne
   g.message({ source: g.top, origin: HOME_ORIGIN, data: INBOX_CHANGED });
   await g.runTimers();
   assert.equal(g.reads.length, 3, "the Inbox request changed the card");
-  assert.deepEqual(accessLabels(g), ["Share as service", "End hosted approval", "Disconnect"]);
+  assert.deepEqual(accessLabels(g), ["End hosted approval", "Disconnect"]);
   assert.equal(g.messages.at(-1), ended, "a neutral line stays");
 });
 
