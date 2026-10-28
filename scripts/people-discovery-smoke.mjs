@@ -148,6 +148,7 @@ function setupEnvironment(name, replies) {
     ["discovery-people", new FakeElement()],
     ["people-requests", new FakeElement()],
     ["people-requests-count", new FakeElement()],
+    ["people-undelivered", new FakeElement()],
     ["discovery-status", new FakeElement()],
     ["discovery-toggle", new FakeElement()],
     ["discovery-refresh", new FakeElement()],
@@ -422,12 +423,11 @@ async function runScenario(name) {
       ["Bea", "Offline"],
       ["Cy", "Not delivered"],
     ]);
-    // The reason sits behind Why? on a request that was not delivered, and
-    // only there; it stays text.
-    const why = cards.map((card) => card.match(/<details class="person-why"[^>]*><summary>Why\?<\/summary><p>([^<]*)<\/p><\/details>/)?.[1] ?? "");
-    assert.deepEqual(why, ["Contact requests can&#039;t be delivered right now.", "", "",
-      "&lt;script&gt;alert(&quot;fixture&quot;)&lt;/script&gt;"]);
-    assert.doesNotMatch(markup, /a1b2c3|…|not known|<script>/, "Rows must not show DID fields or raw markup");
+    // One note above the list covers undelivered requests; no row carries the
+    // reason.
+    assert.equal(environment.nodes.get("people-undelivered").hidden, false);
+    assert.doesNotMatch(markup, /a1b2c3|…|not known|can&#039;t be delivered|script|Why\?/,
+      "Rows must not show DID fields or the delivery reason");
     return;
   }
   if (name === "add_by_did") {
@@ -443,6 +443,7 @@ async function runScenario(name) {
     const node = (id) => environment.nodes.get(id);
     assert.equal(node("profile-id-value").textContent, "did:key:zLocalProfile");
     assert.equal(node("profile-id").hidden, false);
+    assert.equal(node("people-undelivered").hidden, true, "Delivered requests need no note");
     assert.match(node("people-list").innerHTML, /<h4>Request sent<\/h4>/);
     await node("profile-id-copy").listeners.get("click")();
     await settle();

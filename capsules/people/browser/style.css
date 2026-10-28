@@ -461,19 +461,6 @@ button:disabled {
   font-size: 12px;
 }
 
-.person-why summary {
-  width: fit-content;
-  margin-top: 2px;
-  color: var(--el-accent, var(--brand));
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.people-section .person-why p {
-  margin-top: 4px;
-  font-size: 12px;
-}
-
 .danger {
   color: var(--el-danger);
 }
@@ -575,7 +562,6 @@ button:disabled {
 }
 
 :root[data-el-form-factor="phone"] button,
-:root[data-el-form-factor="phone"] .person-why summary,
 :root[data-el-form-factor="phone"] .people-field-row input,
 :root[data-el-form-factor="phone"] .people-field-row code {
   min-height: var(--el-touch-target);
