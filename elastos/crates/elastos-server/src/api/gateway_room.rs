@@ -1593,37 +1593,21 @@ fn participant_card_directory(
     directory
 }
 
-/// The Profile DID behind a card's opaque reference, among the people the
-/// card directory lists: verified posters in this Community and members
-/// whose Home announced presence. Any other reference resolves to nothing,
-/// so Chat acts only on people it shows.
-async fn resolve_participant_ref(
+/// The signed Profile display names this Home holds for Community members,
+/// by Profile DID: unexpired presence first (the newest name), then verified
+/// Community posts. These are the people and names Chat profile cards show.
+pub(super) async fn community_member_names(
     state: &GatewayState,
-    participant_ref: &str,
-) -> anyhow::Result<Option<String>> {
-    let now = now_ts();
-    let mut members = match state.collaboration_presence_product_port.as_ref() {
-        Some(port) => port
-            .authorized_snapshot(now)
-            .await
-            .map(|snapshot| {
-                snapshot
-                    .records()
-                    .iter()
-                    .filter(|record| record.expires_at() > now)
-                    .map(|record| record.sender_profile_did().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
+    now: u64,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut names = std::collections::HashMap::new();
     if let Some(port) = state.collaboration_chat_product_port.as_ref() {
         let (network_id, conversation_id) = port.history_scope();
         let (network_id, conversation_id) = (network_id.to_string(), conversation_id.to_string());
         let data_dir = state.data_dir.clone();
-        members.extend(
+        names.extend(
             tokio::task::spawn_blocking(move || {
-                crate::room_service::collaboration_verified_member_dids(
+                crate::room_service::collaboration_verified_members(
                     &data_dir,
                     &network_id,
                     &conversation_id,
@@ -1632,8 +1616,34 @@ async fn resolve_participant_ref(
             .await??,
         );
     }
-    Ok(members
-        .into_iter()
+    if let Some(port) = state.collaboration_presence_product_port.as_ref() {
+        if let Ok(snapshot) = port.authorized_snapshot(now).await {
+            for record in snapshot
+                .records()
+                .iter()
+                .filter(|record| record.expires_at() > now)
+            {
+                names.insert(
+                    record.sender_profile_did().to_string(),
+                    record.display_name().to_string(),
+                );
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// The Profile DID behind a card's opaque reference, among the people the
+/// card directory lists: verified posters in this Community and members
+/// whose Home announced presence. Any other reference resolves to nothing,
+/// so Chat acts only on people it shows.
+async fn resolve_participant_ref(
+    state: &GatewayState,
+    participant_ref: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(community_member_names(state, now_ts())
+        .await?
+        .into_keys()
         .find(|member_did| home_people_contact_id(member_did) == participant_ref))
 }
 
@@ -1694,10 +1704,16 @@ pub(super) async fn chat_room_contact_request(
             crate::collaboration_release_network::COMMUNITY_LEFT_DETAIL
         ));
     }
-    let member_did = match resolve_participant_ref(&state, &body.participant_ref).await {
-        Ok(Some(member_did)) => member_did,
-        Ok(None) => return (StatusCode::CONFLICT, PARTICIPANT_NOT_LISTED).into_response(),
+    let community_names = match community_member_names(&state, now).await {
+        Ok(names) => names,
         Err(err) => return room_service_error_response(err),
+    };
+    let Some(member_did) = community_names
+        .keys()
+        .find(|member_did| home_people_contact_id(member_did) == body.participant_ref)
+        .cloned()
+    else {
+        return (StatusCode::CONFLICT, PARTICIPANT_NOT_LISTED).into_response();
     };
     let addable =
         matches!(
@@ -1734,6 +1750,7 @@ pub(super) async fn chat_room_contact_request(
     gateway_home_system::send_profile_contact_request_response(
         &service,
         state.collaboration_presence_product_port.as_ref(),
+        &community_names,
         &context,
         &authority,
         &member_did,

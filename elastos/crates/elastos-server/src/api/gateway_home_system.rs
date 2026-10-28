@@ -557,6 +557,7 @@ pub(super) async fn people_summary(
         Some(port) => port.authorized_snapshot(now_ts()).await.ok(),
         None => None,
     };
+    let community_names = community_member_names_or_none(&state).await;
     match tokio::task::spawn_blocking(move || {
         let mut state = home_state(&data_dir);
         let contact_authority = load_configured_contact_authority_for_context(
@@ -573,6 +574,7 @@ pub(super) async fn people_summary(
         if let Some(snapshot) = presence_snapshot.as_ref() {
             stamp_contact_reachability(&mut people, snapshot, now);
         }
+        stamp_community_names(&mut people, &community_names);
         let discovery = if let (Some(service), Some(authority)) =
             (discovery_service.as_ref(), contact_authority.as_ref())
         {
@@ -823,9 +825,11 @@ pub(super) async fn people_contact_request_create(
         Err(err) => return room_service_join_error_response(err),
     };
     let recipient = body.profile_id.trim().to_string();
+    let community_names = community_member_names_or_none(&state).await;
     send_profile_contact_request_response(
         &service,
         state.collaboration_presence_product_port.as_ref(),
+        &community_names,
         &context,
         &authority,
         &recipient,
@@ -833,16 +837,32 @@ pub(super) async fn people_contact_request_create(
     .await
 }
 
+/// Community names for presentation only: an unreadable source leaves the
+/// name unknown and never blocks the action.
+pub(super) async fn community_member_names_or_none(
+    state: &GatewayState,
+) -> std::collections::HashMap<String, String> {
+    match super::gateway_room::community_member_names(state, now_ts()).await {
+        Ok(names) => names,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "Community names are unavailable");
+            std::collections::HashMap::new()
+        }
+    }
+}
+
 /// Queues a request by Profile DID and answers `{status, display_name}`.
 /// `status` is `requested`, `already_requested`, `already_contact`,
 /// `pending_from_them` or `own_profile`; `display_name` is the signed name
-/// this Home holds for the DID, else `CONTACT_NAME_NOT_KNOWN`. A refusal is a
+/// this Home holds for the DID (its contact store first, then the Community
+/// names Chat shows), else `CONTACT_NAME_NOT_KNOWN`. A refusal is a
 /// 400 or 409 whose body is the refusal's text, and never echoes the DID.
 /// `presence` supplies the device DIDs of Community members seen live, so
 /// one of them is refused like a contact's device DID.
 pub(super) async fn send_profile_contact_request_response(
     service: &crate::collaboration_discovery_runtime::CollaborationDiscoveryService,
     presence: Option<&crate::collaboration_presence::CollaborationPresenceProductPort>,
+    community_names: &std::collections::HashMap<String, String>,
     context: &HomeLaunchTokenContext,
     authority: &ConfiguredContactAuthority,
     recipient_profile_did: &str,
@@ -889,9 +909,11 @@ pub(super) async fn send_profile_contact_request_response(
             .and_then(|read| read.display_name_for(recipient_profile_did, now))
     };
     let display_name = match display_name {
-        Ok(name) => name.unwrap_or_else(|| {
-            crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN.to_string()
-        }),
+        Ok(name) => name
+            .or_else(|| community_names.get(recipient_profile_did).cloned())
+            .unwrap_or_else(|| {
+                crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN.to_string()
+            }),
         Err(err) => return room_service_error_response(err),
     };
     Json(serde_json::json!({
@@ -2327,6 +2349,28 @@ fn stamp_contact_reachability(
             continue;
         };
         contact.reachable = Some(profile_reachable(snapshot, profile_did, now));
+    }
+}
+
+/// A waiting request to someone whose signed Profile this Home's contact
+/// store does not hold is named from Community, as Chat's card names them.
+fn stamp_community_names(
+    people: &mut HomePeopleSummary,
+    community_names: &std::collections::HashMap<String, String>,
+) {
+    for contact in &mut people.contacts {
+        if contact.relationship != "requested"
+            || contact.display_name != crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN
+        {
+            continue;
+        }
+        if let Some(name) = contact
+            .remote_profile_did
+            .as_deref()
+            .and_then(|did| community_names.get(did))
+        {
+            contact.display_name = name.clone();
+        }
     }
 }
 

@@ -394,16 +394,14 @@ async fn test_chat_contact_request_queues_a_request_by_did_with_discovery_off() 
     assert_eq!(body, NOT_LISTED);
     assert!(home.outgoing_requests().is_empty());
 
-    // A person who posted in Community is asked by their DID.
+    // A person who posted in Community is asked by their DID and named as
+    // Chat names them, from the signed Profile on their posts.
     let participant_ref = home.remote.participant_ref();
     let (status, body) = home.request(Some(&home.chat_token), &participant_ref).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         json(&body),
-        serde_json::json!({
-            "status": "requested",
-            "display_name": crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN,
-        })
+        serde_json::json!({ "status": "requested", "display_name": "Remote" })
     );
     assert!(!body.contains("did:key:"), "{body}");
     let outgoing = home.outgoing_requests();
@@ -536,8 +534,22 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
     assert_eq!(json(&body)["status"], "own_profile");
     assert!(home.outgoing_requests().is_empty());
 
-    // Anyone else's DID is queued once, whatever Discovery says.
+    // Anyone else's DID is queued once, whatever Discovery says, named from
+    // their signed Community posts when this Home holds them.
     let (status, body) = ask(Some(token.clone()), format!("  {remote_did}  ")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        json(&body),
+        serde_json::json!({ "status": "requested", "display_name": "Remote" })
+    );
+    assert!(!body.contains("did:key:"), "{body}");
+    let (status, body) = ask(Some(token.clone()), remote_did.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["status"], "already_requested");
+    assert_eq!(home.outgoing_requests().len(), 1);
+    // Someone who never posted and isn't a contact has no signed name here.
+    let unknown = RemotePerson::new("Unknown", home.now);
+    let (status, body) = ask(Some(token.clone()), unknown.did().to_string()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         json(&body),
@@ -546,15 +558,11 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
             "display_name": crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN,
         })
     );
-    assert!(!body.contains("did:key:"), "{body}");
-    let (status, body) = ask(Some(token.clone()), remote_did.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(json(&body)["status"], "already_requested");
-    assert_eq!(home.outgoing_requests().len(), 1);
+    assert_eq!(home.outgoing_requests().len(), 2);
 
-    // People shows the waiting row, and says when the Community node cannot
-    // deliver requests by DID.
-    let requested_row = || async {
+    // People shows the waiting rows with the same names, and says when the
+    // Community node cannot deliver requests by DID.
+    let requested_rows = || async {
         let (status, summary) =
             home_test_get_json(&home.app, "/api/apps/people/summary", &token, "null").await;
         assert_eq!(status, StatusCode::OK, "{summary}");
@@ -563,26 +571,36 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
             home.local_profile.document().profile_did.as_str()
         );
         assert!(!summary.to_string().contains(home.remote.did()));
-        summary["people"]["contacts"]
+        let mut rows = summary["people"]["contacts"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|row| row["relationship"] == "requested")
+            .filter(|row| row["relationship"] == "requested")
             .cloned()
-            .unwrap()
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row["display_name"].as_str().unwrap().to_string());
+        rows
     };
-    let row = requested_row().await;
+    let rows = requested_rows().await;
+    let names = rows
+        .iter()
+        .map(|row| row["display_name"].as_str().unwrap())
+        .collect::<Vec<_>>();
     assert_eq!(
-        row["display_name"],
-        crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN
+        names,
+        vec![
+            crate::collaboration_contact_store::CONTACT_NAME_NOT_KNOWN,
+            "Remote"
+        ]
     );
-    assert!(row.get("delivery_detail").is_none(), "{row}");
+    assert!(rows.iter().all(|row| row.get("delivery_detail").is_none()));
     home.service.set_profile_relay_refusals_for_test(3);
-    let row = requested_row().await;
-    assert_eq!(
-        row["delivery_detail"],
-        crate::collaboration_discovery_runtime::PROFILE_CONTACT_UNDELIVERABLE_DETAIL
-    );
+    for row in requested_rows().await {
+        assert_eq!(
+            row["delivery_detail"],
+            crate::collaboration_discovery_runtime::PROFILE_CONTACT_UNDELIVERABLE_DETAIL
+        );
+    }
     // A new request is refused while that lasts.
     let stranger = RemotePerson::new("Stranger", home.now);
     let (status, body) = ask(Some(token.clone()), stranger.did().to_string()).await;
@@ -591,7 +609,7 @@ async fn test_people_contact_request_by_did_answers_each_status_without_echoing_
         body,
         "Contact requests can't be delivered right now. Try again later."
     );
-    assert_eq!(home.outgoing_requests().len(), 1);
+    assert_eq!(home.outgoing_requests().len(), 2);
 }
 
 #[tokio::test]

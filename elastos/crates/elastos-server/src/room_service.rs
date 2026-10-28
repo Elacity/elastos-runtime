@@ -3102,18 +3102,19 @@ pub(crate) fn collaboration_latest_remote_message_seq(
     })
 }
 
-/// The Profile DIDs of the verified people a configured Community poll
-/// lists, without a session: the people a Chat profile card can act on.
-pub(crate) fn collaboration_verified_member_dids(
+/// The verified people a configured Community poll lists, without a session,
+/// as (Profile DID, signed Profile display name): the people a Chat profile
+/// card can act on, named as the card names them.
+pub(crate) fn collaboration_verified_members(
     data_dir: &Path,
     network_id: &str,
     conversation_id: &str,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<(String, String)>> {
     let scope = collaboration_object_scope(network_id, conversation_id)?;
     with_expired_read_state(data_dir, |state| {
         Ok(participant_views_from_state(state, None, Some(&scope))
             .into_iter()
-            .filter_map(|participant| participant.member_did)
+            .filter_map(|participant| Some((participant.member_did?, participant.display_name)))
             .collect())
     })
 }
