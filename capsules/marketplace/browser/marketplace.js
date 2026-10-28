@@ -1,4 +1,4 @@
-import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_OFFER_ID } from "./model-services.js";
+import { sharedModelOffers, REMOTE_MODEL_ID } from "./model-services.js";
 
 (function () {
   const params = new URLSearchParams(window.location.search);
@@ -29,7 +29,6 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     protectedContent: false,
     modelCatalogState: "unconfigured",
     sharedModels: [],
-    modelAccess: [],
     sharedLoading: false,
     sharedLoaded: false,
     remoteAvailability: [],
@@ -327,27 +326,21 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
     state.sharedLoading = true;
     state.sharedLoaded = true;
     state.sharedModels = [];
-    state.modelAccess = [];
     state.remoteAvailability = [];
     render();
-    const read = async (url, post = false) => {
-      const response = await fetch(url, { method: post ? "POST" : "GET", headers: {
-        "x-elastos-home-token": homeToken, ...(post ? { "content-type": "application/json" } : {}),
-      }, ...(post ? { body: "{}" } : {}), signal: AbortSignal.timeout(35000) });
+    let failed = false;
+    try {
+      const response = await fetch("/api/provider/model/offers_list", { method: "POST", headers: {
+        "x-elastos-home-token": homeToken, "content-type": "application/json",
+      }, body: "{}", signal: AbortSignal.timeout(35000) });
       if (!response.ok) throw new Error("Model access unavailable");
       const reply = await response.json();
       if (reply?.status === "error") throw new Error("Model access unavailable");
-      return reply;
-    };
-    let failed = false;
-    // Summary reconciles new Inbox approvals into grants before discovery reads them.
-    await read("/api/apps/services/summary")
-      .then(reply => { state.modelAccess = modelAccessOpportunities(reply); })
-      .catch(() => { failed = true; });
-    await read("/api/provider/model/offers_list", true).then(reply => {
       state.sharedModels = sharedModelOffers(reply);
       state.remoteAvailability = (reply?.data ?? reply)?.remote_services || [];
-    }).catch(() => { failed = true; });
+    } catch {
+      failed = true;
+    }
     state.sharedLoading = false;
     render();
     if (failed && state.destination === "models") showToast("Couldn’t load shared models.", true);
@@ -767,13 +760,12 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   }
 
   // Models use the same store rows as every category: models this Home can run,
-  // then models shared with it and contacts' AI services.
+  // then models shared with it.
   function renderModels() {
     const matches = item => !state.search || JSON.stringify(item).toLowerCase().includes(state.search);
     const rows = [
       ...filteredByDestination().map(renderAppRow),
       ...state.sharedModels.filter(matches).map(renderSharedModelRow),
-      ...state.modelAccess.filter(matches).map(renderModelAccessRow),
     ];
     if (!rows.length) {
       els.storeSections.innerHTML = state.sharedLoading ? skeletonRows(3)
@@ -801,19 +793,6 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
           <div class="store-row-sub">Shared by ${escapeHtml(model.owner)}</div>
         </div>
         <button class="store-pill" type="button" data-action="use-shared-model" data-offer="${escapeAttr(model.id)}">Open</button>
-      </article>
-    `;
-  }
-
-  function renderModelAccessRow(item) {
-    return `
-      <article class="store-row store-row-static">
-        ${appIconHtml(MODEL_ICON, "store-row-icon")}
-        <div class="store-row-text">
-          <div class="store-row-title">${escapeHtml(item.title)}</div>
-          <div class="store-row-sub">From a contact · ${escapeHtml(item.status)}</div>
-        </div>
-        <button class="store-pill" type="button" data-action="model-service-access" data-offer="${escapeAttr(item.id)}">${item.requestable ? "Ask" : "Review"}</button>
       </article>
     `;
   }
@@ -1380,10 +1359,6 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
             && state.sharedModels.some(model => model.id === target.dataset.offer)) {
           closeDetail();
           window.top.postMessage({ type: "home:open-target", target: "assistant", query: { offer_id: target.dataset.offer }, homeToken }, homeParentOrigin);
-        }
-        if (action === "model-service-access" && SERVICE_OFFER_ID.test(target.dataset.offer || "")
-            && state.modelAccess.some(item => item.id === target.dataset.offer)) {
-          window.top.postMessage({ type: "home:open-target", target: "services", query: { service_offer_id: target.dataset.offer }, homeToken }, homeParentOrigin);
         }
       });
       node.addEventListener("keydown", (event) => {

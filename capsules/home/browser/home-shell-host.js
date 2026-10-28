@@ -2086,12 +2086,6 @@ window.addEventListener("message", (event) => {
   if (context.targetId === "marketplace" && target === "assistant" &&
       (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"]) ||
        !marketplaceAssistantHandoffQuery(data.query))) return;
-  if (context.targetId === "marketplace" && target === "services" &&
-      (!hasExactMessageKeys(data, ["type", "target", "query", "homeToken"])
-       || !data.query || typeof data.query !== "object" || Array.isArray(data.query)
-       || Object.keys(data.query).join(",") !== "service_offer_id"
-       || typeof data.query.service_offer_id !== "string"
-       || !/^[A-Za-z0-9_.:-]{1,256}$/.test(data.query.service_offer_id))) return;
   if (
     context.kind === "app-frame" &&
     context.targetId === "wallet" &&

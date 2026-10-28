@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { sharedModelOffers, modelAccessOpportunities } from "../capsules/marketplace/browser/model-services.js";
+import { sharedModelOffers } from "../capsules/marketplace/browser/model-services.js";
 
 const offer = () => ({
   id: "remote:grant-one:model:hosted-one", title: "Shared writing model", operation: "text.generate",
@@ -37,16 +37,6 @@ test("only current text offers with matching grant identity become shared cards"
   assert.throws(() => sharedModelOffers({ offers: {} }, 100));
 });
 
-test("contact opportunities remain requests, separate from exact usable model offers", () => {
-  const access = modelAccessOpportunities({ remote_offers: [{ service_kind: "remote_model", offer_id: "selected", status: "approved" }],
-    available_remote_offers: [{ service_kind: "remote_model", offer_id: "contact-model", display_name: "Contact", status: "requestable" },
-      { service_kind: "remote_browser", offer_id: "browser" }] });
-  assert.deepEqual(access.map(item => [item.id, item.status, item.requestable]),
-    [["selected", "Approved", false], ["contact-model", "Not shared yet", true]]);
-  assert.equal(access[1].facts, undefined);
-  assert.throws(() => modelAccessOpportunities({ remote_offers: [], available_remote_offers: [{ service_kind: "remote_model", offer_id: "bad/id" }] }));
-});
-
 test("Home accepts an exact remote offer handoff and rejects extra authority or malformed IDs", () => {
   const source = readFileSync(new URL("../capsules/home/browser/home-shell-host.js", import.meta.url), "utf8");
   const fn = source.slice(source.indexOf("function marketplaceAssistantHandoffQuery("), source.indexOf("function hasExactMessageKeys("));
@@ -58,41 +48,38 @@ test("Home accepts an exact remote offer handoff and rejects extra authority or 
     { offer_id: "remote:grant-one:" }, { offer_id: "remote:grant-one:model/bad" }, null, []]) assert.equal(check(query), false);
 });
 
-test("one refresh discovers a grant installed by Services summary, including summary failure recovery", async () => {
+test("one refresh reads only granted shared models, never Services offers, and says when it fails", async () => {
   const source = readFileSync(new URL("../capsules/marketplace/browser/marketplace.js", import.meta.url), "utf8");
   const fn = source.slice(source.indexOf("  async function loadSharedModels()"), source.indexOf("  async function loadCatalogData()"));
-  for (const summaryFails of [false, true]) {
-    let reconciled = false;
+  for (const readFails of [false, true]) {
+    const urls = [];
     const toasts = [];
     const state = { destination: "models", remoteAvailability: [{ status: "stale" }] };
     const context = vm.createContext({ state, homeToken: "fixture", render() {}, AbortSignal,
       showToast: (message, isError) => toasts.push([message, isError]),
-      modelAccessOpportunities, sharedModelOffers: payload => sharedModelOffers(payload, 100),
+      sharedModelOffers: payload => sharedModelOffers(payload, 100),
       fetch: async url => {
-        if (url.endsWith("summary")) {
-          await new Promise(setImmediate);
-          reconciled = true;
-          if (summaryFails) throw new Error("summary unavailable");
-          return { ok: true, json: async () => ({ remote_offers: [], available_remote_offers: [] }) };
-        }
-        assert.equal(reconciled, true, "discovery waits for the grant reconciliation attempt");
+        urls.push(url);
+        if (readFails) throw new Error("offers unavailable");
         return { ok: true, json: async () => ({ offers: [offer()] }) };
       },
     });
     vm.runInContext(fn, context);
     await context.loadSharedModels();
-    assert.equal(state.sharedModels[0].id, offer().id);
+    assert.deepEqual(urls, ["/api/provider/model/offers_list"], "Services is hidden, so Marketplace never reads its offers");
+    assert.deepEqual(Array.from(state.sharedModels, model => model.id), readFails ? [] : [offer().id]);
     assert.equal(state.remoteAvailability.length, 0);
-    assert.deepEqual(toasts, summaryFails ? [["Couldn’t load shared models.", true]] : []);
+    assert.deepEqual(toasts, readFails ? [["Couldn’t load shared models.", true]] : []);
     assert.equal(state.sharedLoading, false);
   }
+  assert.doesNotMatch(source, /target: "services"|\/api\/apps\/services\//, "Marketplace never opens or reads Services");
 });
 
-test("Models show catalog, shared and contact rows in one list, and a plain line when the catalog is unverified", () => {
+test("Models show catalog and shared rows in one list, and a plain line when the catalog is unverified", () => {
   const source = readFileSync(new URL("../capsules/marketplace/browser/marketplace.js", import.meta.url), "utf8");
   const els = { storeSections: { innerHTML: "" } };
   const state = { search: "", sharedLoading: false, modelCatalogState: "verified", remoteAvailability: [],
-    sharedModels: [], modelAccess: [] };
+    sharedModels: [] };
   let local = [];
   const context = vm.createContext({ state, els, MODEL_ICON: {}, icons: { search: "" },
     filteredByDestination: () => local, renderAppRow: app => `<article class="store-row">${app.name}</article>`,
@@ -113,12 +100,10 @@ test("Models show catalog, shared and contact rows in one list, and a plain line
   state.sharedLoading = false;
   local = [{ name: "Catalog model" }];
   state.sharedModels = [{ id: "remote:one", title: "Shared writing model", owner: "Owner Home" }];
-  state.modelAccess = [{ id: "offer:one", title: "Contact AI", status: "Not shared yet", requestable: true }];
   context.renderModels();
-  assert.equal((html().match(/<article class="store-row/g) || []).length, 3);
+  assert.equal((html().match(/<article class="store-row/g) || []).length, 2);
   assert(html().indexOf("Catalog model") < html().indexOf("Shared writing model"), "catalog models come first");
   assert.match(html(), /<div class="store-row-sub">Shared by Owner Home<\/div>/);
-  assert.match(html(), /<div class="store-row-sub">From a contact · Not shared yet<\/div>/);
   assert.doesNotMatch(html(), /class="badge/, "model rows carry no badge, like app rows");
   assert.doesNotMatch(html(), /store-section-head|Run on this Home|Shared with you|Nothing shared|Refresh|internet/);
 });

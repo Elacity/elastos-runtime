@@ -1403,13 +1403,6 @@ function postChatNavigate(entry, query) {
   return true;
 }
 
-function postServicesNavigate(entry, query) {
-  const frame = entry.node.querySelector(".window-frame");
-  const homeToken = browserLaunchAuthority(frame?.dataset.route)?.homeToken;
-  if (!homeToken || !frame?.contentWindow) return;
-  frame.contentWindow.postMessage({ type: "elastos.services.navigate/v1", homeToken, query }, "*");
-}
-
 function postPeopleNavigate(entry, query) {
   const frame = entry.node.querySelector(".window-frame");
   const homeToken = browserLaunchAuthority(frame?.dataset.route)?.homeToken;
@@ -1848,9 +1841,6 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   }
   if (targetId === "marketplace" && Object.keys(options.query || {}).length > 0) {
     postMarketplaceNavigate(entry, options.query);
-  }
-  if (targetId === "services" && Object.keys(options.query || {}).length > 0) {
-    postServicesNavigate(entry, options.query);
   }
   if (targetId === "people" && Object.keys(options.query || {}).length > 0) {
     postPeopleNavigate(entry, options.query);

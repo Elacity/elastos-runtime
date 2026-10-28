@@ -105,7 +105,6 @@ const server = createServer(async (req, res) => {
       if (url.pathname === "/api/capsules/catalog") { json(catalog()); return; }
       if (url.pathname === "/api/capsules/interfaces") { json({ interfaces: [] }); return; }
       if (url.pathname === "/api/apps/home/state") { json({}); return; }
-      if (url.pathname === "/api/apps/services/summary") { json({ remote_offers: [], available_remote_offers: [] }); return; }
       if (url.pathname === "/api/provider/model/offers_list") { json({ offers: [], remote_services: [] }); return; }
       if (url.pathname === "/api/provider/object/list_runtime_custody") {
         json({ schema: "elastos.library.runtime-custody-listings/v1", listings: [], truncated: false }); return;

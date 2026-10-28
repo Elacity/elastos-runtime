@@ -471,6 +471,7 @@ function startServer() {
         json(response, { interfaces: interfaceEntries });
         return;
       }
+      // A contact's Services offer: Services is hidden, so Marketplace must not show it.
       if (url.pathname === "/api/apps/services/summary") {
         json(response, {
           remote_offers: [],
@@ -687,7 +688,6 @@ async function assertModelsLayout(page, frame, { appPrimaryStyle, appRowStyle })
   await frame.locator('#category-list [data-destination="models"]').click();
   const modelRow = frame.locator(`.store-row[data-app="model:${modelCid}"]`);
   await modelRow.waitFor();
-  await frame.getByText("Contact AI", { exact: true }).waitFor();
   const heads = await frame.locator("#store-sections .store-section-head, #store-sections [data-action=\"refresh-shared-models\"]").count();
   assert(heads === 0, "Models must list one row set like every category, with no group headings or Refresh", { heads });
   await frame.locator('.store-row[data-action="shared-detail"]').waitFor();
@@ -705,7 +705,6 @@ async function assertModelsLayout(page, frame, { appPrimaryStyle, appRowStyle })
     JSON.stringify(rows) === JSON.stringify([
       { title: modelTitle, sub: "1.32 GB · Fits this device", pill: "", icon: true },
       { title: "Shared writing model", sub: "Shared by Owner Home", pill: "Open", icon: true },
-      { title: "Contact AI", sub: "From a contact · Not shared yet", pill: "Ask", icon: true },
     ]),
     "Model rows must carry a title, one facts line and at most one row action",
     rows,
@@ -789,14 +788,6 @@ async function assertModelsLayout(page, frame, { appPrimaryStyle, appRowStyle })
   );
   const sharedDetailOpen = await frame.locator("#detail-modal").evaluate((node) => node.classList.contains("active"));
   assert(!sharedDetailOpen, "Opening a shared model must close its detail");
-
-  await frame.locator(`[data-action="model-service-access"][data-offer="${contactOfferId}"]`).click();
-  const accessOpen = await lastOpenTarget(page);
-  assert(
-    accessOpen?.target === "services" && JSON.stringify(accessOpen.query) === JSON.stringify({ service_offer_id: contactOfferId }),
-    "Ask must open the contact's offer in Services",
-    accessOpen,
-  );
 }
 
 async function assertModelsPhone(page, frame) {
@@ -806,11 +797,12 @@ async function assertModelsPhone(page, frame) {
   await page.waitForTimeout(DRAWER_SETTLE_MS);
   const modelRow = frame.locator(`.store-row[data-app="model:${modelCid}"]`);
   await modelRow.waitFor();
+  await frame.locator('.store-row[data-action="shared-detail"]').waitFor();
   await assertNoHorizontalOverflow(frame, "phone Marketplace Models");
   const pills = await frame.locator("#store-sections .store-pill").evaluateAll((nodes) =>
     nodes.map((node) => ({ label: node.textContent.trim(), height: Math.round(node.getBoundingClientRect().height) })));
   assert(
-    pills.length === 2 && pills.every((pill) => pill.height >= PHONE_TOUCH_TARGET_PX),
+    pills.length === 1 && pills.every((pill) => pill.height >= PHONE_TOUCH_TARGET_PX),
     "phone model row actions must be 44 px targets",
     pills,
   );
