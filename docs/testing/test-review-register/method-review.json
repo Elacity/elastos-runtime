@@ -1,0 +1,367 @@
+{
+  "source_commit": "460b1888d344f52cebd1c25866be88ff4085f035",
+  "source_tree": "17aeaf23c640e2dec8f653fd16f3771f95a55b9c",
+  "reviewer": "product_structure",
+  "review_kind": "cross-language methodology and missing-form audit; same reviewer previously owned server partition, so this is not an independent semantic re-review of those server bodies",
+  "review_status": "Known-form census supplements supplied; substantive semantic audit remains open.",
+  "observed_at_utc": "2026-10-22T16:10:41.103831+00:00",
+  "input_snapshots": [
+    {
+      "file": "ps-final-rust-server.jsonl",
+      "bytes": 24108155,
+      "sha256": "8f574236030e3e67b216f7e2aec0cd1e83c83d824ea596224de8653a40da0e9e",
+      "rows": 3351
+    },
+    {
+      "file": "rust-other.jsonl",
+      "bytes": 10218392,
+      "sha256": "086c5bc5ac31e0c3bdd54d33d4b4ed7babd906ffa344a4fbddd5b0ad34e9e8c5",
+      "rows": 2412
+    },
+    {
+      "file": "js-tests.jsonl",
+      "bytes": 17298715,
+      "sha256": "7f18c3758d9adc9045cdfd0bd8ae905e07d6213b2995460ee2acef90f46171a6",
+      "rows": 2620
+    },
+    {
+      "file": "python-tests.jsonl",
+      "bytes": 1518196,
+      "sha256": "dc9055e82170553550e64ff95006de306268bb91acde45feea70c48d86bed157",
+      "rows": 833
+    },
+    {
+      "file": "shell-tests.jsonl",
+      "bytes": 168779,
+      "sha256": "7d7b19778c30f00fd0b99e32c49c7ac71e177412f02390f276eed4f232c08008",
+      "rows": 98
+    },
+    {
+      "file": "extra-tests.jsonl",
+      "bytes": 49228,
+      "sha256": "4ba9a88bb47b51bad57c50ed83f1c52c0618caba79785038728052adae8663a2",
+      "rows": 17
+    },
+    {
+      "file": "tracked-files.json",
+      "bytes": 98719,
+      "sha256": "a3cff0154d59d9ca935846e2c8ab4e04776a21e6329f73f4b2e5549ae444129e"
+    }
+  ],
+  "positive_checks": {
+    "tracked_files_exact": 1926,
+    "tracked_manifest_diff": [],
+    "rust_files": 526,
+    "server_rust_files": 239,
+    "other_rust_files": 287,
+    "js_ts_files": 493,
+    "python_files": 86,
+    "shell_files": 163,
+    "html_files": 26,
+    "markdown_files": 97,
+    "wit_files": 1,
+    "c_files": 3,
+    "cargo_manifests": 57,
+    "duplicate_ledger_ids": [],
+    "cross_ledger_same_source_location": [],
+    "unregistered_python_test_named_functions": [],
+    "inline_html_registration_markers": [],
+    "cargo_custom_configuration_markers": [
+      {
+        "path": "capsules/model-provider/Cargo.toml",
+        "line": 12,
+        "text": "test = false"
+      }
+    ],
+    "known_custom_test_harnesses_or_benches": 0,
+    "known_external_doc_source_includes": 0
+  },
+  "findings": [
+    {
+      "id": "method-01-shell-census",
+      "priority": "high",
+      "status": "supplement-created",
+      "finding": "The original98-row shell register omitted actual proof/verification entrypoints and a named self-test.",
+      "evidence": [
+        "examples/hello/verify.sh:9",
+        "scripts/pinned-model-consumer-proof.sh:176",
+        "scripts/browser-mac-vm-proof.sh:183",
+        "scripts/protected-content-installed-e2e-proof.sh:1581",
+        "scripts/shared-runtime-gossip-proof.sh:128",
+        "scripts/installed-provider-verify.sh:73",
+        "scripts/update-hop-harness.sh:5",
+        "scripts/vendor-ui-tokens.sh:86"
+      ],
+      "correction": "Merge17 supplemental records across16 additional shell files and the163-file inclusion/exclusion manifest. Keep installed suites provisional until substantive phase/helper review is complete.",
+      "artifact": "ps-final-supplemental-shell-records.jsonl"
+    },
+    {
+      "id": "method-02-embedded-ci",
+      "priority": "high",
+      "status": "supplement-created",
+      "finding": "A workflow embeds an independent Python acceptance suite outside every .py/.js/.rs file census.",
+      "evidence": [
+        ".github/workflows/canary-holder-linux.yml:88",
+        ".github/workflows/canary-holder-linux.yml:94",
+        ".github/workflows/canary-holder-linux.yml:478"
+      ],
+      "correction": "Register the inline suite with its70 assert/raise sites as one suite, then review each scenario and shared helper. Keep the20-minute step bound and fixture cleanup in its evidence. Do not count each assertion as an independently registered test.",
+      "artifact": "ps-final-supplemental-inline-proof-records.jsonl"
+    },
+    {
+      "id": "method-03-python-acceptance-operations",
+      "priority": "high",
+      "status": "supplement-created",
+      "finding": "Function-name discovery missed update-hop acceptance operations whose names begin run/compare/cli rather than test.",
+      "evidence": [
+        "scripts/update-hop-compare.py:374",
+        "scripts/update-hop-compare.py:426",
+        "scripts/update-hop-compare.py:3049",
+        "scripts/update-hop-compare.py:3218",
+        "scripts/update-hop-compare.py:3335",
+        "scripts/update-hop-compare.py:3642",
+        ".github/workflows/ci.yml:1262",
+        ".github/workflows/ci.yml:1504"
+      ],
+      "correction": "Merge7 named acceptance/check operations. Preserve need(...) predicates as real oracles and record parent/child run relationships so helper scenarios are not represented as independent runtime cases.",
+      "artifact": "ps-final-supplemental-inline-proof-records.jsonl"
+    },
+    {
+      "id": "method-04-count-units",
+      "priority": "high",
+      "status": "reporting-correction-required",
+      "finding": "The ledgers count different things: Rust source functions/fences, JavaScript expanded registrations plus helpers/criteria, Python methods/scenarios, and shell wrappers/verifiers.",
+      "evidence": [
+        "rust-server-findings.json:counts",
+        "rust-other-findings.json:source_counts",
+        "js-register-summary.json:record_kinds",
+        "shell-tests.jsonl:kind",
+        "scripts/release-platform-input-test.py:1973"
+      ],
+      "correction": "Publish a count table by declaration/registration/scenario/helper/wrapper/criterion unit. An overall record total is valid only when labelled records. Deduplicate source declarations across target instances, and report table/subtest expansion and suite-loader duplication separately. The one known shared Rust test compiles in two targets but remains one declaration."
+    },
+    {
+      "id": "method-05-semantic-completeness",
+      "priority": "high",
+      "status": "open-review-gate",
+      "finding": "Most rows are conservative rule-assisted dispositions; that does not complete the requested substantive first-principles review of every test.",
+      "evidence": [
+        "ps-final-rust-server-findings.json:counts.review_methods",
+        "rust-other-findings.json:audit_status",
+        "js-register-summary.json:review_methods",
+        "python-tests.jsonl:review_method",
+        "shell-tests.jsonl:review_method"
+      ],
+      "correction": "Keep issue194 open. Give each row separate inventory_complete, semantic_review_complete, execution_status and disposition_confidence fields. Retain is a provisional preservation decision until actual behavior, meaningful falsifiable oracle, fixtures, lifecycle and transitive calls have been checked. Empty actions on a provisional retain row mean review remains, not that its design is accepted."
+    },
+    {
+      "id": "method-06-provenance-conflict",
+      "priority": "high",
+      "status": "attestation-supplied-reconciliation-open",
+      "finding": "The current public checkpoint reports119 manually read server bodies; the completed private server ledger attests161 and supplies an explicit ID/hash set. A mutable JS ledger also changed schema/cardinality during this review.",
+      "evidence": [
+        "issue194 Register review provenance checkpoint",
+        "ps-final-manual-attestation.json",
+        "ps-final-rust-sha256.json"
+      ],
+      "correction": "Freeze each input with a hash and reviewer ID. Reconcile manual provenance by ID/body hash, preserving unresolved rows as provisional. Append a correction with its evidence instead of silently replacing the existing checkpoint. Do not combine partly rewritten shared files into an export."
+    },
+    {
+      "id": "method-07-static-routes",
+      "priority": "medium",
+      "status": "limit-confirmed",
+      "finding": "A complete source module/CI graph establishes eligibility, not a compiled or executed test census. Platform cfg, ignored tests, custom entry modes and target duplication affect real exercise.",
+      "evidence": [
+        "capsules/model-provider/Cargo.toml:12",
+        "scripts/release-platform-input-test.py:1973",
+        ".github/workflows/ci.yml:367",
+        ".github/workflows/ci.yml:392",
+        "elastos/crates/elastos-server/src/server_infra.rs:2446"
+      ],
+      "correction": "Keep source-derived cargo filters labelled unverified. Distinguish --provider worker mode from Python unittest execution; distinguish skipped/ignored and runtime early-return from passing exercised behavior. Record exact compiler/test-runner discovery when later authorized, without counting a wrapper pass as every child pass."
+    },
+    {
+      "id": "method-08-nonlanguage-fixtures",
+      "priority": "medium",
+      "status": "classified-with-limits",
+      "finding": "C probes, WIT, HTML, Markdown, generated/vendor assets and historical spreadsheet journeys require explicit ownership/classification even when they add no independently registered tests.",
+      "evidence": [
+        "elastos/crates/elastos-runtime/tests/fixtures/model_seatbelt_probe.c",
+        "elastos/crates/elastos-runtime/src/provider/bridge.rs:2852",
+        "elastos/crates/elastos-server/tests/fixtures/hosted_effect_probe.c",
+        "elastos/crates/elastos-server/src/api/model_provider_egress.rs:3618",
+        "elastos/wit/elastos-bus-v1.wit",
+        "docs/audits/ElastOS-Home-Journey-Audit.xlsx"
+      ],
+      "correction": "Map two C probes to their Rust parent tests and retain the separate C design-proof row. WIT/source fixtures are inputs, not duplicate tests. Manual/historical journeys are a separate acceptance register input. No inline HTML test registration markers or externally included Rust doc sources were found; lexical absence is not arbitrary-code discovery proof."
+    },
+    {
+      "id": "method-09-extractor-limits",
+      "priority": "medium",
+      "status": "limit-confirmed",
+      "finding": "Static extraction cannot exhaust arbitrary macro/proc-macro/dynamic code or all generated fixtures; current source scans found no known unaccounted Rust test-generating macros or custom harnesses.",
+      "evidence": [
+        "rust-other-coverage.json:additional_sweep",
+        "rust-server-files.json:limitations",
+        "js-file-coverage.json:parse_errors",
+        "scripts/release-platform-input-test.py:1973"
+      ],
+      "correction": "State that all recognized static forms have ledger coverage after reconciliation, not that every possible runtime case has been discovered. Keep parameter sets and cfg variants explicit; add compiler/runtime discovery only under a separately approved execution budget."
+    },
+    {
+      "id": "method-10-moving-source",
+      "priority": "high",
+      "status": "supplement and sampled-input file provenance verified; frozen export body/case reconciliation remains",
+      "finding": "The evidence checkout moved from460b1888 to05da461 during the audit, changing nine Browser JS/HTML paths while shared JS evidence also changed schema.",
+      "correction": "Use Git object reads from460b1888 for the audit candidate and compare every frozen export row with its pinned source body. Keep later commits in a separate candidate delta. All supplemental source files were byte-checked against460b1888 and are unchanged. A2620-row JS byte snapshot covering242files declares per-file SHA-256 values that all match460b1888; no mismatched source-file hash was found in that snapshot."
+    }
+  ],
+  "supplement_counts": {
+    "shell_records": 17,
+    "shell_files": 16,
+    "shell_file_manifest": 163,
+    "inline_and_python_acceptance_records": 8,
+    "workflow_inline_assert_raise_sites": 70
+  },
+  "semantic_status": "provisional rows remain unresolved; no evidence supports calling every test semantically reviewed",
+  "execution": "No builds, installed/target runs or test runs performed by this methodology pass. Existing execution reports were not replayed.",
+  "scope_limits": [
+    "Shell file classification uses source scans and targeted manual reads;49 excluded production/build/deploy/fixture-setup files are not asserted fully semantically reviewed.",
+    "Large supplemental suites have full-source marker/AST coverage with selected manual excerpts; their rows explicitly remain provisional.",
+    "The5 YAML/action files contain build, release and cleanup guards besides the newly registered canary suite. Operational guards were not all promoted to standalone tests; embedded/generated code remains a continuation audit surface.",
+    "C probes are fixture programs observed by Rust tests, not separately registered harness cases.",
+    "Manual review is an attestation with exact ID/hash and scope, not a mechanically verifiable completeness proof.",
+    "No source files or primary ledgers were edited; outputs are private evidence pending safe projection."
+  ],
+  "post_read_source_pin_verification": {
+    "observed_checkout_head": "05da461c20db3b224ec87f22d7ed41b79ff6acfb",
+    "observed_changed_paths": [
+      "capsules/browser/browser/browser-clipboard.js",
+      "capsules/browser/browser/browser-clipboard.test.mjs",
+      "capsules/browser/browser/browser-input-surface.js",
+      "capsules/browser/browser/browser-input-surface.test.mjs",
+      "capsules/browser/browser/browser-remote-display.js",
+      "capsules/browser/browser/browser.js",
+      "capsules/browser/browser/index.html",
+      "scripts/browser-input-ordering.test.mjs",
+      "scripts/browser-text-select-smoke.mjs"
+    ],
+    "supplement_sources_match_pinned_git_objects": [
+      {
+        "path": ".github/workflows/canary-holder-linux.yml",
+        "pinned_file_sha256": "3c71882082850aa33c1783f1844b807d2cedf829fadb2f46871c33b1a67bb97d"
+      },
+      {
+        "path": "examples/hello/verify.sh",
+        "pinned_file_sha256": "c21325cb6ae6c452725704ea1520673a52f0faa71c53e9696f4195da16a8ffc8"
+      },
+      {
+        "path": "scripts/browser-hosted-provider-bakeoff.sh",
+        "pinned_file_sha256": "7524ff92363c7cbda3e1c1e94a9e920b9284796ce10830c1dbb2600870280e50"
+      },
+      {
+        "path": "scripts/browser-mac-vm-acceptance-handoff.sh",
+        "pinned_file_sha256": "3967cdbf613d94b756907fc086c332a3d1b6cc7657bfe44ba1e8120b407c4229"
+      },
+      {
+        "path": "scripts/browser-mac-vm-proof.sh",
+        "pinned_file_sha256": "8c0d378c4d100137008017a5150e23031aa834ad5daa2699ff744f5d5bb148c8"
+      },
+      {
+        "path": "scripts/browser-selkies-target-preflight.sh",
+        "pinned_file_sha256": "38e59ac750922de879cb420b40c26ef970c163adf7216b68ffe528d200fdeadc"
+      },
+      {
+        "path": "scripts/browser-vm-artifact-preflight.sh",
+        "pinned_file_sha256": "fc575de8810a1ab7cc6b58c0eab6dfaa1e3c1454ce47ab08ffbb6eff050b92db"
+      },
+      {
+        "path": "scripts/browser-vm-engine-preflight.sh",
+        "pinned_file_sha256": "5181a0461ad99c87696ef2e5dee3eebd9db9627532e0528a054cfe03c510c496"
+      },
+      {
+        "path": "scripts/browser-vm-target-preflight.sh",
+        "pinned_file_sha256": "54a54c7dcc998c4083bbbc861266c0d40ca365680d1c549f1af55108a6f04f0e"
+      },
+      {
+        "path": "scripts/ci-installed-journeys.sh",
+        "pinned_file_sha256": "5c375021c0cd7e420b99d2c6187e5de408d76be1f18fa22b0cf7a824c239aff1"
+      },
+      {
+        "path": "scripts/ci-local-prepush.sh",
+        "pinned_file_sha256": "8b9cfbbddc920efc6c50143fe3d839e0d74d9fdfed9bbcc500ff32d4fe614566"
+      },
+      {
+        "path": "scripts/installed-provider-verify.sh",
+        "pinned_file_sha256": "e0d86dd49fb8ac6dd504c4cca161486ce7ca4d4914c4cc3878bd8235c152aba3"
+      },
+      {
+        "path": "scripts/pinned-model-consumer-proof.sh",
+        "pinned_file_sha256": "d132fe277d731918e5f564ada6c9dcd6556151207e0926c80431b7f57f78e31a"
+      },
+      {
+        "path": "scripts/protected-content-installed-e2e-proof.sh",
+        "pinned_file_sha256": "f8b0e4e6b943f7976d5c68a91ebeb048501e576b1ddc9ff16e2c785b17e3e482"
+      },
+      {
+        "path": "scripts/shared-runtime-gossip-proof.sh",
+        "pinned_file_sha256": "1a003268aba409bbf97707f40d085623909e7a8db1f03906674c1f607fb92f69"
+      },
+      {
+        "path": "scripts/update-hop-compare.py",
+        "pinned_file_sha256": "84bf564e35c3c1aa5f3446afddd5b22ac2e9cee54addd43f09cd5267fcb3350d"
+      },
+      {
+        "path": "scripts/update-hop-harness.sh",
+        "pinned_file_sha256": "a907182472f7fdb4312734c7b5b7cc1954fe0741401cea03dbd85a6f4a719ff7"
+      },
+      {
+        "path": "scripts/vendor-ui-tokens.sh",
+        "pinned_file_sha256": "99e7fd2ef88a1fc3809b7df0987941bfd6208d7dc87ab9def49ad85691af07e2"
+      }
+    ],
+    "all26_html_files_rescanned_from_pinned_git_objects": "zero test-registration markers",
+    "effect": "Supplemental records and Rust evidence remain bound to460b1888. The moving checkout and mutable JS input ledger cannot support a single-snapshot JS completeness claim without frozen per-row body provenance."
+  },
+  "mutable_js_snapshot_pin_check": {
+    "snapshot_sha256": "7f18c3758d9adc9045cdfd0bd8ae905e07d6213b2995460ee2acef90f46171a6",
+    "rows": 2620,
+    "files": 242,
+    "file_sha256_mismatches": [],
+    "limit": "This checks declared per-file provenance in one byte snapshot, not that every body span/case expansion or later export is correct."
+  },
+  "final2_server_reconciliation": {
+    "original161": 161,
+    "Hyper119": 119,
+    "overlap": 111,
+    "original_only": 50,
+    "Hyper_only_freshly_reread": 8,
+    "reconciled_pre_delta_union": 169,
+    "all_candidate_modified_or_new": 97,
+    "new_delta_body_reads_beyond_original161": 93,
+    "final_unique_manual": 261
+  },
+  "final2_source_hash_validation": {
+    "server_files": 239,
+    "server_bodies": 3351,
+    "shell_files": 163,
+    "supplemental_records": 25,
+    "failures": []
+  },
+  "final2_limitations": [
+    "Custom balanced lexical extraction, not rustc or proc-macro expansion.",
+    "All discovered test-bearing files resolve from lib/main/integration roots in a source-level module graph.",
+    "Macros and attributes were inventoried; compiler-generated unknown cases remain an extraction limit.",
+    "Documentation IDs use the declared function or imported boundary type, so unchanged moved blocks retain identity; generic duplicate doc anchors remain a lexical extractor limitation.",
+    "No builds, rustc test listing, mutation checks or test executions were performed.",
+    "Most bodies are explicitly rule-assisted, not individually manually reviewed. This is triage and evidence, not proof that all assertions are semantically sufficient.",
+    "Host/config selection was traced statically; configured CI reachability does not prove successful execution.",
+    "A referenced Python file invoked with --provider is a fixture helper invocation, not evidence that its Python unittest methods run.",
+    "Raw JSON contains source bodies and private test-fixture detail. Publish only a reviewed safe projection.",
+    "No deletion candidates are justified by low assertion count, serialization coverage, helper reuse or source fixtures alone.",
+    "The261 attested bodies are not261 fully closed end-to-end semantic reviews. The remaining3090 bodies require substantive per-test analysis; each keeps an explicit follow-up action.",
+    "Source-record counts differ from runtime registrations, table iterations, delegated helper cases and CI target instances.",
+    "GitHub immutable URL source coordinates are recorded, but candidate commit public accessibility has not been established."
+  ],
+  "superseded_input_note": "Earlier mutable snapshots remain historical only; publication must consume final frozen partition manifests and reconcile counts. This final2 copy updates server provenance and supplements only."
+}
