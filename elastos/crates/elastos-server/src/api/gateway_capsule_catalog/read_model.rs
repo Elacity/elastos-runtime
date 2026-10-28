@@ -45,12 +45,19 @@ pub(in crate::api::gateway) fn capsule_catalog_summary_for(
         // An unconfigured WalletConnect is hidden here as in the launcher and Wallet.
         .filter(|manifest| ensure_wallet_connector_configured(data_dir, &manifest.name).is_ok())
         .map(|manifest| {
-            catalog_capsule_summary(
+            let upstream_origin = upstream_origin(
+                &crate::api::capsule_inventory::installed_capsules_root(data_dir)
+                    .join(&manifest.name),
+                &manifest.name,
+            );
+            let mut summary = catalog_capsule_summary(
                 manifest,
                 &launch_targets,
                 &components,
                 &accepted_content_by_viewer,
-            )
+            );
+            summary.upstream_origin = upstream_origin;
+            summary
         })
         .collect::<Vec<_>>();
     // The browser terminal only starts in developer mode, so the Terminal
@@ -340,6 +347,7 @@ fn catalog_capsule_summary(
             .or_else(|| manifest.description.clone())
             .unwrap_or_else(|| "Capsule metadata available through Runtime.".to_string()),
         author: manifest.author,
+        upstream_origin: None,
         window_policy,
         role,
         capsule_type,
@@ -381,6 +389,33 @@ fn catalog_capsule_summary(
         release_path: component.and_then(|entry| entry.release_path.clone()),
         repository: component.and_then(|entry| entry.repository.clone()),
     }
+}
+
+/// A program the release repackages from upstream names its origin in the
+/// `PROVENANCE.json` its package ships. The origin credits where the code
+/// comes from; it is not a verified publisher.
+fn upstream_origin(capsule_dir: &std::path::Path, name: &str) -> Option<String> {
+    let path = capsule_dir.join("PROVENANCE.json");
+    if std::fs::metadata(&path).ok()?.len() > 64 * 1024 {
+        return None;
+    }
+    let provenance: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if provenance["schema"] != "elastos.release-upstream-input/v1"
+        || provenance["component"] != name
+    {
+        return None;
+    }
+    let url = url::Url::parse(provenance["upstream"]["url"].as_str()?).ok()?;
+    if url.scheme() != "https" {
+        return None;
+    }
+    let host = url.host_str()?;
+    if matches!(host, "github.com" | "codeload.github.com") {
+        let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
+        let (owner, repository) = (segments.next()?, segments.next()?);
+        return Some(format!("github.com/{owner}/{repository}"));
+    }
+    Some(host.to_owned())
 }
 
 fn accepted_content_by_viewer(
@@ -856,6 +891,91 @@ mod tests {
     }
 
     #[test]
+    fn repackaged_upstream_programs_name_their_origin_from_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let mut external = serde_json::Map::new();
+        for (name, url) in [
+            (
+                "kubo",
+                Some("https://github.com/ipfs/kubo/releases/download/v0.40.1/kubo.tar.gz"),
+            ),
+            (
+                "crosvm",
+                Some("https://codeload.github.com/google/crosvm/tar.gz/2ac1410"),
+            ),
+            (
+                "node",
+                Some("https://nodejs.org/download/release/v24.22.1/node.tar.gz"),
+            ),
+            ("plain-http", Some("http://example.org/tool.tar.gz")),
+            ("no-url", None),
+            ("no-provenance", None),
+        ] {
+            let dir = root.path().join("capsules").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("capsule.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema": "elastos.capsule/v1", "name": name, "version": "1.0.0",
+                    "role": "content", "type": "data", "projections": ["content"],
+                    "entrypoint": "tool"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            if name != "no-provenance" {
+                let mut upstream = serde_json::json!({"checksum": "sha256:00"});
+                if let Some(url) = url {
+                    upstream["url"] = url.into();
+                }
+                std::fs::write(
+                    dir.join("PROVENANCE.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "schema": "elastos.release-upstream-input/v1", "component": name,
+                        "license": "MIT", "upstream": upstream
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            external.insert(
+                name.to_owned(),
+                serde_json::json!({"install_path": format!("capsules/{name}"), "platforms": {}}),
+            );
+        }
+        std::fs::write(
+            root.path().join("components.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "external": external, "capsules": {}, "profiles": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let summary = serde_json::to_value(capsule_catalog_summary(root.path())).unwrap();
+        let origin = |name: &str| {
+            summary["capsules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|capsule| capsule["name"] == name)
+                .unwrap_or_else(|| panic!("{name} listed"))
+                .get("upstream_origin")
+                .cloned()
+        };
+        assert_eq!(origin("kubo"), Some("github.com/ipfs/kubo".into()));
+        assert_eq!(origin("crosvm"), Some("github.com/google/crosvm".into()));
+        assert_eq!(origin("node"), Some("nodejs.org".into()));
+        for name in ["plain-http", "no-url", "no-provenance"] {
+            assert_eq!(origin(name), None, "{name}");
+        }
+        // A provenance file for another component names nothing.
+        assert_eq!(
+            upstream_origin(&root.path().join("capsules/kubo"), "node"),
+            None
+        );
+    }
+
+    #[test]
     fn capsule_title_preserves_product_names() {
         assert_eq!(capsule_title("wallet-metamask"), "MetaMask");
         assert_eq!(capsule_title("wallet-unisat"), "UniSat");
@@ -958,6 +1078,8 @@ pub(in crate::api::gateway) struct CapsuleSummary {
     pub(in crate::api::gateway) description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api::gateway) author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) upstream_origin: Option<String>,
     pub(in crate::api::gateway) role: CapsuleRole,
     #[serde(rename = "type")]
     pub(in crate::api::gateway) capsule_type: CapsuleType,

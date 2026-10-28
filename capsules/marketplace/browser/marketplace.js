@@ -455,6 +455,7 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
       modelFit: model ? String(capsule.model_memory_fit || "") : "",
       name: publicTitle(capsule),
       developer: String(model ? capsule.publisher_did : capsule.author || "").trim(),
+      upstreamOrigin: model ? "" : String(capsule.upstream_origin || "").trim(),
       category: appCategory(capsule, role),
       description: model ? modelDescription(capsule) : publicDescription(capsule),
       version: String(capsule.version || ""),
@@ -923,9 +924,9 @@ import { sharedModelOffers, modelAccessOpportunities, REMOTE_MODEL_ID, SERVICE_O
   function detailPublisher(app) {
     if (app.modelCid) return "Verified publisher";
     const author = app.developer;
-    return !author || /^unknown publisher$/i.test(author)
-      ? "Publisher unknown"
-      : `Declared author · ${author}`;
+    if (author && !/^unknown publisher$/i.test(author)) return `Declared author · ${author}`;
+    // A repackaged upstream program credits its origin, never a verified publisher.
+    return app.upstreamOrigin ? `Upstream: ${app.upstreamOrigin}` : "Publisher unknown";
   }
 
   // A model row shows its download size and whether it fits this device.

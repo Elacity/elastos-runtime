@@ -155,6 +155,23 @@ test("declared authors and signatures cannot receive Runtime publisher verificat
   }
 });
 
+test("a repackaged upstream program shows its upstream origin, never a verified publisher", () => {
+  const context = publisherFixture();
+  for (const [author, upstream_origin, expected] of [
+    [undefined, "github.com/ipfs/kubo", "Upstream: github.com/ipfs/kubo"],
+    ["Unknown publisher", "nodejs.org", "Upstream: nodejs.org"],
+    [undefined, "  ", "Publisher unknown"],
+    ["elastos", "github.com/ipfs/kubo", "Declared author · elastos"],
+  ]) {
+    const app = context.capsuleToApp({ name: "kubo", role: "content", source: "installed", author, upstream_origin,
+      signature_state: "catalog-signature-verified" }, new Map(), []);
+    assert.equal(context.detailPublisher(app), expected);
+    assert.equal(context.rowSubtitle(app), expected);
+    assert.equal(context.packageLabel(app), "Publisher verification unavailable");
+    assert.doesNotMatch(context.signatureLabel(app), /Runtime verified|Verified publisher/);
+  }
+});
+
 test("invalid or unavailable model catalog verification clears publisher cards", async () => {
   const context = publisherFixture();
   const model = { name: "fixture", source: "signed-model-catalog", role: "content", installed: false, launchable: false,
