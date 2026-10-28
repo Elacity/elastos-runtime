@@ -3454,24 +3454,6 @@ impl App {
         })
     }
 
-    fn participant_activity_for(&self, participant_ref: &str) -> Option<String> {
-        let state = self.state.borrow();
-        let participant = state.participants.iter().find(|participant| {
-            participant
-                .card
-                .as_ref()
-                .is_some_and(|card| card.participant_ref == participant_ref)
-        })?;
-        let card = participant.card.as_ref()?;
-        if card.active_now {
-            Some("Home online".to_string())
-        } else if participant.last_seen_at > 0 {
-            Some(last_message_text(participant.last_seen_at))
-        } else {
-            None
-        }
-    }
-
     fn open_participant_card(&self, participant_ref: &str, message_seq: Option<u64>) {
         if self.participant_card_for(participant_ref).is_none() {
             return;
@@ -3510,17 +3492,11 @@ impl App {
             return false;
         };
         let (state_text, action) = participant_card_copy(&card, self.home_token().is_some());
-        let activity = self.participant_activity_for(participant_ref);
         self.participant_card_avatar
             .set_text_content(Some(&participant_initial(&name)));
         self.participant_card_name.set_text_content(Some(&name));
         self.participant_card_state
-            .set_text_content(Some(&match activity {
-                Some(activity) if card.relationship != "you" => {
-                    format!("{state_text} · {activity}")
-                }
-                _ => state_text.to_string(),
-            }));
+            .set_text_content(Some(state_text));
         if let Some((relationship, message)) = self.participant_card_notice.borrow().as_ref() {
             if relationship == &card.relationship {
                 self.participant_card_state.set_text_content(Some(message));
@@ -4476,8 +4452,10 @@ impl App {
         self.conversation_avatar.set_text_content(Some(&avatar));
         self.conversation_title.set_text_content(Some(&title));
         self.conversation_detail.set_text_content(Some(detail));
+        // While Community is live, the history status is the one fact shown.
         if let Some(history) = history.filter(|history| {
             selected.is_none()
+                && community_state == Some(CommunityState::Live)
                 && matches!(
                     history.status.as_str(),
                     "searching" | "available" | "unavailable"
@@ -4485,7 +4463,7 @@ impl App {
                 && !history.detail.trim().is_empty()
         }) {
             self.conversation_detail
-                .set_text_content(Some(&format!("{detail} · {}", history.detail.trim())));
+                .set_text_content(Some(history.detail.trim()));
             self.conversation_detail
                 .set_attribute("data-history-status", &history.status)?;
             self.conversation_detail
@@ -4548,19 +4526,18 @@ impl App {
                 &conversation.display_name
             }));
             let detail = self.document.create_element("span")?;
-            detail.set_text_content(Some(&format!(
-                "{} · {}",
-                format_time(message.created_at),
-                if message
-                    .request_id
-                    .as_ref()
-                    .is_some_and(|id| state.direct_in_flight.contains_key(id))
-                {
-                    "Sending"
-                } else {
-                    message.delivery_state.label()
-                }
-            )));
+            let in_flight = message
+                .request_id
+                .as_ref()
+                .is_some_and(|id| state.direct_in_flight.contains_key(id));
+            detail.set_text_content(Some(&if in_flight {
+                "Sending".to_string()
+            } else {
+                message
+                    .delivery_state
+                    .label()
+                    .map_or_else(|| format_time(message.created_at), str::to_string)
+            }));
             meta.append_child(&sender)?;
             meta.append_child(&detail)?;
             let body = self.document.create_element("div")?;
@@ -4930,11 +4907,11 @@ impl App {
 
             let name = self.document.create_element("div")?;
             name.set_class_name("node-row-name");
-            name.set_text_content(Some("Pending profile invite"));
+            name.set_text_content(Some("ElastOS invite"));
 
             let detail = self.document.create_element("div")?;
             detail.set_class_name("node-row-detail");
-            detail.set_text_content(Some("Pending ElastOS invite"));
+            detail.set_text_content(Some("Pending"));
 
             head.append_child(&name)?;
             head.append_child(&detail)?;
@@ -5024,7 +5001,7 @@ impl App {
             }
             let empty = self.document.create_element("li")?;
             empty.set_class_name("empty");
-            empty.set_text_content(Some("No messages yet. Say hi."));
+            empty.set_text_content(Some("No messages yet."));
             self.message_list.append_child(&empty)?;
             return Ok(());
         }
@@ -8378,7 +8355,7 @@ mod tests {
             is_current_session: false,
         };
         assert_eq!(participant_shown_name(&participant), "Owner");
-        assert_eq!(participant_detail(&participant, false, false), "active now");
+        assert_eq!(participant_detail(&participant, false, false), "Active now");
 
         let object = ConversationObjectView {
             message_id: None,
@@ -9124,14 +9101,10 @@ fn format_browser_access_count(count: usize) -> String {
 }
 
 fn format_participant_toggle_label(count: usize, open: bool) -> String {
-    let noun = match count {
-        1 => "1 person".to_string(),
-        _ => format!("{count} people"),
-    };
-    if open {
-        format!("Hide people · {noun}")
-    } else {
-        format!("People · {noun}")
+    match (open, count) {
+        (true, _) => "Hide people".to_string(),
+        (false, 1) => "1 person".to_string(),
+        (false, _) => format!("{count} people"),
     }
 }
 
@@ -9160,30 +9133,12 @@ fn member_display_name(member: &RoomMemberView) -> String {
         .unwrap_or_else(|| UNVERIFIED_ROOM_MEMBER_NAME.to_string())
 }
 
+/// The one fact a People row shows under a name.
 fn participant_detail(participant: &ParticipantView, is_local: bool, shell_mode: bool) -> String {
-    let mut parts = Vec::new();
     let local_runtime_participant =
         participant.is_current_session && participant.device_label.trim() == "ElastOS shell";
-    let verified_profile_identity = participant.profile_verified == Some(true);
-    let generic_browser_label = matches!(
-        participant.device_label.trim(),
-        "" | "Browser" | "This browser"
-    );
-    if !participant.device_label.trim().is_empty()
-        && !verified_profile_identity
-        && !local_runtime_participant
-        && !generic_browser_label
-    {
-        parts.push(participant.device_label.clone());
-    }
     if is_local || local_runtime_participant {
-        parts.push("active now".to_string());
-    } else if participant.local_session_count > 1 {
-        parts.push(format!("{} browsers", participant.local_session_count));
-    } else if participant.role.is_some() {
-        parts.push("active now".to_string());
-    } else if participant.local_session_count > 0 {
-        parts.push("web guest".to_string());
+        return "Active now".to_string();
     }
     let remote_card = participant
         .card
@@ -9193,24 +9148,46 @@ fn participant_detail(participant: &ParticipantView, is_local: bool, shell_mode:
         // Community members: "Home online" while their Home announces
         // presence, otherwise the time of their last public message.
         if card.active_now {
-            parts.push("Home online".to_string());
-        } else if participant.last_seen_at > 0 {
-            parts.push(last_message_text(participant.last_seen_at));
+            return "Home online".to_string();
         }
-    } else if participant.last_seen_at > 0 && !is_local && !local_runtime_participant && !shell_mode
-    {
-        parts.push(format!("seen {}", format_time(participant.last_seen_at)));
+        if participant.last_seen_at > 0 {
+            return last_message_text(participant.last_seen_at);
+        }
     }
-    parts.join(" · ")
+    if participant.local_session_count > 1 {
+        return format!("{} browsers", participant.local_session_count);
+    }
+    if participant.role.is_some() {
+        return "Active now".to_string();
+    }
+    if participant.local_session_count > 0 {
+        return "Web guest".to_string();
+    }
+    let verified_profile_identity = participant.profile_verified == Some(true);
+    let generic_browser_label = matches!(
+        participant.device_label.trim(),
+        "" | "Browser" | "This browser"
+    );
+    if !verified_profile_identity && !generic_browser_label {
+        return participant.device_label.clone();
+    }
+    if remote_card.is_none() && participant.last_seen_at > 0 && !shell_mode {
+        return format!("Seen {}", format_time(participant.last_seen_at));
+    }
+    String::new()
 }
 
-/// "last message 14:02" today, otherwise with the day.
+/// "Last message 14:02" today, "Last message yesterday", otherwise the date.
 fn last_message_text(timestamp_secs: u64) -> String {
-    let now = (js_sys::Date::now() / 1000.0) as u64;
-    if local_day(timestamp_secs) == local_day(now) {
-        format!("last message {}", format_time(timestamp_secs))
-    } else {
-        format!("last message {}", day_separator_text(timestamp_secs))
+    match viewer_day_label(timestamp_secs) {
+        DayLabel::Today => format!("Last message {}", format_time(timestamp_secs)),
+        DayLabel::Yesterday => "Last message yesterday".to_string(),
+        DayLabel::Date { same_year } => {
+            format!(
+                "Last message {}",
+                local_date_text(timestamp_secs, same_year)
+            )
+        }
     }
 }
 
@@ -9323,14 +9300,11 @@ fn participant_card_copy(
     can_act: bool,
 ) -> (&'static str, Option<(&'static str, &'static str)>) {
     let (text, action) = match card.relationship.as_str() {
-        "you" => ("This is you.", None),
+        "you" => ("You", None),
         "contact" if card.conversation_id.is_some() => ("Contact", Some(("Message", "message"))),
         "contact" => ("Contact", None),
-        "requested" => ("Contact request sent. Waiting for them to accept.", None),
-        "pending" => (
-            "Wants to add you as a contact.",
-            Some(("Open Inbox", "inbox")),
-        ),
+        "requested" => ("Request sent", None),
+        "pending" => ("Wants to add you", Some(("Open Inbox", "inbox"))),
         "none" if card.can_add_contact => ("In Community", Some(("Add contact", "add-contact"))),
         _ => ("Relationship unavailable", None),
     };
@@ -9410,10 +9384,20 @@ fn day_label(day: (u32, u32, u32), today: (u32, u32, u32), yesterday: (u32, u32,
 }
 
 fn day_separator_text(timestamp_secs: u64) -> String {
+    match viewer_day_label(timestamp_secs) {
+        DayLabel::Today => "Today".to_string(),
+        DayLabel::Yesterday => "Yesterday".to_string(),
+        DayLabel::Date { same_year } => local_date_text(timestamp_secs, same_year),
+    }
+}
+
+/// The day label for a timestamp, from today and yesterday in the viewer's
+/// time zone.
+fn viewer_day_label(timestamp_secs: u64) -> DayLabel {
     let now = (js_sys::Date::now() / 1000.0) as u64;
     let yesterday = local_date(now);
     yesterday.set_date(yesterday.get_date() - 1);
-    match day_label(
+    day_label(
         local_day(timestamp_secs),
         local_day(now),
         (
@@ -9421,23 +9405,22 @@ fn day_separator_text(timestamp_secs: u64) -> String {
             yesterday.get_month(),
             yesterday.get_date(),
         ),
-    ) {
-        DayLabel::Today => "Today".to_string(),
-        DayLabel::Yesterday => "Yesterday".to_string(),
-        DayLabel::Date { same_year } => {
-            let options = JsObject::new();
-            let _ = Reflect::set(&options, &"weekday".into(), &"short".into());
-            let _ = Reflect::set(&options, &"month".into(), &"short".into());
-            let _ = Reflect::set(&options, &"day".into(), &"numeric".into());
-            if !same_year {
-                let _ = Reflect::set(&options, &"year".into(), &"numeric".into());
-            }
-            local_date(timestamp_secs)
-                .to_locale_date_string("default", &options)
-                .as_string()
-                .unwrap_or_default()
-        }
+    )
+}
+
+/// "Mon, Mar 9", with the year when it is not this year.
+fn local_date_text(timestamp_secs: u64, same_year: bool) -> String {
+    let options = JsObject::new();
+    let _ = Reflect::set(&options, &"weekday".into(), &"short".into());
+    let _ = Reflect::set(&options, &"month".into(), &"short".into());
+    let _ = Reflect::set(&options, &"day".into(), &"numeric".into());
+    if !same_year {
+        let _ = Reflect::set(&options, &"year".into(), &"numeric".into());
     }
+    local_date(timestamp_secs)
+        .to_locale_date_string("default", &options)
+        .as_string()
+        .unwrap_or_default()
 }
 
 fn format_bytes(size_bytes: u64) -> String {
@@ -9942,12 +9925,12 @@ mod participant_card_tests {
             Some(("Message", "message"))
         );
         assert_eq!(
-            participant_card_copy(&card("requested", None, false), true).1,
-            None
+            participant_card_copy(&card("requested", None, false), true),
+            ("Request sent", None)
         );
         assert_eq!(
-            participant_card_copy(&card("pending", None, false), true).1,
-            Some(("Open Inbox", "inbox"))
+            participant_card_copy(&card("pending", None, false), true),
+            ("Wants to add you", Some(("Open Inbox", "inbox")))
         );
         assert_eq!(
             participant_card_copy(&card("none", None, true), true).1,

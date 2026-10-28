@@ -1665,7 +1665,10 @@ async function runScenario(scenario) {
         assert(await original.count() === 1 && await frame.locator("#message-input").inputValue() === draft,
           "Send again replaced the original record or current draft");
       } else {
-        await frame.waitForFunction(() => document.querySelector('[data-direct-message-id="message:retry-original"]')?.textContent.includes("Sent"));
+        await frame.waitForFunction(() => {
+          const node = document.querySelector('[data-direct-message-id="message:retry-original"]');
+          return !!node && !node.textContent.includes("Sending") && !node.querySelector("[data-direct-action]");
+        });
         assert(await original.locator('[data-direct-action]').count() === 0, "settled receipt retains Retry");
         assert(await frame.locator("#message-input").inputValue() === draft, "Retry cleared the current draft");
         assert(trace.retryPosts.length === 1 && trace.retryPosts[0].retry_existing === true, "Retry sent another fresh intent");
@@ -1861,7 +1864,7 @@ async function runScenario(scenario) {
           "an unchanged poll re-enabled the in-flight contact request");
       } else {
         await frame.waitForFunction(() => document.querySelector("#participant-card-action")?.hidden === true
-          && /Request sent|Waiting/.test(document.querySelector("#participant-card-state")?.textContent));
+          && document.querySelector("#participant-card-state")?.textContent === "Runtime says requested.");
       }
       await frame.locator("#participant-card-close").focus();
       trace.peerAccepted = true;
@@ -1869,7 +1872,7 @@ async function runScenario(scenario) {
         const card = document.querySelector("#participant-card");
         const action = document.querySelector("#participant-card-action");
         return card?.hidden === false && card.dataset.participantRef === "participant:fixture-friend"
-          && document.querySelector("#participant-card-state")?.textContent === "Contact · Home online"
+          && document.querySelector("#participant-card-state")?.textContent === "Contact"
           && action?.hidden === false && !action.disabled && action.dataset.cardAction === "message"
           && action.textContent === "Message"
           && !!document.querySelector('[data-conversation-choice="direct:sha256:fixture-conversation"]');
@@ -1886,7 +1889,7 @@ async function runScenario(scenario) {
           window.fixtureCardObserver = new MutationObserver(() => {
             const action = document.querySelector("#participant-card-action");
             window.fixtureCardRegressed ||= card.hidden
-              || document.querySelector("#participant-card-state")?.textContent !== "Contact · Home online"
+              || document.querySelector("#participant-card-state")?.textContent !== "Contact"
               || action?.hidden !== false || action.disabled || action.dataset.cardAction !== "message";
           });
           window.fixtureCardObserver.observe(card, { subtree: true, childList: true, characterData: true, attributes: true });
@@ -1903,7 +1906,7 @@ async function runScenario(scenario) {
           return window.fixtureCardRegressed;
         });
         assert(!regressed, "a held request response briefly reverted accepted contact state");
-        assert(await frame.locator("#participant-card-state").innerText() === "Contact · Home online"
+        assert(await frame.locator("#participant-card-state").innerText() === "Contact"
           && await frame.locator("#participant-card-action").isVisible()
           && await frame.locator("#participant-card-action").innerText() === "Message",
         "a held request response reverted accepted contact state");

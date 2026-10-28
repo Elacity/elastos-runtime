@@ -63,6 +63,12 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   when you allow it: on each device, run
   `elastos node peer add --did <home-did> --allow content.replica` and repeat
   every `--allow` that Home already had. Copies a device already holds stay.
+- Chat and Inbox say less. A Chat profile card shows one state, such as
+  Request sent, Contact or Wants to add you. A person in Chat's People list
+  shows one fact, such as Home online or Last message yesterday. A Direct
+  message shows its time, or Sending or Expired while that matters. Community
+  no longer shows a standing note about public files. An Inbox contact request
+  reads "Name wants to add you", with "Accepting adds them to People." below.
 
 ### Fixed
 
