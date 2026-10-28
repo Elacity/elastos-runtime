@@ -70,6 +70,27 @@ async fn caller_capsule_catalog_summary(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
 ) -> CapsuleCatalogResponse {
+    let mut catalog = caller_capsule_catalog_rows(state, context).await;
+    // A publisher is named only for an installed package whose row matches a
+    // record of the installed signed release; any failure names none.
+    let data_dir = state.data_dir.clone();
+    let signers =
+        tokio::task::spawn_blocking(move || crate::setup::installed_release_signers(&data_dir))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|signers| signers)
+            .unwrap_or_else(|error| {
+                tracing::debug!("installed release publishers unavailable: {error:#}");
+                Default::default()
+            });
+    read_model::project_release_publishers(&mut catalog, &signers);
+    catalog
+}
+
+async fn caller_capsule_catalog_rows(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+) -> CapsuleCatalogResponse {
     // Home may have started offline without its pinned catalogue; Local AI's
     // read retries it, and otherwise reports it unavailable.
     if let Err(error) = crate::setup::retry_model_catalog(&state.data_dir).await {

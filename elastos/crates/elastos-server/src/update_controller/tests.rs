@@ -4400,6 +4400,69 @@ async fn home_launch_and_browser_paths_refuse_a_release_whose_record_differs_bef
     assert!(crate::install_transaction::acquire_installed_writer(&fixture.data).is_ok());
 }
 
+#[test]
+fn installed_release_signers_name_only_rows_their_signed_record_matches() {
+    let app = b"fixture app archive";
+    let row = json!({"install_path":"capsules/fixture-app", "extract_path":"fixture-app",
+        "release_path":"fixture-app.tar.gz", "cid":raw_cid(app),
+        "checksum":format!("sha256:{}", digest(app)), "size":app.len()});
+    let components = serde_json::to_vec(&json!({
+        "schema":"elastos.components/v1", "capsules":{}, "profiles":{},
+        "external":{"fixture-app":{"install_path":"capsules/fixture-app","platforms":{"*":row}}}
+    }))
+    .unwrap();
+    let did = crate::crypto::encode_signing_key_did(&test_key());
+    let record = |size: usize| {
+        crate::capsule_record::signed_record(
+            &test_key(),
+            json!({"schema":"elastos.capsule.record/v1", "name":"fixture-app", "platform":"*",
+                "capsule_version":null, "sha256":digest(app), "size":size, "cid":raw_cid(app),
+                "release_path":"fixture-app.tar.gz", "signer_did":did}),
+        )
+    };
+    // A Home without a signed release names no signer.
+    let fixture = PrivateFixture::new();
+    assert!(crate::setup::installed_release_signers(&fixture.data)
+        .unwrap()
+        .is_empty());
+    // Nor does a release that lists no records.
+    fixture.publish_installed_release_listing(&components, json!({}));
+    assert!(crate::setup::installed_release_signers(&fixture.data)
+        .unwrap()
+        .is_empty());
+
+    let fixture = PrivateFixture::new();
+    fixture.publish_installed_release_listing(
+        &components,
+        json!({"capsule_records":[record(app.len())]}),
+    );
+    assert_eq!(
+        crate::setup::installed_release_signers(&fixture.data).unwrap(),
+        std::collections::BTreeMap::from([("fixture-app".to_owned(), did.clone())])
+    );
+
+    // A record that differs from its row names nobody.
+    let fixture = PrivateFixture::new();
+    fixture.publish_installed_release_listing(
+        &components,
+        json!({"capsule_records":[record(app.len() + 1)]}),
+    );
+    assert!(crate::setup::installed_release_signers(&fixture.data).is_err());
+
+    // Nor does a record signed by a key the Home does not trust.
+    let fixture = PrivateFixture::new();
+    let other = ed25519_dalek::SigningKey::from_bytes(&[44; 32]);
+    let foreign = crate::capsule_record::signed_record(
+        &other,
+        json!({"schema":"elastos.capsule.record/v1", "name":"fixture-app", "platform":"*",
+            "capsule_version":null, "sha256":digest(app), "size":app.len(), "cid":raw_cid(app),
+            "release_path":"fixture-app.tar.gz",
+            "signer_did":crate::crypto::encode_signing_key_did(&other)}),
+    );
+    fixture.publish_installed_release_listing(&components, json!({"capsule_records":[foreign]}));
+    assert!(crate::setup::installed_release_signers(&fixture.data).is_err());
+}
+
 #[tokio::test]
 async fn staged_support_skips_linux_only_home_component_on_darwin() {
     let fixture = PrivateFixture::new();

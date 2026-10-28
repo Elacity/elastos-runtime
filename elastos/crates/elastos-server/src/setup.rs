@@ -1332,6 +1332,39 @@ pub(crate) fn admit_installed_components(
     }))
 }
 
+/// Each component of the installed signed release whose row for this platform
+/// matches its capsule record, with the publisher DID that signed the record.
+/// Empty for a Home without a signed release (a source or CI Home) and for a
+/// release that lists no records.
+pub(crate) fn installed_release_signers(
+    data_dir: &Path,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let Some(source) = installed_release_source(data_dir)? else {
+        return Ok(Default::default());
+    };
+    let binary = fs::canonicalize(&source.install_path)?;
+    let (release, components) =
+        crate::installed_release::read_signed_release(data_dir, &binary, &source, false)?;
+    let (manifest, admission) = crate::capsule_record::admit_release(
+        &release,
+        &source.publisher_dids,
+        &components,
+        crate::update::detect_release_platform(),
+    )?;
+    let Some(records) = admission.records() else {
+        return Ok(Default::default());
+    };
+    let platform = detect_platform();
+    Ok(manifest
+        .external
+        .iter()
+        .filter_map(|(name, component)| {
+            let info = resolve_platform_info(component, &platform)?;
+            Some((name.clone(), records.signer(name, info)?.to_owned()))
+        })
+        .collect())
+}
+
 /// The admitted row `name`/`info` of `admitted`, or, on a Home shown to have no
 /// signed release, of its local manifest `local`.
 pub(crate) fn admitted_row(
