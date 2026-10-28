@@ -6473,10 +6473,62 @@ pub(crate) mod tests {
         );
     }
 
+    /// A Profile that merely declares another person's Profile DID among its
+    /// devices, in a request this Home holds, does not make that DID a
+    /// device: the victim is still asked. The device that signed the request
+    /// is refused.
+    #[tokio::test]
+    async fn profile_request_ignores_a_did_another_profile_only_declares() {
+        let temp = tempfile::tempdir().unwrap();
+        let pair = direct_peer_pair(temp.path()).await;
+        let network = pair.service_a.network_profile();
+        let victim = ProfileContactParty::new(&network, "Victim").did();
+        let device = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
+        let device_did = crate::crypto::encode_signing_key_did(&device);
+        let griefer = ProfileContactParty::with(
+            &network,
+            SigningKey::from_bytes(&device.to_bytes()),
+            signed_profile_document_for_test(
+                &SigningKey::from_bytes(&generate_keypair().0.to_bytes()),
+                "Griefer",
+                None,
+                1,
+                None,
+                1,
+                vec![device_did.clone(), victim.clone()],
+            )
+            .unwrap(),
+        );
+        let now = current_timestamp();
+        pair.store_a
+            .record_incoming_profile_contact_request(
+                &griefer.request_to(&pair.profile_a.document().profile_did, now),
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            pair.service_a
+                .send_profile_contact_request(&pair.store_a, &victim, &[], &pair.profile_a, now)
+                .await
+                .unwrap(),
+            ProfileContactRequestOutcome::Requested
+        );
+        let err = pair
+            .service_a
+            .send_profile_contact_request(&pair.store_a, &device_did, &[], &pair.profile_a, now)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ProfileContactRequestRefusal>(),
+            Some(&ProfileContactRequestRefusal::OtherHomeDeviceId)
+        );
+    }
+
     /// The box journey: Alma removes Bruno, asks him again, then pastes the
     /// device DID his System > About shows (the device his Home signs with).
-    /// No contact or presence names it any more, but the signed Profile from
-    /// their earlier chain does, so it is refused and nothing is queued.
+    /// No contact or presence names it any more, but his signatures on their
+    /// earlier chain do, so it is refused and nothing is queued.
     #[tokio::test]
     async fn profile_request_refuses_a_removed_contacts_device_did() {
         let temp = tempfile::tempdir().unwrap();

@@ -697,15 +697,31 @@ impl CollaborationPresenceProductPort {
         Ok(peers)
     }
 
-    /// The device DIDs of the Community members whose live presence this
-    /// Home holds, leaving out one that is also that member's Profile DID.
+    /// The devices that signed the live presence this Home holds, leaving
+    /// out one that is also that member's Profile DID. Only the signature is
+    /// evidence of a device; a DID a Profile merely declares is not.
     pub(crate) fn seen_device_dids(&self, now: u64) -> anyhow::Result<Vec<String>> {
-        Ok(self
-            .live_presence_endpoints(now)?
-            .into_iter()
-            .filter(|(profile_did, endpoint_did)| profile_did != endpoint_did)
-            .map(|(_, endpoint_did)| endpoint_did)
-            .collect())
+        let state = self
+            .read_model
+            .load_state()?
+            .unwrap_or_else(|| self.read_model.empty_state());
+        let mut signers = Vec::new();
+        for record in state.records {
+            let presence = self.read_model.verify_record(&record)?;
+            if presence.expires_at <= now
+                || presence.issued_at > now.saturating_add(MAX_COLLABORATION_CLOCK_SKEW_SECS)
+            {
+                continue;
+            }
+            let authorized = self
+                .core
+                .authorize_stored_product_message(record.envelope.as_bytes())?;
+            let signer = &authorized.message().envelope().signer_did;
+            if *signer != presence.sender_profile_did {
+                signers.push(signer.clone());
+            }
+        }
+        Ok(signers)
     }
 
     /// `(Profile DID, sole endpoint DID)` of every live, non-bootstrap

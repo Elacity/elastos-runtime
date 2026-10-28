@@ -40,6 +40,12 @@ struct RemotePerson {
 
 impl RemotePerson {
     fn new(display_name: &str, now: u64) -> Self {
+        Self::declaring(display_name, now, Vec::new())
+    }
+
+    /// A person whose signed Profile also lists `declared` DIDs as its
+    /// devices, which any Profile may do without holding their keys.
+    fn declaring(display_name: &str, now: u64, declared: Vec<String>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let chat =
             crate::collaboration_product::test_chat_product_port(dir.path(), NETWORK, CONVERSATION);
@@ -53,10 +59,13 @@ impl RemotePerson {
             1,
             None,
             now,
-            vec![
+            [
                 chat.test_core().test_local_device_did(),
                 crate::crypto::encode_signing_key_did(&device_key),
-            ],
+            ]
+            .into_iter()
+            .chain(declared)
+            .collect(),
         )
         .unwrap();
         let advertisement = signed_discovery_message_for_test(
@@ -650,6 +659,32 @@ async fn test_people_refuses_the_device_did_of_someone_who_posted_in_community()
         "That's a Home's device DID. Use the DID shown in their People."
     );
     assert!(home.outgoing_requests().is_empty());
+}
+
+#[tokio::test]
+async fn test_a_did_another_profile_only_declares_is_still_asked() {
+    // A member lists the victim's Profile DID among their own devices and
+    // posts once. The declaration proves nothing about the victim's key, so
+    // asking the victim by their DID still works; the device that really
+    // signed the post is refused.
+    let home = ContactRequestHome::new().await;
+    let victim = RemotePerson::new("Victim", home.now);
+    let griefer = RemotePerson::declaring("Griefer", home.now, vec![victim.did().to_string()]);
+    assert!(griefer.profile.authorizes_endpoint(victim.did()));
+    home.post_in_community(&griefer);
+    let ask = |profile_id: String| {
+        home.post(
+            PEOPLE_REQUEST_PATH,
+            Some(&home.authority.people_token),
+            serde_json::json!({ "profile_id": profile_id }),
+        )
+    };
+    let (status, body) = ask(victim.did().to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["status"], "requested");
+    let (status, body) = ask(griefer.chat.test_core().test_local_device_did()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(home.outgoing_requests().len(), 1);
 }
 
 #[tokio::test]

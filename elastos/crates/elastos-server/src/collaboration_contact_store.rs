@@ -677,16 +677,57 @@ impl CollaborationContactReadSnapshot<'_> {
             .unwrap_or(CollaborationContactRelationship::None))
     }
 
-    /// Every device DID named by a signed Profile this Home holds for another
-    /// person: contacts, removed and declined pairs, requests either way and
-    /// their answers. A request to one of them would reach nobody.
+    /// Every device DID that signed something this Home holds for another
+    /// person: listings, requests either way, answers, and the device that
+    /// delivered a contact's Profile. Only a signature is evidence; a DID a
+    /// Profile merely declares is not, since anyone can declare anyone's DID.
+    /// A request to one of them would reach nobody.
     pub(crate) fn known_device_dids(&self) -> HashSet<String> {
         let Some(loaded) = self.loaded.as_ref() else {
             return HashSet::new();
         };
-        held_profiles(loaded)
-            .filter(|profile| profile.document().profile_did != self.store.local_profile_did)
-            .flat_map(|profile| profile.device_dids().map(str::to_string))
+        let local = self.store.local_profile_did.as_str();
+        // (signer, the Profile it signed for)
+        let mut signed: Vec<(&str, &str)> = Vec::new();
+        for advertisement in loaded.advertisements.values() {
+            signed.push((
+                &advertisement.message().envelope().signer_did,
+                advertisement.profile_did(),
+            ));
+        }
+        for request in loaded.requests.values() {
+            signed.push((
+                &request.message().envelope().signer_did,
+                request.requester_profile_did(),
+            ));
+        }
+        for request in loaded.profile_requests.values() {
+            signed.push((
+                &request.message().envelope().signer_did,
+                request.requester_profile_did(),
+            ));
+        }
+        for (request_hash, receipt) in &loaded.decisions {
+            if let Some(request) = loaded.requests.get(request_hash) {
+                signed.push((
+                    &receipt.envelope().signer_did,
+                    &request.message().envelope().payload.recipient.id,
+                ));
+            }
+        }
+        for (receipt, decider) in loaded.profile_decisions.values() {
+            signed.push((
+                &receipt.envelope().signer_did,
+                &decider.document().profile_did,
+            ));
+        }
+        for (profile_did, (_, delivered_by)) in &loaded.accepted_profile_heads {
+            signed.push((delivered_by, profile_did));
+        }
+        signed
+            .into_iter()
+            .filter(|(signer, profile_did)| *profile_did != local && signer != profile_did)
+            .map(|(signer, _)| signer.to_string())
             .collect()
     }
 

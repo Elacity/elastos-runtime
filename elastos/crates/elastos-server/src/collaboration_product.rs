@@ -286,13 +286,18 @@ impl CollaborationChatProductPort {
         self.core.conversation_scope()
     }
 
-    /// Every device DID named by the signed Profiles on the Community posts
-    /// this Home retains, including its own. Read only.
+    /// The devices that signed the Community posts this Home retains,
+    /// including its own, leaving out one that is also the post's Profile
+    /// DID. Only the signature is evidence of a device; a DID a Profile
+    /// merely declares is not. Read only.
     pub(crate) fn community_device_dids(&self, now: u64) -> anyhow::Result<Vec<String>> {
         let mut dids = Vec::new();
         for envelope in self.core.conversation_history(now)? {
             let message = self.core.authorize_stored_product_message(&envelope)?;
-            dids.extend(message.sender_profile().device_dids().map(str::to_string));
+            let signer = &message.message().envelope().signer_did;
+            if *signer != message.sender_profile().document().profile_did {
+                dids.push(signer.clone());
+            }
         }
         Ok(dids)
     }
