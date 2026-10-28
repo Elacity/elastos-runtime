@@ -1107,7 +1107,7 @@ async function runScenario(scenario) {
       await dm.press('Enter'); await page.locator('#shared-sheet').waitFor({ state: 'visible' });
       const dmSource = trace.sharedChecks.at(-1).body.source;
       assert(dmSource.conversation_id === 'direct:sha256:fixture-conversation' && dmSource.message_id === 'message:fixture-direct', "DM reference missing", dmSource);
-      assert(await frame.locator('#attach-button').isDisabled(), "DM Attach is enabled");
+      assert(await frame.locator('#attach-button').isHidden(), "Attach must be hidden in a direct conversation");
       return;
     }
     if (scenario === "community-attach") {

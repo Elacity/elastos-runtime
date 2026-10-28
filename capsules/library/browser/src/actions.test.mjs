@@ -757,3 +757,26 @@ test("Library Sharing runs Copy link, Fix or Unpublish from its one dialog", asy
     assert.equal(dialogs[0].shared, true);
   }
 });
+
+test("Library Fix says so when the repair could not share the file again", async () => {
+  for (const [repairStatus, expected] of [
+    ["local_pinned", "Guide.md is shared again."],
+    ["repair_needed", "Guide.md couldn't be shared again. Try again later."],
+  ]) {
+    const statuses = [];
+    const actions = makeActions({
+      async providerApi(op) {
+        if (op === "status") return { published: { published_at: 1780000000, availability: { status: "repair_needed" } } };
+        return { availability: { status: repairStatus } };
+      },
+      async showSharingDialog() {
+        return "fix";
+      },
+      setStatus(status) {
+        statuses.push(status);
+      },
+    });
+    await actions.showSharing(file("Guide.md", { published: true, published_cid: "bafkreirecorded" }));
+    assert.equal(statuses.at(-1), expected, repairStatus);
+  }
+});

@@ -521,13 +521,19 @@ export function createLibraryActions({
       await copyPublishedLink(object);
     } else if (action === "fix") {
       setStatus(`Fixing sharing for ${object.name}...`);
+      let repaired;
       try {
-        await providerApi("repair", { uri: object.uri });
+        repaired = await providerApi("repair", { uri: object.uri });
       } catch (error) {
-        setStatus(libraryErrorText(error) || `${object.name} could not be fixed. Try again.`);
+        setStatus(libraryErrorText(error) || `${object.name} couldn't be shared again. Try again later.`);
         return;
       }
-      await showAfterReload(`${object.name} is shared again.`);
+      // Repair answers with the availability it reached; repair_needed means it failed.
+      const availability = repaired?.availability;
+      const failed = (typeof availability === "string" ? availability : availability?.status) === "repair_needed";
+      await showAfterReload(failed
+        ? `${object.name} couldn't be shared again. Try again later.`
+        : `${object.name} is shared again.`);
     } else if (action === "unpublish") {
       await unpublishObject(object);
     }

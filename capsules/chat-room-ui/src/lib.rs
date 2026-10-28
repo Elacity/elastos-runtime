@@ -45,8 +45,6 @@ const HOME_TOKEN_HEADER: &str = "x-elastos-home-token";
 const DISPLAY_NAME_REQUIRED_ERROR: &str = "Enter your name.";
 const APPROVAL_REQUESTED_BADGE: &str = "Waiting";
 const APPROVAL_REQUESTED_DETAIL: &str = "Waiting for approval.";
-/// The Attach button is an icon; this is its accessible name.
-const ATTACH_LABEL: &str = "Attach";
 const SHELL_SESSION_LOST_DETAIL: &str =
     "The conversation session ended. Choose Reconnect to continue; your unsent text stays.";
 const SHELL_ACCESS_UNAVAILABLE_DETAIL: &str =
@@ -703,6 +701,9 @@ enum LibraryPostPhase {
     Unknown {
         link: Option<String>,
     },
+    /// Unpublished in Library after an unknown outcome: the lost attempt may
+    /// still have posted the file.
+    UnpublishedUnknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -789,6 +790,21 @@ fn attach_library_error_text(code: &str, reason: &str) -> &'static str {
         ("request_id_reused", _) => "This post can't be sent again. Attach the file again.",
         _ => "This file could not be posted. Try again.",
     }
+}
+
+/// Home's answer to a request whose earlier attempt is the `previous` phase.
+/// After an unknown outcome, `withdrawn` says the file was unpublished, not
+/// that it was never posted: the lost attempt may have posted it.
+fn library_post_answer(
+    previous: &LibraryPostPhase,
+    http_status: u16,
+    body: &serde_json::Value,
+) -> LibraryPostPhase {
+    let withdrawn = body.get("code").and_then(serde_json::Value::as_str) == Some("withdrawn");
+    if withdrawn && matches!(previous, LibraryPostPhase::Unknown { .. }) {
+        return LibraryPostPhase::UnpublishedUnknown;
+    }
+    library_post_outcome(http_status, body)
 }
 
 /// Home's answer to one attach-library request, read whatever its HTTP
@@ -882,6 +898,15 @@ fn library_post_view(post: &LibraryPost) -> LibraryPostView {
         LibraryPostPhase::Failed { detail } => LibraryPostView {
             title: "Not posted".to_string(),
             lines: vec![file, detail.clone()],
+            actions: &[Close],
+            retry_label: "Retry post",
+        },
+        LibraryPostPhase::UnpublishedUnknown => LibraryPostView {
+            title: "Post not confirmed".to_string(),
+            lines: vec![
+                file,
+                "Unpublished in Library. Check Community to see whether it was posted.".to_string(),
+            ],
             actions: &[Close],
             retry_label: "Retry post",
         },
@@ -3582,7 +3607,7 @@ impl App {
                     },
                 }
             }
-            Ok((status, body)) => library_post_outcome(status, &body),
+            Ok((status, body)) => library_post_answer(&previous, status, &body),
             // The request may have reached Home: the outcome is unknown, and
             // trying again reuses this request id so the file is posted once.
             Err(_) => LibraryPostPhase::Unknown {
@@ -4260,15 +4285,6 @@ impl App {
     }
 
     fn open_library_from_home(&self) -> Result<bool, JsValue> {
-        if self
-            .state
-            .borrow()
-            .direct
-            .selected_conversation_id
-            .is_some()
-        {
-            return Err(JsValue::from_str(DIRECT_ATTACHMENTS_UNAVAILABLE));
-        }
         if self.home_token().is_none() || self.home_parent_origin.is_none() {
             return Ok(false);
         }
@@ -4690,26 +4706,14 @@ impl App {
         } else {
             !controls.enable_text_send
         });
-        // Direct conversations are text-only by declared decision, and the
-        // control says so where the person meets it — visibly unavailable,
-        // never silently missing.
-        set_hidden(&self.attach_button, !direct_mode && !controls.show_attach)?;
+        // Direct conversations carry no files, so Attach shows only in Community.
+        set_hidden(&self.attach_button, direct_mode || !controls.show_attach)?;
         let library_post = state
             .library_post
             .as_ref()
             .filter(|post| !direct_mode && selection_guard_matches(&state, &post.selection));
         self.render_library_post(library_post)?;
-        self.attach_button
-            .set_disabled(direct_mode || !controls.enable_attach);
-        if direct_mode {
-            self.attach_button.set_title(DIRECT_ATTACHMENTS_UNAVAILABLE);
-            self.attach_button
-                .set_attribute("aria-label", DIRECT_ATTACHMENTS_UNAVAILABLE)?;
-        } else {
-            self.attach_button.set_title(ATTACH_LABEL);
-            self.attach_button
-                .set_attribute("aria-label", ATTACH_LABEL)?;
-        }
+        self.attach_button.set_disabled(!controls.enable_attach);
         self.send_button.set_disabled(if direct_mode {
             !direct_send_enabled
                 || state.reconnect_needed
@@ -8323,6 +8327,28 @@ mod tests {
     }
 
     #[test]
+    fn withdrawn_after_an_unknown_outcome_does_not_claim_the_file_was_not_posted() {
+        use super::LibraryPostPhase::{Confirm, Failed, Unknown, UnpublishedUnknown};
+        let withdrawn =
+            serde_json::json!({ "status": "error", "code": "withdrawn", "message": "x" });
+        let after_unknown = super::library_post_answer(&Unknown { link: None }, 409, &withdrawn);
+        assert_eq!(after_unknown, UnpublishedUnknown);
+        let view = super::library_post_view(&library_post_fixture(after_unknown));
+        assert_eq!(view.title, "Post not confirmed");
+        assert_eq!(
+            view.lines[1],
+            "Unpublished in Library. Check Community to see whether it was posted."
+        );
+        assert!(!view.lines.iter().any(|line| line.contains("not posted")));
+        assert_eq!(
+            super::library_post_answer(&Confirm, 409, &withdrawn),
+            Failed {
+                detail: "This file was unpublished in Library, so it was not posted.".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn library_post_outcome_reports_publication_and_posting_apart() {
         use super::LibraryPostPhase::{Failed, PostFailed, Posted, Unknown};
         let publication =
@@ -9870,12 +9896,6 @@ fn community_presence_view(community_open: bool, presence: Option<&str>) -> (boo
         _ => (false, false),
     }
 }
-
-/// The declared direct-conversation attachment policy, stated where the
-/// person meets it. Attachments need object handling and a delivery path of
-/// their own, designed on the unified delivery layer — until then the attach
-/// control in direct mode is visibly unavailable, never silently missing.
-const DIRECT_ATTACHMENTS_UNAVAILABLE: &str = "Direct conversations are text-only for now.";
 
 /// Unconfigured room-control membership may still lack a profile card; keep
 /// that legacy surface unchanged. Configured shared Chat never renders this
