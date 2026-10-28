@@ -354,10 +354,10 @@ export function createLibraryActions({
   // A shared file is in the local content store, not a Library folder. Read it
   // and save it like any Library download: a link to /content would navigate
   // this frame, and the gateway refuses that navigation.
-  async function downloadSharedFile(cid) {
+  async function downloadSharedFile(cid, name) {
     const response = await fetch(`/content/${encodeURIComponent(cid)}`, { cache: "no-store" });
     if (!response.ok) throw new Error("Could not read the shared file. Open the link in Chat again.");
-    saveDownloadBlob(await response.blob(), cid);
+    saveDownloadBlob(await response.blob(), name || cid);
   }
 
   async function protectAndListObject(object) {

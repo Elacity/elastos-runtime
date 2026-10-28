@@ -1,4 +1,4 @@
-import { sharedFileMarkup } from "./shared-file.js?v=library-links-20261027a";
+import { sharedFileMarkup, sharedFileName } from "./shared-file.js?v=library-links-20261028a";
 import {
   archiveLibraryObjectPayload,
   escapeHtml,
@@ -17,7 +17,7 @@ import {
 } from "./model.js";
 import { createLibraryRuntime } from "./api.js?v=library-20260711c";
 import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
-import { createLibraryActions } from "./actions.js?v=library-20260711d";
+import { createLibraryActions } from "./actions.js?v=library-20261028b";
 import { createLibraryDialog } from "./dialog.js?v=library-20260711d";
 import { createLibraryEditor } from "./editor.js";
 import { bindLibraryEvents } from "./events.js";
@@ -1307,12 +1307,13 @@ import {
         elements.content.innerHTML = '<div class="empty"><div><h2>Library could not open</h2><p>Close Library and try again.</p></div></div>';
       } finally {
         const sharedCid = queryParams.get("cid");
+        const sharedName = sharedFileName(queryParams.get("name"));
         if (state.mode === "browse" && sharedCid) {
           elements.dialog.innerHTML = sharedFileMarkup(sharedCid);
           elements.dialog.classList.remove("hidden");
           elements.dialog.querySelector("[data-shared-download]").addEventListener("click", () => {
             setStatus("Downloading shared file...");
-            downloadSharedFile(sharedCid)
+            downloadSharedFile(sharedCid, sharedName)
               .then(() => setStatus("Downloaded the shared file."))
               .catch(showError);
           });

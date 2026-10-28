@@ -59,14 +59,16 @@ await new Promise(r => server.listen(0, "127.0.0.1", r));
 const port = server.address().port;
 const browser = await chromium.launch({ headless: true, executablePath: brave });
 try {
-for (const [label, query] of [["legacy query {cid,uri}", `cid=${cid}&uri=${encodeURIComponent(`elastos://${cid}`)}`], ["cid only", `cid=${cid}`], ["folder failure", `cid=${cid}`], ["sender filename ignored", `cid=${cid}&fileName=report.pdf`]]) {
+for (const [label, query, expectedName = cid] of [["legacy query {cid,uri}", `cid=${cid}&uri=${encodeURIComponent(`elastos://${cid}`)}`], ["cid only", `cid=${cid}`], ["folder failure", `cid=${cid}`], ["sender filename ignored", `cid=${cid}&fileName=report.pdf`],
+  ["Chat post name names the download", `cid=${cid}&name=${encodeURIComponent("report 1.pdf")}`, "report 1.pdf"],
+  ["unsafe Chat post name ignored", `cid=${cid}&name=${encodeURIComponent("../x.pdf")}`]]) {
   listed.length = 0;
   failFolder = label === "folder failure";
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${port}/apps/library/?${query}&home_origin=${encodeURIComponent("https://home.example")}#home_token=t`);
   await page.locator("#dialog:not(.hidden) [data-shared-download]").waitFor();
   const [download] = await Promise.all([page.waitForEvent("download"), page.locator("#dialog [data-shared-download]").click()]);
-  assert.equal(download.suggestedFilename(), cid);
+  assert.equal(download.suggestedFilename(), expectedName);
   const saved = await download.path();
   assert.deepEqual(await readFile(saved), sharedBytes);
   assert.ok(listed.length > 0);

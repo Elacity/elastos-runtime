@@ -26,6 +26,7 @@ const homeClipboardProtocolPath = path.resolve("capsules/home/browser/home-clipb
 
 const documents = new Map();
 const saveCalls = [];
+const importCalls = [];
 const publishedFixtureCid = "bafypublishedfixture";
 const publishedWebLink = "https://example.invalid/published-link";
 let delayNextSave = false;
@@ -78,6 +79,7 @@ function resetDocumentsFixture() {
   documents.set("doc-alpha", createDocument("doc-alpha", "Alpha", "alpha.md", "# Alpha\n\n- [ ] Check this item\n- [x] Keep this item\n\n## Notes\n\nShared notes here.", "bafyalpha"));
   documents.set("doc-beta", createDocument("doc-beta", "Beta", "beta.md", "# Beta\n\nRegular paragraph text.", null));
   saveCalls.length = 0;
+  importCalls.length = 0;
   delayNextSave = false;
   delayedSaveStart = null;
   delayedSaveRelease = null;
@@ -202,6 +204,20 @@ function createAppServer() {
         if (op === "create") {
           const docDid = `doc-${documents.size + 1}`;
           const document = createDocument(docDid, payload.title || "Untitled document", `${(payload.title || "untitled").toLowerCase().replace(/\s+/g, "-")}.md`, "", null);
+          documents.set(docDid, document);
+          json(res, { document });
+          return;
+        }
+        if (op === "import_chat_attachment") {
+          importCalls.push({ ...payload });
+          // As the server: one copy per attachment id, kept under its own name.
+          const existing = [...documents.values()].find((document) => document.source_id === payload.attachment_id);
+          if (existing) {
+            json(res, { document: existing });
+            return;
+          }
+          const docDid = `doc-${documents.size + 1}`;
+          const document = { ...createDocument(docDid, payload.file_name, payload.file_name, payload.body, null), source_id: payload.attachment_id };
           documents.set(docDid, document);
           json(res, { document });
           return;
@@ -337,6 +353,7 @@ function createAppServer() {
         // As Home opens a shared text file (home-external-link.js).
         params.set("cid", url.searchParams.get("cid"));
         params.set("view", "read");
+        if (url.searchParams.has("name")) params.set("name", url.searchParams.get("name"));
       }
       const query = params.size ? `?${params}` : "";
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
@@ -1202,11 +1219,15 @@ async function run() {
         request(`${origin}/s/${publishedFixtureCid}/_share.json`)]),
       `Shared preview links must send exact Home requests. Got ${JSON.stringify(requests)}`);
 
-      // Save to Library keeps a private copy that then edits like any document.
+      // Save to Library keeps a private copy under the default name and then
+      // edits like any document.
       const before = documents.size;
       await frame.getByRole("button", { name: "Save to Library", exact: true }).click();
-      await waitForCondition(() => documents.size === before + 1 && saveCalls.length === 1, 5000,
-        `Save to Library must create and save a copy. Got ${JSON.stringify(saveCalls)}`);
+      await waitForCondition(() => documents.size === before + 1 && importCalls.length === 1, 5000,
+        `Save to Library must keep a copy. Got ${JSON.stringify(importCalls)}`);
+      assert(importCalls[0].attachment_id === `shared-${publishedFixtureCid}` && importCalls[0].file_name === "Shared file.txt" &&
+        importCalls[0].mime === "text/plain" && importCalls[0].body.startsWith("# Shared note") && saveCalls.length === 0,
+        `Save to Library must import the text as Shared file.txt. Got ${JSON.stringify(importCalls)}`);
       await frame.waitForFunction(() => document.getElementById("save-to-library").getClientRects().length === 0 &&
         ["mode-write", "mode-split", "mode-read", "save-button"].every((id) => document.getElementById(id).getClientRects().length > 0) &&
         !document.getElementById("editor").readOnly && !document.getElementById("title-input").readOnly &&
@@ -1215,12 +1236,40 @@ async function run() {
       assert(await frame.evaluate(() => document.getElementById("documents-shell").dataset.workspaceView) === "write",
         "After Save to Library the copy must offer Write again.");
       const copy = [...documents.values()].at(-1);
-      assert(copy.title === "Shared file" && copy.body.startsWith("# Shared note"),
+      assert(copy.title === "Shared file.txt" && copy.body.startsWith("# Shared note"),
         `Save to Library must keep the shared text. Got ${JSON.stringify(copy)}`);
       assert(await frame.locator(`.document-list-item[data-doc-did="${copy.doc_did}"].active`).count() === 1,
         "The saved copy must be listed and selected.");
     } finally {
       await publishedPage.close();
+    }
+
+    // The name the Chat post states is the title and the default save name;
+    // .md and .txt stay, anything else becomes .txt, a bad name is dropped.
+    for (const [name, title, fileName, mime] of [
+      ["omp-test-note.txt", "omp-test-note.txt", "omp-test-note.txt", "text/plain"],
+      ["Report.MD", "Report.MD", "Report.MD", "text/markdown"],
+      ["report.pdf", "report.pdf", "report.pdf.txt", "text/plain"],
+      ["../evil.txt", "Shared file", "Shared file.txt", "text/plain"],
+    ]) {
+      resetDocumentsFixture();
+      const namedPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+      trackPage(namedPage, consoleErrors, pageErrors, failedRequests, errorResponses);
+      try {
+        await namedPage.goto(`http://127.0.0.1:${port}/home-fixture?cid=${publishedFixtureCid}&name=${encodeURIComponent(name)}`);
+        const frame = await (await namedPage.locator('iframe[title="Documents"]').elementHandle()).contentFrame();
+        await frame.locator("#preview h1").first().waitFor({ state: "visible" });
+        const shownTitle = await frame.locator("#title-input").inputValue();
+        assert(shownTitle === title, `A shared file named ${JSON.stringify(name)} must be titled ${title}. Got ${shownTitle}`);
+        await frame.getByRole("button", { name: "Save to Library", exact: true }).click();
+        await waitForCondition(() => importCalls.length === 1, 5000, `Save to Library did not save ${name}.`);
+        assert(importCalls[0].file_name === fileName && importCalls[0].mime === mime,
+          `Save to Library must name ${JSON.stringify(name)} ${fileName}. Got ${JSON.stringify(importCalls[0])}`);
+        await frame.waitForFunction((expected) => document.getElementById("title-input").value === expected &&
+          !document.getElementById("editor").readOnly, fileName);
+      } finally {
+        await namedPage.close();
+      }
     }
 
     resetDocumentsFixture();

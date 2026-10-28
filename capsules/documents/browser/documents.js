@@ -4,6 +4,8 @@ const state = {
   homeToken: new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "",
   initialDocDid: new URLSearchParams(window.location.search).get("doc") || "",
   initialCid: new URLSearchParams(window.location.search).get("cid") || "",
+  // A shared file's stated name: its title and default save name only.
+  initialName: sharedFileName(new URLSearchParams(window.location.search).get("name")),
   initialLibraryObjectUri:
     new URLSearchParams(window.location.search).get("objectUri") ||
     new URLSearchParams(window.location.search).get("object_uri") ||
@@ -330,6 +332,14 @@ function documentIdentity(document) {
     return "document:" + String(document.doc_did);
   }
   return "draft";
+}
+
+// The same rule as Home's sharedFileName (home-external-link.js): no path
+// separators, control characters or leading dots, at most 120 characters.
+function sharedFileName(value) {
+  if (typeof value !== "string" || /[/\\]/.test(value)) return "";
+  const cleaned = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").replace(/^[.\s]+/, "");
+  return [...cleaned].slice(0, 120).join("").trimEnd();
 }
 
 function baseName(uri) {
@@ -1381,7 +1391,8 @@ async function loadLibraryObject(uri) {
 }
 
 // A file shared in Chat opens in the normal layout as a read-only copy; Save
-// to Library keeps a private copy. Documents shows the content only: no CID,
+// to Library keeps a private copy. Documents shows the content and the file
+// name the Chat post states, if any: no CID,
 // address, type or size. Home opens Documents for a shared file only after it
 // read the bytes as text (home-external-link.js), so the bytes are the file.
 async function readSharedText(cid) {
@@ -1410,18 +1421,37 @@ async function loadSharedFile(cid) {
     return;
   }
   if (sessionId !== state.currentSessionId) return;
-  replaceCurrentDocument({ ...createDraftDocument(), title: "Shared file", body, shared: true });
+  replaceCurrentDocument({ ...createDraftDocument(), title: state.initialName || "Shared file", body, shared: true, shared_cid: cid });
   renderDocumentsList();
   renderCurrentDocument();
 }
 
+// The default name for a saved shared file: .md and .txt stay, anything else
+// becomes a .txt file, since Documents keeps text only.
+function sharedSaveFileName(title) {
+  return /\.(md|txt)$/i.test(title) ? title : title + ".txt";
+}
+
+// Save to Library keeps the shared file under its own name in the Documents
+// folder, through the same import Chat attachments use; saving the same file
+// again opens the copy already kept.
 async function saveSharedCopy() {
   const shared = state.current;
   if (!shared?.shared) return;
-  replaceCurrentDocument({ ...createDraftDocument(), title: shared.title, body: shared.body });
+  const sessionId = state.currentSessionId;
+  const fileName = sharedSaveFileName(shared.title);
+  const response = await documentsProviderApi("import_chat_attachment", {
+    attachment_id: "shared-" + shared.shared_cid,
+    file_name: fileName,
+    mime: /\.md$/i.test(fileName) ? "text/markdown" : "text/plain",
+    body: shared.body,
+  });
+  if (sessionId !== state.currentSessionId) return;
+  const document = requireSavedWorkingCopy(response.document);
+  replaceCurrentDocument(document);
+  upsertDocumentListItem(document);
+  renderDocumentsList();
   renderCurrentDocument();
-  setDirty(true);
-  await saveCurrent();
 }
 
 async function selectLibraryFile(uri) {

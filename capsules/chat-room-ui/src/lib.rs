@@ -1808,6 +1808,7 @@ impl App {
             match link_app.open_elastos_uri_from_shell(
                 &uri,
                 anchor.get_attribute("data-message-ref").as_deref(),
+                anchor.get_attribute("data-file-name").as_deref(),
             ) {
                 Ok(true) => event.prevent_default(),
                 Ok(false) => {}
@@ -1845,6 +1846,7 @@ impl App {
                     let _ = key_app.open_elastos_uri_from_shell(
                         &uri,
                         link.get_attribute("data-message-ref").as_deref(),
+                        link.get_attribute("data-file-name").as_deref(),
                     );
                 } else if let Some(url) = link.get_attribute("data-open-external") {
                     key_app.activate_external_link(&event, &url);
@@ -3238,11 +3240,13 @@ impl App {
         &self,
         uri: &str,
         message_ref: Option<&str>,
+        file_name: Option<&str>,
     ) -> Result<bool, JsValue> {
         if !self.is_shell_mode() {
             return Ok(false);
         }
-        let Some(message) = shared_file_request(self.home_token().as_deref(), uri, message_ref)
+        let Some(message) =
+            shared_file_request(self.home_token().as_deref(), uri, message_ref, file_name)
         else {
             return Ok(false);
         };
@@ -5484,10 +5488,51 @@ fn direct_message_reference(
     Some(format!("{conversation_id}/{message_id}"))
 }
 
+/// The longest file name Chat passes to Home with a shared file link.
+const SHARED_FILE_NAME_MAX_CHARS: usize = 120;
+
+/// A file name fit to show and to suggest when saving: no path separators,
+/// control characters or leading dots, at most 120 characters. It is only a
+/// title and default name; it never decides the type or the app.
+fn shared_file_display_name(raw: &str) -> Option<String> {
+    if raw.contains(['/', '\\']) {
+        return None;
+    }
+    let cleaned: String = raw.chars().filter(|ch| !ch.is_control()).collect();
+    let name: String = cleaned
+        .trim_start_matches(|ch: char| ch == '.' || ch.is_whitespace())
+        .chars()
+        .take(SHARED_FILE_NAME_MAX_CHARS)
+        .collect();
+    let name = name.trim_end();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The file name a Chat file post states (`name · size · elastos://<cid>`),
+/// when the whole message is that post and its link is `uri`.
+fn shared_file_post_name(text: &str, uri: &str) -> Option<String> {
+    let mut parts = text.rsplitn(3, " · ");
+    if parts.next()? != uri {
+        return None;
+    }
+    let size = parts.next()?;
+    let stated_size = match size.strip_suffix(" bytes") {
+        Some(bytes) => !bytes.is_empty() && bytes.bytes().all(|byte| byte.is_ascii_digit()),
+        None => size.split_once(' ').is_some_and(|(number, unit)| {
+            ["KB", "MB", "GB"].contains(&unit) && number.parse::<f64>().is_ok_and(f64::is_finite)
+        }),
+    };
+    if !stated_size {
+        return None;
+    }
+    shared_file_display_name(parts.next()?)
+}
+
 fn shared_file_request(
     home_token: Option<&str>,
     uri: &str,
     message_ref: Option<&str>,
+    file_name: Option<&str>,
 ) -> Option<serde_json::Value> {
     let home_token = home_token.filter(|token| !token.is_empty())?;
     if !is_shared_file_uri(uri) {
@@ -5502,6 +5547,9 @@ fn shared_file_request(
         }
         request["source"] =
             serde_json::json!({"conversation_id": conversation_id, "message_id": message_id});
+    }
+    if let Some(name) = file_name.and_then(shared_file_display_name) {
+        request["name"] = serde_json::Value::String(name);
     }
     Some(request)
 }
@@ -5535,7 +5583,11 @@ fn message_text_nodes(text: &str, shell_mode: bool) -> Vec<MessageTextNode<'_>> 
             TextSegment::Link(url) => MessageTextNode::Link {
                 text: url,
                 attributes: if url.starts_with("elastos://") {
-                    shared_file_attributes(url)
+                    let mut attributes = shared_file_attributes(url);
+                    if let Some(name) = shared_file_post_name(text, url) {
+                        attributes.push(("data-file-name", name));
+                    }
+                    attributes
                 } else {
                     external_link_attributes(url, None, shell_mode)
                 },
@@ -7559,6 +7611,7 @@ mod tests {
                     Some("launch"),
                     uri,
                     row.message_reference().as_deref(),
+                    None,
                 )
                 .unwrap();
                 assert_eq!(
@@ -7619,29 +7672,75 @@ mod tests {
     }
 
     #[test]
-    fn shared_file_post_uses_only_the_cid_for_its_link() {
+    fn shared_file_post_link_carries_only_the_cid_and_the_stated_name() {
         let uri = "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
         let post = format!("report.pdf · 1.0 MB · {uri}");
         let nodes = message_text_nodes(&post, true);
         let MessageTextNode::Link { attributes, .. } = nodes.last().unwrap() else {
             panic!("file link missing")
         };
-        assert_eq!(*attributes, super::shared_file_attributes(uri));
+        let mut expected = super::shared_file_attributes(uri);
+        expected.push(("data-file-name", "report.pdf".to_string()));
+        assert_eq!(*attributes, expected);
         assert_eq!(
-            super::shared_file_request(Some("launch"), uri, None).unwrap(),
+            super::shared_file_request(Some("launch"), uri, None, None).unwrap(),
             serde_json::json!({"type": "home:open-uri", "uri": uri, "homeToken": "launch"})
+        );
+        assert_eq!(
+            super::shared_file_request(Some("launch"), uri, None, Some("report.pdf")).unwrap(),
+            serde_json::json!({"type": "home:open-uri", "uri": uri, "homeToken": "launch", "name": "report.pdf"})
+        );
+        // A name with a separator, or no name at all, sends none.
+        assert!(
+            super::shared_file_request(Some("launch"), uri, None, Some("../x.txt"))
+                .unwrap()
+                .get("name")
+                .is_none()
         );
         for post in [
             uri.to_string(),
             format!("../report.pdf · 30 bytes · {uri}"),
+            format!("a\\b.txt · 30 bytes · {uri}"),
             format!("report.pdf · unknown · {uri}"),
+            format!("report.pdf · 30 bytes · {uri} more"),
+            format!("..... · 30 bytes · {uri}"),
         ] {
             let nodes = message_text_nodes(&post, true);
-            let MessageTextNode::Link { attributes, .. } = nodes.last().unwrap() else {
+            let MessageTextNode::Link { attributes, .. } = nodes
+                .iter()
+                .find(|node| matches!(node, MessageTextNode::Link { .. }))
+                .unwrap()
+            else {
                 panic!("file link missing")
             };
-            assert!(!attributes.iter().any(|(key, _)| *key == "data-file-name"));
+            assert!(
+                !attributes.iter().any(|(key, _)| *key == "data-file-name"),
+                "{post}"
+            );
         }
+    }
+
+    #[test]
+    fn shared_file_names_are_cleaned_and_bounded() {
+        let uri = "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3w2pz3hftb5xg3mh5g4xq7y5u";
+        assert_eq!(
+            super::shared_file_post_name(&format!("omp-test-note.txt · 35 bytes · {uri}"), uri),
+            Some("omp-test-note.txt".to_string())
+        );
+        assert_eq!(
+            super::shared_file_post_name(&format!("a · b.txt · 2.5 KB · {uri}"), uri),
+            Some("a · b.txt".to_string())
+        );
+        assert_eq!(
+            super::shared_file_display_name("..hidden\u{7}.txt"),
+            Some("hidden.txt".to_string())
+        );
+        assert_eq!(
+            super::shared_file_display_name(&"n".repeat(300)),
+            Some("n".repeat(120))
+        );
+        assert_eq!(super::shared_file_display_name(" \u{1b} "), None);
+        assert_eq!(super::shared_file_display_name("dir/x.txt"), None);
     }
 
     #[test]
@@ -7650,7 +7749,7 @@ mod tests {
         for conversation in ["file-community", "direct:sha256:conversation"] {
             let reference = format!("{conversation}/sha256:message");
             assert_eq!(
-                super::shared_file_request(Some("launch"), uri, Some(&reference)),
+                super::shared_file_request(Some("launch"), uri, Some(&reference), None),
                 Some(serde_json::json!({
                     "type": "home:open-uri", "uri": uri, "homeToken": "launch",
                     "source": { "conversation_id": conversation, "message_id": "sha256:message" },
@@ -7661,14 +7760,23 @@ mod tests {
             "seq": 7, "message_id": "sha256:message", "sender": "Alma", "kind": "text", "body": uri, "created_at": 1,
         })).unwrap();
         assert_eq!(row.message_id.as_deref(), Some("sha256:message"));
-        assert!(super::shared_file_request(Some("launch"), uri, None)
+        assert!(super::shared_file_request(Some("launch"), uri, None, None)
             .unwrap()
             .get("source")
             .is_none());
-        assert!(super::shared_file_request(None, uri, Some("file-community/message")).is_none());
-        assert!(super::shared_file_request(Some("launch"), uri, Some("file-community/")).is_none());
-        assert!(super::shared_file_request(Some("launch"), &format!(" {uri}"), None).is_none());
-        assert!(super::shared_file_request(Some("launch"), &format!("{uri} "), None).is_none());
+        assert!(
+            super::shared_file_request(None, uri, Some("file-community/message"), None).is_none()
+        );
+        assert!(
+            super::shared_file_request(Some("launch"), uri, Some("file-community/"), None)
+                .is_none()
+        );
+        assert!(
+            super::shared_file_request(Some("launch"), &format!(" {uri}"), None, None).is_none()
+        );
+        assert!(
+            super::shared_file_request(Some("launch"), &format!("{uri} "), None, None).is_none()
+        );
         let nodes = message_text_nodes(uri, true);
         assert_eq!(
             nodes,

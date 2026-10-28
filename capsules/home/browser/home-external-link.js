@@ -7,6 +7,18 @@
 // synchronously in that click, with no opener and no referrer. The app gets no
 // reply, so it cannot learn what the person chose.
 
+// The file name a Chat post states for a shared file, fit to show and to
+// suggest when saving: no path separators, control characters or leading
+// dots, at most 120 characters. Only a title and default name; it never
+// decides the type or the app. Chat (shared_file_display_name), Documents and
+// Library apply the same rule; documents-shared-file-name.test.mjs checks they
+// agree.
+export function sharedFileName(value) {
+  if (typeof value !== "string" || /[/\\]/.test(value)) return "";
+  const cleaned = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").replace(/^[.\s]+/, "");
+  return [...cleaned].slice(0, 120).join("").trimEnd();
+}
+
 export const HOME_OPEN_EXTERNAL_TYPE = "home:open-external";
 export const EXTERNAL_LINK_REQUEST_SCHEMA = "elastos.home.external-link.request/v1";
 const EXTERNAL_LINK_RESULT_SCHEMA = "elastos.home.external-link.result/v1";
@@ -80,13 +92,17 @@ function validatedSharedResult(result, uri) {
 
 // The launch context is verified by Home before this boundary. Runtime owns
 // CID and message validation; Home preserves the exact request and binding.
+// The optional name is the file name the Chat post states: a title and default
+// name for the opened file only, never part of the check or the app choice.
 export function requestHomeSharedContent({ context, data, prompt, fetchJson }) {
   const source = data.source;
-  const keys = ["type", "uri", "homeToken", ...(source === undefined ? [] : ["source"])];
+  const keys = ["type", "uri", "homeToken", ...(source === undefined ? [] : ["source"]),
+    ...(data.name === undefined ? [] : ["name"])];
   if (context.kind !== "app-frame" || context.targetId !== "chat-room"
     || !hasExactKeys(data, keys) || data.type !== "home:open-uri"
     || data.homeToken !== context.homeToken || typeof data.uri !== "string"
     || !data.uri.startsWith("elastos://") || data.uri.length > MAX_EXTERNAL_LINK_LENGTH
+    || (data.name !== undefined && (typeof data.name !== "string" || data.name.length > MAX_EXTERNAL_LINK_LENGTH))
     || (source !== undefined && (!source
       || typeof source !== "object" || Array.isArray(source)
       || !hasExactKeys(source, ["conversation_id", "message_id"])
@@ -100,7 +116,7 @@ export function requestHomeSharedContent({ context, data, prompt, fetchJson }) {
     method: "POST", signal, body: JSON.stringify({ check_id }),
   });
   const requestId = prompt.begin({ homeToken: context.homeToken, appId: context.targetId,
-    kind: "shared", uri: data.uri, check, get });
+    kind: "shared", uri: data.uri, name: sharedFileName(data.name), check, get });
   if (!requestId) return false;
   check().then(result => prompt.show(requestId, result)).catch(() => prompt.checkFailed(requestId));
   return true;
@@ -108,7 +124,7 @@ export function requestHomeSharedContent({ context, data, prompt, fetchJson }) {
 
 // Read only the verified local gateway after the person chooses Open/Get.
 // Raw CID responses use application/octet-stream, so inspect a bounded sample.
-export async function openHomeSharedFile({ cid, uri }, { openTarget, fetchLocal = globalThis.fetch, signal } = {}) {
+export async function openHomeSharedFile({ cid, uri, name }, { openTarget, fetchLocal = globalThis.fetch, signal } = {}) {
   const response = await fetchLocal(`/content/${encodeURIComponent(cid)}`, { cache: "no-store", signal });
   if (!response.ok) throw new Error("Could not read the local file");
   const reader = response.body.getReader();
@@ -132,8 +148,9 @@ export async function openHomeSharedFile({ cid, uri }, { openTarget, fetchLocal 
     text = !/[\x00-\x08\x0b\x0e-\x1f\x7f]/.test(decoded) && !decoded.startsWith("%PDF-");
   } catch (_) { /* Binary content opens in Library. */ }
   if (signal?.aborted) return;
+  const fileName = sharedFileName(name);
   return openTarget(text ? "documents" : "library", {
-    query: { cid, ...(text ? { uri, view: "read" } : {}) },
+    query: { cid, ...(text ? { uri, view: "read" } : {}), ...(fileName ? { name: fileName } : {}) },
   });
 }
 
@@ -244,7 +261,7 @@ export function createHomeExternalLinkPrompt({
     const current = () => active === request && isLive(request.homeToken) && !request.controller.signal.aborted;
     try {
       if (state === "local") {
-        await openSharedFile(request.result, request.controller.signal);
+        await openSharedFile({ ...request.result, name: request.name }, request.controller.signal);
         if (current()) close();
         return;
       }
@@ -256,7 +273,7 @@ export function createHomeExternalLinkPrompt({
         if (!result || !hasExactKeys(result, ["state"]) || !GET_STATES.includes(result.state)) throw new Error("Invalid file result");
         request.state = result.state;
         if (result.state === "local") {
-          await openSharedFile(request.result, request.controller.signal);
+          await openSharedFile({ ...request.result, name: request.name }, request.controller.signal);
           if (current()) close();
           return;
         }
@@ -387,14 +404,14 @@ export function createHomeExternalLinkPrompt({
   return {
     // Claims the one request slot for this sender. Returns "" while another
     // request is open or being checked, or during the sender's cool-down.
-    begin({ homeToken, appId, kind = "web", uri, check, get }) {
+    begin({ homeToken, appId, kind = "web", uri, name = "", check, get }) {
       if (active || !homeToken || !appId || (cooldownUntil.get(appId) || 0) > now()) {
         return "";
       }
       cooldownUntil.delete(appId);
       sequence += 1;
       const requestId = `external-link-${sequence}`;
-      active = { requestId, homeToken, appId, kind, uri, check, get, phase: "checking", href: "", busy: false };
+      active = { requestId, homeToken, appId, kind, uri, name, check, get, phase: "checking", href: "", busy: false };
       return requestId;
     },
     // Shows the Runtime-checked request. Anything stale or malformed, or a

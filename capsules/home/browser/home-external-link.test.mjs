@@ -260,3 +260,39 @@ test('Home opens binary shared content in Library by CID', async () => {
     openTarget: async (...args) => opens.push(args) });
   assert.deepEqual(opens, [['library', { query: { cid } }]]);
 });
+
+test('a Chat post file name rides along as a title only, never in the check', async () => {
+  for (const [name, expected] of [['omp-test-note.txt', 'omp-test-note.txt'], ['..x\u0007.txt', 'x.txt'],
+    ['../x.txt', ''], ['a\\b', ''], ['n'.repeat(300), 'n'.repeat(120)]]) {
+    const h = harness(), calls = [];
+    const fetchJson = async (route, init) => { calls.push(JSON.parse(init.body));
+      return route.endsWith('/check') ? result() : { state: 'local' }; };
+    assert.equal(requestHomeSharedContent({ context, data: { ...message(), name }, prompt: h.prompt, fetchJson }), true);
+    await settle();
+    assert.deepEqual(calls[0], { schema: 'elastos.home.shared-content.check/v1', app_token: 'launch', uri, source: message().source });
+    h.tick(); h.click(); await settle();
+    assert.equal(h.opened.length, 1);
+    assert.equal(h.opened[0].cid, cid);
+    assert.equal(h.opened[0].name, expected);
+  }
+  for (const name of [5, null, [], 'x'.repeat(2049)]) {
+    const h = harness();
+    assert.equal(requestHomeSharedContent({ context, data: { ...message(), name }, prompt: h.prompt,
+      fetchJson: () => { throw new Error('unexpected request'); } }), false);
+  }
+});
+
+test('Home passes the cleaned name to Documents and Library and never lets it pick the app', async () => {
+  const { openHomeSharedFile, sharedFileName } = await import('./home-external-link.js');
+  for (const [bytes, target] of [['Hello', 'documents'], ['%PDF-1.7', 'library']]) {
+    for (const [name, expected] of [['report.pdf', 'report.pdf'], ['notes.txt', 'notes.txt'], ['../a', undefined], ['', undefined]]) {
+      const opens = [];
+      await openHomeSharedFile({ cid, uri, name }, {
+        fetchLocal: async () => new Response(bytes), openTarget: async (...args) => opens.push(args) });
+      assert.equal(opens[0][0], target, `${name} must not change the app`);
+      assert.equal(opens[0][1].query.name, expected);
+    }
+  }
+  assert.equal(sharedFileName(' .\u001b.hidden '), 'hidden');
+  assert.equal(sharedFileName(undefined), '');
+});

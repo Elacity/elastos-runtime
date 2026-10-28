@@ -1071,6 +1071,12 @@ async function runScenario(scenario) {
       await page.waitForTimeout(600); await page.locator('#open').click();
       await page.waitForFunction(() => window.fixtureFileOpens.length === 1);
       assert(JSON.stringify(trace.sharedGets) === JSON.stringify([{ check_id: 'file-check' }]), "Get contract differs");
+      // A file post's stated name rides along as a title only; a bare link has none.
+      const sharedNames = await page.evaluate(() => window.fixtureSharedMessages.map(message => message.name ?? null));
+      assert(sharedNames.length === 4 && sharedNames.slice(0, 3).every(name => name === 'hello.txt') && sharedNames[3] === null,
+        "file post name differs", sharedNames);
+      const opened = await page.evaluate(() => window.fixtureFileOpens[0]);
+      assert(opened.cid === sharedCid && opened.name === '', "a bare link must open without a name", opened);
       await frame.locator('[data-conversation-choice="direct:sha256:fixture-conversation"]').click();
       const dm = frame.locator('a[data-open-uri]'); await dm.waitFor();
       await dm.press('Enter'); await page.locator('#shared-sheet').waitFor({ state: 'visible' });
