@@ -202,11 +202,45 @@ const libraryDialog = read("capsules/library/browser/src/dialog.js");
 const libraryActions = read("capsules/library/browser/src/actions.js");
 const libraryApp = read("capsules/library/browser/src/app.js");
 const libraryRender = read("capsules/library/browser/src/render.js");
+const { createLibraryDialog } = await import(new URL("capsules/library/browser/src/dialog.js", root));
+const propertiesDialog = { dataset: {}, classList: { add() {}, remove() {} }, innerHTML: "", addEventListener() {} };
+createLibraryDialog({
+  copyText: async () => {},
+  dialog: propertiesDialog,
+  hideMenu: () => {},
+  objectByUri: () => null,
+  onBeforeClose: () => {},
+  roots: () => [
+    { id: "home", label: "Home", uri: "localhost://Users/smoke" },
+    { id: "documents", label: "Documents", uri: "localhost://Users/smoke/Documents" },
+  ],
+}).showProperties({
+  uri: "localhost://Users/smoke/Documents/Probe Folder/Guide.md",
+  name: "Guide.md",
+  kind: "file",
+  mime: "text/markdown",
+  size: 1200,
+  modified_at: 1760000000,
+  content_cid: "bafy-smoke-local",
+  capabilities: ["properties"],
+  metadata: { visibility: { placement: "private_folder" } },
+});
+const propertiesHtml = propertiesDialog.innerHTML;
+const propertiesDetails = propertiesHtml.match(/<details\b[^>]*\bclass="item-props-details"[^>]*>([\s\S]*?)<\/details>/);
+const propertiesOutside = propertiesHtml.replace(propertiesDetails?.[0] || "", "");
+const propertiesLabel = (html, label) => html.includes(`<td class="item-prop-label">${label}</td>`);
 assert(
-  libraryDialog.includes('data-tab="technical">Technical</div>')
-    && !libraryDialog.includes('data-tab="runtime">Runtime</div>')
+  propertiesDetails
+    && !/\bopen\b/.test(propertiesDetails[0].slice(0, propertiesDetails[0].indexOf(">")))
+    && propertiesDetails[1].includes("<summary>Details</summary>")
+    && ["Object URI", "Content ID"].every((label) => propertiesLabel(propertiesDetails[1], label) && !propertiesLabel(propertiesOutside, label))
+    && !propertiesOutside.includes("localhost://")
+    && !propertiesOutside.includes("bafy-smoke-local")
+    && ["Name", "Location", "Type", "Size", "Modified"].every((label) => propertiesLabel(propertiesOutside, label) && !propertiesLabel(propertiesDetails[1], label))
+    && !propertiesHtml.includes("data-tab")
     && !libraryDialog.includes("Visibility Contract"),
-  "Library properties must keep implementation fields under Technical",
+  "Library Properties must keep the object address and content ID inside Details, closed by default; ordinary fields stay outside",
+  propertiesHtml,
 );
 assert(
   !libraryActions.includes("provider-owned location")
@@ -226,9 +260,21 @@ assert(
     && !libraryRender.includes("Localhost is your signed local object space"),
   "Library restored implementation nouns in ordinary actions",
 );
+const libraryDialogFunction = (name) => {
+  const start = libraryDialog.indexOf(`  function ${name}(`);
+  const end = libraryDialog.indexOf("\n  function ", start + 1);
+  return start < 0 ? "" : libraryDialog.slice(start, end < 0 ? undefined : end);
+};
+for (const name of ["showObjectStatus", "showSharedAccessReceipt"]) {
+  const source = libraryDialogFunction(name);
+  assert(
+    /<details class="details-json">\s*<summary>Technical details<\/summary>/.test(source)
+      && !/<details\b[^>]*\bopen\b/.test(source),
+    `Library ${name} must keep implementation details in a closed Technical details section`,
+  );
+}
 assert(
-  (libraryDialog.match(/<summary>Technical details<\/summary>/g) || []).length >= 3
-    && !libraryDialog.includes("Runtime checked this object")
+  !libraryDialog.includes("Runtime checked this object")
     && !libraryDialog.includes("Choose a Runtime share policy")
     && !libraryDialog.includes("Recipient-scoped access requires Runtime recipient proof"),
   "Library share flows must keep implementation details collapsed",
