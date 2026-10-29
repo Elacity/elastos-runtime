@@ -198,20 +198,25 @@ pub(super) async fn gateway_admission(
     }
     // A browser preflight carries header names, never the launch-token value.
     // Its response advertises the protocol; admission of the request still
-    // requires the signed launch before any request body can be read.
+    // requires the signed launch before any request body can be read. An
+    // app reads this Home's local content store (`/content/<cid>`) with its
+    // launch token too, so that read may be preflighted as well.
     if method == Method::OPTIONS {
         let requested_method = single_header(headers, "access-control-request-method");
         let requested_headers =
             single_header(headers, "access-control-request-headers").unwrap_or("");
+        let api = path.starts_with("/api/")
+            && matches!(
+                requested_method,
+                Some("GET" | "POST" | "PUT" | "DELETE" | "HEAD")
+            );
+        let content_read =
+            path.starts_with("/content/") && matches!(requested_method, Some("GET" | "HEAD"));
         if origin == Some("null")
             && requested_headers
                 .split(',')
                 .any(|h| h.trim().eq_ignore_ascii_case("x-elastos-home-token"))
-            && matches!(
-                requested_method,
-                Some("GET" | "POST" | "PUT" | "DELETE" | "HEAD")
-            )
-            && path.starts_with("/api/")
+            && (api || content_read)
         {
             let mut response = StatusCode::NO_CONTENT.into_response();
             apply_capsule_cors_headers(response.headers_mut(), &HeaderValue::from_static("null"));

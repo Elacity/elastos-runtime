@@ -1509,27 +1509,6 @@ async fn an_ordinary_home_serves_its_local_store_over_http_only_to_its_own_sessi
     let app = gateway_router(state);
     let authority = passkey_authority_with_name(dir.path(), Some("owner"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
-    let session_read = |path: String| {
-        let app = app.clone();
-        let token = token.clone();
-        async move {
-            let response = app
-                .oneshot(
-                    test_browser_request("localhost:61180", "null")
-                        .uri(path)
-                        .header("x-elastos-home-token", token)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let status = response.status();
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            (status, body.to_vec())
-        }
-    };
     let routes = [
         format!("/content/{TEST_CIDV1}"),
         format!("/ipfs/{TEST_CIDV1}"),
@@ -1549,8 +1528,55 @@ async fn an_ordinary_home_serves_its_local_store_over_http_only_to_its_own_sessi
         let (status, _) = gateway_get(&app, path).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
     }
-    // This Home's own apps still read what it holds.
-    let (status, body) = session_read(format!("/content/{TEST_CIDV1}")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, b"a file Bob shared");
+    // This Home's own apps still read what it holds: from their opaque frame
+    // the browser preflights the token header first, then reads.
+    let preflight = |path: String, method: &'static str| {
+        app.clone().oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri(path)
+                .header("host", "localhost:61180")
+                .header("origin", "null")
+                .header("access-control-request-method", method)
+                .header("access-control-request-headers", "x-elastos-home-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    let allowed = preflight(format!("/content/{TEST_CIDV1}"), "GET")
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        allowed
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "null"
+    );
+    let refused = preflight(format!("/content/{TEST_CIDV1}"), "POST")
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let read = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(format!("/content/{TEST_CIDV1}"))
+                .header("x-elastos-home-token", token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    assert_eq!(
+        read.headers().get("access-control-allow-origin").unwrap(),
+        "null",
+        "the opaque frame may read the answer"
+    );
+    let body = axum::body::to_bytes(read.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"a file Bob shared");
 }
