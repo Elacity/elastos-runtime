@@ -549,109 +549,6 @@ fn hosted_hint_from_offers(
     })
 }
 
-/// Resolve one saved decision instance without using its display name as authority.
-pub(super) fn decision_hosted_offer(data_dir: &Path, id: &str) -> Option<HostedModelOfferHint> {
-    let offers = load_model_provider_operator_offers(data_dir).ok()?;
-    let offer = offers
-        .iter()
-        .find(|offer| offer.get("id").and_then(serde_json::Value::as_str) == Some(id))?;
-    if !operator_offer_enabled(offer)
-        || !operator_offer_has_key(offer)
-        || offer.get("operation").and_then(serde_json::Value::as_str)
-            != Some(elastos_model_contract::decisions::OPERATION)
-        || offer
-            .pointer("/adapter/kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("open_router_decisions")
-        || !offer
-            .pointer("/adapter/model")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|model| model.starts_with("typesafe/jev-"))
-    {
-        return None;
-    }
-    hosted_hint_from_offers(std::slice::from_ref(offer), id)
-}
-
-fn approval_lens_selection_path(data_dir: &Path) -> PathBuf {
-    model_provider_root_dir(data_dir).join("approval-lens.json")
-}
-
-#[derive(Deserialize)]
-#[cfg_attr(test, derive(Serialize))]
-#[serde(deny_unknown_fields)]
-struct ApprovalLensSelection {
-    offer_id: String,
-}
-
-pub(crate) fn approval_lens_has_selection(data_dir: &Path) -> bool {
-    // A failed policy read keeps human review required.
-    approval_lens_offer_id(data_dir)
-        .map(|id| id.is_some())
-        .unwrap_or(true)
-}
-
-/// System offers no evaluator choice while Approval Lens is hidden; tests
-/// write the selection a Home may already hold from an earlier release.
-#[cfg(test)]
-pub(super) fn select_approval_lens(data_dir: &Path, id: &str) -> anyhow::Result<()> {
-    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    anyhow::ensure!(
-        decision_hosted_offer(data_dir, id).is_some(),
-        "configured decision model required"
-    );
-    write_model_provider_config_atomic(
-        &approval_lens_selection_path(data_dir),
-        &serde_json::to_vec(&ApprovalLensSelection {
-            offer_id: id.to_string(),
-        })?,
-    )
-}
-
-/// Read the saved evaluator identity separately from its availability. An
-/// instance's display name never selects it.
-fn approval_lens_offer_id(data_dir: &Path) -> anyhow::Result<Option<String>> {
-    let _guard = MODEL_PROVIDER_CONFIG_MUTEX
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let path = approval_lens_selection_path(data_dir);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) => {
-            validate_model_provider_private_directory(
-                &data_dir.join("providers"),
-                "model-provider config parent",
-            )?;
-            validate_model_provider_private_directory(
-                &model_provider_root_dir(data_dir),
-                "model-provider config root",
-            )?;
-            let bytes = read_model_provider_private_file(
-                &path,
-                &metadata,
-                4096,
-                "Approval Lens selection",
-            )?;
-            let selection: ApprovalLensSelection = serde_json::from_slice(&bytes)?;
-            anyhow::ensure!(
-                !selection.offer_id.is_empty() && selection.offer_id.len() <= 256,
-                "invalid evaluator selection"
-            );
-            Ok(Some(selection.offer_id))
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-pub(crate) fn named_jev_hosted_offer(data_dir: &Path) -> Option<(String, HostedModelOfferHint)> {
-    let id = approval_lens_offer_id(data_dir).ok()??;
-    Some((id.clone(), decision_hosted_offer(data_dir, &id)?))
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct AiProviderConnection {
     pub operation: String,
@@ -1978,9 +1875,8 @@ mod hosted_decision_write_fault_tests {
 mod hosted_hint_tests {
     use super::{
         hosted_hint_from_offers, hosted_model_share_cards, hosted_offer,
-        materialize_provider_offer, named_jev_hosted_offer,
-        seed_model_provider_operator_offers_for_test, set_hosted_offer_share, status_from_offers,
-        HostedAiProvider,
+        materialize_provider_offer, seed_model_provider_operator_offers_for_test,
+        set_hosted_offer_share, status_from_offers, HostedAiProvider,
     };
     use serde_json::json;
 
@@ -2093,7 +1989,7 @@ mod hosted_hint_tests {
     }
 
     #[test]
-    fn named_jev_requires_a_decision_model_and_stays_private() {
+    fn decision_model_stays_private() {
         let dir = tempfile::tempdir().unwrap();
         let mut offer = hosted_offer(
             HostedAiProvider::OpenRouter,
@@ -2103,9 +1999,7 @@ mod hosted_hint_tests {
             None,
         );
         offer["adapter"]["api_key"] = serde_json::json!("fixture-secret");
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![offer.clone()]).unwrap();
-        super::select_approval_lens(dir.path(), "model:openrouter").unwrap();
-        assert!(named_jev_hosted_offer(dir.path()).is_some());
+        seed_model_provider_operator_offers_for_test(dir.path(), vec![offer]).unwrap();
         assert!(hosted_model_share_cards(dir.path()).unwrap().is_empty());
         assert!(set_hosted_offer_share(
             dir.path(),
@@ -2114,69 +2008,6 @@ mod hosted_hint_tests {
             Some(HostedAiProvider::OpenRouter.share_terms_ack())
         )
         .is_err());
-        offer["adapter"]["model"] = serde_json::json!("other/model");
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![offer]).unwrap();
-        assert!(named_jev_hosted_offer(dir.path()).is_none());
-    }
-
-    #[test]
-    fn approval_lens_selection_survives_rename_and_never_substitutes() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut first = hosted_offer(
-            HostedAiProvider::OpenRouter,
-            "model:first",
-            "Jev",
-            "typesafe/jev-1.13",
-            None,
-        );
-        first["adapter"]["api_key"] = json!("fixture-secret");
-        let mut second = first.clone();
-        second["id"] = json!("model:second");
-        seed_model_provider_operator_offers_for_test(
-            dir.path(),
-            vec![first.clone(), second.clone()],
-        )
-        .unwrap();
-        // The name "Jev" is a label, not a selection.
-        assert!(named_jev_hosted_offer(dir.path()).is_none());
-        assert!(!super::approval_lens_has_selection(dir.path()));
-        assert!(!super::approval_lens_selection_path(dir.path()).exists());
-        super::select_approval_lens(dir.path(), "model:first").unwrap();
-        assert_eq!(named_jev_hosted_offer(dir.path()).unwrap().0, "model:first");
-        first["title"] = json!("My reviewer");
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![first, second.clone()])
-            .unwrap();
-        assert_eq!(named_jev_hosted_offer(dir.path()).unwrap().0, "model:first");
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![second.clone()]).unwrap();
-        assert!(named_jev_hosted_offer(dir.path()).is_none());
-        assert!(super::approval_lens_has_selection(dir.path()));
-        super::select_approval_lens(dir.path(), "model:second").unwrap();
-        assert_eq!(
-            named_jev_hosted_offer(dir.path()).unwrap().0,
-            "model:second"
-        );
-        second["enabled"] = json!(false);
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![second]).unwrap();
-        assert!(super::select_approval_lens(dir.path(), "model:second").is_err());
-        assert!(super::select_approval_lens(dir.path(), "model:foreign").is_err());
-    }
-
-    #[test]
-    fn approval_lens_policy_read_error_keeps_review_required() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut offer = hosted_offer(
-            HostedAiProvider::OpenRouter,
-            "model:first",
-            "Jev",
-            "typesafe/jev-1.13",
-            None,
-        );
-        offer["adapter"]["api_key"] = json!("fixture-secret");
-        seed_model_provider_operator_offers_for_test(dir.path(), vec![offer]).unwrap();
-        std::fs::create_dir(super::approval_lens_selection_path(dir.path())).unwrap();
-        assert!(super::approval_lens_offer_id(dir.path()).is_err());
-        assert!(named_jev_hosted_offer(dir.path()).is_none());
-        assert!(super::approval_lens_has_selection(dir.path()));
     }
 
     #[test]
@@ -2323,7 +2154,7 @@ mod hosted_hint_tests {
     }
 
     #[tokio::test]
-    async fn editing_jev_preserves_evaluator_selection_and_other_instances() {
+    async fn editing_jev_keeps_other_instances() {
         let dir = tempfile::tempdir().unwrap();
         let first = "model:hosted-0123456789abcdef0123456789abcdef";
         let second = "model:hosted-1123456789abcdef0123456789abcdef";
@@ -2347,9 +2178,6 @@ mod hosted_hint_tests {
             )
             .await
             .unwrap();
-            if id == first && canonical.is_none() {
-                super::select_approval_lens(dir.path(), first).unwrap();
-            }
         }
         let offers = super::load_model_provider_operator_offers(dir.path()).unwrap();
         assert_eq!(offers.len(), 2);
@@ -2358,7 +2186,6 @@ mod hosted_hint_tests {
         assert!(offers[1]["adapter"]
             .get("expected_response_model")
             .is_none());
-        assert_eq!(super::named_jev_hosted_offer(dir.path()).unwrap().0, first);
         assert_eq!(
             offers[0]["adapter"]["expected_response_model"],
             "typesafe/jev-1.13-20260917"

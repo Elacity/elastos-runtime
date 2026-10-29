@@ -896,8 +896,9 @@ async function main() {
         state: card?.querySelector(".ai-provider-state")?.textContent?.trim(),
         useDisabled: card?.querySelector("button")?.disabled,
         lensSection: Boolean(document.querySelector("#approval-lens")),
-        decisionListed: [...document.querySelectorAll("#ai-provider-instances .ai-provider-instance")]
-          .some((node) => node.textContent.includes("Jev")),
+        decisionButtons: [...([...document.querySelectorAll("#ai-provider-instances .ai-provider-instance")]
+          .find((node) => node.textContent.includes("Jev"))?.querySelectorAll("button") || [])]
+          .map((button) => button.textContent.trim()),
       };
     });
     assert(
@@ -905,7 +906,7 @@ async function main() {
         hostedPause.state === "External HTTPS paused" &&
         hostedPause.useDisabled === true &&
         hostedPause.lensSection === false &&
-        hostedPause.decisionListed === false,
+        hostedPause.decisionButtons.join() === "Edit,Disconnect",
       "System did not show saved hosted connections as paused",
       hostedPause,
     );

@@ -135,8 +135,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 - System > Models no longer has an Approval Lens section, and Add hosted
   model no longer lists Jev decision models. Naming a hosted model "Jev" no
-  longer turns it into an evaluator. Inbox remains where you approve each
-  hosted connection.
+  longer turns it into an evaluator, and an evaluator chosen in an earlier
+  version is no longer asked: Inbox remains where you approve each hosted
+  connection. A Jev model you saved earlier shows again under Hosted, where
+  you can disconnect it.
 - System no longer has an Apps & Services page. Marketplace lists the apps,
   viewers, content and models you can open or get, with a working Open, and
   System > Security > Advanced > Technical Details lists every component with
@@ -147,9 +149,9 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Approval Lens is hidden: `POST /api/apps/system/approval-lens` and the
   `approval_lens_offer_id`/`approval_lens_error` status fields are gone, and
   OpenRouter discovery admits text models only. `/approval-lens/revoke` stays
-  for ending hosted approvals. A selection saved by an earlier release is
-  still honoured by Assistant's hosted gate; with none, the gate lets the
-  request through as before.
+  for ending hosted approvals. Assistant's hosted requests are only logged:
+  no evaluator is asked, `approval-lens.json` from an earlier release is
+  ignored, and the evaluator code and its tests are removed.
 - System no longer reads `/api/capsules/interfaces` or lists the capsule
   catalog; both routes stay for Marketplace, Assistant and model management.
   Its catalog search keywords are gone, and an old `?settings=catalog` link

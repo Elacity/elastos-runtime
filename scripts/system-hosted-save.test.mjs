@@ -154,6 +154,20 @@ test("saved hosted card labels only states that need attention", async () => {
     ["Use in Assistant", "Edit", "End hosted approval", "Disconnect"]);
 });
 
+test("a decision model saved by an earlier release is listed so it can be disconnected", async () => {
+  const f = fixture([{
+    id: "model:hosted-dddddddddddddddddddddddddddddddd", name: "Jev", provider: "openrouter",
+    processor_label: "OpenRouter", selected_model: "typesafe/jev-1.13", connected: true,
+    operation: "decision.evaluate", egress_state: "consent_required",
+  }]);
+  await new Promise(setImmediate);
+  const [card] = f.node("#ai-provider-instances").children;
+  assert.equal(card?.dataset.offerId, "model:hosted-dddddddddddddddddddddddddddddddd");
+  // It cannot run Assistant prompts, so it offers no Use in Assistant.
+  assert.deepEqual([...card.children[2].children, ...card.children[3].children[1].children].map(node => node.textContent),
+    ["Edit", "Disconnect"]);
+});
+
 test("Inbox approval prompts are neutral; real failures are errors", async () => {
   const f = fixture();
   f.pending();

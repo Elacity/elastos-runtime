@@ -1982,9 +1982,10 @@ pub(super) async fn gateway_provider_proxy(
         if launch_capsule_id == "assistant" && op == "runs_create" {
             if let Some(offer_id) = request.get("offer_id").and_then(serde_json::Value::as_str) {
                 if let Some(hint) = crate::api::hosted_model_offer_hint(&state.data_dir, offer_id) {
-                    let gate = crate::jev_approval_lens::prepare_assistant_hosted_http(
+                    // No evaluator acts while Approval Lens is hidden: log the
+                    // hosted request and let it through to its own Inbox approval.
+                    let _ = crate::jev_approval_lens::record_assistant_hosted_http_shadow(
                         &state.data_dir,
-                        registry.as_ref(),
                         &crate::jev_approval_lens::AssistantHostedHttpContext {
                             request_id: audit.request_id,
                             principal_id: &principal_id,
@@ -1994,27 +1995,7 @@ pub(super) async fn gateway_provider_proxy(
                             offer_id,
                             hint,
                         },
-                    )
-                    .await;
-                    match gate {
-                        crate::jev_approval_lens::HostedHttpGate::Proceed => {}
-                        crate::jev_approval_lens::HostedHttpGate::NeedsReview => {
-                            return Json(serde_json::json!({
-                                "status": "error",
-                                "code": "approval_required",
-                                "message": crate::jev_approval_lens::HOSTED_HTTP_REVIEW_MESSAGE,
-                            }))
-                            .into_response();
-                        }
-                        crate::jev_approval_lens::HostedHttpGate::Denied => {
-                            return Json(serde_json::json!({
-                                "status": "error",
-                                "code": "approval_denied",
-                                "message": crate::jev_approval_lens::HOSTED_HTTP_DENIED_MESSAGE,
-                            }))
-                            .into_response();
-                        }
-                    }
+                    );
                 }
             }
         }

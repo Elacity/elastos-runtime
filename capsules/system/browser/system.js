@@ -991,7 +991,6 @@ function configureAiProvider() {
     instancesNode.replaceChildren();
     for (const connection of connections) {
       if (!connection || connection.connected !== true) continue;
-      if (connection.operation === "decision.evaluate") continue;
       const card = document.createElement("div");
       card.className = "ai-provider-instance";
       card.dataset.offerId = connection.id;
@@ -1078,7 +1077,10 @@ function configureAiProvider() {
       }
       secondary.append(disconnectButton);
       more.append(summary, secondary);
-      actions.append(useButton, replaceButton);
+      // A decision model saved by an earlier release cannot run Assistant
+      // prompts; it stays listed so it can be disconnected.
+      if (connection.operation === "decision.evaluate") actions.append(replaceButton);
+      else actions.append(useButton, replaceButton);
       card.append(title, detail, actions, more);
       instancesNode.append(card);
     }

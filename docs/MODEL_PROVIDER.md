@@ -402,10 +402,11 @@ does not enter catalogues, offers, logs, or a consumer Home.
 
 System offers no decision models and no Approval Lens evaluator: OpenRouter
 discovery lists text models only, no screen selects an evaluator, and an
-instance's display name never selects one. A Home that selected an evaluator
-in an earlier release keeps that saved instance ID; Runtime still asks it for
-advice and the person decides in Inbox. Without a selection, an Assistant
-hosted request needs only the hosted connection approval in Inbox.
+instance's display name never selects one. Runtime asks no evaluator: an
+evaluator choice saved by an earlier release is ignored, and an Assistant
+hosted request needs only the hosted connection approval in Inbox. A decision
+model saved by an earlier release stays in System's Hosted list, without Use
+in Assistant, so it can be disconnected.
 
 ## Local content selection and retention
 
