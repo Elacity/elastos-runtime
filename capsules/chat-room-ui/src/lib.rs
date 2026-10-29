@@ -169,10 +169,6 @@ struct AppState {
     /// request ID, so Runtime treats it as the same message.
     held_direct_sends: BTreeMap<String, PendingDirectSend>,
     community_unread: bool,
-    /// The direct conversation the person just opened by clicking it or
-    /// replied in. The next messages request marks it read even when Home's
-    /// visibility message has not arrived; it is used once.
-    direct_read_by_action: Option<String>,
     /// This person's Community presence state from Runtime: `requested`,
     /// `deferred`, `refused`, `hidden`, `always` or `while_open`. Runtime owns
     /// the decision (Inbox, System); Chat only reflects it and re-asks.
@@ -1130,23 +1126,8 @@ impl App {
         )
     }
 
-    /// Whether this messages request may mark `conversation_id` read: the
-    /// view is visible, or the person just acted in it (`direct_read_by_action`,
-    /// consumed here).
-    fn take_mark_read(&self, conversation_id: &str) -> bool {
-        let visible = self.view_visible();
-        take_mark_read_decision(&mut self.state.borrow_mut(), visible, conversation_id)
-    }
-
     fn can_mark_read(&self, conversation_id: Option<&str>) -> bool {
-        self.view_visible()
-            && self
-                .state
-                .borrow()
-                .direct
-                .selected_conversation_id
-                .as_deref()
-                == conversation_id
+        mark_read_decision(&self.state.borrow(), self.view_visible(), conversation_id)
     }
 
     fn default_status_badge(&self) -> String {
@@ -1492,7 +1473,7 @@ impl App {
         if !selected_is_available {
             return Err(403);
         }
-        let mark_read = self.take_mark_read(&conversation_id);
+        let mark_read = self.can_mark_read(Some(&conversation_id));
         let messages_result: Result<DirectMessageList, u16> = direct_get_json(
             &format!(
                 "{DIRECT_API_BASE}/conversations/{}/messages?retry_details=true&mark_read={}",
@@ -3315,8 +3296,6 @@ impl App {
             {
                 state.held_direct_sends.remove(&conversation_id);
             }
-            // Replying shows the person sees this conversation.
-            state.direct_read_by_action = Some(conversation_id.clone());
             // Accepted text settles by its conversation and revision, even
             // while another conversation is open. Current UI effects below
             // also require the original selection generation.
@@ -3858,7 +3837,6 @@ impl App {
                 let Some(guard) = commit_direct_selection(&mut state, &choice) else {
                     return;
                 };
-                state.direct_read_by_action = Some(choice.clone());
                 guard
             }
         };
@@ -6569,17 +6547,10 @@ fn configured_shared_participant_visible(participant: &ParticipantView) -> bool 
     participant.profile_verified == Some(true) && !participant.display_name.trim().is_empty()
 }
 
-/// A messages request marks the open conversation read when the view is
-/// visible, or once after the person opened it by clicking or replied in it.
-fn take_mark_read_decision(state: &mut AppState, visible: bool, conversation_id: &str) -> bool {
-    if state.direct.selected_conversation_id.as_deref() != Some(conversation_id) {
-        return false;
-    }
-    let acted = state.direct_read_by_action.as_deref() == Some(conversation_id);
-    if acted {
-        state.direct_read_by_action = None;
-    }
-    visible || acted
+/// A messages request marks a conversation read only while it is the open
+/// conversation and Chat is on screen now.
+fn mark_read_decision(state: &AppState, visible: bool, conversation_id: Option<&str>) -> bool {
+    visible && state.direct.selected_conversation_id.as_deref() == conversation_id
 }
 
 /// The conversation list is fetched before the messages request that marks
@@ -6778,7 +6749,6 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         composer_edits: 0,
         held_direct_sends: BTreeMap::new(),
         community_unread: false,
-        direct_read_by_action: None,
         community_presence: None,
         direct_in_flight: BTreeMap::new(),
         direct_retry_terminal: BTreeMap::new(),
@@ -7107,18 +7077,19 @@ mod tests {
     }
 
     #[test]
-    fn a_click_or_a_reply_marks_the_open_conversation_read_once_even_before_visibility_arrives() {
+    fn only_a_visible_open_conversation_is_marked_read() {
         let mut state = super::AppState::default();
         state.direct.selected_conversation_id = Some("buddy".to_string());
-        // Not visible and no action: not marked.
-        assert!(!super::take_mark_read_decision(&mut state, false, "buddy"));
-        // Opened by a click (or a reply): marked once.
-        state.direct_read_by_action = Some("buddy".to_string());
-        assert!(super::take_mark_read_decision(&mut state, false, "buddy"));
-        assert!(!super::take_mark_read_decision(&mut state, false, "buddy"));
-        // Visible: marked; another conversation never is.
-        assert!(super::take_mark_read_decision(&mut state, true, "buddy"));
-        assert!(!super::take_mark_read_decision(&mut state, true, "other"));
+        assert!(super::mark_read_decision(&state, true, Some("buddy")));
+        assert!(!super::mark_read_decision(&state, true, Some("other")));
+        // A reply is pending and Chat is minimized before the next refresh
+        // (a new message arrives meanwhile): nothing is marked read.
+        state.direct.pending_send = Some(super::PendingDirectSend {
+            request_id: "send-1".into(),
+            conversation_id: "buddy".into(),
+            text: "hi".into(),
+        });
+        assert!(!super::mark_read_decision(&state, false, Some("buddy")));
     }
 
     #[test]
