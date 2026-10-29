@@ -39,10 +39,12 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   Carrier. A Home that already runs IPFS from an earlier version restarts it
   offline after the update, keeping everything it holds. Content a Home lacks
   now fails at once locally and comes from Carrier instead of waiting minutes
-  on a network search. Copying content to your other devices works up to
-  64 MiB per object (200 MiB for a single file); larger items are refused
-  straight away until #498 lands. Content held only outside ElastOS, such as a
-  pasted ipfs.io link, no longer opens.
+  on a network search. Copying content to your other devices works for items
+  up to 704 KiB; larger items are refused straight away until #498 lands.
+  `elastos run --cid` and `elastos serve --cid` open only what this Home
+  holds; for anything else they stop at once and say to open it from Home.
+  Content held only outside ElastOS, such as a pasted ipfs.io link, no longer
+  opens.
 - Content links (`/s/`, `/ipfs/`, `/content/` and published sites) open only
   what this Home's IPFS store already holds. Content it does not hold,
   including content only a Carrier peer offers, does not open. The gateway no

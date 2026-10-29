@@ -3211,6 +3211,11 @@ pub fn parse_content_object_manifest(
     Ok(manifest)
 }
 
+/// What `elastos run/serve --cid` say for a CID this Home's store lacks. The
+/// CLI has no Carrier node and Kubo is offline, so only Home can fetch it.
+pub const CID_NOT_ON_THIS_HOME: &str =
+    "This content isn't on this Home. Open it from Home, which can fetch it from a contact.";
+
 /// Materialize a published capsule through the content availability contract.
 ///
 /// Data capsules must carry `_elastos_object.json`; that manifest is the file
@@ -3222,13 +3227,16 @@ pub async fn prepare_capsule_from_content_provider(
     let manifest_bytes = match fetch_bytes_via_provider(registry, cid, Some("capsule.json")).await {
         Ok(bytes) => bytes,
         Err(capsule_err) => {
-            if let Ok(object_manifest) = fetch_content_object_manifest(registry, cid).await {
-                anyhow::bail!(
+            match fetch_content_object_manifest(registry, cid).await {
+                Ok(object_manifest) => anyhow::bail!(
                     "content object {cid} has kind '{}' and is not a launchable capsule; use `elastos open elastos://{cid}` to inspect release objects or open it with a matching viewer once one is installed",
                     object_manifest.kind
-                );
+                ),
+                Err(_) => {
+                    tracing::debug!(%cid, error = %capsule_err, "capsule CID not in this Home's store");
+                    anyhow::bail!(CID_NOT_ON_THIS_HOME);
+                }
             }
-            return Err(capsule_err);
         }
     };
     let manifest_data = String::from_utf8(manifest_bytes.clone())
@@ -13538,6 +13546,20 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("kind 'release'"));
         assert!(err.to_string().contains("not a launchable capsule"));
+    }
+
+    #[tokio::test]
+    async fn content_prepare_capsule_says_a_missing_cid_is_not_on_this_home() {
+        let (_data_dir, registry, ipfs, _content) = registry_with_content_and_ipfs().await;
+        {
+            let mut missing = ipfs.missing_paths.lock().await;
+            missing.push("capsule.json".to_string());
+            missing.push(OBJECT_MANIFEST_PATH.to_string());
+        }
+        let err = prepare_capsule_from_content_provider(&registry, TEST_CID)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), CID_NOT_ON_THIS_HOME);
     }
 
     #[tokio::test]

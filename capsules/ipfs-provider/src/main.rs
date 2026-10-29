@@ -20,8 +20,8 @@ mod directory_hash;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const KUBO_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const KUBO_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-// An online daemon from an earlier release may be closing many connections.
-const KUBO_MIGRATION_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+// After SIGKILL; with KUBO_STOP_TIMEOUT a migration fits Init's 10 s budget.
+const KUBO_KILL_WAIT: Duration = Duration::from_secs(2);
 const KUBO_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // Tests shorten the idle stop so it can be observed.
 #[cfg(not(test))]
@@ -925,7 +925,11 @@ impl IpfsProvider {
                 self.gateway_port = coord.gateway_port;
                 self.state = KuboState::Ready;
                 update_coord_last_used(&self.data_dir);
-            } else if let Err(error) = stop_online_kubo_with_lock(&self.data_dir) {
+            } else if let Err(error) = stop_online_kubo_with_lock(
+                &self.data_dir,
+                &self.repo_dir,
+                self.kubo_binary.as_deref(),
+            ) {
                 eprintln!("ipfs-provider: {error}");
             }
         }
@@ -1000,18 +1004,24 @@ impl IpfsProvider {
         if try_flock_exclusive(&lockfile) {
             // We got the lock — check coord file again (another process may have finished)
             if let Some(coord) = read_coord_file(&self.data_dir) {
-                if is_pid_alive(coord.kubo_pid) {
-                    if coord.offline {
-                        self.api_port = coord.api_port;
-                        self.gateway_port = coord.gateway_port;
-                        self.state = KuboState::Ready;
-                        update_coord_last_used(&self.data_dir);
-                        // Lock is released on drop
-                        return Ok(());
-                    }
-                    stop_online_kubo(coord.kubo_pid)?;
+                if coord.offline && is_pid_alive(coord.kubo_pid) {
+                    self.api_port = coord.api_port;
+                    self.gateway_port = coord.gateway_port;
+                    self.state = KuboState::Ready;
+                    update_coord_last_used(&self.data_dir);
+                    // Lock is released on drop
+                    return Ok(());
                 }
-                remove_coord_file(&self.data_dir);
+                if coord.offline {
+                    remove_coord_file(&self.data_dir);
+                } else {
+                    retire_online_coord(
+                        &coord,
+                        &self.data_dir,
+                        &self.repo_dir,
+                        self.kubo_binary.as_deref(),
+                    )?;
+                }
             }
 
             // Start Kubo (lock is released on drop)
@@ -2181,36 +2191,98 @@ fn write_local_store_config(repo_dir: &Path, gateway_port: u16) -> Result<(), St
         .map_err(|e| format!("Failed to write Kubo config: {e}"))
 }
 
-/// Init's migration: stops an online daemon now unless another process holds
-/// the startup lock, which then replaces it on its own start.
-fn stop_online_kubo_with_lock(data_dir: &Path) -> Result<(), String> {
+/// Init's migration: replaces an online daemon now unless another process
+/// holds the startup lock, which then replaces it on its own start.
+fn stop_online_kubo_with_lock(
+    data_dir: &Path,
+    repo_dir: &Path,
+    kubo_binary: Option<&Path>,
+) -> Result<(), String> {
     let lockfile = open_startup_lock(data_dir)?;
     if !try_flock_exclusive(&lockfile) {
         return Ok(());
     }
-    if let Some(coord) = read_coord_file(data_dir) {
-        if coord.offline {
-            return Ok(());
+    match read_coord_file(data_dir) {
+        Some(coord) if !coord.offline => {
+            retire_online_coord(&coord, data_dir, repo_dir, kubo_binary)
         }
-        if is_pid_alive(coord.kubo_pid) {
-            stop_online_kubo(coord.kubo_pid)?;
-        }
-        remove_coord_file(data_dir);
+        _ => Ok(()),
     }
+}
+
+/// Retires a coord file without `offline`, under the startup lock. The
+/// process it names is signalled only when it is provably this repo's Kubo;
+/// otherwise (a reused PID, say) it is left alone and only the coord goes.
+fn retire_online_coord(
+    coord: &CoordFile,
+    data_dir: &Path,
+    repo_dir: &Path,
+    kubo_binary: Option<&Path>,
+) -> Result<(), String> {
+    if is_pid_alive(coord.kubo_pid) {
+        if kubo_binary.is_some_and(|binary| is_this_repos_kubo(coord, binary, repo_dir)) {
+            stop_online_kubo(coord.kubo_pid)?;
+        } else {
+            eprintln!(
+                "ipfs-provider: pid {} is not this repo's Kubo; not signalled",
+                coord.kubo_pid
+            );
+        }
+    }
+    remove_coord_file(data_dir);
     Ok(())
 }
 
-/// Stops a daemon an earlier release started online, under the startup lock,
-/// so the same repo restarts offline. SIGTERM lets Kubo close the repo
-/// cleanly; a daemon still running after `KUBO_MIGRATION_STOP_TIMEOUT` is
-/// killed. One that never exits keeps its coord and the restart is refused,
-/// so a second daemon never opens the repo.
+/// Whether `coord.kubo_pid` is the daemon an earlier ipfs-provider started on
+/// `repo_dir`: its command line runs our Kubo binary as `daemon` on the coord's
+/// API address, and that API answers with this repo's peer identity.
+fn is_this_repos_kubo(coord: &CoordFile, kubo_binary: &Path, repo_dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(out) = Command::new("ps")
+            .args(["-o", "args=", "-p", &coord.kubo_pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        let args = String::from_utf8_lossy(&out.stdout);
+        let binary = kubo_binary.to_string_lossy();
+        let canonical = fs::canonicalize(kubo_binary)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !(args.contains(binary.as_ref()) || (!canonical.is_empty() && args.contains(&canonical)))
+            || !args.contains(" daemon")
+            || !args.contains(&format!("/ip4/127.0.0.1/tcp/{}", coord.api_port))
+        {
+            return false;
+        }
+        let repo_peer = fs::read(repo_dir.join("config"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|config| config["Identity"]["PeerID"].as_str().map(str::to_owned));
+        let api_peer = ureq::post(&kubo_rpc_url(coord.api_port, "id", &[]))
+            .timeout(Duration::from_secs(2))
+            .call()
+            .ok()
+            .and_then(|resp| resp.into_json::<serde_json::Value>().ok())
+            .and_then(|id| id["ID"].as_str().map(str::to_owned));
+        repo_peer.is_some() && repo_peer == api_peer
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (coord, kubo_binary, repo_dir);
+        false
+    }
+}
+
+/// Stops this repo's online daemon so the repo restarts offline. It fits
+/// Init's budget: SIGTERM lets Kubo close the repo cleanly within
+/// `KUBO_STOP_TIMEOUT`, then SIGKILL and `KUBO_KILL_WAIT`. One that never
+/// exits keeps its coord and the restart is refused, so a second daemon never
+/// opens the repo.
 fn stop_online_kubo(pid: u32) -> Result<(), String> {
     eprintln!("ipfs-provider: stopping online Kubo pid={pid}; it restarts offline");
-    for (force, timeout) in [
-        (false, KUBO_MIGRATION_STOP_TIMEOUT),
-        (true, KUBO_STOP_TIMEOUT),
-    ] {
+    for (force, timeout) in [(false, KUBO_STOP_TIMEOUT), (true, KUBO_KILL_WAIT)] {
         signal_stop(pid, force);
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -3504,12 +3576,14 @@ mod tests {
     #[cfg(unix)]
     fn kubo_fixture(root: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let kubo = root.join("kubo-fixture");
+        // At `<data>/bin/kubo`, where Init finds the managed Kubo.
+        fs::create_dir_all(root.join("bin")).unwrap();
+        let kubo = root.join("bin/kubo");
         fs::write(
             &kubo,
             "#!/bin/sh\ncase \"$1\" in\n\
              init) mkdir -p \"$IPFS_PATH\" && printf '%s' '{\"Identity\":{\"PeerID\":\"fixture-peer\"},\"Bootstrap\":[\"auto\"],\"DNS\":{\"Resolvers\":{\".\":\"auto\",\"eth.\":\"https://dns.example/dns-query\"}}}' > \"$IPFS_PATH/config\";;\n\
-             daemon) printf '%s' \"$*\" > \"$IPFS_PATH.args\"; printf '%s' \"$4\" > \"$IPFS_PATH.started\"; exec sleep 60;;\n\
+             daemon) printf '%s' \"$*\" > \"$IPFS_PATH.args\"; printf '%s' \"$4\" > \"$IPFS_PATH.started\"; sleep 60 & wait;;\n\
              *) exit 0;;\nesac\n",
         )
         .unwrap();
@@ -3562,20 +3636,56 @@ mod tests {
         }
     }
 
-    /// A live process standing in for an online daemon an earlier release
-    /// started, recorded in a coord file without `offline`.
-    fn online_daemon_coord(root: &Path, api_port: u16) -> Child {
-        let daemon = Command::new("sleep").arg("60").spawn().unwrap();
+    /// An online daemon an earlier release started: the Kubo stand-in runs
+    /// `daemon --api` on its own repo, its API answers `/id` with `peer`, and
+    /// the coord file has no `offline`. Set the returned flag when done.
+    fn online_daemon_coord(
+        root: &Path,
+        kubo: &Path,
+        peer: &'static str,
+    ) -> (Child, Arc<std::sync::atomic::AtomicBool>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let api_port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        let _ = read_bounded_fixture_headers(&mut socket);
+                        let body = format!("{{\"ID\":\"{peer}\"}}");
+                        let _ = socket.write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        let daemon = Command::new(kubo)
+            .args(["daemon", "--api", &format!("/ip4/127.0.0.1/tcp/{api_port}")])
+            .env("IPFS_PATH", root.join("old-daemon"))
+            .spawn()
+            .unwrap();
+        write_old_coord(root, daemon.id(), api_port);
+        (daemon, stop)
+    }
+
+    fn write_old_coord(root: &Path, pid: u32, api_port: u16) {
         fs::write(
             coord_file_path(root),
             serde_json::to_vec(&serde_json::json!({
-                "kubo_pid": daemon.id(), "api_port": api_port, "gateway_port": api_port,
+                "kubo_pid": pid, "api_port": api_port, "gateway_port": api_port,
                 "started_at": 1, "last_used": now_unix_secs(),
             }))
             .unwrap(),
         )
         .unwrap();
-        daemon
     }
 
     #[test]
@@ -3685,7 +3795,8 @@ mod tests {
                 br#"{"Identity":{"PeerID":"kept"}}"#,
             )
             .unwrap();
-            let mut online = online_daemon_coord(root.path(), 1);
+            let kubo = provider.kubo_binary.clone().unwrap();
+            let (mut online, api) = online_daemon_coord(root.path(), &kubo, "kept");
             let online_pid = online.id();
             match path {
                 "init" => {
@@ -3711,6 +3822,7 @@ mod tests {
             let health = answer_fixture_health(provider.repo_dir.clone());
             let result = provider.ensure_kubo();
             stop_fixture_daemon(&mut provider);
+            api.store(true, std::sync::atomic::Ordering::SeqCst);
             let online_exited = online.try_wait().unwrap().is_some();
             let _ = online.kill();
             online.wait().unwrap();
@@ -3748,7 +3860,8 @@ mod tests {
         provider.kubo_binary = Some(root.path().join("must-not-execute"));
         let held = open_startup_lock(root.path()).unwrap();
         assert!(try_flock_exclusive(&held));
-        let mut online = online_daemon_coord(root.path(), 1);
+        let mut online = Command::new("sleep").arg("60").spawn().unwrap();
+        write_old_coord(root.path(), online.id(), 1);
         let data_dir = root.path().to_path_buf();
         let starter = std::thread::spawn(move || {
             std::thread::sleep(LOCKFILE_POLL_INTERVAL * 3);
@@ -3771,6 +3884,65 @@ mod tests {
         online.wait().unwrap();
         result.unwrap();
         assert_eq!((provider.api_port, provider.gateway_port), (2, 3));
+    }
+
+    /// A coord whose PID now names some other process (the PID was reused, or
+    /// it is a different repo's Kubo) is dropped without signalling it.
+    #[test]
+    #[cfg(unix)]
+    fn unrelated_process_in_an_old_coord_is_never_signalled() {
+        for case in ["not kubo", "other repo"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut provider = cold_fixture_provider(root.path());
+            let kubo = kubo_fixture(root.path());
+            provider.kubo_binary = Some(kubo.clone());
+            fs::create_dir_all(&provider.repo_dir).unwrap();
+            fs::write(
+                provider.repo_dir.join("config"),
+                br#"{"Identity":{"PeerID":"mine"}}"#,
+            )
+            .unwrap();
+            let (mut other, api) = if case == "not kubo" {
+                let other = Command::new("sleep").arg("60").spawn().unwrap();
+                write_old_coord(root.path(), other.id(), 1);
+                (other, None)
+            } else {
+                let (other, api) = online_daemon_coord(root.path(), &kubo, "someone-else");
+                (other, Some(api))
+            };
+            let health = answer_fixture_health(provider.repo_dir.clone());
+            let result = provider.ensure_kubo();
+            stop_fixture_daemon(&mut provider);
+            let other_running = other.try_wait().unwrap().is_none();
+            let _ = other.kill();
+            other.wait().unwrap();
+            if let Some(api) = api {
+                api.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            result.unwrap_or_else(|e| panic!("{case}: {e}"));
+            health.join().unwrap();
+            assert!(other_running, "{case}: an unrelated process was signalled");
+            assert!(read_coord_file(root.path()).unwrap().offline, "{case}");
+        }
+    }
+
+    /// Init runs inside the bridge's 10 s Init limit, so stopping a daemon
+    /// that ignores SIGTERM must finish well inside it.
+    #[test]
+    #[cfg(unix)]
+    fn online_daemon_ignoring_sigterm_is_killed_within_init_budget() {
+        let mut stubborn = Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 0.1; done"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        let result = stop_online_kubo(stubborn.id());
+        let elapsed = started.elapsed();
+        let _ = stubborn.kill();
+        stubborn.wait().unwrap();
+        result.unwrap();
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
     }
 
     /// Kubo runs offline, so a CID this repo lacks fails on its one local

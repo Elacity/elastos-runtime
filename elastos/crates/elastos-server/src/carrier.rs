@@ -124,8 +124,14 @@ const MAX_CARRIER_REPLICATION_CANDIDATES: usize = 8;
 const MAX_CARRIER_AVAILABILITY_TICKET_LEN: usize = 8192;
 const MAX_CARRIER_AVAILABILITY_ENDPOINT_ID_LEN: usize = 256;
 const MAX_CARRIER_OBJECT_IMPORT_FILES: usize = 512;
-// The largest object one Carrier import request carries (see #498).
-const MAX_CARRIER_OBJECT_IMPORT_BYTES: usize = 64 * 1024 * 1024;
+// The most one Carrier import request carries: its base64 payload plus the
+// request fields must fit one provider request line. Larger content cannot
+// replicate until ranged pull replication (#498).
+const MAX_CARRIER_OBJECT_IMPORT_BYTES: usize = 704 * 1024;
+const _: () = assert!(
+    (MAX_CARRIER_OBJECT_IMPORT_BYTES as u64).div_ceil(3) * 4 + 96 * 1024
+        <= CARRIER_PROVIDER_REQUEST_MAX_BYTES
+);
 const MAX_REMOTE_RECEIPT_REPLICA_SUMMARY_ROWS: usize = 5;
 const GOSSIP_SEND_TIMEOUT: Duration = Duration::from_millis(1_500);
 const GOSSIP_JOIN_PEERS_TIMEOUT: Duration = Duration::from_millis(1_500);
@@ -163,10 +169,10 @@ const CARRIER_PEER_REQUEST_MAX_BYTES: u64 =
     CARRIER_PROVIDER_REQUEST_MAX_BYTES + CARRIER_PEER_ENVELOPE_BYTES;
 /// Largest small reply, such as a release head.
 const CARRIER_PEER_SMALL_REPLY_MAX_BYTES: u64 = 1024 * 1024;
-/// Largest open-ended provider answer: one whole importable object as base64,
+/// Largest open-ended provider answer: a 64 MiB whole payload as base64,
 /// which also covers a full gossip peek batch.
 const CARRIER_PROVIDER_REPLY_MAX_BYTES: u64 =
-    (MAX_CARRIER_OBJECT_IMPORT_BYTES as u64).div_ceil(3) * 4 + CARRIER_PEER_ENVELOPE_BYTES;
+    (64 * 1024 * 1024_u64).div_ceil(3) * 4 + CARRIER_PEER_ENVELOPE_BYTES;
 const _: () = assert!(CARRIER_PROVIDER_REPLY_MAX_BYTES >= GOSSIP_PEEK_MAX_BATCH_BYTES as u64);
 /// Largest whole-content answer: one file of the shared whole-content limit as
 /// base64 stream chunks, plus room for the chunk fields (under 100 bytes per
@@ -6001,6 +6007,8 @@ async fn local_content_fetch_bytes_for_import(
         "op": "fetch",
         "cid": cid,
         "local_only": true,
+        // Refused past the import cap before more is read.
+        "whole_max_bytes": MAX_CARRIER_OBJECT_IMPORT_BYTES,
         "transfer": "stream",
     });
     if let Some(path) = path.filter(|path| !path.is_empty()) {
@@ -6180,6 +6188,7 @@ async fn import_exact_content_via_carrier_provider_invocation(
                 "op": "fetch",
                 "cid": cid,
                 "local_only": true,
+                "whole_max_bytes": MAX_CARRIER_OBJECT_IMPORT_BYTES,
                 "transfer": "stream",
             }),
             transfer: ProviderTransfer::Stream,
@@ -11129,6 +11138,32 @@ pub(crate) mod tests {
         assert_eq!(
             replicas[1].selection_reason,
             "signed_announcement+stale+local_reputation_neutral"
+        );
+    }
+
+    /// One Carrier request line carries at most 1 MiB of provider request, so
+    /// a 1 MiB object (1.33 MiB as base64) cannot travel in one import and is
+    /// refused before any read; the largest accepted import still fits.
+    #[test]
+    fn test_carrier_import_cap_fits_one_request_line() {
+        let manifest = |size: u64| ContentObjectManifest {
+            schema: "elastos.content.object.manifest/v1".into(),
+            kind: "document".into(),
+            content_digest: "sha256:00".into(),
+            files: vec![crate::content::ContentObjectFile {
+                path: "file.bin".into(),
+                sha256: "00".into(),
+                size,
+            }],
+            links: Vec::new(),
+            object_did: None,
+            publisher_did: None,
+        };
+        assert!(carrier_legacy_object_import_declared_bytes(&manifest(1024 * 1024)).is_err());
+        let cap = MAX_CARRIER_OBJECT_IMPORT_BYTES as u64;
+        assert_eq!(
+            carrier_legacy_object_import_declared_bytes(&manifest(cap)).unwrap(),
+            cap
         );
     }
 
