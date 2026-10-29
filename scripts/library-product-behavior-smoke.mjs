@@ -219,7 +219,8 @@ async function assertPropertiesShowNoLinks() {
   assert(!published.html.includes("elastos://"), "Library Properties must not show elastos:// text.");
   assert(!published.general.includes("localhost://"), "Library Properties General must not show a localhost:// address.");
   assert(published.general.includes(">Documents / Probe Folder / Deep<"), "Library Properties Location must use the breadcrumb form.");
-  assert(published.general.includes("Unpublish from the item menu"), "A published file must name Unpublish.");
+  assert(published.general.includes("Shared with your contacts"), "A shared file must say it is shared with your contacts.");
+  assert(!/Unpublish|Publish/.test(published.general), "A shared file's Properties must not name Publish or Unpublish.");
   assert(!published.general.includes("a copy is on the network"), "Library Properties must make no availability claim.");
   assert(published.details.includes('data-prop-copy="bafy-smoke-local"'), "Details must offer the content ID copy.");
   assert(!published.general.includes("bafy-smoke-local"), "Library Properties General must not show the content ID.");

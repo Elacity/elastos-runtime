@@ -163,7 +163,8 @@ assert(
 assert(
   protocolSource.includes('"conversation.invite"') &&
     hostSource.includes('"chat-room:conversation.invite:write"') &&
-    chatRoomUiSource.includes('JsValue::from_str("elastosChatCopyInvite")') &&
+    /write_home_clipboard\(\s*"elastosChatCopyInvite",/.test(chatRoomUiSource) &&
+    /async fn write_home_clipboard\([\s\S]*?Reflect::get\(window\.as_ref\(\), &JsValue::from_str\(writer\)\)/.test(chatRoomUiSource) &&
     !chatRoomUiSource.includes('JsValue::from_str("clipboard")'),
   "Chat invite copies must use the canonical trusted Home Clipboard path",
 );
