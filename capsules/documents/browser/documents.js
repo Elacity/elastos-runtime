@@ -518,18 +518,25 @@ async function loadSavedLibraryVersion() {
 async function saveLibraryFileCopy(fileName) {
   const target = { sessionId: state.currentSessionId, identity: documentIdentity(state.current) };
   const name = String(fileName || "").trim() || suggestedDuplicateFileName(state.current) || "Copy.txt";
+  const requestedTitle = elements.titleInput.value;
+  const requestedBody = elements.editor.value;
   const response = await documentsProviderApi("import_chat_attachment", {
     attachment_id: "copy-" + window.crypto.randomUUID(),
     file_name: name,
     mime: /\.md$/i.test(name) ? "text/markdown" : "text/plain",
-    body: elements.editor.value,
+    body: requestedBody,
   });
-  if (!isCurrentDocumentTarget(target)) return;
   const copy = requireSavedWorkingCopy(response.document);
-  // The edits now live in the copy; the original file keeps what is stored.
-  replaceCurrentDocument(copy);
   upsertDocumentListItem(copy);
   renderDocumentsList();
+  if (!isCurrentDocumentTarget(target)) return;
+  // As ordinary Save As: edits typed while the copy saved stay here, unsaved.
+  if (elements.titleInput.value !== requestedTitle || elements.editor.value !== requestedBody) {
+    showError("Copy saved. Newer edits are kept in this document.");
+    return;
+  }
+  // The edits now live in the copy; the original file keeps what is stored.
+  replaceCurrentDocument(copy);
   renderCurrentDocument();
 }
 

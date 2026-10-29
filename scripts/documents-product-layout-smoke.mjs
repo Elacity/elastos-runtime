@@ -31,6 +31,7 @@ const publishedFixtureCid = "bafypublishedfixture";
 const publishedWebLink = "https://example.invalid/published-link";
 let delayNextSave = false;
 let heldLibraryRead = null;
+let heldImport = null;
 let delayedSaveStart = null;
 let delayedSaveRelease = null;
 let activeSaveCalls = 0;
@@ -219,6 +220,12 @@ function createAppServer() {
           importCalls.push({ ...payload });
           // As the server: one copy per attachment id, kept under its own name.
           const existing = [...documents.values()].find((document) => document.source_id === payload.attachment_id);
+          if (heldImport) {
+            const held = heldImport;
+            heldImport = null;
+            held.started.resolve();
+            await held.release.promise;
+          }
           if (existing) {
             json(res, { document: existing });
             return;
@@ -1354,8 +1361,74 @@ async function run() {
       await conflictPage.waitForFunction(() => document.getElementById("title-input")?.value === "Plain copy.txt");
       assert(plainFile.body === "Changed elsewhere: Edit to keep as a copy", "Save as never overwrites the changed file.");
       assert(!(await plainRow.locator(".document-list-unsaved").count()), "After Save as the file keeps what is stored.");
+
+      // Edits typed while the copy saves stay in the file, unsaved, as with
+      // ordinary Save as.
+      await conflict("Second edit");
+      heldImport = { started: createDeferred(), release: createDeferred() };
+      const held = heldImport;
+      await conflictPage.locator("#save-as-button").click();
+      await conflictPage.locator('#save-as-form button[type="submit"]').click();
+      await held.started.promise;
+      await conflictPage.locator("#editor").fill("Second edit, and more typed meanwhile");
+      held.release.resolve();
+      await waitForCondition(() => importCalls.length === 2, 5000, "The second Save as did not save a copy.");
+      await conflictPage.waitForFunction(() => document.getElementById("status-text")?.textContent ===
+        "Copy saved. Newer edits are kept in this document.");
+      const kept = await conflictPage.evaluate(() => ({
+        title: document.getElementById("title-input").value,
+        body: document.getElementById("editor").value,
+        saveEnabled: !document.getElementById("save-button").disabled,
+      }));
+      assert(importCalls[1].body === "Second edit" && kept.title === "Plain.txt" &&
+        kept.body === "Second edit, and more typed meanwhile" && kept.saveEnabled,
+        `Edits typed while the copy saved must stay unsaved in the file. Got ${JSON.stringify({ kept, importCalls })}`);
+      assert(await plainRow.locator(".document-list-unsaved").count() === 1, "The file keeps its unsaved mark.");
     } finally {
       await conflictPage.close();
+    }
+
+    // Inside Home, Documents says it is ready once, then sends its File and
+    // View menu, and it never touches browser storage or the clipboard itself.
+    resetDocumentsFixture();
+    const chromePage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    trackPage(chromePage, consoleErrors, pageErrors, failedRequests, errorResponses);
+    try {
+      await chromePage.addInitScript(() => {
+        window.__storageUses = [];
+        for (const name of ["localStorage", "sessionStorage", "indexedDB"]) {
+          const descriptor = Object.getOwnPropertyDescriptor(window, name);
+          if (!descriptor?.get) continue;
+          Object.defineProperty(window, name, { configurable: true, get() { window.__storageUses.push(name); return descriptor.get.call(window); } });
+        }
+        if (navigator.clipboard) {
+          for (const method of ["readText", "writeText", "read", "write"]) {
+            const original = navigator.clipboard[method]?.bind(navigator.clipboard);
+            if (original) navigator.clipboard[method] = (...args) => { window.__storageUses.push(`clipboard.${method}`); return original(...args); };
+          }
+        }
+      });
+      await chromePage.goto(`http://127.0.0.1:${port}/home-fixture`);
+      const frame = await (await chromePage.locator('iframe[title="Documents"]').elementHandle()).contentFrame();
+      await frame.locator(".document-list-item").first().waitFor();
+      await chromePage.waitForFunction(() => window.homeMessages.some((message) => message?.type === "home:menu-manifest"));
+      await frame.locator('.document-list-item[data-doc-did="doc-beta"]').click();
+      await frame.locator("#editor").fill("# Beta\n\nTyped inside Home.");
+      const chrome = await chromePage.evaluate(() => window.homeMessages
+        .filter((message) => ["home:app-ready", "home:menu-manifest"].includes(message?.type)));
+      const manifests = chrome.filter((message) => message.type === "home:menu-manifest");
+      assert(chrome[0]?.type === "home:app-ready" && chrome[0].homeToken === "documents-link-token" && manifests.length === 1 &&
+        manifests[0].homeToken === "documents-link-token",
+        `Documents must say it is ready before it sends its menu, and send the menu once. Got ${JSON.stringify(chrome)}`);
+      const menus = manifests[0].menus.map((menu) => [menu.title, menu.items.map((item) => item.cmd)]);
+      assert(JSON.stringify(menus) === JSON.stringify([
+        ["File", ["file-new-document", "file-save", "file-save-as", "file-delete-document", "__close-window"]],
+        ["View", ["view-write", "view-split", "view-read", "view-find"]],
+      ]), `Documents Home menu must be the File and View commands only. Got ${JSON.stringify(menus)}`);
+      const storageUses = await frame.evaluate(() => window.__storageUses);
+      assert(storageUses.length === 0, `Documents must not use browser storage or the clipboard itself. Got ${JSON.stringify(storageUses)}`);
+    } finally {
+      await chromePage.close();
     }
 
     // The name the Chat post states is the title and the default save name;
