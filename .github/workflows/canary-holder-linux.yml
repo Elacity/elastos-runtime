@@ -314,6 +314,9 @@ jobs:
                   cid = processes.text(label + '-add').strip()
                   assert re.fullmatch(r'b[a-z2-7]+', cid)
                   cids.append(cid)
+              # Serve as a seed (publisher node): an ordinary Home serves peers
+              # only its active Library shares. The consumer stays ordinary.
+              (data / 'ElastOS/SystemServices/Publisher/artifacts').mkdir(mode=0o700, parents=True, exist_ok=True)
               holder = processes.spawn([str(runtime), 'serve', '--addr', '127.0.0.1:' + str(holder_port),
                   '--storage-path', str(data / 'storage')], env(home), home, 'holder')
               ready(home, holder, holder_port, full_api=True)
@@ -379,6 +382,8 @@ jobs:
                   reply = processes.command([str(gateway_data / 'bin/kubo'), 'add', '--quiet', '--cid-version=1',
                       '--pin=true', str(content)], kubo_env, gateway_home, 'gateway-' + label + '-add')
                   assert reply['exit'] == 0 and processes.text('gateway-' + label + '-add').strip() == cid
+              # Seed too: an ordinary Home does not serve anonymous /content/:cid reads.
+              (gateway_data / 'ElastOS/SystemServices/Publisher/artifacts').mkdir(mode=0o700, parents=True, exist_ok=True)
               gateway = processes.spawn([str(gateway_runtime), 'gateway', '--addr', '127.0.0.1:' + str(gateway_port),
                   '--cache-dir', str(gateway_home / 'gateway-cache')], env(gateway_home), gateway_home, 'gateway')
               ready(gateway_home, gateway, gateway_port)
