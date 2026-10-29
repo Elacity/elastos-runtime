@@ -169,6 +169,11 @@ struct AppState {
     /// request ID, so Runtime treats it as the same message.
     held_direct_sends: BTreeMap<String, PendingDirectSend>,
     community_unread: bool,
+    /// A Community poll ran while Chat could not mark it read (hidden, or
+    /// another conversation open), so rows it holds may be unread. Runtime
+    /// counts only rows returned by a marking poll as read, so the next
+    /// visible Community poll asks again from the start.
+    community_read_catchup: bool,
     /// This person's Community presence state from Runtime: `requested`,
     /// `deferred`, `refused`, `hidden`, `always` or `while_open`. Runtime owns
     /// the decision (Inbox, System); Chat only reflects it and re-asks.
@@ -2477,12 +2482,12 @@ impl App {
         spawn_local(async move {
             let headers = app.room_request_headers();
             let poll_guard = begin_poll_request(&mut app.state.borrow_mut());
+            let mark_read = app.can_mark_read(None);
+            let (since, mark_read) =
+                community_poll_cursor(&mut app.state.borrow_mut(), 0, mark_read);
             let result = api_post_session_json(
                 &app.room_api_url("/poll"),
-                &RoomPollInput {
-                    since: 0,
-                    mark_read: app.can_mark_read(None),
-                },
+                &RoomPollInput { since, mark_read },
                 &headers,
                 Some(REQUEST_DEADLINE_MS),
             )
@@ -2494,6 +2499,7 @@ impl App {
             }
             match result {
                 Ok(poll) => {
+                    community_poll_answered(&mut app.state.borrow_mut(), since, mark_read);
                     if app.apply_active_poll(&poll_guard, poll).is_none() {
                         return;
                     }
@@ -4370,15 +4376,15 @@ impl App {
             let request_token = self.home_token();
             let headers = self.room_request_headers();
             let poll_guard = begin_poll_request(&mut self.state.borrow_mut());
+            let mark_read = self.can_mark_read(None);
+            let (since, mark_read) = {
+                let mut state = self.state.borrow_mut();
+                let latest_seq = state.latest_seq;
+                community_poll_cursor(&mut state, latest_seq, mark_read)
+            };
             let response = api_post_session_json(
                 &self.room_api_url("/poll"),
-                &RoomPollInput {
-                    since: {
-                        let state = self.state.borrow();
-                        state.latest_seq
-                    },
-                    mark_read: self.can_mark_read(None),
-                },
+                &RoomPollInput { since, mark_read },
                 &headers,
                 Some(REQUEST_DEADLINE_MS),
             )
@@ -4389,7 +4395,10 @@ impl App {
                 return Ok(false);
             }
             let poll: RoomPollView = match response {
-                Ok(poll) => poll,
+                Ok(poll) => {
+                    community_poll_answered(&mut self.state.borrow_mut(), since, mark_read);
+                    poll
+                }
                 Err(err) if is_session_error(&err) => {
                     self.handle_session_loss(self.session_loss_detail());
                     return Ok(true);
@@ -6553,6 +6562,28 @@ fn mark_read_decision(state: &AppState, visible: bool, conversation_id: Option<&
     visible && state.direct.selected_conversation_id.as_deref() == conversation_id
 }
 
+/// The cursor and read flag for one Community poll. A poll that cannot mark
+/// read leaves a catch-up owed; the next poll that can mark read asks from
+/// the start, so the rows Chat already holds are counted as read.
+fn community_poll_cursor(state: &mut AppState, since: u64, mark_read: bool) -> (u64, bool) {
+    if !mark_read {
+        state.community_read_catchup = true;
+        (since, false)
+    } else if state.community_read_catchup {
+        (0, true)
+    } else {
+        (since, true)
+    }
+}
+
+/// Runtime answered a Community poll: a marking poll from the start pays the
+/// catch-up.
+fn community_poll_answered(state: &mut AppState, since: u64, mark_read: bool) {
+    if mark_read && since == 0 {
+        state.community_read_catchup = false;
+    }
+}
+
 /// The conversation list is fetched before the messages request that marks
 /// the open conversation read, so it still carries that conversation's unread
 /// flag; once the messages request has marked it read, the flag is cleared
@@ -6749,6 +6780,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         composer_edits: 0,
         held_direct_sends: BTreeMap::new(),
         community_unread: false,
+        community_read_catchup: false,
         community_presence: None,
         direct_in_flight: BTreeMap::new(),
         direct_retry_terminal: BTreeMap::new(),
@@ -7074,6 +7106,49 @@ mod tests {
             "http://evil.example",
             "http://localhost:61200"
         ));
+    }
+
+    #[test]
+    fn rows_polled_while_hidden_are_marked_read_by_the_next_visible_poll() {
+        let mut state = super::AppState::default();
+        // Visible from the start: ordinary incremental marking polls.
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, true),
+            (24, true)
+        );
+        // A poll while hidden cannot mark read and leaves a catch-up owed.
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, false),
+            (24, false)
+        );
+        // Still hidden: nothing marked, nothing re-asked.
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, false),
+            (24, false)
+        );
+        // Visible again: one marking poll from the start, then incremental.
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, true),
+            (0, true)
+        );
+        super::community_poll_answered(&mut state, 0, true);
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, true),
+            (24, true)
+        );
+        // A failed catch-up poll (no answer) is asked again.
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, false),
+            (24, false)
+        );
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, true),
+            (0, true)
+        );
+        assert_eq!(
+            super::community_poll_cursor(&mut state, 24, true),
+            (0, true)
+        );
     }
 
     #[test]
