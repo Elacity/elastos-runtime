@@ -614,16 +614,17 @@ active records alone at start. A pin is only local storage (published files,
 files received in Chat, models and withdrawn publications all use it), so
 pinned alone is never served. A Library publication is served only to a peer
 whose authenticated Carrier device belongs to an accepted contact of the
-person who published it;
-a protected listing's sealed payload is served to any peer, since opening it
-needs a purchase's key release. Unpublish withdraws the record, and new
-transfers stop at once; the pin stays until a later cleanup removes pins
-nothing needs. Library Publish and its Repair
-pin on this Home only (`local_pin`), with no availability wait; Publish pins
-first and records second, so an interrupted publish leaves a pinned CID that is
-not served. The answer goes out in one message after a second check, so a read
-under way when the publication is withdrawn is refused; bytes already sent
-can't be recalled. A seed serves as before. A whole read past the
+person who published it; a protected listing's sealed payload is served to
+any peer, since opening it needs a purchase's key release. Unpublish withdraws
+the record, and new transfers of that file stop at once, unless another file
+still shared on this Home (by the same or another person) has the same
+contents; the pin stays until a later cleanup removes pins nothing needs.
+Library Publish and its Repair pin on this Home only (`local_pin`), with no
+availability wait; Publish pins first and records second, so an interrupted
+publish leaves a pinned CID that is not served. The answer goes out in one
+message after a second check, so a read under way when the publication is
+withdrawn is refused on the same terms; bytes already sent can't be
+recalled. A seed serves as before. A whole read past the
 requested `whole_max_bytes` answers the fixed token `content_too_large`, and
 the requester bounds the answer line to that size. Over HTTP, an ordinary
 Home's `/content/<cid>`, `/ipfs/<cid>` and `/s/<cid>` routes answer only its

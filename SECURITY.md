@@ -81,11 +81,13 @@ authenticated device belongs to an accepted contact of the person who
 published it, as receiving Homes take files only from contacts. A protected
 listing's sealed payload is served to any peer; opening it needs the key
 release a purchase grants. A pin is only local storage: files received in
-Chat, models and withdrawn publications stay pinned and are never served to
-peers. Unpublish withdraws the record, which stops new transfers at once; the
-pin stays until a later cleanup. A Home answers a peer's read in one message
-and checks again just before sending it, so a read under way when the
-publication is withdrawn is refused. Bytes already sent can't be recalled.
+Chat, models and withdrawn publications stay pinned, and pinned alone is never
+served to peers. Unpublish withdraws the record, which stops new transfers of
+that file at once, unless another file still shared on this Home (yours or
+another person's) has the same contents. The pin stays until a later cleanup.
+A Home answers a peer's read in one message and checks again just before
+sending it, so a read under way when the publication is withdrawn is refused
+on the same terms. Bytes already sent can't be recalled.
 Over HTTP, an ordinary Home's raw CID routes (`/content/<cid>`, `/ipfs/<cid>`,
 `/s/<cid>`) answer only its own Home and app sessions; a seed keeps its public
 CID gateway.
