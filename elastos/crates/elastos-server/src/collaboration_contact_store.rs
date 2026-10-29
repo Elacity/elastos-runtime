@@ -45,6 +45,7 @@ use crate::collaboration_profile_authority::{
 };
 use crate::collaboration_protocol::validate_id;
 use crate::crypto::decode_did_key;
+use crate::host_lock::FileLock;
 
 const CONTACT_STORE_SCHEMA: &str = "elastos.people.contact-store/v1";
 /// Removed relationships stay visible and keep their retained head, so they
@@ -73,7 +74,8 @@ const MAX_ACCEPTED_PROFILE_HEAD_BYTES: usize = 128 * 1024;
 // Chains of requests addressed by Profile DID live in a sibling file that
 // alpha.25 never reads, so an Update Undo to alpha.25 keeps the v1 file — and
 // with it People and Direct messages — loadable. The v1 file keeps exactly
-// the v1 rules; the sibling has its own.
+// the v1 rules; the sibling has its own. A person's retained head and removal
+// are recorded in exactly one of the two files (`settle_sibling_records`).
 const PROFILE_CONTACT_STORE_SCHEMA: &str = "elastos.people.profile-contact-store/v1";
 const PEOPLE_PROFILE_CONTACT_STATE_OBJECT_PATH: &str =
     ".AppData/ElastOS/People/profile-contact-state.json";
@@ -454,6 +456,19 @@ struct LoadedRemovedContact {
     revocation: VerifiedCollaborationContactRevocation,
     removed_by_local: bool,
     revocation_settled: bool,
+}
+
+/// The files a load changed to record each person once, not yet written.
+#[derive(Clone, Copy, Default)]
+struct SettledFiles {
+    v1: bool,
+    sibling: bool,
+}
+
+impl SettledFiles {
+    fn any(self) -> bool {
+        self.v1 || self.sibling
+    }
 }
 
 /// One accepted request and its receipt, from either file. The recipient
@@ -1486,6 +1501,11 @@ impl CollaborationContactStore {
                 retain_removed_records_without(loaded, &profile, &counterpart);
                 reopened = true;
             }
+            // The pair's first v1 chain moves its retained head from the
+            // sibling file into the v1 file in this same write.
+            if inserted && accepted {
+                settle_sibling_records(loaded, &self.profile, &self.local_profile_did)?;
+            }
             Ok((
                 if inserted {
                     ContactStoreWrite::Recorded
@@ -1595,20 +1615,10 @@ impl CollaborationContactStore {
                 anyhow::bail!("accepted profile chain breaks the chain hash");
             }
 
-            // The head lives in the v1 file when the pair has a v1 chain, so
-            // alpha.25 can still verify it; otherwise in the sibling file.
-            let in_v1 = pair_has_v1_chain(loaded, &profile_did, &self.local_profile_did)?;
-            for heads in [
-                &mut loaded.state.accepted_profile_heads,
-                &mut loaded.profile_state.accepted_profile_heads,
-            ] {
-                heads.retain(|stored| !stored.signed_profile.contains(&profile_did));
-            }
-            let heads = if in_v1 {
-                &mut loaded.state.accepted_profile_heads
-            } else {
-                &mut loaded.profile_state.accepted_profile_heads
-            };
+            // The one copy of the head goes where the pair's records belong
+            // (see `pair_has_v1_chain`).
+            retain_heads_without(loaded, &profile_did)?;
+            let heads = head_records_for_pair(loaded, &profile_did, &self.local_profile_did)?;
             heads.push(StoredAcceptedProfileHead {
                 signed_profile: head.1.clone(),
                 delivered_by_device_did: delivered_by_endpoint_did.to_string(),
@@ -1896,13 +1906,9 @@ impl CollaborationContactStore {
         now: u64,
         mutate: impl FnOnce(&mut LoadedState) -> anyhow::Result<(T, bool)>,
     ) -> anyhow::Result<T> {
-        let _guard = contact_state_mutation_lock()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("discovery mutation lock is poisoned"))?;
-        self.ensure_writable_state_parent()?;
-        let _file_guard = lock_owner_only_file(&self.lock_path()?)?;
+        let _locks = self.lock_store()?;
         let v1_file_exists = self.state_path()?.exists();
-        let existing = self.load_state()?;
+        let existing = self.load_state_locked()?;
         let mut loaded = match existing {
             Some(loaded) => loaded,
             None => {
@@ -1919,7 +1925,7 @@ impl CollaborationContactStore {
             false
         };
         if pruned_before || changed || pruned_after {
-            loaded = self.verify_state(loaded.state.clone(), loaded.profile_state.clone())?;
+            (loaded, _) = self.verify_state(loaded.state.clone(), loaded.profile_state.clone())?;
             // Each file is written only when its own content changed, so a
             // store that never used a request by DID keeps its v1 bytes.
             if loaded.state != original_v1 || !v1_file_exists {
@@ -1989,7 +1995,52 @@ impl CollaborationContactStore {
         Ok(Some(bytes))
     }
 
+    /// The process lock, a writable state parent, then the file lock: the
+    /// order every write takes. A read takes them only to write a settled
+    /// pair back.
+    fn lock_store(&self) -> anyhow::Result<(std::sync::MutexGuard<'static, ()>, FileLock)> {
+        let guard = contact_state_mutation_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("discovery mutation lock is poisoned"))?;
+        self.ensure_writable_state_parent()?;
+        let file_guard = lock_owner_only_file(&self.lock_path()?)?;
+        Ok((guard, file_guard))
+    }
+
+    /// Both files, verified. When a person was recorded in both (by an
+    /// earlier build, or by alpha.25 after an Undo), the settled files are
+    /// written back under the store locks before anyone acts on them, so no
+    /// later writer meets the pair. A caller already holding the locks loads
+    /// through `load_state_locked`.
     fn load_state(&self) -> anyhow::Result<Option<LoadedState>> {
+        match self.read_state()? {
+            None => Ok(None),
+            Some((loaded, settled)) if !settled.any() => Ok(Some(loaded)),
+            Some(_) => {
+                let _locks = self.lock_store()?;
+                self.load_state_locked()
+            }
+        }
+    }
+
+    /// Under both store locks: both files, verified, with the ones the read
+    /// settled written back.
+    fn load_state_locked(&self) -> anyhow::Result<Option<LoadedState>> {
+        let Some((loaded, settled)) = self.read_state()? else {
+            return Ok(None);
+        };
+        if settled.v1 {
+            self.write_state(&loaded.state)?;
+        }
+        if settled.sibling {
+            self.write_profile_state(&loaded.profile_state)?;
+        }
+        Ok(Some(loaded))
+    }
+
+    /// Reads and verifies both files, naming the ones whose records moved to
+    /// keep one record per person and are not yet written.
+    fn read_state(&self) -> anyhow::Result<Option<(LoadedState, SettledFiles)>> {
         let v1_bytes = self.read_state_object(&self.state_object_uri())?;
         let profile_bytes = self.read_state_object(&self.profile_state_object_uri())?;
         if v1_bytes.is_none() && profile_bytes.is_none() {
@@ -2061,11 +2112,11 @@ impl CollaborationContactStore {
         &self,
         state: ContactStoreState,
         profile_state: ProfileContactStoreState,
-    ) -> anyhow::Result<LoadedState> {
+    ) -> anyhow::Result<(LoadedState, SettledFiles)> {
         let mut loaded = self.verify_v1_state(state)?;
-        self.load_profile_partition(&mut loaded, profile_state)?;
+        let settled = self.load_profile_partition(&mut loaded, profile_state)?;
         self.verify_profile_partition(&loaded)?;
-        Ok(loaded)
+        Ok((loaded, settled))
     }
 
     fn loaded_state_from_states(
@@ -2078,13 +2129,14 @@ impl CollaborationContactStore {
         Ok(loaded)
     }
 
-    /// Decodes and signature-verifies the sibling file into `loaded`. Heads
-    /// and removals join the v1 ones; a Profile DID in both files is refused.
+    /// Decodes and signature-verifies the sibling file into `loaded`, settles
+    /// every person into one file (`settle_sibling_records`), then joins the
+    /// sibling's heads and removals with the v1 ones.
     fn load_profile_partition(
         &self,
         loaded: &mut LoadedState,
         profile_state: ProfileContactStoreState,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SettledFiles> {
         if profile_state.schema != PROFILE_CONTACT_STORE_SCHEMA
             || profile_state.binding != self.state_binding()
         {
@@ -2145,8 +2197,19 @@ impl CollaborationContactStore {
                 anyhow::bail!("Profile contact store has conflicting contact decisions");
             }
         }
+        loaded.profile_requests = requests;
+        loaded.profile_decisions = decisions;
+        loaded.profile_state = profile_state;
+        let settled = settle_sibling_records(loaded, &self.profile, &self.local_profile_did)?;
+        if settled.v1 {
+            loaded.accepted_profile_heads =
+                parse_accepted_profile_heads(&loaded.state.accepted_profile_heads)?;
+            loaded.removed_contacts =
+                self.parse_removed_contacts(&loaded.state.removed_contacts)?;
+        }
+        // Settled, the sibling file names no person the v1 file names.
         for (profile_did, head) in
-            parse_accepted_profile_heads(&profile_state.accepted_profile_heads)?
+            parse_accepted_profile_heads(&loaded.profile_state.accepted_profile_heads)?
         {
             if loaded
                 .accepted_profile_heads
@@ -2156,7 +2219,9 @@ impl CollaborationContactStore {
                 anyhow::bail!("duplicate accepted profile head for one profile DID");
             }
         }
-        for (remote_did, removed) in self.parse_removed_contacts(&profile_state.removed_contacts)? {
+        for (remote_did, removed) in
+            self.parse_removed_contacts(&loaded.profile_state.removed_contacts)?
+        {
             if loaded
                 .removed_contacts
                 .insert(remote_did, removed)
@@ -2165,10 +2230,7 @@ impl CollaborationContactStore {
                 anyhow::bail!("duplicate removed relationship for one profile DID");
             }
         }
-        loaded.profile_requests = requests;
-        loaded.profile_decisions = decisions;
-        loaded.profile_state = profile_state;
-        Ok(())
+        Ok(settled)
     }
 
     /// The sibling file's rules. The per-person caps count undecided
@@ -3829,16 +3891,21 @@ fn verify_canonical_signed_profile(
     crate::collaboration_profile_authority::verify_signed_profile_document(&signed)
 }
 
+fn stored_head_document(
+    stored: &StoredAcceptedProfileHead,
+) -> anyhow::Result<VerifiedCollaborationProfileDocument> {
+    let signed: crate::collaboration_profile_authority::SignedCollaborationProfileDocument =
+        serde_json::from_str(&stored.signed_profile)
+            .context("invalid stored accepted profile head")?;
+    crate::collaboration_profile_authority::verify_signed_profile_document(&signed)
+}
+
 fn parse_accepted_profile_heads(
     stored_heads: &[StoredAcceptedProfileHead],
 ) -> anyhow::Result<HashMap<String, (VerifiedCollaborationProfileDocument, String)>> {
     let mut accepted_profile_heads = HashMap::new();
     for head in stored_heads {
-        let signed: crate::collaboration_profile_authority::SignedCollaborationProfileDocument =
-            serde_json::from_str(&head.signed_profile)
-                .context("invalid stored accepted profile head")?;
-        let verified =
-            crate::collaboration_profile_authority::verify_signed_profile_document(&signed)?;
+        let verified = stored_head_document(head)?;
         validate_canonical_did(
             &head.delivered_by_device_did,
             "accepted profile head device",
@@ -3972,18 +4039,31 @@ fn pair_has_v1_chain(
     remote_profile_did: &str,
     local_profile_did: &str,
 ) -> anyhow::Result<bool> {
+    Ok(v1_acceptances(loaded, local_profile_did)?.contains_key(remote_profile_did))
+}
+
+/// Each remote Profile with an accepted chain in the v1 file, with its
+/// newest acceptance time there.
+fn v1_acceptances(
+    loaded: &LoadedState,
+    local_profile_did: &str,
+) -> anyhow::Result<HashMap<String, u64>> {
+    let mut acceptances = HashMap::new();
     for chain in accepted_chains(loaded)? {
-        if chain.v1
-            && chain
-                .remote_profile(local_profile_did)?
-                .document()
-                .profile_did
-                == remote_profile_did
-        {
-            return Ok(true);
+        if !chain.v1 {
+            continue;
+        }
+        let remote = chain
+            .remote_profile(local_profile_did)?
+            .document()
+            .profile_did
+            .clone();
+        let newest = acceptances.entry(remote).or_insert(chain.decided_at);
+        if chain.decided_at > *newest {
+            *newest = chain.decided_at;
         }
     }
-    Ok(false)
+    Ok(acceptances)
 }
 
 /// The file's removal records the pair belongs in (see `pair_has_v1_chain`).
@@ -3999,6 +4079,196 @@ fn removed_records_for_pair<'a>(
             &mut loaded.profile_state.removed_contacts
         },
     )
+}
+
+/// The file's head records the pair belongs in (see `pair_has_v1_chain`).
+fn head_records_for_pair<'a>(
+    loaded: &'a mut LoadedState,
+    remote_profile_did: &str,
+    local_profile_did: &str,
+) -> anyhow::Result<&'a mut Vec<StoredAcceptedProfileHead>> {
+    Ok(
+        if pair_has_v1_chain(loaded, remote_profile_did, local_profile_did)? {
+            &mut loaded.state.accepted_profile_heads
+        } else {
+            &mut loaded.profile_state.accepted_profile_heads
+        },
+    )
+}
+
+/// Where `heads` records `profile_did`, with that record's revision. A file
+/// records a Profile at most once (`parse_accepted_profile_heads`).
+fn stored_head_position(
+    heads: &[StoredAcceptedProfileHead],
+    profile_did: &str,
+) -> anyhow::Result<Option<(usize, u64)>> {
+    for (position, stored) in heads.iter().enumerate() {
+        let document = stored_head_document(stored)?;
+        if document.document().profile_did == profile_did {
+            return Ok(Some((position, document.document().revision)));
+        }
+    }
+    Ok(None)
+}
+
+/// Drops a Profile's head record from both files (a new head replaces it).
+fn retain_heads_without(loaded: &mut LoadedState, profile_did: &str) -> anyhow::Result<()> {
+    for heads in [
+        &mut loaded.state.accepted_profile_heads,
+        &mut loaded.profile_state.accepted_profile_heads,
+    ] {
+        if let Some((position, _)) = stored_head_position(heads, profile_did)? {
+            heads.remove(position);
+        }
+    }
+    Ok(())
+}
+
+/// The other side of a removal's signed pair.
+fn removal_remote_did<'a>(
+    revocation: &'a VerifiedCollaborationContactRevocation,
+    local_profile_did: &str,
+) -> &'a str {
+    if revocation.revoking_profile_did() == local_profile_did {
+        revocation.revoked_profile_did()
+    } else {
+        revocation.revoking_profile_did()
+    }
+}
+
+/// What makes one removal record newer than another for the same pair: the
+/// later removal; then the later envelope, since a refresh re-mints the same
+/// removal; then the acknowledged one.
+type RemovalOrder = (u64, u64, bool);
+
+fn removal_order(
+    stored: &StoredRemovedContact,
+    revocation: &VerifiedCollaborationContactRevocation,
+) -> RemovalOrder {
+    (
+        revocation.removed_at(),
+        revocation.message().envelope().payload.created_at,
+        stored.revocation_settled,
+    )
+}
+
+/// Where `records` holds the removal of `remote_profile_did`, with its
+/// order. A file records a pair's removal at most once
+/// (`parse_removed_contacts`).
+fn stored_removal_position(
+    records: &[StoredRemovedContact],
+    network_profile: &VerifiedCollaborationNetworkProfile,
+    local_profile_did: &str,
+    remote_profile_did: &str,
+) -> anyhow::Result<Option<(usize, RemovalOrder)>> {
+    for (position, stored) in records.iter().enumerate() {
+        let revocation = verify_stored_collaboration_contact_revocation(
+            stored.revocation_envelope.as_bytes(),
+            network_profile,
+        )?;
+        if removal_remote_did(&revocation, local_profile_did) == remote_profile_did {
+            return Ok(Some((position, removal_order(stored, &revocation))));
+        }
+    }
+    Ok(None)
+}
+
+/// The placement rule for retained heads and removals, enforced on every
+/// load and after every write: a person with an accepted chain in the v1
+/// file is recorded there, where alpha.25 reads after an Undo; everyone else
+/// in the sibling file. So the files never record one person twice. A
+/// sibling record of a person who has a v1 chain (left by an earlier build,
+/// or by alpha.25 accepting them after an Undo) moves into the v1 file; a
+/// copy already there yields only to newer content: a higher Profile
+/// revision, or a later removal (`removal_order`). A sibling removal older
+/// than the pair's newest v1 acceptance was reopened by that acceptance and
+/// goes. A move waits while the v1 file is at its record limit; a merge
+/// never grows it. Returns the files that changed.
+fn settle_sibling_records(
+    loaded: &mut LoadedState,
+    network_profile: &VerifiedCollaborationNetworkProfile,
+    local_profile_did: &str,
+) -> anyhow::Result<SettledFiles> {
+    let mut settled = SettledFiles::default();
+    if loaded.profile_state.accepted_profile_heads.is_empty()
+        && loaded.profile_state.removed_contacts.is_empty()
+    {
+        return Ok(settled);
+    }
+    let acceptances = v1_acceptances(loaded, local_profile_did)?;
+    if acceptances.is_empty() {
+        return Ok(settled);
+    }
+
+    let mut index = 0;
+    while index < loaded.profile_state.accepted_profile_heads.len() {
+        let document = stored_head_document(&loaded.profile_state.accepted_profile_heads[index])?;
+        let profile_did = &document.document().profile_did;
+        if !acceptances.contains_key(profile_did) {
+            index += 1;
+            continue;
+        }
+        let heads = &mut loaded.state.accepted_profile_heads;
+        match stored_head_position(heads, profile_did)? {
+            Some((position, revision)) => {
+                let stored = loaded.profile_state.accepted_profile_heads.remove(index);
+                if document.document().revision > revision {
+                    heads[position] = stored;
+                    settled.v1 = true;
+                }
+                settled.sibling = true;
+            }
+            None if heads.len() < MAX_ACCEPTED_PROFILE_HEADS => {
+                heads.push(loaded.profile_state.accepted_profile_heads.remove(index));
+                settled.v1 = true;
+                settled.sibling = true;
+            }
+            None => index += 1,
+        }
+    }
+
+    let mut index = 0;
+    while index < loaded.profile_state.removed_contacts.len() {
+        let stored = &loaded.profile_state.removed_contacts[index];
+        let revocation = verify_stored_collaboration_contact_revocation(
+            stored.revocation_envelope.as_bytes(),
+            network_profile,
+        )?;
+        let remote_profile_did = removal_remote_did(&revocation, local_profile_did).to_string();
+        let Some(accepted_at) = acceptances.get(&remote_profile_did) else {
+            index += 1;
+            continue;
+        };
+        if *accepted_at > revocation.removed_at() {
+            loaded.profile_state.removed_contacts.remove(index);
+            settled.sibling = true;
+            continue;
+        }
+        let order = removal_order(stored, &revocation);
+        let records = &mut loaded.state.removed_contacts;
+        match stored_removal_position(
+            records,
+            network_profile,
+            local_profile_did,
+            &remote_profile_did,
+        )? {
+            Some((position, existing_order)) => {
+                let stored = loaded.profile_state.removed_contacts.remove(index);
+                if order > existing_order {
+                    records[position] = stored;
+                    settled.v1 = true;
+                }
+                settled.sibling = true;
+            }
+            None if records.len() < MAX_REMOVED_CONTACTS => {
+                records.push(loaded.profile_state.removed_contacts.remove(index));
+                settled.v1 = true;
+                settled.sibling = true;
+            }
+            None => index += 1,
+        }
+    }
+    Ok(settled)
 }
 
 /// The stored record of a local removal of `remote_profile_did`, in
@@ -6444,17 +6714,22 @@ mod tests {
         )
     }
 
-    /// A Discovery request from `remote` to this Home, recorded and left
-    /// pending. Publishes this Home's advertisement first.
-    fn pending_discovery_request(fixture: &Fixture, remote: &RemoteIdentity, at: u64) -> Vec<u8> {
+    /// A Discovery request to this Home from the device signing `profile`,
+    /// recorded and left pending. Publishes this Home's advertisement first.
+    fn pending_discovery_request(
+        fixture: &Fixture,
+        device_key: &SigningKey,
+        profile: &VerifiedCollaborationProfileDocument,
+        at: u64,
+    ) -> Vec<u8> {
         let local_ad = advertisement_with_profile(&fixture.local_key, &fixture.local_profile, at);
         fixture
             .store
             .store_local_advertisement(&local_ad, at)
             .unwrap();
         let request = outgoing_request_with_profile(
-            &remote.device_key,
-            &remote.profile,
+            device_key,
+            profile,
             &fixture.local_profile.document().profile_did,
             &collaboration_message_envelope_sha256(&local_ad),
             at + 1,
@@ -6515,7 +6790,8 @@ mod tests {
             CollaborationContactDecision::Accepted,
             NOW + 10,
         );
-        let pending = pending_discovery_request(&fixture, &remote, NOW + 20);
+        let pending =
+            pending_discovery_request(&fixture, &remote.device_key, &remote.profile, NOW + 20);
 
         let (rotated_device, _) = generate_keypair();
         let head2 = signed_profile_for_device(
@@ -6551,5 +6827,379 @@ mod tests {
             );
         }
         assert_eq!(file_records(&fixture, "accepted_profile_heads"), (1, 0));
+    }
+
+    /// alpha.25 never reads or writes the sibling file. Running v1 writes
+    /// with it out of the way leaves exactly what alpha.25 leaves after an
+    /// Undo; `restore_sibling_file` is the update back to 0.8.0.
+    fn hide_sibling_file(fixture: &Fixture) -> Vec<u8> {
+        let path = sibling_file_path(fixture);
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        bytes
+    }
+
+    fn restore_sibling_file(fixture: &Fixture, bytes: &[u8]) {
+        let path = sibling_file_path(fixture);
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// Rewrites the sibling file's records through `edit`, as an earlier
+    /// build may have left them.
+    fn edit_sibling_state(fixture: &Fixture, edit: impl FnOnce(&mut ProfileContactStoreState)) {
+        let uri = fixture.store.profile_state_object_uri();
+        let mut state: ProfileContactStoreState = protected_plaintext(fixture, &uri)
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+            .unwrap_or_else(|| fixture.store.empty_profile_state());
+        edit(&mut state);
+        crate::auth::write_protected_principal_root_object(
+            &fixture.data_root,
+            &fixture.principal_id,
+            &fixture.localhost_root,
+            &uri,
+            &sibling_file_path(fixture),
+            &canonical_profile_state_bytes(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn local_removal(fixture: &Fixture, remote_did: &str, removed_at: u64) -> Vec<u8> {
+        revocation_bytes(
+            &fixture.local_key,
+            &fixture.local_profile.document().profile_did,
+            remote_did,
+            removed_at,
+        )
+    }
+
+    /// The Undo journey. On 0.8.0 a person is added by DID, renamed and
+    /// removed, all in the sibling file. After an Undo, alpha.25 accepts
+    /// their new Discovery request and applies their next revision, both in
+    /// the v1 file. Back on 0.8.0 both files record the person: the v1
+    /// acceptance is newer than the removal, so they are a contact again,
+    /// named by the newest head, and the first read leaves each fact once,
+    /// in the v1 file. When alpha.25 removes them after another Undo, that
+    /// newer removal stands over the old sibling copy, is resent, refreshed
+    /// and acknowledged on the one record that survives.
+    #[test]
+    fn undo_journey_alpha25_readd_after_a_removal_by_did() {
+        let fixture = Fixture::new();
+        let (profile_key, _) = generate_keypair();
+        let remote = RemoteIdentity::new_with_profile_key(&profile_key, "Remote");
+        let remote_did = remote.did().to_string();
+        let device = device_did(&remote.device_key);
+
+        add_outgoing_profile_contact(&fixture, &remote, NOW - 100);
+        let head2 = signed_profile_for_device(
+            &profile_key,
+            &remote.device_key,
+            "Remote Two",
+            None,
+            2,
+            Some(&profile_hash(&remote.profile)),
+            NOW - 90,
+        );
+        fixture
+            .store
+            .apply_accepted_profile_chain(&[signed_bytes(&head2)], &device, NOW - 90)
+            .unwrap();
+        fixture
+            .store
+            .record_local_contact_revocation(
+                &local_removal(&fixture, &remote_did, NOW - 80),
+                &fixture.local_profile,
+                NOW - 80,
+            )
+            .unwrap();
+        assert_eq!(file_records(&fixture, "accepted_profile_heads"), (0, 1));
+        assert_eq!(file_records(&fixture, "removed_contacts"), (0, 1));
+
+        // Undo. alpha.25 accepts the request they send with revision 2 and
+        // applies revision 3.
+        let undo_sibling = hide_sibling_file(&fixture);
+        let request = pending_discovery_request(&fixture, &remote.device_key, &head2, NOW);
+        accept_discovery_request(&fixture, &request, NOW + 2);
+        let head3 = signed_profile_for_device(
+            &profile_key,
+            &remote.device_key,
+            "Remote Three",
+            None,
+            3,
+            Some(&profile_hash(&head2)),
+            NOW + 10,
+        );
+        fixture
+            .store
+            .apply_accepted_profile_chain(&[signed_bytes(&head3)], &device, NOW + 10)
+            .unwrap();
+        assert!(!sibling_file_path(&fixture).exists());
+
+        // Back on 0.8.0: both files record the person.
+        restore_sibling_file(&fixture, &undo_sibling);
+        assert_eq!(file_records(&fixture, "accepted_profile_heads"), (1, 1));
+        assert_eq!(file_records(&fixture, "removed_contacts"), (0, 1));
+        let snapshot = fixture.store.snapshot().unwrap();
+        assert_eq!(file_records(&fixture, "accepted_profile_heads"), (1, 0));
+        assert_eq!(file_records(&fixture, "removed_contacts"), (0, 0));
+        assert!(snapshot.removed().is_empty());
+        assert_eq!(snapshot.contacts().len(), 1);
+        assert_eq!(snapshot.contacts()[0].remote_profile_did(), remote_did);
+        assert_eq!(snapshot.contacts()[0].remote_display_name(), "Remote Three");
+        assert!(fixture
+            .store
+            .resendable_contact_revocations(8)
+            .unwrap()
+            .is_empty());
+        assert_eq!(reopened(&fixture).snapshot().unwrap(), snapshot);
+
+        // Another Undo; alpha.25 removes them; back on 0.8.0 the old sibling
+        // copies meet the newer v1 facts.
+        hide_sibling_file(&fixture);
+        fixture
+            .store
+            .record_local_contact_revocation(
+                &local_removal(&fixture, &remote_did, NOW + 40),
+                &fixture.local_profile,
+                NOW + 40,
+            )
+            .unwrap();
+        restore_sibling_file(&fixture, &undo_sibling);
+        assert_eq!(file_records(&fixture, "removed_contacts"), (1, 1));
+        let pending = fixture.store.resendable_contact_revocations(8).unwrap();
+        assert_eq!(file_records(&fixture, "accepted_profile_heads"), (1, 0));
+        assert_eq!(file_records(&fixture, "removed_contacts"), (1, 0));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].removed_at, NOW + 40);
+        fixture
+            .store
+            .refresh_local_contact_revocation(
+                &remote_did,
+                &local_removal(&fixture, &remote_did, NOW + 40),
+                NOW + 50,
+            )
+            .unwrap();
+        fixture
+            .store
+            .settle_local_contact_revocation(&remote_did, NOW + 60)
+            .unwrap();
+        assert!(fixture
+            .store
+            .resendable_contact_revocations(8)
+            .unwrap()
+            .is_empty());
+        let snapshot = reopened(&fixture).snapshot().unwrap();
+        assert!(snapshot.contacts().is_empty());
+        assert_eq!(snapshot.removed().len(), 1);
+        assert_eq!(snapshot.removed()[0].removed_at(), NOW + 40);
+        assert_eq!(snapshot.removed()[0].display_name(), "Remote Three");
+        assert_eq!(file_records(&fixture, "removed_contacts"), (1, 0));
+    }
+
+    /// A v1 contact removed and acknowledged, then a newer, unacknowledged
+    /// removal of the same pair in the sibling file, as an earlier build may
+    /// have written it. Returns the remote Profile DID.
+    fn v1_removal_then_newer_sibling_removal(fixture: &Fixture) -> String {
+        let (profile_key, _) = generate_keypair();
+        let (device_key, _) = generate_keypair();
+        let remote_did = accepted_contact_with_profile(fixture, &profile_key, &device_key)
+            .document()
+            .profile_did
+            .clone();
+        fixture
+            .store
+            .record_local_contact_revocation(
+                &local_removal(fixture, &remote_did, NOW + 10),
+                &fixture.local_profile,
+                NOW + 10,
+            )
+            .unwrap();
+        fixture
+            .store
+            .settle_local_contact_revocation(&remote_did, NOW + 11)
+            .unwrap();
+        assert_eq!(file_records(fixture, "removed_contacts"), (1, 0));
+        let newer = local_removal(fixture, &remote_did, NOW + 30);
+        edit_sibling_state(fixture, |state| {
+            state.removed_contacts.push(StoredRemovedContact {
+                revocation_envelope: String::from_utf8(newer).unwrap(),
+                removed_by_local: true,
+                revocation_settled: false,
+            })
+        });
+        assert_eq!(file_records(fixture, "removed_contacts"), (1, 1));
+        remote_did
+    }
+
+    /// The newer removal is the one in the sibling file: the first read keeps
+    /// it, unacknowledged, in the v1 file, and the refresh and the
+    /// acknowledgement that follow land on that one record.
+    #[test]
+    fn a_newer_removal_in_the_sibling_file_survives_and_takes_refresh_and_acknowledgement() {
+        let fixture = Fixture::new();
+        let remote_did = v1_removal_then_newer_sibling_removal(&fixture);
+
+        let pending = fixture.store.resendable_contact_revocations(8).unwrap();
+        assert_eq!(file_records(&fixture, "removed_contacts"), (1, 0));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].remote_profile_did, remote_did);
+        assert_eq!(pending[0].removed_at, NOW + 30);
+        fixture
+            .store
+            .refresh_local_contact_revocation(
+                &remote_did,
+                &local_removal(&fixture, &remote_did, NOW + 30),
+                NOW + 100,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.store.resendable_contact_revocations(8).unwrap()[0].removed_at,
+            NOW + 30
+        );
+        fixture
+            .store
+            .settle_local_contact_revocation(&remote_did, NOW + 101)
+            .unwrap();
+        assert!(fixture
+            .store
+            .resendable_contact_revocations(8)
+            .unwrap()
+            .is_empty());
+        let snapshot = reopened(&fixture).snapshot().unwrap();
+        assert!(snapshot.contacts().is_empty());
+        assert_eq!(snapshot.removed().len(), 1);
+        assert_eq!(snapshot.removed()[0].removed_at(), NOW + 30);
+        assert_eq!(file_records(&fixture, "removed_contacts"), (1, 0));
+    }
+
+    /// The sibling file also holds an undecided request by DID that expires,
+    /// and the first thing that happens is a write that changes only the
+    /// sibling file. The load that starts it writes the newer removal into
+    /// the v1 file before pruning and before the sibling file is rewritten,
+    /// so the removal survives and is still resent.
+    #[test]
+    fn a_newer_removal_survives_pruning_and_a_sibling_only_write() {
+        let fixture = Fixture::new();
+        fixture
+            .store
+            .record_outgoing_profile_contact_request(
+                &profile_scope_request(
+                    &fixture.local_key,
+                    &fixture.local_profile,
+                    RemoteIdentity::new("Expiring").did(),
+                    NOW,
+                ),
+                NOW,
+            )
+            .unwrap();
+        let remote_did = v1_removal_then_newer_sibling_removal(&fixture);
+        assert_eq!(file_records(&fixture, "requests"), (1, 1));
+
+        let later = NOW
+            + crate::collaboration_discovery::COLLABORATION_PROFILE_CONTACT_REQUEST_TTL_SECS
+            + 1;
+        fixture
+            .store
+            .record_outgoing_profile_contact_request(
+                &profile_scope_request(
+                    &fixture.local_key,
+                    &fixture.local_profile,
+                    RemoteIdentity::new("Next").did(),
+                    later,
+                ),
+                later,
+            )
+            .unwrap();
+        assert_eq!(file_records(&fixture, "requests"), (1, 1));
+        assert_eq!(file_records(&fixture, "removed_contacts"), (1, 0));
+        let pending = fixture.store.resendable_contact_revocations(8).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].remote_profile_did, remote_did);
+        assert_eq!(pending[0].removed_at, NOW + 30);
+        let snapshot = reopened(&fixture).snapshot().unwrap();
+        assert_eq!(snapshot.removed().len(), 1);
+        assert_eq!(snapshot.removed()[0].removed_at(), NOW + 30);
+    }
+
+    /// A person recorded in one file stays there, byte for byte: a v1
+    /// contact with a head and a removal in the v1 file, a contact by DID
+    /// with both in the sibling file. Reads and a reopen rewrite nothing.
+    #[test]
+    fn a_person_in_one_file_is_left_untouched() {
+        let fixture = Fixture::new();
+        let (v1_profile_key, _) = generate_keypair();
+        let (v1_device_key, _) = generate_keypair();
+        let v1_head1 = accepted_contact_with_profile(&fixture, &v1_profile_key, &v1_device_key);
+        let v1_head2 = signed_profile_for_device(
+            &v1_profile_key,
+            &v1_device_key,
+            "Remote Two",
+            None,
+            2,
+            Some(&profile_hash(&v1_head1)),
+            NOW + 10,
+        );
+        fixture
+            .store
+            .apply_accepted_profile_chain(
+                &[signed_bytes(&v1_head2)],
+                &device_did(&v1_device_key),
+                NOW + 10,
+            )
+            .unwrap();
+        let v1_remote_did = v1_head1.document().profile_did.clone();
+        fixture
+            .store
+            .record_local_contact_revocation(
+                &local_removal(&fixture, &v1_remote_did, NOW + 20),
+                &fixture.local_profile,
+                NOW + 20,
+            )
+            .unwrap();
+
+        let (did_profile_key, _) = generate_keypair();
+        let by_did = RemoteIdentity::new_with_profile_key(&did_profile_key, "By DID");
+        add_outgoing_profile_contact(&fixture, &by_did, NOW + 30);
+        let by_did_head2 = signed_profile_for_device(
+            &did_profile_key,
+            &by_did.device_key,
+            "By DID Two",
+            None,
+            2,
+            Some(&profile_hash(&by_did.profile)),
+            NOW + 40,
+        );
+        fixture
+            .store
+            .apply_accepted_profile_chain(
+                &[signed_bytes(&by_did_head2)],
+                &device_did(&by_did.device_key),
+                NOW + 40,
+            )
+            .unwrap();
+        fixture
+            .store
+            .record_local_contact_revocation(
+                &local_removal(&fixture, by_did.did(), NOW + 50),
+                &fixture.local_profile,
+                NOW + 50,
+            )
+            .unwrap();
+        assert_eq!(file_records(&fixture, "accepted_profile_heads"), (1, 1));
+        assert_eq!(file_records(&fixture, "removed_contacts"), (1, 1));
+        let v1_bytes = fs::read(store_state_path(&fixture)).unwrap();
+        let sibling_bytes = fs::read(sibling_file_path(&fixture)).unwrap();
+
+        for store in [&fixture.store, &reopened(&fixture)] {
+            let snapshot = store.snapshot().unwrap();
+            assert!(snapshot.contacts().is_empty());
+            assert_eq!(snapshot.removed().len(), 2);
+            assert_eq!(store.resendable_contact_revocations(8).unwrap().len(), 2);
+        }
+        assert_eq!(fs::read(store_state_path(&fixture)).unwrap(), v1_bytes);
+        assert_eq!(
+            fs::read(sibling_file_path(&fixture)).unwrap(),
+            sibling_bytes
+        );
     }
 }
