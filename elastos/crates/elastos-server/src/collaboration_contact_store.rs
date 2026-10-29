@@ -5847,10 +5847,15 @@ mod tests {
 
     impl RemoteIdentity {
         fn new(display_name: &str) -> Self {
-            let (profile_key, _) = generate_keypair();
+            Self::new_with_profile_key(&generate_keypair().0, display_name)
+        }
+
+        /// Revision 1 signed by `profile_key`, so a test can sign later
+        /// revisions of the same Profile.
+        fn new_with_profile_key(profile_key: &SigningKey, display_name: &str) -> Self {
             let (device_key, _) = generate_keypair();
             let profile = signed_profile_for_device(
-                &profile_key,
+                profile_key,
                 &device_key,
                 display_name,
                 None,
@@ -6413,5 +6418,138 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fixture.store.snapshot().unwrap().contacts().len(), 1);
+    }
+
+    fn sibling_file_path(fixture: &Fixture) -> PathBuf {
+        rooted_localhost_fs_path(
+            &fixture.data_root,
+            &fixture.store.profile_state_object_uri(),
+        )
+        .unwrap()
+    }
+
+    /// How many `field` records each file holds on disk: (v1, by-DID).
+    fn file_records(fixture: &Fixture, field: &str) -> (usize, usize) {
+        let count = |uri: String| {
+            protected_plaintext(fixture, &uri).map_or(0, |bytes| {
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()[field]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            })
+        };
+        (
+            count(fixture.store.state_object_uri()),
+            count(fixture.store.profile_state_object_uri()),
+        )
+    }
+
+    /// A Discovery request from `remote` to this Home, recorded and left
+    /// pending. Publishes this Home's advertisement first.
+    fn pending_discovery_request(fixture: &Fixture, remote: &RemoteIdentity, at: u64) -> Vec<u8> {
+        let local_ad = advertisement_with_profile(&fixture.local_key, &fixture.local_profile, at);
+        fixture
+            .store
+            .store_local_advertisement(&local_ad, at)
+            .unwrap();
+        let request = outgoing_request_with_profile(
+            &remote.device_key,
+            &remote.profile,
+            &fixture.local_profile.document().profile_did,
+            &collaboration_message_envelope_sha256(&local_ad),
+            at + 1,
+        );
+        assert_eq!(
+            fixture
+                .store
+                .record_incoming_contact_request(&request, at + 1)
+                .unwrap(),
+            ContactStoreWrite::Recorded
+        );
+        request
+    }
+
+    fn accept_discovery_request(fixture: &Fixture, request: &[u8], at: u64) {
+        fixture
+            .store
+            .record_contact_decision_receipt(
+                &decision_receipt(
+                    &fixture.local_key,
+                    request,
+                    CollaborationContactDecision::Accepted,
+                    at,
+                    &fixture.local_profile.document().profile_did,
+                ),
+                at,
+            )
+            .unwrap();
+    }
+
+    /// The same store opened again, as after a restart.
+    fn reopened(fixture: &Fixture) -> CollaborationContactStore {
+        CollaborationContactStore::new(
+            &fixture.data_root,
+            &fixture.principal_id,
+            &fixture.localhost_root,
+            fixture.profile.clone(),
+            &fixture.local_profile,
+            &fixture.local_did,
+        )
+        .unwrap()
+    }
+
+    /// No Undo involved: a person accepted by DID rotates their device in
+    /// revision 2 while their Discovery request is still pending; accepting
+    /// that request creates the pair's first v1 chain. Revision 2 is the
+    /// newest signed fact and must survive it, stored once, in the v1 file,
+    /// where alpha.25 would read it after an Undo.
+    #[test]
+    fn newer_head_by_did_survives_the_first_discovery_chain_and_loads() {
+        let fixture = Fixture::new();
+        let (profile_key, _) = generate_keypair();
+        let remote = RemoteIdentity::new_with_profile_key(&profile_key, "Remote");
+        let remote_did = remote.did().to_string();
+        decide_incoming_profile_request(
+            &fixture,
+            &remote,
+            CollaborationContactDecision::Accepted,
+            NOW + 10,
+        );
+        let pending = pending_discovery_request(&fixture, &remote, NOW + 20);
+
+        let (rotated_device, _) = generate_keypair();
+        let head2 = signed_profile_for_device(
+            &profile_key,
+            &rotated_device,
+            "Remote Rotated",
+            None,
+            2,
+            Some(&profile_hash(&remote.profile)),
+            NOW + 30,
+        );
+        fixture
+            .store
+            .apply_accepted_profile_chain(
+                &[signed_bytes(&head2)],
+                &device_did(&rotated_device),
+                NOW + 30,
+            )
+            .unwrap();
+        assert_eq!(file_records(&fixture, "accepted_profile_heads"), (0, 1));
+
+        accept_discovery_request(&fixture, &pending, NOW + 40);
+
+        for store in [&fixture.store, &reopened(&fixture)] {
+            let snapshot = store.snapshot().unwrap();
+            assert_eq!(snapshot.contacts().len(), 1);
+            let contact = &snapshot.contacts()[0];
+            assert_eq!(contact.remote_profile_did(), remote_did);
+            assert_eq!(contact.remote_display_name(), "Remote Rotated");
+            assert_eq!(
+                contact.remote_presence_device_did(),
+                device_did(&rotated_device)
+            );
+        }
+        assert_eq!(file_records(&fixture, "accepted_profile_heads"), (1, 0));
     }
 }
