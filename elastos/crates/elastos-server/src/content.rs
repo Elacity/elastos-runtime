@@ -2958,9 +2958,8 @@ impl SharedContentGet {
     }
 }
 
-/// Whether `cid` is pinned on this Home's backend now, the same evidence a
-/// peer read is admitted on. A receipt alone is not enough: a failed pin can
-/// leave a `repair_needed` receipt with no bytes here.
+/// Whether `cid` is pinned on this Home's backend now. A receipt alone is not
+/// enough: a failed pin can leave a `repair_needed` receipt with no bytes here.
 pub(crate) async fn content_pinned_here(registry: &ProviderRegistry, cid: &str) -> bool {
     crate::carrier::local_cid_pinned(registry, cid).await == Some(true)
 }

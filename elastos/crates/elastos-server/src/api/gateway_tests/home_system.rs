@@ -13225,6 +13225,8 @@ async fn home_shared_content_check_then_get_fetches_a_contacts_linked_file_once(
         crate::carrier::tests::HolderBehavior::default(),
     )
     .await;
+    // Bob published the file, so his Home serves it to Alice.
+    bob_home.publish(&cid);
     let alice_node_dir = tempfile::tempdir().unwrap();
     let (alice_sk, alice_did) = elastos_identity::derive_did(&[203; 32]);
     let alice_node = crate::carrier::start_isolated_carrier_node_with_registry(
@@ -13284,6 +13286,7 @@ async fn home_shared_content_check_then_get_fetches_a_contacts_linked_file_once(
         .unwrap()
     };
     let other_cid = crate::carrier::tests::raw_bytes_cid(b"a file Bob never had");
+    bob_home.publish(&other_cid);
     let shared = post(
         1,
         &card(&bob.profile),

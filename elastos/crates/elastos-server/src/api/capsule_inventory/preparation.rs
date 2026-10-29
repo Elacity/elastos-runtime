@@ -12090,6 +12090,7 @@ server.serve_forever()
             None,
         )
         .await;
+        silent.publish(&cid);
         let holder_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let holder = carrier_fixture::start_content_holder_runtime(
             92,
@@ -12097,6 +12098,7 @@ server.serve_forever()
             holder_requests.clone(),
         )
         .await;
+        holder.publish(&cid);
         consumer
             .memory_lookup
             .add_endpoint_info(holder.addr.clone());
@@ -12272,6 +12274,7 @@ server.serve_forever()
         let served = Arc::new(std::sync::Mutex::new(Vec::new()));
         let holder =
             carrier_fixture::start_content_holder_runtime(94, files.clone(), served.clone()).await;
+        holder.publish(&cid);
         consumer
             .memory_lookup
             .add_endpoint_info(holder.addr.clone());
@@ -12470,6 +12473,7 @@ server.serve_forever()
                 behavior,
             )
             .await;
+            holder.publish(&cid);
             consumer
                 .memory_lookup
                 .add_endpoint_info(holder.addr.clone());

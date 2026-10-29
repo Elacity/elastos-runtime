@@ -75,14 +75,17 @@ durable rotation receipt.
 **Status:** Open (host-plane envelope)
 
 Runtime identifies each Carrier peer by its endpoint key. A key alone gives no
-authority. A Home serves a peer's `content/fetch` only for a CID pinned on it
-now: pinned content is public by link, and unpinned or cached blocks are never
-served to peers. Unpublish stops new transfers before garbage collection. A
-Home answers a peer's read in one message and checks the pin again just before
-sending it, so a read under way when the pin goes is refused. Bytes already
-sent can't be recalled.
+authority. A Home serves a peer's `content/fetch` only for a CID that an active
+publication on it lists (a Library publication or a protected listing, by any
+person on that Home). A pin is only local storage: files received in Chat,
+models and withdrawn publications stay pinned and are never served to peers.
+Unpublish withdraws the record, which stops new transfers at once; the pin
+stays until a later cleanup. A peer the owner gave the `content.replica`
+permission also reads what the Home pins. A Home answers a peer's read in one
+message and checks again just before sending it, so a read under way when the
+publication is withdrawn is refused. Bytes already sent can't be recalled.
 Only a node that serves publisher content (a seed) answers the raw
-`content_fetch` byte operation or serves without the pin check. In this
+`content_fetch` byte operation or serves without these checks. In this
 release a seed accepts no new copies from other Homes; copies it already holds
 stay. A Home accepts a new copy from a peer only if the owner gave that peer
 the `content.replica` permission; copies it already holds stay. The owner

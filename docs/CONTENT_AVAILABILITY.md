@@ -606,15 +606,19 @@ an ordinary Home refuses it. Normal capsules do not receive raw Carrier
 tickets, peer handles, or Kubo authority.
 
 Peer `content/fetch` admission: every peer read is `local_only`. An ordinary
-Home serves it only for a CID pinned there now (Kubo `pin/ls`); pinned content
-is public by link, and unpinned or cached blocks are never served to peers.
-Library publication records on this Home say who publishes a CID: identical
-bytes published twice share one pin, and Unpublish removes the pin, so new
-transfers stop, only when no other publication record on this Home names the
-CID. Library Publish and its Repair pin on this Home only (`local_pin`), with
-no availability wait. The answer goes out in one message after a
-second pin check, so a read under way when the pin goes is refused; bytes
-already sent can't be recalled. A seed serves as before. A whole read past the
+Home serves it only for a CID that an active publication on it lists: the
+Library publication records of every person on the Home, kept as a small
+index of published CIDs that changes with the records and is reconciled from
+them at start. A pin is only local storage (published files, files received in
+Chat, models and withdrawn publications all use it), so pinned alone is never
+served. Unpublish withdraws the record, and new transfers stop at once; the pin
+stays until a later cleanup removes pins nothing needs. A peer the owner gave
+`content.replica` also reads what the Home pins. Library Publish and its Repair
+pin on this Home only (`local_pin`), with no availability wait; Publish pins
+first and records second, so an interrupted publish leaves a pinned CID that is
+not served. The answer goes out in one message after a second check, so a read
+under way when the publication is withdrawn is refused; bytes already sent
+can't be recalled. A seed serves as before. A whole read past the
 requested `whole_max_bytes` answers the fixed token `content_too_large`, and
 the requester bounds the answer line to that size.
 

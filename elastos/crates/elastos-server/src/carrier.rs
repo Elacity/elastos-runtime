@@ -2851,9 +2851,12 @@ pub(crate) async fn local_cid_pinned(registry: &ProviderRegistry, cid: &str) -> 
 }
 
 /// A peer `fetch` on a node that does not serve publisher content reads only
-/// a CID pinned here: pinned content is public by link, while unpinned or
-/// cached blocks are never served to peers. Unpinning stops serving at once,
-/// before blocks are collected.
+/// a CID an active publication on this Home lists (Library publications and
+/// protected listings, by any person here). Sharing follows the publication
+/// record: a pin is only local storage, which received files, models and
+/// withdrawn publications also use, so pinned alone is never served, and
+/// Unpublish stops serving at once. A replica a peer with the owner's
+/// `content.replica` grant placed here is served while pinned, as before.
 async fn admit_carrier_peer_content_fetch(
     registry: &ProviderRegistry,
     data_dir: &std::path::Path,
@@ -2866,10 +2869,67 @@ async fn admit_carrier_peer_content_fetch(
         .get("cid")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    if validate_content_cid(cid).is_err() || local_cid_pinned(registry, cid).await != Some(true) {
+    let shared = validate_content_cid(cid).is_ok()
+        && (crate::library::cid_is_published_here(data_dir, cid)
+            || (granted_replica_held(data_dir, cid)
+                && local_cid_pinned(registry, cid).await == Some(true)));
+    if !shared {
         return Err(carrier_peer_refusal(
             "this Home does not share this content",
         ));
+    }
+    Ok(())
+}
+
+const GRANTED_REPLICAS_SCHEMA: &str = "elastos.carrier.granted-replicas/v1";
+static GRANTED_REPLICAS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// CIDs placed on this Home by a peer holding the owner's `content.replica`
+/// grant: replicas this Home holds for the network.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GrantedReplicas {
+    schema: String,
+    #[serde(default)]
+    cids: std::collections::BTreeSet<String>,
+}
+
+fn granted_replicas_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir
+        .join("ElastOS")
+        .join("SystemServices")
+        .join("Content")
+        .join("granted-replicas.json")
+}
+
+fn load_granted_replicas(data_dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    std::fs::read(granted_replicas_path(data_dir))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<GrantedReplicas>(&bytes).ok())
+        .filter(|replicas| replicas.schema == GRANTED_REPLICAS_SCHEMA)
+        .map(|replicas| replicas.cids)
+        .unwrap_or_default()
+}
+
+fn granted_replica_held(data_dir: &std::path::Path, cid: &str) -> bool {
+    let _guard = GRANTED_REPLICAS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    load_granted_replicas(data_dir).contains(cid)
+}
+
+fn record_granted_replica(data_dir: &std::path::Path, cid: &str) -> Result<()> {
+    let _guard = GRANTED_REPLICAS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cids = load_granted_replicas(data_dir);
+    if cids.insert(cid.to_string()) {
+        crate::auth::atomic_write(
+            &granted_replicas_path(data_dir),
+            &serde_json::to_vec_pretty(&GrantedReplicas {
+                schema: GRANTED_REPLICAS_SCHEMA.to_string(),
+                cids,
+            })?,
+        )?;
     }
     Ok(())
 }
@@ -2988,9 +3048,11 @@ async fn carrier_provider_invoke_registry(
         }),
     );
     // An ordinary Home's peer read, admitted again after the read: the whole
-    // reply goes out in one message, so a CID unpinned while it was read is
+    // reply goes out in one message, so a CID withdrawn while it was read is
     // refused before any byte of it is sent.
     let mut pinned_read_dir = None;
+    // A granted peer's replica placed here is served as a replica.
+    let mut replica_dir = None;
     if let (CarrierProviderCaller::Peer { data_dir }, "content") = (caller, target) {
         if let Err(answer) = admit_carrier_peer_content_request(
             data_dir,
@@ -3008,6 +3070,11 @@ async fn carrier_provider_invoke_registry(
             }
             pinned_read_dir = Some(data_dir);
         }
+        if matches!(operation, "import_exact" | "import_object" | "ensure")
+            && !is_trusted_source_runtime(data_dir)
+        {
+            replica_dir = Some(data_dir);
+        }
     }
 
     let result = if target == "custody"
@@ -3023,6 +3090,17 @@ async fn carrier_provider_invoke_registry(
     if let (Ok(_), Some(data_dir)) = (&result, pinned_read_dir) {
         if let Err(answer) = admit_carrier_peer_content_fetch(registry, data_dir, &request).await {
             return Ok(answer);
+        }
+    }
+    if let (Ok(response), Some(data_dir)) = (&result, replica_dir) {
+        let cid = request
+            .get("cid")
+            .or_else(|| response.get("data").and_then(|data| data.get("cid")))
+            .and_then(|cid| cid.as_str());
+        if let (Some("ok"), Some(cid)) = (response.get("status").and_then(|s| s.as_str()), cid) {
+            if let Err(err) = record_granted_replica(data_dir, cid) {
+                warn!("carrier: granted replica {cid} not recorded: {err:#}");
+            }
         }
     }
     match result {
@@ -12229,6 +12307,13 @@ pub(crate) mod tests {
         _dir: tempfile::TempDir,
     }
 
+    impl HolderRuntime {
+        /// Lists `cid` as published on this holder, so peers may read it.
+        pub(crate) fn publish(&self, cid: &str) {
+            crate::library::publish_cid_for_test(self._dir.path(), cid);
+        }
+    }
+
     pub(crate) async fn start_holder_runtime(
         seed: u8,
         content: Arc<dyn Provider>,
@@ -12340,8 +12425,10 @@ pub(crate) mod tests {
             None,
         )
         .await;
+        oversized.publish(cid);
         let holder_requests = Arc::new(StdMutex::new(Vec::new()));
         let holder = start_content_holder_runtime(83, files, holder_requests.clone()).await;
+        holder.publish(cid);
         consumer_node
             .memory_lookup
             .add_endpoint_info(holder.addr.clone());
@@ -12487,6 +12574,7 @@ pub(crate) mod tests {
             None,
         )
         .await;
+        flood.publish(cid);
         seed_content_availability_announcements(
             &consumer_node,
             cid,
@@ -12561,6 +12649,7 @@ pub(crate) mod tests {
             None,
         )
         .await;
+        silent.publish(cid);
         // A fresh consumer has no history, so the newest announcement is tried first.
         availability.peer_reputation.lock().await.clear();
         seed_content_availability_announcements(
@@ -12899,6 +12988,8 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let remote_dir = tempfile::tempdir().unwrap();
+        // The remote Home has published the fixture CID, so peers may read it.
+        crate::library::publish_cid_for_test(remote_dir.path(), FIXTURE_CID);
         let (remote_sk, remote_did) = elastos_identity::derive_did(&[remote_seed; 32]);
         let remote_node = start_isolated_carrier_node_with_registry(
             &remote_sk,
@@ -13313,7 +13404,8 @@ pub(crate) mod tests {
         }
         assert!(recorded_content_ops(&fixture.remote_requests).is_empty());
 
-        // Any peer may read a CID pinned here, but only locally.
+        // Any peer may read a CID published here, but only locally.
+        crate::library::publish_cid_for_test(fixture._remote_dir.path(), cid);
         invoke(serde_json::json!({ "op": "fetch", "cid": cid }))
             .await
             .unwrap();
@@ -13334,6 +13426,12 @@ pub(crate) mod tests {
             recorded_content_ops(&fixture.remote_requests),
             ["fetch", "ensure", "admission", "status"]
         );
+        // The granted peer's `ensure` placed a replica this Home now serves.
+        assert!(granted_replica_held(fixture._remote_dir.path(), cid));
+        assert!(!granted_replica_held(
+            fixture._remote_dir.path(),
+            &raw_bytes_cid(b"never replicated here")
+        ));
         shutdown_test_carrier_node(fixture.remote_node).await;
         shutdown_test_carrier_node(fixture.local_node).await;
     }
@@ -13574,13 +13672,14 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    /// Content whose read completes after the owner unpins the CID.
-    struct UnpinDuringReadContent {
-        pinned: Arc<std::sync::atomic::AtomicBool>,
+    /// Content whose read completes after the owner withdraws the CID.
+    struct WithdrawDuringReadContent {
+        data_dir: std::path::PathBuf,
+        read: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[async_trait::async_trait]
-    impl Provider for UnpinDuringReadContent {
+    impl Provider for WithdrawDuringReadContent {
         async fn handle(
             &self,
             _request: ResourceRequest,
@@ -13591,36 +13690,30 @@ pub(crate) mod tests {
             Vec::new()
         }
         fn name(&self) -> &'static str {
-            "unpin-during-read-content"
+            "withdraw-during-read-content"
         }
         async fn send_raw(
             &self,
             _request: &serde_json::Value,
         ) -> Result<serde_json::Value, ProviderError> {
-            self.pinned
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            crate::library::withdraw_cid_for_test(&self.data_dir, FIXTURE_CID);
+            self.read.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(serde_json::json!({ "status": "ok", "data": { "data": "c2VjcmV0" } }))
         }
     }
 
     #[tokio::test]
-    async fn carrier_peer_fetch_unpinned_during_its_read_sends_no_bytes() {
-        let pinned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    async fn carrier_peer_fetch_withdrawn_during_its_read_sends_no_bytes() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::library::publish_cid_for_test(data_dir.path(), FIXTURE_CID);
+        let read = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let registry = ProviderRegistry::new();
         registry
             .register_sub_provider(
                 "content",
-                Arc::new(UnpinDuringReadContent {
-                    pinned: pinned.clone(),
-                }),
-            )
-            .await
-            .unwrap();
-        registry
-            .register_sub_provider(
-                "ipfs",
-                Arc::new(SwitchPinIpfs {
-                    pinned: pinned.clone(),
+                Arc::new(WithdrawDuringReadContent {
+                    data_dir: data_dir.path().to_path_buf(),
+                    read: read.clone(),
                 }),
             )
             .await
@@ -13636,7 +13729,6 @@ pub(crate) mod tests {
                 "range":null, "progress":null
             }}
         });
-        let data_dir = tempfile::tempdir().unwrap();
         let answer = carrier_provider_invoke_registry(
             &registry,
             &request,
@@ -13647,18 +13739,16 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            !pinned.load(std::sync::atomic::Ordering::SeqCst),
-            "read ran"
-        );
+        assert!(read.load(std::sync::atomic::Ordering::SeqCst), "read ran");
         assert_eq!(answer["ok"], false, "{answer}");
         assert_eq!(answer["code"], CARRIER_PEER_REFUSED);
         assert!(!answer.to_string().contains("c2VjcmV0"));
     }
 
     #[tokio::test]
-    async fn carrier_peer_fetch_serves_only_cids_pinned_on_an_ordinary_home() {
+    async fn carrier_peer_fetch_serves_only_cids_an_active_publication_lists() {
         let fixture = peer_did_route_fixture(156, 157).await;
+        let remote_dir = fixture._remote_dir.path().to_path_buf();
         let invoke = || {
             fixture
                 .local_registry
@@ -13667,17 +13757,29 @@ pub(crate) mod tests {
                     serde_json::json!({ "op": "fetch", "cid": FIXTURE_CID }),
                 ))
         };
-        // Pinned: any peer reads it, locally only.
+        let refused = |result: Result<serde_json::Value, ProviderError>| {
+            let refused = result.unwrap_err().to_string();
+            assert!(refused.ends_with(CARRIER_PEER_REFUSED), "{refused}");
+        };
+        // The fixture Home published it: any peer reads it, locally only.
         invoke().await.unwrap();
         assert_eq!(recorded_content_ops(&fixture.remote_requests), ["fetch"]);
-        // Unpublished, or blocks only cached: the blocks may still be present,
-        // but nothing is served from the moment the pin is gone.
+        // Withdrawn: the pin and blocks stay, but nothing is served. A file
+        // received in Chat, a model or a withdrawn publication is pinned the
+        // same way and published by nobody.
+        crate::library::withdraw_cid_for_test(&remote_dir, FIXTURE_CID);
+        refused(invoke().await);
+        // A replica a granted peer placed here is served while pinned, as before.
+        record_granted_replica(&remote_dir, FIXTURE_CID).unwrap();
+        invoke().await.unwrap();
         fixture
             .remote_pinned
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let refused = invoke().await.unwrap_err().to_string();
-        assert!(refused.ends_with(CARRIER_PEER_REFUSED), "{refused}");
-        assert_eq!(recorded_content_ops(&fixture.remote_requests), ["fetch"]);
+        refused(invoke().await);
+        assert_eq!(
+            recorded_content_ops(&fixture.remote_requests),
+            ["fetch", "fetch"]
+        );
         shutdown_test_carrier_node(fixture.remote_node).await;
         shutdown_test_carrier_node(fixture.local_node).await;
     }
@@ -13798,6 +13900,7 @@ pub(crate) mod tests {
         let cid = raw_bytes_cid(&bytes);
         let (holder, served) =
             shared_file_holder(192, &fixture, bytes.clone(), HolderBehavior::default()).await;
+        holder.publish(&cid);
 
         let got = crate::content::get_shared_content_from_peer(
             &fixture.local_registry,
@@ -13841,6 +13944,7 @@ pub(crate) mod tests {
             HolderBehavior::default(),
         )
         .await;
+        holder.publish(&cid);
 
         let got = crate::content::get_shared_content_from_peer(
             &fixture.local_registry,
@@ -13910,6 +14014,7 @@ pub(crate) mod tests {
             },
         )
         .await;
+        holder.publish(&cid);
 
         let started = std::time::Instant::now();
         let got = crate::content::get_shared_content_from_peer(

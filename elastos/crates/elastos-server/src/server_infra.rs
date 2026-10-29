@@ -1544,6 +1544,19 @@ async fn setup_server_infrastructure_impl(
         );
     }
 
+    // Peers are served only CIDs an active publication lists: bring that
+    // index in line with the publish records before Carrier answers anyone.
+    {
+        let data_dir = data_dir.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            elastos_server::library::reconcile_published_cids(&data_dir)
+        })
+        .await
+        {
+            tracing::warn!("Published CID index reconcile failed: {}", e);
+        }
+    }
+
     // Built-in Carrier node — ALWAYS starts, not conditional on spawn_host_providers.
     // Carrier is fundamental infrastructure: gossip, content, identity.
     // Identity is DID (derived from device_key), not raw device_key.

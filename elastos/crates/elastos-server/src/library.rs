@@ -524,12 +524,7 @@ impl Provider for ObjectProvider {
                 };
                 handle_runtime_custody_library_request(data_dir, registry, request, None).await
             }
-            request => {
-                tokio::task::spawn_blocking(move || handle_library_request(&data_dir, request))
-                    .await
-                    .map_err(|err| anyhow!("object provider task failed: {err}"))
-                    .and_then(|result| result)
-            }
+            request => handle_library_request_serialized(data_dir, request).await,
         };
 
         Ok(match result {
@@ -797,16 +792,39 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
             handle_library_request_with_protected_content_status(data_dir, request, Some(registry))
                 .await
         }
-        request => tokio::task::spawn_blocking(move || handle_library_request(&data_dir, request))
-            .await
-            .map_err(|err| anyhow!("object provider task failed: {err}"))
-            .and_then(|result| result),
+        request => handle_library_request_serialized(data_dir, request).await,
     };
 
     match result {
         Ok(data) => provider_ok(data),
         Err(err) => provider_error_from("library_error", &err),
     }
+}
+
+/// A file operation that moves or checks publication records (rename, move,
+/// trash, restore, delete) runs under `PUBLICATIONS`, so a publish never
+/// writes a record for a file that moved meanwhile.
+async fn handle_library_request_serialized(
+    data_dir: PathBuf,
+    request: ObjectProviderRequest,
+) -> anyhow::Result<Value> {
+    let touches_records = matches!(
+        request,
+        ObjectProviderRequest::Rename { .. }
+            | ObjectProviderRequest::Move { .. }
+            | ObjectProviderRequest::Trash { .. }
+            | ObjectProviderRequest::Restore { .. }
+            | ObjectProviderRequest::DeletePermanently { .. }
+            | ObjectProviderRequest::EmptyTrash { .. }
+    );
+    let _serialized = match touches_records {
+        true => Some(PUBLICATIONS.lock().await),
+        false => None,
+    };
+    tokio::task::spawn_blocking(move || handle_library_request(&data_dir, request))
+        .await
+        .map_err(|err| anyhow!("object provider task failed: {err}"))
+        .and_then(|result| result)
 }
 
 async fn handle_library_request_with_protected_content_status(
@@ -2143,22 +2161,24 @@ pub(crate) struct LibraryFilePublication {
     publication_id: String,
 }
 
-/// One lock for every publication on this Home: publish, unpublish and
-/// repair never interleave, whoever makes them. Unpublish decides "no other
-/// publication record names this CID" and then unpins; a publish of the same
-/// bytes by another person must not land between the two.
+/// One lock for every publication record on this Home: publish, unpublish,
+/// repair, Chat attach, and the rename, move and delete steps that move or
+/// check records never interleave, whoever makes them. A record therefore
+/// always follows its file, and the published-CID index always matches the
+/// records.
 static PUBLICATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The one Library publish operation, shared by Library Publish and Chat
 /// attach: a file in one of the principal's Library places is pinned on this
-/// Home only and recorded with the revision it shares. Caller holds
-/// `PUBLICATIONS`.
+/// Home only and recorded with the revision it shares. A new record takes
+/// `publication_id` when given. Caller holds `PUBLICATIONS`.
 async fn publish_library_uri_locked(
     data_dir: &Path,
     registry: &ProviderRegistry,
     principal_id: &str,
     uri: &str,
     if_revision: Option<&str>,
+    publication_id: Option<String>,
 ) -> anyhow::Result<LibraryFilePublication> {
     if !uri.trim().starts_with("localhost://") {
         return Err(library_unsupported(
@@ -2167,7 +2187,15 @@ async fn publish_library_uri_locked(
         ));
     }
     let target = library_target(data_dir, principal_id, uri)?;
-    publish_plain_locked(data_dir, registry, principal_id, &target, if_revision).await
+    publish_plain_locked(
+        data_dir,
+        registry,
+        principal_id,
+        &target,
+        if_revision,
+        publication_id,
+    )
+    .await
 }
 
 async fn publish_plain_library_file(
@@ -2178,7 +2206,7 @@ async fn publish_plain_library_file(
     if_revision: Option<&str>,
 ) -> anyhow::Result<LibraryFilePublication> {
     let _serialized = PUBLICATIONS.lock().await;
-    publish_plain_locked(data_dir, registry, principal_id, target, if_revision).await
+    publish_plain_locked(data_dir, registry, principal_id, target, if_revision, None).await
 }
 
 async fn publish_plain_locked(
@@ -2187,6 +2215,7 @@ async fn publish_plain_locked(
     principal_id: &str,
     target: &LibraryTarget,
     if_revision: Option<&str>,
+    publication_id: Option<String>,
 ) -> anyhow::Result<LibraryFilePublication> {
     let (bytes, revision) = read_publish_source(data_dir, principal_id, target, if_revision)?;
     let name = target
@@ -2222,11 +2251,10 @@ async fn publish_plain_locked(
             size_bytes,
         });
     }
-    let publication_id = hex::encode(rand::random::<[u8; 16]>());
-    // Pin first, then record. A crash in between leaves a pin with no record:
-    // its link was never returned, shown or posted, so nothing is shared that
-    // the person cannot withdraw. The reverse order could leave a record of a
-    // publication that never happened.
+    let publication_id = publication_id.unwrap_or_else(|| hex::encode(rand::random::<[u8; 16]>()));
+    // Pin first, then record. Peers are served only CIDs an active record
+    // lists, so a crash in between leaves a pinned CID that is not served,
+    // even when the same bytes were published and withdrawn before.
     let publish_request = json!({
         "op": "publish",
         "kind": "file",
@@ -2492,33 +2520,9 @@ fn plain_publish_records(data_dir: &Path, principal_id: &str) -> Vec<LibraryPubl
         .collect()
 }
 
-/// Whether an active publication record on this Home other than
-/// `principal_id`'s record for `object_uri` names `cid`. The records of every
-/// person on this Home are the one account of who publishes a CID.
-fn cid_published_elsewhere(
-    data_dir: &Path,
-    principal_id: &str,
-    object_uri: &str,
-    cid: &str,
-) -> bool {
-    let mut principals: BTreeSet<String> = crate::auth::list_passkey_principals(data_dir)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|principal| principal.principal_id)
-        .collect();
-    principals.insert(principal_id.to_string());
-    principals.iter().any(|principal| {
-        publish_records(data_dir, principal).iter().any(|record| {
-            record.cid == cid
-                && record_is_published(record)
-                && !(principal == principal_id && record.object_uri == object_uri)
-        })
-    })
-}
-
 /// One Chat attach request, saved before anything is published: its
-/// `request_id` stays bound to this file and, once published, to that one
-/// publication.
+/// `request_id` stays bound to this file and to the publication id it
+/// publishes under (or the publication it reused).
 #[derive(Serialize, Deserialize)]
 struct ChatAttachBinding {
     schema: String,
@@ -2526,8 +2530,8 @@ struct ChatAttachBinding {
     uri: String,
     #[serde(default)]
     if_revision: Option<String>,
-    #[serde(default)]
-    publication_id: Option<String>,
+    publication_id: String,
+    bound_at: u64,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -2544,10 +2548,12 @@ fn chat_attach_binding_uri(principal_id: &str, request_id: &str) -> String {
 /// from the first look at its binding to the last write:
 /// - the same `request_id` with another file or revision is refused before
 ///   anything happens;
-/// - a request already published posts that publication as it was, wherever
-///   the file is now, and one withdrawn since is never published again;
-/// - a new request passes `check_send_allowed` (the send rate limit), is bound
-///   to its file, published, and bound to its publication.
+/// - the request is bound to its file and to a publication id before
+///   anything is published, so a retry always finds what it made;
+/// - a publication made or reused by this request is posted as it was,
+///   wherever the file is now, and one withdrawn since answers `withdrawn`
+///   and is never published again;
+/// - a new request passes `check_send_allowed` (the send rate limit) first.
 pub(crate) async fn chat_attach_publication(
     data_dir: &Path,
     registry: &ProviderRegistry,
@@ -2560,37 +2566,43 @@ pub(crate) async fn chat_attach_publication(
     let _serialized = PUBLICATIONS.lock().await;
     let uri = uri.trim();
     let binding_uri = chat_attach_binding_uri(principal_id, request_id);
-    if let Some(mut binding) =
-        read_runtime_json::<ChatAttachBinding>(data_dir, principal_id, &binding_uri)
-    {
+    let saved = read_runtime_json::<ChatAttachBinding>(data_dir, principal_id, &binding_uri);
+    if let Some(mut binding) = saved {
         if binding.uri != uri || binding.if_revision.as_deref() != if_revision {
             return Err(library_refusal(
                 "request_id_reused",
                 "This request was already used for another file.",
             ));
         }
-        let record = match &binding.publication_id {
-            Some(publication_id) => plain_publish_records(data_dir, principal_id)
-                .into_iter()
-                .find(|record| record_publication_id(record) == *publication_id),
-            // Interrupted after the record was written and before its id was
-            // saved here: the record for this file (one per file) is the one
-            // this request made when it names this revision. One withdrawn
-            // since answers `withdrawn`, never a new publication.
-            None => read_publish_record(data_dir, principal_id, &binding.uri)
+        let by_id = plain_publish_records(data_dir, principal_id)
+            .into_iter()
+            .find(|record| record_publication_id(record) == binding.publication_id);
+        // Interrupted after reusing the file's existing publication, before
+        // its id was saved here: that publication is the one for this file
+        // and revision, withdrawn since this request began or still active.
+        let reused = || {
+            read_publish_record(data_dir, principal_id, &binding.uri)
                 .ok()
                 .filter(|record| !record_is_runtime_custody(record))
                 .filter(|record| {
                     if_revision.is_none_or(|revision| record.revision.as_deref() == Some(revision))
-                }),
+                })
+                .filter(|record| {
+                    record_is_published(record)
+                        || record
+                            .unpublished_at
+                            .is_some_and(|at| at >= binding.bound_at)
+                })
         };
-        match record {
+        match by_id.or_else(reused) {
             Some(record) if record_is_published(&record) => {
                 let publication_id = record_publication_id(&record);
-                if binding.publication_id.is_none() {
-                    binding.publication_id = Some(publication_id.clone());
-                    binding.name = binding.uri.rsplit('/').next().map(str::to_string);
-                    binding.size_bytes = record.size_bytes;
+                if binding.publication_id != publication_id || binding.name.is_none() {
+                    binding.publication_id = publication_id.clone();
+                    binding.name = binding
+                        .name
+                        .or_else(|| binding.uri.rsplit('/').next().map(str::to_string));
+                    binding.size_bytes = binding.size_bytes.or(record.size_bytes);
                     write_runtime_json(data_dir, principal_id, &binding_uri, &binding)?;
                 }
                 let object = library_object(data_dir, principal_id, &record.object_uri)?;
@@ -2603,7 +2615,6 @@ pub(crate) async fn chat_attach_publication(
                 });
             }
             Some(_) => return Err(chat_attach_withdrawn()),
-            None if binding.publication_id.is_some() => return Err(chat_attach_withdrawn()),
             // Bound, but nothing was recorded: publish as a new request.
             None => {}
         }
@@ -2614,7 +2625,8 @@ pub(crate) async fn chat_attach_publication(
         request_id: request_id.to_string(),
         uri: uri.to_string(),
         if_revision: if_revision.map(str::to_string),
-        publication_id: None,
+        publication_id: hex::encode(rand::random::<[u8; 16]>()),
+        bound_at: now_ts(),
         name: None,
         size_bytes: None,
     };
@@ -2625,19 +2637,26 @@ pub(crate) async fn chat_attach_publication(
         principal_id,
         uri,
         if_revision,
+        Some(binding.publication_id.clone()),
     )
     .await
     {
         Ok(publication) => publication,
         Err(err) => {
-            // Nothing was recorded, so nothing stays bound to this id.
-            if let Err(unbind) = remove_runtime_file(data_dir, &binding_uri) {
-                tracing::warn!(error = %unbind, "chat attach: binding not removed");
+            // A record this request wrote keeps its binding; otherwise
+            // nothing was published and nothing stays bound to this id.
+            let recorded = plain_publish_records(data_dir, principal_id)
+                .iter()
+                .any(|record| record_publication_id(record) == binding.publication_id);
+            if !recorded {
+                if let Err(unbind) = remove_runtime_file(data_dir, &binding_uri) {
+                    tracing::warn!(error = %unbind, "chat attach: binding not removed");
+                }
             }
             return Err(err);
         }
     };
-    binding.publication_id = Some(publication.publication_id.clone());
+    binding.publication_id = publication.publication_id.clone();
     binding.name = Some(publication.name.clone());
     binding.size_bytes = Some(publication.size_bytes);
     write_runtime_json(data_dir, principal_id, &binding_uri, &binding)?;
@@ -2718,20 +2737,13 @@ async fn library_unpublish(
     if !record_is_published(&record) {
         bail!("library object is not actively published");
     }
-    // Unpin first, record second. A crash between leaves the record active,
-    // so Unpublish is offered and simply runs again: Content treats a CID it
-    // verifies is no longer pinned as unpinned. Recording first could leave a
-    // CID still served while the person sees it withdrawn, with nothing left
-    // to retry. Another publication record on this Home naming the same CID
-    // keeps it pinned; this record alone is withdrawn.
-    let data = if cid_published_elsewhere(data_dir, principal_id, &target.uri, &record.cid) {
-        json!({
-            "availability": {
-                "status": "publication_released",
-                "note": "Another publication on this Home shares these bytes, so they stay pinned.",
-            },
-        })
-    } else {
+    // Sharing follows the record: once it is withdrawn (and out of the
+    // published-CID index), peers are no longer served this CID from here.
+    // The pin is only local storage, which other publications, received
+    // files or models may share, so a plain Unpublish leaves it in place;
+    // removing pins no publication needs is a later cleanup. A protected
+    // publication keeps its existing withdrawal, which unpins.
+    let data = if record_is_runtime_custody(&record) {
         let response = registry
             .send_raw(
                 "content",
@@ -2755,6 +2767,13 @@ async fn library_unpublish(
             .get("data")
             .cloned()
             .ok_or_else(|| anyhow!("content unpublish response missing data"))?
+    } else {
+        json!({
+            "availability": {
+                "status": "withdrawn",
+                "note": "No longer shared from this Home. Copies others downloaded stay with them.",
+            },
+        })
     };
     record.unpublished_at = Some(now_ts());
     record.shared_at = None;
@@ -8137,6 +8156,13 @@ fn write_publish_record(
     principal_id: &str,
     record: &LibraryPublishRecord,
 ) -> anyhow::Result<()> {
+    // Serving follows the index. A publication that ends leaves the index
+    // before its record changes, and one that starts joins it after: a crash
+    // in between serves less, never more.
+    let active = record_is_published(record);
+    if !active {
+        set_published_index_entry(data_dir, principal_id, record, false)?;
+    }
     let root = crate::auth::principal_localhost_root(principal_id);
     let record_uri = publish_record_uri(&root, &record.object_uri);
     let record_path = rooted_localhost_fs_path(data_dir, &record_uri)
@@ -8152,7 +8178,170 @@ fn write_publish_record(
         &record_uri,
         &record_path,
         &bytes,
+    )?;
+    if active {
+        set_published_index_entry(data_dir, principal_id, record, true)?;
+    }
+    Ok(())
+}
+
+const PUBLISHED_INDEX_SCHEMA: &str = "elastos.library.published-cids/v1";
+
+/// This Home's active publications, by every person, as the CIDs each one
+/// shares: the only thing a peer read of an ordinary Home is served on.
+/// Keys are opaque digests of person and publication; the records stay the
+/// source of truth and the index is reconciled from them at start.
+#[derive(Default, Serialize, Deserialize)]
+struct PublishedIndex {
+    schema: String,
+    #[serde(default)]
+    publications: std::collections::BTreeMap<String, BTreeSet<String>>,
+}
+
+static PUBLISHED_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn published_index_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("ElastOS")
+        .join("SystemServices")
+        .join("Library")
+        .join("published-cids.json")
+}
+
+fn load_published_index(data_dir: &Path) -> anyhow::Result<PublishedIndex> {
+    match fs::read(published_index_path(data_dir)) {
+        Ok(bytes) => {
+            let index: PublishedIndex = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                index.schema == PUBLISHED_INDEX_SCHEMA,
+                "published CID index has an unknown schema"
+            );
+            Ok(index)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(PublishedIndex {
+            schema: PUBLISHED_INDEX_SCHEMA.to_string(),
+            publications: Default::default(),
+        }),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn update_published_index(
+    data_dir: &Path,
+    change: impl FnOnce(&mut PublishedIndex),
+) -> anyhow::Result<()> {
+    let _guard = PUBLISHED_INDEX_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut index = load_published_index(data_dir)?;
+    change(&mut index);
+    crate::auth::atomic_write(
+        &published_index_path(data_dir),
+        &serde_json::to_vec_pretty(&index)?,
     )
+}
+
+fn published_index_key(principal_id: &str, record: &LibraryPublishRecord) -> String {
+    hex::encode(Sha256::digest(format!(
+        "{principal_id}\n{}",
+        record_publication_id(record)
+    )))
+}
+
+/// The CIDs one publication shares: its content, and a protected
+/// publication's listing.
+fn record_shared_cids(record: &LibraryPublishRecord) -> BTreeSet<String> {
+    let mut cids = BTreeSet::from([record.cid.clone()]);
+    if let Some(listing_cid) = record
+        .listing_uri
+        .as_deref()
+        .and_then(|uri| uri.strip_prefix("elastos://"))
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .filter(|cid| !cid.is_empty())
+    {
+        cids.insert(listing_cid.to_string());
+    }
+    cids
+}
+
+fn set_published_index_entry(
+    data_dir: &Path,
+    principal_id: &str,
+    record: &LibraryPublishRecord,
+    active: bool,
+) -> anyhow::Result<()> {
+    let key = published_index_key(principal_id, record);
+    update_published_index(data_dir, |index| {
+        if active {
+            index.publications.insert(key, record_shared_cids(record));
+        } else {
+            index.publications.remove(&key);
+        }
+    })
+}
+
+/// Whether some active publication on this Home shares `cid`. An index that
+/// cannot be read shares nothing.
+pub(crate) fn cid_is_published_here(data_dir: &Path, cid: &str) -> bool {
+    let _guard = PUBLISHED_INDEX_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    load_published_index(data_dir)
+        .is_ok_and(|index| index.publications.values().any(|cids| cids.contains(cid)))
+}
+
+/// Brings the index in line with every publish record this Runtime can read
+/// at start: active records are listed, withdrawn ones are not. Entries whose
+/// records it cannot read are left as they are.
+pub fn reconcile_published_cids(data_dir: &Path) {
+    let principals: BTreeSet<String> = crate::auth::list_passkey_principals(data_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|principal| principal.principal_id)
+        .collect();
+    let mut entries = Vec::new();
+    for principal in &principals {
+        for record in publish_records(data_dir, principal) {
+            entries.push((
+                published_index_key(principal, &record),
+                record_is_published(&record).then(|| record_shared_cids(&record)),
+            ));
+        }
+    }
+    if let Err(err) = update_published_index(data_dir, |index| {
+        for (key, cids) in entries {
+            match cids {
+                Some(cids) => {
+                    index.publications.insert(key, cids);
+                }
+                None => {
+                    index.publications.remove(&key);
+                }
+            }
+        }
+    }) {
+        tracing::warn!(error = %err, "library: published CID index not reconciled");
+    }
+}
+
+/// Lists `cid` as published on this Home, as a test fixture's holder does.
+#[cfg(test)]
+pub(crate) fn publish_cid_for_test(data_dir: &Path, cid: &str) {
+    update_published_index(data_dir, |index| {
+        index
+            .publications
+            .insert(format!("test:{cid}"), BTreeSet::from([cid.to_string()]));
+    })
+    .unwrap();
+}
+
+/// Withdraws what `publish_cid_for_test` listed.
+#[cfg(test)]
+pub(crate) fn withdraw_cid_for_test(data_dir: &Path, cid: &str) {
+    update_published_index(data_dir, |index| {
+        index.publications.remove(&format!("test:{cid}"));
+    })
+    .unwrap();
 }
 
 fn remove_publish_record(
@@ -9761,7 +9950,10 @@ mod publish_tests {
             )
             .await;
         assert_eq!(unpublish["status"], "ok", "{unpublish}");
-        assert_eq!(home.requests("unpublish")[0]["cid"], cid);
+        assert!(
+            home.requests("unpublish").is_empty(),
+            "withdrawal never unpins"
+        );
         assert!(home.stat("Documents/notes.txt").await["publication"].is_null());
 
         let repair = home
@@ -9907,6 +10099,7 @@ mod publish_tests {
             home.principal,
             "file:///etc/passwd",
             None,
+            None,
         )
         .await
         .err()
@@ -9960,6 +10153,7 @@ mod publish_tests {
                 home.principal,
                 &home.uri(hidden),
                 None,
+                None,
             )
             .await
             .err()
@@ -9995,44 +10189,101 @@ mod publish_tests {
     }
 
     #[tokio::test]
-    async fn unpublishing_one_of_two_publications_of_the_same_bytes_keeps_the_other_shared() {
+    async fn withdrawing_one_of_two_publications_of_the_same_bytes_keeps_the_other_served() {
         let home = home("did:key:z6MkPublishSameBytes").await;
         home.write("Documents/a.txt", b"same bytes").await;
         home.write("Pictures/b.txt", b"same bytes").await;
         let a = home.publish("Documents/a.txt").await;
         let b = home.publish("Pictures/b.txt").await;
         assert_eq!(a["data"]["cid"], b["data"]["cid"]);
+        let cid = a["data"]["cid"].as_str().unwrap().to_string();
+        assert!(cid_is_published_here(home.dir.path(), &cid));
 
         let first = home
             .call("unpublish", json!({ "uri": home.uri("Documents/a.txt") }))
             .await;
         assert_eq!(first["status"], "ok", "{first}");
-        assert_eq!(
-            first["data"]["availability"]["status"],
-            "publication_released"
-        );
-        assert!(home.requests("unpublish").is_empty(), "b stays pinned");
+        assert_eq!(first["data"]["availability"]["status"], "withdrawn");
         assert!(home.stat("Documents/a.txt").await["publication"].is_null());
-        assert_eq!(
-            home.stat("Pictures/b.txt").await["publication"]["cid"],
-            b["data"]["cid"]
+        assert!(
+            cid_is_published_here(home.dir.path(), &cid),
+            "b still served"
         );
 
         let last = home
             .call("unpublish", json!({ "uri": home.uri("Pictures/b.txt") }))
             .await;
         assert_eq!(last["status"], "ok", "{last}");
-        let unpins = home.requests("unpublish");
-        assert_eq!(unpins.len(), 1);
-        assert_eq!(unpins[0]["cid"], b["data"]["cid"]);
+        assert!(!cid_is_published_here(home.dir.path(), &cid));
+        // Withdrawal never unpins: the pin is only local storage.
+        assert!(home.requests("unpublish").is_empty());
     }
 
     #[tokio::test]
-    async fn an_interrupted_publish_or_unpublish_leaves_a_state_the_person_can_finish() {
+    async fn another_persons_unpublish_never_affects_a_publication_it_cannot_see_or_read() {
+        // Neither person is in the passkey list, and Alma's record is
+        // unreadable by the time Bruno withdraws.
+        let alma = home("did:key:z6MkAlmaUnlisted").await;
+        let bruno_id = "did:key:z6MkBrunoUnlisted";
+        alma.write("Documents/same.txt", b"shared bytes").await;
+        let published = alma.publish("Documents/same.txt").await;
+        let cid = published["data"]["cid"].as_str().unwrap().to_string();
+        let bruno_uri = format!(
+            "{}/Documents/same.txt",
+            crate::auth::principal_localhost_root(bruno_id)
+        );
+        let as_bruno = |op: &str, mut body: Value| {
+            body["op"] = json!(op);
+            body["principal_id"] = json!(bruno_id);
+            let (dir, registry) = (alma.dir.path().to_path_buf(), alma.registry.clone());
+            async move { handle_object_provider_runtime_request(&dir, registry, &body).await }
+        };
+        let write = as_bruno(
+            "write",
+            json!({
+                "uri": bruno_uri,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"shared bytes"),
+            }),
+        )
+        .await;
+        assert_eq!(write["status"], "ok", "{write}");
+        let bruno = as_bruno("publish", json!({ "uri": bruno_uri })).await;
+        assert_eq!(bruno["data"]["cid"], cid.as_str());
+
+        let record_path = rooted_localhost_fs_path(
+            alma.dir.path(),
+            &publish_record_uri(&alma.root, &alma.uri("Documents/same.txt")),
+        )
+        .unwrap();
+        std::fs::write(&record_path, b"unreadable").unwrap();
+
+        let unpublish = as_bruno("unpublish", json!({ "uri": bruno_uri })).await;
+        assert_eq!(unpublish["status"], "ok", "{unpublish}");
+        assert!(
+            cid_is_published_here(alma.dir.path(), &cid),
+            "Alma's stays served"
+        );
+        reconcile_published_cids(alma.dir.path());
+        assert!(
+            cid_is_published_here(alma.dir.path(), &cid),
+            "and after a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_publish_serves_nothing_even_for_bytes_shared_before() {
         let home = home("did:key:z6MkPublishCrashes").await;
         home.write("Documents/c.txt", b"crash").await;
-        // Crash after the pin, before the record: an unrecorded pin whose
-        // link was never shown. The file is simply not published.
+        let first = home.publish("Documents/c.txt").await;
+        let cid = first["data"]["cid"].as_str().unwrap().to_string();
+        let unpublish = home
+            .call("unpublish", json!({ "uri": home.uri("Documents/c.txt") }))
+            .await;
+        assert_eq!(unpublish["status"], "ok", "{unpublish}");
+        assert!(!cid_is_published_here(home.dir.path(), &cid));
+
+        // Publishing the same bytes again stops after the pin, before the
+        // record: the old link stays unserved and Library shows no publication.
         home.registry
             .send_raw(
                 "content",
@@ -10045,26 +10296,36 @@ mod publish_tests {
             )
             .await
             .unwrap();
+        assert!(!cid_is_published_here(home.dir.path(), &cid));
         assert!(home.stat("Documents/c.txt").await["publication"].is_null());
-        let publish = home.publish("Documents/c.txt").await;
-        assert_eq!(publish["status"], "ok", "{publish}");
-        let cid = publish["data"]["cid"].clone();
 
-        // Crash after the unpin, before the record: still recorded, so
-        // Unpublish is offered again and completes.
-        home.registry
-            .send_raw("content", &json!({ "op": "unpublish", "cid": cid }))
-            .await
-            .unwrap();
-        assert_eq!(
-            home.stat("Documents/c.txt").await["publication"]["cid"],
-            cid
+        let again = home.publish("Documents/c.txt").await;
+        assert_eq!(again["status"], "ok", "{again}");
+        assert!(cid_is_published_here(home.dir.path(), &cid));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rename_racing_a_publish_keeps_the_record_with_the_file() {
+        let home = home("did:key:z6MkPublishRenameRace").await;
+        home.write("Documents/a.txt", b"race").await;
+        let (publish, rename) = tokio::join!(
+            home.publish("Documents/a.txt"),
+            home.call(
+                "rename",
+                json!({ "uri": home.uri("Documents/a.txt"), "name": "b.txt" })
+            )
         );
-        let unpublish = home
-            .call("unpublish", json!({ "uri": home.uri("Documents/c.txt") }))
-            .await;
-        assert_eq!(unpublish["status"], "ok", "{unpublish}");
-        assert!(home.stat("Documents/c.txt").await["publication"].is_null());
+        assert_eq!(rename["status"], "ok", "{rename}");
+        // Whichever ran first, no publication is left at a missing path.
+        for record in plain_publish_records(home.dir.path(), home.principal) {
+            assert_eq!(record.object_uri, home.uri("Documents/b.txt"), "{publish}");
+        }
+        if publish["status"] == "ok" {
+            assert_eq!(
+                home.stat("Documents/b.txt").await["publication"]["cid"],
+                publish["data"]["cid"]
+            );
+        }
     }
 
     #[tokio::test]
@@ -10072,44 +10333,66 @@ mod publish_tests {
         let home = home("did:key:z6MkAttachInterrupted").await;
         home.write("Documents/post.txt", b"post me").await;
         let uri = home.uri("Documents/post.txt");
-        // Bound, published and recorded, but the binding never got its id.
-        write_runtime_json(
-            home.dir.path(),
-            home.principal,
-            &chat_attach_binding_uri(home.principal, "chat-attach:cut"),
-            &ChatAttachBinding {
-                schema: "elastos.library.chat-attach/v1".to_string(),
-                request_id: "chat-attach:cut".to_string(),
-                uri: uri.clone(),
-                if_revision: None,
-                publication_id: None,
-                name: None,
-                size_bytes: None,
-            },
-        )
-        .unwrap();
-        let published = home.publish("Documents/post.txt").await;
-        let attach = || {
+        let bind = |request_id: &str, publication_id: &str| {
+            write_runtime_json(
+                home.dir.path(),
+                home.principal,
+                &chat_attach_binding_uri(home.principal, request_id),
+                &ChatAttachBinding {
+                    schema: "elastos.library.chat-attach/v1".to_string(),
+                    request_id: request_id.to_string(),
+                    uri: uri.clone(),
+                    if_revision: None,
+                    publication_id: publication_id.to_string(),
+                    bound_at: now_ts(),
+                    name: None,
+                    size_bytes: None,
+                },
+            )
+            .unwrap();
+        };
+        let attach = |request_id: &'static str| {
             chat_attach_publication(
                 home.dir.path(),
                 &home.registry,
                 home.principal,
-                "chat-attach:cut",
+                request_id,
                 &uri,
                 None,
                 || Ok(()),
             )
         };
-        let resumed = attach().await.unwrap();
-        assert_eq!(resumed.cid, published["data"]["cid"].as_str().unwrap());
+        // Bound and recorded under its own id; the binding was not updated.
+        bind("chat-attach:cut", "intended-id");
+        let recorded = {
+            let _serialized = PUBLICATIONS.lock().await;
+            publish_library_uri_locked(
+                home.dir.path(),
+                &home.registry,
+                home.principal,
+                &uri,
+                None,
+                Some("intended-id".to_string()),
+            )
+            .await
+            .unwrap()
+        };
+        let resumed = attach("chat-attach:cut").await.unwrap();
+        assert_eq!(resumed.cid, recorded.cid);
         assert_eq!(resumed.name, "post.txt");
         assert_eq!(resumed.size_bytes, 7);
+        // A second request bound before it reused that publication.
+        bind("chat-attach:reuse", "never-recorded");
+        let reused = attach("chat-attach:reuse").await.unwrap();
+        assert_eq!(reused.cid, recorded.cid);
         assert_eq!(home.requests("publish").len(), 1);
 
         let unpublish = home.call("unpublish", json!({ "uri": uri })).await;
         assert_eq!(unpublish["status"], "ok", "{unpublish}");
-        let replay = attach().await.err().unwrap();
-        assert_eq!(find_library_refusal(&replay).unwrap().code, "withdrawn");
+        for request_id in ["chat-attach:cut", "chat-attach:reuse"] {
+            let replay = attach(request_id).await.err().unwrap();
+            assert_eq!(find_library_refusal(&replay).unwrap().code, "withdrawn");
+        }
         assert_eq!(home.requests("publish").len(), 1);
     }
 
@@ -10201,7 +10484,7 @@ mod publish_tests {
             )
             .await;
         assert_eq!(unpublish["status"], "ok", "{unpublish}");
-        assert_eq!(home.requests("unpublish")[0]["cid"], cid);
+        assert!(!cid_is_published_here(home.dir.path(), &cid));
         let trash = home
             .call("trash", json!({ "uri": home.uri("Documents/Moved") }))
             .await;

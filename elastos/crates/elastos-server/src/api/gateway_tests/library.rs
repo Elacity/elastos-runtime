@@ -11680,10 +11680,7 @@ async fn test_library_provider_unpublish_and_repair_update_status() {
         .unwrap()
         .starts_with("bafkrei"));
     assert_eq!(unpublish["data"]["object"].get("published_cid"), None);
-    assert_eq!(
-        unpublish["data"]["object"]["availability"],
-        "local_unpinned"
-    );
+    assert_eq!(unpublish["data"]["object"]["availability"], "withdrawn");
 
     let (repair_status, repair) = post_library(
         app.clone(),
@@ -11751,22 +11748,24 @@ async fn unpublishing_one_persons_publication_keeps_another_persons_identical_by
         people.push((token, uri));
     }
 
-    // Alma withdraws: Bruno's publication of the same CID keeps it pinned.
+    // Alma withdraws: Bruno's publication of the same CID stays served.
     let (token, uri) = &people[0];
     let (_, unpublish) = post_library(app.clone(), token, "unpublish", json!({ "uri": uri })).await;
     assert_eq!(unpublish["status"], "ok", "{unpublish}");
-    assert_eq!(
-        unpublish["data"]["availability"]["status"],
-        "publication_released"
-    );
+    assert_eq!(unpublish["data"]["availability"]["status"], "withdrawn");
+    assert!(crate::library::cid_is_published_here(
+        dir.path(),
+        TEST_CIDV1
+    ));
     let (token, uri) = &people[1];
     let (_, status) = post_library(app.clone(), token, "status", json!({ "uri": uri })).await;
     assert_eq!(status["data"]["object"]["published"], true, "{status}");
 
-    // Bruno withdraws last: the CID is unpinned.
+    // Bruno withdraws last: nothing on this Home shares the CID any more.
     let (_, unpublish) = post_library(app.clone(), token, "unpublish", json!({ "uri": uri })).await;
-    assert_eq!(
-        unpublish["data"]["availability"]["status"],
-        "local_unpinned"
-    );
+    assert_eq!(unpublish["status"], "ok", "{unpublish}");
+    assert!(!crate::library::cid_is_published_here(
+        dir.path(),
+        TEST_CIDV1
+    ));
 }
