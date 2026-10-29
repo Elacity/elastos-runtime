@@ -329,7 +329,8 @@ assert(!browserJs.includes("Browser Engine Adapter returned an invalid") && !bro
 const homeVisual = read("scripts/home-camofox-smoke.mjs");
 const systemVisual = read("scripts/system-camofox-smoke.mjs");
 const passkeyVisual = read("scripts/home-passkey-virtual-auth-smoke.mjs");
-for (const surface of ["home-cli", "system", "marketplace", "services", "inbox", "library", "documents", "wallet", "browser"]) {
+// Services is hidden and not served, so its page has no visual check.
+for (const surface of ["home-cli", "system", "marketplace", "inbox", "library", "documents", "wallet", "browser"]) {
   assert(homeVisual.includes(`\"/apps/${surface}/\"`), `visual empty/error coverage is missing ${surface}`);
 }
 assert(
