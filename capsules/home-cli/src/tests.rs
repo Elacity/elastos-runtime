@@ -335,7 +335,6 @@ fn home_cli_line_mode_accepts_shared_snapshot_backed_commands() {
         "debug spaces",
         "debug spaces webspaces",
         "debug webspaces",
-        "debug services",
         "debug browser",
         "debug terminal",
         "debug contract",
@@ -373,6 +372,9 @@ fn home_cli_line_mode_accepts_shared_snapshot_backed_commands() {
         );
     }
     assert_eq!(normalize_contract_command("call"), "invoke");
+    // Services is hidden, so debug has no Services topic.
+    let line_views = include_str!("line_views.rs");
+    assert!(!line_views.contains("debug services") && !line_views.contains("\"services\" =>"));
 }
 
 #[test]
