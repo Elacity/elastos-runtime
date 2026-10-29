@@ -2474,12 +2474,12 @@ fn read_runtime_json<T: serde::de::DeserializeOwned>(
     data_dir: &Path,
     principal_id: &str,
     uri: &str,
-) -> Option<T> {
+) -> anyhow::Result<T> {
     let root = crate::auth::principal_localhost_root(principal_id);
-    let path = rooted_localhost_fs_path(data_dir, uri)?;
-    let bytes =
-        crate::auth::read_principal_root_object(data_dir, principal_id, &root, uri, &path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let path =
+        rooted_localhost_fs_path(data_dir, uri).ok_or_else(|| anyhow!("invalid Library path"))?;
+    let bytes = crate::auth::read_principal_root_object(data_dir, principal_id, &root, uri, &path)?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// Every readable `.json` entry of one Runtime Library folder.
@@ -2498,7 +2498,9 @@ fn read_runtime_json_dir<T: serde::de::DeserializeOwned>(
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().to_string())
         .filter(|name| name.ends_with(".json"))
-        .filter_map(|name| read_runtime_json(data_dir, principal_id, &format!("{dir_uri}/{name}")))
+        .filter_map(|name| {
+            read_runtime_json(data_dir, principal_id, &format!("{dir_uri}/{name}")).ok()
+        })
         .collect()
 }
 
@@ -2566,7 +2568,7 @@ pub(crate) async fn chat_attach_publication(
     let _serialized = PUBLICATIONS.lock().await;
     let uri = uri.trim();
     let binding_uri = chat_attach_binding_uri(principal_id, request_id);
-    let saved = read_runtime_json::<ChatAttachBinding>(data_dir, principal_id, &binding_uri);
+    let saved = read_runtime_json::<ChatAttachBinding>(data_dir, principal_id, &binding_uri).ok();
     if let Some(mut binding) = saved {
         if binding.uri != uri || binding.if_revision.as_deref() != if_revision {
             return Err(library_refusal(
@@ -7761,8 +7763,8 @@ fn library_roots(data_dir: &Path, principal_id: &str) -> Vec<LibraryRoot> {
     ]
     .into_iter()
     .map(|(id, label, uri, kind)| {
-        // Library offers no Publish, so it lists the Public place only while
-        // it holds items; the root says whether it does.
+        // The Public place says whether it holds items, so Library can list
+        // it only while it does.
         let metadata = (id == "public").then(|| {
             let (empty, item_count) = root_item_state(data_dir, principal_id, &uri);
             json!({
@@ -8138,17 +8140,11 @@ fn read_publish_record(
     object_uri: &str,
 ) -> anyhow::Result<LibraryPublishRecord> {
     let root = crate::auth::principal_localhost_root(principal_id);
-    let record_uri = publish_record_uri(&root, object_uri);
-    let record_path = rooted_localhost_fs_path(data_dir, &record_uri)
-        .ok_or_else(|| anyhow!("invalid library publish record path"))?;
-    let bytes = crate::auth::read_principal_root_object(
+    read_runtime_json(
         data_dir,
         principal_id,
-        &root,
-        &record_uri,
-        &record_path,
-    )?;
-    Ok(serde_json::from_slice(&bytes)?)
+        &publish_record_uri(&root, object_uri),
+    )
 }
 
 fn write_publish_record(
@@ -8164,20 +8160,11 @@ fn write_publish_record(
         set_published_index_entry(data_dir, principal_id, record, false)?;
     }
     let root = crate::auth::principal_localhost_root(principal_id);
-    let record_uri = publish_record_uri(&root, &record.object_uri);
-    let record_path = rooted_localhost_fs_path(data_dir, &record_uri)
-        .ok_or_else(|| anyhow!("invalid library publish record path"))?;
-    if let Some(parent) = record_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(record)?;
-    crate::auth::write_principal_root_object(
+    write_runtime_json(
         data_dir,
         principal_id,
-        &root,
-        &record_uri,
-        &record_path,
-        &bytes,
+        &publish_record_uri(&root, &record.object_uri),
+        record,
     )?;
     if active {
         set_published_index_entry(data_dir, principal_id, record, true)?;
@@ -8419,13 +8406,7 @@ fn remove_publish_record(
     object_uri: &str,
 ) -> anyhow::Result<()> {
     let root = crate::auth::principal_localhost_root(principal_id);
-    let record_path = rooted_localhost_fs_path(data_dir, &publish_record_uri(&root, object_uri))
-        .ok_or_else(|| anyhow!("invalid library publish record path"))?;
-    match fs::remove_file(record_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
+    remove_runtime_file(data_dir, &publish_record_uri(&root, object_uri))
 }
 
 /// A plain publication moves with its file on rename and move, so Unpublish

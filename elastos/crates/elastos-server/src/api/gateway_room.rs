@@ -1666,7 +1666,7 @@ pub(super) struct ChatRoomContactRequestBody {
 
 /// Sends a contact request to a Community participant chosen on their
 /// profile card, with or without Discovery, and answers like People's
-/// request by DID: `{status, display_name}`. They accept or decline it in
+/// request by DID: `{status, message}`. They accept or decline it in
 /// Inbox. A person visible in Discovery gets the request bound to their
 /// listing, which an alpha.25 Home can still receive.
 pub(super) async fn chat_room_contact_request(
