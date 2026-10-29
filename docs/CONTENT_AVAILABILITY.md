@@ -322,20 +322,15 @@ The built-in Carrier availability provider signs and broadcasts CID
 availability announcements on deterministic Carrier topics. When matching
 signed remote announcements already exist, it treats those announcements as
 candidate peers, invokes the remote peer's `content/ensure` over the Carrier
-provider plane, falls back first to bounded remote `content/import_object` for
-manifest-backed content objects, then to bounded remote `content/import_exact`
-for file-like CIDs when remote pin cannot fetch the object, verifies the same
-CID with remote `content/status`, and records `network_available` only when an
-independent remote provider proves a live pinned replica. `import_object`
-reconstructs the directory/object from the provider-owned object manifest and
-listed file bytes; `import_exact` accepts bytes through a provider stream
-envelope. Both fail closed unless the remote low-level content backend produces
-the exact requested CID; mismatched imports are unpinned. Successful remote
-`ensure`, `import_object`, or `import_exact` responses may also carry the remote
-content provider's signed availability receipt; Carrier verifies and summarizes
-that receipt in the peer-selection proof when present, including safe
-peer-selection, quota, repair-worker, and accounting posture without exposing
-raw provider internals.
+provider plane, verifies the same CID with remote `content/status`, and records
+`network_available` only when an independent remote provider proves a live
+pinned replica. In 0.8.0 Carrier pushes no copy to a replica (#498): when the
+remote ensure fails or reports `repair_needed`, `local_unpinned` or `unknown`,
+the replication is refused at once. A successful remote `ensure` response may
+also carry the remote content provider's signed availability receipt; Carrier
+verifies and summarizes that receipt in the peer-selection proof when present,
+including safe peer-selection, quota, repair-worker, and accounting posture
+without exposing raw provider internals.
 If only the local pin is proven, the honest state is
 `carrier_announced`; if requested replica/live-proof requirements are not met,
 the state is `repair_needed`. Repair-only local announcements omit fetch
@@ -528,26 +523,21 @@ delivery plus optional configured federated alert-exchange delivery when
 explicitly requested. Peer-attestation exchange policy posture is included in
 Carrier peer selection, provider proof summaries, and the operator dashboard so
 live peer proof is not confused with a production cross-runtime trust network.
-Carrier availability also emits `elastos.content.repair-graph/v1` metadata.
-Object-manifest and exact-byte repair remain bounded fallbacks, while arbitrary
-`ipld_dag` repair now routes through the Runtime-only `elastos://block-graph/*`
-provider path: Carrier asks local `content-block-graph-provider.export_graph`,
-then invokes remote `content-block-graph-provider.import_graph` over the
-provider plane. The provider uses the local `ipfs-provider` Kubo coordination
-file to exchange bounded DAG CAR bytes and pin the imported root. If Kubo or
-the provider is absent, the path fails closed and still refuses object/exact
-fallback.
+Carrier availability also emits `elastos.content.repair-graph/v1` metadata. In
+0.8.0 it reports `replication_import_unavailable` with no supported import
+fallbacks for every graph kind: Carrier copies no object, exact bytes or block
+graph to a replica (#498).
 Operators can inspect the same availability/storage state with `elastos content status` for the
 provider-wide dashboard or `elastos content status --cid <cid>` for a single
 object; both commands route through Runtime provider invocation and expose the
 provider status JSON without granting app capsules raw backend authority.
 With the built-in Carrier provider, that retry can execute the same remote
-`content/admission` + `content/ensure` + exact-import fallback +
-`content/status` proof path against signed remote announcements. Remote
+`content/admission` + `content/ensure` + `content/status` proof path against
+signed remote announcements. Remote
 admission is a provider-only preflight: the remote content provider evaluates
 projected principal storage quota and returns an
-`elastos.content.admission/v1` receipt before Carrier sends exact bytes, object
-manifests, or block-graph repair data. Carrier verifies that signed receipt and
+`elastos.content.admission/v1` receipt before Carrier asks for the ensure.
+Carrier verifies that signed receipt and
 its payload/CID binding before trusting the admission decision. When a live
 multi-peer proof is required, Carrier keeps at least one remote provider
 invocation in the candidate budget when quota permits it, even if the reported
@@ -654,11 +644,11 @@ uses `carrier-provider-plane` `provider_invoke` to call remote
 peers serve from their own content provider without recursive availability
 loops or app-visible backend authority. The built-in availability provider
 decodes the returned stream envelope before returning the normal byte response.
-For replication, the same provider plane now calls remote `content/ensure`,
-remote `content/import_object` when a manifest-backed object needs
-provider-owned reconstruction, remote `content/import_exact` when a file-like
-CID needs byte-push fallback, and remote `content/status`; `network_available`
-requires that remote proof.
+For replication, the same provider plane calls remote `content/ensure` and
+remote `content/status`; `network_available` requires that remote proof. It
+pushes no bytes, objects or block graphs to a replica in 0.8.0 (#498): a replica
+that does not already hold the CID is refused at once with "Copies to your own
+devices come in a later update."
 Verified remote content availability receipts are included in the proof
 metadata when the remote content provider returns them, including safe
 peer-selection, quota, repair-worker, and accounting posture; selected remote
@@ -781,11 +771,9 @@ setting `ELASTOS_AVAILABILITY_ENSURE_URL` or
 `ELASTOS_AVAILABILITY_PROVIDER_CONFIG`. If no external target is configured,
 the built-in Carrier availability provider signs and announces the CID on
 Carrier, attempts remote provider-mediated replication proof from signed remote
-announcements, uses bounded `content/import_exact` byte-push fallback for
-file-like exact-CID imports and bounded `content/import_object` fallback for
-manifest-backed content objects when remote pin cannot fetch, records
-`network_available` only after remote `content/ensure`/`import_object` or
-`import_exact` plus `content/status` proves a live independent replica,
+announcements, records `network_available` only after remote `content/ensure`
+plus `content/status` proves a live independent replica the peer already
+holds (it pushes no copy in 0.8.0, #498),
 verifies/summarizes remote content availability receipts when present, and otherwise records
 `carrier_announced` or `repair_needed`; if Carrier is unavailable, publish
 remains honestly local or `repair_needed`. Public gateway

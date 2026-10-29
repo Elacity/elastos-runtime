@@ -2199,50 +2199,88 @@ fn stop_online_kubo_with_lock(data_dir: &Path, repo_dir: &Path) -> Result<(), St
 /// Retires a coord file without `offline`, under the startup lock. A daemon
 /// whose API answers with this repo's peer identity is asked to stop through
 /// that API and is never signalled. One that has not stopped within
-/// `KUBO_STOP_TIMEOUT` keeps its coord and the offline start is refused, so a
-/// second daemon never opens the repo. Any other process (a reused PID, a
-/// different repo's Kubo) is left alone and only the coord goes.
+/// `KUBO_STOP_TIMEOUT`, or whose identity check gets no clear answer, keeps
+/// its coord and the offline start is refused, so a second daemon never opens
+/// the repo. Any other process (a reused PID with no API, a different repo's
+/// Kubo) is left alone and only the coord goes.
 fn retire_online_coord(coord: &CoordFile, data_dir: &Path, repo_dir: &Path) -> Result<(), String> {
     let pid = coord.kubo_pid;
     if is_pid_alive(pid) {
-        if api_is_this_repos_kubo(coord.api_port, repo_dir) {
-            eprintln!("ipfs-provider: stopping online Kubo pid={pid} through its API; it restarts offline");
-            let _ = ureq::post(&kubo_rpc_url(coord.api_port, "shutdown", &[]))
-                .timeout(KUBO_API_CHECK_TIMEOUT)
-                .call();
-            let deadline = Instant::now() + KUBO_STOP_TIMEOUT;
-            while !online_kubo_stopped(coord) {
-                if Instant::now() >= deadline {
-                    let error = format!(
-                        "online Kubo pid {pid} did not stop through its API; offline start refused"
-                    );
-                    eprintln!("ipfs-provider: {error}");
-                    return Err(error);
+        match api_identity(coord.api_port, repo_dir) {
+            ApiIdentity::ThisRepo => {
+                eprintln!("ipfs-provider: stopping online Kubo pid={pid} through its API; it restarts offline");
+                let _ = ureq::post(&kubo_rpc_url(coord.api_port, "shutdown", &[]))
+                    .timeout(KUBO_API_CHECK_TIMEOUT)
+                    .call();
+                let deadline = Instant::now() + KUBO_STOP_TIMEOUT;
+                while !online_kubo_stopped(coord) {
+                    if Instant::now() >= deadline {
+                        return Err(migration_refused(format!(
+                            "online Kubo pid {pid} did not stop through its API"
+                        )));
+                    }
+                    std::thread::sleep(KUBO_STOP_POLL_INTERVAL);
                 }
-                std::thread::sleep(KUBO_STOP_POLL_INTERVAL);
             }
-        } else {
-            eprintln!("ipfs-provider: pid {pid} is not this repo's Kubo; left running");
+            ApiIdentity::Unknown => {
+                return Err(migration_refused(format!(
+                    "online Kubo pid {pid} gave no clear answer to its identity check"
+                )));
+            }
+            ApiIdentity::Other => {
+                eprintln!("ipfs-provider: pid {pid} is not this repo's Kubo; left running");
+            }
         }
     }
     remove_coord_file(data_dir);
     Ok(())
 }
 
-/// Whether the Kubo API on `api_port` answers `/id` with the peer identity in
-/// `repo_dir`'s config.
-fn api_is_this_repos_kubo(api_port: u16, repo_dir: &Path) -> bool {
-    let repo_peer = fs::read(repo_dir.join("config"))
+/// Logs a migration that cannot finish now; its coord stays for the next try.
+fn migration_refused(reason: String) -> String {
+    let error = format!("{reason}; offline start refused");
+    eprintln!("ipfs-provider: {error}");
+    error
+}
+
+enum ApiIdentity {
+    /// The API answered `/id` with this repo's peer identity.
+    ThisRepo,
+    /// Not this repo's daemon: the repo has no identity, nothing listens on
+    /// the API port, or the API answered with another identity.
+    Other,
+    /// A timeout, an HTTP error or an unreadable answer.
+    Unknown,
+}
+
+/// What the Kubo API on `api_port` says about `repo_dir`'s peer identity.
+fn api_identity(api_port: u16, repo_dir: &Path) -> ApiIdentity {
+    let Some(repo_peer) = fs::read(repo_dir.join("config"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|config| config["Identity"]["PeerID"].as_str().map(str::to_owned));
-    let api_peer = ureq::post(&kubo_rpc_url(api_port, "id", &[]))
+        .and_then(|config| config["Identity"]["PeerID"].as_str().map(str::to_owned))
+    else {
+        return ApiIdentity::Other;
+    };
+    let response = match ureq::post(&kubo_rpc_url(api_port, "id", &[]))
         .timeout(KUBO_API_CHECK_TIMEOUT)
         .call()
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Transport(error)) if error.kind() == ureq::ErrorKind::ConnectionFailed => {
+            return ApiIdentity::Other;
+        }
+        Err(_) => return ApiIdentity::Unknown,
+    };
+    match response
+        .into_json::<serde_json::Value>()
         .ok()
-        .and_then(|resp| resp.into_json::<serde_json::Value>().ok())
-        .and_then(|id| id["ID"].as_str().map(str::to_owned));
-    repo_peer.is_some() && repo_peer == api_peer
+        .and_then(|id| id["ID"].as_str().map(str::to_owned))
+    {
+        Some(api_peer) if api_peer == repo_peer => ApiIdentity::ThisRepo,
+        Some(_) => ApiIdentity::Other,
+        None => ApiIdentity::Unknown,
+    }
 }
 
 /// Whether an online daemon asked to shut down is gone: its API refuses
@@ -3925,6 +3963,68 @@ mod tests {
             !provider.repo_dir.with_extension("started").exists(),
             "a second daemon started"
         );
+    }
+
+    /// An identity check without a clear answer (a slow `/id`, an HTTP error,
+    /// an unreadable body) is not a different identity: the coord stays, the
+    /// process is left running and no second daemon starts on the repo.
+    #[test]
+    #[cfg(unix)]
+    fn unclear_identity_answer_keeps_the_coord_and_starts_nothing() {
+        for case in ["slow", "http error", "invalid json"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut provider = cold_fixture_provider(root.path());
+            provider.kubo_binary = Some(kubo_fixture(root.path()));
+            fs::create_dir_all(&provider.repo_dir).unwrap();
+            fs::write(
+                provider.repo_dir.join("config"),
+                br#"{"Identity":{"PeerID":"mine"}}"#,
+            )
+            .unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let api_port = listener.local_addr().unwrap().port();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
+            let api = std::thread::spawn(move || {
+                let mut held = Vec::new();
+                while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                    let Ok((mut socket, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    let reply: &[u8] = match case {
+                        "http error" => b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        "invalid json" => b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot json",
+                        _ => b"",
+                    };
+                    if read_fixture_request(&mut socket).is_some() {
+                        let _ = socket.write_all(reply);
+                    }
+                    held.push(socket);
+                }
+            });
+            let mut process = Command::new("sleep").arg("60").spawn().unwrap();
+            write_old_coord(root.path(), process.id(), api_port);
+            let started = Instant::now();
+            let result = provider.ensure_kubo();
+            let elapsed = started.elapsed();
+            let still_running = process.try_wait().unwrap().is_none();
+            let coord = read_coord_file(root.path());
+            let _ = process.kill();
+            process.wait().unwrap();
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            api.join().unwrap();
+            let error = result.unwrap_err();
+            assert!(error.contains("no clear answer"), "{case}: {error}");
+            assert!(still_running, "{case}: the process was signalled");
+            assert!(coord.is_some_and(|coord| !coord.offline), "{case}");
+            assert!(
+                !provider.repo_dir.with_extension("started").exists(),
+                "{case}: a second daemon started"
+            );
+            assert!(elapsed < Duration::from_secs(3), "{case}: {elapsed:?}");
+        }
     }
 
     /// Kubo runs offline, so a CID this repo lacks fails on its one local

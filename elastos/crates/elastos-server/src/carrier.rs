@@ -99,13 +99,10 @@ const CONTENT_AVAILABILITY_ANNOUNCEMENT_DOMAIN: &str =
     "elastos.content.availability.announcement.v1";
 const CONTENT_ADMISSION_DOMAIN: &str = "elastos.content.admission.v1";
 const CONTENT_REPAIR_GRAPH_SCHEMA: &str = "elastos.content.repair-graph/v1";
-const CONTENT_BLOCK_GRAPH_SCHEMA: &str = "elastos.content.block-graph/v1";
 const CONTENT_FEDERATED_QUOTA_LEDGER_POLICY_SCHEMA: &str =
     "elastos.content.federated-quota-ledger-policy/v1";
 const CONTENT_STORAGE_MARKET_ADMISSION_POLICY_SCHEMA: &str =
     "elastos.content.storage-market-admission-policy/v1";
-const CONTENT_BLOCK_GRAPH_PROVIDER: &str = "content-block-graph-provider";
-const CONTENT_BLOCK_GRAPH_TARGET: &str = "block-graph";
 const CARRIER_PEER_REPUTATION_SCHEMA: &str = "elastos.carrier.peer-reputation/v1";
 const CARRIER_LOCAL_HOLDER_ANNOUNCEMENTS_SCHEMA: &str =
     "elastos.carrier.local-holder-announcements/v1";
@@ -4102,10 +4099,6 @@ impl CarrierRepairGraphKind {
             Self::IpldDag => "ipld_dag",
         }
     }
-
-    fn supports_current_import_fallback(self) -> bool {
-        !matches!(self, Self::IpldDag)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -6141,36 +6134,18 @@ fn carrier_repair_worker_json(scheduled: bool, availability_status: &str) -> ser
     })
 }
 
+/// 0.8.0 copies nothing to a replica (#498): a replica proves only content it
+/// already holds, whatever graph kind is requested.
 fn carrier_repair_graph_policy_json(
     requirements: CarrierAvailabilityRequirements,
 ) -> serde_json::Value {
-    let current_modes = ["object_manifest", "exact_bytes"];
-    let requested_kind = requirements.repair_graph_kind.as_str();
-    let supported = requirements
-        .repair_graph_kind
-        .supports_current_import_fallback();
     serde_json::json!({
         "schema": CONTENT_REPAIR_GRAPH_SCHEMA,
-        "policy": "carrier_provider_bounded_graph_repair",
-        "requested_kind": requested_kind,
-        "status": if supported {
-            "bounded_import_supported"
-        } else {
-            "unsupported_without_block_graph_provider"
-        },
-        "supported_import_fallbacks": current_modes,
+        "policy": "carrier_replica_holds_only",
+        "requested_kind": requirements.repair_graph_kind.as_str(),
+        "status": "replication_import_unavailable",
+        "supported_import_fallbacks": [],
         "refuses_exact_fallback_for_arbitrary_dag": true,
-        "block_graph_contract": {
-            "provider": CONTENT_BLOCK_GRAPH_PROVIDER,
-            "target": CONTENT_BLOCK_GRAPH_TARGET,
-            "schema": CONTENT_BLOCK_GRAPH_SCHEMA,
-            "operations": ["export_graph", "import_graph", "status"]
-        },
-        "requires_provider": if supported {
-            serde_json::Value::Null
-        } else {
-            serde_json::Value::String(CONTENT_BLOCK_GRAPH_PROVIDER.to_string())
-        },
     })
 }
 
@@ -17092,7 +17067,11 @@ pub(crate) mod tests {
         );
         assert_eq!(
             availability["repair_graph"]["status"],
-            "bounded_import_supported"
+            "replication_import_unavailable"
+        );
+        assert_eq!(
+            availability["repair_graph"]["supported_import_fallbacks"],
+            serde_json::json!([])
         );
         assert_eq!(
             availability["repair_graph"]["refuses_exact_fallback_for_arbitrary_dag"],

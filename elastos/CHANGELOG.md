@@ -37,10 +37,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Each Home's IPFS store now runs offline. It no longer joins, announces to or
   fetches from the public IPFS network; content moves between Homes only over
   Carrier. A Home that already runs IPFS from an earlier version restarts it
-  offline after the update, keeping everything it holds. Content a Home lacks
-  now fails at once locally and comes from Carrier instead of waiting minutes
-  on a network search. Copies to your own devices are not available in 0.8.0
-  (#498).
+  offline after the update, keeping everything it holds, unless the old file
+  service doesn't stop; then on the next restart. Content a Home lacks now
+  fails at once locally and comes from Carrier instead of waiting minutes on a
+  network search.
   `elastos run --cid` and `elastos serve --cid` open only what this Home
   holds; for anything else they stop at once and say to open it from Home.
   Content held only outside ElastOS, such as a pasted ipfs.io link, no longer
@@ -88,11 +88,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   received). Unpublishing releases that one publication: the file stays shared
   while another publication of the same bytes on this Home holds it, and
   copies people already have stay.
-- In this release the seed accepts no new copies of a Home's files; copies it
-  already holds stay. Your own devices accept new copies of a Home's files only
-  when you allow it: on each device, run
-  `elastos node peer add --did <home-did> --allow content.replica` and repeat
-  every `--allow` that Home already had. Copies a device already holds stay.
+- In this release neither the seed nor your own devices accept new copies of a
+  Home's files (#498). Copies they already hold stay.
 - Chat and Inbox say less. A Chat profile card shows one state, such as
   Request sent, Contact or Wants to add you. A person in Chat's People list
   shows one fact, such as Home online or Last message yesterday. A Direct
