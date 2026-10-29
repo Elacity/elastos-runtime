@@ -13422,3 +13422,55 @@ async fn home_shared_content_check_then_get_fetches_a_contacts_linked_file_once(
     crate::carrier::tests::shutdown_test_carrier_node(bob_home.node).await;
     crate::carrier::tests::shutdown_test_carrier_node(alice_node).await;
 }
+
+#[tokio::test]
+async fn a_published_file_is_served_only_to_the_publishers_contacts() {
+    let alice_dir = tempfile::tempdir().unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    let carol_dir = tempfile::tempdir().unwrap();
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let (trusted_key, _) = generate_keypair();
+    let network = configured_discovery_network_profile_for_test(&trusted_key, "services-contacts");
+    let alice =
+        services_contact_fixture(alice_dir.path(), "Alice", bus.clone(), network.clone()).await;
+    let bob = services_contact_fixture(bob_dir.path(), "Bob", bus.clone(), network.clone()).await;
+    let carol = services_contact_fixture(carol_dir.path(), "Carol", bus, network.clone()).await;
+    accept_services_contact_pair(&alice, &bob);
+    let device = |fixture: &ServicesContactFixture| {
+        iroh::PublicKey::from_bytes(&fixture.device_key.verifying_key().to_bytes()).unwrap()
+    };
+    let read = |source: iroh::PublicKey, cid: String, network: Option<_>| {
+        let dir = bob_dir.path().to_path_buf();
+        async move {
+            crate::carrier::admit_carrier_peer_content_fetch(
+                &dir,
+                network,
+                &source,
+                &json!({ "cid": cid }),
+            )
+            .await
+            .is_ok()
+        }
+    };
+
+    // Bob published a file: his contact Alice gets it, Carol (no contact)
+    // does not, and nobody does without the contacts network.
+    let cid = crate::carrier::tests::raw_bytes_cid(b"a file Bob published");
+    crate::library::publish_cid_for_contacts_for_test(
+        bob_dir.path(),
+        &bob.authority.principal_id,
+        &cid,
+    );
+    assert!(read(device(&alice), cid.clone(), Some(&network)).await);
+    assert!(!read(device(&carol), cid.clone(), Some(&network)).await);
+    assert!(!read(device(&alice), cid.clone(), None).await);
+
+    // A file Bob received in Chat is pinned on his Home but published by
+    // nobody: never served, not even to a contact.
+    let received = crate::carrier::tests::raw_bytes_cid(b"a file Bob received");
+    assert!(!read(device(&alice), received, Some(&network)).await);
+
+    // Withdrawn: Alice no longer gets it.
+    crate::library::withdraw_cid_for_test(bob_dir.path(), &cid);
+    assert!(!read(device(&alice), cid, Some(&network)).await);
+}

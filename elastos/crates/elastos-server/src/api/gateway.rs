@@ -144,7 +144,7 @@ pub(in crate::api) use gateway_home_system::profile_readiness_for_principal;
 use gateway_home_system::*;
 pub(crate) use gateway_home_system::{
     authorize_home_engine_preparation_cancellation, authorize_home_service_engine,
-    authorize_home_service_exit, sync_runtime_services_mailboxes,
+    authorize_home_service_exit, carrier_source_is_contact_of, sync_runtime_services_mailboxes,
 };
 use gateway_home_terminal::*;
 pub(crate) use gateway_home_token::home_launch_auth_data_dir;

@@ -8188,14 +8188,36 @@ fn write_publish_record(
 const PUBLISHED_INDEX_SCHEMA: &str = "elastos.library.published-cids/v1";
 
 /// This Home's active publications, by every person, as the CIDs each one
-/// shares: the only thing a peer read of an ordinary Home is served on.
-/// Keys are opaque digests of person and publication; the records stay the
-/// source of truth and the index is reconciled from them at start.
+/// shares and who may read them: the only thing a peer read of an ordinary
+/// Home is served on. Keys are opaque digests of person and publication; the
+/// records stay the source of truth and the index is reconciled from them at
+/// start.
 #[derive(Default, Serialize, Deserialize)]
 struct PublishedIndex {
     schema: String,
     #[serde(default)]
-    publications: std::collections::BTreeMap<String, BTreeSet<String>>,
+    publications: std::collections::BTreeMap<String, PublishedEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PublishedEntry {
+    /// The person who published: a plain publication is for their contacts.
+    principal_id: String,
+    cids: BTreeSet<String>,
+    /// A protected listing's sealed payload, readable by any peer: opening it
+    /// needs the key release a purchase grants.
+    #[serde(default)]
+    any_peer: bool,
+}
+
+impl PublishedEntry {
+    fn of(principal_id: &str, record: &LibraryPublishRecord) -> Self {
+        Self {
+            principal_id: principal_id.to_string(),
+            cids: record_shared_cids(record),
+            any_peer: record_is_runtime_custody(record),
+        }
+    }
 }
 
 static PUBLISHED_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -8273,21 +8295,46 @@ fn set_published_index_entry(
     let key = published_index_key(principal_id, record);
     update_published_index(data_dir, |index| {
         if active {
-            index.publications.insert(key, record_shared_cids(record));
+            index
+                .publications
+                .insert(key, PublishedEntry::of(principal_id, record));
         } else {
             index.publications.remove(&key);
         }
     })
 }
 
-/// Whether some active publication on this Home shares `cid`. An index that
-/// cannot be read shares nothing.
-pub(crate) fn cid_is_published_here(data_dir: &Path, cid: &str) -> bool {
+/// Who may read `cid` from this Home: `None` when no active publication
+/// lists it, or the index cannot be read.
+pub(crate) struct PublishedAudience {
+    pub(crate) any_peer: bool,
+    /// The people whose publications list it; their contacts may read it.
+    pub(crate) principals: BTreeSet<String>,
+}
+
+pub(crate) fn published_cid_audience(data_dir: &Path, cid: &str) -> Option<PublishedAudience> {
     let _guard = PUBLISHED_INDEX_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    load_published_index(data_dir)
-        .is_ok_and(|index| index.publications.values().any(|cids| cids.contains(cid)))
+    let index = load_published_index(data_dir).ok()?;
+    let mut audience = PublishedAudience {
+        any_peer: false,
+        principals: BTreeSet::new(),
+    };
+    for entry in index
+        .publications
+        .values()
+        .filter(|entry| entry.cids.contains(cid))
+    {
+        audience.any_peer |= entry.any_peer;
+        audience.principals.insert(entry.principal_id.clone());
+    }
+    (!audience.principals.is_empty()).then_some(audience)
+}
+
+#[cfg(test)]
+pub(crate) fn cid_is_published_here(data_dir: &Path, cid: &str) -> bool {
+    published_cid_audience(data_dir, cid).is_some()
 }
 
 /// Brings the index in line with every publish record this Runtime can read
@@ -8304,15 +8351,15 @@ pub fn reconcile_published_cids(data_dir: &Path) {
         for record in publish_records(data_dir, principal) {
             entries.push((
                 published_index_key(principal, &record),
-                record_is_published(&record).then(|| record_shared_cids(&record)),
+                record_is_published(&record).then(|| PublishedEntry::of(principal, &record)),
             ));
         }
     }
     if let Err(err) = update_published_index(data_dir, |index| {
-        for (key, cids) in entries {
-            match cids {
-                Some(cids) => {
-                    index.publications.insert(key, cids);
+        for (key, entry) in entries {
+            match entry {
+                Some(entry) => {
+                    index.publications.insert(key, entry);
                 }
                 None => {
                     index.publications.remove(&key);
@@ -8324,13 +8371,35 @@ pub fn reconcile_published_cids(data_dir: &Path) {
     }
 }
 
-/// Lists `cid` as published on this Home, as a test fixture's holder does.
+/// Lists `cid` as published on this Home for any peer, as a test fixture's
+/// holder does.
 #[cfg(test)]
 pub(crate) fn publish_cid_for_test(data_dir: &Path, cid: &str) {
     update_published_index(data_dir, |index| {
-        index
-            .publications
-            .insert(format!("test:{cid}"), BTreeSet::from([cid.to_string()]));
+        index.publications.insert(
+            format!("test:{cid}"),
+            PublishedEntry {
+                principal_id: "test".to_string(),
+                cids: BTreeSet::from([cid.to_string()]),
+                any_peer: true,
+            },
+        );
+    })
+    .unwrap();
+}
+
+/// Lists `cid` as `principal_id`'s Library publication, for their contacts.
+#[cfg(test)]
+pub(crate) fn publish_cid_for_contacts_for_test(data_dir: &Path, principal_id: &str, cid: &str) {
+    update_published_index(data_dir, |index| {
+        index.publications.insert(
+            format!("test:{cid}"),
+            PublishedEntry {
+                principal_id: principal_id.to_string(),
+                cids: BTreeSet::from([cid.to_string()]),
+                any_peer: false,
+            },
+        );
     })
     .unwrap();
 }
@@ -10018,6 +10087,12 @@ mod publish_tests {
         assert_refused(&protected, "unsupported");
         assert_eq!(protected["reason"], "protected");
         assert!(home.requests("publish").is_empty());
+        // Buyers fetch the sealed payload and listing from any Home: an
+        // active protected publication is served to any peer.
+        for cid in ["bafyprotected", "bafylisting"] {
+            let audience = published_cid_audience(home.dir.path(), cid).unwrap();
+            assert!(audience.any_peer, "{cid}");
+        }
     }
 
     #[tokio::test]

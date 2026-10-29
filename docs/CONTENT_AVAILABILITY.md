@@ -611,9 +611,12 @@ Library publication records of every person on the Home, kept as a small
 index of published CIDs that changes with the records and is reconciled from
 them at start. A pin is only local storage (published files, files received in
 Chat, models and withdrawn publications all use it), so pinned alone is never
-served. Unpublish withdraws the record, and new transfers stop at once; the pin
-stays until a later cleanup removes pins nothing needs. A peer the owner gave
-`content.replica` also reads what the Home pins. Library Publish and its Repair
+served. A Library publication is served only to a peer whose authenticated
+Carrier device belongs to an accepted contact of the person who published it;
+a protected listing's sealed payload is served to any peer, since opening it
+needs a purchase's key release. Unpublish withdraws the record, and new
+transfers stop at once; the pin stays until a later cleanup removes pins
+nothing needs. Library Publish and its Repair
 pin on this Home only (`local_pin`), with no availability wait; Publish pins
 first and records second, so an interrupted publish leaves a pinned CID that is
 not served. The answer goes out in one message after a second check, so a read

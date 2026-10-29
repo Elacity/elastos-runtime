@@ -4200,6 +4200,38 @@ fn accepted_contact_for_carrier_source(
         .map(|contact| contact.remote_presence_device_did().to_string()))
 }
 
+/// Whether the Carrier peer `source` is an accepted contact of any of
+/// `principals` on this Home: the people a published file is for. A store
+/// that cannot be read counts as no contact.
+pub(crate) fn carrier_source_is_contact_of(
+    data_dir: &std::path::Path,
+    network: &crate::collaboration_network::VerifiedCollaborationNetworkProfile,
+    principals: &std::collections::BTreeSet<String>,
+    source: &iroh::PublicKey,
+) -> bool {
+    let Ok(Some(local_did)) =
+        crate::collaboration_profile_authority::load_existing_device_did(data_dir)
+    else {
+        return false;
+    };
+    let Ok(records) = crate::auth::active_passkey_principals(data_dir) else {
+        return false;
+    };
+    passkey_principals_once(records)
+        .into_iter()
+        .filter(|(principal, _)| principals.contains(&principal.principal_id))
+        .any(|(principal, _)| {
+            let context = HomeLaunchTokenContext {
+                principal_id: principal.principal_id,
+                proof_binding_id: Some(principal.proof_binding_id),
+                session_id: String::new(),
+                grant_id: String::new(),
+            };
+            accepted_contact_for_carrier_source(data_dir, network, &context, &local_did, source)
+                .is_ok_and(|contact| contact.is_some())
+        })
+}
+
 /// One entry per principal from the active passkey records. A principal with
 /// several passkeys has one record per passkey but owns one set of service
 /// requests, so the grant loops must read it once. The flag is true only when
