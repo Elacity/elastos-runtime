@@ -5817,33 +5817,27 @@ pub(crate) mod tests {
                 }
             }
         }
-        let protected_home_dependencies = [
-            "chain-provider",
-            "wallet-provider",
-            "kubo",
-            "ipfs-provider",
-            "protected-content-protect-provider",
-            "media-provider",
-            "protected-content-decrypt-provider",
-            "library",
-            "marketplace",
+        // Hidden in 0.8.0: a fresh Home does not install them (no ffmpeg
+        // download either); each stays installable with `setup --with`.
+        let hidden = [
+            "services",
+            "wallet-walletconnect",
+            "content-block-graph-provider",
             "elacity-player",
+            "protected-content-protect-provider",
+            "protected-content-decrypt-provider",
+            "media-provider",
+            "media-tools",
         ];
-        {
-            let profile = &manifest.profiles["home"];
-            let profile_name = "home";
-            for dependency in protected_home_dependencies {
-                assert_eq!(
-                    profile
-                        .components
-                        .iter()
-                        .filter(|component| component.as_str() == dependency)
-                        .count(),
-                    1,
-                    "{profile_name} protected-content Home profile must include {dependency} exactly once"
-                );
-            }
+        for name in hidden {
+            assert!(
+                !selected.iter().any(|component| component == name),
+                "home must not install {name}"
+            );
         }
+        let with = hidden.map(str::to_string);
+        let on_request = resolve_components(&manifest, None, &with, &[]).unwrap();
+        assert_eq!(on_request, hidden);
         // Chain/wallet/DRM development providers stay out of Home and remain
         // reachable only as an explicit developer `--with`.
         let developer_providers = [
@@ -6119,13 +6113,14 @@ pub(crate) mod tests {
             components["external"]["elacity-player"]["install_path"],
             "capsules/elacity-player"
         );
+        // Protected content ships after 0.8.0: the Player installs only with `--with`.
         assert!(
-            components["profiles"]["home"]["components"]
+            !components["profiles"]["home"]["components"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|value| value == "elacity-player"),
-            "home must include the Elacity Player capsule"
+            "home must not install the Elacity Player capsule in 0.8.0"
         );
     }
 

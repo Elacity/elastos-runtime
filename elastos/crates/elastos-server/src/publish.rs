@@ -18,17 +18,14 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "webspace-provider",
     "wallet-provider",
     "object-provider",
-    "content-block-graph-provider",
     "ipfs-provider",
     "home-cli",
     "home-gui",
     "home",
     "system",
-    "services",
     "people",
     "wallet-metamask",
     "wallet-unisat",
-    "wallet-walletconnect",
     "wallet",
     "browser",
     "documents",
@@ -38,7 +35,6 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
     "inbox",
     "chat-room",
     "assistant",
-    "elacity-player",
     "model-provider",
 ];
 const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat", "home-agent"];
@@ -2308,8 +2304,15 @@ mod tests {
         expected.sort();
         assert_eq!(selected, expected);
         assert!(selected.contains(&"archive-manager".to_string()));
-        assert!(selected.contains(&"services".to_string()));
-        assert!(selected.contains(&"content-block-graph-provider".to_string()));
+        // Hidden in 0.8.0: still published as release assets for `setup --with`.
+        for hidden in [
+            "services",
+            "wallet-walletconnect",
+            "content-block-graph-provider",
+            "elacity-player",
+        ] {
+            assert!(!selected.contains(&hidden.to_string()), "{hidden}");
+        }
         assert!(selected.contains(&"chain-provider".to_string()));
         assert!(selected.contains(&"wallet-provider".to_string()));
         assert!(selected.contains(&"ipfs-provider".to_string()));

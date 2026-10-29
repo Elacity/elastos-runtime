@@ -595,7 +595,6 @@ for installed in \
     "${DATA_DIR}/bin/webspace-provider" \
     "${DATA_DIR}/bin/wallet-provider" \
     "${DATA_DIR}/bin/object-provider" \
-    "${DATA_DIR}/bin/content-block-graph-provider" \
     "${DATA_DIR}/capsules/home-cli/capsule.json" \
     "${DATA_DIR}/capsules/home/browser/index.html" \
     "${DATA_DIR}/capsules/home-cli/browser/index.html" \
@@ -603,7 +602,6 @@ for installed in \
     "${DATA_DIR}/capsules/home-gui/browser/home-gui-template.html" \
     "${DATA_DIR}/capsules/home-gui/browser/style.css" \
     "${DATA_DIR}/capsules/system/browser/index.html" \
-    "${DATA_DIR}/capsules/services/browser/index.html" \
     "${DATA_DIR}/capsules/people/browser/index.html" \
     "${DATA_DIR}/capsules/browser/browser/index.html" \
     "${DATA_DIR}/capsules/documents/browser/index.html" \
@@ -621,11 +619,26 @@ for installed in \
     "${DATA_DIR}/capsules/assistant/browser/index.html" \
     "${DATA_DIR}/capsules/wallet/browser/index.html" \
     "${DATA_DIR}/capsules/wallet-metamask/browser/index.html" \
-    "${DATA_DIR}/capsules/wallet-unisat/browser/index.html" \
-    "${DATA_DIR}/capsules/wallet-walletconnect/browser/index.html"
+    "${DATA_DIR}/capsules/wallet-unisat/browser/index.html"
 do
     if [[ ! -f "${installed}" ]]; then
         echo "expected installed file missing: ${installed}" >&2
+        exit 1
+    fi
+done
+# Hidden in 0.8.0: the Home profile leaves them out; `setup --with` adds them.
+for absent in \
+    "${DATA_DIR}/bin/content-block-graph-provider" \
+    "${DATA_DIR}/bin/media-provider" \
+    "${DATA_DIR}/bin/protected-content-protect-provider" \
+    "${DATA_DIR}/bin/protected-content-decrypt-provider" \
+    "${DATA_DIR}/tools/media-tools" \
+    "${DATA_DIR}/capsules/services" \
+    "${DATA_DIR}/capsules/elacity-player" \
+    "${DATA_DIR}/capsules/wallet-walletconnect"
+do
+    if [[ -e "${absent}" ]]; then
+        echo "hidden component installed by the Home profile: ${absent}" >&2
         exit 1
     fi
 done
