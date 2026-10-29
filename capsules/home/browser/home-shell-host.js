@@ -54,7 +54,7 @@ import {
   EXTERNAL_LINK_REQUEST_SCHEMA,
   HOME_OPEN_EXTERNAL_TYPE,
   MAX_EXTERNAL_LINK_LENGTH,
-} from "./home-external-link.js?v=home-links-20261028a";
+} from "./home-external-link.js?v=home-links-20261029a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -157,7 +157,6 @@ const homeExternalLinkPrompt = createHomeExternalLinkPrompt({
   asker: document.querySelector("#home-link-copy"),
   size: document.querySelector("#home-link-size"),
   status: document.querySelector("#home-link-status"),
-  linkLabel: document.querySelector("#home-link-label"),
   openSharedFile: (file, signal) => openHomeSharedFile(file, { openTarget: openTargetFromHomeGui, signal }),
   isLive: externalLinkSenderIsLive,
   otherSheetShown: () => !homeClipboardPromptRoot.hidden,

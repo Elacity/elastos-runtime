@@ -678,7 +678,6 @@ struct LibraryPost {
     revision: String,
     file_name: String,
     size_bytes: u64,
-    selection: SelectionGuard,
     phase: LibraryPostPhase,
 }
 
@@ -740,6 +739,18 @@ struct AttachLibraryInput<'a> {
     request_id: &'a str,
 }
 
+/// The Community post Chat shows: kept for Community across conversation
+/// switches and reconnects, hidden while a direct conversation is open.
+/// Generation guards cover only the picker delivery and in-flight requests.
+fn visible_library_post(state: &AppState) -> Option<&LibraryPost> {
+    state
+        .direct
+        .selected_conversation_id
+        .is_none()
+        .then_some(state.library_post.as_ref())
+        .flatten()
+}
+
 /// A Community picker selection: the Library file's address, revision, name
 /// and size. Bytes never travel through Chat for a Community post.
 fn library_post_from_selection(
@@ -748,7 +759,6 @@ fn library_post_from_selection(
     revision: Option<String>,
     file_name: String,
     size_bytes: Option<f64>,
-    selection: SelectionGuard,
 ) -> Result<LibraryPost, String> {
     let (Some(object_uri), Some(revision)) = (object_uri, revision) else {
         return Err("Choose the file again in Library.".to_string());
@@ -767,7 +777,6 @@ fn library_post_from_selection(
         revision,
         file_name,
         size_bytes,
-        selection,
         phase: LibraryPostPhase::Confirm,
     })
 }
@@ -2221,7 +2230,6 @@ impl App {
                             js_string_field(&data, "revision"),
                             file_name,
                             js_number_field(&data, "sizeBytes"),
-                            request.selection.clone(),
                         )
                     });
                     let accepted = match post {
@@ -3111,7 +3119,13 @@ impl App {
                 .filter(|value| !value.trim().is_empty())
         }
         .ok_or_else(|| "Create a join link first.".to_string())?;
-        copy_text_to_clipboard(&invite_url).await?;
+        write_home_clipboard(
+            "elastosChatCopyInvite",
+            &invite_url,
+            "Trusted Home Clipboard is unavailable.",
+            "Join link could not be copied. Try again.",
+        )
+        .await?;
         self.set_status("Copied", "Conversation join link copied.");
         Ok(())
     }
@@ -3552,12 +3566,7 @@ impl App {
     async fn run_library_post(self: &Rc<Self>) {
         let started = {
             let mut state = self.state.borrow_mut();
-            let allowed = state.community_send_enabled()
-                && state.direct.selected_conversation_id.is_none()
-                && state
-                    .library_post
-                    .as_ref()
-                    .is_some_and(|post| selection_guard_matches(&state, &post.selection));
+            let allowed = state.community_send_enabled() && visible_library_post(&state).is_some();
             match state.library_post.as_mut() {
                 Some(post)
                     if matches!(
@@ -4168,7 +4177,15 @@ impl App {
                 return;
             }
             let copied = match result {
-                Ok(response) => copy_profile_id_to_clipboard(&response.profile_id).await,
+                Ok(response) => {
+                    write_home_clipboard(
+                        "elastosChatCopyProfileId",
+                        &response.profile_id,
+                        "Open Chat from Home to copy a DID.",
+                        "DID could not be copied. Try again.",
+                    )
+                    .await
+                }
                 Err(error) => Err(error),
             };
             app.participant_profile_copying.set(false);
@@ -4707,10 +4724,7 @@ impl App {
         });
         // Direct conversations carry no files, so Attach shows only in Community.
         set_hidden(&self.attach_button, direct_mode || !controls.show_attach)?;
-        let library_post = state
-            .library_post
-            .as_ref()
-            .filter(|post| !direct_mode && selection_guard_matches(&state, &post.selection));
+        let library_post = visible_library_post(&state);
         self.render_library_post(library_post)?;
         self.attach_button.set_disabled(!controls.enable_attach);
         self.send_button.set_disabled(if direct_mode {
@@ -8278,20 +8292,40 @@ mod tests {
             revision: "rev:1".to_string(),
             file_name: "notes.txt".to_string(),
             size_bytes: 30,
-            selection: super::SelectionGuard {
-                generation: 0,
-                selected_conversation_id: None,
-            },
             phase,
         }
     }
 
     #[test]
-    fn community_picker_selection_names_a_library_file_by_address_and_revision() {
-        let guard = super::SelectionGuard {
-            generation: 0,
-            selected_conversation_id: None,
+    fn a_community_post_survives_conversation_switches_and_reconnects() {
+        let mut state = super::AppState {
+            session_active: true,
+            community_state: super::CommunityState::Live,
+            library_post: Some(library_post_fixture(super::LibraryPostPhase::Unknown {
+                link: None,
+            })),
+            ..Default::default()
         };
+        // Community, then a direct conversation, then Community again.
+        state.direct.selected_conversation_id = Some("direct:sha256:alma".to_string());
+        state.selection_generation += 1;
+        assert!(super::visible_library_post(&state).is_none());
+        state.direct.selected_conversation_id = None;
+        state.selection_generation += 1;
+        assert_eq!(
+            super::visible_library_post(&state).map(|post| post.request_id.as_str()),
+            Some("post-1")
+        );
+        // A reconnect bumps the generation and restores the session.
+        state.reconnect_needed = true;
+        state.selection_generation += 1;
+        assert!(!state.community_send_enabled());
+        state.reconnect_needed = false;
+        assert!(state.community_send_enabled() && super::visible_library_post(&state).is_some());
+    }
+
+    #[test]
+    fn community_picker_selection_names_a_library_file_by_address_and_revision() {
         let select = |uri: Option<&str>, revision: Option<&str>, size: Option<f64>| {
             super::library_post_from_selection(
                 "post-1".to_string(),
@@ -8299,7 +8333,6 @@ mod tests {
                 revision.map(str::to_string),
                 "notes.txt".to_string(),
                 size,
-                guard.clone(),
             )
         };
         let uri = Some("localhost://Users/alma/Documents/notes.txt");
@@ -10100,34 +10133,24 @@ fn set_hidden(element: &HtmlElement, hidden: bool) -> Result<(), JsValue> {
     }
 }
 
-async fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
-    let window = window().ok_or_else(|| "window unavailable".to_string())?;
-    let write_text = Reflect::get(window.as_ref(), &JsValue::from_str("elastosChatCopyInvite"))
+/// Calls one of the Home Clipboard writers chat-chrome.js installs on the
+/// window: `unavailable` when the writer is missing, `failed` when the write is.
+async fn write_home_clipboard(
+    writer: &str,
+    text: &str,
+    unavailable: &str,
+    failed: &str,
+) -> Result<(), String> {
+    let window = window().ok_or_else(|| unavailable.to_string())?;
+    let write = Reflect::get(window.as_ref(), &JsValue::from_str(writer))
         .and_then(|value| value.dyn_into::<Function>())
-        .map_err(|_| "Trusted Home Clipboard is unavailable.".to_string())?;
-    let promise = write_text
-        .call1(&JsValue::UNDEFINED, &JsValue::from_str(text))
-        .map_err(js_error)?;
-    JsFuture::from(Promise::from(promise))
-        .await
-        .map_err(js_error)?;
-    Ok(())
-}
-
-async fn copy_profile_id_to_clipboard(profile_id: &str) -> Result<(), String> {
-    let window = window().ok_or_else(|| "Open Chat from Home to copy a DID.".to_string())?;
-    let write = Reflect::get(
-        window.as_ref(),
-        &JsValue::from_str("elastosChatCopyProfileId"),
-    )
-    .and_then(|value| value.dyn_into::<Function>())
-    .map_err(|_| "Open Chat from Home to copy a DID.".to_string())?;
+        .map_err(|_| unavailable.to_string())?;
     let promise = write
-        .call1(&JsValue::UNDEFINED, &JsValue::from_str(profile_id))
-        .map_err(|_| "DID could not be copied. Try again.".to_string())?;
+        .call1(&JsValue::UNDEFINED, &JsValue::from_str(text))
+        .map_err(|_| failed.to_string())?;
     JsFuture::from(Promise::from(promise))
         .await
-        .map_err(|_| "DID could not be copied. Try again.".to_string())?;
+        .map_err(|_| failed.to_string())?;
     Ok(())
 }
 

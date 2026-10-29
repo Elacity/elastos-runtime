@@ -178,7 +178,7 @@ export function createHomeExternalLinkPrompt({
   address,
   openButton,
   cancelButton,
-  eyebrow, title, asker, size, status, linkLabel,
+  eyebrow, title, asker, size, status,
   openSharedFile = async () => {},
   windowRef = globalThis.window,
   isLive = () => true,
@@ -242,7 +242,6 @@ export function createHomeExternalLinkPrompt({
     host.textContent = "";
     address.hidden = true;
     address.textContent = "";
-    if (linkLabel) linkLabel.hidden = true;
     title.textContent = state === "local" ? "Open this file?"
       : state === "not_contact" ? "Only contacts can send you files"
       : sender ? `Get this file from ${sender}?` : "Get this file?";
@@ -463,7 +462,6 @@ export function createHomeExternalLinkPrompt({
         host.textContent = checked.host;
         address.hidden = false;
         address.textContent = checked.href;
-        if (linkLabel) linkLabel.hidden = true;
         if (size) size.hidden = true;
         if (status) status.hidden = true;
         openButton.textContent = "Open link";

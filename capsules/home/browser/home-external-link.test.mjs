@@ -255,7 +255,7 @@ test('an unnamed sender uses natural contact instructions', () => {
 test('Home opens binary shared content in Library by CID', async () => {
   const { openHomeSharedFile } = await import('./home-external-link.js');
   const opens = [];
-  await openHomeSharedFile({ cid, uri, fileName: 'report.pdf' }, {
+  await openHomeSharedFile({ cid, uri }, {
     fetchLocal: async () => new Response('%PDF-1.7'),
     openTarget: async (...args) => opens.push(args) });
   assert.deepEqual(opens, [['library', { query: { cid } }]]);
