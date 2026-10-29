@@ -169,6 +169,10 @@ struct AppState {
     /// request ID, so Runtime treats it as the same message.
     held_direct_sends: BTreeMap<String, PendingDirectSend>,
     community_unread: bool,
+    /// The direct conversation the person just opened by clicking it or
+    /// replied in. The next messages request marks it read even when Home's
+    /// visibility message has not arrived; it is used once.
+    direct_read_by_action: Option<String>,
     /// This person's Community presence state from Runtime: `requested`,
     /// `deferred`, `refused`, `hidden`, `always` or `while_open`. Runtime owns
     /// the decision (Inbox, System); Chat only reflects it and re-asks.
@@ -1126,6 +1130,14 @@ impl App {
         )
     }
 
+    /// Whether this messages request may mark `conversation_id` read: the
+    /// view is visible, or the person just acted in it (`direct_read_by_action`,
+    /// consumed here).
+    fn take_mark_read(&self, conversation_id: &str) -> bool {
+        let visible = self.view_visible();
+        take_mark_read_decision(&mut self.state.borrow_mut(), visible, conversation_id)
+    }
+
     fn can_mark_read(&self, conversation_id: Option<&str>) -> bool {
         self.view_visible()
             && self
@@ -1480,11 +1492,12 @@ impl App {
         if !selected_is_available {
             return Err(403);
         }
+        let mark_read = self.take_mark_read(&conversation_id);
         let messages_result: Result<DirectMessageList, u16> = direct_get_json(
             &format!(
                 "{DIRECT_API_BASE}/conversations/{}/messages?retry_details=true&mark_read={}",
                 encode_path_segment(&conversation_id),
-                self.can_mark_read(Some(&conversation_id))
+                mark_read
             ),
             &self.home_token_headers(),
         )
@@ -1508,12 +1521,13 @@ impl App {
         let unread_changed =
             state.community_unread != conversations.community_unread.unwrap_or(false);
         state.community_unread = conversations.community_unread.unwrap_or(false);
-        let Some(result) = apply_direct_refresh_if_current(
-            &mut state,
-            guard,
-            conversations.conversations,
-            response,
-        ) else {
+        let mut conversation_list = conversations.conversations;
+        if mark_read {
+            mark_conversation_read(&mut conversation_list, &conversation_id);
+        }
+        let Some(result) =
+            apply_direct_refresh_if_current(&mut state, guard, conversation_list, response)
+        else {
             return Ok(false);
         };
         drop(state);
@@ -1565,7 +1579,9 @@ impl App {
                     };
                     let source = Reflect::get(event.as_ref(), &JsValue::from_str("source"))
                         .unwrap_or(JsValue::NULL);
-                    if event.origin() != origin || !JsObject::is(&source, parent.as_ref()) {
+                    if !shell_layout_origin_admitted(&event.origin(), origin)
+                        || !JsObject::is(&source, parent.as_ref())
+                    {
                         return;
                     }
                     let data = event.data();
@@ -1586,15 +1602,16 @@ impl App {
             layout.forget();
             // WASM initialization can finish after the iframe load message.
             // Request the same presentation snapshot once the listener exists.
-            if let (Some(window), Some(origin)) = (
-                window(),
-                admitted_home_origin(self.home_parent_origin.as_deref()),
-            ) {
-                if let Ok(Some(parent)) = window.parent() {
-                    if let Ok(request) =
-                        js_sys::JSON::parse(r#"{"type":"elastos:shell-layout","request":true}"#)
-                    {
-                        let _ = parent.post_message(&request, origin);
+            // The Home GUI shell is an opaque frame, so a request addressed to
+            // the Home origin would be dropped; it carries no data.
+            if admitted_home_origin(self.home_parent_origin.as_deref()).is_some() {
+                if let Some(window) = window() {
+                    if let Ok(Some(parent)) = window.parent() {
+                        if let Ok(request) =
+                            js_sys::JSON::parse(r#"{"type":"elastos:shell-layout","request":true}"#)
+                        {
+                            let _ = parent.post_message(&request, "*");
+                        }
                     }
                 }
             }
@@ -3298,6 +3315,8 @@ impl App {
             {
                 state.held_direct_sends.remove(&conversation_id);
             }
+            // Replying shows the person sees this conversation.
+            state.direct_read_by_action = Some(conversation_id.clone());
             // Accepted text settles by its conversation and revision, even
             // while another conversation is open. Current UI effects below
             // also require the original selection generation.
@@ -3839,6 +3858,7 @@ impl App {
                 let Some(guard) = commit_direct_selection(&mut state, &choice) else {
                     return;
                 };
+                state.direct_read_by_action = Some(choice.clone());
                 guard
             }
         };
@@ -6554,6 +6574,35 @@ fn configured_shared_participant_visible(participant: &ParticipantView) -> bool 
     participant.profile_verified == Some(true) && !participant.display_name.trim().is_empty()
 }
 
+/// A messages request marks the open conversation read when the view is
+/// visible, or once after the person opened it by clicking or replied in it.
+fn take_mark_read_decision(state: &mut AppState, visible: bool, conversation_id: &str) -> bool {
+    if state.direct.selected_conversation_id.as_deref() != Some(conversation_id) {
+        return false;
+    }
+    let acted = state.direct_read_by_action.as_deref() == Some(conversation_id);
+    if acted {
+        state.direct_read_by_action = None;
+    }
+    visible || acted
+}
+
+/// The conversation list is fetched before the messages request that marks
+/// the open conversation read, so it still carries that conversation's unread
+/// flag; once the messages request has marked it read, the flag is cleared
+/// here too, or the dot would stay until a later refresh.
+fn mark_conversation_read(
+    conversations: &mut [direct::DirectConversationView],
+    conversation_id: &str,
+) {
+    if let Some(conversation) = conversations
+        .iter_mut()
+        .find(|conversation| conversation.conversation_id == conversation_id)
+    {
+        conversation.unread = false;
+    }
+}
+
 fn apply_direct_refresh_if_current(
     state: &mut AppState,
     guard: &SelectionGuard,
@@ -6734,6 +6783,7 @@ fn load_state(session_storage: Option<&Storage>, config: &AppConfig) -> AppState
         composer_edits: 0,
         held_direct_sends: BTreeMap::new(),
         community_unread: false,
+        direct_read_by_action: None,
         community_presence: None,
         direct_in_flight: BTreeMap::new(),
         direct_retry_terminal: BTreeMap::new(),
@@ -7041,6 +7091,39 @@ mod tests {
         ] {
             assert!(!due(true, silent, true), "{silent:?}");
         }
+    }
+
+    #[test]
+    fn the_opaque_home_shell_can_tell_chat_it_is_visible() {
+        // On a real Home the Home GUI shell is sandboxed without
+        // allow-same-origin, so its layout message arrives from "null".
+        assert!(super::shell_layout_origin_admitted(
+            "null",
+            "http://localhost:61200"
+        ));
+        assert!(super::shell_layout_origin_admitted(
+            "http://localhost:61200",
+            "http://localhost:61200"
+        ));
+        assert!(!super::shell_layout_origin_admitted(
+            "http://evil.example",
+            "http://localhost:61200"
+        ));
+    }
+
+    #[test]
+    fn a_click_or_a_reply_marks_the_open_conversation_read_once_even_before_visibility_arrives() {
+        let mut state = super::AppState::default();
+        state.direct.selected_conversation_id = Some("buddy".to_string());
+        // Not visible and no action: not marked.
+        assert!(!super::take_mark_read_decision(&mut state, false, "buddy"));
+        // Opened by a click (or a reply): marked once.
+        state.direct_read_by_action = Some("buddy".to_string());
+        assert!(super::take_mark_read_decision(&mut state, false, "buddy"));
+        assert!(!super::take_mark_read_decision(&mut state, false, "buddy"));
+        // Visible: marked; another conversation never is.
+        assert!(super::take_mark_read_decision(&mut state, true, "buddy"));
+        assert!(!super::take_mark_read_decision(&mut state, true, "other"));
     }
 
     #[test]
@@ -9434,6 +9517,23 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_marked_read_loses_its_dot_from_the_list_fetched_before_the_mark() {
+        let view = |id: &str, unread: bool| DirectConversationView {
+            conversation_id: id.to_string(),
+            display_name: id.to_string(),
+            removed: false,
+            unread,
+        };
+        // The list came back before the messages request marked "buddy" read.
+        let mut conversations = vec![view("buddy", true), view("other", true)];
+        super::mark_conversation_read(&mut conversations, "buddy");
+        assert_eq!(
+            conversations,
+            vec![view("buddy", false), view("other", true)]
+        );
+    }
+
+    #[test]
     fn stale_requested_direct_selection_after_shared_choice_is_ignored() {
         let config = AppConfig {
             access_mode: AccessMode::Shell,
@@ -9900,6 +10000,14 @@ fn presence_heartbeat_due(
     page_visible: bool,
 ) -> bool {
     community_open && page_visible && matches!(presence, Some("always" | "while_open"))
+}
+
+/// Who may tell Chat whether its frame is on screen: its parent frame (checked
+/// by the caller). In Home that parent is the Home GUI shell, an opaque
+/// sandboxed frame whose origin reads "null"; a page that embeds Chat directly
+/// has the Home origin. Presentation only, as in the shared theme script.
+fn shell_layout_origin_admitted(event_origin: &str, home_origin: &str) -> bool {
+    event_origin == "null" || event_origin == home_origin
 }
 
 /// Chat is on screen: the document is shown and, in the shell, the shell
