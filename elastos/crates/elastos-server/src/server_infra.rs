@@ -868,8 +868,9 @@ async fn setup_server_infrastructure_impl(
                 Err(e) => tracing::warn!("Failed to spawn content-block-graph-provider: {}", e),
             }
         }
+        // Not in the 0.8.0 Home profile; `setup --with` adds it.
         Ok(None) => {
-            tracing::warn!(
+            tracing::debug!(
                 "content-block-graph-provider binary is not installed; arbitrary DAG repair will fail closed"
             );
         }
@@ -972,7 +973,8 @@ async fn setup_server_infrastructure_impl(
             Ok(None) => tracing::info!("media-provider is installed but unconfigured"),
             Err(_) => tracing::warn!("Skipping media-provider due to invalid private config"),
         },
-        Ok(None) => tracing::warn!(
+        // Protected content ships after 0.8.0; its providers install with `setup --with`.
+        Ok(None) => tracing::debug!(
             "media-provider binary is not installed; protected-content media sessions will fail closed"
         ),
         Err(_) => tracing::warn!("Skipping media-provider due to verification failure"),
@@ -1484,7 +1486,7 @@ async fn setup_server_infrastructure_impl(
             .await;
         }
     } else {
-        tracing::warn!(
+        tracing::debug!(
             "protected-content-decrypt-provider binary is not installed; protected-content open and play will fail closed"
         );
     }
@@ -1510,7 +1512,7 @@ async fn setup_server_infrastructure_impl(
             );
         }
     } else {
-        tracing::warn!(
+        tracing::debug!(
             "protected-content-protect-provider binary is not installed; protected-content mint will fail closed"
         );
     }
