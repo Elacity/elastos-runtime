@@ -684,7 +684,6 @@ async function main() {
         "/apps/home-cli/",
         "/apps/system/",
         "/apps/marketplace/",
-        "/apps/services/",
         "/apps/inbox/",
         "/apps/library/",
         "/apps/documents/",

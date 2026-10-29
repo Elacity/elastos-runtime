@@ -216,6 +216,13 @@ pub(super) use gateway_site::{content_type, validate_file_path};
 use gateway_transaction_effects::*;
 pub(crate) use gateway_wallet::ensure_wallet_connector_configured;
 use gateway_wallet::*;
+
+/// A capsule this Home does not offer is absent everywhere: not served, not
+/// launchable and not in the catalog. Services is hidden until sharing moves
+/// into People; WalletConnect waits for an operator-pinned config.
+pub(crate) fn capsule_is_offered(data_dir: &std::path::Path, name: &str) -> bool {
+    name != SERVICES_CAPSULE_ID && ensure_wallet_connector_configured(data_dir, name).is_ok()
+}
 pub(super) use gateway_wallet_adapter::RuntimeWalletAdapter;
 
 /// Largest single file the gateway serves or Library accepts (100 MiB). Gateway
@@ -1105,6 +1112,11 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             )),
         )
         .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
+        // Reachable only with a Services token, which Home stops issuing while
+        // Services is hidden (0.8.0; see capsule_is_offered). The share and
+        // request backend stays: Inbox approval, grant use and revocation run on
+        // it, its tests set up grants through these routes, and the 0.8.1 People
+        // rework reuses it.
         .route("/api/apps/services/summary", get(services_summary))
         .route("/api/apps/services/offers", post(services_offer_update))
         .route("/api/apps/inbox/summary", get(inbox_summary))

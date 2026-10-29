@@ -8791,6 +8791,31 @@ async fn test_home_drops_a_saved_services_window_and_marketplace_does_not_list_s
             .any(|capsule| capsule.name == SERVICES_CAPSULE_ID),
         "Marketplace must not list Services"
     );
+
+    // A direct launch (a saved shortcut or old bookmark) cannot start Services,
+    // so Home issues no Services token for its request routes.
+    assert!(home_launch_target(dir.path(), SERVICES_CAPSULE_ID).is_none());
+    let (status, _) = home_test_post_json(
+        &app,
+        "/api/apps/home/launch",
+        &authority.home_token,
+        "http://localhost:61180",
+        json!({ "target": SERVICES_CAPSULE_ID }),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK);
+    // A bookmarked Services page is not served.
+    let page = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .uri("/apps/services/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

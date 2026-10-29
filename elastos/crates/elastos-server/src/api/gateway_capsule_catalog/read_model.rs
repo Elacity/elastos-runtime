@@ -34,8 +34,6 @@ pub(in crate::api::gateway) fn capsule_catalog_summary_for(
         .into_iter()
         // Assistant owns new launches even while a retired app tree remains.
         .filter(|manifest| manifest.name != "home-agent")
-        // Services is hidden until sharing moves into People.
-        .filter(|manifest| manifest.name != SERVICES_CAPSULE_ID)
         // A directory or component entry cannot authenticate model content.
         .filter(|manifest| manifest.model_content.is_none())
         .filter(|manifest| {
@@ -44,8 +42,9 @@ pub(in crate::api::gateway) fn capsule_catalog_summary_for(
         })
         // Browser is absent, not merely unlaunchable, where it is unavailable.
         .filter(|manifest| manifest.name != "browser" || crate::setup::browser_available(platform))
-        // An unconfigured WalletConnect is hidden here as in the launcher and Wallet.
-        .filter(|manifest| ensure_wallet_connector_configured(data_dir, &manifest.name).is_ok())
+        // Hidden Services and an unconfigured WalletConnect are absent here as
+        // in the launcher and Wallet.
+        .filter(|manifest| capsule_is_offered(data_dir, &manifest.name))
         .map(|manifest| {
             catalog_capsule_summary(
                 manifest,
