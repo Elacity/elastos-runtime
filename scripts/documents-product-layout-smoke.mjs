@@ -290,17 +290,6 @@ function createAppServer() {
           json(res, { document: duplicate });
           return;
         }
-        if (op === "publish") {
-          const current = documents.get(payload.doc_did);
-          const updated = {
-            ...current,
-            latest_published_cid: current.latest_published_cid || `bafy${payload.doc_did}`,
-            publish_history: [{ cid: current.latest_published_cid || `bafy${payload.doc_did}`, published_at: current.updated_at + 1 }],
-          };
-          documents.set(payload.doc_did, updated);
-          json(res, { uri: `elastos://${updated.latest_published_cid}` });
-          return;
-        }
         if (op === "unpublish") {
           const current = documents.get(payload.doc_did);
           const updated = { ...current, latest_published_cid: null, publish_history: [] };
@@ -396,25 +385,6 @@ addEventListener("message", (event) => window.homeMessages.push(event.data));</s
       res.writeHead(200, { "content-type": "application/octet-stream" });
       res.end(`# Shared note\n\n[Out](${publishedWebLink}) [Same](http://${req.headers.host}/s/${publishedFixtureCid}/_share.json) [Jump](#notes-2) [Rel](/apps/documents/)\n\n`
         + Array.from({ length: 80 }, (_, index) => `Filler line ${index}`).join("\n\n") + "\n\n# Notes\n\nEnd.");
-      return;
-    }
-    if (url.pathname.startsWith(`/s/${publishedFixtureCid}/`)) {
-      // A published two-file revision with links of every kind.
-      const file = url.pathname.slice(`/s/${publishedFixtureCid}/`.length);
-      const bodies = {
-        "_files.json": JSON.stringify(["first.md", "second.md"]),
-        "_share.json": JSON.stringify({ share_id: "share-fixture", version: 1 }),
-        "first.md": `# Published\n\n[Out](${publishedWebLink}) [Same](http://${req.headers.host}/s/${publishedFixtureCid}/_share.json) [Jump](#notes-2) [Rel](/apps/documents/)\n\n`
-          + Array.from({ length: 80 }, (_, index) => `Filler line ${index}`).join("\n\n") + "\n\n# Notes\n\nEnd.",
-        "second.md": `# Second file\n\n[Same second](http://${req.headers.host}/s/${publishedFixtureCid}/_share.json) [Top](#second-file-1)\n\nSecond body.`,
-      };
-      if (!Object.hasOwn(bodies, file)) {
-        res.writeHead(404);
-        res.end("Not found");
-        return;
-      }
-      res.writeHead(200, { "content-type": file.endsWith(".json") ? "application/json" : "text/markdown; charset=utf-8" });
-      res.end(bodies[file]);
       return;
     }
 
@@ -932,8 +902,8 @@ async function run() {
       await parserPage.close();
     }
 
-    // "Save automatically" is off by default: edits wait for Save, Cmd/Ctrl+S
-    // or the unsaved-changes prompt when switching documents.
+    // "Save automatically" is off by default: edits wait for Save or Cmd/Ctrl+S.
+    // Switching documents keeps each one's unsaved text; closing asks.
     resetDocumentsFixture();
     const manualPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
     trackPage(manualPage, consoleErrors, pageErrors, failedRequests, errorResponses);
@@ -1388,7 +1358,35 @@ async function run() {
       await conflictPage.close();
     }
 
-    // Inside Home, Documents says it is ready once, then sends its File and
+    // The row menu acts on its row: Duplicate, Unpublish and Delete reach the
+    // document that was right-clicked, not just the one already open.
+    resetDocumentsFixture();
+    const rowMenuPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    trackPage(rowMenuPage, consoleErrors, pageErrors, failedRequests, errorResponses);
+    try {
+      await rowMenuPage.goto(`http://127.0.0.1:${port}/apps/documents/?home_origin=${encodeURIComponent("https://home.example")}#home_token=documents-layout-token`);
+      await rowMenuPage.locator(".document-list-item").first().waitFor();
+      const rowAction = async (docDid, label) => {
+        await rowMenuPage.locator(`.document-list-item[data-doc-did="${docDid}"]`).click({ button: "right" });
+        await rowMenuPage.locator("#context-menu:not(.hidden)").waitFor();
+        await rowMenuPage.locator("#context-menu .context-menu-item", { hasText: label }).click();
+      };
+      const before = documents.size;
+      await rowAction("doc-beta", "Duplicate");
+      await waitForCondition(() => documents.size === before + 1, 5000, "Duplicate from the row menu did nothing.");
+      assert([...documents.values()].at(-1).body === documents.get("doc-beta").body, "Duplicate copies the right-clicked document.");
+      await rowAction("doc-alpha", "Unpublish");
+      await waitForCondition(() => documents.get("doc-alpha").latest_published_cid === null, 5000, "Unpublish from the row menu did nothing.");
+      await rowAction("doc-beta", "Delete");
+      await rowMenuPage.locator("#confirm-modal.open").waitFor();
+      await rowMenuPage.locator("#confirm-action").click();
+      await waitForCondition(() => !documents.has("doc-beta"), 5000, "Delete from the row menu did nothing.");
+      await rowMenuPage.waitForFunction(() => !document.querySelector('.document-list-item[data-doc-did="doc-beta"]'));
+    } finally {
+      await rowMenuPage.close();
+    }
+
+    // Inside Home, Documents says it is ready before it sends its File and
     // View menu, and it never touches browser storage or the clipboard itself.
     resetDocumentsFixture();
     const chromePage = await browser.newPage({ viewport: { width: 1280, height: 900 } });

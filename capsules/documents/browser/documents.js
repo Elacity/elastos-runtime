@@ -438,7 +438,6 @@ function createDraftDocument() {
     created_at: 0,
     updated_at: 0,
     latest_published_cid: null,
-    publish_history: [],
   };
 }
 
@@ -1634,7 +1633,6 @@ async function loadLibraryObject(uri) {
     created_at: object.created_at || 0,
     updated_at: object.modified_at || 0,
     latest_published_cid: null,
-    publish_history: [],
   });
   renderDocumentsList();
   renderCurrentDocument();
@@ -2331,23 +2329,25 @@ function suggestedDuplicateFileName(document) {
   return fileName.slice(0, -ext.length) + " copy" + ext;
 }
 
-async function ensureContextDocumentSelected() {
-  if (!contextMenuDocDid) {
+async function ensureContextDocumentSelected(docDid) {
+  if (!docDid) {
     return null;
   }
-  if (!state.current || state.current.doc_did !== contextMenuDocDid) {
-    await selectDocument(contextMenuDocDid);
+  if (!state.current || state.current.doc_did !== docDid) {
+    await selectDocument(docDid);
   }
-  return state.current;
+  return state.current?.doc_did === docDid ? state.current : null;
 }
 
 async function runContextMenuAction(action) {
+  // Closing the menu forgets its row, so the row's document is taken first.
+  const docDid = contextMenuDocDid;
   closeContextMenu();
   if (action === "new") {
     await createDocument("");
     return;
   }
-  const current = await ensureContextDocumentSelected();
+  const current = await ensureContextDocumentSelected(docDid);
   if (!current) {
     return;
   }
@@ -2685,18 +2685,15 @@ function setSharePreview(title, markdown, subtitle, pills) {
   });
 }
 
-async function loadShareBundle(options) {
-  const basePath = options && options.basePath ? options.basePath : "";
-  const sourceUri = options && options.sourceUri ? options.sourceUri : "";
+// Outside Home, a published revision's folder: its files, read relative to
+// this page, each linked by ?file=.
+async function loadShareMode() {
   state.mode = "share";
   elements.shareShell.classList.remove("hidden");
-
-  const params = new URLSearchParams(window.location.search);
-  const requestedFile = (options && options.file) || params.get("file");
-
+  const requestedFile = new URLSearchParams(window.location.search).get("file");
   try {
-    const files = await loadJson(basePath + "_files.json");
-    const shareMeta = await loadJson(basePath + "_share.json").catch(() => null);
+    const files = await loadJson("_files.json");
+    const shareMeta = await loadJson("_share.json").catch(() => null);
     if (!Array.isArray(files) || files.length === 0) {
       throw new Error("Shared revision has no documents.");
     }
@@ -2711,37 +2708,18 @@ async function loadShareBundle(options) {
     files.forEach((file) => {
       const link = document.createElement("a");
       link.className = "share-doc-link" + (file === activeFile ? " active" : "");
-      if (DOCUMENTS_INSIDE_HOME) {
-        // Inside Home a navigation would replace the Documents frame (and
-        // drop its Home token), so the chosen file opens in place.
-        link.setAttribute("role", "link");
-        link.tabIndex = 0;
-        const open = (event) => {
-          if (event.type === "keydown" && event.key !== "Enter" && event.key !== " ") {
-            return;
-          }
-          event.preventDefault();
-          void loadShareBundle({ ...options, file });
-        };
-        link.addEventListener("click", open);
-        link.addEventListener("keydown", open);
-      } else {
-        const linkParams = new URLSearchParams(window.location.search);
-        linkParams.set("file", file);
-        link.href = window.location.pathname + "?" + linkParams.toString();
-      }
+      const linkParams = new URLSearchParams(window.location.search);
+      linkParams.set("file", file);
+      link.href = window.location.pathname + "?" + linkParams.toString();
       link.innerHTML =
         '<span class="share-doc-title">' + escapeHtml(file.replace(/\.md$/i, "")) + "</span>" +
         '<span class="share-doc-meta">' + escapeHtml(file) + "</span>";
       elements.shareDocList.appendChild(link);
     });
 
-    const markdown = await loadText(basePath + encodeURIComponent(activeFile));
+    const markdown = await loadText(encodeURIComponent(activeFile));
     const title = markdown.match(/^#\s+(.+)$/m)?.[1]?.trim() || activeFile.replace(/\.md$/i, "");
     const pills = [];
-    if (sourceUri) {
-      pills.push({ label: "Revision", value: sourceUri });
-    }
     if (shareMeta && shareMeta.share_id) {
       pills.push({ label: "Document", value: shareMeta.share_id });
     }
@@ -2749,14 +2727,9 @@ async function loadShareBundle(options) {
       pills.push({ label: "Version", value: String(shareMeta.version) });
     }
     setSharePreview(title, markdown, "Immutable shared revision.", pills);
-    return;
   } catch (error) {
     elements.sharePreview.innerHTML = '<div class="error-state">' + escapeHtml(readableDocumentsError(error, "Shared document could not be loaded.")) + "</div>";
   }
-}
-
-async function loadShareMode() {
-  await loadShareBundle({ basePath: "", sourceUri: "" });
 }
 
 function loadLockedMode() {

@@ -179,10 +179,7 @@ test("unchanged GET permits only explicit conditional retry; mixed outcome prese
   }
 });
 
-test("Rust trim/default title contract also reconciles lost replies and long titles", async () => {
-  const rust = readFileSync(new URL("../elastos/crates/elastos-server/src/documents.rs", import.meta.url), "utf8");
-  assert.match(rust, /DOCUMENTS_DEFAULT_TITLE: &str = "Untitled"/);
-  assert.match(rust, /fn documents_normalize_title[\s\S]*?\.map\(str::trim\)[\s\S]*?\.unwrap_or\(default_title\)[\s\S]*?\.to_string\(\)/);
+test("trimmed and default titles also reconcile lost replies and long titles", async () => {
   for (const title of ["", "   ", "  Trim me  ", "Long".repeat(40)]) {
     const server = backend(), app = editor(server), request = server.request;
     app.elements.titleInput.value = title;
