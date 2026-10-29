@@ -1644,7 +1644,12 @@ async function loadLibraryObject(uri) {
 // address, type or size. Home opens Documents for a shared file only after it
 // read the bytes as text (home-external-link.js), so the bytes are the file.
 async function readSharedText(cid) {
-  const response = await fetch("/content/" + encodeURIComponent(cid), { cache: "no-store" });
+  // Home serves stored content only to its own apps, so the read carries the
+  // launch token like every other Documents request.
+  const response = await fetch("/content/" + encodeURIComponent(cid), {
+    cache: "no-store",
+    headers: { "x-elastos-home-token": state.homeToken },
+  });
   if (!response.ok) {
     throw new Error("This shared file could not be opened.");
   }

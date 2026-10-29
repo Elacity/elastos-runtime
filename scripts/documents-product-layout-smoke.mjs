@@ -381,6 +381,12 @@ addEventListener("message", (event) => window.homeMessages.push(event.data));</s
       return;
     }
     if (url.pathname === `/content/${publishedFixtureCid}`) {
+      // As Home: stored content only for its own apps (the launch token).
+      if (req.headers["x-elastos-home-token"] !== "documents-link-token") {
+        res.writeHead(404);
+        res.end("Not found");
+        return;
+      }
       // Raw shared bytes carry no name, so the gateway calls them octet-stream.
       res.writeHead(200, { "content-type": "application/octet-stream" });
       res.end(`# Shared note\n\n[Out](${publishedWebLink}) [Same](http://${req.headers.host}/s/${publishedFixtureCid}/_share.json) [Jump](#notes-2) [Rel](/apps/documents/)\n\n`
