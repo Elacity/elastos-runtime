@@ -86,6 +86,9 @@ peers. Unpublish withdraws the record, which stops new transfers at once; the
 pin stays until a later cleanup. A Home answers a peer's read in one message
 and checks again just before sending it, so a read under way when the
 publication is withdrawn is refused. Bytes already sent can't be recalled.
+Over HTTP, an ordinary Home's raw CID routes (`/content/<cid>`, `/ipfs/<cid>`,
+`/s/<cid>`) answer only its own Home and app sessions; a seed keeps its public
+CID gateway.
 Only a node that serves publisher content (a seed) answers the raw
 `content_fetch` byte operation or serves without these checks. In this
 release a seed accepts no new copies from other Homes; copies it already holds
@@ -98,10 +101,10 @@ remove or repair content on a Home or a seed. Peers cannot use the
 availability provider. A Home signs an availability announcement only from its
 own pin state. Peers cannot push or read gossip messages directly. Only topics
 that a Home joins keep messages, to a maximum of 100 topics. A granted peer's
-`ensure` (once the pin succeeds) and `import_object` announce the CID and join
-its topic, so a granted peer shares that limit with the Home's own topics. A
-granted peer's `import_exact`, `admission` and `status`, and any peer's
-`fetch`, join no topic.
+`ensure` (once the pin succeeds) announces the CID and joins its topic, so a
+granted peer shares that limit with the Home's own topics. A granted peer's
+`import_exact`, `admission` and `status`, and any peer's `fetch`, join no
+topic. No peer can push a whole object with `import_object`.
 
 Host-process provider capsules use a raw operation and path envelope without a
 capsule capability token. Runtime owns admission for this trusted provider

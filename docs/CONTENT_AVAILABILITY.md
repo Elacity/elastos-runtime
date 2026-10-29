@@ -548,9 +548,10 @@ imports only from peers its owner granted `content.replica`
 (`elastos node peer add --did <home-did> --allow content.replica`). In this
 release a seed refuses them from every peer; copies a node already holds stay.
 An import adds content unpinned and pins only the expected CID, so a mismatch
-changes no pin. A granted `ensure` and `import_object` announce the CID and
-join its topic; `import_exact` pins without announcing. Peers cannot publish,
-unpublish or repair content on another node.
+changes no pin. A granted `ensure` announces the CID and joins its topic;
+`import_exact` pins without announcing. A whole-object `import_object` push
+from an older peer is refused. Peers cannot publish, unpublish or repair
+content on another node.
 Verified remote content-provider receipts are summarized with safe
 peer-selection replica counts plus capped redacted score/reason/local
 reputation rows with explicit cap/truncation metadata, admission, quota,
@@ -623,7 +624,10 @@ not served. The answer goes out in one message after a second check, so a read
 under way when the publication is withdrawn is refused; bytes already sent
 can't be recalled. A seed serves as before. A whole read past the
 requested `whole_max_bytes` answers the fixed token `content_too_large`, and
-the requester bounds the answer line to that size.
+the requester bounds the answer line to that size. Over HTTP, an ordinary
+Home's `/content/<cid>`, `/ipfs/<cid>` and `/s/<cid>` routes answer only its
+own Home and app sessions, published or not; a seed keeps its public CID
+gateway, and published sites keep their own route.
 
 Internal `content-provider` calls use the Runtime provider-to-provider
 invocation envelope for IPFS and availability effects. The envelope validates

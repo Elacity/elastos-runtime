@@ -73,9 +73,10 @@ fn assert_content_policy(response: &Response, path: &str) {
     );
 }
 
-/// Gateway state whose local store holds the fixture bundle as `TEST_CIDV1`
-/// and the download as the single file `TEST_CIDV0`.
+/// Gateway state of a seed whose local store holds the fixture bundle as
+/// `TEST_CIDV1` and the download as the single file `TEST_CIDV0`.
 async fn content_fixture_state(dir: &std::path::Path) -> GatewayState {
+    serve_as_seed(dir);
     let files: Vec<(&str, &str, &[u8])> = CONTENT_FIXTURE_FILES
         .iter()
         .map(|(path, bytes)| (TEST_CIDV1, *path, *bytes))
@@ -192,6 +193,7 @@ async fn content_sandbox_cid_aliases_preserve_bytes_and_types() {
         (format!("/content/{TEST_CIDV1}"), "application/octet-stream"),
     ] {
         let fetched_dir = tempfile::tempdir().unwrap();
+        serve_as_seed(fetched_dir.path());
         let fetched = gateway_router(content_test_state(fetched_dir.path()).await)
             .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
             .await

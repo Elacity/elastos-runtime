@@ -523,10 +523,14 @@ pub(super) async fn redirect_cid_root(Path(cid): Path<String>) -> Redirect {
 
 pub(super) async fn serve_cid_root(
     State(state): State<GatewayState>,
+    headers: HeaderMap,
     Path(cid): Path<String>,
 ) -> Response {
     if !is_valid_cid(&cid) {
         return (StatusCode::BAD_REQUEST, "Invalid CID").into_response();
+    }
+    if !cid_route_admitted(&state, &headers) {
+        return cid_route_refused();
     }
 
     serve_directory_root(&state, &cid).await
@@ -534,10 +538,14 @@ pub(super) async fn serve_cid_root(
 
 pub(super) async fn serve_ipfs_cid_root(
     State(state): State<GatewayState>,
+    headers: HeaderMap,
     Path(cid): Path<String>,
 ) -> Response {
     if !is_valid_cid(&cid) {
         return (StatusCode::BAD_REQUEST, "Invalid CID").into_response();
+    }
+    if !cid_route_admitted(&state, &headers) {
+        return cid_route_refused();
     }
 
     match fetch_file_inline(&state, &cid, "").await {
@@ -549,6 +557,21 @@ pub(super) async fn serve_ipfs_cid_root(
             .into_response(),
         Err(_) => serve_directory_root(&state, &cid).await,
     }
+}
+
+/// Whether the raw CID routes serve this request. An ordinary Home reads its
+/// local store over HTTP only for its own signed-in sessions and apps: it
+/// shares files with others over Carrier, with its contacts, never over open
+/// HTTP, so a file that stops being shared is never served here either. A
+/// node that serves publisher content (a seed) keeps its public CID gateway.
+/// A published site is served through its own route.
+fn cid_route_admitted(state: &GatewayState, headers: &HeaderMap) -> bool {
+    crate::carrier::is_trusted_source_runtime(&state.data_dir)
+        || super::gateway_home_token::require_gateway_launch(&state.data_dir, headers).is_ok()
+}
+
+fn cid_route_refused() -> Response {
+    (StatusCode::NOT_FOUND, "File not found").into_response()
 }
 
 async fn serve_directory_root(state: &GatewayState, cid: &str) -> Response {
@@ -700,12 +723,15 @@ async fn serve_site_file(
 
 pub(super) async fn serve_cid_file(
     State(state): State<GatewayState>,
+    headers: HeaderMap,
     Path((cid, file_path)): Path<(String, String)>,
 ) -> Response {
     if !is_valid_cid(&cid) {
         return (StatusCode::BAD_REQUEST, "Invalid CID").into_response();
     }
-
+    if !cid_route_admitted(&state, &headers) {
+        return cid_route_refused();
+    }
     match serve_cid_path_result(&state, &cid, &file_path).await {
         Ok(response) => response,
         Err(StatusCode::BAD_REQUEST) => {
