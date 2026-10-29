@@ -2228,6 +2228,24 @@ class InstalledJourneyTests(unittest.TestCase):
                         self.assertTrue(path.is_symlink())
                         self.assertFalse(path.exists())
 
+    def test_the_package_holder_starts_as_a_seed(self):
+        journey = runpy.run_path(str(WORKFLOW.parents[2] / "scripts/ci-installed-journeys.py"))
+        with tempfile.TemporaryDirectory() as temp:
+            home, data = Path(temp) / "holder", Path(temp) / "holder/.local/share/elastos"
+            data.mkdir(parents=True)
+            started = []
+
+            def refuse_start(*args, **kwargs):
+                started.append((data / "ElastOS/SystemServices/Publisher/artifacts").is_dir())
+                raise RuntimeError("fixture stops at start")
+
+            with mock.patch.object(journey["subprocess"], "Popen", side_effect=refuse_start):
+                with self.assertRaisesRegex(RuntimeError, "fixture stops at start"):
+                    journey["start_holder"](home, data, Path(temp) / "consumer", {})
+            self.assertEqual(started, [True], "the holder is a seed before its Runtime starts")
+            artifacts = data / "ElastOS/SystemServices/Publisher/artifacts"
+            self.assertEqual(artifacts.stat().st_mode & 0o777, 0o700)
+
     def test_gateway_and_node_share_the_installed_fixture_root(self):
         for platform in ("macos", "linux"):
             with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:

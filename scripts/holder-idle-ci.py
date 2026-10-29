@@ -166,6 +166,12 @@ def main():
             cid = processes.text("always-on-" + label + "-add").strip()
             assert re.fullmatch(r"b[a-z2-7]+", cid)
             cids.append(cid)
+        # A seed, as production's content holders are: an ordinary Home serves
+        # peers and open HTTP only files its people publish to their contacts.
+        seed = data
+        for part in ("ElastOS", "SystemServices", "Publisher", "artifacts"):
+            seed = seed / part
+            seed.mkdir(mode=0o700, exist_ok=True)
         holder = processes.spawn([str(runtime), "gateway", "--addr", "127.0.0.1:" + str(gateway_port),
             "--cache-dir", str(home / "gateway-cache")], environment(home), home, "always-on-holder")
         ready(holder, f"http://127.0.0.1:{gateway_port}/healthz")
