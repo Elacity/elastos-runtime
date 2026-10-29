@@ -68,7 +68,12 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Auth audit saves verify the changed suffix against a verified loaded prefix and
   refill the cache after stable byte readback; retention, signatures, checkpoint
   order, and the file format stay unchanged.
-- Services stays installed but is treated like an unconfigured WalletConnect:
+- The Home install profile no longer includes Services, WalletConnect, the
+  content block graph provider or the protected-content set (Elacity Player,
+  its protect and decrypt providers, media-provider and media tools). They stay
+  published: `elastos setup --with NAME` installs one, and Homes that already
+  have them keep updating them. Absent ones log at debug when Runtime starts.
+  Where Services is installed it is treated like an unconfigured WalletConnect:
   it is not served, not launchable and not in the capsule catalog, so a
   bookmarked page gets Not Found, a direct launch is refused, and Home issues
   no Services token.
