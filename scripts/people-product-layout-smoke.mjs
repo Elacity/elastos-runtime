@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { discoverySummary } from "./lib/people-discovery-fixture.mjs";
 import { PHONE_VIEWPORT, setPhoneFormFactor } from "./lib/phone-drawer-assert.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
@@ -41,37 +42,6 @@ async function readJson(request) {
   }
   const text = Buffer.concat(chunks).toString("utf8");
   return text ? JSON.parse(text) : {};
-}
-
-function discoverySummary({
-  configured = false,
-  enabled = false,
-  status = configured ? (enabled ? "visible" : "off") : "unconfigured",
-  statusMessage = configured
-    ? (enabled
-      ? "Public is on."
-      : "Public is off.")
-    : "Public isn’t available on this Home.",
-  discoveredPeers = [],
-  pendingRequestCount = 0,
-  remainingSeconds = null,
-  remoteVisibilityMayRemainUntil = null,
-  remoteVisibilityRemainingSeconds = null,
-} = {}) {
-  return {
-    schema: "elastos.people.discovery/v1",
-    configured,
-    enabled,
-    status,
-    status_message: statusMessage,
-    expires_at: remainingSeconds === null ? null : 1_000 + remainingSeconds,
-    remaining_seconds: remainingSeconds,
-    remote_visibility_may_remain_until: remoteVisibilityMayRemainUntil,
-    remote_visibility_remaining_seconds: remoteVisibilityRemainingSeconds,
-    discovered_count: discoveredPeers.length,
-    discovered_peers: discoveredPeers,
-    request_count: pendingRequestCount,
-  };
 }
 
 function summary({

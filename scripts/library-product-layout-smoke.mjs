@@ -95,17 +95,14 @@ function contrastRatio(text, surface, base) {
 
 // The upload panel renders uploads.js rows; its text must read in either theme.
 async function assertUploadProgressReadable(page, label) {
-  const colors = await page.evaluate(() => {
+  const colors = await page.evaluate(async () => {
     const panel = document.getElementById("upload-progress");
-    panel.classList.remove("hidden");
-    panel.innerHTML = `
-      <div class="upload-row">
-        <div>
-          <div class="upload-name">explorer-note.txt</div>
-          <div>Complete</div>
-        </div>
-        <div class="upload-meter"><div class="upload-fill" style="--progress: 100%"></div></div>
-      </div>`;
+    const { createLibraryUploads } = await import(new URL("./src/uploads.js", document.baseURI).href);
+    createLibraryUploads({
+      container: panel,
+      perf: { uploadRenderCount: 0, uploadRenderScheduledCount: 0 },
+      state: { uploads: [{ id: "contrast", name: "explorer-note.txt", status: "Complete", progress: 100 }] },
+    }).renderUploads();
     const read = (selector) => getComputedStyle(document.querySelector(selector));
     const result = {
       base: read("body").backgroundColor,

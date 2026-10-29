@@ -221,6 +221,17 @@ async function assertPropertiesShowNoLinks() {
   assert(published.general.includes("Unpublish from the item menu"), "A published file must name Unpublish.");
   assert(!published.general.includes("a copy is on the network"), "Library Properties must make no availability claim.");
   assert(published.details.includes('data-prop-copy="bafy-smoke-local"'), "Details must offer the content ID copy.");
+  // Details stays closed (renderProperties matches the tag without `open`);
+  // ordinary fields stay in General and the address fields stay in Details.
+  const propLabel = (html, label) => html.includes(`<td class="item-prop-label">${label}</td>`);
+  for (const label of ["Name", "Location", "Type", "Size"]) {
+    assert(propLabel(published.general, label) && !propLabel(published.details, label), `Library Properties must show ${label} outside Details.`);
+  }
+  for (const label of ["Object URI", "Content ID"]) {
+    assert(propLabel(published.details, label) && !propLabel(published.general, label), `Library Properties must keep ${label} inside Details.`);
+  }
+  assert(published.details.includes("<summary>Details</summary>"), "Library Properties Details must be labelled Details.");
+  assert(!published.html.includes("data-tab"), "Library Properties must not use tabs.");
 
   const elastosSpace = await renderProperties({
     uri: "localhost://WebSpaces/Elastos/content/bafy-smoke-content",

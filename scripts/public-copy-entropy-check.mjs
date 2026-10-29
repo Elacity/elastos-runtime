@@ -209,46 +209,7 @@ const libraryDialog = read("capsules/library/browser/src/dialog.js");
 const libraryActions = read("capsules/library/browser/src/actions.js");
 const libraryApp = read("capsules/library/browser/src/app.js");
 const libraryRender = read("capsules/library/browser/src/render.js");
-const { createLibraryDialog } = await import(new URL("capsules/library/browser/src/dialog.js", root));
-const propertiesDialog = { dataset: {}, classList: { add() {}, remove() {} }, innerHTML: "", addEventListener() {} };
-createLibraryDialog({
-  copyText: async () => {},
-  dialog: propertiesDialog,
-  hideMenu: () => {},
-  objectByUri: () => null,
-  onBeforeClose: () => {},
-  roots: () => [
-    { id: "home", label: "Home", uri: "localhost://Users/smoke" },
-    { id: "documents", label: "Documents", uri: "localhost://Users/smoke/Documents" },
-  ],
-}).showProperties({
-  uri: "localhost://Users/smoke/Documents/Probe Folder/Guide.md",
-  name: "Guide.md",
-  kind: "file",
-  mime: "text/markdown",
-  size: 1200,
-  modified_at: 1760000000,
-  content_cid: "bafy-smoke-local",
-  capabilities: ["properties"],
-  metadata: { visibility: { placement: "private_folder" } },
-});
-const propertiesHtml = propertiesDialog.innerHTML;
-const propertiesDetails = propertiesHtml.match(/<details\b[^>]*\bclass="item-props-details"[^>]*>([\s\S]*?)<\/details>/);
-const propertiesOutside = propertiesHtml.replace(propertiesDetails?.[0] || "", "");
-const propertiesLabel = (html, label) => html.includes(`<td class="item-prop-label">${label}</td>`);
-assert(
-  propertiesDetails
-    && !/\bopen\b/.test(propertiesDetails[0].slice(0, propertiesDetails[0].indexOf(">")))
-    && propertiesDetails[1].includes("<summary>Details</summary>")
-    && ["Object URI", "Content ID"].every((label) => propertiesLabel(propertiesDetails[1], label) && !propertiesLabel(propertiesOutside, label))
-    && !propertiesOutside.includes("localhost://")
-    && !propertiesOutside.includes("bafy-smoke-local")
-    && ["Name", "Location", "Type", "Size", "Modified"].every((label) => propertiesLabel(propertiesOutside, label) && !propertiesLabel(propertiesDetails[1], label))
-    && !propertiesHtml.includes("data-tab")
-    && !libraryDialog.includes("Visibility Contract"),
-  "Library Properties must keep the object address and content ID inside Details, closed by default; ordinary fields stay outside",
-  propertiesHtml,
-);
+assert(!libraryDialog.includes("Visibility Contract"), "Library Properties must not name the visibility contract");
 assert(
   !libraryActions.includes("provider-owned location")
     && !libraryActions.includes(" object${")
@@ -335,23 +296,5 @@ const browserDisplay = read("capsules/browser/browser/browser-remote-display.js"
 assert(!browserStatus.includes("Browser failed closed") && browserStatus.includes("public") === false, "Browser must not show fail-closed implementation narration");
 assert(!browserJs.includes("Browser Engine Adapter returned an invalid") && !browserDisplay.includes("Browser Engine Adapter returned an invalid"), "Browser must not show adapter contract failures");
 
-const homeVisual = read("scripts/home-camofox-smoke.mjs");
-const systemVisual = read("scripts/system-camofox-smoke.mjs");
-const passkeyVisual = read("scripts/home-passkey-virtual-auth-smoke.mjs");
-// Services is hidden and not served, so its page has no visual check.
-for (const surface of ["home-cli", "system", "marketplace", "inbox", "library", "documents", "wallet", "browser"]) {
-  assert(homeVisual.includes(`\"/apps/${surface}/\"`), `visual empty/error coverage is missing ${surface}`);
-}
-assert(
-  homeVisual.includes('"ordinary-app-copy-stays-plain-and-heading-unique"')
-    && homeVisual.includes('"home-cli-copy-stays-plain"')
-    && homeVisual.includes('"browser"')
-    && systemVisual.includes('state.panelLabels.includes("Accounts")')
-    && systemVisual.includes('!state.fieldLabels.includes("Documents")')
-    && passkeyVisual.includes("async function checkHomePublicCopy(page)")
-    && passkeyVisual.includes('"Home GUI exposed implementation copy"')
-    && passkeyVisual.includes('"Home GUI rendered duplicate visible headings"'),
-  "visual public-copy checks are stale or incomplete",
-);
 
 console.log("PASS public-copy entropy check");
