@@ -428,23 +428,23 @@ export function createLibraryActions({
   }
 
   async function unpublishObject(object) {
-    setStatus(`Unpublishing ${object.name}...`);
+    setStatus(`Stopping sharing ${object.name}...`);
     await providerApi("unpublish", { uri: object.uri, if_revision: object.revision });
-    setStatus(`Unpublished ${object.name}.`);
+    setStatus(`Stopped sharing ${object.name}.`);
     await loadCurrentFolder();
   }
 
   async function publishObject(object) {
     if (!canPublishObject(object)) return;
     if (!await confirmPublish({ files: [object], excluded: [] })) return;
-    setStatus(`Publishing ${object.name}...`);
+    setStatus(`Sharing ${object.name}...`);
     try {
       await providerApi("publish", { uri: object.uri, if_revision: object.revision });
     } catch (error) {
       setStatus(publishFailureText(error, object.name));
       return;
     }
-    await showAfterReload(`Published ${object.name}.`);
+    await showAfterReload(`Shared ${object.name} with your contacts.`);
   }
 
   // Reloading the folder writes its own status, so a result shows after it.
@@ -462,14 +462,14 @@ export function createLibraryActions({
     const selection = selectedObjects().filter(Boolean);
     const files = selection.filter(canPublishObject);
     if (!files.length) {
-      setStatus("Select files to publish. Folders can't be published.");
+      setStatus("Select files to share. Folders can't be shared.");
       return;
     }
     const excluded = selection.filter((object) => !files.includes(object));
     if (!await confirmPublish({ files, excluded })) return;
     const failed = [];
     for (const object of files) {
-      setStatus(`Publishing ${object.name}...`);
+      setStatus(`Sharing ${object.name}...`);
       try {
         await providerApi("publish", { uri: object.uri, if_revision: object.revision });
       } catch (error) {
@@ -480,11 +480,11 @@ export function createLibraryActions({
     const published = files.length - failed.length;
     const count = (value) => `${value} file${value === 1 ? "" : "s"}`;
     if (!failed.length) {
-      await showAfterReload(`Published ${count(published)}.`);
+      await showAfterReload(`Shared ${count(published)} with your contacts.`);
       return;
     }
     const details = failed.map(({ object, text }) => `${object.name}: ${text}`).join(" ");
-    await showAfterReload(`Published ${published} of ${count(files.length)}. ${details}`);
+    await showAfterReload(`Shared ${published} of ${count(files.length)}. ${details}`);
   }
 
   // Copies the recorded publication link. When the clipboard refuses, the link
@@ -503,7 +503,7 @@ export function createLibraryActions({
   }
 
   // Sharing for a plain published file: one plain dialog, whose buttons run
-  // Copy link, Fix (the existing repair) or Unpublish.
+  // Copy link, Fix (the existing repair) or Stop sharing.
   async function showSharing(object) {
     let status;
     try {
@@ -614,7 +614,7 @@ export function createLibraryActions({
 
   async function unpublishSelectedObjects() {
     const objects = selectedObjects().filter((object) => !isDirectory(object) && !inTrash(object) && object.published && hasCapability(object, "unpublish"));
-    await runBatchAction("Unpublished", objects, (object) => providerApi("unpublish", {
+    await runBatchAction("Stopped sharing", objects, (object) => providerApi("unpublish", {
       uri: object.uri,
       if_revision: object.revision,
     }));

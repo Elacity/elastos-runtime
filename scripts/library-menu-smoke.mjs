@@ -1741,7 +1741,7 @@ async function clickMenu(page, label) {
   await page.locator("#context-menu > .menu-entry > .menu-item").filter({ hasText: label }).first().click();
 }
 
-// "Publish" is part of "Unpublish" and "Copy" of "Copy Link"; match the whole label.
+// "Copy" is part of "Copy Link" and "Stop sharing" of "Stop sharing selected"; match the whole label.
 async function clickMenuExact(page, label) {
   await page.locator("#context-menu > .menu-entry > .menu-item").filter({ hasText: new RegExp(`^${label}$`) }).first().click();
 }
@@ -2216,7 +2216,7 @@ async function run() {
       "Open",
       "Download",
       "Compress to ZIP",
-      "Publish",
+      "Share with contacts",
       "Cut",
       "Copy",
       "Delete",
@@ -2228,7 +2228,7 @@ async function run() {
       "Open",
       "Download",
       "Compress to ZIP",
-      "Publish",
+      "Share with contacts",
       "Protect and List...",
       "Properties",
     ], "protected publish video menu");
@@ -2312,7 +2312,7 @@ async function run() {
     await page.locator(".place").filter({ hasText: "Public" }).first().click();
     await page.locator(".item").filter({ hasText: "Public Draft.md" }).first().waitFor();
     await page.locator(".item").filter({ hasText: "Public Draft.md" }).filter({ hasText: "Public folder" }).first().waitFor();
-    includesAll(await openItemMenu(page, "Public Draft.md"), ["Publish", "Properties"], "public folder unpublished file menu");
+    includesAll(await openItemMenu(page, "Public Draft.md"), ["Share with contacts", "Properties"], "public folder unpublished file menu");
     excludesAll(await openItemMenu(page, "Public Draft.md"), ["Copy Link"], "public folder unpublished file menu");
     await clickMenu(page, "Properties");
     await page.locator(".window-item-properties").filter({ hasText: "Public Draft.md properties" }).first().waitFor();
@@ -2423,10 +2423,10 @@ async function run() {
       "Compress to ZIP",
       "Copy Link",
       "Sharing...",
-      "Unpublish",
+      "Stop sharing",
       "Properties",
     ], "published file menu");
-    excludesAll(publishedRows, ["Publish", "Share", "Copy Content CID", "Status", "Repair"], "published file menu");
+    excludesAll(publishedRows, ["Share with contacts", "Share", "Copy Content CID", "Status", "Repair"], "published file menu");
     // Copy Link copies the recorded publication link, never the file's current CID.
     await clickMenuExact(page, "Copy Link");
     await page.waitForFunction((link) => window.__clipboardText === link, `elastos://${SMOKE_PUBLISHED_CID}`);
@@ -2445,6 +2445,8 @@ async function run() {
       await fallbackLink.evaluate((input) => input.readOnly && document.activeElement === input && input.selectionEnd - input.selectionStart === input.value.length),
       "Copy Link fallback must select the read-only link",
     );
+    assert(await page.locator("[data-published-link] .subtitle").textContent() === "Paste this in a chat with a contact.",
+      "Copy Link fallback must say where the link goes");
     await page.locator("[data-published-link] [data-dialog-close]").click();
     await page.evaluate(() => { window.__clipboardDeny = false; });
     await openItemMenu(page, "Published.md");
@@ -2453,8 +2455,8 @@ async function run() {
     const publishedProperties = await readProperties(page);
     assertPlainGeneral(publishedProperties, "Published.md Properties");
     assert(
-      publishedProperties.general.Sharing === "Published Unpublish from the item menu",
-      `Published.md Sharing must name Unpublish; got ${publishedProperties.general.Sharing}`,
+      publishedProperties.general.Sharing === "Shared with contacts Stop sharing from the item menu",
+      `Published.md Sharing must name Stop sharing; got ${publishedProperties.general.Sharing}`,
     );
     assertPropertyLabels(publishedProperties.details, ["Object URI", "Content ID"], "Published.md Details");
     await page.locator(".properties-window-actions [data-dialog-close]").click();
@@ -2473,9 +2475,9 @@ async function run() {
     const sharing = await readSharing();
     assert(
       sharing.eyebrow === 0 && sharing.title === "Published.md" && sharing.lines.length === 2
-        && /^Shared publicly since [^\d]*\d.*\.$/.test(sharing.lines[0]) && !/\d{4}-\d{2}-\d{2}/.test(sharing.lines[0])
-        && sharing.lines[1] === "Anyone with the link can download it while your Home is online."
-        && sharing.buttons.join("|") === "Copy link|Unpublish|Close",
+        && /^Shared with your contacts since [^\d]*\d.*\.$/.test(sharing.lines[0]) && !/\d{4}-\d{2}-\d{2}/.test(sharing.lines[0])
+        && sharing.lines[1] === "Your contacts can get it while your Home is open."
+        && sharing.buttons.join("|") === "Copy link|Stop sharing|Close",
       `Sharing dialog differs: ${JSON.stringify(sharing)}`,
     );
     assert(!/elastos:\/\/|bafy|baf[a-z0-9]{20}|replica|receipt|availability|provider/i.test(sharing.text),
@@ -2488,19 +2490,19 @@ async function run() {
     await clickMenuExact(page, "Sharing...");
     await sharingDialog.waitFor();
     const broken = await readSharing();
-    assert(broken.lines[0] === "Not shared right now." && broken.buttons.join("|") === "Fix|Unpublish|Close",
+    assert(broken.lines[0] === "Not shared right now." && broken.buttons.join("|") === "Fix|Stop sharing|Close",
       `Broken sharing differs: ${JSON.stringify(broken)}`);
     await sharingDialog.locator('[data-sharing-action="fix"]').click();
     await waitForOp((entry) => entry.op === "repair" && entry.payload.uri.endsWith("/Published.md"), "Fix must run repair");
     await page.waitForFunction(() => document.querySelector("#status-text")?.textContent === "Published.md is shared again.");
-    // Unpublish withdraws the publication and offers Publish again.
+    // Stop sharing withdraws the publication and offers Share with contacts again.
     await openItemMenu(page, "Published.md");
-    await clickMenu(page, "Unpublish");
+    await clickMenuExact(page, "Stop sharing");
     await waitForOp((entry) => entry.op === "unpublish" && entry.payload.uri.endsWith("/Published.md"), "Unpublish must call unpublish");
     await page.waitForFunction(() => !document.querySelector(".badge-published"));
     const unpublishedRows = await openItemMenu(page, "Published.md");
-    includesAll(unpublishedRows, ["Publish"], "unpublished file menu");
-    excludesAll(unpublishedRows, ["Unpublish", "Copy Link"], "unpublished file menu");
+    includesAll(unpublishedRows, ["Share with contacts"], "unpublished file menu");
+    excludesAll(unpublishedRows, ["Stop sharing", "Copy Link"], "unpublished file menu");
 
     await openItemMenu(page, "Bundle.tar.gz");
     await clickMenu(page, "Properties");
@@ -2595,7 +2597,7 @@ async function run() {
     await page.waitForFunction(() => document.querySelector("#footer-left")?.textContent?.includes("4 items"));
     await page.locator(".item").filter({ hasText: "Localhost" }).first().waitFor();
     includesAll(await openItemMenu(page, "Localhost"), ["Open", "Open in New Window", "Properties"], "Localhost Spaces pointer menu");
-    excludesAll(await openItemMenu(page, "Localhost"), ["Download", "Compress to ZIP", "Publish", "Delete", "Rename"], "Localhost Spaces pointer menu");
+    excludesAll(await openItemMenu(page, "Localhost"), ["Download", "Compress to ZIP", "Share with contacts", "Delete", "Rename"], "Localhost Spaces pointer menu");
     for (const [name, source] of [["Localhost", undefined], ["Elastos", undefined], ["Cloud", "cloud://drive"]]) {
       await openItemMenu(page, name);
       await clickMenu(page, "Properties");
@@ -2620,7 +2622,7 @@ async function run() {
     excludesAll(webspaceRows, ["New", "Paste", "Upload Here"], "Spaces background menu");
     includesAll(webspaceRows, ["Sort By", "Refresh", "Properties"], "Spaces background menu");
     includesAll(await openItemMenu(page, "Cloud"), ["Open", "Open in New Window", "Properties"], "mounted WebSpace menu");
-    excludesAll(await openItemMenu(page, "Cloud"), ["Download", "Compress to ZIP", "Publish", "Delete", "Rename", "Paste Into Folder"], "mounted WebSpace menu");
+    excludesAll(await openItemMenu(page, "Cloud"), ["Download", "Compress to ZIP", "Share with contacts", "Delete", "Rename", "Paste Into Folder"], "mounted WebSpace menu");
 
     await page.locator(".item").filter({ hasText: "Cloud" }).first().dblclick();
     await page.locator(".crumb-current").filter({ hasText: "Cloud" }).first().waitFor();
@@ -2630,7 +2632,7 @@ async function run() {
     await page.locator(".crumb-current").filter({ hasText: "Project X" }).first().waitFor();
     const indexedWebspaceRows = await openItemMenu(page, "file.pdf");
     includesAll(indexedWebspaceRows, ["Open", "Download", "Properties"], "indexed WebSpace file menu");
-    excludesAll(indexedWebspaceRows, ["Publish", "Delete", "Rename", "Compress to ZIP", "Paste Into Folder"], "indexed WebSpace file menu");
+    excludesAll(indexedWebspaceRows, ["Share with contacts", "Delete", "Rename", "Compress to ZIP", "Paste Into Folder"], "indexed WebSpace file menu");
     const webspaceDownloadPromise = page.waitForEvent("download");
     await clickMenu(page, "Download");
     await webspaceDownloadPromise;
@@ -2660,7 +2662,7 @@ async function run() {
     await page.locator(".item").filter({ hasText: "content" }).first().dblclick();
     const contentRows = await openItemMenu(page, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
     includesAll(contentRows, ["Open", "Download", "Properties"], "Elastos content WebSpace file menu");
-    excludesAll(contentRows, ["Publish", "Delete", "Rename", "Compress to ZIP", "Paste Into Folder"], "Elastos content WebSpace file menu");
+    excludesAll(contentRows, ["Share with contacts", "Delete", "Rename", "Compress to ZIP", "Paste Into Folder"], "Elastos content WebSpace file menu");
 
     await page.locator(".place").filter({ hasText: "Spaces" }).first().click();
     await page.locator(".item").filter({ hasText: "Mutable" }).first().dblclick();
@@ -2685,7 +2687,7 @@ async function run() {
     );
     const mutableUploadRows = await openItemMenu(page, "Mutable Upload.txt");
     includesAll(mutableUploadRows, ["Open", "Download", "Delete Permanently", "Properties"], "mutable WebSpace file menu");
-    excludesAll(mutableUploadRows, ["Publish", "Rename", "Compress to ZIP", "Delete"], "mutable WebSpace file menu");
+    excludesAll(mutableUploadRows, ["Share with contacts", "Rename", "Compress to ZIP", "Delete"], "mutable WebSpace file menu");
     await clickMenu(page, "Delete Permanently");
     await page.locator("#dialog").filter({ hasText: "Delete permanently?" }).first().waitFor();
     await page.locator("#dialog button").filter({ hasText: "Delete Permanently" }).first().click();
@@ -2823,8 +2825,8 @@ async function run() {
     // Publish asks once; Cancel sends nothing.
     const guidePublishes = () => ops.filter((entry) => entry.op === "publish" && entry.payload.uri === `${documentsUri}/Guide.md`).length;
     await openItemMenu(page, "Guide.md");
-    await clickMenuExact(page, "Publish");
-    const publishDialog = page.locator(".dialog-card").filter({ has: page.locator("[data-dialog-confirm]", { hasText: "Publish" }) }).first();
+    await clickMenuExact(page, "Share with contacts");
+    const publishDialog = page.locator(".dialog-card").filter({ has: page.locator("[data-dialog-confirm]", { hasText: "Share" }) }).first();
     await publishDialog.waitFor();
     const publishLayout = await publishDialog.evaluate((card) => ({
       eyebrow: card.querySelectorAll(".eyebrow").length,
@@ -2835,9 +2837,9 @@ async function run() {
     assert(
       JSON.stringify(publishLayout) === JSON.stringify({
         eyebrow: 0,
-        title: 'Publish "Guide.md"?',
-        lines: ["Anyone with the link can download a copy."],
-        buttons: ["Cancel:btn", "Publish:btn btn-primary"],
+        title: 'Share "Guide.md" with your contacts?',
+        lines: ["Your contacts can get it while your Home is open."],
+        buttons: ["Cancel:btn", "Share:btn btn-primary"],
       }),
       `Publish must use Library's confirmation layout with one line; got ${JSON.stringify(publishLayout)}`,
     );
@@ -2845,7 +2847,7 @@ async function run() {
     await publishDialog.waitFor({ state: "detached" });
     assert(guidePublishes() === 0, "Cancel must not publish");
     await openItemMenu(page, "Guide.md");
-    await clickMenuExact(page, "Publish");
+    await clickMenuExact(page, "Share with contacts");
     await publishDialog.locator("[data-dialog-confirm]").click();
     await waitForOp(
       (entry) => entry.op === "publish" && entry.payload.uri === `${documentsUri}/Guide.md` && entry.payload.if_revision && !entry.payload.protection,
@@ -2853,9 +2855,9 @@ async function run() {
     );
     await page.locator(".item").filter({ hasText: "Guide.md" }).locator(".badge-published").first().waitFor();
     const guidePublishedRows = await openItemMenu(page, "Guide.md");
-    includesAll(guidePublishedRows, ["Copy Link", "Sharing...", "Unpublish"], "published Guide menu");
-    excludesAll(guidePublishedRows, ["Publish", "Share", "Copy Content CID"], "published Guide menu");
-    await clickMenu(page, "Unpublish");
+    includesAll(guidePublishedRows, ["Copy Link", "Sharing...", "Stop sharing"], "published Guide menu");
+    excludesAll(guidePublishedRows, ["Share with contacts", "Share", "Copy Content CID"], "published Guide menu");
+    await clickMenuExact(page, "Stop sharing");
     await waitForOp((entry) => entry.op === "unpublish" && entry.payload.uri === `${documentsUri}/Guide.md`, "Unpublish must call unpublish");
     await page.waitForFunction(() => !Array.from(document.querySelectorAll(".item")).some((item) => item.textContent.includes("Guide.md") && item.querySelector(".badge-published")));
 
@@ -2867,9 +2869,9 @@ async function run() {
     await clickMenu(page, "Refresh");
     await page.locator(".item").filter({ hasText: "Empty.txt" }).first().waitFor();
     await openItemMenu(page, "Empty.txt");
-    await clickMenuExact(page, "Publish");
+    await clickMenuExact(page, "Share with contacts");
     await publishDialog.locator("[data-dialog-confirm]").click();
-    await page.waitForFunction(() => document.querySelector("#status-text")?.textContent === "Empty files can't be published.");
+    await page.waitForFunction(() => document.querySelector("#status-text")?.textContent === "Empty files can't be shared.");
 
     // Publish Selected confirms once, listing the files and the folders it leaves out.
     const publishesBeforeBatch = guidePublishes();
@@ -2877,10 +2879,10 @@ async function run() {
     await page.locator(`.item[data-uri="${documentsUri}/Guide.md"]`).click();
     await page.locator(`.item[data-uri="${documentsUri}/Work"]`).click({ modifiers: [multiSelectModifier] });
     const batchRows = await openItemMenuWithoutClearingSelection(page, "Guide.md");
-    includesAll(batchRows, ["Publish Selected"], "file and folder selection menu");
-    await clickMenuExact(page, "Publish Selected");
+    includesAll(batchRows, ["Share selected with contacts"], "file and folder selection menu");
+    await clickMenuExact(page, "Share selected with contacts");
     await publishDialog.waitFor();
-    assert(await publishDialog.locator("h2").textContent() === 'Publish "Guide.md"?', "Publish Selected must name its one file");
+    assert(await publishDialog.locator("h2").textContent() === 'Share "Guide.md" with your contacts?', "Share selected must name its one file");
     assert(await publishDialog.locator("[data-publish-files]").count() === 0, "One file needs no list");
     assert(await publishDialog.locator("[data-publish-excluded]").textContent() === "Not included: Work (folder)",
       "Publish Selected must name the folders it leaves out on one line");
@@ -2889,13 +2891,13 @@ async function run() {
     await page.locator(`.item[data-uri="${documentsUri}/Guide.md"]`).click();
     await page.locator(`.item[data-uri="${documentsUri}/Work"]`).click({ modifiers: [multiSelectModifier] });
     await openItemMenuWithoutClearingSelection(page, "Guide.md");
-    await clickMenuExact(page, "Publish Selected");
+    await clickMenuExact(page, "Share selected with contacts");
     await publishDialog.locator("[data-dialog-confirm]").click();
     await waitForOp(() => guidePublishes() === publishesBeforeBatch + 1, "Publish Selected must publish the selected file");
     assert(!ops.some((entry) => entry.op === "publish" && entry.payload.uri === `${documentsUri}/Work`), "Publish Selected must never publish a folder");
     await page.locator(".item").filter({ hasText: "Guide.md" }).locator(".badge-published").first().waitFor();
     await openItemMenu(page, "Guide.md");
-    await clickMenu(page, "Unpublish");
+    await clickMenuExact(page, "Stop sharing");
     await page.waitForFunction(() => !Array.from(document.querySelectorAll(".item")).some((item) => item.textContent.includes("Guide.md") && item.querySelector(".badge-published")));
 
     // An empty Public place leaves the sidebar the next time the places load.

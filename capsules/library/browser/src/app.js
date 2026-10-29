@@ -1065,9 +1065,9 @@ import {
           } else if (object.published) {
             if (publishedLink(object)) actions.push(menuAction("Copy Link", () => copyPublishedLink(object)));
             actions.push(menuAction("Sharing...", () => showSharing(object)));
-            if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
+            if (hasCapability(object, "unpublish")) actions.push(menuAction("Stop sharing", () => unpublishObject(object)));
           } else {
-            if (canPublishObject(object)) actions.push(menuAction("Publish", () => publishObject(object)));
+            if (canPublishObject(object)) actions.push(menuAction("Share with contacts", () => publishObject(object)));
             if (isRuntimeCustodyProtectableVideo(object)) {
               actions.push(menuAction("Protect and List...", () => protectAndListObject(object)));
             }
@@ -1144,8 +1144,8 @@ import {
       ) {
         actions.push(menuAction("Compress Selected to ZIP", compressSelectedObjectsToZip));
       }
-      if (files.some(canPublishObject)) actions.push(menuAction("Publish Selected", publishSelectedObjects));
-      if (published.some((object) => hasCapability(object, "unpublish"))) actions.push(menuAction("Unpublish Selected", unpublishSelectedObjects));
+      if (files.some(canPublishObject)) actions.push(menuAction("Share selected with contacts", publishSelectedObjects));
+      if (published.some((object) => hasCapability(object, "unpublish"))) actions.push(menuAction("Stop sharing selected", unpublishSelectedObjects));
       if (active.length) actions.push("-");
       if (active.some((object) => hasCapability(object, "move"))) actions.push(menuAction("Cut", () => setClipboard("move", active)));
       if (active.some((object) => hasCapability(object, "copy"))) actions.push(menuAction("Copy", () => setClipboard("copy", active)));

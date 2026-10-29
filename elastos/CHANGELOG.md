@@ -50,17 +50,17 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   including content only a Carrier peer offers, does not open. The gateway no
   longer keeps its own copy of what it serves, so copies saved by earlier
   versions are not used, and a single file larger than 100 MiB is refused.
-- Library no longer offers Share, and Properties no longer shows the published
+- Library no longer offers Share to one person, and Properties no longer shows the published
   CID or `elastos://` text. Documents no longer offers Publish, Copy Published
   Link or Copy link on a revision, and drops its History tab and Published
-  icon. Library's Publish (item menu, or Publish Selected for several files)
-  asks once before it shares: anyone with the link can download a copy, and
-  copies people already have stay after you unpublish. It shares from this
-  Home only, without waiting for a seed copy, files
-  up to 8 MiB; a selection's folders are named and left out. A published file
-  offers Copy Link (the link to the version you published), Status, Repair and
-  Unpublish, and opens from this Home's own copy. Unpublish a file before you
-  delete it or publish a changed version. Library's sidebar shows the Public
+  icon. Library's Share with contacts (item menu, or Share selected with
+  contacts for several files) asks once: your contacts can get the file while
+  your Home is open. It shares from this Home only, without waiting for a seed
+  copy, files up to 8 MiB; a selection's folders are named and left out. A
+  shared file offers Copy Link (the link to the version you shared, to paste in
+  a chat with a contact), Sharing (since when, with Fix if sharing broke) and
+  Stop sharing, and opens from this Home's own copy. Stop sharing a file before
+  you delete it or share a changed version. Library's sidebar shows the Public
   place only while it holds items.
 - Archive no longer has a Home launcher tile, desktop shortcut or Marketplace
   Open button. Double-click a ZIP in Library, or use Open With, to open it in
@@ -76,18 +76,18 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   contact's use of your AI model there. Sharing returns inside People in a
   later release.
 - Chat can share files in Community: Attach picks a Library file (up to
-  8 MiB), asks once ("Post publicly?"), publishes it from Library and posts
-  `name · size · elastos://<cid>`. Chat shows publishing and posting apart: if
-  posting fails, Retry post posts the same publication; if Home's answer is
+  8 MiB), asks once ('Post "name" in Community?'), shares it from Library and
+  posts `name · size · elastos://<cid>`. Chat shows sharing and posting apart:
+  if posting fails, Retry post posts the same file again; if Home's answer is
   lost, Chat says it couldn't confirm the post, and Try again cannot post it
-  twice. Open in Library shows the file, which is Published there and can be
-  unpublished. A contact who clicks the link gets the file from
-  your Home (up to 64 MiB) after Home checks that its bytes match the link.
-  Direct messages still carry no files.
-- A Home now gives other Homes only files it has pinned (published, posted or
-  received). Unpublishing releases that one publication: the file stays shared
-  while another publication of the same bytes on this Home holds it, and
-  copies people already have stay.
+  twice. Open in Library shows the file, where you can stop sharing it. A
+  contact who clicks the link gets the file from your Home (up to 64 MiB) after
+  Home checks that its bytes match the link. Direct messages carry no files,
+  and Attach is not shown there.
+- A Home gives a shared file only to its contacts, and only files it has
+  shared, posted or received. Stop sharing releases that one share: the file
+  stays shared while another share of the same bytes on this Home holds it,
+  and copies contacts already have stay.
 - In this release neither the seed nor your own devices accept new copies of a
   Home's files (#498). Copies they already hold stay.
 - Chat and Inbox say less. A Chat profile card shows one state, such as

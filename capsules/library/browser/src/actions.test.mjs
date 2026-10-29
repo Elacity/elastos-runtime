@@ -583,7 +583,7 @@ test("Library Publish sends the plain publish shape after one confirmation", asy
   assert.deepEqual(harness.requests, [
     { op: "publish", payload: { uri: `${DOCS}/Guide.md`, if_revision: "rev:Guide.md" } },
   ]);
-  assert.equal(harness.statuses.at(-1), "Published Guide.md.");
+  assert.equal(harness.statuses.at(-1), "Shared Guide.md with your contacts.");
 });
 
 test("Library Publish Selected lists eligible files and leaves folders and published files out", async () => {
@@ -595,7 +595,7 @@ test("Library Publish Selected lists eligible files and leaves folders and publi
   assert.deepEqual(harness.confirmations[0].files.map((object) => object.name), ["A.md", "B.md"]);
   assert.deepEqual(harness.confirmations[0].excluded.map((object) => object.name), ["Projects", "Shared.md"]);
   assert.deepEqual(harness.requests.map(({ payload }) => payload.uri), [`${DOCS}/A.md`, `${DOCS}/B.md`]);
-  assert.equal(harness.statuses.at(-1), "Published 2 files.");
+  assert.equal(harness.statuses.at(-1), "Shared 2 files with your contacts.");
 });
 
 test("Library Publish Selected with only folders asks nothing and says why", async () => {
@@ -604,7 +604,7 @@ test("Library Publish Selected with only folders asks nothing and says why", asy
   await harness.actions.publishSelectedObjects();
   assert.deepEqual(harness.confirmations, []);
   assert.deepEqual(harness.requests, []);
-  assert.equal(harness.statuses.at(-1), "Select files to publish. Folders can't be published.");
+  assert.equal(harness.statuses.at(-1), "Select files to share. Folders can't be shared.");
 });
 
 test("Library Publish Selected reports partial success in plain words", async () => {
@@ -614,7 +614,7 @@ test("Library Publish Selected reports partial success in plain words", async ()
   });
   await harness.actions.publishSelectedObjects();
   assert.equal(harness.requests.length, 3);
-  assert.equal(harness.statuses.at(-1), "Published 2 of 3 files. Empty.md: Empty files can't be published.",
+  assert.equal(harness.statuses.at(-1), "Shared 2 of 3 files. Empty.md: Empty files can't be shared.",
     "the result must stay visible after the folder reloads");
 
   const two = publishHarness({
@@ -624,19 +624,19 @@ test("Library Publish Selected reports partial success in plain words", async ()
   await two.actions.publishSelectedObjects();
   assert.equal(
     two.statuses.at(-1),
-    "Published 1 of 3 files. Big.bin: This file is too large to publish. Files up to 8 MiB can be published. Old.md: This file changed. Refresh Library and try again.",
+    "Shared 1 of 3 files. Big.bin: This file is too large to share. Files up to 8 MiB can be shared. Old.md: This file changed. Refresh Library and try again.",
   );
 });
 
 test("Library Publish maps each error code to plain words", async () => {
   const expected = {
-    empty_file: "Empty files can't be published.",
-    too_large: "This file is too large to publish. Files up to 8 MiB can be published.",
+    empty_file: "Empty files can't be shared.",
+    too_large: "This file is too large to share. Files up to 8 MiB can be shared.",
     stale_revision: "This file changed. Refresh Library and try again.",
-    unsupported: "This file can't be published from here.",
-    unavailable: "Publishing isn't available right now. Try again.",
-    changed_since_publish: "This file changed after it was published. Unpublish it first, then publish it again.",
-    library_error: "Guide.md could not be published. Try again.",
+    unsupported: "This file can't be shared from here.",
+    unavailable: "Sharing isn't available right now. Try again.",
+    changed_since_publish: "This file changed after you shared it. Stop sharing it first, then share it again.",
+    library_error: "Guide.md could not be shared. Try again.",
   };
   for (const [code, text] of Object.entries(expected)) {
     const harness = publishHarness({ failures: { [`${DOCS}/Guide.md`]: code } });
@@ -644,9 +644,9 @@ test("Library Publish maps each error code to plain words", async () => {
     assert.equal(harness.statuses.at(-1), text, code);
   }
   for (const [reason, text] of [
-    ["folder", "Folders can't be published."],
-    ["protected", "Protected files can't be published."],
-    ["symlink", "This file can't be published from here."],
+    ["folder", "Folders can't be shared."],
+    ["protected", "Protected files can't be shared."],
+    ["symlink", "This file can't be shared from here."],
   ]) {
     const harness = publishHarness({ failures: { [`${DOCS}/Guide.md`]: { code: "unsupported", reason } } });
     await harness.actions.publishObject(file("Guide.md"));
@@ -654,7 +654,7 @@ test("Library Publish maps each error code to plain words", async () => {
   }
   const ok = publishHarness();
   await ok.actions.publishObject(file("Guide.md"));
-  assert.equal(ok.statuses.at(-1), "Published Guide.md.", "success must stay visible after the folder reloads");
+  assert.equal(ok.statuses.at(-1), "Shared Guide.md with your contacts.", "success must stay visible after the folder reloads");
 });
 
 test("Library Copy Link copies the recorded publication, never the current file CID", async () => {

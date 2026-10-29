@@ -661,7 +661,7 @@ fn validate_attachment_size(size: u64) -> Result<(), String> {
 }
 
 /// The same words Library shows before it publishes a file.
-const POST_PUBLICLY_BODY: &str = "Anyone with the link can download a copy.";
+const POST_PUBLICLY_BODY: &str = "Your contacts can get it from the post while your Home is open.";
 
 /// Shown when Home's answer was lost: the post may or may not have gone out.
 const POST_OUTCOME_UNKNOWN: &str = "Couldn't confirm the post. Check Community, or try again.";
@@ -774,19 +774,17 @@ fn library_post_from_selection(
 
 fn attach_library_error_text(code: &str, reason: &str) -> &'static str {
     match (code, reason) {
-        ("empty_file", _) => "Empty files can't be published.",
-        ("too_large", _) => {
-            "This file is too large to publish. Files up to 8 MiB can be published."
-        }
+        ("empty_file", _) => "Empty files can't be shared.",
+        ("too_large", _) => "This file is too large to share. Files up to 8 MiB can be shared.",
         ("stale_revision", _) => "This file changed. Choose it again in Library.",
         ("unsupported", "folder") => "Folders can't be posted. Choose a file.",
         ("unsupported", "protected") => "Protected files can't be posted.",
         ("unsupported", _) => "This file can't be posted from here.",
-        ("unavailable", _) => "Publishing isn't available right now. Try again.",
+        ("unavailable", _) => "Sharing isn't available right now. Try again.",
         ("changed_since_publish", _) => {
-            "This file changed after it was published. Unpublish it in Library, then post it again."
+            "This file changed after you shared it. Stop sharing it in Library, then post it again."
         }
-        ("withdrawn", _) => "This file was unpublished in Library, so it was not posted.",
+        ("withdrawn", _) => "Sharing of this file stopped in Library, so it was not posted.",
         ("request_id_reused", _) => "This post can't be sent again. Attach the file again.",
         _ => "This file could not be posted. Try again.",
     }
@@ -863,34 +861,34 @@ fn library_post_view(post: &LibraryPost) -> LibraryPostView {
     let file = format!("{} · {}", post.file_name, format_bytes(post.size_bytes));
     match &post.phase {
         LibraryPostPhase::Confirm => LibraryPostView {
-            title: format!("Post \"{}\" publicly?", post.file_name),
+            title: format!("Post \"{}\" in Community?", post.file_name),
             lines: vec![POST_PUBLICLY_BODY.to_string()],
             actions: &[Cancel, Post],
             retry_label: "Retry post",
         },
         LibraryPostPhase::Working => LibraryPostView {
-            title: format!("Post \"{}\" publicly?", post.file_name),
-            lines: vec!["Publishing and posting...".to_string()],
+            title: format!("Post \"{}\" in Community?", post.file_name),
+            lines: vec!["Sharing and posting...".to_string()],
             actions: &[],
             retry_label: "Retry post",
         },
         LibraryPostPhase::Posted { link } => LibraryPostView {
-            title: "Posted publicly".to_string(),
+            title: "Posted in Community".to_string(),
             lines: vec![
                 file,
-                format!("Published: {link}"),
+                format!("Shared: {link}"),
                 "Posted in Community.".to_string(),
             ],
             actions: &[OpenLibrary, Close],
             retry_label: "Retry post",
         },
         LibraryPostPhase::PostFailed { link, detail } => LibraryPostView {
-            title: "Published, not posted".to_string(),
+            title: "Shared, not posted".to_string(),
             lines: vec![
                 file,
-                format!("Published: {link}"),
+                format!("Shared: {link}"),
                 detail.clone(),
-                "Published in Library. You can unpublish it there.".to_string(),
+                "Shared from Library. You can stop sharing it there.".to_string(),
             ],
             actions: &[Retry, OpenLibrary, Close],
             retry_label: "Retry post",
@@ -905,7 +903,8 @@ fn library_post_view(post: &LibraryPost) -> LibraryPostView {
             title: "Post not confirmed".to_string(),
             lines: vec![
                 file,
-                "Unpublished in Library. Check Community to see whether it was posted.".to_string(),
+                "Sharing stopped in Library. Check Community to see whether it was posted."
+                    .to_string(),
             ],
             actions: &[Close],
             retry_label: "Retry post",
@@ -913,7 +912,7 @@ fn library_post_view(post: &LibraryPost) -> LibraryPostView {
         LibraryPostPhase::Unknown { link } => {
             let mut lines = vec![file];
             if let Some(link) = link {
-                lines.push(format!("Published: {link}"));
+                lines.push(format!("Shared: {link}"));
             }
             lines.push(POST_OUTCOME_UNKNOWN.to_string());
             LibraryPostView {
@@ -8337,13 +8336,14 @@ mod tests {
         assert_eq!(view.title, "Post not confirmed");
         assert_eq!(
             view.lines[1],
-            "Unpublished in Library. Check Community to see whether it was posted."
+            "Sharing stopped in Library. Check Community to see whether it was posted."
         );
         assert!(!view.lines.iter().any(|line| line.contains("not posted")));
         assert_eq!(
             super::library_post_answer(&Confirm, 409, &withdrawn),
             Failed {
-                detail: "This file was unpublished in Library, so it was not posted.".to_string()
+                detail: "Sharing of this file stopped in Library, so it was not posted."
+                    .to_string()
             }
         );
     }
@@ -8382,14 +8382,14 @@ mod tests {
             }
         );
         for (code, detail) in [
-            ("empty_file", "Empty files can't be published."),
-            ("too_large", "This file is too large to publish. Files up to 8 MiB can be published."),
+            ("empty_file", "Empty files can't be shared."),
+            ("too_large", "This file is too large to share. Files up to 8 MiB can be shared."),
             ("stale_revision", "This file changed. Choose it again in Library."),
             ("unsupported", "This file can't be posted from here."),
-            ("unavailable", "Publishing isn't available right now. Try again."),
-            ("changed_since_publish", "This file changed after it was published. Unpublish it in Library, then post it again."),
+            ("unavailable", "Sharing isn't available right now. Try again."),
+            ("changed_since_publish", "This file changed after you shared it. Stop sharing it in Library, then post it again."),
             ("post_failed", "This file could not be posted. Try again."),
-            ("withdrawn", "This file was unpublished in Library, so it was not posted."),
+            ("withdrawn", "Sharing of this file stopped in Library, so it was not posted."),
             ("request_id_reused", "This post can't be sent again. Attach the file again."),
             ("library_error", "This file could not be posted. Try again."),
         ] {
@@ -8436,10 +8436,10 @@ mod tests {
         use super::LibraryPostAction::{Cancel, Close, OpenLibrary, Post, Retry};
         use super::LibraryPostPhase::{Confirm, Failed, PostFailed, Posted, Unknown, Working};
         let confirm = super::library_post_view(&library_post_fixture(Confirm));
-        assert_eq!(confirm.title, "Post \"notes.txt\" publicly?");
+        assert_eq!(confirm.title, "Post \"notes.txt\" in Community?");
         assert_eq!(
             confirm.lines,
-            vec!["Anyone with the link can download a copy.".to_string()]
+            vec!["Your contacts can get it from the post while your Home is open.".to_string()]
         );
         assert_eq!(confirm.actions, &[Cancel, Post]);
         assert!(super::library_post_view(&library_post_fixture(Working))
@@ -8450,7 +8450,7 @@ mod tests {
         assert_eq!(
             posted.lines[1..],
             [
-                "Published: elastos://bafkreipublished".to_string(),
+                "Shared: elastos://bafkreipublished".to_string(),
                 "Posted in Community.".to_string()
             ]
         );
@@ -8459,21 +8459,14 @@ mod tests {
             link: link.clone(),
             detail: "Posting to Community failed. Retry the post.".to_string(),
         }));
-        assert_eq!(failed_post.title, "Published, not posted");
-        assert_eq!(
-            failed_post.lines[1],
-            "Published: elastos://bafkreipublished"
-        );
+        assert_eq!(failed_post.title, "Shared, not posted");
+        assert_eq!(failed_post.lines[1], "Shared: elastos://bafkreipublished");
         assert_eq!(failed_post.actions, &[Retry, OpenLibrary, Close]);
         assert_eq!(failed_post.retry_label, "Retry post");
         assert_eq!(
             failed_post.lines[3],
-            "Published in Library. You can unpublish it there."
+            "Shared from Library. You can stop sharing it there."
         );
-        assert!(!failed_post
-            .lines
-            .iter()
-            .any(|line| line.contains("stop sharing")));
         let unknown = super::library_post_view(&library_post_fixture(Unknown { link: None }));
         assert_eq!(unknown.title, "Post not confirmed");
         assert_eq!(
@@ -8489,7 +8482,7 @@ mod tests {
             super::library_post_view(&library_post_fixture(Unknown { link: Some(link) }));
         assert_eq!(
             unknown_published.lines[1],
-            "Published: elastos://bafkreipublished"
+            "Shared: elastos://bafkreipublished"
         );
         let failed = super::library_post_view(&library_post_fixture(Failed {
             detail: "x".to_string(),

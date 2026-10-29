@@ -1130,8 +1130,8 @@ async function runScenario(scenario) {
       await page.waitForFunction(() => window.fixturePickerReplies.some(reply => reply.accepted));
       await panel.waitFor({ state: 'visible' });
       assert(await page.evaluate(() => window.fixturePickerReplies.length) === 1, "a replayed picker delivery was answered again");
-      assert(await frame.locator('#library-post-title').innerText() === 'Post "attached.txt" publicly?', "Post confirmation title differs");
-      assert(await frame.locator('#library-post-lines').innerText() === 'Anyone with the link can download a copy.',
+      assert(await frame.locator('#library-post-title').innerText() === 'Post "attached.txt" in Community?', "Post confirmation title differs");
+      assert(await frame.locator('#library-post-lines').innerText() === 'Your contacts can get it from the post while your Home is open.',
         "Post confirmation must have one line");
       assert(await frame.locator('.library-post-actions button:not([hidden])').allInnerTexts().then((labels) => labels.join('|')) === 'Cancel|Post',
         "Post confirmation buttons differ");
@@ -1154,18 +1154,18 @@ async function runScenario(scenario) {
         && Object.keys(first.body).sort().join(',') === 'if_revision,request_id,uri', "attach-library body differs", first.body);
       assert(first.token === 'test-token', "attach-library launch authority missing");
       await frame.locator('#library-post-retry').click();
-      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Published, not posted');
+      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Shared, not posted');
       assert(trace.attachLibrary.length === 2 && trace.attachLibrary[1].body.request_id === first.body.request_id,
         "Try again must reuse the request id", trace.attachLibrary);
-      assert((await panelText()).includes(`Published: ${sharedUri}`), "a failed post must still show the publication");
-      assert((await panelText()).includes('Published in Library. You can unpublish it there.'), "a failed post must point to Library");
+      assert((await panelText()).includes(`Shared: ${sharedUri}`), "a failed post must still show the shared link");
+      assert((await panelText()).includes('Shared from Library. You can stop sharing it there.'), "a failed post must point to Library");
       assert(await frame.locator('#library-post-retry').innerText() === 'Retry post' && await frame.locator('#library-post-open-library').isVisible(),
         "a failed post must offer Retry post and Open in Library");
       await frame.locator('#library-post-retry').click();
-      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Posted publicly');
+      await frame.waitForFunction(() => document.querySelector('#library-post-title').textContent === 'Posted in Community');
       assert(trace.attachLibrary.length === 3 && trace.attachLibrary[2].body.request_id === first.body.request_id,
         "Retry post must reuse the request id", trace.attachLibrary);
-      assert((await panelText()).includes(`Published: ${sharedUri}`) && (await panelText()).includes('Posted in Community.'),
+      assert((await panelText()).includes(`Shared: ${sharedUri}`) && (await panelText()).includes('Posted in Community.'),
         "publication and posting must show apart");
       await frame.locator('#library-post-open-library').click();
       await page.waitForFunction(() => window.fixtureLibraryOpens.length === 1);

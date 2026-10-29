@@ -154,7 +154,7 @@ export function publishedLink(object) {
   return cid ? `elastos://${cid}` : "";
 }
 
-export const PUBLISH_CONFIRM_BODY = "Anyone with the link can download a copy.";
+export const PUBLISH_CONFIRM_BODY = "Your contacts can get it while your Home is open.";
 
 // A published file's sharing in plain terms, from Library's own record:
 // whether it is shared, since when, and whether its last repair failed.
@@ -186,19 +186,19 @@ export function canPublishObject(object) {
 }
 
 const LIBRARY_ERROR_TEXT = {
-  empty_file: "Empty files can't be published.",
-  too_large: "This file is too large to publish. Files up to 8 MiB can be published.",
+  empty_file: "Empty files can't be shared.",
+  too_large: "This file is too large to share. Files up to 8 MiB can be shared.",
   stale_revision: "This file changed. Refresh Library and try again.",
-  unsupported: "This file can't be published from here.",
-  unavailable: "Publishing isn't available right now. Try again.",
-  changed_since_publish: "This file changed after it was published. Unpublish it first, then publish it again.",
-  published_withdraw_first: "Unpublish this file before deleting it.",
+  unsupported: "This file can't be shared from here.",
+  unavailable: "Sharing isn't available right now. Try again.",
+  changed_since_publish: "This file changed after you shared it. Stop sharing it first, then share it again.",
+  published_withdraw_first: "Stop sharing this file before deleting it.",
 };
 
 // Why the provider refused with `unsupported`, in plain words.
 const UNSUPPORTED_REASON_TEXT = {
-  folder: "Folders can't be published.",
-  protected: "Protected files can't be published.",
+  folder: "Folders can't be shared.",
+  protected: "Protected files can't be shared.",
 };
 
 // Plain words for a Library error code; empty for an unknown code.
@@ -211,7 +211,7 @@ export function libraryErrorText(error) {
 }
 
 export function publishFailureText(error, name) {
-  return libraryErrorText(error) || `${name || "This file"} could not be published. Try again.`;
+  return libraryErrorText(error) || `${name || "This file"} could not be shared. Try again.`;
 }
 
 export function visibilityContract(object) {

@@ -8,6 +8,7 @@ import {
   inTrash,
   isBlockedObject,
   isDirectory,
+  isProtectedContent,
   isWebSpaceUri,
   parentUri,
   pathCrumbs,
@@ -101,8 +102,11 @@ export function createLibraryDialog({
   }
 
   function sharingValue(object) {
-    if (object.published) {
+    if (object.published && isProtectedContent(object)) {
       return badgeValue("Published", "public", hasCapability(object, "unpublish") ? "Unpublish from the item menu" : "");
+    }
+    if (object.published) {
+      return badgeValue("Shared with contacts", "public", hasCapability(object, "unpublish") ? "Stop sharing from the item menu" : "");
     }
     return badgeValue(
       "Private",
@@ -608,10 +612,10 @@ export function createLibraryDialog({
       });
     }
     return confirmDecision({
-      title: files.length === 1 ? `Publish "${names[0]}"?` : `Publish ${files.length} files?`,
+      title: files.length === 1 ? `Share "${names[0]}" with your contacts?` : `Share ${files.length} files with your contacts?`,
       message: PUBLISH_CONFIRM_BODY,
       lines,
-      confirmLabel: "Publish",
+      confirmLabel: "Share",
       confirmClass: "btn-primary",
       targetUris: files.map((object) => object.uri),
     });
@@ -619,8 +623,8 @@ export function createLibraryDialog({
 
   function publishExclusionReason(object) {
     if (isDirectory(object)) return "folder";
-    if (object.published) return "already published";
-    return "can't be published";
+    if (object.published) return "already shared";
+    return "can't be shared";
   }
 
   function compactNames(names, limit = 5) {
@@ -636,8 +640,8 @@ export function createLibraryDialog({
     dialog.innerHTML = `
       <div class="dialog-card" data-published-link>
         <div>
-          <h2>${escapeHtml(name || "Published file")}</h2>
-          <p class="subtitle">Copying didn't work. Select the link and copy it.</p>
+          <h2>${escapeHtml(name || "Shared file")}</h2>
+          <p class="subtitle">Paste this in a chat with a contact.</p>
         </div>
         <label class="dialog-field">
           <span>Link</span>
@@ -656,7 +660,7 @@ export function createLibraryDialog({
 
   // A published file's sharing for someone who knows nothing about how it
   // works: since when, who can get it, and what they can do. Resolves to
-  // "copy", "fix", "unpublish" or false.
+  // "copy", "fix", "unpublish" (Stop sharing) or false.
   function showSharingDialog({ object, shared, broken, since, canCopy }) {
     hideMenu();
     hideDialog();
@@ -664,8 +668,8 @@ export function createLibraryDialog({
     const first = !shared
       ? "Not shared right now."
       : since
-        ? `Shared publicly since ${since.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })}.`
-        : "Shared publicly.";
+        ? `Shared with your contacts since ${since.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })}.`
+        : "Shared with your contacts.";
     const lead = broken
       ? '<button class="btn btn-primary" type="button" data-sharing-action="fix">Fix</button>'
       : canCopy
@@ -678,11 +682,11 @@ export function createLibraryDialog({
           <div>
             <h2>${escapeHtml(object.name || "File")}</h2>
             <p class="subtitle">${escapeHtml(first)}</p>
-            <p class="subtitle">Anyone with the link can download it while your Home is online.</p>
+            <p class="subtitle">${escapeHtml(PUBLISH_CONFIRM_BODY)}</p>
           </div>
           <div class="button-row">
             ${lead}
-            <button class="btn" type="button" data-sharing-action="unpublish">Unpublish</button>
+            <button class="btn" type="button" data-sharing-action="unpublish">Stop sharing</button>
             <button class="btn" type="button" data-dialog-close>Close</button>
           </div>
         </div>
