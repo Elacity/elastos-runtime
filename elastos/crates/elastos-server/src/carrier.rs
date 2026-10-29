@@ -62,7 +62,6 @@ use elastos_runtime::provider::{
     ResourceResponse,
 };
 
-use crate::content::{ContentObjectManifest, CONTENT_OBJECT_MANIFEST_PATH};
 use crate::operator_control::{
     load_operator_control, OperatorHandler, OperatorRuntimeContext, OPERATOR_ALPN,
 };
@@ -123,16 +122,6 @@ const CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_DOMAIN: &str =
 const MAX_CARRIER_REPLICATION_CANDIDATES: usize = 8;
 const MAX_CARRIER_AVAILABILITY_TICKET_LEN: usize = 8192;
 const MAX_CARRIER_AVAILABILITY_ENDPOINT_ID_LEN: usize = 256;
-const MAX_CARRIER_OBJECT_IMPORT_FILES: usize = 512;
-// The most one Carrier import request carries: its base64 payload plus the
-// request fields must fit one provider request line. Larger content cannot
-// replicate until ranged pull replication (#498).
-// 696 KiB is the largest that fits: base64 950,272 + 96 KiB = 1 MiB.
-const MAX_CARRIER_OBJECT_IMPORT_BYTES: usize = 696 * 1024;
-const _: () = assert!(
-    (MAX_CARRIER_OBJECT_IMPORT_BYTES as u64).div_ceil(3) * 4 + 96 * 1024
-        <= CARRIER_PROVIDER_REQUEST_MAX_BYTES
-);
 const MAX_REMOTE_RECEIPT_REPLICA_SUMMARY_ROWS: usize = 5;
 const GOSSIP_SEND_TIMEOUT: Duration = Duration::from_millis(1_500);
 const GOSSIP_JOIN_PEERS_TIMEOUT: Duration = Duration::from_millis(1_500);
@@ -5031,7 +5020,7 @@ async fn ensure_content_via_carrier_provider_invocation(
         ensure_request["publisher_did"] = serde_json::Value::String(publisher_did.to_string());
     }
 
-    let mut ensure_response = registry
+    let ensure_response = registry
         .invoke_provider(ProviderInvocation {
             source: "carrier-availability".to_string(),
             target: "content".to_string(),
@@ -5044,58 +5033,24 @@ async fn ensure_content_via_carrier_provider_invocation(
         })
         .await
         .map_err(|err| anyhow::anyhow!("remote content ensure failed: {err}"))?;
+    // 0.8.0 has no push replication (#498): the remote ensure only proves a
+    // copy the device already holds; anything else is refused at once.
+    let ensure_status = ensure_response
+        .get("data")
+        .and_then(|data| data.get("availability"))
+        .and_then(|availability| availability.get("status"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
     if ensure_response
         .get("status")
         .and_then(|value| value.as_str())
         == Some("error")
+        || matches!(
+            ensure_status,
+            "repair_needed" | "local_unpinned" | "unknown"
+        )
     {
-        let message = ensure_response
-            .get("message")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown provider error");
-        ensure_response = import_content_via_carrier_provider_invocation(
-            registry,
-            replica,
-            cid,
-            source_request,
-            Some(message),
-        )
-        .await?;
-    }
-    let ensure_status = ensure_response
-        .get("data")
-        .and_then(|data| data.get("availability"))
-        .and_then(|availability| availability.get("status"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    if matches!(
-        ensure_status.as_str(),
-        "repair_needed" | "local_unpinned" | "unknown"
-    ) {
-        ensure_response = import_content_via_carrier_provider_invocation(
-            registry,
-            replica,
-            cid,
-            source_request,
-            Some(&ensure_status),
-        )
-        .await?;
-    }
-    let ensure_status = ensure_response
-        .get("data")
-        .and_then(|data| data.get("availability"))
-        .and_then(|availability| availability.get("status"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    if matches!(
-        ensure_status.as_str(),
-        "repair_needed" | "local_unpinned" | "unknown"
-    ) {
-        anyhow::bail!(
-            "remote content import/ensure did not prove a pinned replica: {ensure_status}"
-        );
+        anyhow::bail!("Copies to your own devices come in a later update.");
     }
     let remote_receipt = remote_content_receipt_summary(&ensure_response, cid)?;
 
@@ -5155,7 +5110,7 @@ async fn ensure_content_via_carrier_provider_invocation(
         selection_reason: replica.selection_reason.clone(),
         reputation_score: replica.reputation_score,
         reputation_reason: replica.reputation_reason.clone(),
-        ensure_status,
+        ensure_status: ensure_status.to_string(),
         admission: Some(admission),
         status_availability,
         remote_receipt,
@@ -5799,465 +5754,6 @@ fn remote_content_receipt_abuse_controls_summary(
             .cloned()
             .unwrap_or(serde_json::Value::Bool(false)),
     })
-}
-
-async fn import_content_via_carrier_provider_invocation(
-    registry: &ProviderRegistry,
-    replica: &CarrierAvailabilityReplica,
-    cid: &str,
-    source_request: &serde_json::Value,
-    ensure_failure: Option<&str>,
-) -> Result<serde_json::Value> {
-    let requirements = CarrierAvailabilityRequirements::from_request(source_request);
-    if !requirements
-        .repair_graph_kind
-        .supports_current_import_fallback()
-    {
-        return import_ipld_dag_content_via_carrier_block_graph_provider(
-            registry,
-            replica,
-            cid,
-            source_request,
-            ensure_failure,
-            requirements,
-        )
-        .await;
-    }
-    match import_object_content_via_carrier_provider_invocation(
-        registry,
-        replica,
-        cid,
-        source_request,
-        ensure_failure,
-    )
-    .await
-    {
-        Ok(response) => Ok(response),
-        Err(object_err)
-            if object_err
-                .to_string()
-                .contains("local content object import exceeds") =>
-        {
-            // Kubo is offline, so the replica cannot pin this itself and no
-            // Carrier import carries an object past the cap; it is refused at
-            // once. Ranged pull replication for big objects is #498.
-            Err(object_err)
-        }
-        Err(object_err) => import_exact_content_via_carrier_provider_invocation(
-            registry,
-            replica,
-            cid,
-            source_request,
-            ensure_failure,
-        )
-        .await
-        .map_err(|exact_err| {
-            anyhow::anyhow!(
-                "remote content object import failed: {object_err}; exact import fallback failed: {exact_err}"
-            )
-        }),
-    }
-}
-
-async fn import_ipld_dag_content_via_carrier_block_graph_provider(
-    registry: &ProviderRegistry,
-    replica: &CarrierAvailabilityReplica,
-    cid: &str,
-    source_request: &serde_json::Value,
-    ensure_failure: Option<&str>,
-    requirements: CarrierAvailabilityRequirements,
-) -> Result<serde_json::Value> {
-    let mut export_request = serde_json::json!({
-        "op": "export_graph",
-        "cid": cid,
-        "schema": CONTENT_BLOCK_GRAPH_SCHEMA,
-        "repair_graph_kind": requirements.repair_graph_kind.as_str(),
-        "availability_requirements": requirements.to_json(),
-        "policy": "carrier_block_graph_repair",
-    });
-    copy_optional_content_identity(source_request, &mut export_request);
-
-    let export_response = registry
-        .invoke_provider(ProviderInvocation {
-            source: "carrier-availability".to_string(),
-            target: CONTENT_BLOCK_GRAPH_TARGET.to_string(),
-            op: "export_graph".to_string(),
-            request: export_request,
-            transfer: ProviderTransfer::Json,
-            range: None,
-            progress: None,
-            transport: ProviderInvocationTransport::Local,
-        })
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "local block-graph export failed for arbitrary DAG repair: {err}; Carrier refused object/exact fallback"
-            )
-        })?;
-    ensure_provider_ok(&export_response, "local block-graph export")?;
-    let graph = exported_block_graph(&export_response, cid)?;
-
-    let route = ProviderCarrierRoute::ConnectTicket {
-        connect_ticket: replica.connect_ticket.clone(),
-        peer_did: Some(replica.node_did.clone()),
-        timeout_ms: Some(5_000),
-    };
-    let mut import_request = serde_json::json!({
-        "op": "import_graph",
-        "cid": cid,
-        "graph": graph,
-        "availability_policy": "carrier_block_graph_import",
-        "availability_requirements": requirements.to_json(),
-        "ensure_failure": ensure_failure,
-    });
-    copy_optional_content_identity(source_request, &mut import_request);
-
-    let import_response = registry
-        .invoke_provider(ProviderInvocation {
-            source: "carrier-availability".to_string(),
-            target: CONTENT_BLOCK_GRAPH_TARGET.to_string(),
-            op: "import_graph".to_string(),
-            request: import_request,
-            transfer: ProviderTransfer::Json,
-            range: None,
-            progress: None,
-            transport: ProviderInvocationTransport::Carrier(route),
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("remote block-graph import failed: {err}"))?;
-    ensure_provider_ok(&import_response, "remote block-graph import")?;
-
-    let mut ensure_request = serde_json::json!({
-        "op": "ensure",
-        "cid": cid,
-        "availability_policy": "carrier_block_graph_import",
-        "availability_requirements": requirements.to_json(),
-    });
-    copy_optional_content_identity(source_request, &mut ensure_request);
-    let route = ProviderCarrierRoute::ConnectTicket {
-        connect_ticket: replica.connect_ticket.clone(),
-        peer_did: Some(replica.node_did.clone()),
-        timeout_ms: Some(5_000),
-    };
-    let ensure_response = registry
-        .invoke_provider(ProviderInvocation {
-            source: "carrier-availability".to_string(),
-            target: "content".to_string(),
-            op: "ensure".to_string(),
-            request: ensure_request,
-            transfer: ProviderTransfer::Json,
-            range: None,
-            progress: None,
-            transport: ProviderInvocationTransport::Carrier(route),
-        })
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!("remote content ensure after block-graph import failed: {err}")
-        })?;
-    ensure_provider_ok(
-        &ensure_response,
-        "remote content ensure after block-graph import",
-    )?;
-    Ok(ensure_response)
-}
-
-fn ensure_provider_ok(response: &serde_json::Value, label: &str) -> Result<()> {
-    if response.get("status").and_then(|status| status.as_str()) == Some("error") {
-        let message = response
-            .get("message")
-            .and_then(|message| message.as_str())
-            .unwrap_or("unknown provider error");
-        anyhow::bail!("{label} returned error: {message}");
-    }
-    Ok(())
-}
-
-fn exported_block_graph(response: &serde_json::Value, cid: &str) -> Result<serde_json::Value> {
-    let graph = response
-        .get("data")
-        .and_then(|data| data.get("graph"))
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("local block-graph export missing data.graph"))?;
-    if graph.get("schema").and_then(|value| value.as_str()) != Some(CONTENT_BLOCK_GRAPH_SCHEMA) {
-        anyhow::bail!("local block-graph export returned unsupported graph schema");
-    }
-    let root_cid = graph
-        .get("root_cid")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if root_cid != cid {
-        anyhow::bail!("local block-graph export root CID mismatch");
-    }
-    Ok(graph)
-}
-
-fn copy_optional_content_identity(source: &serde_json::Value, target: &mut serde_json::Value) {
-    for key in ["object_did", "publisher_did"] {
-        if let Some(value) = source.get(key).cloned() {
-            target[key] = value;
-        }
-    }
-}
-
-async fn local_content_fetch_bytes_for_import(
-    registry: &ProviderRegistry,
-    cid: &str,
-    path: Option<&str>,
-) -> Result<Vec<u8>> {
-    let mut request = serde_json::json!({
-        "op": "fetch",
-        "cid": cid,
-        "local_only": true,
-        // Refused past the import cap before more is read.
-        "whole_max_bytes": MAX_CARRIER_OBJECT_IMPORT_BYTES,
-        "transfer": "stream",
-    });
-    if let Some(path) = path.filter(|path| !path.is_empty()) {
-        request["path"] = serde_json::Value::String(path.to_string());
-    }
-    let response = registry
-        .invoke_provider(ProviderInvocation {
-            source: "carrier-availability".to_string(),
-            target: "content".to_string(),
-            op: "fetch".to_string(),
-            request,
-            transfer: ProviderTransfer::Stream,
-            range: None,
-            progress: None,
-            transport: ProviderInvocationTransport::Local,
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("local content fetch for object import failed: {err}"))?;
-    if response.get("status").and_then(|value| value.as_str()) == Some("error") {
-        let message = response
-            .get("message")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown provider error");
-        anyhow::bail!("local content fetch for object import returned error: {message}");
-    }
-    remote_content_provider_response_bytes(&response)
-}
-
-fn carrier_legacy_object_import_declared_bytes(manifest: &ContentObjectManifest) -> Result<u64> {
-    let mut total_bytes = 0_u64;
-    for file in &manifest.files {
-        total_bytes = total_bytes.saturating_add(file.size);
-        if total_bytes > MAX_CARRIER_OBJECT_IMPORT_BYTES as u64 {
-            anyhow::bail!(
-                "local content object import exceeds {} bytes",
-                MAX_CARRIER_OBJECT_IMPORT_BYTES
-            );
-        }
-    }
-    Ok(total_bytes)
-}
-
-async fn import_object_content_via_carrier_provider_invocation(
-    registry: &ProviderRegistry,
-    replica: &CarrierAvailabilityReplica,
-    cid: &str,
-    source_request: &serde_json::Value,
-    ensure_failure: Option<&str>,
-) -> Result<serde_json::Value> {
-    let manifest_bytes =
-        local_content_fetch_bytes_for_import(registry, cid, Some(CONTENT_OBJECT_MANIFEST_PATH))
-            .await?;
-    let manifest: ContentObjectManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|err| {
-            anyhow::anyhow!("local content object manifest decode failed for {cid}: {err}")
-        })?;
-    if manifest.files.is_empty() {
-        anyhow::bail!("local content object manifest has no files");
-    }
-    if manifest.files.len() > MAX_CARRIER_OBJECT_IMPORT_FILES {
-        anyhow::bail!(
-            "local content object manifest exceeds {} files",
-            MAX_CARRIER_OBJECT_IMPORT_FILES
-        );
-    }
-    carrier_legacy_object_import_declared_bytes(&manifest)?;
-    let mut files = Vec::with_capacity(manifest.files.len());
-    let mut total_bytes = 0_usize;
-    for file in &manifest.files {
-        let bytes = local_content_fetch_bytes_for_import(registry, cid, Some(&file.path)).await?;
-        if bytes.len() as u64 != file.size {
-            anyhow::bail!(
-                "local content object file {} size mismatch: manifest {}, fetched {}",
-                file.path,
-                file.size,
-                bytes.len()
-            );
-        }
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
-        if sha256 != file.sha256 {
-            anyhow::bail!(
-                "local content object file {} digest mismatch: manifest {}, fetched {}",
-                file.path,
-                file.sha256,
-                sha256
-            );
-        }
-        total_bytes = total_bytes.saturating_add(bytes.len());
-        if total_bytes > MAX_CARRIER_OBJECT_IMPORT_BYTES {
-            anyhow::bail!(
-                "local content object import exceeds {} bytes",
-                MAX_CARRIER_OBJECT_IMPORT_BYTES
-            );
-        }
-        files.push(serde_json::json!({
-            "path": file.path.clone(),
-            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-        }));
-    }
-    let file_count = files.len();
-    let mut import_request = serde_json::json!({
-        "op": "import_object",
-        "cid": cid,
-        "object_kind": manifest.kind.clone(),
-        "files": files,
-    });
-    if let Some(reason) = ensure_failure {
-        import_request["ensure_failure"] = serde_json::Value::String(reason.to_string());
-    }
-    if !manifest.links.is_empty() {
-        import_request["links"] = serde_json::to_value(&manifest.links)
-            .map_err(|err| anyhow::anyhow!("content object links encode failed: {err}"))?;
-    }
-    if let Some(object_did) = manifest.object_did.or_else(|| {
-        source_request
-            .get("object_did")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-    }) {
-        import_request["object_did"] = serde_json::Value::String(object_did);
-    }
-    if let Some(publisher_did) = manifest.publisher_did.or_else(|| {
-        source_request
-            .get("publisher_did")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-    }) {
-        import_request["publisher_did"] = serde_json::Value::String(publisher_did);
-    }
-    import_request["import_summary"] = serde_json::json!({
-        "schema": "elastos.content.import-object.request-summary/v1",
-        "files": file_count,
-        "bytes": total_bytes,
-        "source": "local-object-manifest",
-    });
-
-    let response = registry
-        .invoke_provider(ProviderInvocation {
-            source: "carrier-availability".to_string(),
-            target: "content".to_string(),
-            op: "import_object".to_string(),
-            request: import_request,
-            transfer: ProviderTransfer::Json,
-            range: None,
-            progress: None,
-            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::ConnectTicket {
-                connect_ticket: replica.connect_ticket.clone(),
-                peer_did: Some(replica.node_did.clone()),
-                timeout_ms: Some(5_000),
-            }),
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("remote content object import failed: {err}"))?;
-    if response.get("status").and_then(|value| value.as_str()) == Some("error") {
-        let message = response
-            .get("message")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown provider error");
-        anyhow::bail!("remote content object import returned error: {message}");
-    }
-    Ok(response)
-}
-
-async fn import_exact_content_via_carrier_provider_invocation(
-    registry: &ProviderRegistry,
-    replica: &CarrierAvailabilityReplica,
-    cid: &str,
-    source_request: &serde_json::Value,
-    ensure_failure: Option<&str>,
-) -> Result<serde_json::Value> {
-    let local_fetch = registry
-        .invoke_provider(ProviderInvocation {
-            source: "carrier-availability".to_string(),
-            target: "content".to_string(),
-            op: "fetch".to_string(),
-            request: serde_json::json!({
-                "op": "fetch",
-                "cid": cid,
-                "local_only": true,
-                "whole_max_bytes": MAX_CARRIER_OBJECT_IMPORT_BYTES,
-                "transfer": "stream",
-            }),
-            transfer: ProviderTransfer::Stream,
-            range: None,
-            progress: None,
-            transport: ProviderInvocationTransport::Local,
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("local content fetch for exact import failed: {err}"))?;
-    if local_fetch.get("status").and_then(|value| value.as_str()) == Some("error") {
-        let message = local_fetch
-            .get("message")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown provider error");
-        anyhow::bail!("local content fetch for exact import returned error: {message}");
-    }
-    let stream = local_fetch
-        .get("data")
-        .and_then(|data| data.get("stream"))
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("local content fetch missing stream payload"))?;
-    let mut import_request = serde_json::json!({
-        "op": "import_exact",
-        "cid": cid,
-        "stream": stream,
-        "filename": "content.bin",
-    });
-    if let Some(reason) = ensure_failure {
-        import_request["ensure_failure"] = serde_json::Value::String(reason.to_string());
-    }
-    if let Some(object_did) = source_request
-        .get("object_did")
-        .and_then(|value| value.as_str())
-    {
-        import_request["object_did"] = serde_json::Value::String(object_did.to_string());
-    }
-    if let Some(publisher_did) = source_request
-        .get("publisher_did")
-        .and_then(|value| value.as_str())
-    {
-        import_request["publisher_did"] = serde_json::Value::String(publisher_did.to_string());
-    }
-
-    let response = registry
-        .invoke_provider(ProviderInvocation {
-            source: "carrier-availability".to_string(),
-            target: "content".to_string(),
-            op: "import_exact".to_string(),
-            request: import_request,
-            transfer: ProviderTransfer::Json,
-            range: None,
-            progress: None,
-            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::ConnectTicket {
-                connect_ticket: replica.connect_ticket.clone(),
-                peer_did: Some(replica.node_did.clone()),
-                timeout_ms: Some(5_000),
-            }),
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("remote content exact import failed: {err}"))?;
-    if response.get("status").and_then(|value| value.as_str()) == Some("error") {
-        let message = response
-            .get("message")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown provider error");
-        anyhow::bail!("remote content exact import returned error: {message}");
-    }
-    Ok(response)
 }
 
 fn remote_content_provider_response_bytes(response: &serde_json::Value) -> Result<Vec<u8>> {
@@ -10239,186 +9735,6 @@ pub(crate) mod tests {
         }
     }
 
-    struct MockCarrierObjectContentProvider;
-    struct MockCarrierBlockGraphProvider;
-
-    #[async_trait::async_trait]
-    impl Provider for MockCarrierObjectContentProvider {
-        async fn handle(
-            &self,
-            _request: ResourceRequest,
-        ) -> Result<ResourceResponse, ProviderError> {
-            Err(ProviderError::Provider(
-                "mock content provider only supports raw operations".into(),
-            ))
-        }
-
-        fn schemes(&self) -> Vec<&'static str> {
-            Vec::new()
-        }
-
-        fn name(&self) -> &'static str {
-            "mock-carrier-object-content-provider"
-        }
-
-        async fn send_raw(
-            &self,
-            request: &serde_json::Value,
-        ) -> std::result::Result<serde_json::Value, ProviderError> {
-            if request.get("op").and_then(|op| op.as_str()) != Some("fetch")
-                || !request
-                    .get("local_only")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false)
-            {
-                return Ok(serde_json::json!({
-                    "status": "error",
-                    "code": "unsupported",
-                    "message": "mock object content provider only supports local fetch"
-                }));
-            }
-            let path = request
-                .get("path")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let bytes = match path {
-                CONTENT_OBJECT_MANIFEST_PATH => carrier_test_object_manifest_bytes(),
-                "index.md" => carrier_test_object_file_bytes(),
-                _ => {
-                    return Ok(serde_json::json!({
-                        "status": "error",
-                        "code": "not_found",
-                        "message": "mock object path not found"
-                    }))
-                }
-            };
-            Ok(serde_json::json!({
-                "status": "ok",
-                "data": {
-                    "cid": request
-                        .get("cid")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    "stream": carrier_test_stream_payload(&bytes)
-                }
-            }))
-        }
-    }
-
-    /// Local Content holding one object whose manifest declares more bytes
-    /// than a Carrier object import carries; it records every path it reads.
-    struct MockCarrierOversizedObjectContentProvider {
-        paths: Arc<StdMutex<Vec<String>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for MockCarrierOversizedObjectContentProvider {
-        async fn handle(
-            &self,
-            _request: ResourceRequest,
-        ) -> Result<ResourceResponse, ProviderError> {
-            Err(ProviderError::Provider("raw operations only".into()))
-        }
-
-        fn schemes(&self) -> Vec<&'static str> {
-            Vec::new()
-        }
-
-        fn name(&self) -> &'static str {
-            "mock-carrier-oversized-object-content-provider"
-        }
-
-        async fn send_raw(
-            &self,
-            request: &serde_json::Value,
-        ) -> std::result::Result<serde_json::Value, ProviderError> {
-            let path = request["path"].as_str().unwrap_or_default().to_string();
-            self.paths.lock().unwrap().push(path.clone());
-            if path != CONTENT_OBJECT_MANIFEST_PATH {
-                return Ok(serde_json::json!({
-                    "status": "error", "code": "unexpected", "message": "only the manifest is read"
-                }));
-            }
-            let manifest = serde_json::to_vec(&ContentObjectManifest {
-                schema: "elastos.content.object.manifest/v1".into(),
-                kind: "model".into(),
-                content_digest: "sha256:00".into(),
-                files: vec![crate::content::ContentObjectFile {
-                    path: "weights.gguf".into(),
-                    sha256: "00".into(),
-                    size: MAX_CARRIER_OBJECT_IMPORT_BYTES as u64 + 1,
-                }],
-                links: Vec::new(),
-                object_did: None,
-                publisher_did: None,
-            })
-            .unwrap();
-            Ok(serde_json::json!({
-                "status": "ok",
-                "data": { "cid": request["cid"].clone(), "stream": carrier_test_stream_payload(&manifest) }
-            }))
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for MockCarrierBlockGraphProvider {
-        async fn handle(
-            &self,
-            _request: ResourceRequest,
-        ) -> Result<ResourceResponse, ProviderError> {
-            Err(ProviderError::Provider(
-                "mock block-graph provider only supports raw operations".into(),
-            ))
-        }
-
-        fn schemes(&self) -> Vec<&'static str> {
-            Vec::new()
-        }
-
-        fn name(&self) -> &'static str {
-            "mock-block-graph-provider"
-        }
-
-        async fn send_raw(
-            &self,
-            request: &serde_json::Value,
-        ) -> std::result::Result<serde_json::Value, ProviderError> {
-            if request.get("op").and_then(|op| op.as_str()) != Some("export_graph") {
-                return Ok(serde_json::json!({
-                    "status": "error",
-                    "code": "unsupported",
-                    "message": "mock block-graph provider only supports export_graph"
-                }));
-            }
-            let cid = request
-                .get("cid")
-                .and_then(|value| value.as_str())
-                .unwrap_or("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
-            Ok(serde_json::json!({
-                "status": "ok",
-                "data": {
-                    "graph": {
-                        "schema": CONTENT_BLOCK_GRAPH_SCHEMA,
-                        "root_cid": cid,
-                        "kind": "ipld_dag",
-                        "blocks": [
-                            {
-                                "cid": cid,
-                                "codec": "dag-pb",
-                                "size": 22,
-                                "data": base64::engine::general_purpose::STANDARD.encode(
-                                    b"carrier provider bytes",
-                                )
-                            }
-                        ],
-                        "links": [],
-                        "bytes": 22
-                    }
-                }
-            }))
-        }
-    }
-
     #[derive(Default)]
     struct MockCarrierProviderPlaneInvoker {
         requests: Mutex<Vec<serde_json::Value>>,
@@ -10547,13 +9863,6 @@ pub(crate) mod tests {
                 }));
             }
             if invocation.transfer == ProviderTransfer::Json && invocation.op == "ensure" {
-                let ensure_attempts = self
-                    .requests
-                    .lock()
-                    .await
-                    .iter()
-                    .filter(|request| request["op"] == "ensure")
-                    .count();
                 if self.fail_tickets.iter().any(|dead| dead == ticket) {
                     return Ok(serde_json::json!({
                         "status": "error",
@@ -10561,7 +9870,7 @@ pub(crate) mod tests {
                         "message": "mock remote pin failed"
                     }));
                 }
-                if self.fail_ensure && ensure_attempts == 1 {
+                if self.fail_ensure {
                     // A replica whose offline Kubo lacks the CID: Content
                     // answers its ensure with a repair-needed receipt.
                     return Ok(serde_json::json!({
@@ -10607,138 +9916,6 @@ pub(crate) mod tests {
                                 "scheduled": false,
                                 "status": "not_scheduled"
                             }
-                        }
-                    }
-                }));
-            }
-            if invocation.transfer == ProviderTransfer::Json && invocation.op == "import_exact" {
-                return Ok(serde_json::json!({
-                    "status": "ok",
-                    "data": {
-                        "cid": request
-                            .get("cid")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "receipt": signed_remote_content_receipt(
-                            request
-                                .get("cid")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
-                        ),
-                        "availability": {
-                            "status": "local_pinned",
-                            "provider": "content-provider",
-                            "policy": "carrier_exact_import",
-                            "replicas": 1,
-                            "peer_selection": {
-                                "mode": "single_local",
-                                "live_multi_peer_proof": false
-                            },
-                            "quota": {
-                                "policy": "not_enforced"
-                            },
-                            "repair_worker": {
-                                "scheduled": false,
-                                "status": "not_scheduled"
-                            }
-                        },
-                        "import": {
-                            "schema": "elastos.content.import-exact/v1",
-                            "verified_cid": true,
-                            "bytes": 22
-                        }
-                    }
-                }));
-            }
-            if invocation.transfer == ProviderTransfer::Json && invocation.op == "import_object" {
-                return Ok(serde_json::json!({
-                    "status": "ok",
-                    "data": {
-                        "cid": request
-                            .get("cid")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "receipt": signed_remote_content_receipt(
-                            request
-                                .get("cid")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
-                        ),
-                        "availability": {
-                            "status": "local_pinned",
-                            "provider": "content-provider",
-                            "policy": "carrier_object_import",
-                            "replicas": 1,
-                            "peer_selection": {
-                                "mode": "single_local",
-                                "live_multi_peer_proof": false
-                            },
-                            "quota": {
-                                "policy": "not_enforced"
-                            },
-                            "repair_worker": {
-                                "scheduled": false,
-                                "status": "not_scheduled"
-                            }
-                        },
-                        "import": {
-                            "schema": "elastos.content.import-object/v1",
-                            "verified_cid": true,
-                            "files": request
-                                .get("files")
-                                .and_then(|value| value.as_array())
-                                .map(|files| files.len())
-                                .unwrap_or(0)
-                        }
-                    }
-                }));
-            }
-            if invocation.transfer == ProviderTransfer::Json && invocation.op == "import_graph" {
-                return Ok(serde_json::json!({
-                    "status": "ok",
-                    "data": {
-                        "cid": request
-                            .get("cid")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "receipt": signed_remote_content_receipt(
-                            request
-                                .get("cid")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
-                        ),
-                        "availability": {
-                            "status": "local_pinned",
-                            "provider": CONTENT_BLOCK_GRAPH_PROVIDER,
-                            "policy": "carrier_block_graph_import",
-                            "replicas": 1,
-                            "peer_selection": {
-                                "mode": "single_local",
-                                "live_multi_peer_proof": false
-                            },
-                            "quota": {
-                                "policy": "not_enforced"
-                            },
-                            "repair_worker": {
-                                "scheduled": false,
-                                "status": "not_scheduled"
-                            },
-                            "repair_graph": {
-                                "schema": CONTENT_REPAIR_GRAPH_SCHEMA,
-                                "policy": "carrier_provider_bounded_graph_repair",
-                                "requested_kind": "ipld_dag",
-                                "status": "block_graph_provider_imported"
-                            }
-                        },
-                        "import": {
-                            "schema": CONTENT_BLOCK_GRAPH_SCHEMA,
-                            "verified_cid": true,
-                            "blocks": request
-                                .get("graph")
-                                .and_then(|graph| graph.get("blocks"))
-                                .and_then(|value| value.as_array())
-                                .map(|blocks| blocks.len())
-                                .unwrap_or(0)
                         }
                     }
                 }));
@@ -11142,72 +10319,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// One Carrier request line carries at most 1 MiB of provider request, so
-    /// a 1 MiB object (1.33 MiB as base64) cannot travel in one import and is
-    /// refused before any read; the largest accepted import still fits.
-    #[test]
-    fn test_carrier_import_cap_fits_one_request_line() {
-        let manifest = |size: u64| ContentObjectManifest {
-            schema: "elastos.content.object.manifest/v1".into(),
-            kind: "document".into(),
-            content_digest: "sha256:00".into(),
-            files: vec![crate::content::ContentObjectFile {
-                path: "file.bin".into(),
-                sha256: "00".into(),
-                size,
-            }],
-            links: Vec::new(),
-            object_did: None,
-            publisher_did: None,
-        };
-        assert!(carrier_legacy_object_import_declared_bytes(&manifest(1024 * 1024)).is_err());
-        let cap = MAX_CARRIER_OBJECT_IMPORT_BYTES as u64;
-        assert_eq!(
-            carrier_legacy_object_import_declared_bytes(&manifest(cap)).unwrap(),
-            cap
-        );
-    }
-
-    #[test]
-    fn test_carrier_legacy_object_import_rejects_declared_oversize_before_allocation() {
-        let oversized = ContentObjectManifest {
-            schema: "elastos.content.object.manifest/v1".into(),
-            kind: "capsule".into(),
-            content_digest: "sha256:00".into(),
-            files: vec![crate::content::ContentObjectFile {
-                path: "weights.gguf".into(),
-                sha256: "00".into(),
-                size: MAX_CARRIER_OBJECT_IMPORT_BYTES as u64 + 1,
-            }],
-            links: Vec::new(),
-            object_did: None,
-            publisher_did: None,
-        };
-        let err = carrier_legacy_object_import_declared_bytes(&oversized).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("local content object import exceeds"),
-            "{err}"
-        );
-        let small = ContentObjectManifest {
-            schema: "elastos.content.object.manifest/v1".into(),
-            kind: "capsule".into(),
-            content_digest: "sha256:00".into(),
-            files: vec![crate::content::ContentObjectFile {
-                path: "capsule.json".into(),
-                sha256: "00".into(),
-                size: 12,
-            }],
-            links: Vec::new(),
-            object_did: None,
-            publisher_did: None,
-        };
-        assert_eq!(
-            carrier_legacy_object_import_declared_bytes(&small).unwrap(),
-            12
-        );
-    }
-
     #[test]
     fn test_content_availability_replicas_apply_local_runtime_reputation() {
         let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
@@ -11525,51 +10636,6 @@ pub(crate) mod tests {
             })
             .unwrap_or(0);
         request.len() >= header_end + 4 + content_length
-    }
-
-    fn carrier_test_stream_payload(bytes: &[u8]) -> serde_json::Value {
-        serde_json::json!({
-            "schema": "elastos.provider.stream/v1",
-            "encoding": "base64-chunks",
-            "total_bytes": bytes.len(),
-            "completed": true,
-            "chunks": [{
-                "index": 0,
-                "offset": 0,
-                "length": bytes.len(),
-                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-            }],
-        })
-    }
-
-    fn carrier_test_object_file_bytes() -> Vec<u8> {
-        b"# Carrier Object\n".to_vec()
-    }
-
-    fn carrier_test_object_manifest_bytes() -> Vec<u8> {
-        let bytes = carrier_test_object_file_bytes();
-        let file_sha = format!("{:x}", Sha256::digest(&bytes));
-        let mut hasher = Sha256::new();
-        hasher.update(b"index.md");
-        hasher.update(b"\0");
-        hasher.update(file_sha.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(bytes.len().to_string().as_bytes());
-        hasher.update(b"\0");
-        let manifest = serde_json::json!({
-            "schema": "elastos.content.object.manifest/v1",
-            "kind": "document",
-            "content_digest": format!("sha256:{:x}", hasher.finalize()),
-            "files": [{
-                "path": "index.md",
-                "sha256": file_sha,
-                "size": bytes.len()
-            }],
-            "links": [],
-            "object_did": "did:key:zObject",
-            "publisher_did": "did:key:zPublisher"
-        });
-        serde_json::to_vec(&manifest).unwrap()
     }
 
     #[tokio::test]
@@ -16138,274 +15204,11 @@ pub(crate) mod tests {
         );
     }
 
+    /// 0.8.0 has no push replication (#498): a replica that does not already
+    /// hold the content is refused at once, though this node holds it, and
+    /// nothing is sent after the remote ensure.
     #[tokio::test]
-    async fn test_carrier_replication_falls_back_to_exact_import_when_remote_pin_fails() {
-        let registry = ProviderRegistry::new();
-        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
-            requests: Mutex::new(Vec::new()),
-            fail_ensure: true,
-            fail_tickets: Vec::new(),
-            transit_tickets: Default::default(),
-            reject_admission: false,
-            omit_admission_receipt: false,
-        });
-        registry.set_carrier_invoker(invoker.clone()).await;
-        registry
-            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
-            .await
-            .unwrap();
-        let replica = CarrierAvailabilityReplica {
-            node_did: "did:key:zRemote".to_string(),
-            endpoint_id: Some("remote-endpoint".to_string()),
-            connect_ticket: "ticket:internal-secret".to_string(),
-            announced_at: 1_700_000_000,
-            score: 90,
-            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
-            reputation_score: 0,
-            reputation_reason: "no_local_history".to_string(),
-        };
-
-        let proof = ensure_content_via_carrier_provider_invocation(
-            &registry,
-            &replica,
-            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
-            &serde_json::json!({
-                "object_did": "did:key:zObject",
-                "publisher_did": "did:key:zPublisher"
-            }),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(proof.ensure_status, "local_pinned");
-        assert_eq!(proof.status_availability["status"], "local_pinned");
-        assert_eq!(proof.remote_receipt.as_ref().unwrap()["verified"], true);
-
-        let requests = invoker.requests.lock().await;
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[0]["op"], "admission");
-        assert_eq!(requests[1]["op"], "ensure");
-        assert_eq!(requests[2]["op"], "import_exact");
-        assert_eq!(requests[2]["request"]["object_did"], "did:key:zObject");
-        assert_eq!(
-            requests[2]["request"]["stream"]["schema"],
-            "elastos.provider.stream/v1"
-        );
-        assert_eq!(requests[3]["op"], "status");
-        assert!(!requests[2]["request"]
-            .to_string()
-            .contains("ticket:internal-secret"));
-    }
-
-    #[tokio::test]
-    async fn test_carrier_replication_refuses_object_exact_fallback_without_block_graph_provider() {
-        let registry = ProviderRegistry::new();
-        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
-            requests: Mutex::new(Vec::new()),
-            fail_ensure: true,
-            fail_tickets: Vec::new(),
-            transit_tickets: Default::default(),
-            reject_admission: false,
-            omit_admission_receipt: false,
-        });
-        registry.set_carrier_invoker(invoker.clone()).await;
-        registry
-            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
-            .await
-            .unwrap();
-        let replica = CarrierAvailabilityReplica {
-            node_did: "did:key:zRemote".to_string(),
-            endpoint_id: Some("remote-endpoint".to_string()),
-            connect_ticket: "ticket:internal-secret".to_string(),
-            announced_at: 1_700_000_000,
-            score: 90,
-            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
-            reputation_score: 0,
-            reputation_reason: "no_local_history".to_string(),
-        };
-
-        let err = ensure_content_via_carrier_provider_invocation(
-            &registry,
-            &replica,
-            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
-            &serde_json::json!({
-                "availability_requirements": {
-                    "repair_graph_kind": "ipld_dag"
-                }
-            }),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("local block-graph export failed for arbitrary DAG repair"));
-        assert!(err.to_string().contains("refused object/exact fallback"));
-
-        let requests = invoker.requests.lock().await;
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0]["op"], "admission");
-        assert_eq!(requests[1]["op"], "ensure");
-        assert!(!requests
-            .iter()
-            .any(|request| request["op"] == "import_exact"));
-        assert!(!requests
-            .iter()
-            .any(|request| request["op"] == "import_object"));
-    }
-
-    #[tokio::test]
-    async fn test_carrier_replication_uses_block_graph_provider_for_arbitrary_dag() {
-        let registry = ProviderRegistry::new();
-        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
-            requests: Mutex::new(Vec::new()),
-            fail_ensure: true,
-            fail_tickets: Vec::new(),
-            transit_tickets: Default::default(),
-            reject_admission: false,
-            omit_admission_receipt: false,
-        });
-        registry.set_carrier_invoker(invoker.clone()).await;
-        registry
-            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
-            .await
-            .unwrap();
-        registry
-            .register_sub_provider("block-graph", Arc::new(MockCarrierBlockGraphProvider))
-            .await
-            .unwrap();
-        let replica = CarrierAvailabilityReplica {
-            node_did: "did:key:zRemote".to_string(),
-            endpoint_id: Some("remote-endpoint".to_string()),
-            connect_ticket: "ticket:internal-secret".to_string(),
-            announced_at: 1_700_000_000,
-            score: 90,
-            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
-            reputation_score: 0,
-            reputation_reason: "no_local_history".to_string(),
-        };
-
-        let proof = ensure_content_via_carrier_provider_invocation(
-            &registry,
-            &replica,
-            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
-            &serde_json::json!({
-                "object_did": "did:key:zObject",
-                "publisher_did": "did:key:zPublisher",
-                "availability_requirements": {
-                    "repair_graph_kind": "ipld_dag"
-                }
-            }),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(proof.ensure_status, "local_pinned");
-        assert_eq!(
-            proof.remote_receipt.as_ref().unwrap()["verified"],
-            serde_json::Value::Bool(true)
-        );
-
-        let requests = invoker.requests.lock().await;
-        assert_eq!(requests.len(), 5);
-        assert_eq!(requests[0]["op"], "admission");
-        assert_eq!(requests[1]["op"], "ensure");
-        assert_eq!(requests[2]["target"], CONTENT_BLOCK_GRAPH_TARGET);
-        assert_eq!(requests[2]["op"], "import_graph");
-        assert_eq!(
-            requests[2]["request"]["graph"]["schema"],
-            CONTENT_BLOCK_GRAPH_SCHEMA
-        );
-        assert_eq!(requests[2]["request"]["object_did"], "did:key:zObject");
-        assert_eq!(
-            requests[2]["request"]["publisher_did"],
-            "did:key:zPublisher"
-        );
-        assert_eq!(requests[3]["target"], "content");
-        assert_eq!(requests[3]["op"], "ensure");
-        assert_eq!(
-            requests[3]["request"]["availability_policy"],
-            "carrier_block_graph_import"
-        );
-        assert_eq!(requests[4]["op"], "status");
-        assert!(!requests
-            .iter()
-            .any(|request| request["op"] == "import_exact"));
-        assert!(!requests
-            .iter()
-            .any(|request| request["op"] == "import_object"));
-    }
-
-    #[tokio::test]
-    async fn test_carrier_replication_prefers_object_import_when_manifest_exists() {
-        let registry = ProviderRegistry::new();
-        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
-            requests: Mutex::new(Vec::new()),
-            fail_ensure: true,
-            fail_tickets: Vec::new(),
-            transit_tickets: Default::default(),
-            reject_admission: false,
-            omit_admission_receipt: false,
-        });
-        registry.set_carrier_invoker(invoker.clone()).await;
-        registry
-            .register_sub_provider("content", Arc::new(MockCarrierObjectContentProvider))
-            .await
-            .unwrap();
-        let replica = CarrierAvailabilityReplica {
-            node_did: "did:key:zRemote".to_string(),
-            endpoint_id: Some("remote-endpoint".to_string()),
-            connect_ticket: "ticket:internal-secret".to_string(),
-            announced_at: 1_700_000_000,
-            score: 90,
-            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
-            reputation_score: 0,
-            reputation_reason: "no_local_history".to_string(),
-        };
-
-        let proof = ensure_content_via_carrier_provider_invocation(
-            &registry,
-            &replica,
-            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
-            &serde_json::json!({
-                "object_did": "did:key:zIgnoredSourceObject",
-                "publisher_did": "did:key:zIgnoredSourcePublisher"
-            }),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(proof.ensure_status, "local_pinned");
-        assert_eq!(proof.status_availability["status"], "local_pinned");
-
-        let requests = invoker.requests.lock().await;
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[0]["op"], "admission");
-        assert_eq!(requests[1]["op"], "ensure");
-        assert_eq!(requests[2]["op"], "import_object");
-        assert_eq!(requests[2]["request"]["object_kind"], "document");
-        assert_eq!(requests[2]["request"]["object_did"], "did:key:zObject");
-        assert_eq!(
-            requests[2]["request"]["publisher_did"],
-            "did:key:zPublisher"
-        );
-        assert_eq!(requests[2]["request"]["files"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            requests[2]["request"]["files"][0]["path"],
-            serde_json::Value::String("index.md".to_string())
-        );
-        assert!(requests[2]["request"].get("stream").is_none());
-        assert_eq!(requests[3]["op"], "status");
-        assert!(!requests[2]["request"]
-            .to_string()
-            .contains("ticket:internal-secret"));
-    }
-
-    /// An object past the Carrier import cap that the replica's offline Kubo
-    /// lacks is refused at once: no file is read or sent, no exact import is
-    /// tried (#498 adds ranged pull replication for it).
-    #[tokio::test]
-    async fn test_carrier_replication_refuses_an_object_past_the_import_cap_at_once() {
+    async fn test_carrier_replication_refuses_content_the_replica_lacks_at_once() {
         let registry = ProviderRegistry::new();
         let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
             requests: Mutex::new(Vec::new()),
@@ -16413,14 +15216,8 @@ pub(crate) mod tests {
             ..Default::default()
         });
         registry.set_carrier_invoker(invoker.clone()).await;
-        let paths = Arc::new(StdMutex::new(Vec::new()));
         registry
-            .register_sub_provider(
-                "content",
-                Arc::new(MockCarrierOversizedObjectContentProvider {
-                    paths: paths.clone(),
-                }),
-            )
+            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
             .await
             .unwrap();
         let replica = CarrierAvailabilityReplica {
@@ -16434,21 +15231,23 @@ pub(crate) mod tests {
             reputation_reason: "no_local_history".to_string(),
         };
 
-        let err = ensure_content_via_carrier_provider_invocation(
-            &registry,
-            &replica,
-            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
-            &serde_json::json!({}),
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ensure_content_via_carrier_provider_invocation(
+                &registry,
+                &replica,
+                "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                &serde_json::json!({"object_did": "did:key:zObject"}),
+            ),
         )
         .await
+        .expect("refused within 1 s")
         .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("local content object import exceeds"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "Copies to your own devices come in a later update."
         );
-        assert_eq!(*paths.lock().unwrap(), [CONTENT_OBJECT_MANIFEST_PATH]);
         let requests = invoker.requests.lock().await;
         let ops: Vec<&str> = requests
             .iter()
