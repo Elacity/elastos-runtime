@@ -73,7 +73,7 @@ setting to own setup, launch, and cleanup; older installers ignore it and alread
 stop after bootstrap.
 
 The current default Home exposes Assistant, Chat (Community), System, People,
-Wallet, Documents, Library, Marketplace, Archive, and Inbox. On Apple Silicon
+Wallet, Documents, Library, Marketplace, and Inbox. On Apple Silicon
 Macs it also exposes Browser; Linux Homes do not show Browser in 0.8.0. People is installed as a
 separate app capsule; Home presents it but does not own its state or authority.
 

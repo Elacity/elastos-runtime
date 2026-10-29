@@ -133,7 +133,7 @@ User-facing actions:
 Discovery must be opt-in, bounded, and honest:
 
 - off by default;
-- advertisements renew only while the user has turned Discovery on and this
+- advertisements renew only while the user has turned Public on and this
   Home is online; after a disconnect or failed withdrawal, the last
   advertisement can remain visible for at most its existing TTL;
 - `Public now` is bounded and never implies a global roster or directory;
@@ -237,7 +237,7 @@ The primary action should remain reachable without exposing advanced controls.
 
 Discovery is convenience, not the only path.
 
-1. User saves a real display name and turns Discovery on.
+1. User saves a real display name and turns Public on.
 2. Runtime publishes a short-lived signed `DiscoveryAdvertisement` derived from
    the current signed Profile document.
 3. Other opt-in Homes can show the bounded `Public now` list, with optional
@@ -417,7 +417,7 @@ Scope:
 
 User test:
 
-- Turn Discovery on from one runtime.
+- Turn Public on from one runtime.
 - Refresh `Public now` from the other runtime.
 - Send request, accept in Inbox, and see the accepted contact authority land on
   both sides with no second user click after relay loss/restart.
