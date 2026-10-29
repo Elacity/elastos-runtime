@@ -6,7 +6,6 @@ use elastos_model_contract::{
     model_input_hash, RuntimeAccessBinding, RuntimeCreateBinding, RUNTIME_ACCESS_BINDING_SCHEMA,
     RUNTIME_CREATE_BINDING_SCHEMA,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -1476,16 +1475,12 @@ fn runtime_validates_typed_model_outputs_before_assistant_projection() {
 #[derive(Clone)]
 struct ScriptedModelProvider {
     requests: Arc<TokioMutex<Vec<Value>>>,
-    replies: Arc<TokioMutex<HashMap<String, Value>>>,
-    get_replies: Arc<TokioMutex<HashMap<String, Value>>>,
 }
 
 impl Default for ScriptedModelProvider {
     fn default() -> Self {
         Self {
             requests: Arc::new(TokioMutex::new(Vec::new())),
-            replies: Arc::new(TokioMutex::new(HashMap::new())),
-            get_replies: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 }
@@ -1508,21 +1503,6 @@ impl Provider for ScriptedModelProvider {
 
     async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
         self.requests.lock().await.push(request.clone());
-        if request.get("op").and_then(Value::as_str) == Some("runs_get") {
-            if let Some(run_id) = request.get("run_id").and_then(Value::as_str) {
-                if let Some(reply) = self.get_replies.lock().await.get(run_id).cloned() {
-                    return Ok(reply);
-                }
-            }
-        }
-        let offer_id = request
-            .get("offer_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if let Some(reply) = self.replies.lock().await.get(&offer_id).cloned() {
-            return Ok(reply);
-        }
         Ok(json!({ "status": "ok" }))
     }
 }
@@ -2938,8 +2918,8 @@ async fn system_offers_no_approval_lens_choice_and_ignores_a_saved_one() {
     assert_eq!(jev["connected"], true, "{body}");
     assert_eq!(jev["operation"], "decision.evaluate", "{body}");
 
-    // The saved choice is ignored: Assistant's hosted send is not held for
-    // advice and Jev is never asked.
+    // The saved choice is ignored: Assistant's hosted send goes straight to
+    // Venice, and Jev is never asked.
     let grant = assistant_auth_grant(dir.path(), &authority);
     let assistant_token =
         issue_home_launch_token_for_auth_grant(dir.path(), "assistant", &grant).unwrap();
@@ -2959,13 +2939,11 @@ async fn system_offers_no_approval_lens_choice_and_ignores_a_saved_one() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_ne!(body["code"], "approval_required", "{body}");
-    assert!(provider
-        .requests
-        .lock()
-        .await
-        .iter()
-        .all(|request| request["offer_id"] != "model:openrouter"));
+    assert_eq!(body["status"], "ok", "{body}");
+    let requests = provider.requests.lock().await.clone();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0]["op"], "runs_create", "{requests:?}");
+    assert_eq!(requests[0]["offer_id"], "model:venice", "{requests:?}");
 }
 
 #[tokio::test]
