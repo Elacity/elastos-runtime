@@ -1319,7 +1319,7 @@ async function main() {
         sidebarSubtitleExists: !!doc.querySelector("#documents-sidebar .sidebar-subtitle"),
         actionLabels: [...doc.querySelectorAll(".toolbar-actions button")]
           .filter((button) => !button.classList.contains("hidden") && win.getComputedStyle(button).display !== "none")
-          .map((button) => button.getAttribute("aria-label") || ""),
+          .map((button) => button.getAttribute("aria-label") || button.querySelector(".switch-label")?.textContent?.trim() || ""),
         actionCount: doc.querySelectorAll(".toolbar-actions .action-icon-button").length,
         editorWidth: doc.querySelector(".editor-pane")?.getBoundingClientRect().width || 0,
         previewWidth: doc.querySelector(".preview-pane")?.getBoundingClientRect().width || 0,
@@ -1354,8 +1354,9 @@ async function main() {
       assert(viewer.hasOutlineTab && !viewer.hasHistoryTab, "documents inspector tabs must be Preview and Outline only", viewer);
       assert(viewer.workspaceView === "split", "documents should default to split view on desktop shell", viewer);
       assert(!viewer.sidebarTitleExists && !viewer.sidebarSubtitleExists, "Documents sidebar should not duplicate title copy", viewer);
-      assert(viewer.actionLabels.join("|") === "Save|Save as|Delete", "Documents toolbar actions drifted", viewer);
-      assert(viewer.actionCount === 3, "Documents toolbar actions should be compact icon buttons", viewer);
+      // Desktop shows the view toggle, Save, the labeled Autosave switch, Save as and Delete; More is phone-only.
+      assert(viewer.actionLabels.join("|") === "Write — edit markdown|Split — edit and preview|Read — preview only|Save|Autosave|Save as|Delete", "Documents toolbar actions drifted", viewer);
+      assert(viewer.actionCount === 4, "Documents Save, More, Save as and Delete should be compact icon buttons", viewer);
       assert(Math.abs(viewer.editorWidth - viewer.previewWidth) <= 2, "Documents split view should be even", viewer);
       assert(Math.abs(viewer.editorHeaderHeight - viewer.inspectorHeaderHeight) <= 2, "Documents inspector tabs should not make the header taller than Write", viewer);
     });
@@ -1510,6 +1511,27 @@ async function main() {
         const state = await shellState(tabId);
         return !state.windows.some((window) => window.target === "library");
       }, 6000, 250);
+
+      // Chat asks before posting the attached file in Community.
+      let postSheet = null;
+      const postAsked = await waitFor(async () => {
+        postSheet = await frameState(tabId, "chat-room", `(() => {
+          const sheet = doc.querySelector("#library-post");
+          const confirm = doc.querySelector("#library-post-confirm");
+          return {
+            ok: true,
+            visible: !!sheet && !sheet.hidden,
+            title: doc.querySelector("#library-post-title")?.textContent?.trim() || "",
+            confirmVisible: !!confirm && !confirm.hidden,
+            confirmText: confirm?.textContent?.trim() || "",
+          };
+        })()`);
+        return postSheet.ok && postSheet.visible && postSheet.confirmVisible;
+      }, 12000, 500);
+      assert(postAsked, "Chat Room did not ask before posting the attached document", postSheet);
+      assert(/^Post ".+" in Community\?$/.test(postSheet.title) && postSheet.confirmText === "Post", "Chat Room Post sheet copy drifted", postSheet);
+      const posted = await clickInFrame(tabId, "chat-room", "#library-post-confirm");
+      assert(posted.ok, "Chat Room Post was not clickable", posted);
 
       let linkCard = null;
       const renderedLink = await waitFor(async () => {
