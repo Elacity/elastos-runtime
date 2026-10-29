@@ -267,7 +267,17 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url || "/", "http://127.0.0.1");
     if (await handleApi(req, res, url)) return;
     if (url.pathname === `/content/${sharedCid}`) {
-      // As the gateway serves user content: no CORP, a sandbox CSP.
+      // As the gateway serves user content: an app's token read is preflighted
+      // (GET and HEAD only).
+      if (req.method === "OPTIONS") {
+        res.writeHead(204, isolationHeaders(req, {
+          "access-control-allow-methods": "GET, HEAD",
+          "access-control-allow-headers": "x-elastos-home-token,range",
+        }));
+        res.end();
+        return;
+      }
+      // No CORP, a sandbox CSP.
       send(req, res, 200, sharedBytes, {
         "content-type": "application/octet-stream",
         "content-security-policy": "sandbox allow-scripts allow-forms allow-popups; connect-src 'none'",
