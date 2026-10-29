@@ -149,7 +149,7 @@ export function inertSystemApiResponse(pathname) {
   if (pathname === "/api/apps/system/ai-provider") {
     return {
       hosted_external_https: "paused",
-      approval_lens_offer_id: "model:hosted-11111111111111111111111111111111",
+      // A decision model saved by an earlier release stays out of System.
       connections: [
         { id: "model:hosted-11111111111111111111111111111111", name: "Jev", provider: "openrouter",
           processor_label: "OpenRouter", selected_model: "typesafe/jev-1.13", operation: "decision.evaluate",

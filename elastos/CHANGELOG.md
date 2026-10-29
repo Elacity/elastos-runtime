@@ -131,8 +131,21 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   a contact's or one seen in Community, and says "That's a Home's device DID.
   Use the DID shown in their People."
 
+### Removed
+
+- System > Models no longer has an Approval Lens section, and Add hosted
+  model no longer lists Jev decision models. Naming a hosted model "Jev" no
+  longer turns it into an evaluator. Inbox remains where you approve each
+  hosted connection.
+
 ### Developer detail
 
+- Approval Lens is hidden: `POST /api/apps/system/approval-lens` and the
+  `approval_lens_offer_id`/`approval_lens_error` status fields are gone, and
+  OpenRouter discovery admits text models only. `/approval-lens/revoke` stays
+  for ending hosted approvals. A selection saved by an earlier release is
+  still honoured by Assistant's hosted gate; with none, the gate lets the
+  request through as before.
 - System no longer calls `/api/auth/passkey/status`. From its sandboxed frame
   the call carried no Home token, so the gateway refused it (a CORS error in
   the console) and System fell back to "Not set" beside Passkeys. The account

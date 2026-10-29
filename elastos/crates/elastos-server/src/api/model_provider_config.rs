@@ -577,28 +577,23 @@ fn approval_lens_selection_path(data_dir: &Path) -> PathBuf {
     model_provider_root_dir(data_dir).join("approval-lens.json")
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(deny_unknown_fields)]
 struct ApprovalLensSelection {
     offer_id: String,
 }
 
 pub(crate) fn approval_lens_has_selection(data_dir: &Path) -> bool {
-    // A failed policy read or migration keeps human review required.
+    // A failed policy read keeps human review required.
     approval_lens_offer_id(data_dir)
         .map(|id| id.is_some())
         .unwrap_or(true)
 }
 
-fn store_approval_lens_selection(data_dir: &Path, id: &str) -> anyhow::Result<()> {
-    write_model_provider_config_atomic(
-        &approval_lens_selection_path(data_dir),
-        &serde_json::to_vec(&ApprovalLensSelection {
-            offer_id: id.to_string(),
-        })?,
-    )
-}
-
+/// System offers no evaluator choice while Approval Lens is hidden; tests
+/// write the selection a Home may already hold from an earlier release.
+#[cfg(test)]
 pub(super) fn select_approval_lens(data_dir: &Path, id: &str) -> anyhow::Result<()> {
     let _guard = MODEL_PROVIDER_CONFIG_MUTEX
         .get_or_init(|| Mutex::new(()))
@@ -608,12 +603,17 @@ pub(super) fn select_approval_lens(data_dir: &Path, id: &str) -> anyhow::Result<
         decision_hosted_offer(data_dir, id).is_some(),
         "configured decision model required"
     );
-    store_approval_lens_selection(data_dir, id)
+    write_model_provider_config_atomic(
+        &approval_lens_selection_path(data_dir),
+        &serde_json::to_vec(&ApprovalLensSelection {
+            offer_id: id.to_string(),
+        })?,
+    )
 }
 
-/// Read policy identity separately from availability. First legacy selection is
-/// migrated while holding the same lock as explicit selection and model edits.
-pub(super) fn approval_lens_offer_id(data_dir: &Path) -> anyhow::Result<Option<String>> {
+/// Read the saved evaluator identity separately from its availability. An
+/// instance's display name never selects it.
+fn approval_lens_offer_id(data_dir: &Path) -> anyhow::Result<Option<String>> {
     let _guard = MODEL_PROVIDER_CONFIG_MUTEX
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -642,23 +642,7 @@ pub(super) fn approval_lens_offer_id(data_dir: &Path) -> anyhow::Result<Option<S
             );
             Ok(Some(selection.offer_id))
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            let offers = load_model_provider_operator_offers(data_dir)?;
-            let id = offers.iter().find_map(|offer| {
-                let id = offer.get("id")?.as_str()?;
-                (offer
-                    .get("title")?
-                    .as_str()?
-                    .trim()
-                    .eq_ignore_ascii_case("jev")
-                    && decision_hosted_offer(data_dir, id).is_some())
-                .then(|| id.to_string())
-            });
-            if let Some(id) = &id {
-                store_approval_lens_selection(data_dir, id)?;
-            }
-            Ok(id)
-        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -2120,6 +2104,7 @@ mod hosted_hint_tests {
         );
         offer["adapter"]["api_key"] = serde_json::json!("fixture-secret");
         seed_model_provider_operator_offers_for_test(dir.path(), vec![offer.clone()]).unwrap();
+        super::select_approval_lens(dir.path(), "model:openrouter").unwrap();
         assert!(named_jev_hosted_offer(dir.path()).is_some());
         assert!(hosted_model_share_cards(dir.path()).unwrap().is_empty());
         assert!(set_hosted_offer_share(
@@ -2152,6 +2137,11 @@ mod hosted_hint_tests {
             vec![first.clone(), second.clone()],
         )
         .unwrap();
+        // The name "Jev" is a label, not a selection.
+        assert!(named_jev_hosted_offer(dir.path()).is_none());
+        assert!(!super::approval_lens_has_selection(dir.path()));
+        assert!(!super::approval_lens_selection_path(dir.path()).exists());
+        super::select_approval_lens(dir.path(), "model:first").unwrap();
         assert_eq!(named_jev_hosted_offer(dir.path()).unwrap().0, "model:first");
         first["title"] = json!("My reviewer");
         seed_model_provider_operator_offers_for_test(dir.path(), vec![first, second.clone()])
@@ -2357,6 +2347,9 @@ mod hosted_hint_tests {
             )
             .await
             .unwrap();
+            if id == first && canonical.is_none() {
+                super::select_approval_lens(dir.path(), first).unwrap();
+            }
         }
         let offers = super::load_model_provider_operator_offers(dir.path()).unwrap();
         assert_eq!(offers.len(), 2);

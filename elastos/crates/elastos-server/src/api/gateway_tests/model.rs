@@ -2879,6 +2879,90 @@ async fn system_delete_and_discard_drain_committed_authority_before_cleanup() {
 }
 
 #[tokio::test]
+async fn system_offers_no_approval_lens_choice() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::api::seed_model_provider_operator_offers_for_test(
+        dir.path(),
+        vec![
+            hosted_test_offer(
+                "model:openrouter",
+                "Jev",
+                "OpenRouter",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "sk-or-fixture-secret",
+            ),
+            hosted_test_offer(
+                "model:venice",
+                "Venice",
+                "Venice",
+                "https://api.venice.ai/api/v1/chat/completions",
+                "sk-vnz-fixture-secret",
+            ),
+        ],
+    )
+    .unwrap();
+    let provider = ScriptedModelProvider::default();
+    let app = gateway_router(scripted_model_state(dir.path(), provider.clone()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+
+    let select = test_browser_request("localhost:61180", "null")
+        .method("POST")
+        .uri("/api/apps/system/approval-lens")
+        .header("x-elastos-home-token", authority.system_token.clone())
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"id":"model:openrouter"}).to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(select).await.unwrap();
+    assert!(
+        matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ),
+        "{}",
+        response.status()
+    );
+
+    let status_request = test_browser_request("localhost:61180", "null")
+        .uri("/api/apps/system/ai-provider")
+        .header("x-elastos-home-token", authority.system_token.clone())
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = status_json(app.clone().oneshot(status_request).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("approval_lens_offer_id").is_none(), "{body}");
+    assert!(body.get("approval_lens_error").is_none(), "{body}");
+
+    // An instance named "Jev" is not an evaluator: Assistant's hosted send
+    // is not held for advice.
+    let grant = assistant_auth_grant(dir.path(), &authority);
+    let assistant_token =
+        issue_home_launch_token_for_auth_grant(dir.path(), "assistant", &grant).unwrap();
+    let (status, body) = status_json(
+        app.oneshot(post_model(
+            assistant_token,
+            "runs_create",
+            json!({
+                "offer_id": "model:venice",
+                "operation": "text.generate",
+                "request_id": "request-venice-no-lens",
+                "input": { "messages": [{ "role": "user", "content": "hello" }] }
+            }),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["code"], "approval_required", "{body}");
+    assert!(provider
+        .requests
+        .lock()
+        .await
+        .iter()
+        .all(|request| request["offer_id"] != "model:openrouter"));
+}
+
+#[tokio::test]
 async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
     let dir = tempfile::tempdir().unwrap();
     crate::api::seed_model_provider_operator_offers_for_test(
@@ -2901,6 +2985,8 @@ async fn named_jev_instance_advises_hosted_http_inbox_without_auto_approve() {
         ],
     )
     .unwrap();
+    crate::api::model_provider_config::select_approval_lens(dir.path(), "model:openrouter")
+        .unwrap();
     let provider = ScriptedModelProvider::default();
     provider.replies.lock().await.insert(
         "model:openrouter".to_string(),
@@ -3162,6 +3248,8 @@ async fn named_jev_waits_for_run_terminal_before_inbox_advice() {
         ],
     )
     .unwrap();
+    crate::api::model_provider_config::select_approval_lens(dir.path(), "model:openrouter")
+        .unwrap();
     let run_id = format!("run:sha256:{}", "ab".repeat(32));
     let provider = ScriptedModelProvider::default();
     provider.replies.lock().await.insert(
@@ -3253,6 +3341,8 @@ async fn named_jev_malformed_or_failed_reply_still_opens_inbox() {
         ],
     )
     .unwrap();
+    crate::api::model_provider_config::select_approval_lens(dir.path(), "model:openrouter")
+        .unwrap();
     let provider = ScriptedModelProvider::default();
     provider.replies.lock().await.insert(
         "model:openrouter".to_string(),
@@ -3325,6 +3415,8 @@ async fn named_jev_provider_failure_still_opens_inbox() {
         ],
     )
     .unwrap();
+    crate::api::model_provider_config::select_approval_lens(dir.path(), "model:openrouter")
+        .unwrap();
     let provider = ScriptedModelProvider::default();
     provider.replies.lock().await.insert(
         "model:openrouter".to_string(),
@@ -3392,6 +3484,8 @@ async fn named_jev_retries_eval_after_unsigned_record_cleared() {
         ],
     )
     .unwrap();
+    crate::api::model_provider_config::select_approval_lens(dir.path(), "model:openrouter")
+        .unwrap();
     let provider = ScriptedModelProvider::default();
     provider.replies.lock().await.insert(
         "model:openrouter".to_string(),

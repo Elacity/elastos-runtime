@@ -157,8 +157,6 @@ pub(super) struct AiProviderDeleteRequest {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct DiscoveredModel {
     id: String,
-    #[serde(skip_serializing)]
-    expected_response_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     privacy: Option<String>,
 }
@@ -216,11 +214,7 @@ pub(crate) fn install_venice_validate_double(
         *slot.borrow_mut() = models.map(|models| {
             models
                 .into_iter()
-                .map(|(id, privacy)| DiscoveredModel {
-                    id,
-                    privacy,
-                    expected_response_model: None,
-                })
+                .map(|(id, privacy)| DiscoveredModel { id, privacy })
                 .collect()
         });
     });
@@ -348,36 +342,18 @@ fn parse_openrouter_models_body(bytes: &[u8]) -> anyhow::Result<Vec<DiscoveredMo
             continue;
         };
         let id = id.trim();
-        // Discovery admits only the operations implemented by this provider.
-        let outputs = entry
+        // Discovery admits text models only. Decision models (Jev) stay out of
+        // System while Approval Lens is hidden.
+        let text = entry
             .pointer("/architecture/output_modalities")
-            .and_then(serde_json::Value::as_array);
-        let decision = outputs
-            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("decisions")));
-        let text =
-            outputs.is_some_and(|items| items.iter().any(|item| item.as_str() == Some("text")));
-        let pinned_jev = id.starts_with("typesafe/jev-");
-        let canonical = entry
-            .get("canonical_slug")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| {
-                !value.is_empty()
-                    && value.trim() == *value
-                    && value.len() <= 256
-                    && !value.starts_with('~')
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| item.as_str() == Some("text"))
+                    && !items.iter().any(|item| item.as_str() == Some("decisions"))
             });
-        if !id.is_empty()
-            && !id.starts_with('~')
-            && ((decision && pinned_jev && canonical.is_some())
-                || (text && !decision && !pinned_jev))
-        {
+        if !id.is_empty() && !id.starts_with('~') && !id.starts_with("typesafe/jev-") && text {
             models.push(DiscoveredModel {
                 id: id.to_string(),
-                expected_response_model: if decision {
-                    canonical.map(ToOwned::to_owned)
-                } else {
-                    None
-                },
                 privacy: None,
             });
         }
@@ -422,7 +398,6 @@ fn parse_venice_models_body(bytes: &[u8]) -> anyhow::Result<Vec<DiscoveredModel>
         models.push(DiscoveredModel {
             id: id.to_string(),
             privacy,
-            expected_response_model: None,
         });
     }
     Ok(models)
@@ -483,7 +458,6 @@ async fn fetch_openrouter_models(
                 .iter()
                 .map(|id| DiscoveredModel {
                     id: id.clone(),
-                    expected_response_model: id.starts_with("typesafe/jev-").then(|| id.clone()),
                     privacy: None,
                 })
                 .collect()),
@@ -633,20 +607,6 @@ pub(super) struct ApprovalLensRequest {
     id: String,
 }
 
-pub(super) async fn system_approval_lens_select(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    Json(req): Json<ApprovalLensRequest>,
-) -> Response {
-    if let Err(err) = require_system_admin(&state.data_dir, &headers) {
-        return system_error_response(err);
-    }
-    match crate::api::model_provider_config::select_approval_lens(&state.data_dir, &req.id) {
-        Ok(()) => Json(serde_json::json!({ "offer_id": req.id })).into_response(),
-        Err(err) => system_error_response(err),
-    }
-}
-
 pub(super) async fn system_approval_lens_revoke(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -791,14 +751,6 @@ pub(super) async fn system_ai_provider_get(
                     .unwrap_or("unavailable");
                     result["validation_egress_approval_state"][provider] =
                         serde_json::json!(state_value);
-                }
-            }
-            match crate::api::model_provider_config::approval_lens_offer_id(&state.data_dir) {
-                Ok(id) => {
-                    result["approval_lens_offer_id"] = serde_json::json!(id);
-                }
-                Err(_) => {
-                    result["approval_lens_error"] = serde_json::json!(true);
                 }
             }
             Json(result).into_response()
@@ -948,7 +900,7 @@ pub(super) async fn system_ai_provider_save(
             provider,
             api_key: &api_key,
             model: &model,
-            expected_response_model: selected.expected_response_model.as_deref(),
+            expected_response_model: None,
             privacy: selected.privacy.as_deref(),
             name: &name,
             instance_id: Some(&connection_id),
@@ -1228,18 +1180,13 @@ mod parse_tests {
     }
 
     #[test]
-    fn decision_catalog_binds_exact_canonical_identity_and_requires_metadata() {
+    fn discovery_offers_no_decision_models() {
         let models = super::parse_openrouter_models_body(br#"{"data":[
             {"id":"typesafe/jev-1.13","canonical_slug":"typesafe/jev-1.13-20260917","architecture":{"output_modalities":["decisions"]}},
-            {"id":"typesafe/jev-1.12","architecture":{"output_modalities":["decisions"]}},
-            {"id":"typesafe/jev-1.14","canonical_slug":"~typesafe/jev-latest","architecture":{"output_modalities":["decisions"]}}
+            {"id":"typesafe/jev-1.14","canonical_slug":"typesafe/jev-1.14-20261001","architecture":{"output_modalities":["decisions","text"]}},
+            {"id":"typesafe/jev-1.15","architecture":{"output_modalities":["text"]}}
         ]}"#).unwrap();
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "typesafe/jev-1.13");
-        assert_eq!(
-            models[0].expected_response_model.as_deref(),
-            Some("typesafe/jev-1.13-20260917")
-        );
+        assert!(models.is_empty(), "{models:?}");
     }
 
     #[test]
@@ -1262,7 +1209,7 @@ mod parse_tests {
             .into_iter()
             .map(|model| model.id)
             .collect::<Vec<_>>(),
-            vec!["fixture/model".to_string(), "typesafe/jev-1.13".to_string()]
+            vec!["fixture/model".to_string()]
         );
     }
 

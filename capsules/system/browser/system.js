@@ -971,7 +971,6 @@ function configureAiProvider() {
     formNode.hidden = true;
     instancesNode.hidden = false;
     document.querySelector("#local-models").hidden = false;
-    document.querySelector("#approval-lens").hidden = false;
     addButton.hidden = false;
     nameInput.value = "";
     keyInput.value = "";
@@ -985,7 +984,6 @@ function configureAiProvider() {
     formNode.hidden = false;
     instancesNode.hidden = true;
     document.querySelector("#local-models").hidden = true;
-    document.querySelector("#approval-lens").hidden = true;
     addButton.hidden = true;
     editingId = instance && instance.id ? String(instance.id) : "";
     nameInput.value = instance && instance.name ? String(instance.name) : "";
@@ -1143,100 +1141,12 @@ function configureAiProvider() {
       [...instancesNode.querySelectorAll("button, summary")].find((node) => controlKey(node) === focused)?.focus({ preventScroll: true });
     }
   };
-  const lensModel = document.querySelector("#approval-lens-model");
-  const lensStatus = document.querySelector("#approval-lens-status");
-  const lensSelect = document.querySelector("#approval-lens-select");
-  const lensEdit = document.querySelector("#approval-lens-edit");
-  const lensDisconnect = document.querySelector("#approval-lens-disconnect");
-  let lensChoice = ""; // an evaluator picked here and not yet saved
-  const lensEnd = document.createElement("button");
-  lensEnd.className = "pc2-btn pc2-btn-secondary";
-  lensEnd.type = "button";
-  lensEnd.textContent = "End hosted approval";
-  lensEnd.hidden = true;
-  lensDisconnect.after(lensEnd);
-  const updateLensEnd = () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    lensEnd.hidden = !connection || (connection.approval_state !== "approved" && !["pending", "approved"].includes(connection.egress_approval_state));
-    lensEnd.disabled = !hasShellAccess();
-  };
-  const renderLens = (status) => {
-    const decisions = (status.connections || []).filter(c => c.connected && c.operation === "decision.evaluate");
-    const current = decisions.find(c => c.id === status.approval_lens_offer_id);
-    lensModel.replaceChildren();
-    for (const connection of decisions) {
-      const option = document.createElement("option"); option.value = connection.id;
-      option.textContent = `${connection.name} · ${connection.processor_label} · ${connection.selected_model}`;
-      lensModel.append(option);
-    }
-    if (!decisions.some((connection) => connection.id === lensChoice)) lensChoice = "";
-    if (lensChoice || current) lensModel.value = lensChoice || current.id;
-    lensStatus.textContent = current && status.hosted_external_https === "paused"
-      ? `${current.name} selected · external HTTPS paused`
-      : current ? `Using ${current.name} · ${current.processor_label}`
-      : status.approval_lens_offer_id || status.approval_lens_error ? "Selected evaluator unavailable. Choose a saved decision model or review requests yourself in Inbox."
-      : decisions.length ? "Choose a decision model for approval advice." : "Add a Jev decision model to enable advice.";
-    lensModel.disabled = lensSelect.disabled = lensEdit.disabled = lensDisconnect.disabled = !decisions.length;
-    updateLensEnd();
-  };
-  lensModel.addEventListener("change", () => {
-    lensChoice = lensModel.value;
-    updateLensEnd();
-  });
-  lensEnd.addEventListener("click", async () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    if (!connection || !hasShellAccess()) return;
-    lensEnd.disabled = true;
-    try {
-      await hostedFetch("/api/apps/system/approval-lens/revoke", {
-        method: "POST", headers: shellHeaders({ "content-type": "application/json" }),
-        body: JSON.stringify({ id: connection.id }),
-      });
-      await refreshStatus();
-      showState("Hosted approval ended.", "");
-    } catch (error) {
-      showState(publicSystemError(error, "Approval could not be ended."), "error");
-      lensEnd.disabled = false;
-    }
-  });
-  lensEdit.addEventListener("click", () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    if (!connection) return;
-    showForm(connection);
-  });
-  lensDisconnect.addEventListener("click", async () => {
-    const connection = (latestStatus?.connections || []).find(c => c.id === lensModel.value && c.operation === "decision.evaluate");
-    if (!connection || !hasShellAccess()) return;
-    lensDisconnect.disabled = true;
-    try {
-      await hostedFetch("/api/apps/system/ai-provider", {
-        method: "DELETE", headers: shellHeaders({ "content-type": "application/json" }),
-        body: JSON.stringify({ id: connection.id }),
-      });
-      hideForm();
-      await refreshStatus();
-      showState(`${readText(connection.name)} is disconnected.`, "");
-    } catch (error) {
-      showState(publicSystemError(error, "This Home could not disconnect that evaluator."), "error");
-      lensDisconnect.disabled = false;
-    }
-  });
-  lensSelect.addEventListener("click", async () => {
-    lensSelect.disabled = true;
-    try {
-      await hostedFetch("/api/apps/system/approval-lens", { method: "POST", headers: shellHeaders({ "content-type": "application/json" }), body: JSON.stringify({ id: lensModel.value }) });
-      lensChoice = "";
-      await refreshStatus();
-    } catch (error) { lensStatus.textContent = publicSystemError(error, "Evaluator selection could not be saved."); }
-    finally { lensSelect.disabled = false; }
-  });
   const applyStatus = (status) => {
     latestStatus = status;
     const egressNote = document.querySelector("#ai-provider-egress-note");
     egressNote.hidden = latestStatus.hosted_external_https !== "paused";
     egressNote.textContent = egressNote.hidden ? "" : "External HTTPS is paused on this Home.";
     renderInstances(latestStatus);
-    renderLens(latestStatus);
     updateValidationEnd();
   };
   const readStatus = () => {
@@ -1398,7 +1308,6 @@ function configureAiProvider() {
         keyInput.value = "";
         formNode.hidden = true;
         addButton.hidden = true;
-        document.querySelector("#approval-lens").hidden = true;
         showState("Hosted model setup is not available for this account yet.", "error");
         return;
       }

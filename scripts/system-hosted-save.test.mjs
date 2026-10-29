@@ -178,16 +178,25 @@ test("guest setup does not keep an entered key or offer an unusable Add form", a
   assert.equal(f.node("#ai-provider-key").value, "");
   assert.equal(f.node("#ai-provider-add").hidden, true);
   assert.equal(f.node("#ai-provider-form").hidden, true);
-  assert.equal(f.node("#approval-lens").hidden, true);
   assert.match(f.messages.at(-1), /not available for this account/);
   assert.equal(f.attempts.length, 0);
+});
+
+test("System Models offers no Approval Lens evaluator choice", () => {
+  const page = readFileSync(new URL("../capsules/system/browser/index.html", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../capsules/system/browser/style.css", import.meta.url), "utf8");
+  for (const text of [page, source, styles]) {
+    assert.doesNotMatch(text, /approval-lens(?!\/revoke)|Approval Lens|evaluator/i);
+  }
+  // Ending a hosted approval still uses the shared revoke route.
+  assert.match(source, /\/api\/apps\/system\/approval-lens\/revoke/);
 });
 
 test("hosted Save keeps one identity and entered key across activation failure and retry", async () => {
   const f = fixture();
   f.node("#ai-provider-add").handlers.click();
-  f.node("#ai-provider-name").value = "Jev";
-  f.node("#ai-provider-model").value = "typesafe/jev-1.13";
+  f.node("#ai-provider-name").value = "Chat";
+  f.node("#ai-provider-model").value = "fixture/model";
   f.node("#ai-provider-key").value = "fixture-key";
   await f.node("#ai-provider-save").handlers.click();
   const first = f.attempts[0];

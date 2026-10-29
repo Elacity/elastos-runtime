@@ -3,12 +3,13 @@
 //! The durable envelope keeps a sanitized consequence, factual relationships,
 //! blocked `auto_approve`, a stable request id, a human decision, an actual
 //! outcome, and a private 0600 record. Skeleton writes still persist
-//! `recommendation=unavailable` when no named Jev instance exists.
+//! `recommendation=unavailable` when no evaluator is selected.
 //!
-//! When an owner has configured a named Jev instance, first Assistant hosted
-//! HTTP to another hosted instance creates an Inbox card, calls Jev through
-//! that instance, and keeps the person as the authority. Advice cannot grant
-//! permission. Auto-approval stays disabled.
+//! System no longer offers an evaluator choice. When a Home holds a selection
+//! saved by an earlier release, first Assistant hosted HTTP to another hosted
+//! instance creates an Inbox card, calls Jev through the selected instance,
+//! and keeps the person as the authority. Advice cannot grant permission.
+//! Auto-approval stays disabled.
 
 use std::fs;
 use std::io::Write;

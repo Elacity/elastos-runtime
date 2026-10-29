@@ -364,8 +364,8 @@ the generic model-provider capsule with repeatable owner-bound instances.
 Each instance has a stable offer identity, display name, adapter, selected
 model, Runtime secret reference, privacy and share policy, limits, and
 lifecycle. One Home can keep several instances of the same provider, for
-example Jev via OpenRouter, private DeepSeek via OpenRouter, and shared
-Venice. Private is the default. Changing or disconnecting one instance leaves
+example private DeepSeek and Qwen via OpenRouter, and shared Venice. Private is
+the default. Changing or disconnecting one instance leaves
 the others. Existing `model:openrouter` and `model:venice` offers migrate into
 named instances without losing secrets.
 
@@ -384,7 +384,7 @@ retains its original credential and journal binding. A failed provider refresh
 returns a pending state after saving configuration; the Home must retry activation
 or restart before claiming that configuration is active.
 
-For Decisions, Save binds the exact validated catalog entry's canonical model
+A Decisions offer binds the exact validated catalog entry's canonical model
 ID to the offer revision. This binding is part of the execution hash. The
 adapter checks the response against that ID before projecting `output.model`
 as the selected contract model. The terminal backend report retains the actual
@@ -400,19 +400,12 @@ selector, resolved model when the backend reports it, and explicit fallback
 policy. The secret stays in Runtime-owned storage on the provider Home. It
 does not enter catalogues, offers, logs, or a consumer Home.
 
-System Models owns the Approval Lens evaluator selection by saved instance ID.
-Renaming an instance preserves the selection. If that instance becomes
-unavailable, Runtime keeps human review required and Inbox remains the decision
-surface. Another configured evaluator becomes active only through an explicit
-selection.
-
-The labelled sample evaluates a fixed fictional weather request through the
-same Decisions contract and provider journal. The selected processor receives
-the sample and the Home pays for the evaluation. Advice changes no permission
-and dispatches no downstream weather request. A durable receipt binds the
-sample to its principal and evaluator; later checks read that same run. Lost
-responses or missing journal state retain unknown acceptance instead of
-dispatching another paid evaluation.
+System offers no decision models and no Approval Lens evaluator: OpenRouter
+discovery lists text models only, no screen selects an evaluator, and an
+instance's display name never selects one. A Home that selected an evaluator
+in an earlier release keeps that saved instance ID; Runtime still asks it for
+advice and the person decides in Inbox. Without a selection, an Assistant
+hosted request needs only the hosted connection approval in Inbox.
 
 ## Local content selection and retention
 

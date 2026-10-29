@@ -895,14 +895,17 @@ async function main() {
         note: document.querySelector("#ai-provider-egress-note")?.textContent?.trim(),
         state: card?.querySelector(".ai-provider-state")?.textContent?.trim(),
         useDisabled: card?.querySelector("button")?.disabled,
-        lens: document.querySelector("#approval-lens-status")?.textContent?.trim(),
+        lensSection: Boolean(document.querySelector("#approval-lens")),
+        decisionListed: [...document.querySelectorAll("#ai-provider-instances .ai-provider-instance")]
+          .some((node) => node.textContent.includes("Jev")),
       };
     });
     assert(
       hostedPause.note?.includes("External HTTPS is paused") &&
         hostedPause.state === "External HTTPS paused" &&
         hostedPause.useDisabled === true &&
-        hostedPause.lens?.includes("external HTTPS paused"),
+        hostedPause.lensSection === false &&
+        hostedPause.decisionListed === false,
       "System did not show saved hosted connections as paused",
       hostedPause,
     );
