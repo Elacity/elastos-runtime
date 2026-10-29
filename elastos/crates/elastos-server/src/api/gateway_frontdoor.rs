@@ -222,7 +222,11 @@ pub(super) async fn gateway_admission(
             apply_capsule_cors_headers(response.headers_mut(), &HeaderValue::from_static("null"));
             response.headers_mut().insert(
                 "access-control-allow-methods",
-                HeaderValue::from_static("GET, POST, PUT, DELETE, HEAD"),
+                HeaderValue::from_static(if api {
+                    "GET, POST, PUT, DELETE, HEAD"
+                } else {
+                    "GET, HEAD"
+                }),
             );
             response.headers_mut().insert(
                 "access-control-allow-headers",

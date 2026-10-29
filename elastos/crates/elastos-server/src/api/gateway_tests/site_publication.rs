@@ -1554,6 +1554,14 @@ async fn an_ordinary_home_serves_its_local_store_over_http_only_to_its_own_sessi
             .unwrap(),
         "null"
     );
+    assert_eq!(
+        allowed
+            .headers()
+            .get("access-control-allow-methods")
+            .unwrap(),
+        "GET, HEAD",
+        "a content read is advertised as a read only"
+    );
     let refused = preflight(format!("/content/{TEST_CIDV1}"), "POST")
         .await
         .unwrap();
