@@ -22,7 +22,7 @@ import {
 } from "./model.js";
 import { createLibraryRuntime } from "./api.js?v=library-20261028a";
 import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
-import { createLibraryActions } from "./actions.js?v=library-20261029a";
+import { createLibraryActions } from "./actions.js?v=library-20261029b";
 import { createLibraryDialog } from "./dialog.js?v=library-20261029a";
 import { createLibraryEditor } from "./editor.js";
 import { bindLibraryEvents } from "./events.js";

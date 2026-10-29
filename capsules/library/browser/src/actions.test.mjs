@@ -744,3 +744,25 @@ test("Library Share again runs the repair and says whether the file is shared ag
     assert.equal(statuses.at(-1), expected, repairStatus);
   }
 });
+
+test("Library reads a shared file with this Home's token", async () => {
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+  const originalDocument = globalThis.document;
+  const originalUrl = globalThis.URL;
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init });
+    return new Response("hello");
+  };
+  globalThis.document = { createElement: () => ({ click() {}, remove() {} }), body: { appendChild() {} } };
+  globalThis.URL = Object.assign(class extends originalUrl {}, { createObjectURL: () => "blob:x", revokeObjectURL() {} });
+  try {
+    await makeActions({ state: { homeToken: "home-token" } }).downloadSharedFile("bafkreishared", "notes.txt");
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.document = originalDocument;
+    globalThis.URL = originalUrl;
+  }
+  assert.equal(requests[0].url, "/content/bafkreishared");
+  assert.equal(requests[0].init.headers["x-elastos-home-token"], "home-token");
+});
