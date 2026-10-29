@@ -2079,7 +2079,11 @@ impl CollaborationContactStore {
     }
 
     /// Decodes and signature-verifies the sibling file into `loaded`. Heads
-    /// and removals join the v1 ones; a Profile DID in both files is refused.
+    /// and removals join the v1 ones. A pair can have records in both files:
+    /// added by DID here, then after an Undo re-added and renamed or removed
+    /// on alpha.25, which writes only the v1 file. Such a pair is merged, never
+    /// refused: the newest head wins, and of its removals the latest stands,
+    /// unless alpha.25 recorded a newer acceptance that ended it.
     fn load_profile_partition(
         &self,
         loaded: &mut LoadedState,
@@ -2148,21 +2152,42 @@ impl CollaborationContactStore {
         for (profile_did, head) in
             parse_accepted_profile_heads(&profile_state.accepted_profile_heads)?
         {
-            if loaded
-                .accepted_profile_heads
-                .insert(profile_did, head)
-                .is_some()
-            {
-                anyhow::bail!("duplicate accepted profile head for one profile DID");
+            match loaded.accepted_profile_heads.entry(profile_did) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(head);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if head.0.document().revision > slot.get().0.document().revision {
+                        slot.insert(head);
+                    }
+                }
             }
         }
+        // Only the sibling file can hold a removal that a later acceptance
+        // ended: alpha.25 accepts without seeing the sibling file.
+        let mut v1_accepted_at: HashMap<String, u64> = HashMap::new();
+        for chain in accepted_chains(loaded)?.iter().filter(|chain| chain.v1) {
+            let remote = remote_presentation(chain, &self.local_profile_did)?.remote_profile_did;
+            let newest = v1_accepted_at.entry(remote).or_default();
+            *newest = (*newest).max(chain.decided_at);
+        }
         for (remote_did, removed) in self.parse_removed_contacts(&profile_state.removed_contacts)? {
-            if loaded
-                .removed_contacts
-                .insert(remote_did, removed)
-                .is_some()
+            let removed_at = removed.revocation.removed_at();
+            if v1_accepted_at
+                .get(&remote_did)
+                .is_some_and(|accepted_at| *accepted_at > removed_at)
             {
-                anyhow::bail!("duplicate removed relationship for one profile DID");
+                continue;
+            }
+            match loaded.removed_contacts.entry(remote_did) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(removed);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if removed_at > slot.get().revocation.removed_at() {
+                        slot.insert(removed);
+                    }
+                }
             }
         }
         loaded.profile_requests = requests;
@@ -2208,14 +2233,10 @@ impl CollaborationContactStore {
                 anyhow::bail!("accepted profile head is not bound to a known relationship");
             }
         }
-        for (remote_did, _) in self.parse_removed_contacts(&state.removed_contacts)? {
+        for (remote_did, entry) in self.parse_removed_contacts(&state.removed_contacts)? {
             if !accepted_remotes.contains(&remote_did) {
                 anyhow::bail!("removed relationship has no signed acceptance chain");
             }
-            let entry = loaded
-                .removed_contacts
-                .get(&remote_did)
-                .ok_or_else(|| anyhow::anyhow!("removed relationship record is missing"))?;
             require_pair_conversation(&entry.revocation, &self.local_profile_did, &remote_did)?;
         }
         if canonical_profile_state_bytes(state)?.len() > MAX_CONTACT_STORE_STATE_BYTES {
@@ -6335,6 +6356,153 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    /// The pair's sibling file as an Undo to alpha.25 leaves it: alpha.25
+    /// never reads or writes it, so it keeps these exact bytes.
+    fn sibling_file_bytes(fixture: &Fixture) -> Vec<u8> {
+        fs::read(
+            rooted_localhost_fs_path(
+                &fixture.data_root,
+                &fixture.store.profile_state_object_uri(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn restore_sibling_file(fixture: &Fixture, bytes: &[u8]) {
+        fs::write(
+            rooted_localhost_fs_path(
+                &fixture.data_root,
+                &fixture.store.profile_state_object_uri(),
+            )
+            .unwrap(),
+            bytes,
+        )
+        .unwrap();
+    }
+
+    /// Added by DID, renamed and removed on 0.8.0; after an Undo, re-added
+    /// through Discovery and renamed again on alpha.25, which writes only the
+    /// v1 file; then removed again there. Each time 0.8.0 loads both files,
+    /// the pair is one contact with the newest name, and only a removal later
+    /// than the alpha.25 acceptance ends it.
+    #[test]
+    fn a_pair_in_both_files_after_undo_loads_as_one_contact() {
+        let fixture = Fixture::new();
+        let (profile_key, _) = generate_keypair();
+        let (device_key, _) = generate_keypair();
+        let device = device_did(&device_key);
+        let local_did = fixture.local_profile.document().profile_did.clone();
+        let head1 = signed_profile_for_device(
+            &profile_key,
+            &device_key,
+            "Remote",
+            None,
+            1,
+            None,
+            NOW - 200,
+        );
+        let remote_did = head1.document().profile_did.clone();
+        let remote = RemoteIdentity {
+            device_key: SigningKey::from_bytes(&device_key.to_bytes()),
+            profile: head1.clone(),
+        };
+
+        // 0.8.0: added by DID, renamed, removed. All of it in the sibling.
+        add_outgoing_profile_contact(&fixture, &remote, NOW - 100);
+        let head2 = signed_profile_for_device(
+            &profile_key,
+            &device_key,
+            "Remote Two",
+            None,
+            2,
+            Some(&profile_hash(&head1)),
+            NOW - 90,
+        );
+        fixture
+            .store
+            .apply_accepted_profile_chain(&[signed_bytes(&head2)], &device, NOW - 90)
+            .unwrap();
+        fixture
+            .store
+            .record_local_contact_revocation(
+                &revocation_bytes(&fixture.local_key, &local_did, &remote_did, NOW - 80),
+                &fixture.local_profile,
+                NOW - 80,
+            )
+            .unwrap();
+        let undo_sibling = sibling_file_bytes(&fixture);
+
+        // alpha.25: re-added through Discovery, then renamed.
+        let local_ad = advertisement_with_profile(&fixture.local_key, &fixture.local_profile, NOW);
+        fixture
+            .store
+            .store_local_advertisement(&local_ad, NOW)
+            .unwrap();
+        let incoming = outgoing_request_with_profile(
+            &device_key,
+            &head2,
+            &local_did,
+            &collaboration_message_envelope_sha256(&local_ad),
+            NOW + 1,
+        );
+        fixture
+            .store
+            .record_incoming_contact_request(&incoming, NOW + 1)
+            .unwrap();
+        fixture
+            .store
+            .record_contact_decision_receipt(
+                &decision_receipt(
+                    &fixture.local_key,
+                    &incoming,
+                    CollaborationContactDecision::Accepted,
+                    NOW + 2,
+                    &local_did,
+                ),
+                NOW + 2,
+            )
+            .unwrap();
+        let head3 = signed_profile_for_device(
+            &profile_key,
+            &device_key,
+            "Remote Three",
+            None,
+            3,
+            Some(&profile_hash(&head2)),
+            NOW + 10,
+        );
+        fixture
+            .store
+            .apply_accepted_profile_chain(&[signed_bytes(&head3)], &device, NOW + 10)
+            .unwrap();
+        restore_sibling_file(&fixture, &undo_sibling);
+
+        // Back on 0.8.0: both files name the pair; the older sibling removal
+        // was ended by the alpha.25 acceptance.
+        let snapshot = fixture.store.snapshot().unwrap();
+        assert!(snapshot.removed().is_empty());
+        assert_eq!(snapshot.contacts().len(), 1);
+        assert_eq!(snapshot.contacts()[0].remote_profile_did(), remote_did);
+        assert_eq!(snapshot.contacts()[0].remote_display_name(), "Remote Three");
+
+        // alpha.25 removes them; 0.8.0 still loads, and the removal stands.
+        fixture
+            .store
+            .record_local_contact_revocation(
+                &revocation_bytes(&fixture.local_key, &local_did, &remote_did, NOW + 40),
+                &fixture.local_profile,
+                NOW + 40,
+            )
+            .unwrap();
+        restore_sibling_file(&fixture, &undo_sibling);
+        let snapshot = fixture.store.snapshot().unwrap();
+        assert!(snapshot.contacts().is_empty());
+        assert_eq!(snapshot.removed().len(), 1);
+        assert_eq!(snapshot.removed()[0].removed_at(), NOW + 40);
+        assert_eq!(snapshot.removed()[0].display_name(), "Remote Three");
     }
 
     #[test]
