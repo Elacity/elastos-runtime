@@ -8324,35 +8324,48 @@ pub(crate) fn cid_is_published_here(data_dir: &Path, cid: &str) -> bool {
     published_cid_audience(data_dir, cid).is_some()
 }
 
-/// Brings the index in line with every publish record this Runtime can read
-/// at start: active records are listed, withdrawn ones are not. Entries whose
-/// records it cannot read are left as they are.
+/// Rewrites `object_uri`'s publish record as alpha.25 withdrew it after an
+/// Undo: withdrawn, without the publication id it never knew, and with the
+/// index left as it was.
+#[cfg(test)]
+pub(crate) fn withdraw_as_alpha25_for_test(data_dir: &Path, principal_id: &str, object_uri: &str) {
+    let mut record = read_publish_record(data_dir, principal_id, object_uri).unwrap();
+    record.publication_id = None;
+    record.unpublished_at = Some(record.published_at + 1);
+    let root = crate::auth::principal_localhost_root(principal_id);
+    write_runtime_json(
+        data_dir,
+        principal_id,
+        &publish_record_uri(&root, object_uri),
+        &record,
+    )
+    .unwrap();
+}
+
+/// Rebuilds the index at start from the publish records alone: an entry
+/// stays only while an active record backs it, whatever wrote it. A record
+/// an earlier release rewrote (for example a withdrawal after Undo, which
+/// drops the publication id) therefore can't leave its old entry behind, and
+/// a record this Runtime cannot read is not served until it can.
 pub fn reconcile_published_cids(data_dir: &Path) {
     let principals: BTreeSet<String> = crate::auth::list_passkey_principals(data_dir)
         .unwrap_or_default()
         .into_iter()
         .map(|principal| principal.principal_id)
         .collect();
-    let mut entries = Vec::new();
+    let mut publications = std::collections::BTreeMap::new();
     for principal in &principals {
         for record in publish_records(data_dir, principal) {
-            entries.push((
-                published_index_key(principal, &record),
-                record_is_published(&record).then(|| PublishedEntry::of(principal, &record)),
-            ));
+            if record_is_published(&record) {
+                publications.insert(
+                    published_index_key(principal, &record),
+                    PublishedEntry::of(principal, &record),
+                );
+            }
         }
     }
     if let Err(err) = update_published_index(data_dir, |index| {
-        for (key, entry) in entries {
-            match entry {
-                Some(entry) => {
-                    index.publications.insert(key, entry);
-                }
-                None => {
-                    index.publications.remove(&key);
-                }
-            }
-        }
+        index.publications = publications;
     }) {
         tracing::warn!(error = %err, "library: published CID index not reconciled");
     }
@@ -10319,10 +10332,11 @@ mod publish_tests {
             cid_is_published_here(alma.dir.path(), &cid),
             "Alma's stays served"
         );
+        // A restart serves only what a readable active record backs.
         reconcile_published_cids(alma.dir.path());
         assert!(
-            cid_is_published_here(alma.dir.path(), &cid),
-            "and after a restart"
+            !cid_is_published_here(alma.dir.path(), &cid),
+            "an unreadable record is not served after a restart"
         );
     }
 

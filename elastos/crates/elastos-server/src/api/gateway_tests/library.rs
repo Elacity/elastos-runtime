@@ -11769,3 +11769,39 @@ async fn unpublishing_one_persons_publication_keeps_another_persons_identical_by
         TEST_CIDV1
     ));
 }
+
+#[tokio::test]
+async fn a_publication_withdrawn_by_an_older_release_is_not_served_after_the_update() {
+    let _guard = protected_content_gateway_mock_test_guard().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("alma"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/undo.txt");
+    let (_, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"undo bytes"),
+        }),
+    )
+    .await;
+    assert_eq!(write["status"], "ok", "{write}");
+    let (_, publish) = post_library(app.clone(), &token, "publish", json!({ "uri": uri })).await;
+    let cid = publish["data"]["cid"].as_str().unwrap().to_string();
+    assert!(crate::library::cid_is_published_here(dir.path(), &cid));
+
+    // Undo to alpha.25, which stops sharing and rewrites the record without
+    // the publication id; the index it never knew keeps the old entry.
+    crate::library::withdraw_as_alpha25_for_test(dir.path(), &authority.principal_id, &uri);
+    assert!(crate::library::cid_is_published_here(dir.path(), &cid));
+
+    // Update back: the start rebuild serves only what an active record backs.
+    crate::library::reconcile_published_cids(dir.path());
+    assert!(!crate::library::cid_is_published_here(dir.path(), &cid));
+    let (_, status) = post_library(app, &token, "status", json!({ "uri": uri })).await;
+    assert_eq!(status["data"]["object"]["published"], false, "{status}");
+}

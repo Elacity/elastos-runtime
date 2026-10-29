@@ -609,11 +609,12 @@ tickets, peer handles, or Kubo authority.
 Peer `content/fetch` admission: every peer read is `local_only`. An ordinary
 Home serves it only for a CID that an active publication on it lists: the
 Library publication records of every person on the Home, kept as a small
-index of published CIDs that changes with the records and is reconciled from
-them at start. A pin is only local storage (published files, files received in
-Chat, models and withdrawn publications all use it), so pinned alone is never
-served. A Library publication is served only to a peer whose authenticated
-Carrier device belongs to an accepted contact of the person who published it;
+index of published CIDs that changes with the records and is rebuilt from the
+active records alone at start. A pin is only local storage (published files,
+files received in Chat, models and withdrawn publications all use it), so
+pinned alone is never served. A Library publication is served only to a peer
+whose authenticated Carrier device belongs to an accepted contact of the
+person who published it;
 a protected listing's sealed payload is served to any peer, since opening it
 needs a purchase's key release. Unpublish withdraws the record, and new
 transfers stop at once; the pin stays until a later cleanup removes pins
