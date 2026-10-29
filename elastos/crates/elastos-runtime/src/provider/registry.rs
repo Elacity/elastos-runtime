@@ -2368,7 +2368,7 @@ fn provider_stream_response_bytes(
     data: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vec<u8>, ProviderError> {
     if let Some(stream) = data.get("stream") {
-        return decode_provider_stream_payload(stream);
+        return decode_provider_stream_payload(stream, usize::MAX);
     }
     let encoded = data
         .get("data")
@@ -2388,7 +2388,13 @@ fn provider_stream_response_bytes(
         })
 }
 
-fn decode_provider_stream_payload(stream: &serde_json::Value) -> Result<Vec<u8>, ProviderError> {
+/// Decodes a completed `elastos.provider.stream/v1` payload: chunks in order,
+/// each at its offset and length, matching the stated total. A payload past
+/// `max_bytes` is refused before the chunk that crosses it is kept.
+pub fn decode_provider_stream_payload(
+    stream: &serde_json::Value,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ProviderError> {
     let object = stream.as_object().ok_or_else(|| {
         ProviderError::Provider("provider stream payload must be an object".to_string())
     })?;
@@ -2472,6 +2478,11 @@ fn decode_provider_stream_payload(stream: &serde_json::Value) -> Result<Vec<u8>,
                     "provider stream chunk {index} has invalid base64 data: {err}"
                 ))
             })?;
+        if bytes.len().saturating_add(decoded.len()) > max_bytes {
+            return Err(ProviderError::Provider(format!(
+                "provider stream payload exceeds {max_bytes} bytes"
+            )));
+        }
         if let Some(length) = chunk.get("length").and_then(|value| value.as_u64()) {
             if length != decoded.len() as u64 {
                 return Err(ProviderError::Provider(format!(
@@ -3006,7 +3017,18 @@ mod tests {
     }
 
     fn decode_test_stream_response(response: &serde_json::Value) -> Vec<u8> {
-        decode_provider_stream_payload(&response["data"]["stream"]).unwrap()
+        decode_provider_stream_payload(&response["data"]["stream"], usize::MAX).unwrap()
+    }
+
+    #[test]
+    fn provider_stream_decoding_refuses_a_payload_past_its_bound() {
+        let stream = provider_stream_payload(&[7u8; 10]);
+        assert_eq!(
+            decode_provider_stream_payload(&stream, 10).unwrap(),
+            vec![7u8; 10]
+        );
+        let err = decode_provider_stream_payload(&stream, 9).unwrap_err();
+        assert!(err.to_string().contains("exceeds 9 bytes"), "{err}");
     }
 
     #[derive(Default)]

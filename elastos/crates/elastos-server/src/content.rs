@@ -95,7 +95,6 @@ const REPAIR_WORKER_MAX_FAILURE_BUDGET: u32 = 100;
 const IMPORT_EXACT_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Publish policy that pins on this node only and never asks availability to replicate.
 pub(crate) const LOCAL_PIN_AVAILABILITY_POLICY: &str = "local_pin";
-const IMPORT_OBJECT_MAX_FILES: usize = 512;
 const AVAILABILITY_DASHBOARD_REMOTE_ROW_LIMIT: usize = 10;
 const OBJECT_MANIFEST_SCHEMA: &str = "elastos.content.object.manifest/v1";
 const OBJECT_MANIFEST_PATH: &str = "_elastos_object.json";
@@ -3298,7 +3297,6 @@ impl Provider for ContentProvider {
             Some("publish") => self.publish(request).await,
             Some("fetch") => self.fetch(request).await,
             Some("import_exact") => self.import_exact(request).await,
-            Some("import_object") => self.import_object(request).await,
             Some("admission") => self.admission(request).await,
             Some("ensure") => self.ensure(request).await,
             Some("repair") => self.repair(request).await,
@@ -4058,162 +4056,6 @@ impl ContentProvider {
                 "schema": "elastos.content.import-exact/v1",
                 "method": "carrier_provider_stream",
                 "bytes": bytes.len(),
-                "verified_cid": true,
-            }
-        })))
-    }
-
-    async fn import_object(&self, request: &Value) -> Result<Value, ProviderError> {
-        validate_import_object_invocation(request)?;
-        let cid = request
-            .get("cid")
-            .and_then(|cid| cid.as_str())
-            .filter(|cid| !cid.trim().is_empty())
-            .ok_or_else(|| ProviderError::Provider("content import_object requires cid".into()))?;
-        if !is_valid_cid(cid) {
-            return Ok(provider_error(
-                "invalid_cid",
-                "content import_object requires a valid CID",
-            ));
-        }
-        let files = request
-            .get("files")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        let (file_count, total_bytes) = validate_import_object_payload_bounds(&files)?;
-        let requirements = AvailabilityRequirements::from_request(request);
-        let publisher_did = request
-            .get("publisher_did")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let publisher_did = Some(self.effective_publisher_did(publisher_did.as_deref())?);
-        let object_kind = request
-            .get("object_kind")
-            .or_else(|| request.get("kind"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("directory");
-        let files = with_directory_object_manifest(
-            files,
-            object_kind,
-            request.get("object_did").and_then(|value| value.as_str()),
-            request
-                .get("publisher_did")
-                .and_then(|value| value.as_str()),
-            request.get("links"),
-        )?;
-        // The quota counts what this node keeps: the files and the generated
-        // manifest.
-        let retained_bytes = directory_files_decoded_bytes(&files);
-        let storage_quota = self.principal_storage_quota_for_request(
-            publisher_did.as_deref().unwrap_or_default(),
-            &requirements,
-            Some(retained_bytes),
-            Some(cid),
-        )?;
-        if storage_quota.get("status").and_then(|value| value.as_str()) == Some("quota_exceeded") {
-            return Ok(provider_error(
-                "storage_quota_exceeded",
-                "content import_object exceeds the principal storage quota",
-            ));
-        }
-        let registry = self.registry()?;
-        let ipfs_response = self
-            .invoke_provider(
-                &registry,
-                "ipfs",
-                "add_directory",
-                json!({
-                    "op": "add_directory",
-                    "files": files,
-                    "pin": false,
-                }),
-                ProviderTransfer::Json,
-            )
-            .await?;
-        provider_response_ok(&ipfs_response, "content import_object")?;
-        let imported_cid = provider_response_cid(&ipfs_response).map_err(|err| {
-            ProviderError::Provider(format!("content import_object missing imported CID: {err}"))
-        })?;
-        if imported_cid != cid {
-            return Ok(provider_error(
-                "cid_mismatch",
-                "content import_object produced a different CID; exact object import requires matching manifest and bytes",
-            ));
-        }
-        self.pin_imported_cid(&registry, cid, "content import_object")
-            .await?;
-
-        let local_outcome = AvailabilityOutcome {
-            provider: "ipfs-provider".to_string(),
-            policy: "carrier_object_import".to_string(),
-            status: "local_pinned".to_string(),
-            replicas: 1,
-            reason: None,
-            peer_selection: local_peer_selection_json(),
-            quota: local_quota_json(),
-            repair_worker: repair_worker_json(false),
-            storage_market: local_storage_market_json(),
-            repair_graph: local_repair_graph_json(),
-            abuse_controls: local_abuse_controls_json(),
-        };
-        let outcome = self
-            .ensure_network_availability(
-                &registry,
-                cid,
-                request,
-                &local_outcome,
-                AvailabilityRequestContext {
-                    object_did: request.get("object_did").and_then(|value| value.as_str()),
-                    publisher_did: publisher_did.as_deref(),
-                    accounting_observation: ContentAccountingObservation {
-                        files: Some(file_count as u64),
-                        bytes: Some(retained_bytes),
-                    },
-                },
-            )
-            .await?
-            .unwrap_or(local_outcome);
-        let object_did = request
-            .get("object_did")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let receipt = self.write_receipt(ReceiptInput {
-            cid: cid.to_string(),
-            object_did,
-            publisher_did,
-            provider: outcome.provider.clone(),
-            policy: outcome.policy.clone(),
-            status: outcome.status.clone(),
-            replicas: outcome.replicas,
-            peer_selection: outcome.peer_selection.clone(),
-            quota: outcome.quota.clone(),
-            repair_worker: outcome.repair_worker.clone(),
-            storage_market: outcome.storage_market.clone(),
-            repair_graph: outcome.repair_graph.clone(),
-            abuse_controls: outcome.abuse_controls.clone(),
-            accounting: content_accounting_json_with_storage_quota(
-                "carrier_object_import",
-                ContentAccountingObservation {
-                    files: Some(file_count as u64),
-                    bytes: Some(retained_bytes),
-                },
-                outcome.replicas,
-                storage_quota,
-            ),
-        })?;
-        let repair_task = self.record_repair_task(&receipt, &outcome, requirements, false)?;
-
-        Ok(provider_ok(json!({
-            "cid": cid,
-            "uri": format!("elastos://{cid}"),
-            "availability": outcome.to_json(),
-            "repair_task": repair_task,
-            "receipt": receipt,
-            "import": {
-                "schema": "elastos.content.import-object/v1",
-                "method": "carrier_provider_object_manifest",
-                "files": file_count,
-                "bytes": total_bytes,
                 "verified_cid": true,
             }
         })))
@@ -8433,25 +8275,6 @@ fn validate_import_exact_invocation(request: &Value) -> Result<(), ProviderError
     Ok(())
 }
 
-fn validate_import_object_invocation(request: &Value) -> Result<(), ProviderError> {
-    let runtime = runtime_invocation_object(
-        request,
-        "content import_object requires Runtime provider invocation metadata",
-    )?;
-    validate_runtime_invocation_fields(
-        runtime,
-        "content import_object",
-        &[
-            ("schema", "elastos.provider.invocation/v1"),
-            ("source", "carrier-availability"),
-            ("target", "content"),
-            ("op", "import_object"),
-            ("transport", "carrier-provider-plane"),
-            ("transfer", "json"),
-        ],
-    )
-}
-
 fn validate_repair_worker_invocation(request: &Value) -> Result<(), ProviderError> {
     let runtime = runtime_invocation_object(
         request,
@@ -8523,146 +8346,17 @@ fn import_exact_payload_bytes(request: &Value) -> Result<Vec<u8>, ProviderError>
     Ok(bytes)
 }
 
-fn validate_import_object_payload_bounds(files: &Value) -> Result<(usize, usize), ProviderError> {
-    let files = files.as_array().ok_or_else(|| {
-        ProviderError::Provider("content import_object files must be an array".into())
-    })?;
-    if files.is_empty() {
-        return Err(ProviderError::Provider(
-            "content import_object requires at least one file".into(),
-        ));
-    }
-    if files.len() > IMPORT_OBJECT_MAX_FILES {
-        return Err(ProviderError::Provider(format!(
-            "content import_object file count exceeds {IMPORT_OBJECT_MAX_FILES}"
-        )));
-    }
-    let mut total_bytes = 0_usize;
-    for file in files {
-        let path = file
-            .get("path")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let data = file
-            .get("data")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                ProviderError::Provider(format!(
-                    "content import_object file {path} is missing base64 data"
-                ))
-            })?;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|err| {
-                ProviderError::Provider(format!(
-                    "content import_object file {path} has invalid base64 data: {err}"
-                ))
-            })?;
-        total_bytes = total_bytes.saturating_add(decoded.len());
-        if total_bytes > IMPORT_EXACT_MAX_BYTES {
-            return Err(ProviderError::Provider(format!(
-                "content import_object payload exceeds {} bytes",
-                IMPORT_EXACT_MAX_BYTES
-            )));
-        }
-    }
-    Ok((files.len(), total_bytes))
-}
-
 fn provider_stream_payload_bytes(stream: &Value) -> Result<Vec<u8>, ProviderError> {
-    let object = stream.as_object().ok_or_else(|| {
-        ProviderError::Provider("content import_exact stream must be an object".into())
-    })?;
-    let schema = object
-        .get("schema")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if schema != "elastos.provider.stream/v1" {
-        return Err(ProviderError::Provider(format!(
-            "content import_exact stream schema mismatch: expected elastos.provider.stream/v1, got {schema}"
-        )));
-    }
-    let encoding = object
-        .get("encoding")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if encoding != "base64-chunks" {
-        return Err(ProviderError::Provider(format!(
-            "content import_exact stream encoding mismatch: expected base64-chunks, got {encoding}"
-        )));
-    }
-    let chunks = object
-        .get("chunks")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| {
-            ProviderError::Provider("content import_exact stream missing chunks".into())
-        })?;
-    let mut bytes = Vec::new();
-    for (expected_index, chunk) in chunks.iter().enumerate() {
-        let chunk = chunk.as_object().ok_or_else(|| {
-            ProviderError::Provider("content import_exact stream chunk must be an object".into())
-        })?;
-        let index = chunk
-            .get("index")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| {
-                ProviderError::Provider("content import_exact stream chunk missing index".into())
-            })?;
-        if index != expected_index as u64 {
-            return Err(ProviderError::Provider(format!(
-                "content import_exact stream chunk index mismatch: expected {expected_index}, got {index}"
-            )));
-        }
-        let offset = chunk
-            .get("offset")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| {
-                ProviderError::Provider("content import_exact stream chunk missing offset".into())
-            })?;
-        if offset != bytes.len() as u64 {
-            return Err(ProviderError::Provider(format!(
-                "content import_exact stream chunk {index} offset mismatch: expected {}, got {offset}",
-                bytes.len()
-            )));
-        }
-        let encoded = chunk
-            .get("data")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                ProviderError::Provider("content import_exact stream chunk missing data".into())
-            })?;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|err| {
+    elastos_runtime::provider::decode_provider_stream_payload(stream, IMPORT_EXACT_MAX_BYTES)
+        .map_err(|err| {
+            if err.to_string().contains("payload exceeds") {
                 ProviderError::Provider(format!(
-                    "content import_exact stream chunk has invalid base64: {err}"
+                    "content import_exact payload exceeds {IMPORT_EXACT_MAX_BYTES} bytes"
                 ))
-            })?;
-        if bytes.len().saturating_add(decoded.len()) > IMPORT_EXACT_MAX_BYTES {
-            return Err(ProviderError::Provider(format!(
-                "content import_exact payload exceeds {} bytes",
-                IMPORT_EXACT_MAX_BYTES
-            )));
-        }
-        if let Some(length) = chunk.get("length").and_then(|value| value.as_u64()) {
-            if length != decoded.len() as u64 {
-                return Err(ProviderError::Provider(format!(
-                    "content import_exact stream chunk {index} length {length} does not match decoded length {}",
-                    decoded.len()
-                )));
+            } else {
+                ProviderError::Provider(format!("content import_exact stream: {err}"))
             }
-        }
-        bytes.extend_from_slice(&decoded);
-    }
-    if let Some(total_bytes) = object.get("total_bytes").and_then(|value| value.as_u64()) {
-        if total_bytes != bytes.len() as u64 {
-            return Err(ProviderError::Provider(format!(
-                "content import_exact stream total_bytes {total_bytes} does not match decoded length {}",
-                bytes.len()
-            )));
-        }
-    }
-    Ok(bytes)
+        })
 }
 
 fn parse_availability_provider_response(
@@ -9545,20 +9239,6 @@ fn append_jsonl<T: Serialize>(path: &Path, entry: &T) -> Result<(), ProviderErro
     Ok(())
 }
 
-/// Decoded bytes of a directory's files: what the node stores for them.
-fn directory_files_decoded_bytes(files: &Value) -> u64 {
-    files
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|file| file.get("data")?.as_str())
-        .map(|data| {
-            let padding = data.bytes().rev().take_while(|byte| *byte == b'=').count();
-            (data.len() / 4 * 3).saturating_sub(padding) as u64
-        })
-        .sum()
-}
-
 fn verify_signed_receipt(receipt: &SignedAvailabilityReceipt) -> Result<(), ProviderError> {
     let envelope = serde_json::to_vec(receipt)
         .map_err(|err| ProviderError::Provider(format!("content receipt encode failed: {err}")))?;
@@ -9883,25 +9563,6 @@ mod tests {
                 "encoding": "base64-chunks",
                 "chunk_size": 65536
             },
-            "range": null,
-            "progress": null
-        })
-    }
-
-    fn carrier_import_object_invocation() -> Value {
-        json!({
-            "schema": "elastos.provider.invocation/v1",
-            "source": "carrier-availability",
-            "target": "content",
-            "op": "import_object",
-            "capability": "provider:carrier-availability->content:import_object",
-            "transport": "carrier-provider-plane",
-            "carrier": {
-                "route": "connect_ticket",
-                "peer_did": "did:key:zRemote",
-                "timeout_ms": 5000
-            },
-            "transfer": "json",
             "range": null,
             "progress": null
         })
@@ -10491,24 +10152,17 @@ mod tests {
         // The bytes hash to TEST_CID, which this node already pins; the peer
         // names a different CID.
         let other_cid = "QmRSEtAyq7Xgr5YCFVWuYsBdqbR5X9fJDsdpNQuvm9yaic";
-        for request in [
-            json!({
+        let response = content
+            .send_raw(&json!({
                 "op": "import_exact",
                 "cid": other_cid,
                 "stream": test_stream_payload(b"hello content"),
                 "_runtime_invocation": carrier_import_exact_invocation(),
-            }),
-            json!({
-                "op": "import_object",
-                "cid": other_cid,
-                "files": [{ "path": "index.md", "data": "IyBUZXN0Cg==" }],
-                "_runtime_invocation": carrier_import_object_invocation(),
-            }),
-        ] {
-            let response = content.send_raw(&request).await.unwrap();
-            assert_eq!(response["status"], "error", "{response}");
-            assert_eq!(response["code"], "cid_mismatch");
-        }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "error", "{response}");
+        assert_eq!(response["code"], "cid_mismatch");
         assert!(ipfs.unpinned.lock().await.is_empty(), "no pin is removed");
         assert!(ipfs.pinned.lock().await.is_empty(), "nothing is pinned");
         for request in ipfs.requests.lock().await.iter() {
@@ -10561,83 +10215,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_import_object_requires_runtime_provider_invocation() {
-        let (_data_dir, _registry, _ipfs, content) = registry_with_content_and_ipfs().await;
-        let err = content
-            .send_raw(&json!({
-                "op": "import_object",
-                "cid": TEST_CID,
-                "files": [{"path": "index.md", "data": "IyBUZXN0Cg=="}],
-            }))
-            .await
-            .unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("requires Runtime provider invocation metadata"));
-    }
-
-    #[tokio::test]
-    async fn content_import_object_reconstructs_manifest_directory() {
+    async fn content_refuses_an_older_peers_replica_object_import() {
         let (_data_dir, _registry, ipfs, content) = registry_with_content_and_ipfs().await;
-        let response = content
+        let refused = content
             .send_raw(&json!({
                 "op": "import_object",
                 "cid": TEST_CID,
-                "object_kind": "document",
-                "object_did": "did:key:zObject",
-                "publisher_did": "did:key:zPublisher",
-                "links": [{"rel": "provenance", "cid": TEST_CID}],
                 "files": [{"path": "index.md", "data": "IyBUZXN0Cg=="}],
-                "_runtime_invocation": carrier_import_object_invocation(),
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "carrier-availability",
+                    "target": "content",
+                    "op": "import_object",
+                    "transport": "carrier-provider-plane",
+                    "transfer": "json",
+                },
             }))
-            .await
-            .unwrap();
-
-        assert_eq!(response["status"], "ok");
-        assert_eq!(response["data"]["cid"], TEST_CID);
-        assert_eq!(
-            response["data"]["availability"]["policy"],
-            "carrier_object_import"
+            .await;
+        assert!(
+            !matches!(&refused, Ok(response) if response["status"] == "ok"),
+            "{refused:?}"
         );
-        assert_eq!(
-            response["data"]["import"]["schema"],
-            "elastos.content.import-object/v1"
-        );
-        assert_eq!(response["data"]["import"]["files"], 1);
-        assert_eq!(response["data"]["import"]["verified_cid"], true);
-        assert_eq!(
-            response["data"]["receipt"]["payload"]["accounting"]["source"],
-            "carrier_object_import"
-        );
-        assert_eq!(
-            response["data"]["receipt"]["payload"]["accounting"]["files"],
-            1
-        );
-
-        let directories = ipfs.added_directories.lock().await;
-        assert_eq!(directories.len(), 1);
-        let manifest_entry = directories[0]
-            .iter()
-            .find(|entry| entry["path"].as_str() == Some(OBJECT_MANIFEST_PATH))
-            .expect("object manifest should be injected");
-        let manifest_bytes = base64::engine::general_purpose::STANDARD
-            .decode(manifest_entry["data"].as_str().unwrap())
-            .unwrap();
-        let manifest: ContentObjectManifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        // The ledger counts the files and the generated manifest.
-        assert_eq!(
-            response["data"]["receipt"]["payload"]["accounting"]["content_bytes"],
-            7 + manifest_bytes.len() as u64
-        );
-        assert_eq!(manifest.kind, "document");
-        assert_eq!(manifest.object_did.as_deref(), Some("did:key:zObject"));
-        assert_eq!(
-            manifest.publisher_did.as_deref(),
-            Some("did:key:zPublisher")
-        );
-        assert_eq!(manifest.files.len(), 1);
-        assert_eq!(manifest.links[0].rel, "provenance");
+        assert!(ipfs.added_directories.lock().await.is_empty());
+        assert!(ipfs.pinned.lock().await.is_empty());
     }
 
     #[tokio::test]

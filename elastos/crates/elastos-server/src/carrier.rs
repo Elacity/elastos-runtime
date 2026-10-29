@@ -1214,7 +1214,7 @@ fn mdns_enabled_from(value: Option<&str>) -> bool {
         .unwrap_or(true)
 }
 
-fn is_trusted_source_runtime(data_dir: &std::path::Path) -> bool {
+pub(crate) fn is_trusted_source_runtime(data_dir: &std::path::Path) -> bool {
     // Installed clients cache release metadata under the Publisher root for
     // update checks. That does NOT make them a trusted-source runtime.
     //
@@ -2937,12 +2937,12 @@ fn admit_carrier_peer_content_request(
             request["local_only"] = serde_json::Value::Bool(true);
             Ok(())
         }
-        "admission" | "import_object" | "import_exact" | "ensure" | "status"
+        "admission" | "import_exact" | "ensure" | "status"
             if is_trusted_source_runtime(data_dir) =>
         {
             Err(carrier_peer_refusal("this node does not accept replicas"))
         }
-        "admission" | "import_object" | "import_exact" | "ensure" | "status" => {
+        "admission" | "import_exact" | "ensure" | "status" => {
             let granted = crate::operator_control::granted_peer_actions(data_dir, peer_did);
             if granted
                 .iter()
@@ -5803,7 +5803,9 @@ fn remote_content_provider_response_bytes(response: &serde_json::Value) -> Resul
         .and_then(|data| data.as_object())
         .ok_or_else(|| anyhow::anyhow!("remote content provider response missing data"))?;
     if let Some(stream) = data.get("stream") {
-        return decode_carrier_provider_stream_payload(stream);
+        // The caller bounds the bytes it accepts after decoding.
+        return elastos_runtime::provider::decode_provider_stream_payload(stream, usize::MAX)
+            .map_err(|err| anyhow::anyhow!("remote content provider stream: {err}"));
     }
     let data_value = data
         .get("data")
@@ -5815,88 +5817,6 @@ fn remote_content_provider_response_bytes(response: &serde_json::Value) -> Resul
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|err| anyhow::anyhow!("remote content provider returned invalid base64: {err}"))
-}
-
-fn decode_carrier_provider_stream_payload(stream: &serde_json::Value) -> Result<Vec<u8>> {
-    let object = stream
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("remote content provider stream must be an object"))?;
-    let schema = object
-        .get("schema")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if schema != "elastos.provider.stream/v1" {
-        anyhow::bail!(
-            "remote content provider stream schema mismatch: expected elastos.provider.stream/v1, got {schema}"
-        );
-    }
-    let encoding = object
-        .get("encoding")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if encoding != "base64-chunks" {
-        anyhow::bail!(
-            "remote content provider stream encoding mismatch: expected base64-chunks, got {encoding}"
-        );
-    }
-    let chunks = object
-        .get("chunks")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| anyhow::anyhow!("remote content provider stream missing chunks"))?;
-    let mut bytes = Vec::new();
-    for (expected_index, chunk) in chunks.iter().enumerate() {
-        let chunk = chunk.as_object().ok_or_else(|| {
-            anyhow::anyhow!("remote content provider stream chunk must be an object")
-        })?;
-        let index = chunk
-            .get("index")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("remote content provider stream chunk missing index"))?;
-        if index != expected_index as u64 {
-            anyhow::bail!(
-                "remote content provider stream chunk index mismatch: expected {expected_index}, got {index}"
-            );
-        }
-        let offset = chunk
-            .get("offset")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| {
-                anyhow::anyhow!("remote content provider stream chunk missing offset")
-            })?;
-        if offset != bytes.len() as u64 {
-            anyhow::bail!(
-                "remote content provider stream chunk {index} offset mismatch: expected {}, got {offset}",
-                bytes.len()
-            );
-        }
-        let encoded = chunk
-            .get("data")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| anyhow::anyhow!("remote content provider stream chunk missing data"))?;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|err| {
-                anyhow::anyhow!("remote content provider stream chunk has invalid base64: {err}")
-            })?;
-        if let Some(length) = chunk.get("length").and_then(|value| value.as_u64()) {
-            if length != decoded.len() as u64 {
-                anyhow::bail!(
-                    "remote content provider stream chunk {index} length {length} does not match decoded length {}",
-                    decoded.len()
-                );
-            }
-        }
-        bytes.extend_from_slice(&decoded);
-    }
-    if let Some(total_bytes) = object.get("total_bytes").and_then(|value| value.as_u64()) {
-        if total_bytes != bytes.len() as u64 {
-            anyhow::bail!(
-                "remote content provider stream total_bytes {total_bytes} does not match decoded length {}",
-                bytes.len()
-            );
-        }
-    }
-    Ok(bytes)
 }
 
 fn carrier_connect_ticket(endpoint: &Endpoint) -> String {
@@ -12821,8 +12741,8 @@ pub(crate) mod tests {
         let started = std::time::Instant::now();
         let response = local_registry
             .invoke_provider(route(
-                "import_object",
-                serde_json::json!({"op":"import_object","cid":"bafyfixture"}),
+                "import_exact",
+                serde_json::json!({"op":"import_exact","cid":"bafyfixture"}),
                 ProviderTransfer::Json,
             ))
             .await
@@ -12870,8 +12790,8 @@ pub(crate) mod tests {
         };
         let response = local_registry
             .invoke_provider(by_did(
-                "import_object",
-                serde_json::json!({"op":"import_object","cid":"bafyfixture"}),
+                "import_exact",
+                serde_json::json!({"op":"import_exact","cid":"bafyfixture"}),
                 ProviderTransfer::Json,
             ))
             .await
@@ -13395,6 +13315,9 @@ pub(crate) mod tests {
         for request in replica_ops() {
             invoke(request).await.unwrap();
         }
+        // An older peer's whole-object replica push is refused even with the grant.
+        let refused = invoke(serde_json::json!({ "op": "import_object", "cid": cid })).await;
+        assert!(refused.is_err(), "{refused:?}");
         assert_eq!(
             recorded_content_ops(&fixture.remote_requests),
             ["fetch", "ensure", "admission", "status"]
