@@ -208,6 +208,7 @@ async function assertPropertiesShowNoLinks() {
     kind: "file",
     mime: "text/markdown",
     size: 1200,
+    modified_at: 1760000000,
     content_cid: "bafy-smoke-local",
     published: true,
     published_cid: "bafy-smoke-published",
@@ -221,10 +222,11 @@ async function assertPropertiesShowNoLinks() {
   assert(published.general.includes("Unpublish from the item menu"), "A published file must name Unpublish.");
   assert(!published.general.includes("a copy is on the network"), "Library Properties must make no availability claim.");
   assert(published.details.includes('data-prop-copy="bafy-smoke-local"'), "Details must offer the content ID copy.");
+  assert(!published.general.includes("bafy-smoke-local"), "Library Properties General must not show the content ID.");
   // Details stays closed (renderProperties matches the tag without `open`);
   // ordinary fields stay in General and the address fields stay in Details.
   const propLabel = (html, label) => html.includes(`<td class="item-prop-label">${label}</td>`);
-  for (const label of ["Name", "Location", "Type", "Size"]) {
+  for (const label of ["Name", "Location", "Type", "Size", "Modified"]) {
     assert(propLabel(published.general, label) && !propLabel(published.details, label), `Library Properties must show ${label} outside Details.`);
   }
   for (const label of ["Object URI", "Content ID"]) {
