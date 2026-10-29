@@ -12797,6 +12797,8 @@ pub(crate) mod tests {
         .await;
         // An effectful content operation needs the holder owner's grant.
         grant_peer(slow._dir.path(), &local_did, &["content.replica"]);
+        // The holder published what the bounded fetch reads.
+        slow.publish("bafyfixture");
         let route =
             |op: &str, request: serde_json::Value, transfer: ProviderTransfer| ProviderInvocation {
                 source: "carrier-availability".into(),
