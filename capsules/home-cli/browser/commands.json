@@ -16,7 +16,7 @@
       "aliases": ["status", "summary", "whoami"],
       "usage": "home",
       "summary": "Home dashboard summary",
-      "description": "Show Home status, the active view, Inbox, apps, and services.",
+      "description": "Show Home status, the active view, Inbox, and apps.",
       "surface": ["home-cli"]
     },
     {
@@ -78,7 +78,7 @@
     {
       "name": "debug",
       "aliases": ["dev"],
-      "usage": "debug [capsules|inspect <capsule>|affordances [capsule]|gates [capsule]|audit <capsule>|people|spaces [root]|services|browser|terminal|contract]",
+      "usage": "debug [capsules|inspect <capsule>|affordances [capsule]|gates [capsule]|audit <capsule>|people|spaces [root]|browser|terminal|contract]",
       "summary": "Developer facts and projections",
       "description": "Debug command for diagnostics hidden from the default Home CLI product surface. Debug rows are declared capability descriptors, not grants.",
       "surface": ["home-cli"]

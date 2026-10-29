@@ -372,9 +372,11 @@ fn home_cli_line_mode_accepts_shared_snapshot_backed_commands() {
         );
     }
     assert_eq!(normalize_contract_command("call"), "invoke");
-    // Services is hidden, so debug has no Services topic.
-    let line_views = include_str!("line_views.rs");
-    assert!(!line_views.contains("debug services") && !line_views.contains("\"services\" =>"));
+    // Services is hidden, so neither the debug help nor the dashboard summary offers it.
+    let debug_help = help_lines("debug").join("\n");
+    assert!(debug_help.contains("debug [capsules"));
+    assert!(!debug_help.contains("services"));
+    assert!(!help_lines("home").join("\n").contains("services"));
 }
 
 #[test]
