@@ -1056,18 +1056,17 @@ test("System startup and recovery stay ready while the background Carrier check 
       refreshAccountList: async () => calls.push("accounts"),
       refreshRecoveryStatus: async () => calls.push("recovery"),
       refreshChainNetworks: async () => calls.push("chains"),
-      refreshCapsuleCatalog: async () => calls.push("catalogue"),
     });
     for (const name of ["configureSettingsTabs", "configureSettingsSearch", "activateSettingsTab",
       "configureAppearanceEditor", "configureAppearancePreferences", "configureGuestAccess", "configureCommunityMembership", "configureCommunityPresence",
       "configureAiProvider", "configurePasskeyAccess", "configureRecoveryAccess", "configureChainAccess",
-      "configureActiveShell", "configureCapsuleCatalog", "configureTechnicalDetails", "configureDeviceDidCopy",
+      "configureActiveShell", "configureTechnicalDetails", "configureDeviceDidCopy",
       "configureRuntimeUpdate", "configureHomeRecoverySave"]) context[name] = () => {};
     vm.runInContext(boot, context);
     await context.boot();
     await context.initialRecoveryState;
     assert.deepEqual(calls, [checking ? "summary-checking" : "summary-offline",
-      "shell", "accounts", "recovery", "chains", "catalogue"]);
+      "shell", "accounts", "recovery", "chains"]);
   }
 });
 

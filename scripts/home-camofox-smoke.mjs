@@ -764,7 +764,7 @@ async function main() {
         ok: true,
         title: doc.title || "",
         heading: [...doc.querySelectorAll("h1")].find((node) => node.offsetParent !== null)?.textContent?.trim() || "",
-        panelLabels: [...doc.querySelectorAll(".pc2-section-title, #catalog-title")].map((node) => node.textContent?.trim() || ""),
+        panelLabels: [...doc.querySelectorAll(".pc2-section-title, .settings-content h1")].map((node) => node.textContent?.trim() || ""),
         fieldLabels: [...doc.querySelectorAll(".system-fields dt")].map((node) => node.textContent?.trim() || ""),
         aboutFieldLabels: [...doc.querySelectorAll('[data-settings="about"] .system-fields dt')].map((node) => node.textContent?.trim() || ""),
         walletControlsRemoved: !doc.querySelector("#wallet-create") && !doc.querySelector("#wallet-approvals"),
@@ -815,7 +815,7 @@ async function main() {
       assert(system.panelLabels.includes("Recovery"), "System frame is missing Recovery", system);
       assert(system.panelLabels.includes("Access"), "System frame is missing Access", system);
       assert(!system.panelLabels.includes("Elastos Webspace"), "System must not present app inventory as a WebSpace", system);
-      assert(system.panelLabels.includes("Apps & Services"), "System frame is missing Apps & Services", system);
+      assert(!system.panelLabels.includes("Apps & Services"), "System frame still has Apps & Services", system);
       assert(system.panelLabels.includes("This Device"), "System frame is missing This Device", system);
       assert(!system.panelLabels.includes("Profile"), "System frame should keep People profile settings out of System", system);
       assert(system.fieldLabels.includes("Device identity"), "System frame is missing the Device identity section", system);

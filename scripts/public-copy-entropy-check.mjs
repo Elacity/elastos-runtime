@@ -155,7 +155,8 @@ const homeRuntime = read("elastos/crates/elastos-server/src/api/gateway_home_run
 const catalogReadModel = read("elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs");
 assert(
   homeRuntime.includes('CHAT_ROOM_CAPSULE_ID => "Send messages and join conversations."')
-    && homeRuntime.includes('MARKETPLACE_CAPSULE_ID => {\n            "Browse installed apps, services, viewers, and content."')
+    && homeRuntime.includes('"Find apps, viewers, content and models you can open or get."')
+    && !homeRuntime.includes("Browse installed apps, services, viewers, and content")
     && homeRuntime.includes('INBOX_CAPSULE_ID => "Review messages, requests, and approvals."')
     && homeRuntime.includes('BROWSER_CAPSULE_ID => "Browse websites from this device."')
     && !homeRuntime.includes("Open web sites through the ElastOS Browser boundary")
@@ -190,10 +191,18 @@ assert(
     && !systemJs.includes('empty.textContent = "No capsules or providers discovered."')
     && systemJs.includes("function publicSystemError(")
     && systemJs.includes('publicSystemError(error, "System could not be loaded.")')
-    && !systemJs.includes("actions.push(description.replace")
-    && systemJs.includes('return dependency ? catalogTitle(dependency) : "";')
-    && systemJs.includes('{ role: "provider", label: "Background services" }'),
-  "System must keep app discovery human-facing and technical inspection explicit",
+    && !systemJs.includes("actions.push(description.replace"),
+  "System must keep technical inspection explicit",
+);
+// Marketplace lists what you can open or get; Technical Details lists every
+// component. System keeps no third inventory.
+assert(
+  !systemHtml.includes('data-settings="catalog"')
+    && !systemHtml.includes("Apps &amp; Services")
+    && !systemHtml.includes('id="capsule-catalog"')
+    && !systemJs.includes("/api/capsules/interfaces")
+    && !systemJs.includes("refreshCapsuleCatalog"),
+  "System restored its Apps & Services inventory",
 );
 
 const libraryDialog = read("capsules/library/browser/src/dialog.js");

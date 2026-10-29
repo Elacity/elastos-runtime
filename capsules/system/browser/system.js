@@ -53,9 +53,6 @@ const recoveryCancelButton = document.querySelector("#recovery-cancel");
 const chainTableNode = document.querySelector("#chain-table");
 const activeShellOptions = document.querySelector("#active-shell-options");
 const activeShellStatusNode = document.querySelector('[data-field="active-shell-status"]');
-const capsuleCatalogNode = document.querySelector("#capsule-catalog");
-const capsuleCatalogStatusNode = document.querySelector("#capsule-catalog-status");
-const capsuleCatalogRefreshButton = document.querySelector("#capsule-catalog-refresh");
 const technicalDetailsNode = document.querySelector("#technical-details");
 const technicalInspectListNode = document.querySelector("#technical-inspect-list");
 const technicalInspectDetailNode = document.querySelector("#technical-inspect-detail");
@@ -166,19 +163,11 @@ const READABLE_CHAIN_KINDS = new Set([
   "bitcoin_core_rpc",
   "bitcoin_rest",
 ]);
-const CATALOG_GROUPS = [
-  { role: "app", label: "Apps" },
-  { role: "viewer", label: "Viewers" },
-  { role: "content", label: "Content" },
-  { role: "provider", label: "Background services" },
-  { role: "shell", label: "Home views" },
-];
 const SETTINGS_SEARCH_KEYWORDS = Object.freeze({
   account: ["account", "passkey", "accounts", "credential", "signin", "sign in"],
   personalization: ["appearance", "theme", "accent", "background", "wallpaper", "dock", "sound"],
   shell: ["shell", "desktop", "terminal", "home gui", "home cli"],
   security: ["security", "recovery", "access", "guest", "inspection", "technical"],
-  catalog: ["catalog", "apps", "services", "capsules"],
   models: ["models", "use", "keep", "preparation", "provider", "openrouter", "venice", "key", "ai provider"],
   about: ["about", "device", "version", "source", "network", "did", "update", "publisher", "changes"],
 });
@@ -215,7 +204,6 @@ async function boot() {
   configureRecoveryAccess();
   configureChainAccess();
   configureActiveShell();
-  configureCapsuleCatalog();
   configureTechnicalDetails();
   configureDeviceDidCopy();
   configureRuntimeUpdate();
@@ -234,10 +222,6 @@ async function boot() {
   }
   await initialRecoveryState;
   await refreshChainNetworks();
-  await refreshCapsuleCatalog().catch((error) => {
-    console.error("catalog refresh failed", error);
-    showCapsuleCatalogStatus("Apps and services could not be loaded.", "error");
-  });
 }
 
 function configureHomeRecoverySave() {
@@ -1372,21 +1356,6 @@ function configureActiveShell() {
   });
 }
 
-function configureCapsuleCatalog() {
-  if (!capsuleCatalogRefreshButton) {
-    return;
-  }
-  capsuleCatalogRefreshButton.disabled = !hasShellAccess();
-  if (hasShellAccess()) {
-    capsuleCatalogRefreshButton.addEventListener("click", () => {
-      refreshCapsuleCatalog().catch((error) => {
-        console.error("catalog refresh failed", error);
-        showCapsuleCatalogStatus("Apps and services could not be loaded.", "error");
-      });
-    });
-  }
-}
-
 function configureTechnicalDetails() {
   if (!technicalDetailsNode) {
     return;
@@ -2443,246 +2412,6 @@ function showTechnicalApprovalStatus(section, message, tone) {
   status.hidden = !text;
 }
 
-async function refreshCapsuleCatalog() {
-  if (!capsuleCatalogNode || !hasShellAccess()) {
-    return;
-  }
-  setCapsuleCatalogBusy(true);
-  showCapsuleCatalogStatus("Loading", "muted");
-  try {
-    const [catalog, interfaces] = await Promise.all([
-      fetchJson("/api/capsules/catalog", { headers: shellHeaders() }),
-      fetchJson("/api/capsules/interfaces", { headers: shellHeaders() }),
-    ]);
-    const entries = (Array.isArray(catalog.capsules) ? catalog.capsules : [])
-      .filter((entry) => entry && entry.installed !== false);
-    const interfaceEntries = Array.isArray(interfaces.interfaces) ? interfaces.interfaces : [];
-    renderCapsuleCatalog(entries, interfaceEntries);
-    showCapsuleCatalogStatus(`${entries.length} available`, "muted");
-  } finally {
-    setCapsuleCatalogBusy(false);
-  }
-}
-
-function renderCapsuleCatalog(entries, interfaceEntries) {
-  if (!capsuleCatalogNode) {
-    return;
-  }
-  capsuleCatalogNode.replaceChildren();
-  if (entries.length === 0) {
-    capsuleCatalogNode.append(catalogEmpty("No apps or services are installed."));
-    return;
-  }
-  const entriesByName = new Map(entries.map((entry) => [readText(entry.name), entry]));
-  const interfacesByCapsule = new Map();
-  for (const entry of interfaceEntries) {
-    const capsule = readText(entry && entry.capsule);
-    if (!capsule) {
-      continue;
-    }
-    const current = interfacesByCapsule.get(capsule) || [];
-    current.push(entry);
-    interfacesByCapsule.set(capsule, current);
-  }
-  for (const group of CATALOG_GROUPS) {
-    const members = entries
-      .filter((entry) => readText(entry.role) === group.role)
-      .sort((left, right) => catalogTitle(left).localeCompare(catalogTitle(right)));
-    if (members.length === 0) {
-      continue;
-    }
-    const section = document.createElement("section");
-    section.className = "catalog-group";
-    const heading = document.createElement("div");
-    heading.className = "catalog-group-heading";
-    const title = document.createElement("h2");
-    title.className = "catalog-group-title";
-    title.textContent = group.label;
-    const count = document.createElement("span");
-    count.className = "catalog-group-count";
-    count.textContent = String(members.length);
-    heading.append(title, count);
-    const list = document.createElement("div");
-    list.className = "catalog-list";
-    for (const entry of members) {
-      list.append(catalogRow(entry, entriesByName, interfacesByCapsule.get(readText(entry.name)) || []));
-    }
-    section.append(heading, list);
-    capsuleCatalogNode.append(section);
-  }
-}
-
-function catalogRow(entry, entriesByName, interfaceEntries) {
-  const row = document.createElement("article");
-  row.className = "catalog-row";
-  const body = document.createElement("div");
-  body.className = "catalog-row-body";
-  const title = document.createElement("h3");
-  title.textContent = catalogTitle(entry);
-  const summary = document.createElement("p");
-  summary.className = "catalog-summary";
-  summary.textContent = catalogSummary(entry);
-  body.append(title, summary);
-
-  const facts = catalogFacts(entry, entriesByName, interfaceEntries);
-  if (facts.length > 0) {
-    const list = document.createElement("dl");
-    list.className = "catalog-facts";
-    for (const [label, value] of facts) {
-      const item = document.createElement("div");
-      const key = document.createElement("dt");
-      key.textContent = label;
-      const text = document.createElement("dd");
-      text.textContent = value;
-      item.append(key, text);
-      list.append(item);
-    }
-    body.append(list);
-  }
-  row.append(body);
-
-  if (entry.launchable === true && readText(entry.launch_target)) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "pc2-btn pc2-btn-secondary catalog-open";
-    button.textContent = "Open";
-    button.addEventListener("click", () => openCapsuleTarget(readText(entry.launch_target)));
-    row.append(button);
-  }
-  return row;
-}
-
-function catalogFacts(entry, entriesByName, interfaceEntries) {
-  const facts = [];
-  const role = readText(entry.role);
-  if (role === "viewer") {
-    const accepts = acceptedContent(entry, interfaceEntries);
-    if (accepts.length > 0) {
-      facts.push(["Accepts", joinWords(accepts)]);
-    }
-  }
-  if (role === "content") {
-    const viewer = readText(entry.viewer_title) || catalogTitle(entriesByName.get(readText(entry.viewer)));
-    if (viewer) {
-      facts.push(["Opens with", viewer]);
-    }
-  }
-  const dependencies = (Array.isArray(entry.requires) ? entry.requires : [])
-    .map((requirement) => {
-      const name = readText(requirement && requirement.name);
-      const dependency = entriesByName.get(name);
-      return dependency ? catalogTitle(dependency) : "";
-    })
-    .filter(Boolean);
-  if (dependencies.length > 0) {
-    facts.push(["Needs", joinWords(dependencies)]);
-  }
-  const executable = executableActions(interfaceEntries)
-    .filter((action) => action !== "Open");
-  if (executable.length > 0) {
-    facts.push(["Available", joinWords(executable)]);
-  }
-  return facts;
-}
-
-function acceptedContent(entry, interfaceEntries) {
-  const content = (Array.isArray(entry.accepted_content) ? entry.accepted_content : [])
-    .map((item) => readText(item && item.title) || humanizeName(readText(item && item.name)))
-    .filter(Boolean);
-  const extensions = new Set();
-  for (const interfaceEntry of interfaceEntries) {
-    const methods = interfaceEntry && interfaceEntry.interface && Array.isArray(interfaceEntry.interface.methods)
-      ? interfaceEntry.interface.methods
-      : [];
-    for (const method of methods) {
-      const accepts = method && method.input_schema && Array.isArray(method.input_schema.accepts)
-        ? method.input_schema.accepts
-        : [];
-      for (const accepted of accepts) {
-        if (readText(accepted && accepted.mode) === "unsupported_family_diagnostic") {
-          continue;
-        }
-        for (const extension of Array.isArray(accepted && accepted.extensions) ? accepted.extensions : []) {
-          const value = readText(extension);
-          if (value) {
-            extensions.add(value);
-          }
-        }
-      }
-    }
-  }
-  if (extensions.size > 0) {
-    content.push(`${joinWords([...extensions])} files`);
-  }
-  return content;
-}
-
-function executableActions(interfaceEntries) {
-  const actions = [];
-  for (const interfaceEntry of interfaceEntries) {
-    for (const binding of Array.isArray(interfaceEntry && interfaceEntry.bindings) ? interfaceEntry.bindings : []) {
-      if (!binding || binding.executable !== true) {
-        continue;
-      }
-      const methodId = readText(binding.method);
-      if (methodId === "capsule.open") {
-        actions.push("Open");
-        continue;
-      }
-      const operation = methodId.split(".").filter(Boolean).at(-1);
-      if (operation) actions.push(humanizeName(operation));
-    }
-  }
-  return [...new Set(actions)];
-}
-
-function catalogSummary(entry) {
-  const title = catalogTitle(entry);
-  const role = readText(entry && entry.role);
-  if (role === "provider") {
-    return "Service for apps on this Home.";
-  }
-  if (role === "shell") {
-    return readText(entry && entry.name).endsWith("-cli")
-      ? "Use Home from a command line."
-      : "Use the Home desktop.";
-  }
-  if (readText(entry && entry.name) === "home") {
-    return "Keeps your selected Home view available.";
-  }
-  const description = readText(entry && entry.description)
-    .replace(/\s+through the ElastOS [^.]+ boundary/gi, "")
-    .replace(/\s+inside ElastOS/gi, "")
-    .replace(/\bcapsules\b/gi, "apps")
-    .replace(/\bproviders\b/gi, "services")
-    .replace(/\bruntime settings\b/gi, "settings");
-  if (description && !/\b(runtime|capsules?|providers?|projection|schema|derived facts?|boundary|capabilit(?:y|ies)|affordances?|host-loaded|frontend)\b/i.test(description)) {
-    return description;
-  }
-  if (role === "viewer") {
-    return `Open compatible content with ${title}.`;
-  }
-  return `${title} is available on this Home.`;
-}
-
-function catalogTitle(entry) {
-  const title = readText(entry && entry.title);
-  if (readText(entry && entry.role) === "provider") {
-    return serviceLabel(entry);
-  }
-  return title ? normalizeDisplayTitle(title) : humanizeName(readText(entry && entry.name));
-}
-
-function serviceLabel(entry) {
-  const title = readText(entry && entry.title) || humanizeName(readText(entry && entry.name));
-  return normalizeDisplayTitle(title.replace(/\s+(Provider|Adapter)$/i, ""));
-}
-
-function normalizeDisplayTitle(value) {
-  const acronyms = new Map([["Did", "DID"], ["Gba", "GBA"], ["Ipfs", "IPFS"], ["Cli", "CLI"], ["Gui", "GUI"]]);
-  return readText(value).split(/\s+/).map((part) => acronyms.get(part) || part).join(" ");
-}
-
 function humanizeName(value) {
   const acronyms = new Map([
     ["did", "DID"],
@@ -2710,29 +2439,6 @@ function joinWords(values) {
     return words[0] || "";
   }
   return `${words.slice(0, -1).join(", ")} and ${words.at(-1)}`;
-}
-
-function catalogEmpty(message) {
-  const empty = document.createElement("div");
-  empty.className = "catalog-empty";
-  empty.textContent = message;
-  return empty;
-}
-
-function setCapsuleCatalogBusy(busy) {
-  if (capsuleCatalogRefreshButton) {
-    capsuleCatalogRefreshButton.disabled = busy || !hasShellAccess();
-  }
-}
-
-function showCapsuleCatalogStatus(message, tone) {
-  if (!capsuleCatalogStatusNode) {
-    return;
-  }
-  capsuleCatalogStatusNode.textContent = tone === "error"
-    ? publicSystemError(message, "Apps and services could not be loaded.")
-    : readText(message);
-  capsuleCatalogStatusNode.dataset.tone = tone;
 }
 
 async function refreshAccountList() {

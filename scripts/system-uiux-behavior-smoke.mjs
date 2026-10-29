@@ -279,7 +279,6 @@ async function main() {
   const tokenlessRequests = [];
   let heldRecoveryStatus = null;
   let heldChainNetworks = null;
-  let heldCapsuleCatalog = null;
   let hostedStatus = null;
   let hostedReads = 0;
   const discardedStaged = [];
@@ -389,9 +388,6 @@ async function main() {
         return;
       }
       if (url.pathname === "/api/capsules/catalog") {
-        if (heldCapsuleCatalog) {
-          await heldCapsuleCatalog.promise;
-        }
         await route.fulfill({
           status: 200,
           contentType: "application/json",
@@ -489,7 +485,6 @@ async function main() {
     });
 
     heldChainNetworks = deferred();
-    heldCapsuleCatalog = deferred();
     requestOrder.length = 0;
     await page.goto(`${server.baseUrl}/fixture?settings=security`, {
       waitUntil: "domcontentloaded",
@@ -518,12 +513,17 @@ async function main() {
       "System should focus Recovery after recovery readiness resolves and before later reads",
       { requestOrder: securityFocusOrder },
     );
-    const catalogRequested = page.waitForRequest("**/api/capsules/catalog");
     heldChainNetworks.resolve();
-    await catalogRequested;
-    heldCapsuleCatalog.resolve();
     heldChainNetworks = null;
-    heldCapsuleCatalog = null;
+    await page.waitForLoadState("networkidle");
+    // Marketplace and Security > Technical Details list apps and components;
+    // System has no Apps & Services inventory to load.
+    assert(
+      !requestOrder.includes("/api/capsules/catalog")
+        && await frame.evaluate(() => !document.querySelector('[data-settings="catalog"]')),
+      "System still loads or shows an Apps & Services inventory",
+      { requestOrder },
+    );
 
     heldRecoveryStatus = deferred();
     requestOrder.length = 0;

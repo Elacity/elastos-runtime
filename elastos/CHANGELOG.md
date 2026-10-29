@@ -137,6 +137,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   model no longer lists Jev decision models. Naming a hosted model "Jev" no
   longer turns it into an evaluator. Inbox remains where you approve each
   hosted connection.
+- System no longer has an Apps & Services page. Marketplace lists the apps,
+  viewers, content and models you can open or get, with a working Open, and
+  System > Security > Advanced > Technical Details lists every component with
+  its state and version. Marketplace's description now says what it lists.
 
 ### Developer detail
 
@@ -146,6 +150,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   for ending hosted approvals. A selection saved by an earlier release is
   still honoured by Assistant's hosted gate; with none, the gate lets the
   request through as before.
+- System no longer reads `/api/capsules/interfaces` or lists the capsule
+  catalog; both routes stay for Marketplace, Assistant and model management.
+  Its catalog search keywords are gone, and an old `?settings=catalog` link
+  opens Accounts.
 - System no longer calls `/api/auth/passkey/status`. From its sandboxed frame
   the call carried no Home token, so the gateway refused it (a CORS error in
   the console) and System fell back to "Not set" beside Passkeys. The account
