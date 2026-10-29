@@ -57,9 +57,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   contacts for several files) asks once: your contacts can get the file while
   your Home is open. It shares from this Home only, without waiting for a seed
   copy, files up to 8 MiB; a selection's folders are named and left out. A
-  shared file offers Copy Link (the link to the version you shared, to paste in
-  a chat with a contact), Sharing (since when, with Fix if sharing broke) and
-  Stop sharing, and opens from this Home's own copy. Stop sharing a file before
+  shared file is marked Shared, offers Copy link (the link to the version you
+  shared, to paste in a chat with a contact) and Stop sharing, and opens from
+  this Home's own copy; if its sharing broke, Share again replaces Copy link.
+  Stop sharing a file before
   you delete it or share a changed version. Library's sidebar shows the Public
   place only while it holds items.
 - Archive no longer has a Home launcher tile, desktop shortcut or Marketplace

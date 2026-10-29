@@ -9,6 +9,7 @@ import {
   isBlockedObject,
   isDirectory,
   isProtectedContent,
+  isSharingBroken,
   isWebSpaceUri,
   parentUri,
   pathCrumbs,
@@ -105,8 +106,11 @@ export function createLibraryDialog({
     if (object.published && isProtectedContent(object)) {
       return badgeValue("Published", "public", hasCapability(object, "unpublish") ? "Unpublish from the item menu" : "");
     }
+    if (isSharingBroken(object)) {
+      return badgeValue("Not shared right now", "private");
+    }
     if (object.published) {
-      return badgeValue("Shared with contacts", "public", hasCapability(object, "unpublish") ? "Stop sharing from the item menu" : "");
+      return badgeValue("Shared with your contacts", "public");
     }
     return badgeValue(
       "Private",
@@ -658,43 +662,6 @@ export function createLibraryDialog({
     input?.select();
   }
 
-  // A published file's sharing for someone who knows nothing about how it
-  // works: since when, who can get it, and what they can do. Resolves to
-  // "copy", "fix", "unpublish" (Stop sharing) or false.
-  function showSharingDialog({ object, shared, broken, since, canCopy }) {
-    hideMenu();
-    hideDialog();
-    decisionTargetUris = [object.uri];
-    const first = !shared
-      ? "Not shared right now."
-      : since
-        ? `Shared with your contacts since ${since.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })}.`
-        : "Shared with your contacts.";
-    const lead = broken
-      ? '<button class="btn btn-primary" type="button" data-sharing-action="fix">Fix</button>'
-      : canCopy
-        ? '<button class="btn btn-primary" type="button" data-sharing-action="copy">Copy link</button>'
-        : "";
-    return new Promise((resolve) => {
-      pendingDialogResolve = resolve;
-      dialog.innerHTML = `
-        <div class="dialog-card" data-sharing>
-          <div>
-            <h2>${escapeHtml(object.name || "File")}</h2>
-            <p class="subtitle">${escapeHtml(first)}</p>
-            <p class="subtitle">${escapeHtml(PUBLISH_CONFIRM_BODY)}</p>
-          </div>
-          <div class="button-row">
-            ${lead}
-            <button class="btn" type="button" data-sharing-action="unpublish">Stop sharing</button>
-            <button class="btn" type="button" data-dialog-close>Close</button>
-          </div>
-        </div>
-      `;
-      dialog.classList.remove("hidden");
-    });
-  }
-
   function confirmDecision({ eyebrow = "", title, message, lines = [], confirmLabel, confirmClass, targetUris }) {
     hideMenu();
     hideDialog();
@@ -776,12 +743,6 @@ export function createLibraryDialog({
     });
 
     dialog.addEventListener("click", (event) => {
-      const sharingAction = event.target.closest("[data-sharing-action]");
-      if (sharingAction) {
-        resolveDialogDecision(sharingAction.getAttribute("data-sharing-action"));
-        hideDialog();
-        return;
-      }
       if (event.target.closest("[data-dialog-confirm]")) {
         resolveDialogDecision(true);
         hideDialog();
@@ -826,7 +787,6 @@ export function createLibraryDialog({
     showObjectStatus,
     showProperties,
     showPublishedLink,
-    showSharingDialog,
     showSharedAccessReceipt,
   };
 }

@@ -19,7 +19,6 @@ import {
   parentUri,
   publishFailureText,
   publishedLink,
-  sharingState,
   viewerOptions,
 } from "./model.js";
 
@@ -47,7 +46,6 @@ export function createLibraryActions({
   showProtectAndListDialog,
   showProperties,
   showPublishedLink,
-  showSharingDialog,
   showSharedAccessReceipt,
   startCreateObject,
   state,
@@ -502,41 +500,23 @@ export function createLibraryActions({
     setStatus(`Copied the link to ${object.name}.`);
   }
 
-  // Sharing for a plain published file: one plain dialog, whose buttons run
-  // Copy link, Fix (the existing repair) or Stop sharing.
-  async function showSharing(object) {
-    let status;
+  // Share again: the existing repair, for a shared file whose last repair
+  // could not pin it.
+  async function shareAgain(object) {
+    setStatus(`Sharing ${object.name} again...`);
+    let repaired;
     try {
-      status = await providerApi("status", { uri: object.uri });
+      repaired = await providerApi("repair", { uri: object.uri });
     } catch (error) {
-      setStatus(libraryErrorText(error) || "Sharing details aren't available right now. Try again.");
+      setStatus(libraryErrorText(error) || `${object.name} couldn't be shared again. Try again later.`);
       return;
     }
-    const action = await showSharingDialog({
-      object,
-      ...sharingState(object, status),
-      canCopy: !!publishedLink(object),
-    });
-    if (action === "copy") {
-      await copyPublishedLink(object);
-    } else if (action === "fix") {
-      setStatus(`Fixing sharing for ${object.name}...`);
-      let repaired;
-      try {
-        repaired = await providerApi("repair", { uri: object.uri });
-      } catch (error) {
-        setStatus(libraryErrorText(error) || `${object.name} couldn't be shared again. Try again later.`);
-        return;
-      }
-      // Repair answers with the availability it reached; repair_needed means it failed.
-      const availability = repaired?.availability;
-      const failed = (typeof availability === "string" ? availability : availability?.status) === "repair_needed";
-      await showAfterReload(failed
-        ? `${object.name} couldn't be shared again. Try again later.`
-        : `${object.name} is shared again.`);
-    } else if (action === "unpublish") {
-      await unpublishObject(object);
-    }
+    // Repair answers with the availability it reached; repair_needed means it failed.
+    const availability = repaired?.availability;
+    const failed = (typeof availability === "string" ? availability : availability?.status) === "repair_needed";
+    await showAfterReload(failed
+      ? `${object.name} couldn't be shared again. Try again later.`
+      : `${object.name} is shared again.`);
   }
 
   async function repairObject(object) {
@@ -831,7 +811,7 @@ export function createLibraryActions({
     restoreObject,
     restoreSelectedObjects,
     setClipboard,
-    showSharing,
+    shareAgain,
     showStatusObject,
     trashObject,
     trashSelectedObjects,

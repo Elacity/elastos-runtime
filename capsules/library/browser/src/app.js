@@ -8,6 +8,7 @@ import {
   isBlockedObject,
   isDirectory,
   isProtectedContent,
+  isSharingBroken,
   isRuntimeCustodyProtectableVideo,
   isTrashRootUri,
   isTrashUri,
@@ -21,15 +22,15 @@ import {
 } from "./model.js";
 import { createLibraryRuntime } from "./api.js?v=library-20261028a";
 import { createHomeNavigationClient } from "/apps/home/home-navigation-client.js";
-import { createLibraryActions } from "./actions.js?v=library-20261028c";
-import { createLibraryDialog } from "./dialog.js?v=library-20261028a";
+import { createLibraryActions } from "./actions.js?v=library-20261029a";
+import { createLibraryDialog } from "./dialog.js?v=library-20261029a";
 import { createLibraryEditor } from "./editor.js";
 import { bindLibraryEvents } from "./events.js";
 import { createLibraryMenu } from "./menu.js";
 import { createLibraryNavigation } from "./navigation.js";
 import { createLibraryPreview } from "./preview.js";
 import { createLibraryRealtime } from "./realtime.js";
-import { createLibraryRenderer, iconPlaceholder } from "./render.js?v=library-20260711d";
+import { createLibraryRenderer, iconPlaceholder } from "./render.js?v=library-20261029a";
 import { createLibrarySelection } from "./selection.js";
 import {
   MUTATING_PROVIDER_OPS,
@@ -153,7 +154,7 @@ import {
     let restoreObject = async () => {};
     let restoreSelectedObjects = async () => {};
     let setClipboard = () => {};
-    let showSharing = async () => {};
+    let shareAgain = async () => {};
     let showStatusObject = async () => {};
     let trashObject = async () => {};
     let trashSelectedObjects = async () => {};
@@ -229,7 +230,6 @@ import {
       showProtectAndListDialog,
       showProperties,
       showPublishedLink,
-      showSharingDialog,
       showSharedAccessReceipt,
     } = createLibraryDialog({
       allVisible,
@@ -317,7 +317,7 @@ import {
       restoreObject,
       restoreSelectedObjects,
       setClipboard,
-      showSharing,
+      shareAgain,
       showStatusObject,
       trashObject,
       trashSelectedObjects,
@@ -348,7 +348,6 @@ import {
       showProtectAndListDialog,
       showProperties,
       showPublishedLink,
-      showSharingDialog,
       showSharedAccessReceipt,
       startCreateObject,
       state,
@@ -1063,8 +1062,11 @@ import {
             if (object.shared) actions.push(menuAction("Check My Access", () => checkMyAccess(object)));
             if (hasCapability(object, "unpublish")) actions.push(menuAction("Unpublish", () => unpublishObject(object)));
           } else if (object.published) {
-            if (publishedLink(object)) actions.push(menuAction("Copy Link", () => copyPublishedLink(object)));
-            actions.push(menuAction("Sharing...", () => showSharing(object)));
+            if (isSharingBroken(object)) {
+              if (hasCapability(object, "repair")) actions.push(menuAction("Share again", () => shareAgain(object)));
+            } else if (publishedLink(object)) {
+              actions.push(menuAction("Copy link", () => copyPublishedLink(object)));
+            }
             if (hasCapability(object, "unpublish")) actions.push(menuAction("Stop sharing", () => unpublishObject(object)));
           } else {
             if (canPublishObject(object)) actions.push(menuAction("Share with contacts", () => publishObject(object)));

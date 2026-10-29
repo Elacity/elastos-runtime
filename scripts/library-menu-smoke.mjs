@@ -1741,7 +1741,7 @@ async function clickMenu(page, label) {
   await page.locator("#context-menu > .menu-entry > .menu-item").filter({ hasText: label }).first().click();
 }
 
-// "Copy" is part of "Copy Link" and "Stop sharing" of "Stop sharing selected"; match the whole label.
+// "Copy" is part of "Copy link" and "Stop sharing" of "Stop sharing selected"; match the whole label.
 async function clickMenuExact(page, label) {
   await page.locator("#context-menu > .menu-entry > .menu-item").filter({ hasText: new RegExp(`^${label}$`) }).first().click();
 }
@@ -2223,7 +2223,7 @@ async function run() {
       "Rename",
       "Properties",
     ], "file menu");
-    excludesAll(readmeRows, ["Open With", "Copy Link", "Copy Content CID"], "file menu without installed viewer, published link or content CID");
+    excludesAll(readmeRows, ["Open With", "Copy link", "Copy Content CID"], "file menu without installed viewer, published link or content CID");
     includesAll(await openItemMenu(page, "Clip.mp4"), [
       "Open",
       "Download",
@@ -2313,7 +2313,7 @@ async function run() {
     await page.locator(".item").filter({ hasText: "Public Draft.md" }).first().waitFor();
     await page.locator(".item").filter({ hasText: "Public Draft.md" }).filter({ hasText: "Public folder" }).first().waitFor();
     includesAll(await openItemMenu(page, "Public Draft.md"), ["Share with contacts", "Properties"], "public folder unpublished file menu");
-    excludesAll(await openItemMenu(page, "Public Draft.md"), ["Copy Link"], "public folder unpublished file menu");
+    excludesAll(await openItemMenu(page, "Public Draft.md"), ["Copy link"], "public folder unpublished file menu");
     await clickMenu(page, "Properties");
     await page.locator(".window-item-properties").filter({ hasText: "Public Draft.md properties" }).first().waitFor();
     const publicDraftProperties = await readProperties(page);
@@ -2421,32 +2421,33 @@ async function run() {
       "Open",
       "Download",
       "Compress to ZIP",
-      "Copy Link",
-      "Sharing...",
+      "Copy link",
       "Stop sharing",
       "Properties",
     ], "published file menu");
-    excludesAll(publishedRows, ["Share with contacts", "Share", "Copy Content CID", "Status", "Repair"], "published file menu");
-    // Copy Link copies the recorded publication link, never the file's current CID.
-    await clickMenuExact(page, "Copy Link");
+    excludesAll(publishedRows, ["Share with contacts", "Share", "Sharing...", "Share again", "Copy Content CID", "Status", "Repair"], "published file menu");
+    assert(await page.locator(".item").filter({ hasText: "Published.md" }).locator(".badge-published").first().textContent() === "Shared",
+      "A shared file's row must be marked Shared");
+    // Copy link copies the recorded publication link, never the file's current CID.
+    await clickMenuExact(page, "Copy link");
     await page.waitForFunction((link) => window.__clipboardText === link, `elastos://${SMOKE_PUBLISHED_CID}`);
     assert(
       await page.evaluate(() => window.__clipboardPurposes.at(-1)) === "resource.uri",
-      "Copy Link must use the resource URI Clipboard purpose",
+      "Copy link must use the resource URI Clipboard purpose",
     );
     // When the clipboard refuses, the link shows as selectable text.
     await page.evaluate(() => { window.__clipboardDeny = true; window.__clipboardText = ""; });
     await openItemMenu(page, "Published.md");
-    await clickMenuExact(page, "Copy Link");
+    await clickMenuExact(page, "Copy link");
     const fallbackLink = page.locator("[data-published-link] [data-published-link-text]");
     await fallbackLink.waitFor();
-    assert(await fallbackLink.inputValue() === `elastos://${SMOKE_PUBLISHED_CID}`, "Copy Link fallback must show the recorded link");
+    assert(await fallbackLink.inputValue() === `elastos://${SMOKE_PUBLISHED_CID}`, "Copy link fallback must show the recorded link");
     assert(
       await fallbackLink.evaluate((input) => input.readOnly && document.activeElement === input && input.selectionEnd - input.selectionStart === input.value.length),
-      "Copy Link fallback must select the read-only link",
+      "Copy link fallback must select the read-only link",
     );
     assert(await page.locator("[data-published-link] .subtitle").textContent() === "Paste this in a chat with a contact.",
-      "Copy Link fallback must say where the link goes");
+      "Copy link fallback must say where the link goes");
     await page.locator("[data-published-link] [data-dialog-close]").click();
     await page.evaluate(() => { window.__clipboardDeny = false; });
     await openItemMenu(page, "Published.md");
@@ -2455,46 +2456,27 @@ async function run() {
     const publishedProperties = await readProperties(page);
     assertPlainGeneral(publishedProperties, "Published.md Properties");
     assert(
-      publishedProperties.general.Sharing === "Shared with contacts Stop sharing from the item menu",
-      `Published.md Sharing must name Stop sharing; got ${publishedProperties.general.Sharing}`,
+      publishedProperties.general.Sharing === "Shared with your contacts",
+      `Published.md Sharing must say it is shared with contacts; got ${publishedProperties.general.Sharing}`,
     );
     assertPropertyLabels(publishedProperties.details, ["Object URI", "Content ID"], "Published.md Details");
     await page.locator(".properties-window-actions [data-dialog-close]").click();
-    await openItemMenu(page, "Published.md");
-    // Sharing is one plain dialog: no CID, link text, receipts or technical details.
-    await clickMenuExact(page, "Sharing...");
-    const sharingDialog = page.locator("[data-sharing]");
-    const readSharing = () => sharingDialog.evaluate((card) => ({
-      eyebrow: card.querySelectorAll(".eyebrow, details").length,
-      title: card.querySelector("h2")?.textContent,
-      lines: Array.from(card.querySelectorAll(".subtitle")).map((line) => line.textContent),
-      buttons: Array.from(card.querySelectorAll(".button-row button")).map((button) => button.textContent),
-      text: card.textContent,
-    }));
-    await sharingDialog.waitFor();
-    const sharing = await readSharing();
-    assert(
-      sharing.eyebrow === 0 && sharing.title === "Published.md" && sharing.lines.length === 2
-        && /^Shared with your contacts since [^\d]*\d.*\.$/.test(sharing.lines[0]) && !/\d{4}-\d{2}-\d{2}/.test(sharing.lines[0])
-        && sharing.lines[1] === "Your contacts can get it while your Home is open."
-        && sharing.buttons.join("|") === "Copy link|Stop sharing|Close",
-      `Sharing dialog differs: ${JSON.stringify(sharing)}`,
-    );
-    assert(!/elastos:\/\/|bafy|baf[a-z0-9]{20}|replica|receipt|availability|provider/i.test(sharing.text),
-      `Sharing must not show technical details: ${sharing.text}`);
-    assert(ops.some((entry) => entry.op === "status" && entry.payload.uri.endsWith("/Published.md")), "Sharing must read the publication");
-    await sharingDialog.locator("[data-dialog-close]").click();
-    // A failed last repair shows Fix, which runs the existing repair.
+    // A failed last repair shows Share again in place of Copy link; it runs the existing repair.
     findObject(`${documentsUri}/Published.md`).availability = "repair_needed";
+    await openBackgroundMenu(page);
+    await clickMenu(page, "Refresh");
+    const brokenRows = await openItemMenu(page, "Published.md");
+    includesAll(brokenRows, ["Share again", "Stop sharing"], "broken shared file menu");
+    excludesAll(brokenRows, ["Copy link", "Sharing..."], "broken shared file menu");
+    await clickMenu(page, "Properties");
+    await page.locator(".window-item-properties").filter({ hasText: "Published.md properties" }).first().waitFor();
+    assert((await readProperties(page)).general.Sharing === "Not shared right now", "A broken share must say it is not shared right now");
+    await page.locator(".properties-window-actions [data-dialog-close]").click();
     await openItemMenu(page, "Published.md");
-    await clickMenuExact(page, "Sharing...");
-    await sharingDialog.waitFor();
-    const broken = await readSharing();
-    assert(broken.lines[0] === "Not shared right now." && broken.buttons.join("|") === "Fix|Stop sharing|Close",
-      `Broken sharing differs: ${JSON.stringify(broken)}`);
-    await sharingDialog.locator('[data-sharing-action="fix"]').click();
-    await waitForOp((entry) => entry.op === "repair" && entry.payload.uri.endsWith("/Published.md"), "Fix must run repair");
+    await clickMenuExact(page, "Share again");
+    await waitForOp((entry) => entry.op === "repair" && entry.payload.uri.endsWith("/Published.md"), "Share again must run repair");
     await page.waitForFunction(() => document.querySelector("#status-text")?.textContent === "Published.md is shared again.");
+    includesAll(await openItemMenu(page, "Published.md"), ["Copy link"], "repaired shared file menu");
     // Stop sharing withdraws the publication and offers Share with contacts again.
     await openItemMenu(page, "Published.md");
     await clickMenuExact(page, "Stop sharing");
@@ -2502,7 +2484,7 @@ async function run() {
     await page.waitForFunction(() => !document.querySelector(".badge-published"));
     const unpublishedRows = await openItemMenu(page, "Published.md");
     includesAll(unpublishedRows, ["Share with contacts"], "unpublished file menu");
-    excludesAll(unpublishedRows, ["Stop sharing", "Copy Link"], "unpublished file menu");
+    excludesAll(unpublishedRows, ["Stop sharing", "Copy link"], "unpublished file menu");
 
     await openItemMenu(page, "Bundle.tar.gz");
     await clickMenu(page, "Properties");
@@ -2855,7 +2837,7 @@ async function run() {
     );
     await page.locator(".item").filter({ hasText: "Guide.md" }).locator(".badge-published").first().waitFor();
     const guidePublishedRows = await openItemMenu(page, "Guide.md");
-    includesAll(guidePublishedRows, ["Copy Link", "Sharing...", "Stop sharing"], "published Guide menu");
+    includesAll(guidePublishedRows, ["Copy link", "Stop sharing"], "published Guide menu");
     excludesAll(guidePublishedRows, ["Share with contacts", "Share", "Copy Content CID"], "published Guide menu");
     await clickMenuExact(page, "Stop sharing");
     await waitForOp((entry) => entry.op === "unpublish" && entry.payload.uri === `${documentsUri}/Guide.md`, "Unpublish must call unpublish");

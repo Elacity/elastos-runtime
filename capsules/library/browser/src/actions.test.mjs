@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createLibraryActions } from "./actions.js";
-import { decimalIntegerToHexQuantity, sharingState } from "./model.js";
+import { decimalIntegerToHexQuantity, isSharingBroken } from "./model.js";
 
 function makeActions(overrides = {}) {
   return createLibraryActions({
@@ -714,69 +714,33 @@ test("Library gives Chat the file's address and revision, and Browser the file's
   assert.equal(browser.payload.revision, undefined);
 });
 
-test("Library Sharing reads the record in plain terms and offers Fix only when the last repair failed", () => {
-  const object = file("Guide.md", { published: true, published_cid: "bafkreirecorded" });
-  const record = (status) => ({ published: { published_at: 1780000000, availability: { status } } });
-  assert.deepEqual(sharingState(object, record("local_pinned")), {
-    shared: true, broken: false, since: new Date(1780000000 * 1000),
-  });
-  assert.deepEqual(sharingState(object, record("unknown")).broken, false);
-  assert.deepEqual(sharingState(object, record("repair_needed")), {
-    shared: false, broken: true, since: new Date(1780000000 * 1000),
-  });
-  assert.deepEqual(sharingState(object, { published: null }), { shared: false, broken: true, since: null });
+test("Library treats only a failed last repair as broken sharing", () => {
+  const shared = (availability) => file("Guide.md", { published: true, published_cid: "bafkreirecorded", availability });
+  assert.equal(isSharingBroken(shared("local_pinned")), false);
+  assert.equal(isSharingBroken(shared("unknown")), false);
+  assert.equal(isSharingBroken(shared("repair_needed")), true);
+  assert.equal(isSharingBroken(shared({ status: "repair_needed" })), true);
+  assert.equal(isSharingBroken(file("Guide.md", { availability: "repair_needed" })), false);
 });
 
-test("Library Sharing runs Copy link, Fix or Unpublish from its one dialog", async () => {
-  for (const [choice, expectedOps, expectedClipboard] of [
-    ["copy", ["status"], ["elastos://bafkreirecorded"]],
-    ["fix", ["status", "repair"], []],
-    ["unpublish", ["status", "unpublish"], []],
-    [false, ["status"], []],
-  ]) {
-    const ops = [];
-    const clipboard = [];
-    const dialogs = [];
-    const actions = makeActions({
-      async providerApi(op) {
-        ops.push(op);
-        return op === "status" ? { published: { published_at: 1780000000, availability: { status: "local_pinned" } } } : {};
-      },
-      async showSharingDialog(request) {
-        dialogs.push(request);
-        return choice;
-      },
-      async writeResourceUri(value) {
-        clipboard.push(value);
-      },
-    });
-    await actions.showSharing(file("Guide.md", { published: true, published_cid: "bafkreirecorded" }));
-    assert.deepEqual(ops, expectedOps, String(choice));
-    assert.deepEqual(clipboard, expectedClipboard, String(choice));
-    assert.equal(dialogs[0].canCopy, true);
-    assert.equal(dialogs[0].shared, true);
-  }
-});
-
-test("Library Fix says so when the repair could not share the file again", async () => {
+test("Library Share again runs the repair and says whether the file is shared again", async () => {
   for (const [repairStatus, expected] of [
     ["local_pinned", "Guide.md is shared again."],
     ["repair_needed", "Guide.md couldn't be shared again. Try again later."],
   ]) {
+    const ops = [];
     const statuses = [];
     const actions = makeActions({
       async providerApi(op) {
-        if (op === "status") return { published: { published_at: 1780000000, availability: { status: "repair_needed" } } };
+        ops.push(op);
         return { availability: { status: repairStatus } };
-      },
-      async showSharingDialog() {
-        return "fix";
       },
       setStatus(status) {
         statuses.push(status);
       },
     });
-    await actions.showSharing(file("Guide.md", { published: true, published_cid: "bafkreirecorded" }));
+    await actions.shareAgain(file("Guide.md", { published: true, published_cid: "bafkreirecorded", availability: "repair_needed" }));
+    assert.deepEqual(ops, ["repair"], repairStatus);
     assert.equal(statuses.at(-1), expected, repairStatus);
   }
 });
