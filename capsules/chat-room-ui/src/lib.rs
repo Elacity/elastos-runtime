@@ -4927,16 +4927,11 @@ impl App {
         self.conversation_avatar.set_text_content(Some(&avatar));
         self.conversation_title.set_text_content(Some(&title));
         self.conversation_detail.set_text_content(Some(detail));
-        // While Community is live, the history status is the one fact shown.
-        if let Some(history) = history.filter(|history| {
-            selected.is_none()
-                && community_state == Some(CommunityState::Live)
-                && matches!(
-                    history.status.as_str(),
-                    "searching" | "available" | "unavailable"
-                )
-                && !history.detail.trim().is_empty()
-        }) {
+        // While Community is live, the subtitle says Live; only history that
+        // cannot be loaded is worth saying instead.
+        if let Some(history) =
+            community_history_notice(selected.is_none(), community_state, history)
+        {
             self.conversation_detail
                 .set_text_content(Some(history.detail.trim()));
             self.conversation_detail
@@ -7598,6 +7593,15 @@ mod tests {
             assert!(state.session_active);
             assert!(!state.reconnect_needed);
             assert_eq!(state.status_badge, "Live");
+            // The header says Live unless earlier posts cannot be loaded.
+            let notice = super::community_history_notice(
+                true,
+                Some(CommunityState::Live),
+                state.history.as_ref(),
+            )
+            .map(|history| history.detail.as_str());
+            let expected = (status == "unavailable").then_some("History unavailable.");
+            assert_eq!(notice, expected, "{status}");
         }
     }
 
@@ -10008,6 +10012,21 @@ fn presence_heartbeat_due(
 /// has the Home origin. Presentation only, as in the shared theme script.
 fn shell_layout_origin_admitted(event_origin: &str, home_origin: &str) -> bool {
     event_origin == "null" || event_origin == home_origin
+}
+
+/// The Community history fact the header shows in place of "Live": only that
+/// earlier posts cannot be loaded, the one case the person needs to know.
+fn community_history_notice(
+    community_selected: bool,
+    community_state: Option<CommunityState>,
+    history: Option<&RoomHistoryView>,
+) -> Option<&RoomHistoryView> {
+    history.filter(|history| {
+        community_selected
+            && community_state == Some(CommunityState::Live)
+            && history.status == "unavailable"
+            && !history.detail.trim().is_empty()
+    })
 }
 
 /// Chat is on screen: the document is shown and, in the shell, the shell

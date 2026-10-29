@@ -76,7 +76,8 @@ impl CollaborationChatProductPort {
             community_recovery_exhausted: Arc::new(AtomicBool::new(false)),
             history_status: Arc::new(Mutex::new(crate::room_service::RoomHistoryView {
                 status: "searching".to_string(),
-                detail: "Checking recent Community history from online participants.".to_string(),
+                // Chat says Live while history is searched or available.
+                detail: String::new(),
             })),
         })
     }
@@ -389,8 +390,7 @@ impl CollaborationChatProductPort {
     pub(crate) fn set_history_searching(&self) {
         if let Ok(mut status) = self.history_status.lock() {
             status.status = "searching".to_string();
-            status.detail =
-                "Checking recent Community history from online participants.".to_string();
+            status.detail = String::new();
         }
     }
 
@@ -411,7 +411,7 @@ impl CollaborationChatProductPort {
             }
             .to_string();
             status.detail = if available {
-                "Recent Community history is available from an online participant."
+                ""
             } else {
                 "Earlier Community posts cannot be loaded right now."
             }

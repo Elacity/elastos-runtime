@@ -311,9 +311,10 @@ function startServer(scenario) {
       poll.objects = [historyMessage(1, `My DID ${sharedDid} ${sharedDid}/path`, "2026-03-09T12:00:00Z")];
     }
     if (historyScenario) {
+      // As Runtime sends them: only unavailable history has words to show.
       const details = {
-        searching: "Checking recent Community history from online participants.",
-        available: "Recent Community history is available from an online participant.",
+        searching: "",
+        available: "",
         unavailable: "Earlier Community posts cannot be loaded right now.",
       };
       poll.transport.history = { status: trace.historyStatus, detail: details[trace.historyStatus] };
@@ -1628,8 +1629,14 @@ async function runScenario(scenario) {
       const draft = "Keep this draft while recent history is checked";
       await frame.locator("#message-input").fill(draft);
       const historyStatus = async (status) => {
-        await frame.waitForFunction(expected =>
-          document.querySelector("#conversation-detail")?.dataset.historyStatus === expected, status);
+        // Searching and available history leave the header at Live; only
+        // unavailable history is shown.
+        await frame.waitForFunction(expected => {
+          const detail = document.querySelector("#conversation-detail");
+          return expected === "unavailable"
+            ? detail?.dataset.historyStatus === "unavailable"
+            : detail?.textContent === "Live" && detail?.dataset.historyStatus === undefined;
+        }, status);
         assert(await frame.locator("#conversation-detail").isVisible(), "history status is hidden in shell mode");
         assert(await frame.locator("#message-input").isEnabled() && await frame.locator("#send-button").isEnabled()
           && !(await frame.locator("#reconnect-button").isVisible()), "history status changed live session controls");
