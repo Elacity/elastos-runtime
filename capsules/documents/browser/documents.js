@@ -2304,11 +2304,14 @@ async function requestDeleteCurrent() {
   try {
     await documentsProviderApi("delete", { doc_did: deletedDocDid });
     state.documents = state.documents.filter((document) => document.doc_did !== deletedDocDid);
+    // A deleted document keeps no unsaved text; whatever is open now (another
+    // document, perhaps with edits) stays as it is.
+    unsavedDocuments.delete("document:" + deletedDocDid);
     if (state.current && state.current.doc_did === deletedDocDid) {
       replaceCurrentDocument(createDraftDocument());
+      renderCurrentDocument();
     }
     renderDocumentsList();
-    renderCurrentDocument();
   } catch (error) {
     console.error("documents delete failed", error);
     showError(readableDocumentsError(error, "Document could not be deleted."));

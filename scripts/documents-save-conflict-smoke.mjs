@@ -427,3 +427,28 @@ test("a new document created before its first save failed is listed, with its te
   assert.equal(app.elements.editor.value, "Keep me");
   assert.equal(app.state.dirty, true);
 });
+
+test("a delete that finishes after another document was opened leaves that document's edits alone", async () => {
+  const server = backend(), app = editor(server), held = deferred(), request = server.request;
+  server.put({ doc_did: "did:two", title: "Two", body: "Two" });
+  vm.runInContext(["requestDeleteCurrent"].map(functionSource).join("\n"), app);
+  app.state.dirty = false;
+  app.confirmInCapsule = async () => true;
+  server.request = async (op, payload) => {
+    if (op === "delete") { await held.promise; server.docs.delete(payload.doc_did); return { ok: true }; }
+    return request(op, payload);
+  };
+  const deleting = app.requestDeleteCurrent();
+  await new Promise(setImmediate);
+  await app.selectDocument("did:two");
+  app.elements.editor.value = "Edits to Two";
+  app.state.dirty = true;
+  held.resolve();
+  await deleting;
+  assert.equal(app.state.current.doc_did, "did:two");
+  assert.equal(app.elements.editor.value, "Edits to Two");
+  assert.equal(app.state.dirty, true, "the open document keeps its unsaved state");
+  server.put({ doc_did: "did:three", title: "Three", body: "Three" });
+  await app.selectDocument("did:three");
+  assert.equal(app.unsavedDocuments.get("document:did:two")?.document.body, "Edits to Two", "leaving keeps its text");
+});
