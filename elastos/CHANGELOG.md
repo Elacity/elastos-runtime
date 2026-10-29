@@ -144,11 +144,15 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - Auth audit saves verify the changed suffix against a verified loaded prefix and
   refill the cache after stable byte readback; retention, signatures, checkpoint
   order, and the file format stay unchanged.
-- Services stays installed but is left out of the capsule catalog, so Home,
-  Marketplace and System do not list it.
+- Services stays installed but is treated like an unconfigured WalletConnect:
+  it is not served, not launchable and not in the capsule catalog, so a
+  bookmarked page gets Not Found, a direct launch is refused, and Home issues
+  no Services token.
+  Its share and request routes stay for the People rework.
   `/api/apps/services/summary` accepts only a Services token, Services request
-  notifications name Inbox as their source app, and System's hosted connection
-  status no longer reports `share_enabled`.
+  notifications name Inbox as their source app, System's hosted connection
+  status no longer reports `share_enabled`, and Home CLI drops
+  `debug services`.
 
 - Library writes and archive extraction keep the start check's folder rule
   (#449): a write that would put a folder 16 or more folders below a protected
