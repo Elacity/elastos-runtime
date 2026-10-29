@@ -52,7 +52,7 @@ const principalId = "did:elastos:fixture-phone-layout";
 // measure the shell around them.
 const FIRST_PARTY_APPS = [
   ["library", "Library", "Browse files and folders"],
-  ["documents", "Documents", "Write and publish markdown"],
+  ["documents", "Documents", "Write Markdown and text documents."],
   ["marketplace", "Marketplace", "Find and install apps"],
   ["system", "System", "Runtime, updates and devices"],
   ["people", "People", "Contacts and trusted peers"],

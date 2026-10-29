@@ -884,9 +884,7 @@ fn app_shell_title(name: &str) -> String {
 
 fn app_shell_description(name: &str, manifest_description: Option<String>) -> String {
     match name {
-        DOCUMENTS_CAPSULE_ID => {
-            "Create, edit, and publish markdown documents from this device.".to_string()
-        }
+        DOCUMENTS_CAPSULE_ID => "Write Markdown and text documents.".to_string(),
         CHAT_ROOM_CAPSULE_ID => "Send messages and join conversations.".to_string(),
         LIBRARY_CAPSULE_ID => "Browse documents and open them in Documents.".to_string(),
         MARKETPLACE_CAPSULE_ID => {
