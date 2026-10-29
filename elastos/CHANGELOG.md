@@ -36,11 +36,11 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   Shared model details show where prompts go.
 - Each Home's IPFS store now runs offline. It no longer joins, announces to or
   fetches from the public IPFS network; content moves between Homes only over
-  Carrier. A Home that already runs IPFS from an earlier version restarts it
-  offline after the update, keeping everything it holds, unless the old file
-  service doesn't stop; then on the next restart. Content a Home lacks now
-  fails at once locally and comes from Carrier instead of waiting minutes on a
-  network search.
+  Carrier. A Home that already runs IPFS from an earlier version keeps
+  everything it holds and switches to offline once the old file service
+  stops; Home retries on each start. Content a Home lacks now fails at once
+  locally and comes from Carrier instead of waiting minutes on a network
+  search.
   `elastos run --cid` and `elastos serve --cid` open only what this Home
   holds; for anything else they stop at once and say to open it from Home.
   Content held only outside ElastOS, such as a pasted ipfs.io link, no longer

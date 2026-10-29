@@ -2198,11 +2198,11 @@ fn stop_online_kubo_with_lock(data_dir: &Path, repo_dir: &Path) -> Result<(), St
 
 /// Retires a coord file without `offline`, under the startup lock. A daemon
 /// whose API answers with this repo's peer identity is asked to stop through
-/// that API and is never signalled. One that has not stopped within
-/// `KUBO_STOP_TIMEOUT`, or whose identity check gets no clear answer, keeps
-/// its coord and the offline start is refused, so a second daemon never opens
-/// the repo. Any other process (a reused PID with no API, a different repo's
-/// Kubo) is left alone and only the coord goes.
+/// that API and is never signalled. The coord goes without touching the
+/// process only when the API answers with another identity, or when no daemon
+/// holds this repo's lock. Otherwise (no stop within `KUBO_STOP_TIMEOUT`, no
+/// clear identity answer while the repo is locked) the coord stays and the
+/// offline start is refused, so a second daemon never opens the repo.
 fn retire_online_coord(coord: &CoordFile, data_dir: &Path, repo_dir: &Path) -> Result<(), String> {
     let pid = coord.kubo_pid;
     if is_pid_alive(pid) {
@@ -2222,13 +2222,16 @@ fn retire_online_coord(coord: &CoordFile, data_dir: &Path, repo_dir: &Path) -> R
                     std::thread::sleep(KUBO_STOP_POLL_INTERVAL);
                 }
             }
-            ApiIdentity::Unknown => {
-                return Err(migration_refused(format!(
-                    "online Kubo pid {pid} gave no clear answer to its identity check"
-                )));
+            ApiIdentity::OtherPeer => {
+                eprintln!("ipfs-provider: pid {pid} is another repo's Kubo; left running");
             }
-            ApiIdentity::Other => {
-                eprintln!("ipfs-provider: pid {pid} is not this repo's Kubo; left running");
+            ApiIdentity::NoAnswer if repo_lock_is_free(repo_dir) => {
+                eprintln!("ipfs-provider: no daemon holds this repo; pid {pid} left running");
+            }
+            ApiIdentity::NoAnswer => {
+                return Err(migration_refused(format!(
+                    "online Kubo pid {pid} gave no clear identity answer and the repo is locked"
+                )));
             }
         }
     }
@@ -2246,11 +2249,11 @@ fn migration_refused(reason: String) -> String {
 enum ApiIdentity {
     /// The API answered `/id` with this repo's peer identity.
     ThisRepo,
-    /// Not this repo's daemon: the repo has no identity, nothing listens on
-    /// the API port, or the API answered with another identity.
-    Other,
-    /// A timeout, an HTTP error or an unreadable answer.
-    Unknown,
+    /// The API answered `/id` with another peer identity.
+    OtherPeer,
+    /// No identity to compare: the repo has none, or the call failed (refused,
+    /// timed out, an HTTP error, an unreadable answer).
+    NoAnswer,
 }
 
 /// What the Kubo API on `api_port` says about `repo_dir`'s peer identity.
@@ -2260,26 +2263,50 @@ fn api_identity(api_port: u16, repo_dir: &Path) -> ApiIdentity {
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|config| config["Identity"]["PeerID"].as_str().map(str::to_owned))
     else {
-        return ApiIdentity::Other;
+        return ApiIdentity::NoAnswer;
     };
-    let response = match ureq::post(&kubo_rpc_url(api_port, "id", &[]))
+    match ureq::post(&kubo_rpc_url(api_port, "id", &[]))
         .timeout(KUBO_API_CHECK_TIMEOUT)
         .call()
-    {
-        Ok(response) => response,
-        Err(ureq::Error::Transport(error)) if error.kind() == ureq::ErrorKind::ConnectionFailed => {
-            return ApiIdentity::Other;
-        }
-        Err(_) => return ApiIdentity::Unknown,
-    };
-    match response
-        .into_json::<serde_json::Value>()
         .ok()
+        .and_then(|response| response.into_json::<serde_json::Value>().ok())
         .and_then(|id| id["ID"].as_str().map(str::to_owned))
     {
         Some(api_peer) if api_peer == repo_peer => ApiIdentity::ThisRepo,
-        Some(_) => ApiIdentity::Other,
-        None => ApiIdentity::Unknown,
+        Some(_) => ApiIdentity::OtherPeer,
+        None => ApiIdentity::NoAnswer,
+    }
+}
+
+/// Whether no daemon owns `repo_dir`: Kubo holds an fcntl write lock on
+/// `repo.lock` while it runs and removes the file on a clean stop. The probe
+/// lock is released at once.
+fn repo_lock_is_free(repo_dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(repo_dir.join("repo.lock"))
+        {
+            Ok(file) => file,
+            Err(error) => return error.kind() == io::ErrorKind::NotFound,
+        };
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } != 0 {
+            return false;
+        }
+        lock.l_type = libc::F_UNLCK as _;
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) };
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = repo_dir;
+        false
     }
 }
 
@@ -3883,12 +3910,14 @@ mod tests {
         assert_eq!((provider.api_port, provider.gateway_port), (2, 3));
     }
 
-    /// A coord whose PID now names some other process (the PID was reused, or
-    /// it is a different repo's Kubo) is dropped without signalling it.
+    /// A coord whose PID now names some other process is dropped without
+    /// signalling it, when the API answers with another identity ("other
+    /// repo") or when nothing answers and no daemon holds this repo's lock
+    /// (no lock file, or one left unlocked by a stopped daemon).
     #[test]
     #[cfg(unix)]
     fn unrelated_process_in_an_old_coord_is_never_signalled() {
-        for case in ["not kubo", "other repo"] {
+        for case in ["not kubo", "stale lock file", "other repo"] {
             let root = tempfile::tempdir().unwrap();
             let mut provider = cold_fixture_provider(root.path());
             let kubo = kubo_fixture(root.path());
@@ -3899,13 +3928,16 @@ mod tests {
                 br#"{"Identity":{"PeerID":"mine"}}"#,
             )
             .unwrap();
-            let (sleeper, online) = if case == "not kubo" {
-                let sleeper = Command::new("sleep").arg("60").spawn().unwrap();
-                write_old_coord(root.path(), sleeper.id(), 1);
-                (Some(sleeper), None)
-            } else {
+            if case == "stale lock file" {
+                fs::write(provider.repo_dir.join("repo.lock"), b"").unwrap();
+            }
+            let (sleeper, online) = if case == "other repo" {
                 let online = online_daemon_coord(root.path(), &kubo, "someone-else", true);
                 (None, Some(online))
+            } else {
+                let sleeper = Command::new("sleep").arg("60").spawn().unwrap();
+                write_old_coord(root.path(), sleeper.id(), bind_free_port().unwrap());
+                (Some(sleeper), None)
             };
             let other_pid = read_coord_file(root.path()).unwrap().kubo_pid;
             let health = answer_fixture_health(provider.repo_dir.clone());
@@ -3965,13 +3997,14 @@ mod tests {
         );
     }
 
-    /// An identity check without a clear answer (a slow `/id`, an HTTP error,
-    /// an unreadable body) is not a different identity: the coord stays, the
+    /// An identity check without a clear answer (nothing listening, a slow
+    /// `/id`, an HTTP error, an unreadable body) while another process holds
+    /// this repo's lock is not a different identity: the coord stays, the
     /// process is left running and no second daemon starts on the repo.
     #[test]
     #[cfg(unix)]
-    fn unclear_identity_answer_keeps_the_coord_and_starts_nothing() {
-        for case in ["slow", "http error", "invalid json"] {
+    fn unclear_identity_answer_on_a_locked_repo_keeps_the_coord_and_starts_nothing() {
+        for case in ["refused", "slow", "http error", "invalid json"] {
             let root = tempfile::tempdir().unwrap();
             let mut provider = cold_fixture_provider(root.path());
             provider.kubo_binary = Some(kubo_fixture(root.path()));
@@ -3981,29 +4014,35 @@ mod tests {
                 br#"{"Identity":{"PeerID":"mine"}}"#,
             )
             .unwrap();
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let api_port = listener.local_addr().unwrap().port();
+            let locker = hold_repo_lock_in_another_process(&provider.repo_dir.join("repo.lock"));
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let stopping = Arc::clone(&stop);
-            let api = std::thread::spawn(move || {
-                let mut held = Vec::new();
-                while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                    let Ok((mut socket, _)) = listener.accept() else {
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    };
-                    let reply: &[u8] = match case {
-                        "http error" => b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        "invalid json" => b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot json",
-                        _ => b"",
-                    };
-                    if read_fixture_request(&mut socket).is_some() {
-                        let _ = socket.write_all(reply);
+            let (api_port, api) = if case == "refused" {
+                (bind_free_port().unwrap(), None)
+            } else {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let api_port = listener.local_addr().unwrap().port();
+                let stopping = Arc::clone(&stop);
+                let api = std::thread::spawn(move || {
+                    let mut held = Vec::new();
+                    while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                        let Ok((mut socket, _)) = listener.accept() else {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        };
+                        let reply: &[u8] = match case {
+                            "http error" => b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            "invalid json" => b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot json",
+                            _ => b"",
+                        };
+                        if read_fixture_request(&mut socket).is_some() {
+                            let _ = socket.write_all(reply);
+                        }
+                        held.push(socket);
                     }
-                    held.push(socket);
-                }
-            });
+                });
+                (api_port, Some(api))
+            };
             let mut process = Command::new("sleep").arg("60").spawn().unwrap();
             write_old_coord(root.path(), process.id(), api_port);
             let started = Instant::now();
@@ -4014,9 +4053,15 @@ mod tests {
             let _ = process.kill();
             process.wait().unwrap();
             stop.store(true, std::sync::atomic::Ordering::SeqCst);
-            api.join().unwrap();
+            if let Some(api) = api {
+                api.join().unwrap();
+            }
+            unsafe {
+                libc::kill(locker, libc::SIGKILL);
+                libc::waitpid(locker, std::ptr::null_mut(), 0);
+            }
             let error = result.unwrap_err();
-            assert!(error.contains("no clear answer"), "{case}: {error}");
+            assert!(error.contains("repo is locked"), "{case}: {error}");
             assert!(still_running, "{case}: the process was signalled");
             assert!(coord.is_some_and(|coord| !coord.offline), "{case}");
             assert!(
@@ -4025,6 +4070,47 @@ mod tests {
             );
             assert!(elapsed < Duration::from_secs(3), "{case}: {elapsed:?}");
         }
+    }
+
+    /// Holds an fcntl write lock on `path` from a forked child, as a running
+    /// Kubo holds `repo.lock`; returns once it is held. Kill the pid when done.
+    fn hold_repo_lock_in_another_process(path: &Path) -> libc::pid_t {
+        use std::os::unix::io::AsRawFd;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        // The child makes only async-signal-safe calls.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                let held = [u8::from(
+                    libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) == 0,
+                )];
+                libc::write(pipe[1], held.as_ptr().cast(), 1);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        let mut held = [0u8];
+        unsafe {
+            libc::close(pipe[1]);
+            assert_eq!(libc::read(pipe[0], held.as_mut_ptr().cast(), 1), 1);
+            libc::close(pipe[0]);
+        }
+        assert_eq!(held, [1], "the child could not lock {}", path.display());
+        assert!(!repo_lock_is_free(path.parent().unwrap()));
+        pid
     }
 
     /// Kubo runs offline, so a CID this repo lacks fails on its one local
@@ -4123,6 +4209,8 @@ mod tests {
         assert!(ureq::post(&kubo_rpc_url(old_port, "swarm/peers", &[]))
             .call()
             .is_ok());
+        // The ownership probe sees the running daemon's repo lock.
+        assert!(!repo_lock_is_free(&provider.repo_dir));
         fs::write(
             coord_file_path(root.path()),
             serde_json::to_vec(&serde_json::json!({
