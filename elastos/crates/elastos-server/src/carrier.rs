@@ -127,7 +127,8 @@ const MAX_CARRIER_OBJECT_IMPORT_FILES: usize = 512;
 // The most one Carrier import request carries: its base64 payload plus the
 // request fields must fit one provider request line. Larger content cannot
 // replicate until ranged pull replication (#498).
-const MAX_CARRIER_OBJECT_IMPORT_BYTES: usize = 704 * 1024;
+// 696 KiB is the largest that fits: base64 950,272 + 96 KiB = 1 MiB.
+const MAX_CARRIER_OBJECT_IMPORT_BYTES: usize = 696 * 1024;
 const _: () = assert!(
     (MAX_CARRIER_OBJECT_IMPORT_BYTES as u64).div_ceil(3) * 4 + 96 * 1024
         <= CARRIER_PROVIDER_REQUEST_MAX_BYTES

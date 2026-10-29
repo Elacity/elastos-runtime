@@ -40,7 +40,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   offline after the update, keeping everything it holds. Content a Home lacks
   now fails at once locally and comes from Carrier instead of waiting minutes
   on a network search. Copying content to your other devices works for items
-  up to 704 KiB; larger items are refused straight away until #498 lands.
+  up to 696 KiB; larger items are refused straight away until #498 lands.
   `elastos run --cid` and `elastos serve --cid` open only what this Home
   holds; for anything else they stop at once and say to open it from Home.
   Content held only outside ElastOS, such as a pasted ipfs.io link, no longer
