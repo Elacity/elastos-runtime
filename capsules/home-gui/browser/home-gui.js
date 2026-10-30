@@ -144,16 +144,6 @@ import {
   inboxRailOpen,
   inboxRailSessionMounted,
 } from "./shell-inbox-rail.js?v=home-20260813a";
-import {
-  attachAuthorizedConnectorSheet,
-  bindConnectorSheet,
-  connectorSheetFrame,
-  connectorSheetTarget,
-  isConnectorSheetTarget,
-  noteConnectorSheetSummaryRefresh,
-  retireConnectorSheet,
-  showConnectorSheet,
-} from "./shell-connector-sheet.js?v=home-20260813a";
 import { bindFormFactor, FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20260813a";
 import { bindPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
 import { bindPhoneStage, resetPhoneStage } from "./shell-phone-stage.js?v=home-20260813a";
@@ -178,7 +168,6 @@ bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow 
 bindControlCentre();
 bindWalletRail();
 bindInboxRail();
-bindConnectorSheet();
 
 let homeGuiInteractionsBound = false;
 
@@ -266,7 +255,6 @@ export function retireHomeGuiSurface(options = {}) {
   retireWalletRail();
   retireInboxRail();
   retireAssistantSpace();
-  retireConnectorSheet();
   hideAboutOverlay({ restoreFocus: false });
   hideQuickLook();
   closeExpose();
@@ -361,29 +349,12 @@ export function closeHomeGuiWindowsForTarget(targetId) {
 }
 
 export function openHomeGuiTarget(target, options = {}) {
-  const query = options.query && typeof options.query === "object" ? options.query : {};
-  if (
-    isConnectorSheetTarget(target) &&
-    (query.presentation === "sheet" || walletRailOpen())
-  ) {
-    void showConnectorSheet(target, {
-      ...options,
-      query: { ...query, presentation: "sheet" },
-    }).catch((error) => {
-      console.error("connector sheet open failed", error);
-    });
-    return;
-  }
   if (target !== "inbox") {
     // An Open from the inbox rail must reveal the target, not leave the
     // rail covering it (#92).
     hideInboxRail({ restoreFocus: false });
   }
   openTarget(target, options);
-}
-
-export function noteHomeGuiConnectorSheetSummaryRefresh(homeToken) {
-  noteConnectorSheetSummaryRefresh(homeToken);
 }
 
 export function homeGuiHasWindows() {
@@ -598,27 +569,6 @@ export function homeGuiMessageContextForSource(source, origin, homeToken) {
     }
     return null;
   }
-  const sheetFrame = connectorSheetFrame();
-  let sheetWindow = null;
-  try {
-    sheetWindow = sheetFrame?.contentWindow || null;
-  } catch (_error) {
-    sheetWindow = null;
-  }
-  if (sheetWindow && sheetWindow === source) {
-    const expectedToken = homeLaunchTokenFromRoute(
-      sheetFrame?.dataset?.route || sheetFrame?.getAttribute("src") || "",
-    );
-    if (expectedToken && expectedToken === homeToken) {
-      return {
-        kind: "app-frame",
-        targetId: connectorSheetTarget() || "wallet-metamask",
-        windowId: "connector-sheet",
-        homeToken,
-      };
-    }
-    return null;
-  }
   for (const entry of shellState.windows.values()) {
     const frame = entry?.node?.querySelector(".window-frame");
     let frameWindow = null;
@@ -727,9 +677,6 @@ export function renewHomeGuiChatWindowAuthority(homeToken, launched, homeOrigin,
 }
 
 export function attachAuthorizedHomeGuiTarget(launched) {
-  if (walletRailOpen() && isConnectorSheetTarget(launched?.target)) {
-    return attachAuthorizedConnectorSheet(launched);
-  }
   return attachAuthorizedTarget(launched);
 }
 

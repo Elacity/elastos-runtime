@@ -94,7 +94,7 @@ const server = createServer(async (req, res) => {
           }
         });</script>`); return;
     }
-    if (url.pathname === "/fixture-app") { res.writeHead(200, { ...cors, "content-type": "text/html" }); res.end(`<p>Fixture launched</p><script>window.uiPreferences=[];window.addEventListener('message',e=>{
+    if (url.pathname === "/fixture-app" || url.pathname === "/apps/wallet-metamask/") { res.writeHead(200, { ...cors, "content-type": "text/html" }); res.end(`<p>Fixture launched</p><script>window.uiPreferences=[];window.addEventListener('message',e=>{
         const m=e.data;
         if(m.type==='elastos:ui-preference')window.uiPreferences.push(m.preferences);
         if(m.type==='elastos.documents.window-close.request/v1')parent.postMessage({type:'elastos.documents.window-close.result/v1',requestId:m.requestId,homeToken:m.homeToken,state:'terminal',ok:true,reason:'',sessionId:1},'*');
@@ -210,6 +210,20 @@ try {
   await page.waitForFunction(() => window.calls.some(m => m.type === "home:launch-target" && m.target === "documents"));
   await page.waitForTimeout(2700); // Home protects a new window from the opening pointer's close click.
   await frame().locator('.window [data-action="close"]').first().click();
+  await frame().locator('.window').waitFor({ state: 'detached' });
+  // Wallet rail Connect: the host attaches the authorized connector; it opens as a window beside the open rail.
+  await frame().locator("#toolbar-wallet").click();
+  await frame().locator("#wallet-rail").waitFor({ state: "visible" });
+  await page.evaluate((homeOrigin) => document.querySelector("iframe").contentWindow.postMessage({
+    type: "home:gui-command", command: "attach-authorized-target",
+    descriptor: { schema: "elastos.home.authorized-target-attachment/v1", receipt_id: "fixture-metamask-receipt",
+      target: "wallet-metamask", title: "MetaMask", attach_kind: "iframe",
+      route: `/apps/wallet-metamask/?home_origin=${encodeURIComponent(homeOrigin)}#home_token=fixture-metamask` },
+  }, "*"), origin);
+  await frame().locator('.window[data-target="wallet-metamask"]').waitFor({ timeout: 5000 })
+    .catch(() => assert.fail("Wallet rail Connect opens the MetaMask connector window"));
+  await page.waitForTimeout(2700);
+  await frame().locator('.window[data-target="wallet-metamask"] [data-action="close"]').click();
   await frame().locator('.window').waitFor({ state: 'detached' });
   await frame().locator("#desktop").click({ button: "right", position: { x: 600, y: 400 } });
   assert.deepEqual(await frame().locator('#desktop-context-menu [role="menuitem"]').allTextContents(), ["Hide Desktop Icons", "Auto-arrange Icons", "Change Wallpaper…"]);

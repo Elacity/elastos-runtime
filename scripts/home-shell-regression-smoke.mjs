@@ -412,8 +412,6 @@ const shellChrome = await import(`../capsules/home-gui/browser/shell-chrome.js?v
 const shellControlCentre = await import(`../capsules/home-gui/browser/shell-control-centre.js?v=${moduleVersion}`);
 const shellWindows = await import(`../capsules/home-gui/browser/shell-windows.js?v=${moduleVersion}`);
 const shellSurface = await import(`../capsules/home-gui/browser/shell-surface.js?v=${moduleVersion}`);
-const shellWalletRail = await import(`../capsules/home-gui/browser/shell-wallet-rail.js?v=${moduleVersion}`);
-const shellConnectorSheet = await import(`../capsules/home-gui/browser/shell-connector-sheet.js?v=${moduleVersion}`);
 const shellSpotlight = await import(`../capsules/home-gui/browser/shell-spotlight.js?v=${moduleVersion}`);
 const shellKeyboard = await import(`../capsules/home-gui/browser/shell-keyboard.js?v=${moduleVersion}`);
 
@@ -678,16 +676,6 @@ const controlCentreScript = readFileSync(
   new URL("../capsules/home-gui/browser/shell-control-centre.js", import.meta.url),
   "utf8",
 );
-const openHomeGuiTargetBlock = sourceBlock(
-  homeGuiScript,
-  "export function openHomeGuiTarget(target, options = {}) {",
-  "Home GUI connector open path",
-);
-const attachAuthorizedHomeGuiTargetBlock = sourceBlock(
-  homeGuiScript,
-  "export function attachAuthorizedHomeGuiTarget(launched) {",
-  "Home GUI authorized connector attach path",
-);
 const homeSetupSheetScript = readFileSync(
   new URL("../capsules/home-gui/browser/shell-setup-sheet.js", import.meta.url),
   "utf8",
@@ -718,22 +706,6 @@ const taskbarCloseIndex = homeGuiTemplate.indexOf("</footer>", taskbarPrimaryInd
 const launcherMarkup = launcherOpenIndex >= 0 && launcherCloseIndex > launcherOpenIndex
   ? homeGuiTemplate.slice(launcherOpenIndex, launcherCloseIndex)
   : "";
-
-assert(
-  openHomeGuiTargetBlock.includes("void showConnectorSheet(target, {") &&
-    openHomeGuiTargetBlock.includes('query: { ...query, presentation: "sheet" },') &&
-    openHomeGuiTargetBlock.includes('console.error("connector sheet open failed", error);') &&
-    !openHomeGuiTargetBlock.includes("openTarget(target, options);\n      },"),
-  "Home GUI connector sheet open path still falls back to a generic connector launch",
-  openHomeGuiTargetBlock,
-);
-assert(
-  /if \(walletRailOpen\(\) && isConnectorSheetTarget\(launched\?\.target\)\) \{\s*return attachAuthorizedConnectorSheet\(launched\);\s*\}\s*return attachAuthorizedTarget\(launched\);/.test(
-    attachAuthorizedHomeGuiTargetBlock,
-  ),
-  "Home GUI authorized connector attach path no longer keeps wallet ceremony on the sheet",
-  attachAuthorizedHomeGuiTargetBlock,
-);
 
 assert(
   (homeGuiTemplate.match(/id="launcher"/g) || []).length === 1 &&
@@ -2019,110 +1991,6 @@ shellWindows.closeWindow(backgroundConnector.id);
 shellWindows.closeWindow(continuityWallet.id);
 shellCore.shellState.windows.clear();
 shellCore.shellState.activeWindowId = null;
-
-shellWalletRail.bindWalletRail();
-shellConnectorSheet.bindConnectorSheet();
-const walletRailNode = document.querySelector("#wallet-rail");
-walletRailNode.hidden = true;
-walletRailNode.inert = true;
-const boundWalletRailFrame = shellWalletRail.walletRailFrame();
-boundWalletRailFrame.hidden = true;
-boundWalletRailFrame.dataset.route =
-  "/apps/wallet/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=wallet-rail-token";
-shellWalletRail.syncWalletRailAvailability(summary);
-const connectorSheetNode = document.querySelector("#connector-sheet");
-connectorSheetNode.hidden = true;
-connectorSheetNode.inert = true;
-const windowsBeforeAuthorizedConnectorSheet = shellCore.shellState.windows.size;
-const requestsBeforeAuthorizedConnectorSheet = requests.length;
-const closedRailConnectorSheet = await shellConnectorSheet.attachAuthorizedConnectorSheet({
-  target: "wallet-metamask",
-  title: "MetaMask",
-  route:
-    "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180" +
-    "#home_token=authorized-metamask-token",
-  attach_kind: "iframe",
-  launch_status: "launched",
-});
-assert(
-  closedRailConnectorSheet === false &&
-    connectorSheetNode.hidden === true &&
-    shellCore.shellState.windows.size === windowsBeforeAuthorizedConnectorSheet &&
-    requests.length === requestsBeforeAuthorizedConnectorSheet,
-  "direct authorized connector sheet attachment with a closed Wallet rail did not fail closed",
-  {
-    closedRailConnectorSheet,
-    hidden: connectorSheetNode.hidden,
-    windows: [...shellCore.shellState.windows.keys()],
-    newRequests: requests.slice(requestsBeforeAuthorizedConnectorSheet),
-  },
-);
-shellWalletRail.showWalletRail();
-const attachedConnectorSheet = await shellConnectorSheet.attachAuthorizedConnectorSheet({
-  target: "wallet-metamask",
-  title: "MetaMask",
-  route:
-    "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180" +
-    "#home_token=authorized-metamask-token",
-  attach_kind: "iframe",
-  launch_status: "launched",
-});
-assert(
-  attachedConnectorSheet === true &&
-    shellConnectorSheet.connectorSheetOpen() &&
-    shellConnectorSheet.connectorSheetTarget() === "wallet-metamask" &&
-    connectorSheetNode.hidden === false,
-  "authorized connector descriptor did not open the wallet connector sheet",
-  {
-    attachedConnectorSheet,
-    activeTarget: shellConnectorSheet.connectorSheetTarget(),
-    hidden: connectorSheetNode.hidden,
-  },
-);
-const connectorSheetFrame = shellConnectorSheet.connectorSheetFrame();
-assert(
-  connectorSheetFrame.dataset.route ===
-    "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=authorized-metamask-token" &&
-    connectorSheetFrame.getAttribute("src") ===
-      "/apps/wallet-metamask/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=authorized-metamask-token",
-  "authorized connector sheet did not mount the exact descriptor route byte-for-byte",
-  {
-    route: connectorSheetFrame.dataset.route,
-    src: connectorSheetFrame.getAttribute("src"),
-  },
-);
-assert(
-  shellCore.shellState.windows.size === windowsBeforeAuthorizedConnectorSheet &&
-    requests.length === requestsBeforeAuthorizedConnectorSheet,
-  "authorized connector descriptor created a generic connector surface or a second launch",
-  {
-    windows: [...shellCore.shellState.windows.keys()],
-    newRequests: requests.slice(requestsBeforeAuthorizedConnectorSheet),
-  },
-);
-shellConnectorSheet.hideConnectorSheet();
-const failedAuthorizedConnectorSheet = await shellConnectorSheet.attachAuthorizedConnectorSheet({
-  target: "wallet-metamask",
-  title: "MetaMask",
-  route: "",
-  attach_kind: "iframe",
-  launch_status: "launched",
-});
-assert(
-  failedAuthorizedConnectorSheet === false &&
-    connectorSheetNode.hidden === true &&
-    !connectorSheetFrame.dataset.route &&
-    shellCore.shellState.windows.size === windowsBeforeAuthorizedConnectorSheet &&
-    requests.length === requestsBeforeAuthorizedConnectorSheet,
-  "failed authorized connector sheet attachment did not fail closed",
-  {
-    failedAuthorizedConnectorSheet,
-    hidden: connectorSheetNode.hidden,
-    route: connectorSheetFrame.dataset.route || null,
-    windows: [...shellCore.shellState.windows.keys()],
-    newRequests: requests.slice(requestsBeforeAuthorizedConnectorSheet),
-  },
-);
 
 function sessionWindow(id, targetId, {
   x,

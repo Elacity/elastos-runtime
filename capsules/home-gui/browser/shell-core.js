@@ -410,7 +410,6 @@ export const HOME_GUI_HOST_SELECTORS = Object.freeze([
   "#wallet-rail",
   "#inbox-rail",
   "#setup-sheet",
-  "#connector-sheet",
   "#spotlight",
   "#window-switcher",
   "#quick-look",
