@@ -4,7 +4,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import vm from "node:vm";
 import { exerciseNavigationConsumers, navigationClientFixture } from "./home-navigation-consumers-smoke.mjs";
 
-const moduleVersion = "home-20260813a";
+const moduleVersion = "home-20261030a";
 const savedStatePatches = [];
 const requests = [];
 const windowEventListeners = new Map();
@@ -1032,17 +1032,13 @@ assert(
   "Control Centre must issue preference requests without treating local mutations as canonical state",
 );
 assert(
-  homeGuiScript.includes("const active = Boolean(fullscreenElement());") &&
-    homeGuiScript.includes("document.addEventListener(\"fullscreenchange\", syncFullscreenButton);") &&
-    homeGuiScript.includes("document.addEventListener(\"webkitfullscreenchange\", syncFullscreenButton);") &&
-    homeGuiScript.includes("await exit.call(document);") &&
-    homeGuiScript.includes("await request.call(root);"),
-  "Home Control Centre fullscreen action no longer follows the real browser Fullscreen API state",
+  homeGuiScript.includes("bindFullscreenToggle(toolbarFullscreenButton);"),
+  "Home top-bar full screen toggle no longer follows the real browser Fullscreen API state",
 );
 assert(
   !homeGuiScript.includes("toggleActiveFullscreenStage") &&
     !homeGuiScript.includes("Window fullscreen stage (dedicated Space)"),
-  "Home Control Centre fullscreen action still routes through the app-window fullscreen Space path",
+  "Home top-bar full screen toggle still routes through the app-window fullscreen Space path",
 );
 assert(
   homeGuiScript.includes("bindSetupSheet();") &&
@@ -1129,9 +1125,9 @@ assert(
     homeGuiTemplate.includes('id="toolbar-active-title"') &&
     homeGuiTemplate.includes('id="toolbar-menubar"') &&
     homeGuiTemplate.includes('id="toolbar-control-centre"') &&
-    homeGuiTemplate.includes('id="control-centre-fullscreen"') &&
+    homeGuiTemplate.includes('id="toolbar-fullscreen"') &&
+    !homeGuiTemplate.includes('id="control-centre-fullscreen"') &&
     homeGuiTemplate.includes('id="identity-menu-sign-out"') &&
-    !homeGuiTemplate.includes('id="toolbar-fullscreen"') &&
     !homeGuiTemplate.includes('id="toolbar-sign-out"'),
   "Home template still mixes the obsolete naked top bar with the canonical system bar structure",
 );

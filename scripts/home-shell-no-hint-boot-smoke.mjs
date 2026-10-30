@@ -61,7 +61,7 @@ const homeGuiSelectors = [
   "#toolbar-active-title",
   "#toolbar-inbox",
   "#toolbar-inbox-count",
-  "#control-centre-fullscreen",
+  "#toolbar-fullscreen",
   "#identity-menu-sign-out",
   "#clock",
   "#taskbar-targets",

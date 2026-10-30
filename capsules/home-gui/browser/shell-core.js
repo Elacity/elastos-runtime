@@ -1,5 +1,5 @@
-import { isPhone } from "./shell-form-factor.js?v=home-20260813a";
-import { normalizePhoneHomeIds, normalizePhoneHomePages } from "./shell-phone-home.js?v=home-20260813a";
+import { isPhone } from "./shell-form-factor.js?v=home-20261030a";
+import { normalizePhoneHomeIds, normalizePhoneHomePages } from "./shell-phone-home.js?v=home-20261030a";
 
 export let desktop = document.querySelector("#desktop");
 export let desktopBackdrop = document.querySelector(".desktop-backdrop");
@@ -20,7 +20,7 @@ export let toolbarIdentityAvatarImage = document.querySelector("#toolbar-identit
 export let toolbarInboxButton = document.querySelector("#toolbar-inbox");
 export let toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
 export let toolbarSpotlightButton = document.querySelector("#toolbar-spotlight");
-export let toolbarFullscreenButton = document.querySelector("#control-centre-fullscreen");
+export let toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
 export let toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
 export let toolbarSystem = document.querySelector("#toolbar-system");
 export let toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");
@@ -63,9 +63,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260813a", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20261030a", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260813a", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20261030a", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -163,7 +163,7 @@ function bindHomeGuiDomRefs() {
   toolbarInboxButton = document.querySelector("#toolbar-inbox");
   toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
   toolbarSpotlightButton = document.querySelector("#toolbar-spotlight");
-  toolbarFullscreenButton = document.querySelector("#control-centre-fullscreen");
+  toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
   toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
   toolbarSystem = document.querySelector("#toolbar-system");
   toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");

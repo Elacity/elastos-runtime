@@ -370,7 +370,7 @@ async function shellState(tabId) {
     })),
     topToolbar: {
       launcherPresent: !!document.querySelector("#toolbar-launcher"),
-      fullscreenPresent: !!document.querySelector("#control-centre-fullscreen"),
+      fullscreenPresent: !!document.querySelector("#toolbar-fullscreen"),
       searchPresent: !!document.querySelector("#toolbar-search"),
       identityPresent: !!document.querySelector("#identity-button"),
       systemPresent: !!document.querySelector("#toolbar-system"),
@@ -630,7 +630,7 @@ async function main() {
       assert(duplicateHomeHeadings.length === 0, "Home GUI renders duplicate visible headings", { duplicateHomeHeadings, publicState });
       assert(state.pageTitle === "Home · ElastOS", "Home page title mismatch", state);
       assert(state.topToolbar.launcherPresent === false, "top toolbar should not show a launcher button", state);
-      assert(state.topToolbar.fullscreenPresent === true, "top toolbar should expose fullscreen as a working mobile control", state);
+      assert(state.topToolbar.fullscreenPresent === true, "top toolbar should carry the full screen toggle", state);
       assert(state.topToolbar.searchPresent === false, "top toolbar should not show a search button", state);
       assert(state.topToolbar.identityPresent === false, "top toolbar should not show a local identity button", state);
       assert(state.topToolbar.systemPresent === true, "top toolbar should expose the canonical system menu", state);

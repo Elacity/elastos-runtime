@@ -25,14 +25,14 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260813a";
-import { registerStageGesture, registerStageLayer } from "./shell-popovers.js?v=home-20260813a";
+} from "./shell-core.js?v=home-20261030a";
+import { registerStageGesture, registerStageLayer } from "./shell-popovers.js?v=home-20261030a";
 import {
   bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260813a";
+} from "./shell-chrome.js?v=home-20261030a";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -59,13 +59,13 @@ import {
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260813a";
+} from "./shell-surface.js?v=home-20261030a";
 import {
   assistantFaceActive,
   assistantSpaceActive,
   hideAssistantFace,
   retireAssistantSpace,
-} from "./shell-assistant-face.js?v=home-20260813a";
+} from "./shell-assistant-face.js?v=home-20261030a";
 import {
   attachAuthorizedTarget,
   closeWindow,
@@ -81,50 +81,50 @@ import {
   acceptHomeNavigation,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260813a";
+} from "./shell-windows.js?v=home-20261030a";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
   toggleShortcutsOverlay,
-} from "./shell-keyboard.js?v=home-20260813a";
+} from "./shell-keyboard.js?v=home-20261030a";
 import {
   bindSpotlight,
   hideSpotlight,
   showSpotlight,
-} from "./shell-spotlight.js?v=home-20260813a";
+} from "./shell-spotlight.js?v=home-20261030a";
 import {
   bindNotificationCenter,
   hideNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20260813a";
+} from "./shell-notifications.js?v=home-20261030a";
 import {
   bindSetupSheet,
   holdHomeSetupAct,
   syncSetupSheet,
-} from "./shell-setup-sheet.js?v=home-20260813a";
+} from "./shell-setup-sheet.js?v=home-20261030a";
 import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20260813a";
+} from "./shell-menubar.js?v=home-20261030a";
 import {
   bindQuickLook,
   hideQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260813a";
-import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20260813a";
+} from "./shell-quicklook.js?v=home-20261030a";
+import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20261030a";
 import {
   bindSpaceEdgePeek,
   bindSpacePager,
-} from "./shell-stages.js?v=home-20260813a";
-import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260813a";
+} from "./shell-stages.js?v=home-20261030a";
+import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20261030a";
 import {
   bindControlCentre,
   hideControlCentre,
   syncControlCentre,
-} from "./shell-control-centre.js?v=home-20260813a";
+} from "./shell-control-centre.js?v=home-20261030a";
 import {
   bindWalletRail,
   hideWalletRail,
@@ -134,7 +134,7 @@ import {
   walletRailFrame,
   walletRailOpen,
   walletRailSessionMounted,
-} from "./shell-wallet-rail.js?v=home-20260813a";
+} from "./shell-wallet-rail.js?v=home-20261030a";
 import {
   bindInboxRail,
   retireInboxRail,
@@ -144,12 +144,13 @@ import {
   inboxRailFrame,
   inboxRailOpen,
   inboxRailSessionMounted,
-} from "./shell-inbox-rail.js?v=home-20260813a";
-import { bindFormFactor, FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20260813a";
-import { bindPhoneDock } from "./shell-phone-dock.js?v=home-20260813a";
-import { bindPhoneStage, resetPhoneStage } from "./shell-phone-stage.js?v=home-20260813a";
-import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20260813a";
-import { bindTouchLongPress } from "./shell-touch.js?v=home-20260813a";
+} from "./shell-inbox-rail.js?v=home-20261030a";
+import { bindFormFactor, FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20261030a";
+import { bindPhoneDock } from "./shell-phone-dock.js?v=home-20261030a";
+import { bindPhoneStage, resetPhoneStage } from "./shell-phone-stage.js?v=home-20261030a";
+import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20261030a";
+import { bindTouchLongPress } from "./shell-touch.js?v=home-20261030a";
+import { bindFullscreenToggle } from "./shell-fullscreen.js?v=home-20261030a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -889,17 +890,6 @@ function desktopObjectsSignature(summary) {
     .join("|");
 }
 
-function fullscreenElement() {
-  return document.fullscreenElement || document.webkitFullscreenElement || null;
-}
-
-function fullscreenApi() {
-  const root = document.documentElement;
-  const request = root.requestFullscreen || root.webkitRequestFullscreen;
-  const exit = document.exitFullscreen || document.webkitExitFullscreen;
-  return { root, request, exit };
-}
-
 /* About ElastOS: window-chrome close, verified runtime version, and an
    honest update path (System About owns check/install — no fake badges). */
 let aboutOverlayBound = false;
@@ -1046,39 +1036,6 @@ function bindAboutOverlay() {
   });
 }
 
-function syncFullscreenButton() {
-  if (!toolbarFullscreenButton) {
-    return;
-  }
-  const active = Boolean(fullscreenElement());
-  const text = active ? "Exit Fullscreen" : "Enter Fullscreen";
-  const label = toolbarFullscreenButton.querySelector(".control-centre-row-label");
-  if (label) {
-    label.textContent = text;
-  }
-  toolbarFullscreenButton.setAttribute("aria-label", text);
-  toolbarFullscreenButton.title = text;
-}
-
-async function toggleHomeGuiFullscreen() {
-  hideControlCentre({ restoreFocus: false });
-  const { root, request, exit } = fullscreenApi();
-  try {
-    if (fullscreenElement()) {
-      if (typeof exit === "function") {
-        await exit.call(document);
-      }
-    } else if (typeof request === "function") {
-      await request.call(root);
-    }
-  } catch {
-    // Browser Fullscreen API owns state. Fail closed and resync from the
-    // actual document fullscreen state so the control stays retryable.
-  } finally {
-    syncFullscreenButton();
-  }
-}
-
 function trackPointerDown(event) {
   shellState.lastPointer = {
     x: event.clientX,
@@ -1107,17 +1064,11 @@ function trackPointerMove(event) {
 }
 
 function bindHomeGuiFullscreenControl() {
-  if (!toolbarFullscreenButton || homeGuiFullscreenControlBound) {
+  if (homeGuiFullscreenControlBound) {
     return;
   }
   homeGuiFullscreenControlBound = true;
-  toolbarFullscreenButton.hidden = false;
-  document.addEventListener("fullscreenchange", syncFullscreenButton);
-  document.addEventListener("webkitfullscreenchange", syncFullscreenButton);
-  toolbarFullscreenButton.addEventListener("click", () => {
-    void toggleHomeGuiFullscreen();
-  });
-  syncFullscreenButton();
+  bindFullscreenToggle(toolbarFullscreenButton);
 }
 
 /* Grid/list view for the launcher (macOS Apps panel view control). This is a

@@ -4,9 +4,9 @@
    body classes drive CSS, the JS only decides when. Presentation only — the
    Dock's contents, pins and running state are untouched. docs/HOME_MOBILE.md. */
 
-import { launcher, shellState, taskbarTargets } from "./shell-core.js?v=home-20260813a";
-import { FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20260813a";
-import { LAYER_STATE, registerStageGesture, registerStageLayer } from "./shell-popovers.js?v=home-20260813a";
+import { launcher, shellState, taskbarTargets } from "./shell-core.js?v=home-20261030a";
+import { FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20261030a";
+import { LAYER_STATE, registerStageGesture, registerStageLayer } from "./shell-popovers.js?v=home-20261030a";
 
 export const PHONE_DOCK_TUCKED_CLASS = "phone-dock-tucked";
 export const PHONE_DOCK_PEEK_CLASS = "phone-dock-peek";
