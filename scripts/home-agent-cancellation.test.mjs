@@ -1129,44 +1129,6 @@ test("a reply cut off by End says so live and after restore", () => {
   assert.doesNotMatch(status.textContent, /Model run failed/);
 });
 
-function renderedAgentText(stream) {
-  const row = (stream.children || []).find((child) => child.dataset?.role === "agent");
-  if (!row) return "";
-  const parts = [];
-  const walk = (node) => {
-    if (!node || typeof node !== "object") return;
-    if (typeof node.data === "string") parts.push(node.data);
-    else if (String(node.className || "").includes("agent-stream-frozen-block") && node.textContent) {
-      parts.push(node.textContent);
-    }
-    for (const child of node.children || []) walk(child);
-  };
-  walk(row);
-  return parts.join("");
-}
-
-test("live chat flushes two consecutive deltas before reopen of unretained output", async t => {
-  const { ctx, status, stream, offerLists, offersAfterProbe } = await runUnretainedLiveTurn(t, {
-    create: { run_id: "run-two-deltas", sequence_cursor: 0, status: "running" },
-    eventsPages: [
-      { after: 0, data: {
-        schema: "elastos.model.run-events/v1", run_id: "run-two-deltas",
-        events: [
-          { sequence: 1, kind: "text_delta", data: { text: "Hel" } },
-          { sequence: 2, kind: "text_delta", data: { text: "lo" } },
-          { sequence: 3, kind: "completed", terminal: true, data: { output_retained: false } },
-        ],
-        next_cursor: 3, has_more: false, settlement_source: "runtime_index",
-        output_retained: false,
-      } },
-    ],
-  });
-  assert.equal(status.textContent, controller.OUTPUT_UNRETAINED_STATUS);
-  assert.equal(offerLists, offersAfterProbe);
-  assert.equal(renderedAgentText(stream), "Hello", "both deltas must paint before reopen");
-  assert.equal(ctx.sessions[0].messages.filter((message) => message.role === "agent").at(-1)?.text, "Hello");
-});
-
 test("refresh after a refused new turn requires another deliberate Send", async t => {
   t.after(() => live.selectLiveOffer(""));
   const { ctx } = controllerFixture(); ctx.turnBusy = false;

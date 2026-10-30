@@ -369,3 +369,121 @@ test("Scrolling up while a reply streams keeps the reader's place and offers Jum
   assert.ok(end.jumpVisible, "Jump to latest is offered");
   assert.deepEqual(app.errors, []);
 });
+
+/** Cross the stream's freeze boundary before the final code/table blocks. */
+const markdownReply = [
+  "## Plan\n\nThe reply opens with **bold words** and a short paragraph.\n\n",
+  ...Array.from({ length: 8 }, (_, i) => `Paragraph ${i + 1}. ${"Keep this paragraph in the reply. ".repeat(8)}\n\n`),
+  "### Steps\n\n1. Read the **first** file\n2. Change the second one\n3. Run the tests\n\n",
+  "### Notes\n\n- one bullet\n- another bullet with `code`\n\n",
+  "```js\nconst answer = 42;\nconsole.log(answer);\n```\n\n",
+  "| Item | State |\n| --- | --- |\n| Plan | Ready |\n\nThe last line of the reply.\n",
+].join("");
+const replyShape = body => body.evaluate(node => ({
+  h2: node.querySelectorAll("h2").length,
+  h3: node.querySelectorAll("h3").length,
+  strong: node.querySelectorAll("strong").length,
+  ol: node.querySelectorAll("ol").length,
+  ul: node.querySelectorAll("ul").length,
+  pre: node.querySelectorAll("pre").length,
+  table: node.querySelectorAll("table").length,
+  literalMarkers: (node.textContent.match(/\*\*|^#+ /gm) || []).length,
+  html: node.innerHTML,
+}));
+
+for (const terminal of ["completed", "cancelled", "failed", "settlement_unknown", "output_unretained"]) {
+  test(`A ${terminal} Markdown stream settles frozen blocks into the reopened history render`, async t => {
+    let release;
+    const gate = new Promise(done => { release = done; });
+    const chunks = markdownReply.match(/[\s\S]{1,80}/g);
+    const app = await openAssistant(t, { eventsPage: async after => {
+      const index = Number(after);
+      if (index < chunks.length) return { next_cursor: index + 1, has_more: true,
+        events: [{ sequence: index + 1, kind: "text_delta", data: { text: chunks[index] } }] };
+      await gate;
+      return { next_cursor: index + 1, has_more: false,
+        events: [{ sequence: index + 1, kind: terminal === "output_unretained" ? "completed" : terminal, terminal: true,
+          data: terminal === "failed" ? { code: "run_failed", message: "Fixture run failed" }
+            : terminal === "output_unretained" ? { output_retained: false } : {} }] };
+    } });
+    t.after(() => release());
+    // Exercise completion after slow streaming renders, without replacing the renderer.
+    if (terminal === "completed") {
+      const cdp = await app.page.context().newCDPSession(app.page);
+      await cdp.send("Emulation.setCPUThrottlingRate", { rate: 6 });
+    }
+    await app.send("Write a plan", "The last line of the reply.");
+    const row = app.frame.locator(".agent-msg-agent");
+    const body = row.locator(".agent-msg-body");
+    assert.ok(await body.locator(".agent-stream-frozen-block").count() > 0, "streaming froze earlier paragraphs");
+    const streaming = await replyShape(body);
+    assert.equal(streaming.h2 + streaming.strong + streaming.pre + streaming.table, 0, "live chunks stay plain");
+    assert.ok(streaming.literalMarkers > 0, "Markdown markers remain visible during streaming");
+    if (terminal === "cancelled" || terminal === "settlement_unknown") {
+      await app.frame.getByRole("button", { name: "Stop", exact: true }).click();
+      await until(() => app.cancels.length === 1, "Stop sends one cancel");
+    }
+    release();
+    await app.frame.locator('.agent-msg-agent .agent-msg-body[data-md-painted="1"]').waitFor();
+    if (terminal === "completed" || terminal === "cancelled") await presented(app.frame);
+    if (terminal === "failed") await row.locator(".agent-msg-stopped").waitFor();
+    const finished = await replyShape(body);
+    assert.deepEqual(
+      { h2: finished.h2, h3: finished.h3, strong: finished.strong, ol: finished.ol, ul: finished.ul,
+        pre: finished.pre, table: finished.table, literalMarkers: finished.literalMarkers },
+      { h2: 1, h3: 2, strong: 2, ol: 1, ul: 1, pre: 1, table: 1, literalMarkers: 0 });
+    assert.equal(await body.locator(".agent-stream-frozen-block").count(), 0, "settling replaces every frozen block");
+    await app.savedTranscript([["user", "Write a plan"], ["agent", markdownReply.trim()]]);
+    await app.page.reload();
+    await app.composer.waitFor({ state: "visible" });
+    await body.waitFor();
+    assert.equal(finished.html, (await replyShape(body)).html, "finished and reopened HTML match exactly");
+    assert.deepEqual(app.errors, []);
+  });
+}
+
+for (const size of [8000, 8001]) {
+  test(`A ${size}-character streamed reply keeps the history rendering cap`, async t => {
+    const reply = "**Bold** " + "x".repeat(size - 9);
+    const chunks = reply.match(/[\s\S]{1,400}/g);
+    const app = await openAssistant(t, { eventsPage: async after => {
+      const index = Number(after);
+      const last = index + 1 === chunks.length;
+      return { next_cursor: index + (last ? 2 : 1), has_more: !last, events: [
+        { sequence: index + 1, kind: "text_delta", data: { text: chunks[index] } },
+        ...(last ? [{ sequence: index + 2, kind: "completed", terminal: true, data: {} }] : [])] };
+    } });
+    await app.send("Long reply");
+    await presented(app.frame);
+    const body = app.replies;
+    const finished = await body.innerHTML();
+    assert.equal(await body.locator("strong").count(), size === 8000 ? 1 : 0);
+    assert.equal(await body.getAttribute("data-md-source"), reply, "the entire source survives the cap");
+    await app.savedTranscript([["user", "Long reply"], ["agent", reply]]);
+    await app.page.reload();
+    await app.composer.waitFor({ state: "visible" });
+    await body.waitFor();
+    assert.equal(await body.innerHTML(), finished, "the cap is the same after reopening");
+    assert.deepEqual(app.errors, []);
+  });
+}
+
+// These deltas arrive in one poll. Verify the painted body in a real DOM,
+// including the finished template, before the workspace is reopened.
+test("Two consecutive deltas settle before reopen when the provider drops its output", async t => {
+  const app = await openAssistant(t, { eventsPage: async () => ({ next_cursor: 3, has_more: false, events: [
+    { sequence: 1, kind: "text_delta", data: { text: "**Hel" } },
+    { sequence: 2, kind: "text_delta", data: { text: "lo**" } },
+    { sequence: 3, kind: "completed", terminal: true, data: { output_retained: false } },
+  ] }) });
+  await app.send("Question");
+  await app.replies.locator("strong").waitFor();
+  assert.equal(await app.replies.textContent(), "Hello", "both deltas paint before reopen");
+  const finished = await app.replies.innerHTML();
+  await app.savedTranscript([["user", "Question"], ["agent", "**Hello**"]]);
+  await app.page.reload();
+  await app.composer.waitFor({ state: "visible" });
+  await app.replies.waitFor();
+  assert.equal(await app.replies.innerHTML(), finished);
+  assert.deepEqual(app.errors, []);
+});
