@@ -67,6 +67,10 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   the console) and System fell back to "Not set" beside Passkeys. The account
   list, read with the Home token, already shows each account's passkeys. The
   System behavior smoke now fails on any Runtime call without the Home token.
+  The Home wallpaper GET sends `Cross-Origin-Resource-Policy: cross-origin`
+  and `X-Content-Type-Options: nosniff` so the sandboxed GUI can display it;
+  Runtime still requires a Home token. System's hidden file inputs use fixed
+  positioning so picker focus keeps the settings at their scroll position.
 - Auth audit saves verify the changed suffix against a verified loaded prefix and
   refill the cache after stable byte readback; retention, signatures, checkpoint
   order, and the file format stay unchanged.
