@@ -218,7 +218,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   raises its soft open-file limit to the hard limit, at most 10240, when it
   starts, and the Browser local exit keeps accepting after an accept error.
 
-## [2.0.0-alpha.1] - 2026-10-30
+## [2.0.0-rc.1] - 2026-10-30
 
 Release candidate for 2.0.0 on the test channel, with the same notes.
 
