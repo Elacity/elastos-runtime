@@ -597,6 +597,21 @@ test('policy prints the prepared source, package run and develop CI run', t => {
 // A final version is one stable head: canary Homes accept it, so nothing else is signed.
 const stable = { versions: ['1.2.3', '1.2.4-alpha.1'] };
 
+test('a release candidate prepares on canary from develop and keeps its exact version', t => {
+  const version = '2.0.0-rc.1';
+  const f = fixture(t, { versions: [version, '2.0.0-rc.2'], noTag: true });
+  const result = f.prepare(version);
+  assert.equal(result.status, 0, result.stderr);
+  const args = f.args();
+  assert.equal(args[args.indexOf('--version') + 1], version);
+  assert.equal(args[args.indexOf('--channel') + 1], 'canary');
+  const prepared = policy(f, version);
+  assert.equal(prepared.status, 0, prepared.stderr);
+  const pinned = JSON.parse(readFileSync(join(f.root, `work/${version}/policy.json`)));
+  assert.deepEqual([pinned.version, pinned.channel, pinned.develop_oid, pinned.tag],
+    [version, 'canary', commit, undefined]);
+});
+
 test('a final version prepares on stable from its tag on main and pins that tag for the signer', t => {
   const f = fixture(t, stable);
   const result = f.prepare('1.2.3');
