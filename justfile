@@ -173,6 +173,7 @@ verify:
     just product-ui-source
     node --test scripts/browser-window-close-handshake.test.mjs
     node --test scripts/home-assistant-mark.test.mjs
+    node --test scripts/assistant-markdown.test.mjs
     node --test scripts/home-two-runtime-acceptance.test.mjs
     node --test scripts/system-hosted-save.test.mjs
     node --test scripts/home-form-factor.test.mjs
