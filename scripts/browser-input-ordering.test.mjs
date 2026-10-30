@@ -44,7 +44,7 @@ function harness() {
     currentPageGeneration: 1, currentDisplayMode: "webrtc_remote_display", currentView: { width: 1280, height: 720 },
     libraryPickerRequest: null, runtimePageOwner, sameRuntimePageOwner, selkiesMessagesForInput,
     PAGE_STATUS_AFTER_INPUT_DELAY_MS: 1, PAGE_STATUS_AFTER_SCROLL_DELAY_MS: 1,
-    DATACHANNEL_INPUT_SETTLE_MS, setTimeout,
+    DATACHANNEL_INPUT_SETTLE_MS, setTimeout, Date,
     remoteDisplay: {
       inputChannelOpen: () => channel.open,
       inputBufferedAmount: () => channel.buffered,
@@ -380,13 +380,18 @@ const release = { type: "mouse", x: 30, y: 20, buttons: 0 };
 for (const [name, first, messages] of [
   ["drag release", release, ["m,30,20,0,0"]],
   ["Cmd+A select-all", { type: "key_combo", keysyms: [65507, 97] }, ["kd,65507", "kd,97", "ku,97", "ku,65507"]],
-]) test(`Runtime text after a ${name} waits for the datachannel settle barrier`, async () => {
+]) test(`Runtime text after a ${name} waits for the datachannel settle barrier`, async t => {
+  // Advance the guest settle clock explicitly: a busy suite can delay a real
+  // sleep beyond the barrier before the assertion gets to observe it.
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1000 });
   const h = harness(), results = [h.submit(first), h.submit(text("x"))];
   await nextTurn();
   assert.deepEqual(h.sends, messages);
-  await sleep(DATACHANNEL_INPUT_SETTLE_MS - 50);
+  t.mock.timers.tick(DATACHANNEL_INPUT_SETTLE_MS - 1);
+  await nextTurn();
   assert.equal(h.requests.length, 0, "replacement text must not overtake the selection");
-  await sleep(100);
+  t.mock.timers.tick(10);
+  await nextTurn();
   assert.equal(h.requests.length, 1);
   h.requests[0].ack();
   assert.ok((await Promise.all(results)).every(result => result.status === "fulfilled"));
