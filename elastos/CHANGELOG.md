@@ -52,6 +52,7 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ### Developer detail
 
+- Assistant uses the history renderer when a streamed reply finishes or stops.
 - Approval Lens is hidden: `POST /api/apps/system/approval-lens` and the
   `approval_lens_offer_id`/`approval_lens_error` status fields are gone, and
   OpenRouter discovery admits text models only. `/approval-lens/revoke` stays
