@@ -2990,10 +2990,11 @@ class PreviousReleaseInstallTests(unittest.TestCase):
             target.start()
             self.addCleanup(target.stop)
 
-    def published(self, case):
+    def published(self, case, home_components=None):
         """The pinned release as Runtime installs it, its signed release and components, and the pin."""
         root = self.root / case
-        installed, stage = root / "installed", root / "stage"
+        installed, stage, optional = root / "installed", root / "stage", root / "optional"
+        home_components = list(observer.CLI_SETUP_COMPONENTS if home_components is None else home_components)
         builder = re.search(r"(?ms)^create_capsule_tar\(\) \{\n.*?^\}\n", Path(__file__).with_name("publish-release.sh").read_text())[0]
 
         def put(path, raw, mode):
@@ -3029,7 +3030,7 @@ class PreviousReleaseInstallTests(unittest.TestCase):
                 metadata = {"install_path": "capsules/" + name, "platforms": {"*": signed}}
         for name in ("ipfs-provider", "localhost-provider", *observer.CLI_PROTECTED_PROVIDERS, "custody-provider"):
             natives[name] = b"native " + name.encode()
-            put(installed / "bin" / name, natives[name], 0o755)
+            put((installed if name in home_components else optional) / "bin" / name, natives[name], 0o755)
             external[name] = {"install_path": "bin/" + name, "platforms": {self.PLATFORM: entry(
                 natives[name], name + "-" + self.PLATFORM, install_path="bin/" + name)}}
         external["localhost-provider"]["capsule_metadata"] = metadata
@@ -3044,7 +3045,7 @@ class PreviousReleaseInstallTests(unittest.TestCase):
                             "capsule_metadata": {"install_path": "capsules/kubo", "platforms": {
                                 self.PLATFORM: {**kubo, "extract_path": "kubo", "install_path": "capsules/kubo"}}}}
         observer.write(installed / "components.json", {"schema": "elastos.components/v1", "capsules": {}, "external": external,
-                                                       "profiles": {"home": {"components": list(observer.CLI_SETUP_COMPONENTS)}}})
+                                                       "profiles": {"home": {"components": home_components}}})
         pinned, current = root / "pinned-elastos", root / "current-elastos"
         pinned.write_bytes(b"#!/bin/sh\n# the pinned Runtime\n")
         source = {key: subprocess.check_output(["git", "rev-parse", ref], cwd=Path(__file__).resolve().parents[1], text=True).strip()
@@ -3060,7 +3061,20 @@ class PreviousReleaseInstallTests(unittest.TestCase):
                                            "release_cid": observer.cli_v0_cid(raw), "release_sha256": hashlib.sha256(raw).hexdigest(),
                                            "head_cid": observer.cli_v0_cid(b"pinned head"), "signer_did": envelope["signer_did"]})
         data = '"$HOME"/' + shlex.quote(observer.CLI_DATA)
-        current.write_text("#!/bin/bash\nset -eu\ncase $1 in\nsetup) exit ;;\n"
+        current.write_text("#!/bin/bash\nset -eu\ncase $1 in\nsetup)\n"
+                           "while [ $# -gt 0 ]; do\n"
+                           "  if [ \"$1\" = --with ]; then\n"
+                           "    IFS=, read -ra names <<< \"$2\"\n"
+                           "    for name in \"${names[@]}\"; do\n"
+                           "      optional=" + shlex.quote(str(optional)) + "/bin/\"$name\"\n"
+                           "      if [ -f \"$optional\" ]; then\n"
+                           "        mkdir -p " + data + "/bin\n"
+                           "        cp \"$optional\" " + data + "/bin/\n"
+                           "      fi\n"
+                           "    done\n"
+                           "    shift 2\n"
+                           "  else shift; fi\n"
+                           "done\nexit ;;\n"
                            "update) [ \"$2 $3 $4\" = '--rollback-to " + observer.cli_v0_cid(b"pinned head") + " --yes' ] ;;\n*) exit 1 ;;\nesac\n"
                            "cp -R " + shlex.quote(str(installed)) + "/. " + data + "/\n"
                            "cp " + shlex.quote(str(pinned)) + ' "$HOME/.local/bin/elastos.new"\n'
@@ -3099,12 +3113,26 @@ class PreviousReleaseInstallTests(unittest.TestCase):
         self.assertEqual({name: (support / "bin" / name).read_bytes() for name in fixture["natives"]}, fixture["natives"])
         self.assertFalse((fixture["root"] / "home").exists())
 
+    def test_home_profile_can_leave_required_fixture_providers_optional(self):
+        home = [name for name in observer.CLI_SETUP_COMPONENTS if name not in observer.CLI_PROTECTED_PROVIDERS]
+        fixture = self.published("optional-providers", home_components=home)
+        published = observer.cli_json(fixture["installed"] / "components.json")
+        for name in observer.CLI_PROTECTED_PROVIDERS:
+            self.assertNotIn(name, published["profiles"]["home"]["components"])
+            self.assertIn(name, published["external"])
+            self.assertFalse((fixture["installed"] / "bin" / name).exists())
+        self.assertEqual(self.install(fixture)["release"]["version"], "0.8.0-alpha.8")
+        for name in observer.CLI_PROTECTED_PROVIDERS:
+            self.assertEqual((fixture["root"] / "previous/support/bin" / name).read_bytes(), fixture["natives"][name])
+
     def test_rollback_refuses_installed_bytes_that_differ_from_the_pin_or_their_signed_hash(self):
         def tamper(relative):
             return lambda fixture: (fixture["installed"] / relative).write_bytes(b"tampered")
         faults = {"release.json differs from its signed hash": tamper("installation/release.json"),
                   "artifacts/home.tar.gz differs from its signed hash": tamper("capsules/home/browser/app.js"),
                   "artifacts/ipfs-provider-linux-amd64 differs from its signed hash": tamper("bin/ipfs-provider"),
+                  "artifacts/protected-content-protect-provider-linux-amd64 differs from its signed hash":
+                      tamper("bin/protected-content-protect-provider"),
                   "installed kubo differs from its signed archive": tamper("capsules/kubo/.elastos-artifact-sha256"),
                   "support/bin/kubo differs from its signed hash": tamper("bin/kubo"),
                   "localhost-provider-capsule-metadata.tar.gz differs from its signed hash": tamper("capsules/localhost-provider/icons/icon-32.png"),
