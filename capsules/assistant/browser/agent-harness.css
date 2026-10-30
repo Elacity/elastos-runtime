@@ -2386,6 +2386,10 @@ html[data-agent-reasoning="off"] .agent-thinking {
   margin-top: var(--space-1);
 }
 
+.agent-md-list .agent-md-list {
+  margin: var(--space-1) 0 0;
+}
+
 .agent-md-quote {
   margin: 0 0 var(--space-4);
   padding: 0 0 0 0.85em;

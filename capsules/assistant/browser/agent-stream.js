@@ -365,6 +365,88 @@ function formatInlineMarkdown(escaped) {
     .replaceAll(/`([^`]+)`/g, '<code class="agent-md-inline">$1</code>');
 }
 
+const MD_LIST_ITEM = /^(\s*)([-*+]|\d+\.)\s+(.*)$/;
+
+function startsMarkdownBlock(line) {
+  const trimmed = line.trim();
+  return (
+    line.includes("|") ||
+    /^(#{1,3})\s+/.test(trimmed) ||
+    /^>\s?/.test(trimmed) ||
+    /^\s*(\\\[|\$\$)/.test(line)
+  );
+}
+
+/* One list starting at lines[start]. Items continue across blank lines while
+   the next marker has the same kind and indent; non-list text directly under
+   an item (or indented after a blank) joins that item; deeper markers form a
+   nested list inside the current item. Returns the html and the next line. */
+function renderMarkdownList(lines, start) {
+  const first = MD_LIST_ITEM.exec(lines[start]);
+  const indent = first[1].length;
+  const ordered = /\d/.test(first[2]);
+  const tag = ordered ? "ol" : "ul";
+  const number = ordered ? Number.parseInt(first[2], 10) : 1;
+  let html = `<${tag} class="agent-md-list"${number !== 1 ? ` start="${number}"` : ""}>`;
+  let j = start;
+  for (;;) {
+    const marker = MD_LIST_ITEM.exec(lines[j]);
+    const parts = [marker[3]];
+    let nested = "";
+    let nextItem = false;
+    j += 1;
+    while (j < lines.length) {
+      const line = lines[j];
+      if (!line.trim()) {
+        let k = j + 1;
+        while (k < lines.length && !lines[k].trim()) {
+          k += 1;
+        }
+        if (k >= lines.length) {
+          break;
+        }
+        const after = MD_LIST_ITEM.exec(lines[k]);
+        const afterIndent = /^\s*/.exec(lines[k])[0].length;
+        if (after && afterIndent === indent && /\d/.test(after[2]) === ordered) {
+          j = k;
+          nextItem = true;
+          break;
+        }
+        if (after ? afterIndent > indent : afterIndent > indent && !startsMarkdownBlock(lines[k])) {
+          if (!after) {
+            parts.push("");
+          }
+          j = k;
+          continue;
+        }
+        break;
+      }
+      const item = MD_LIST_ITEM.exec(line);
+      if (item) {
+        const itemIndent = item[1].length;
+        if (itemIndent > indent) {
+          const sub = renderMarkdownList(lines, j);
+          nested += sub.html;
+          j = sub.next;
+          continue;
+        }
+        nextItem = itemIndent === indent && /\d/.test(item[2]) === ordered;
+        break;
+      }
+      if (startsMarkdownBlock(line)) {
+        break;
+      }
+      parts.push(line.trim());
+      j += 1;
+    }
+    html += `<li>${formatInlineMarkdown(escapeHtml(parts.join("\n").trim())).replaceAll("\n", "<br>")}${nested}</li>`;
+    if (!nextItem) {
+      break;
+    }
+  }
+  return { html: `${html}</${tag}>`, next: j };
+}
+
 function renderMarkdownBlocks(raw) {
   const lines = String(raw).replace(/\r\n/g, "\n").split("\n");
   let html = "";
@@ -468,16 +550,10 @@ function renderMarkdownBlocks(raw) {
       i += 1;
       continue;
     }
-    if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
-      const ordered = /^\s*\d+\.\s+/.test(line);
-      const tag = ordered ? "ol" : "ul";
-      html += `<${tag} class="agent-md-list">`;
-      while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])) {
-        const item = lines[i].replace(/^\s*([-*+]|\d+\.)\s+/, "");
-        html += `<li>${formatInlineMarkdown(escapeHtml(item))}</li>`;
-        i += 1;
-      }
-      html += `</${tag}>`;
+    if (MD_LIST_ITEM.test(line)) {
+      const list = renderMarkdownList(lines, i);
+      html += list.html;
+      i = list.next;
       continue;
     }
     if (/^>\s?/.test(line.trim())) {
