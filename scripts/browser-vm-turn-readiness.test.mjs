@@ -34,19 +34,28 @@ function fixture(t) {
   return { root, launcher, turn, env };
 }
 
-function probe(env, imageReason = null) {
+function probe(env, imageReason = null, hostProbe = "ready") {
   // Execute the actual host-readiness branch with real executable-file checks.
-  // Image hashing is covered by the artifact smoke; host eligibility is a fixture.
+  // Image hashing and the supervisor process are covered by the artifact smoke.
+  // Stub host eligibility so suite load cannot exhaust its two-second deadline.
   const program = `import json, os, pathlib, platform as host_platform, subprocess, sys
+from types import SimpleNamespace
 host_platform.system = lambda: "Darwin"
 host_platform.machine = lambda: "arm64"
 platform = os.environ["ELASTOS_BROWSER_VM_PLATFORM"]
 mode = "--host-readiness"
 vz_supervisor = os.environ["ELASTOS_BROWSER_VM_VZ_SUPERVISOR"]
+def host_probe(command, **options):
+    assert command == [vz_supervisor, "--host-capabilities"]
+    assert options == dict(capture_output=True, text=True, timeout=2, check=True)
+    if sys.argv[2] == "timeout":
+        raise subprocess.TimeoutExpired(command, options["timeout"])
+    return SimpleNamespace(stdout=json.dumps({"schema": "elastos.browser.vm-host-capabilities/v1", "available": True}))
+subprocess.run = host_probe
 verify_image_set = lambda: json.loads(sys.argv[1])
 local_substrate_artifacts_ready = True
 ${hostReadiness}`;
-  const child = spawnSync("python3", ["-c", program, JSON.stringify(imageReason)], {
+  const child = spawnSync("python3", ["-c", program, JSON.stringify(imageReason), hostProbe], {
     env: { PATH: process.env.PATH, ...env }, encoding: "utf8", timeout: 5000,
   });
   assert.equal(child.status, 0, child.stderr || String(child.error));
@@ -69,6 +78,11 @@ for (const kind of ["valid", "missing", "empty", "nonexistent", "relative", "dir
     assert.deepEqual(probe(f.env), ["valid", "symlink"].includes(kind) ? ready : unavailable());
   });
 }
+
+test("a supervisor timeout keeps host readiness unavailable", t => {
+  const f = fixture(t);
+  assert.deepEqual(probe(f.env, null, "timeout"), unavailable("readiness_unsupported"));
+});
 
 test("TURN readiness does not replace image integrity or host compatibility checks", t => {
   const f = fixture(t);
