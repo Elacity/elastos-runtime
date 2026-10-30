@@ -275,6 +275,12 @@ body.agent-harness-active .taskbar.is-agent-face {
   margin-left: 6px;
 }
 
+/* White lettering vanishes on the light rail; swap to the ink variant
+   (navy lettering), as the Home menubar does. */
+:root[data-el-theme="light"] .agent-harness-brand {
+  content: url("./elastos-logo-ink.svg");
+}
+
 .agent-harness-sidebar-actions {
   display: flex;
   flex: 0 0 auto;
