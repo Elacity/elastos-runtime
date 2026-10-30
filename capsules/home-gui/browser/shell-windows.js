@@ -21,6 +21,7 @@ import {
   targetById,
   WINDOW_TOP_INSET,
   WINDOW_BOTTOM_INSET,
+  pushUiPreferencesToFrameWindow,
 } from "./shell-core.js?v=home-20260813a";
 import {
   fitWindowBounds,
@@ -2024,6 +2025,8 @@ function syncBrowserWindow(entry, launched) {
   cleanupFrameAutoFit(node);
 
   const syncLoadedFrame = () => {
+    // Each load (first mount and reload) starts from the theme default, so hand it the current preference.
+    pushUiPreferencesToFrameWindow(frame.contentWindow);
     probeHomeNavigation(entry, true);
     if (entry.targetId !== "browser") {
       installFrameAutoFit(node, frame);

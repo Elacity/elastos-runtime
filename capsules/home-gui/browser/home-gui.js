@@ -503,7 +503,7 @@ function broadcastHomeGuiUiPreferences(preferences) {
     try {
       frame?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
     } catch (_error) {
-      // Frame mid-teardown; the boot push covers the next mount.
+      // Frame mid-teardown; the window's load handler pushes the current preference on its next load.
     }
   }
   try {

@@ -57,7 +57,7 @@ const homeSummary = {
   authority: { signed_in: true, principal_id: "did:key:fixture", proof_binding_id: "fixture", session_id: "fixture" },
   identity: { display_name: "Fixture Home", recovery_readiness: { status: "ready" }, profile_readiness: { status: "ready" } },
   targets, active_shell: { active: "home-gui", candidates: [] },
-  appearance: { schema: "elastos.home.appearance/v1", revision: 0, theme: "dark", accent: "blue", accent_custom: "#4f7fff",
+  appearance: { schema: "elastos.home.appearance/v1", revision: 0, theme: "light", accent: "blue", accent_custom: "#4f7fff",
     dock_auto_hide: false, sounds: false, focus_mode: false, background_image_url: null,
     background_overlay_enabled: true, background_overlay_opacity: 0.55 },
   browser_state: { principal_id: "did:key:fixture", recent_targets: [], session: null,
@@ -94,8 +94,9 @@ const server = createServer(async (req, res) => {
           }
         });</script>`); return;
     }
-    if (url.pathname === "/fixture-app") { res.writeHead(200, { ...cors, "content-type": "text/html" }); res.end(`<p>Fixture launched</p><script>window.addEventListener('message',e=>{
+    if (url.pathname === "/fixture-app") { res.writeHead(200, { ...cors, "content-type": "text/html" }); res.end(`<p>Fixture launched</p><script>window.uiPreferences=[];window.addEventListener('message',e=>{
         const m=e.data;
+        if(m.type==='elastos:ui-preference')window.uiPreferences.push(m.preferences);
         if(m.type==='elastos.documents.window-close.request/v1')parent.postMessage({type:'elastos.documents.window-close.result/v1',requestId:m.requestId,homeToken:m.homeToken,state:'terminal',ok:true,reason:'',sessionId:1},'*');
         if(m.type==='elastos.system.window-ready.request/v1')parent.postMessage({type:'elastos.system.window-ready.result/v1',requestId:m.requestId,homeToken:m.homeToken,documentNonce:'fixture-app'},'*');
         if(m.type==='elastos.system.window.request/v1')parent.postMessage({type:'elastos.system.window.result/v1',requestId:m.requestId,homeToken:m.homeToken,documentNonce:m.documentNonce,ok:true},'*');
@@ -174,6 +175,20 @@ try {
   await page.goto(`${origin}/?app=home-gui`);
   await frame().locator('body[data-home-status="ready"]').waitFor();
   assert.equal(await frame().locator("#control-centre-discovery").count(), 0);
+  const library = frame().locator('[data-kind="object"]').first();
+  await library.click({ button: "right" });
+  await frame().getByRole("menuitem", { name: "Show in Library" }).click();
+  await frame().locator('.window[data-target="library"]').waitFor();
+  const libraryApp = () => page.frames().find(f => f.url().includes("/fixture-app?target=library"));
+  for (let i = 0; !libraryApp() && i < 50; i++) await page.waitForTimeout(100);
+  for (const load of ["first load", "reload"]) {
+    if (load === "reload") await libraryApp().evaluate(() => location.reload());
+    await libraryApp().waitForFunction(() => window.uiPreferences?.some(p => p.theme === "light"), null, { timeout: 5000 })
+      .catch(() => assert.fail(`Library window gets the light theme on ${load}`));
+  }
+  await page.waitForTimeout(2700); // Home protects a new window from the opening pointer's close click.
+  await frame().locator('.window[data-target="library"] [data-action="close"]').click();
+  await frame().locator('.window').waitFor({ state: 'detached' });
   await frame().locator("#desktop-shortcut-system").click({ button: "right" });
   assert.deepEqual(await frame().locator('#desktop-context-menu [role="menuitem"]').allTextContents(),
     ["Open System", "Rename", "Remove from Desktop", "Remove from Shelf"]);
