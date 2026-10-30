@@ -106,6 +106,8 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 - wasmtime is built without its `cache` feature, which the Runtime never
   turned on, so zstd 0.13.3, zstd-safe 7.2.4 and zstd-sys 2.0.16 leave the
   elastos and object-provider locks (RUSTSEC-2026-0391/0398/0403/0410).
+- wasmtime 36.0.20 (from 36.0.19) in the elastos and object-provider locks
+  fixes RUSTSEC-2026-0424, published 29 October.
 - `elastos serve --capsule` starts its initial MicroVM capsule with a VM-bound
   Capsule session instead of a Shell session, because the guest can read its
   boot token; capability approval stays with the shell (#387).
