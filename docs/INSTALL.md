@@ -74,7 +74,7 @@ stop after bootstrap.
 
 The current default Home exposes Assistant, Chat (Community), System, People,
 Wallet, Documents, Library, Marketplace, and Inbox. On Apple Silicon
-Macs it also exposes Browser; Linux Homes do not show Browser in 0.8.0. People is installed as a
+Macs it also exposes Browser; Linux Homes do not show Browser in 2.0.0. People is installed as a
 separate app capsule; Home presents it but does not own its state or authority.
 
 Native Windows is not an accepted install target today. The current product
@@ -310,7 +310,7 @@ key if you need to recover across that first update.
 
 ### Recover an interrupted update
 
-On 0.8.0 and its test release 0.8.0-alpha.25, an update that stops partway
+On 2.0.0 and its test releases from 0.8.0-alpha.25, an update that stops partway
 keeps Home closed until it is recovered. Keep the installation files and data
 in place, and stay connected to the network Home updates over.
 
@@ -336,7 +336,7 @@ private receipt in the data directory. The controller of the version that runs
 the update owns its restart and recovery, so the steps below depend on that
 version.
 
-From 0.8.0 (and its test release 0.8.0-alpha.18), if a Home restart was
+From 2.0.0 (and its test releases from 0.8.0-alpha.18), if a Home restart was
 interrupted, run `elastos home --browser`. It
 hands recovery to that retained controller, which verifies its signed Runtime,
 retained launch settings and saved release before it starts Home. When the
@@ -350,7 +350,7 @@ through the update controller appends its output under a header to the private
 after the rollback; a startup failure names that file.
 
 On 0.8.0-alpha.16 and 0.8.0-alpha.17 (including an update from one of them to
-0.8.0), an update or rollback start has a 30-second limit, each start replaces
+2.0.0), an update or rollback start has a 30-second limit, each start replaces
 `update-controller/runtime.log`, and `elastos home --browser` refuses a pending
 restart. Set `ELASTOS_RECOVERY_DATA` to the data directory shown in the local
 message and run the retained controller:

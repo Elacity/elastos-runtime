@@ -6,47 +6,49 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-10-16
+## [2.0.0] - 2026-11-02
 
 ### Security
 
-- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in 0.8.1). Web pages and content links open in a separate sandbox, and sandboxed apps need valid tokens to reach private data. Home checks allowed hosts and rejects requests whose Origin header names another website. Releases are signed with a new key kept off the public server.
-- Isolation status, not done yet (planned for 0.8.1): Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls (S1 and S2 of #173). Importing a Recovery Kit does not yet ask for your passkey again (#403), and on Linux with KVM the Browser network helper is installed with sudo without a hash check (#406).
-- Only the host and admins get the Runtime audit log (#404) and can use the web Terminal, which is off by default. A demoted admin's terminal closes (#405). A hand-run `elastos serve` has the shell apply its policy file, and the shell allows nothing without a valid one.
-- Security updates for Browser (Chromium 155, Node 24.22.1), the TLS library, the WebAssembly runtime and the ZIP library (#380, #417, #473, #474). On a Mac, Browser downloads its new image (about 900 MB) once after the update. Library refuses archive entries with a Windows drive, root or network name.
-- A Home gives a file to another Home only while you share it in Library or post it in Chat, and only to your contacts; files you received are not passed on. A Home's content links answer only its own sessions.
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in a later release). Web pages and content links open in a separate sandbox, and sandboxed apps need valid tokens to reach private data. Home checks allowed hosts and rejects requests whose Origin names another website. Releases are signed with a new key kept off the public server.
+- Isolation status, not done yet (planned for a later release): Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls (S1 and S2 of #173). Importing a Recovery Kit does not yet ask for your passkey again (#403), and on Linux with KVM the Browser network helper is installed with sudo without a hash check (#406).
+- Only the host and admins get the Runtime audit log (#404) and can use the web Terminal, which is off by default. A demoted admin's terminal closes (#405). A hand-run `elastos serve` applies the shell's policy file; without a valid one the shell allows nothing.
+- Security updates for Browser (Chromium 155, Node 24.22.1), the TLS, WebAssembly and ZIP libraries (#380, #417, #473, #474). On a Mac, Browser downloads its new image (about 900 MB) once after the update. Library refuses archive entries with a Windows drive, root or network name.
+- A Home gives a file to another Home only while you share it in Library or post it in Chat, and only to your contacts; files you received are not passed on. Content links answer only the Home's own sessions.
 
 ### Added
 
-- An admin can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey, after confirming with a current one. Make admin and Make guest change every passkey of that account. When sign-in fails, the lock screen says why and what to do next (#338).
-- Home has a touch layout for screens 640 px wide or less: a Dock and pages of apps, one app at a time full screen, swipe down on its title bar to switch apps, and long-press menus. A phone needs an HTTPS address for Home, which 0.8.0 does not set up yet (#116, #92).
-- People has three pages: People, Profile and Public (formerly Discovery). Add someone by DID, even without Public: Profile shows your DID, People has an Add form, and a Chat profile card or a DID in a message opens it. They answer in Inbox if they open Home within 24 hours; after a Decline, new requests to them are dropped for 7 days. Requests reach Homes on 0.8.0 once the seed's Community node runs it, when 0.8.0 is published; until then People says they can't be delivered yet.
-- Library: Share with contacts lets your contacts get a file of up to 8 MiB from your Home while it runs; Copy link gives its link, Stop sharing ends that share (contacts keep their copies), and Share again restarts a stopped share. Chat's Attach posts a file's link in Community, after asking; direct messages have no Attach. Members who are not contacts see the post but must add you first. A contact's link asks before Home gets the file; text opens in Documents, other files in Library.
+- An admin can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey, after confirming with a current one. Make admin and Make guest apply to all of that account's passkeys. When sign-in fails, the lock screen says why and what to do next (#338).
+- Home has a touch layout for screens 640 px wide or less: a Dock and pages of apps, one app at a time full screen, swipe down on its title bar to switch apps, and long-press menus. A phone needs an HTTPS address for Home, which 2.0.0 does not set up yet (#116, #92).
+- People has three pages: People, Profile and Public (formerly Discovery). Add someone by DID, even without Public: Profile shows your DID, People has an Add form, and a Chat profile card or a DID in a message opens it. They answer in Inbox if they open Home within 24 hours; after a Decline, new requests to them are dropped for 7 days. Requests reach other Homes once the seed's Community node runs 2.0.0; until then People says they can't be delivered yet.
+- Library: Share with contacts lets your contacts get a file of up to 8 MiB from your Home while it runs; Copy link gives its link; Stop sharing ends it (contacts keep their copies) and Share again restarts it. Chat's Attach posts a file's link in Community, after asking; direct messages have no Attach. Non-contacts see the post but must add you first. A contact's link asks before Home gets the file; text opens in Documents, other files in Library.
+- A full screen button in the top bar replaces the Status menu row.
 
 ### Changed
 
-- Updates: test-channel Homes update to 0.8.0 in System; the install command moves them to stable (#335). If an update needs the install command, System and `elastos update` show it and keep your version. Home waits up to 2 minutes for the new Runtime, so slow devices such as a Jetson start after an update. If the old version was put back but cannot start, `elastos home --browser` starts it.
-- A Home joins the shared Community by default; to keep it out, run `elastos setup --isolated` before it first joins, or an admin leaves in System → Security. Signed posts cross networks through the seed's Community node, which can read them until the relay arrives in 0.8.1. Direct messages need a direct connection, which some networks block.
+- Updates: test-channel Homes update to 2.0.0 in System; the install command moves them to stable (#335). If an update needs the install command, System and `elastos update` show it and keep your version. Home waits up to 2 minutes for the new Runtime, so slow devices like a Jetson start. If the old version was put back but cannot start, `elastos home --browser` starts it.
+- A Home joins the shared Community by default; to keep it out, run `elastos setup --isolated` before it first joins, or an admin leaves in System → Security. Signed posts cross networks through the seed's Community node, which can read them until the relay arrives in a later release. Direct messages need a direct connection, which some networks block.
 - Community: Inbox asks once whether members see you online (Always, Only while Community is open, Later or Never); change it in System → Security.
-- Marketplace lists launchable apps and signed models and shows Verified publisher for items that match a signed release. Hidden in 0.8.0: Services, so contacts cannot share AI models or Browser; WalletConnect until it is set up; Approval Lens and Apps & Services in System; Archive's launcher tile (Library opens ZIPs).
-- The file service runs offline: it no longer uses the public IPFS network, and files move between Homes only over Carrier. `elastos open` and `elastos run --cid` read only what this Home holds (#500). Copies to your own devices are not available in 0.8.0 (#498).
+- Marketplace lists launchable apps and signed models and shows Verified publisher for items in a signed release. Hidden in 2.0.0: Services, so contacts cannot share AI models or Browser; WalletConnect until it is set up; Approval Lens and Apps & Services in System; Archive's launcher tile (Library opens ZIPs).
+- The file service runs offline: it no longer uses the public IPFS network, and files move between Homes only over Carrier. `elastos open` and `elastos run --cid` read only what this Home holds (#500). Copies to your own devices are not available in 2.0.0 (#498).
 - Hosted AI on a Mac, for admins: add a Venice or OpenRouter key in System → Models. Nothing is sent until you approve it in Inbox; End there or in System stops it (#85).
 - Known issues: Browser runs only on Apple Silicon Macs and has no Chinese, Japanese or Korean fonts. On the Jetson, getting Qwen takes about 43 minutes and its first reply about 22 seconds. Library can lose a save of a file saved from two places at once or renamed, moved or deleted meanwhile (#480). Unsaved Documents edits are lost if sign-in ends, after 12 hours without Home running, such as while a computer sleeps (#497).
 - Known issues when updating: from 0.7.1 or earlier, run the install command once, as releases have a new signing key (#186); your Home keeps its data. From a test version older than 0.8.0-alpha.18 on a slow device such as a Jetson, System update can fail. Earlier versions cannot start a Home with a Library file over 16 MB or over 64 MB in total: update with the install command and do not use Undo. If an update leaves Home stuck, follow "Recover an interrupted update" in `docs/INSTALL.md` (#108).
-- When Community is unreachable, for example after a network change, Home reconnects by itself, usually within a few minutes. If it has used up its repairs, Chat says to restart Home. If a direct message stays "Sending" after a Home changed networks, restarting either Home delivers it (#451).
-- Undo to 0.8.0-alpha.25: the file service keeps its offline settings and stays off the public IPFS network. Contacts added by DID are kept apart; alpha.25 does not show them, and they return when you update again.
+- After a network change, Home reconnects to Community by itself, usually in minutes. If it has used up its repairs, Chat says to restart Home. If a direct message stays "Sending" after a Home changed networks, restarting either Home delivers it (#451).
+- Undo to 0.8.0-alpha.25: the file service stays offline, off the public IPFS network. Contacts added by DID are kept apart; alpha.25 does not show them, and they return when you update again.
 
 ### Fixed
 
-- Assistant: Edit and Delete work on a message you just sent, and a finished or stopped reply offers Delete and Regenerate. An interrupted model download resumes by itself before asking you to Retry.
-- In the Assistant, Qwen2.5 1.5B does ordinary requests instead of saying they need a tool. Models still cannot read files, open websites or send messages, and SmolLM2 135M often pretends it did (#455).
+- Assistant: Edit and Delete work on a message you just sent, and a finished or stopped reply offers Delete and Regenerate. An interrupted model download resumes before asking you to Retry.
+- Assistant: Qwen2.5 1.5B does ordinary requests instead of saying they need a tool. Models still cannot read files, open websites or send messages, and SmolLM2 135M often pretends it did (#455).
 - On a Mac, a local model is refused only when it cannot fit beside memory macOS has locked or compressed, memory cannot be read, or memory is critically low, which also stops a reply (#98).
-- Chat: the message box returns to one line after you send, a web link opens after Home shows the address and you choose Open link, and a stalled read no longer stops new messages.
-- Documents: Autosave is off by default, and the list shows .md and .txt files from the Documents folder and subfolders. A web link opens after Home shows the address and you choose Open link (#436). For a PDF or another file no app opens, Library offers a download.
+- Chat: the message box returns to one line after you send, and a stalled read no longer stops new messages. In Chat and Documents a web link opens after Home shows the address and you choose Open link (#436).
+- Documents: Autosave is off by default, and the list shows .md and .txt files in Documents and its subfolders. For a PDF or another file no app opens, Library offers a download.
 - Home starts, updates and shows Recovery status with any number of large Library files. A file with a damaged label, or one for another key or place, shows as Blocked in Library (#444).
-- Library: saving, copying, moving and extracting can no longer create folders too deep for Home to start. Extract Here checks entry count and sizes first and, if it stops partway, says where the extracted files are (#449, #432). Library actions are faster.
-- Library: when a search hides selected items, Delete and menu actions affect only items you can see (#441). Compress: up to 100 MB. Download archives: up to 1 GB total and 100 MB per file (#481). Dialogs and upload progress are readable in the dark theme.
-- First-run setup: the welcome sheet shrinks to a card while you work on a step and returns after you save the Recovery Kit. Setup says where a passkey can be saved (#452) and retries a stalled download once.
+- Library: saving, copying, moving and extracting can no longer create folders too deep for Home to start. Extract Here checks entry count and sizes first and, if stopped partway, says where the files are (#449, #432). Library is faster.
+- Library: when a search hides selected items, Delete and menu actions affect only visible items (#441). Compress: up to 100 MB. Download archives: up to 1 GB total and 100 MB per file (#481). Dialogs and upload progress are readable in the dark theme.
+- First-run setup: the welcome sheet shrinks to a card during a step and returns after you save the Recovery Kit. It says where a passkey can be saved (#452) and retries a stalled download once.
+- In Light theme, app windows open and reload in Light and the Assistant logo shows. Assistant numbered lists keep their numbers, a reply with a table no longer freezes it, and Wallet Connect works from the sidebar (#511).
 
 ### Developer detail
 
@@ -213,6 +215,52 @@ release's Added, Changed, Fixed, Removed and Security bullets before you update;
   (a value saved in `browser-engine-adapter.json` is ignored). The Runtime
   raises its soft open-file limit to the hard limit, at most 10240, when it
   starts, and the Browser local exit keeps accepting after an accept error.
+
+## [2.0.0-alpha.1] - 2026-10-30
+
+Release candidate for 2.0.0 on the test channel, with the same notes.
+
+### Security
+
+- Isolation status: the first stage of the isolation plan (#173) is done, except that the seed does not yet run under its own account (#174, in a later release). Web pages and content links open in a separate sandbox, and sandboxed apps need valid tokens to reach private data. Home checks allowed hosts and rejects requests whose Origin names another website. Releases are signed with a new key kept off the public server.
+- Isolation status, not done yet (planned for a later release): Home can still get every app's permissions, providers run as normal programs with your account's rights (only the model provider is partly limited), and approvals are not yet shown on a screen that only the Runtime controls (S1 and S2 of #173). Importing a Recovery Kit does not yet ask for your passkey again (#403), and on Linux with KVM the Browser network helper is installed with sudo without a hash check (#406).
+- Only the host and admins get the Runtime audit log (#404) and can use the web Terminal, which is off by default. A demoted admin's terminal closes (#405). A hand-run `elastos serve` applies the shell's policy file; without a valid one the shell allows nothing.
+- Security updates for Browser (Chromium 155, Node 24.22.1), the TLS, WebAssembly and ZIP libraries (#380, #417, #473, #474). On a Mac, Browser downloads its new image (about 900 MB) once after the update. Library refuses archive entries with a Windows drive, root or network name.
+- A Home gives a file to another Home only while you share it in Library or post it in Chat, and only to your contacts; files you received are not passed on. Content links answer only the Home's own sessions.
+
+### Added
+
+- An admin can add another passkey, such as a second device or a security key, in System → Accounts → Add passkey, after confirming with a current one. Make admin and Make guest apply to all of that account's passkeys. When sign-in fails, the lock screen says why and what to do next (#338).
+- Home has a touch layout for screens 640 px wide or less: a Dock and pages of apps, one app at a time full screen, swipe down on its title bar to switch apps, and long-press menus. A phone needs an HTTPS address for Home, which 2.0.0 does not set up yet (#116, #92).
+- People has three pages: People, Profile and Public (formerly Discovery). Add someone by DID, even without Public: Profile shows your DID, People has an Add form, and a Chat profile card or a DID in a message opens it. They answer in Inbox if they open Home within 24 hours; after a Decline, new requests to them are dropped for 7 days. Requests reach other Homes once the seed's Community node runs 2.0.0; until then People says they can't be delivered yet.
+- Library: Share with contacts lets your contacts get a file of up to 8 MiB from your Home while it runs; Copy link gives its link; Stop sharing ends it (contacts keep their copies) and Share again restarts it. Chat's Attach posts a file's link in Community, after asking; direct messages have no Attach. Non-contacts see the post but must add you first. A contact's link asks before Home gets the file; text opens in Documents, other files in Library.
+- A full screen button in the top bar replaces the Status menu row.
+
+### Changed
+
+- Updates: test-channel Homes update to 2.0.0 in System; the install command moves them to stable (#335). If an update needs the install command, System and `elastos update` show it and keep your version. Home waits up to 2 minutes for the new Runtime, so slow devices like a Jetson start. If the old version was put back but cannot start, `elastos home --browser` starts it.
+- A Home joins the shared Community by default; to keep it out, run `elastos setup --isolated` before it first joins, or an admin leaves in System → Security. Signed posts cross networks through the seed's Community node, which can read them until the relay arrives in a later release. Direct messages need a direct connection, which some networks block.
+- Community: Inbox asks once whether members see you online (Always, Only while Community is open, Later or Never); change it in System → Security.
+- Marketplace lists launchable apps and signed models and shows Verified publisher for items in a signed release. Hidden in 2.0.0: Services, so contacts cannot share AI models or Browser; WalletConnect until it is set up; Approval Lens and Apps & Services in System; Archive's launcher tile (Library opens ZIPs).
+- The file service runs offline: it no longer uses the public IPFS network, and files move between Homes only over Carrier. `elastos open` and `elastos run --cid` read only what this Home holds (#500). Copies to your own devices are not available in 2.0.0 (#498).
+- Hosted AI on a Mac, for admins: add a Venice or OpenRouter key in System → Models. Nothing is sent until you approve it in Inbox; End there or in System stops it (#85).
+- Known issues: Browser runs only on Apple Silicon Macs and has no Chinese, Japanese or Korean fonts. On the Jetson, getting Qwen takes about 43 minutes and its first reply about 22 seconds. Library can lose a save of a file saved from two places at once or renamed, moved or deleted meanwhile (#480). Unsaved Documents edits are lost if sign-in ends, after 12 hours without Home running, such as while a computer sleeps (#497).
+- Known issues when updating: from 0.7.1 or earlier, run the install command once, as releases have a new signing key (#186); your Home keeps its data. From a test version older than 0.8.0-alpha.18 on a slow device such as a Jetson, System update can fail. Earlier versions cannot start a Home with a Library file over 16 MB or over 64 MB in total: update with the install command and do not use Undo. If an update leaves Home stuck, follow "Recover an interrupted update" in `docs/INSTALL.md` (#108).
+- After a network change, Home reconnects to Community by itself, usually in minutes. If it has used up its repairs, Chat says to restart Home. If a direct message stays "Sending" after a Home changed networks, restarting either Home delivers it (#451).
+- Undo to 0.8.0-alpha.25: the file service stays offline, off the public IPFS network. Contacts added by DID are kept apart; alpha.25 does not show them, and they return when you update again.
+
+### Fixed
+
+- Assistant: Edit and Delete work on a message you just sent, and a finished or stopped reply offers Delete and Regenerate. An interrupted model download resumes before asking you to Retry.
+- Assistant: Qwen2.5 1.5B does ordinary requests instead of saying they need a tool. Models still cannot read files, open websites or send messages, and SmolLM2 135M often pretends it did (#455).
+- On a Mac, a local model is refused only when it cannot fit beside memory macOS has locked or compressed, memory cannot be read, or memory is critically low, which also stops a reply (#98).
+- Chat: the message box returns to one line after you send, and a stalled read no longer stops new messages. In Chat and Documents a web link opens after Home shows the address and you choose Open link (#436).
+- Documents: Autosave is off by default, and the list shows .md and .txt files in Documents and its subfolders. For a PDF or another file no app opens, Library offers a download.
+- Home starts, updates and shows Recovery status with any number of large Library files. A file with a damaged label, or one for another key or place, shows as Blocked in Library (#444).
+- Library: saving, copying, moving and extracting can no longer create folders too deep for Home to start. Extract Here checks entry count and sizes first and, if stopped partway, says where the files are (#449, #432). Library is faster.
+- Library: when a search hides selected items, Delete and menu actions affect only visible items (#441). Compress: up to 100 MB. Download archives: up to 1 GB total and 100 MB per file (#481). Dialogs and upload progress are readable in the dark theme.
+- First-run setup: the welcome sheet shrinks to a card during a step and returns after you save the Recovery Kit. It says where a passkey can be saved (#452) and retries a stalled download once.
+- In Light theme, app windows open and reload in Light and the Assistant logo shows. Assistant numbered lists keep their numbers, a reply with a table no longer freezes it, and Wallet Connect works from the sidebar (#511).
 
 ## [0.8.0-alpha.26] - 2026-10-29
 
