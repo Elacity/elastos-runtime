@@ -211,7 +211,7 @@ try {
   await page.waitForTimeout(2700); // Home protects a new window from the opening pointer's close click.
   await frame().locator('.window [data-action="close"]').first().click();
   await frame().locator('.window').waitFor({ state: 'detached' });
-  // Wallet rail Connect: the host attaches the authorized connector; it opens as a window beside the open rail.
+  // Wallet rail Connect: the host attaches the authorized connector; the rail closes so the window is not beneath it.
   await frame().locator("#toolbar-wallet").click();
   await frame().locator("#wallet-rail").waitFor({ state: "visible" });
   await page.evaluate((homeOrigin) => document.querySelector("iframe").contentWindow.postMessage({
@@ -222,6 +222,9 @@ try {
   }, "*"), origin);
   await frame().locator('.window[data-target="wallet-metamask"]').waitFor({ timeout: 5000 })
     .catch(() => assert.fail("Wallet rail Connect opens the MetaMask connector window"));
+  await frame().locator("#wallet-rail").waitFor({ state: "hidden", timeout: 5000 })
+    .catch(() => assert.fail("Wallet rail closes when Connect opens the connector window"));
+  assert.equal(await frame().locator('.window[data-target="wallet-metamask"]').isVisible(), true, "Connector window is visible");
   await page.waitForTimeout(2700);
   await frame().locator('.window[data-target="wallet-metamask"] [data-action="close"]').click();
   await frame().locator('.window').waitFor({ state: 'detached' });

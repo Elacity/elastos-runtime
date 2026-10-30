@@ -127,6 +127,7 @@ import {
 } from "./shell-control-centre.js?v=home-20260813a";
 import {
   bindWalletRail,
+  hideWalletRail,
   retireWalletRail,
   showWalletRail,
   syncWalletRailAvailability,
@@ -677,6 +678,9 @@ export function renewHomeGuiChatWindowAuthority(homeToken, launched, homeOrigin,
 }
 
 export function attachAuthorizedHomeGuiTarget(launched) {
+  // Wallet Connect: close the rail as an outside click would, so the connector
+  // window is not opened beneath it.
+  hideWalletRail({ restoreFocus: false });
   return attachAuthorizedTarget(launched);
 }
 
