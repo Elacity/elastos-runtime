@@ -330,6 +330,55 @@ async function assertScenario(page, width, height, screenshotPath) {
   await frame.locator("body").screenshot({ path: screenshotPath });
 }
 
+// Closing the file picker refocuses the hidden file input. In a short window
+// the input sits below the fold; focusing it must not scroll the settings
+// container (which is overflow: hidden, so the content would stay shifted).
+async function assertFileInputFocusKeepsLayout(page) {
+  await page.setViewportSize({ width: 1280, height: 620 });
+  await page.goto(page.url(), { waitUntil: "networkidle" });
+  const frame = await waitForSystemFrame(page);
+  await activateTab(frame, "personalization");
+  const shift = await frame.evaluate(() => {
+    const container = document.querySelector(".settings-container");
+    const content = document.querySelector(".settings-content-container");
+    const sidebar = document.querySelector(".settings-sidebar");
+    const input = document.querySelector("#background-input");
+    if (
+      !(container instanceof HTMLElement) ||
+      !(content instanceof HTMLElement) ||
+      !(sidebar instanceof HTMLElement) ||
+      !(input instanceof HTMLElement)
+    ) {
+      throw new Error("missing settings container, content, sidebar or #background-input");
+    }
+    content.scrollTo({ top: 0, left: 0 });
+    const before = {
+      containerScrollTop: container.scrollTop,
+      contentScrollTop: content.scrollTop,
+      sidebarTop: sidebar.getBoundingClientRect().top,
+    };
+    input.focus();
+    return {
+      before,
+      after: {
+        containerScrollTop: container.scrollTop,
+        contentScrollTop: content.scrollTop,
+        sidebarTop: sidebar.getBoundingClientRect().top,
+      },
+      focused: document.activeElement === input,
+      inputPosition: getComputedStyle(input).position,
+    };
+  });
+  assert(shift.focused, "System background file input did not take focus", shift);
+  assert(
+    shift.after.containerScrollTop === shift.before.containerScrollTop &&
+      shift.after.contentScrollTop === shift.before.contentScrollTop &&
+      Math.abs(shift.after.sidebarTop - shift.before.sidebarTop) < 0.5,
+    "Focusing the hidden background file input scrolls the System content",
+    shift,
+  );
+}
+
 // Phone stage: the menu button sits on the leading edge, on the same line as
 // the page title, as a 44 px target.
 async function assertPhoneTitleRow(page, screenshotPath) {
@@ -417,6 +466,7 @@ async function main() {
     await assertScenario(page, 1280, 900, desktopScreenshot);
     await assertScenario(page, 640, 900, narrowScreenshot);
     await assertPhoneTitleRow(page, phoneScreenshot);
+    await assertFileInputFocusKeepsLayout(page);
 
     assert(
       server.requestFailures.length === 0,

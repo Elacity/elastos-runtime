@@ -5617,6 +5617,13 @@ async fn test_system_updates_home_background_image() {
             .and_then(|value| value.to_str().ok()),
         Some("image/png")
     );
+    // The sandboxed Home GUI frame has an opaque origin; under COEP require-corp
+    // the browser drops the image unless the response says so explicitly.
+    assert_eq!(
+        image.headers()["cross-origin-resource-policy"],
+        "cross-origin"
+    );
+    assert_eq!(image.headers()["x-content-type-options"], "nosniff");
     let image_body = axum::body::to_bytes(image.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -5641,6 +5648,11 @@ async fn test_system_updates_home_background_image() {
             .and_then(|value| value.to_str().ok()),
         Some("image/jpeg")
     );
+    assert_eq!(
+        guest_image.headers()["cross-origin-resource-policy"],
+        "cross-origin"
+    );
+    assert_eq!(guest_image.headers()["x-content-type-options"], "nosniff");
     let guest_image_body = axum::body::to_bytes(guest_image.into_body(), usize::MAX)
         .await
         .unwrap();

@@ -606,6 +606,15 @@ code {
   border: 0;
 }
 
+/* The picker's close refocuses the hidden file input; a focused element is
+   scrolled into view, which dragged the whole settings container up when
+   the input sat below the fold. Fixed to the viewport it cannot scroll. */
+input[type="file"].visually-hidden {
+  position: fixed;
+  top: 0;
+  left: 0;
+}
+
 .system-file-button {
   display: inline-flex;
   align-items: center;

@@ -8742,9 +8742,23 @@ pub(super) async fn home_background_image(
     ) {
         Ok(bytes) => {
             let mut response = bytes.into_response();
-            response.headers_mut().insert(
+            let headers = response.headers_mut();
+            headers.insert(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static(entry.content_type),
+            );
+            // The Home GUI document is sandboxed without allow-same-origin, so
+            // its origin is opaque and never same-origin or same-site with the
+            // gateway. Under COEP require-corp an image without CORP is dropped,
+            // so `cross-origin` is the only value that lets it load. Access is
+            // still gated by the Home launch token above.
+            headers.insert(
+                axum::http::HeaderName::from_static("cross-origin-resource-policy"),
+                HeaderValue::from_static("cross-origin"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("x-content-type-options"),
+                HeaderValue::from_static("nosniff"),
             );
             response
         }
