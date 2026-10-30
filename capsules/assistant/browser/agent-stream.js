@@ -55,7 +55,6 @@ const liveTurnCanonical = {
 const STREAM_BUDGET_MS = 8;
 const STREAM_TRACE_LIMIT = 48;
 const FOLLOW_RESUME_PX = 96;
-const RICH_FINALIZE_BUDGET_MS = 48;
 /** One-shot markdown+KaTeX above this freezes Brave. Stream freeze slices stay ~800. */
 const RICH_MARKDOWN_MAX_CHARS = 8_000;
 const LONG_TASK_TRACE_LIMIT = 24;
@@ -233,7 +232,7 @@ export function renderMarkdown(text, { streaming = false, stream, kind } = {}) {
 }
 
 /** Keep raw markdown on the node so Stop/Copy don't lose markers after HTML paint. */
-function paintAgentMessageBody(body, text, { streaming = false, allowDegrade = false } = {}) {
+function paintAgentMessageBody(body, text, { streaming = false } = {}) {
   if (!body) {
     return;
   }
@@ -247,18 +246,8 @@ function paintAgentMessageBody(body, text, { streaming = false, allowDegrade = f
     delete body.dataset.mdPainted;
     return;
   }
-  const started = performance.now();
-  const html = renderMarkdown(raw, { streaming: false });
-  if (allowDegrade && performance.now() - started > RICH_FINALIZE_BUDGET_MS) {
-    delete body.dataset.mdPainted;
-    return;
-  }
   const tmpl = document.createElement("template");
-  tmpl.innerHTML = html;
-  if (allowDegrade && performance.now() - started > RICH_FINALIZE_BUDGET_MS) {
-    delete body.dataset.mdPainted;
-    return;
-  }
+  tmpl.innerHTML = renderMarkdown(raw, { streaming: false });
   body.replaceChildren(tmpl.content);
   body.dataset.mdPainted = "1";
 }
@@ -1967,17 +1956,11 @@ function streamBucketP95(traces) {
 }
 
 function scheduleIdleWork(fn) {
-  const startedAt = performance.now();
-  const invoke = (abandonRich) => {
-    fn({ abandonRich: Boolean(abandonRich) || performance.now() - startedAt > 4000 });
-  };
   if (typeof requestIdleCallback === "function") {
-    requestIdleCallback((deadline) => {
-      invoke(Boolean(deadline?.didTimeout));
-    }, { timeout: 4000 });
+    requestIdleCallback(() => fn(), { timeout: 4000 });
     return;
   }
-  window.setTimeout(() => invoke(false), 32);
+  window.setTimeout(fn, 32);
 }
 
 /** Live turn: contract runs_events → scheduled DOM. Stop requests cancellation. */
@@ -2756,9 +2739,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       const partial = materializeCanonical();
       commitAgentReply(session, partial.answer, partial.reasoning, { partial: true, turn: result.turnManifest });
       answerRow?.classList.remove("is-streaming");
-      if (answerBody) {
-        answerBody.dataset.mdSource = partial.answer;
-      }
+      paintAgentMessageBody(answerBody, String(partial.answer || "").trim());
       settleStreamedReply(answerRow, session);
       if (result.stopRequested && result.settlementUnknown) {
         /* Local engines cannot confirm a stop; the turn keeps its unknown state. */
@@ -2787,9 +2768,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       const reasoning = String(partial.reasoning || "").trim();
       commitAgentReply(session, answer, reasoning, { turn: result.turnManifest });
       answerRow?.classList.remove("is-streaming");
-      if (answerBody) {
-        answerBody.dataset.mdSource = answer;
-      }
+      paintAgentMessageBody(answerBody, answer);
       if (!answer) {
         progressEl?.remove();
         answerRow?.remove();
@@ -2831,10 +2810,9 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     let thinking = String(joined.reasoning || "").trim();
     if (!answer && thinking) {
       /* Reasoning models often spend the budget thinking — surface it honestly.
-         Do not one-shot markdown a Think dump; that is what crashed Brave. */
+         It is rendered like any reply, the same way a reopened chat shows it. */
       answer = thinking;
       thinking = "";
-      state.quality = "plain";
     }
     const split = splitThinkTaggedContent(answer);
     if (split.thinking && !thinking) {
@@ -2881,39 +2859,25 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
     }
     const answerBodyRef = answerBody;
     const answerTextRef = answer;
-    const finalize = ({ abandonRich = false } = {}) => {
+    const finalize = () => {
       if (generation !== ctx.streamGeneration || !answerBodyRef?.isConnected) {
         return;
       }
-      const unhealthy =
-        abandonRich ||
-        perf.slowFrames > 12 ||
-        perf.longTasks.some((row) => row.duration >= 50);
       /* The last flush and the rich render below make the reply taller; keep
          a reader who was following at the end. One who scrolled up since the
          stream ended (its listeners are gone) stays where they are. */
       const pinned = endScrollTop !== null && !!scroller && scroller.scrollTop >= endScrollTop - 1;
-      answerBodyRef.dataset.mdSource = answerTextRef;
-      const skipRich = unhealthy || stoppedEarly || state.quality === "plain";
-      if (!skipRich) {
-        try {
-          if (frozenEl?.isConnected) {
-            const remaining = String(tailNode?.data || tail || "");
-            if (remaining) {
-              freezeSlice(remaining, { markdown: true });
-            }
-            tailEl?.remove();
-            tailEl = null;
-            tailNode = null;
-          } else {
-            paintAgentMessageBody(answerBodyRef, answerTextRef, {
-              streaming: false,
-              allowDegrade: true,
-            });
-          }
-        } catch {
-          /* keep streamed prefix — canonical survives presentation failure */
-        }
+      /* Streaming painted plain text (live tokens never run Markdown, see
+         adaptQuality). The finished reply, stopped early or not, now gets the
+         render a reopened chat gives it: the whole text through the history
+         painter, which keeps the same size cap. */
+      try {
+        paintAgentMessageBody(answerBodyRef, answerTextRef, { streaming: false });
+        frozenEl = null;
+        tailEl = null;
+        tailNode = null;
+      } catch {
+        /* keep streamed prefix — canonical survives presentation failure */
       }
       if (pinned) {
         pinToEnd();
@@ -3064,9 +3028,7 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
       persistPartialAgentReply(partialAnswer, partialThinking);
       settleStreamedReply(answerRow, session);
       answerRow?.classList.remove("is-streaming");
-      if (answerBody) {
-        answerBody.dataset.mdSource = partialAnswer;
-      }
+      paintAgentMessageBody(answerBody, partialAnswer, { streaming: false });
       if (answerRow && !answerRow.querySelector(".agent-msg-stopped")) {
         const note = document.createElement("div");
         note.className = "agent-msg-stopped";
