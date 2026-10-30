@@ -2325,6 +2325,21 @@ mod tests {
             compare_release_versions("", "0.7.1-rc.1").unwrap(),
             Ordering::Greater
         );
+        // The 0.8 train is renamed 2.0.0: each step of the jump is an update.
+        for (installed, offered) in [
+            ("0.8.0-alpha.26", "2.0.0-alpha.1"),
+            ("2.0.0-alpha.1", "2.0.0"),
+            ("0.7.1", "2.0.0"),
+        ] {
+            assert_eq!(
+                compare_release_versions(installed, offered).unwrap(),
+                Ordering::Greater
+            );
+            assert_eq!(
+                compare_release_versions(offered, installed).unwrap(),
+                Ordering::Less
+            );
+        }
         for invalid in ["0.7", "0.7.01", "0.7.1-", "0.7.1-rc_1", "unknown"] {
             assert!(compare_release_versions("0.7.0", invalid).is_err());
             assert!(compare_release_versions(invalid, "0.7.1").is_err());
