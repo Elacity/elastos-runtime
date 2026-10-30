@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import test from "node:test";
 
 globalThis.CustomEvent ??= class CustomEvent extends Event {
@@ -79,4 +80,26 @@ test("a different list kind or an unindented paragraph after a blank ends the li
     renderMarkdown("- a\n\nAfter."),
     '<ul class="agent-md-list"><li>a</li></ul><p class="agent-md-p">After.</p>',
   );
+});
+
+// Render in a child process with a deadline, so a renderer that stops
+// advancing fails the test instead of hanging the suite.
+function renderBounded(text) {
+  const script =
+    'globalThis.window = Object.assign(new EventTarget(), { location: { href: "http://home.invalid/", hash: "" }, setTimeout, clearTimeout, setInterval, clearInterval });' +
+    `const { renderMarkdown } = await import(${JSON.stringify(new URL("../capsules/assistant/browser/agent-stream.js", import.meta.url).href)});` +
+    "process.stdout.write(renderMarkdown(process.argv[1]));";
+  return execFileSync(process.execPath, ["--input-type=module", "-e", script, text], { encoding: "utf8", timeout: 5000 });
+}
+
+test("a pipe table with a dashed separator renders as a table", () => {
+  const html = renderBounded("| a | b |\n|---|---|\n| 1 | 2 |");
+  assert.match(html, /<thead><tr><th>a<\/th><th>b<\/th><\/tr><\/thead><tbody><tr><td>1<\/td><td>2<\/td><\/tr><\/tbody>/);
+  assert.match(renderBounded("| a | b |\n| :--- | ---: |\n| 1 | 2 |"), /<th>a<\/th>/);
+});
+
+test("lines with a stray pipe or an unclosed display-math opener still render", () => {
+  assert.equal(renderBounded("cats | dogs"), '<p class="agent-md-p">cats | dogs</p>');
+  assert.equal(renderBounded("Intro\n| not a table"), '<p class="agent-md-p">Intro</p><p class="agent-md-p">| not a table</p>');
+  assert.match(renderBounded("$$ x"), /^<p class="agent-md-p">/);
 });

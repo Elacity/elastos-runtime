@@ -477,13 +477,13 @@ function renderMarkdownBlocks(raw) {
     if (
       line.includes("|") &&
       i + 1 < lines.length &&
-      /^\s*\|?[\s:-|]+\|?\s*$/.test(lines[i + 1])
+      /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1])
     ) {
       const rows = [];
       while (i < lines.length && lines[i].includes("|")) {
         rows.push(lines[i]);
         i += 1;
-        if (rows.length === 1 && i < lines.length && /^\s*\|?[\s:-|]+\|?\s*$/.test(lines[i])) {
+        if (rows.length === 1 && i < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i])) {
           i += 1; /* skip separator */
         } else if (rows.length > 1 && (!lines[i] || !lines[i].includes("|"))) {
           break;
@@ -576,7 +576,11 @@ function renderMarkdownBlocks(raw) {
       ).replaceAll("\n", "<br>")}</blockquote>`;
       continue;
     }
-    const para = [];
+    /* The current line matched no other block, so it opens the paragraph;
+       taking it unconditionally guarantees progress (a stray "|" or an
+       unclosed "$$" line would otherwise stall this loop forever). */
+    const para = [line];
+    i += 1;
     while (
       i < lines.length &&
       lines[i].trim() &&
