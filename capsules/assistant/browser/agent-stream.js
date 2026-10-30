@@ -391,8 +391,15 @@ function renderMarkdownList(lines, start) {
   let j = start;
   for (;;) {
     const marker = MD_LIST_ITEM.exec(lines[j]);
-    const parts = [marker[3]];
-    let nested = "";
+    let parts = [marker[3]];
+    let body = "";
+    const flushText = () => {
+      const text = parts.join("\n").trim();
+      if (text) {
+        body += formatInlineMarkdown(escapeHtml(text)).replaceAll("\n", "<br>");
+      }
+      parts = [];
+    };
     let nextItem = false;
     j += 1;
     while (j < lines.length) {
@@ -425,8 +432,9 @@ function renderMarkdownList(lines, start) {
       if (item) {
         const itemIndent = item[1].length;
         if (itemIndent > indent) {
+          flushText();
           const sub = renderMarkdownList(lines, j);
-          nested += sub.html;
+          body += sub.html;
           j = sub.next;
           continue;
         }
@@ -439,7 +447,8 @@ function renderMarkdownList(lines, start) {
       parts.push(line.trim());
       j += 1;
     }
-    html += `<li>${formatInlineMarkdown(escapeHtml(parts.join("\n").trim())).replaceAll("\n", "<br>")}${nested}</li>`;
+    flushText();
+    html += `<li>${body}</li>`;
     if (!nextItem) {
       break;
     }

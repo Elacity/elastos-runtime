@@ -39,6 +39,18 @@ test("indented bullets under a numbered item form a nested list", () => {
   );
 });
 
+test("text between nested lists stays in source order", () => {
+  const html = renderMarkdown(
+    "1. Deploy\n   - Stop the service.\n\n   Replace its configuration.\n   - Start the service.",
+  );
+  const stop = html.indexOf("Stop the service.");
+  const replace = html.indexOf("Replace its configuration.");
+  const start = html.indexOf("Start the service.");
+  assert.ok(stop >= 0 && replace >= 0 && start >= 0, html);
+  assert.ok(stop < replace && replace < start, html);
+  assert.equal(count(html, /<ol /g), 1);
+});
+
 test("a contiguous list renders as before", () => {
   assert.equal(renderMarkdown("- a\n- b\n- c"), '<ul class="agent-md-list"><li>a</li><li>b</li><li>c</li></ul>');
   assert.equal(renderMarkdown("1. a\n2. b"), '<ol class="agent-md-list"><li>a</li><li>b</li></ol>');
