@@ -5477,6 +5477,27 @@ async fn test_system_updates_home_background_image() {
     let guest_protection =
         crate::auth::store_test_principal_root_protection(dir.path(), &guest.principal_id);
 
+    // The host owns the read; neither opaque-frame provenance nor a System
+    // launch token grants it, even though System owns the upload.
+    for (origin, token) in [
+        ("null", admin.home_token.as_str()),
+        ("null", admin.system_token.as_str()),
+        ("http://localhost:61180", admin.system_token.as_str()),
+    ] {
+        let denied = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", origin)
+                    .uri("/api/apps/home/appearance/background-image")
+                    .header("x-elastos-home-token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+
     let updated = app
         .clone()
         .oneshot(
@@ -5617,8 +5638,7 @@ async fn test_system_updates_home_background_image() {
             .and_then(|value| value.to_str().ok()),
         Some("image/png")
     );
-    // The sandboxed Home GUI frame has an opaque origin; under COEP require-corp
-    // the browser drops the image unless the response says so explicitly.
+    // These response headers are separate from the authenticated host handoff.
     assert_eq!(
         image.headers()["cross-origin-resource-policy"],
         "cross-origin"

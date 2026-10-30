@@ -52,6 +52,25 @@ export function hasHomeAuthorityToken() {
   return Boolean(homeAuthorityToken);
 }
 
+export function createHomeBackgroundImageReader() {
+  // Capture the authority that creates the frame's launch, before that launch
+  // awaits a response. A later Home session cannot change this reader's actor.
+  const token = homeAuthorityToken;
+  return async () => {
+    const currentAuthority = homeAuthorityToken;
+    if (!token || !currentAuthority) throw new Error("Home sign-in is required");
+    const response = await fetch("/api/apps/home/appearance/background-image", {
+      headers: { "x-elastos-home-token": token },
+      cache: "no-store",
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) throw new Error("Home could not read the background image");
+    const blob = await response.blob();
+    if (currentAuthority !== homeAuthorityToken) throw new Error("Home session changed");
+    return blob;
+  };
+}
+
 export async function fetchJson(url, init) {
   const requiresHomeAuthority = url === "/api/apps/home/launch"
     || url === "/api/apps/home/active-shell"

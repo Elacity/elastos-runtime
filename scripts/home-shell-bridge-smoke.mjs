@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-links-20261027a";
+const moduleVersion = "home-wallpaper-20261030a";
 const requests = [];
 const injectedProviderCalls = [];
 let extraWindowOpenCount = 0;

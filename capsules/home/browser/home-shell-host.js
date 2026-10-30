@@ -17,8 +17,9 @@ import {
   clearHomeAuthorityToken,
   shellState,
   fetchJson,
+  createHomeBackgroundImageReader,
   targetById,
-} from "./shell-core.js?v=home-links-20261027a";
+} from "./shell-core.js?v=home-wallpaper-20261030a";
 import {
   addAccountPasskey,
   bindHomeUnlock,
@@ -29,11 +30,11 @@ import {
   profileReadinessActionTarget,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-update-20261003a";
+} from "./shell-auth.js?v=home-wallpaper-20261030a";
 import {
   handleHomeWalletConnectorEffect,
   WALLET_CONNECTOR_EFFECT_TYPE,
-} from "./home-wallet-connector-host.js?v=home-update-20261003a";
+} from "./home-wallet-connector-host.js?v=home-wallpaper-20261030a";
 import {
   createHomeClipboardFrameState,
   createHomeClipboardHost,
@@ -525,12 +526,14 @@ async function launchHomeTarget(target, query = {}) {
       home_origin: window.location.origin,
     },
   };
+  const readBackgroundImage = [HOME_GUI_SHELL_ID, SYSTEM_APP_ID].includes(target)
+    ? createHomeBackgroundImageReader() : null;
   const launched = await fetchJson("/api/apps/home/launch", {
     method: "POST",
     body: JSON.stringify(body),
   });
   if (launched?.attach_kind === "iframe") {
-    rememberLaunchedAppContext(launched);
+    rememberLaunchedAppContext(launched, readBackgroundImage);
     if (pickerOwner) {
       const token = homeLaunchTokenFromRoute(launched.route);
       if (!currentLibraryPicker(pickerOwner) || pickerOwner.pickerToken) {
@@ -918,7 +921,7 @@ function replyToShellRequest(event, requestId, result, error = null) {
   }, OPAQUE_FRAME_TARGET);
 }
 
-function rememberLaunchedAppContext(launched) {
+function rememberLaunchedAppContext(launched, readBackgroundImage) {
   const token = homeLaunchTokenFromRoute(launched?.route || "");
   if (!token || !launched?.target) {
     throw new Error("Runtime returned an incomplete isolated launch");
@@ -928,6 +931,7 @@ function rememberLaunchedAppContext(launched) {
   }
   launchedAppContexts.set(token, {
     targetId: launched.target,
+    readBackgroundImage,
     browserInstance:
       launched.target === "browser"
         ? browserInstanceFromRoute(launched.route || "")
@@ -1645,6 +1649,24 @@ window.addEventListener("message", (event) => {
   const data = event.data;
   const context = homeMessageContext(event, data);
   if (!context) {
+    return;
+  }
+  if (data.type === "home:background-image") {
+    if (!hasExactMessageKeys(data, ["type", "requestId", "homeToken"])
+      || typeof data.requestId !== "string" || !data.requestId || data.requestId.length > 128
+      || !((context.kind === "shell-frame" && context.targetId === HOME_GUI_SHELL_ID)
+        || (context.kind === "app-frame" && context.targetId === SYSTEM_APP_ID))) return;
+    const launched = launchedAppContexts.get(context.homeToken);
+    if (!launched?.readBackgroundImage) return;
+    const reply = (blob) => {
+      const current = homeMessageContext(event, data);
+      if (current?.kind !== context.kind || current?.targetId !== context.targetId
+        || current?.homeToken !== context.homeToken
+        || launchedAppContexts.get(context.homeToken) !== launched) return;
+      event.source.postMessage({ type: "home:background-image-result",
+        requestId: data.requestId, blob }, OPAQUE_FRAME_TARGET);
+    };
+    launched.readBackgroundImage().then(reply, () => reply(null));
     return;
   }
   if (data.type === "home:navigation-hint") {

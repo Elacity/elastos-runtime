@@ -17,7 +17,7 @@ const require = createRequire(
   new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url),
 );
 
-export const { chromium } = require("playwright");
+export const { chromium } = require(process.env.ELASTOS_PLAYWRIGHT_MODULE || "playwright");
 
 export const CORS_HEADERS = Object.freeze({
   "access-control-allow-origin": "null",
@@ -226,6 +226,7 @@ async function serveStaticAsset(response, url, host, fixtureOptions) {
         ? "index.html"
         : pathname.slice("/apps/system/".length);
   } else if (
+    pathname === "/apps/home/home-background-image.js" ||
     pathname === "/apps/home/home-clipboard-client.js" ||
     pathname === "/apps/home/home-clipboard-protocol.js"
   ) {

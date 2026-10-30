@@ -4,6 +4,7 @@ import {
   provenanceView,
 } from "./esp-projections.mjs";
 import { createHomeClipboardClient } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+import { createHomeBackgroundImage } from "/apps/home/home-background-image.js?v=home-20261030a";
 
 const errorNode = document.querySelector(".system-error");
 const backgroundInput = document.querySelector("#background-input");
@@ -178,6 +179,14 @@ const homeClipboard = createHomeClipboardClient({
   targetId: "system",
   homeOrigin: homeParentOrigin,
   homeToken: frameHomeToken,
+});
+const backgroundImage = createHomeBackgroundImage({
+  homeOrigin: homeParentOrigin,
+  homeToken: frameHomeToken,
+  apply: (url) => {
+    if (backgroundPreview) backgroundPreview.style.backgroundImage = `url("${url || DEFAULT_BACKGROUND_IMAGE_URL}")`;
+  },
+  onError: () => showBackgroundStatus("Home could not load the image. Close System and open it to retry.", "error"),
 });
 
 boot().catch((error) => {
@@ -1573,7 +1582,7 @@ function applyAppearance(appearance) {
   window.elastosTheme?.setAccentCustom?.(appearance.accent_custom);
   window.elastosTheme?.setAccent?.(appearance.accent);
   if (backgroundPreview) {
-    backgroundPreview.style.backgroundImage = `url("${imageUrl || DEFAULT_BACKGROUND_IMAGE_URL}")`;
+    backgroundImage.update(imageUrl);
     backgroundPreview.dataset.empty = imageUrl ? "false" : "true";
   }
   if (backgroundResetButton) {

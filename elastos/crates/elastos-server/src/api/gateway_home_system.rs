@@ -8747,11 +8747,9 @@ pub(super) async fn home_background_image(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static(entry.content_type),
             );
-            // The Home GUI document is sandboxed without allow-same-origin, so
-            // its origin is opaque and never same-origin or same-site with the
-            // gateway. Under COEP require-corp an image without CORP is dropped,
-            // so `cross-origin` is the only value that lets it load. Access is
-            // still gated by the Home launch token above.
+            // Home owns this authenticated same-origin read and hands image
+            // bytes to the opaque GUI/System frames. CORP governs embedding;
+            // the Home token and browser provenance gates above own access.
             headers.insert(
                 axum::http::HeaderName::from_static("cross-origin-resource-policy"),
                 HeaderValue::from_static("cross-origin"),

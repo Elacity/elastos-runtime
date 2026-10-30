@@ -840,9 +840,6 @@ export function renderHomeGuiShell(summary, options = {}) {
 }
 
 export function syncHomeGuiAppearance(summary) {
-  const imageUrl = typeof summary?.appearance?.background_image_url === "string"
-    ? summary.appearance.background_image_url.trim()
-    : "";
   const overlayEnabled = summary?.appearance?.background_overlay_enabled === true;
   const overlayOpacityRaw = Number(summary?.appearance?.background_overlay_opacity);
   const overlayOpacity = Number.isFinite(overlayOpacityRaw)
@@ -853,11 +850,6 @@ export function syncHomeGuiAppearance(summary) {
   }
   desktopBackdrop.dataset.overlay = overlayEnabled ? "true" : "false";
   desktopBackdrop.style.setProperty("--desktop-overlay-opacity", String(overlayOpacity));
-  if (!imageUrl) {
-    desktopBackdrop.style.removeProperty("--desktop-wallpaper");
-    return;
-  }
-  desktopBackdrop.style.setProperty("--desktop-wallpaper", `url("${imageUrl}")`);
 }
 
 function targetsChanged(previous, next) {
