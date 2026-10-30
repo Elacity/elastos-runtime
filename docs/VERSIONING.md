@@ -95,7 +95,7 @@ Use dotted prerelease identifiers such as `-rc.31`, not `-rc31`.
 ## Pre-release Policy
 
 Use `-alpha.N` for a signed test release published while a version is still
-being built; the 0.8.0 train ships `0.8.0-alpha.N`. Use `-rc.N` for a signed
+being built; the 2.0.0 train ships `2.0.0-alpha.N` (after `0.8.0-alpha.26`). Use `-rc.N` for a signed
 candidate that is published before its final version.
 A monthly source release (a repository tag; signed releases over Carrier are
 the only binary distribution) uses plain `X.Y.Z`; its notes state what is not

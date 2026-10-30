@@ -99,17 +99,17 @@ Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/
 
 ## Releases
 
-- Weekly test releases (`0.8.0-alpha.N`, canary channel) are built from a
+- Weekly test releases (`2.0.0-alpha.N`, canary channel) are built from a
   `develop` merge commit through `.github/workflows/release-package.yml`
   (dispatched from `develop`) and published with `scripts/release-publish.sh`
   (see [Publishing a release](docs/VERSIONING.md#publishing-a-release)). Each one
   gets one comment on #93 naming its commit and accepted scope.
-- Milestones: `0.8.0` (the five first-release goals, phones, isolation S0-S2 and
-  the release gates in #93) and `After 0.8.0`. There are no weekly milestones.
+- Milestones: `2.0.0` (the five first-release goals, phones, isolation S0-S2 and
+  the release gates in #93) and `After 2.0.0`. There are no weekly milestones.
 - `main` changes only when a stable release is tagged: a release PR from the
   accepted `develop` commit, then `vX.Y.Z` on the merge commit, then `main`
   merges back into `develop`.
-- 0.8.0 ships when every result in the 0.8.0 milestone meets its Done means.
+- 2.0.0 ships when every result in the 2.0.0 milestone meets its Done means.
 
 ## Branch Lifecycle
 
