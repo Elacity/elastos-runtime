@@ -19,7 +19,7 @@ import {
   fetchJson,
   createHomeBackgroundImageReader,
   targetById,
-} from "./shell-core.js?v=home-wallpaper-20261030a";
+} from "./shell-core.js?v=home-wallpaper-20261030b";
 import {
   addAccountPasskey,
   bindHomeUnlock,
@@ -30,11 +30,11 @@ import {
   profileReadinessActionTarget,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-wallpaper-20261030a";
+} from "./shell-auth.js?v=home-wallpaper-20261030b";
 import {
   handleHomeWalletConnectorEffect,
   WALLET_CONNECTOR_EFFECT_TYPE,
-} from "./home-wallet-connector-host.js?v=home-wallpaper-20261030a";
+} from "./home-wallet-connector-host.js?v=home-wallpaper-20261030b";
 import {
   createHomeClipboardFrameState,
   createHomeClipboardHost,

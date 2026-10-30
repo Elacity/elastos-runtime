@@ -39,13 +39,23 @@ export const shellState = {
 };
 
 let homeAuthorityToken = "";
+let homeAuthorityContext = null;
 
-export function setHomeAuthorityToken(value) {
+export function setHomeAuthorityToken(value, session = {}) {
   homeAuthorityToken = typeof value === "string" ? value.trim() : "";
+  const fields = [session?.principal_id, session?.session_id, session?.proof_binding_id];
+  const identity = fields.every((field) => typeof field === "string" && field.trim())
+    ? JSON.stringify(fields) : null;
+  if (!homeAuthorityToken) {
+    homeAuthorityContext = null;
+  } else if (!identity || homeAuthorityContext?.identity !== identity) {
+    homeAuthorityContext = { identity };
+  }
 }
 
 export function clearHomeAuthorityToken() {
   homeAuthorityToken = "";
+  homeAuthorityContext = null;
 }
 
 export function hasHomeAuthorityToken() {
@@ -53,20 +63,20 @@ export function hasHomeAuthorityToken() {
 }
 
 export function createHomeBackgroundImageReader() {
-  // Capture the authority that creates the frame's launch, before that launch
-  // awaits a response. A later Home session cannot change this reader's actor.
-  const token = homeAuthorityToken;
+  // The authenticated session response identifies the launch's authority.
+  // Token renewal keeps it; sign-out or another session retires the reader.
+  const authority = homeAuthorityContext;
   return async () => {
-    const currentAuthority = homeAuthorityToken;
-    if (!token || !currentAuthority) throw new Error("Home sign-in is required");
+    if (!homeAuthorityToken) throw new Error("Home sign-in is required");
+    if (!authority || authority !== homeAuthorityContext) throw new Error("Home session changed");
     const response = await fetch("/api/apps/home/appearance/background-image", {
-      headers: { "x-elastos-home-token": token },
+      headers: { "x-elastos-home-token": homeAuthorityToken },
       cache: "no-store",
       signal: AbortSignal.timeout(15_000),
     });
     if (!response.ok) throw new Error("Home could not read the background image");
     const blob = await response.blob();
-    if (currentAuthority !== homeAuthorityToken) throw new Error("Home session changed");
+    if (authority !== homeAuthorityContext) throw new Error("Home session changed");
     return blob;
   };
 }

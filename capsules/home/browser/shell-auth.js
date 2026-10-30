@@ -2,7 +2,7 @@ import {
   clearHomeAuthorityToken,
   fetchJson,
   setHomeAuthorityToken,
-} from "./shell-core.js?v=home-wallpaper-20261030a";
+} from "./shell-core.js?v=home-wallpaper-20261030b";
 import { ownerRecoveryCommand } from "./owner-recovery-command.js?v=home-update-20261003a";
 
 const unlockPanel = document.querySelector("#home-unlock");
@@ -247,7 +247,7 @@ export function refreshHomeSession({ signal } = {}) {
       signal: signal || controller.signal,
     })
       .then((response) => {
-        setHomeAuthorityToken(response?.home_token);
+        setHomeAuthorityToken(response?.home_token, response);
         return response;
       })
       .catch((error) => {
@@ -733,7 +733,7 @@ async function completeEnrollmentRecovery() {
   }
   if (readText(response.home_token)) {
     recoverySession = { ...recoverySession, home_token: response.home_token };
-    setHomeAuthorityToken(response.home_token);
+    setHomeAuthorityToken(response.home_token, response);
   }
   recoveryTerminalToken = readText(response.runtime_audit?.retry_token);
   const incomplete = recoveryImportIncompleteMessage(response);
@@ -862,7 +862,7 @@ async function runPasskeyCreate() {
     try { window.sessionStorage.removeItem(PENDING_REGISTRATION_KEY); }
     catch (_) { throw new Error("Home cannot clear setup retry data. Check browser storage and retry."); }
     pendingRegistration = null;
-    setHomeAuthorityToken(response?.home_token);
+    setHomeAuthorityToken(response?.home_token, response);
     if (pending.intent.purpose === "recover") {
       recoverySession = response;
       await completeEnrollmentRecovery();
@@ -947,7 +947,7 @@ async function runOwnerRecovery() {
       throw new Error("Home recovery returned an invalid completion.");
     }
     if (ownerRecoveryCode) ownerRecoveryCode.value = "";
-    setHomeAuthorityToken(response.home_token);
+    setHomeAuthorityToken(response.home_token, response);
     recoverySession = response;
     await completeEnrollmentRecovery();
   } catch (error) {
@@ -984,7 +984,7 @@ async function runPasskeySignIn() {
         response: serializeAssertionCredential(credential),
       }),
     });
-    setHomeAuthorityToken(response?.home_token);
+    setHomeAuthorityToken(response?.home_token, response);
     stage = "open";
     await unlockComplete(response);
   } catch (error) {
