@@ -1473,6 +1473,45 @@ function logEvent(event, fields = {}) {
   })}\n`);
 }
 
+function boundedLogText(value, maxChars = 240) {
+  const text = String(value ?? "");
+  return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+}
+
+// Input bodies carry typed text, URLs and files, so only the event type and
+// resize geometry are logged, with the guest's bounded error message. Every
+// failed input and every resize outcome is logged: the gateway rejects a
+// resize receipt whose page, geometry or sequence does not match the request.
+function logPageInput(rawPageId, event, startedAt, result, error = null) {
+  let pageId = rawPageId;
+  try { pageId = decodeURIComponent(rawPageId); } catch { /* keep the raw segment */ }
+  const integer = value => (Number.isSafeInteger(value) ? value : null);
+  const type = typeof event?.type === "string" && /^[a-z_]{1,32}$/.test(event.type) ? event.type : "invalid";
+  const fields = { page_id: boundedLogText(pageId), event_type: type, duration_ms: Date.now() - startedAt };
+  if (type === "resize") {
+    fields.requested = { width: integer(event.width), height: integer(event.height), sequence: integer(event.sequence) };
+  }
+  if (error) {
+    logEvent("page_input_failed", {
+      ...fields,
+      guest_status: integer(error?.guestStatus),
+      code: typeof error?.code === "string" ? boundedLogText(error.code) : null,
+      error: boundedLogText(error instanceof Error ? error.message : error),
+    });
+    return;
+  }
+  logEvent("page_input_resize", {
+    ...fields,
+    schema: typeof result?.schema === "string" ? boundedLogText(result.schema) : null,
+    page_id_match: result?.page_id === pageId,
+    accepted: typeof result?.accepted === "boolean" ? result.accepted : null,
+    width: integer(result?.width),
+    height: integer(result?.height),
+    sequence: integer(result?.sequence),
+    resize_error: typeof result?.resize_error?.code === "string" ? boundedLogText(result.resize_error.code) : null,
+  });
+}
+
 function parseVzMediaDiagnostic(line, launch) {
   if (typeof line !== "string" || line.length === 0 || line.length > 8192) {
     return null;
@@ -2818,8 +2857,9 @@ function requestJsonOverUnix(
             }
           }
           if (res.statusCode < 200 || res.statusCode >= 300) {
-            reject((requestPath.endsWith("/inspect") ? browserInspectionControlError(parsed, res.statusCode) : null) || browserDisplayControlError(parsed) ||
-              new Error((typeof parsed?.error === "string" && parsed.error) || `Browser VM guest control ${method} ${requestPath} failed: HTTP ${res.statusCode}`));
+            const error = (requestPath.endsWith("/inspect") ? browserInspectionControlError(parsed, res.statusCode) : null) || browserDisplayControlError(parsed) ||
+              new Error((typeof parsed?.error === "string" && parsed.error) || `Browser VM guest control ${method} ${requestPath} failed: HTTP ${res.statusCode}`);
+            reject(Object.assign(error, { guestStatus: res.statusCode }));
             return;
           }
           resolve(parsed);
@@ -4817,18 +4857,17 @@ function main() {
       }
       const pageInputMatch = url.pathname.match(/^\/pages\/([^/]+)\/input$/);
       if (req.method === "POST" && pageInputMatch) {
+        const startedAt = Date.now();
+        let event;
         try {
-          sendJson(
-            200,
-            await proxyGuestPageInput(
-              config,
-              activePages,
-              activeVms,
-              decodeURIComponent(pageInputMatch[1]),
-              await readJsonBody(req, MAX_BROWSER_INPUT_BODY_BYTES),
-            ),
-          );
+          const pageId = decodeURIComponent(pageInputMatch[1]);
+          const body = await readJsonBody(req, MAX_BROWSER_INPUT_BODY_BYTES);
+          event = body?.event;
+          const result = await proxyGuestPageInput(config, activePages, activeVms, pageId, body);
+          if (event?.type === "resize") logPageInput(pageInputMatch[1], event, startedAt, result);
+          sendJson(200, result);
         } catch (error) {
+          logPageInput(pageInputMatch[1], event, startedAt, null, error);
           sendJson(404, { error: error instanceof Error ? error.message : String(error) });
         }
         return;

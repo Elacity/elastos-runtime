@@ -1,4 +1,4 @@
-import { observeBrowserStage, createBrowserFrameFence } from "./browser-resize.js?v=browser-20261031a";
+import { observeBrowserStage, createBrowserFrameFence } from "./browser-resize.js?v=browser-20261031c";
 import { createBrowserLocationController } from "./browser-location.js?v=browser-20260523b";
 import {
   DEFAULT_URL,
@@ -1639,6 +1639,9 @@ async function sendBrowserInput(
     return dispatchBrowserInput(event, { focus, history }, owner);
   });
   queue.tail = pending.catch(() => {
+    // A failed resize leaves only the guest geometry unknown. The frame fence
+    // holds pointer input until a resize is accepted, so later input still runs.
+    if (event?.type === "resize") return;
     // Delivery can be uncertain. Abandon dependent input without replaying it.
     queue.failed = true;
     if (browserInputQueue === queue) {

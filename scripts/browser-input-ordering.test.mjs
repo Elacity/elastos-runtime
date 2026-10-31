@@ -532,3 +532,23 @@ test("typed resize refusal keeps later owner input usable", async () => {
   const click = h.submit({ type: "click", x: 0, y: 0 });
   await nextTurn(); h.requests[1].ack(); assert.equal((await click).status, "fulfilled");
 });
+
+test("a failed resize does not cancel queued input; the navigate behind it is still sent", async () => {
+  const h = harness();
+  const resize = h.submit({ type: "resize", width: 390, height: 1200, sequence: 1 });
+  const navigate = h.submit({ type: "browser_command", command: "navigate", url: "https://fixture.invalid/next" });
+  const typed = h.submit(text("e"));
+  await nextTurn();
+  assert.deepEqual(h.requests.map(request => request.event.type), ["resize"]);
+  const error = Object.assign(new Error("Browser Engine returned an invalid resize receipt"), { status: 502 });
+  h.requests[0].reject(error);
+  assert.equal((await resize).error, error);
+  await nextTurn();
+  assert.deepEqual(h.requests.map(request => request.event.type), ["resize", "browser_command"]);
+  assert.equal(h.requests[1].event.url, "https://fixture.invalid/next");
+  h.requests[1].ack({ accepted: true, actual_url: "https://fixture.invalid/next" });
+  await nextTurn();
+  assert.equal(h.requests[2]?.event.text, "e");
+  h.requests[2].ack();
+  assert.ok((await Promise.all([navigate, typed])).every(result => result.status === "fulfilled"));
+});
