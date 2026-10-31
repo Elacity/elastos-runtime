@@ -137,7 +137,7 @@ pub fn save_trusted_sources(
     config: &TrustedSourcesConfig,
 ) -> anyhow::Result<()> {
     let _writer = crate::install_transaction::acquire_installed_writer(data_dir)?;
-    std::fs::create_dir_all(data_dir)?;
+    crate::setup::create_data_directory_with_safe_modes(data_dir)?;
     let json = serde_json::to_string_pretty(config)?;
     std::fs::write(trusted_sources_path(data_dir), json)?;
     Ok(())

@@ -1984,7 +1984,7 @@ pub(crate) fn ensure_media_provider_directory(path: &Path, label: &str) -> anyho
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if let Some(parent) = path.parent() {
                 if !parent.exists() {
-                    fs::create_dir_all(parent).map_err(|_| {
+                    crate::setup::create_data_directory_with_safe_modes(parent).map_err(|_| {
                         invalid_media_provider_config(format!(
                             "{label} parent could not be created"
                         ))

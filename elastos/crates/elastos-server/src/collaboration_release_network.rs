@@ -191,7 +191,7 @@ impl ReleaseNetworkOutcome {
 /// network; leaving Community is a separate step. A configuration that is
 /// not the release network belongs to the Home's operator and is kept.
 pub fn choose_isolated(data_dir: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(data_dir)?;
+    crate::setup::create_data_directory_with_safe_modes(data_dir)?;
     // Runtime startup takes the same lock to read and accept the network, so
     // the check, the choice and the removal below cannot interleave with it.
     let _choice = lock_network_choice(data_dir)?;
@@ -428,7 +428,7 @@ fn apply_release_network(
     let network_id = pin.expected_network_id.clone();
     let dest = data_dir.join(COLLABORATION_STARTUP_CONFIG_FILE);
     if fs::symlink_metadata(&dest).is_err() {
-        fs::create_dir_all(data_dir)?;
+        crate::setup::create_data_directory_with_safe_modes(data_dir)?;
         create_owner_only_file(&dest, release, "collaboration network configuration")?;
         return Ok(ReleaseNetworkOutcome::Joined { network_id });
     }

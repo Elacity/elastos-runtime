@@ -1999,6 +1999,64 @@ class PublisherFixtureTests(unittest.TestCase):
         self.assertEqual(len(requests), 2)
 
 
+class RuntimeDirectSetupTests(unittest.TestCase):
+    """Tests for the Runtime's own directory creation (setup.rs, protected_content_runtime.rs)"""
+
+    def test_direct_setup_under_group_umask_creates_safe_data_root(self):
+        """Fresh setup under umask 0002 with ~/.local/share missing must create 0700 data root.
+        
+        Tests that directory creation (via data_dir() in config.rs, used by setup.rs and
+        protected_content_runtime.rs) creates ancestors with 0755 and the data root with 0700,
+        even under a group-writable umask.
+        """
+        runtime = Path(__file__).resolve().parent.parent / "elastos/target/release/elastos"
+        if not runtime.exists():
+            self.skipTest(f"Runtime binary not found at {runtime}; run 'just build' first")
+        
+        with tempfile.TemporaryDirectory(prefix="runtime-setup-test-") as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            # Do NOT create ~/.local or ~/.local/share - let the Runtime create them
+            # Do NOT set XDG_DATA_HOME - let it default to ~/.local/share
+            
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            env.pop("XDG_DATA_HOME", None)  # Ensure it's unset
+            
+            # Run identity show under umask 0002 (group-writable) to trigger data directory creation
+            result = subprocess.run(
+                ["bash", "-c", f"umask 0002; exec {shlex.quote(str(runtime))} identity show"],
+                env=env,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                self.fail(f"Identity show failed:\nstdout: {result.stdout}\nstderr: {result.stderr}")
+            
+            # Check created directories
+            local = home / ".local"
+            share = home / ".local/share"
+            data = home / ".local/share/elastos"
+            
+            for path, expected_mode, label in [
+                (local, 0o755, "~/.local"),
+                (share, 0o755, "~/.local/share"),
+                (data, 0o700, "~/.local/share/elastos")
+            ]:
+                if not path.exists():
+                    self.fail(f"{label} was not created. Existing: {list(home.rglob('*'))}")
+                
+                actual_mode = path.stat().st_mode & 0o777
+                self.assertEqual(
+                    actual_mode, expected_mode,
+                    f"{label} has mode {oct(actual_mode)}, expected {oct(expected_mode)}\n"
+                    f"All modes: .local={oct((local.stat().st_mode & 0o777))}, "
+                    f"share={oct((share.stat().st_mode & 0o777))}, "
+                    f"data={oct((data.stat().st_mode & 0o777))}"
+                )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bash", default="/bin/bash")
