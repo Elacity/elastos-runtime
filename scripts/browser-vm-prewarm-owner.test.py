@@ -32,11 +32,12 @@ def identity(pid):
 
 
 def wait_gone(pid, start, seconds):
-    """True once the process named by (pid, start) is observed to be gone."""
+    """True once the process named by (pid, start) is observed to be gone. With
+    start None (identity never observed) only an absent pid counts as gone."""
     deadline = time.monotonic() + seconds
     while True:
         current = identity(pid)
-        if current is not None and current != start:
+        if current == GONE or (start is not None and current is not None and current != start):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -58,22 +59,27 @@ class BrowserVmPrewarmOwner(unittest.TestCase):
         self.node = node
 
     def tearDown(self):
+        survivors = self.stop_services()
+        if survivors:
+            self.fail(f"control service {survivors} did not exit; fixture kept at {self.directory}")
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+    def stop_services(self):
         # Closing every owner pipe stops the services; force only a process
-        # that is still the exact one this test started.
+        # that is still the exact one this test started, never one whose
+        # identity was not observed. Returns the pids that did not exit.
         for writer in list(self.writers):  # close_owner removes from the list
             self.close_owner(writer)
-        survivors = False
+        survivors = []
         for pid, start in self.services.items():
             if wait_gone(pid, start, 5):
                 continue
-            if identity(pid) == start:  # still exactly our process; anything else is left alone
+            if start is not None and identity(pid) == start:  # still exactly our process
                 os.kill(pid, signal.SIGKILL)
                 if wait_gone(pid, start, 5):
                     continue
-            survivors = True
-        if survivors:
-            self.fail(f"control service did not exit; fixture kept at {self.directory}")
-        shutil.rmtree(self.directory, ignore_errors=True)
+            survivors.append(pid)
+        return survivors
 
     def close_owner(self, writer):
         if writer in self.writers:
@@ -104,9 +110,13 @@ class BrowserVmPrewarmOwner(unittest.TestCase):
             os.close(reader)
         self.assertEqual(result.returncode, 0, result.stderr)
         pid = json.loads(result.stdout)["control_status"]["pid"]
+        # Register before observing, so teardown verifies this pid exits even
+        # if the observation below fails (None = identity unknown, never signalled).
+        self.services.setdefault(pid, None)
         observed = identity(pid)
         self.assertTrue(observed and observed != GONE, f"could not observe control service {pid}")
-        self.services.setdefault(pid, observed)
+        if self.services[pid] is None:
+            self.services[pid] = observed
         return pid, writer
 
     def status(self):
@@ -144,6 +154,20 @@ class BrowserVmPrewarmOwner(unittest.TestCase):
         self.close_owner(owner)
         self.assertTrue(wait_gone(first, self.services[first], 5), "the service must exit with its owner")
         self.assertFalse((self.directory / "control.sock").exists(), "owned socket remains")
+
+    def test_failed_initial_observation_still_verifies_exit(self):
+        global identity
+        real = identity
+        identity = lambda pid: None  # the first observation fails
+        try:
+            with self.assertRaises(AssertionError):
+                self.prewarm()
+        finally:
+            identity = real
+        [(pid, start)] = self.services.items()
+        self.assertIsNone(start, "unobserved service must be registered without an identity")
+        self.assertEqual(self.stop_services(), [])
+        self.assertEqual(identity(pid), GONE)
 
 
 if __name__ == "__main__":
