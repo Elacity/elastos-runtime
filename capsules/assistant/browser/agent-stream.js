@@ -369,14 +369,17 @@ function startsMarkdownBlock(line) {
 /* One list starting at lines[start]. Items continue across blank lines while
    the next marker has the same kind and indent; non-list text directly under
    an item (or indented after a blank) joins that item; deeper markers form a
-   nested list inside the current item. Returns the html and the next line. */
+   nested list inside the current item. An ordered list says how many digits
+   its widest number has, so its gutter fits "10." as well as "9.". Returns
+   the html and the next line. */
 function renderMarkdownList(lines, start) {
   const first = MD_LIST_ITEM.exec(lines[start]);
   const indent = first[1].length;
   const ordered = /\d/.test(first[2]);
   const tag = ordered ? "ol" : "ul";
   const number = ordered ? Number.parseInt(first[2], 10) : 1;
-  let html = `<${tag} class="agent-md-list"${number !== 1 ? ` start="${number}"` : ""}>`;
+  let html = "";
+  let items = 0;
   let j = start;
   for (;;) {
     const marker = MD_LIST_ITEM.exec(lines[j]);
@@ -438,11 +441,14 @@ function renderMarkdownList(lines, start) {
     }
     flushText();
     html += `<li>${body}</li>`;
+    items += 1;
     if (!nextItem) {
       break;
     }
   }
-  return { html: `${html}</${tag}>`, next: j };
+  const digits = ordered ? Math.min(String(number + items - 1).length, 4) : 1;
+  const attrs = `${number !== 1 ? ` start="${number}"` : ""}${digits > 1 ? ` data-marker-digits="${digits}"` : ""}`;
+  return { html: `<${tag} class="agent-md-list"${attrs}>${html}</${tag}>`, next: j };
 }
 
 function renderMarkdownBlocks(raw) {
@@ -2129,6 +2135,9 @@ async function startLiveTurnForPrompt(userText, { resumeTurn = null } = {}) {
         reasoning: ctx.reasoningVisible ? getReasoning() : "",
         reasoningVisible: ctx.reasoningVisible,
       });
+      /* The status line appears and grows below the newest message: a
+         following reader keeps it in view above the composer. */
+      followAfterFlush();
     },
   });
   revealTimer = window.setTimeout(() => {

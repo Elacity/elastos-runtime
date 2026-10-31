@@ -64,6 +64,15 @@ test("an ordered list keeps the model's first number", () => {
   assert.equal(count(html, /<ol class="agent-md-list" start="2">/g), 1);
 });
 
+test("an ordered list with two- or three-digit numbers says so, for its gutter", () => {
+  const items = (n) => Array.from({ length: n }, (_, i) => `${i + 1}. item`).join("\n");
+  assert.match(renderMarkdown(items(9)), /^<ol class="agent-md-list"><li>/);
+  assert.match(renderMarkdown(items(25)), /^<ol class="agent-md-list" data-marker-digits="2"><li>/);
+  assert.equal(count(renderMarkdown(items(25)), /<li>/g), 25);
+  assert.match(renderMarkdown("98. a\n99. b\n100. c"), /^<ol class="agent-md-list" start="98" data-marker-digits="3">/);
+  assert.match(renderMarkdown("- a\n- b"), /^<ul class="agent-md-list"><li>/);
+});
+
 test("list text is still HTML-escaped", () => {
   const html = renderMarkdown('1. <img src=x onerror="alert(1)">\n   <b>under</b>');
   assert.ok(!html.includes("<img"));

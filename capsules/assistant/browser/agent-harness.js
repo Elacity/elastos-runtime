@@ -398,15 +398,22 @@ function toggleSidebarCollapsed() {
   setSidebarCollapsed(!collapsed);
 }
 
-let lastComposerGeometryKey = "";
+/* A reader this close to the transcript's end counts as at the end. */
+const READER_AT_END_PX = 8;
+let lastComposerColumnKey = "";
+let lastComposerClearance = -1;
+/* During a turn the column stays put while the stream grows. */
+let composerColumnFrozen = false;
 let composerGeometryRoRaf = 0;
 let composerGeometrySyncing = false;
 let composerGeometryBurstAt = 0;
 let composerGeometryBurst = 0;
 
 /* `tracking`: a bounded per-frame follow of a CSS ease (the rail collapse);
-   it is not a ResizeObserver feedback loop, so the burst guard stands aside. */
-function syncComposerGeometry({ tracking = false } = {}) {
+   it is not a ResizeObserver feedback loop, so the burst guard stands aside.
+   `clearanceOnly`: during a turn only the stream's bottom clearance follows
+   the composer (a follow-up being typed grows it). */
+function syncComposerGeometry({ tracking = false, clearanceOnly = false } = {}) {
   const taskbar = document.querySelector(".taskbar");
   const main = document.querySelector(".agent-harness-main");
   if (!taskbar || !main || !document.body.classList.contains("agent-harness-active")) {
@@ -441,23 +448,42 @@ function syncComposerGeometry({ tracking = false } = {}) {
     }
   }
   const dock = taskbar.getBoundingClientRect();
-  const band = main.getBoundingClientRect();
-  /* Round to device pixels so left/right edges don’t drift by a subpixel. */
-  const dpr = window.devicePixelRatio || 1;
-  const snap = (n) => Math.round(n * dpr) / dpr;
-  const width = snap(dock.width);
-  const left = snap(dock.left - band.left);
   const clearance = Math.max(96, Math.round(window.innerHeight - dock.top));
-  const key = `${width}|${left}|${clearance}`;
-  if (key === lastComposerGeometryKey) {
+  let width = 0;
+  let left = 0;
+  let columnKey = lastComposerColumnKey;
+  if (!clearanceOnly) {
+    const band = main.getBoundingClientRect();
+    /* Round to device pixels so left/right edges don’t drift by a subpixel. */
+    const dpr = window.devicePixelRatio || 1;
+    const snap = (n) => Math.round(n * dpr) / dpr;
+    width = snap(dock.width);
+    left = snap(dock.left - band.left);
+    columnKey = `${width}|${left}`;
+  }
+  if (columnKey === lastComposerColumnKey && clearance === lastComposerClearance) {
     return;
   }
-  lastComposerGeometryKey = key;
+  /* Measured before the writes: a reader at the end stays at the end, so the
+     newest message and the turn's status line stay above the composer as it
+     grows. */
+  const scroller = streamScrollEl();
+  const atEnd = Boolean(scroller) &&
+    scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= READER_AT_END_PX;
   composerGeometrySyncing = true;
   const root = document.documentElement;
-  root.style.setProperty("--harness-composer-clearance", `${clearance}px`);
-  root.style.setProperty("--agent-column-width", `${width}px`);
-  root.style.setProperty("--agent-column-left", `${left}px`);
+  if (clearance !== lastComposerClearance) {
+    root.style.setProperty("--harness-composer-clearance", `${clearance}px`);
+    lastComposerClearance = clearance;
+  }
+  if (columnKey !== lastComposerColumnKey) {
+    root.style.setProperty("--agent-column-width", `${width}px`);
+    root.style.setProperty("--agent-column-left", `${left}px`);
+    lastComposerColumnKey = columnKey;
+  }
+  if (atEnd) {
+    scroller.scrollTop = scroller.scrollHeight;
+  }
   requestAnimationFrame(() => {
     composerGeometrySyncing = false;
   });
@@ -472,15 +498,12 @@ function observeDockGeometry() {
     dockResizeObserver.disconnect();
   }
   dockResizeObserver = new ResizeObserver(() => {
-    if (turnBusy) {
-      return;
-    }
     if (composerGeometryRoRaf) {
       return;
     }
     composerGeometryRoRaf = requestAnimationFrame(() => {
       composerGeometryRoRaf = 0;
-      syncComposerGeometry();
+      syncComposerGeometry({ clearanceOnly: composerColumnFrozen });
     });
   });
   /* Observe the dock only. Watching `main` re-fired on every stream height
@@ -494,14 +517,11 @@ function stopDockGeometryObserver() {
   dockResizeObserver = null;
 }
 
-/** Suspend dock geometry work for the whole turn (stream growth). */
+/** For the whole turn the column stays put while the stream grows; the
+    clearance still follows the composer. */
 function setComposerGeometrySuspended(suspended) {
+  composerColumnFrozen = suspended;
   if (suspended) {
-    if (composerGeometryRoRaf) {
-      cancelAnimationFrame(composerGeometryRoRaf);
-      composerGeometryRoRaf = 0;
-    }
-    stopDockGeometryObserver();
     return;
   }
   observeDockGeometry();

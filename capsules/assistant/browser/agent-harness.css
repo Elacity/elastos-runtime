@@ -2378,6 +2378,20 @@ html[data-agent-reasoning="off"] .agent-thinking {
   min-width: 0;
 }
 
+/* Numbers hang outside in the gutter and a message clips its paint
+   (contain: content), so the gutter grows a digit for "10." and "100.". */
+.agent-md-list[data-marker-digits="2"] {
+  padding-inline-start: calc(1.4em + 1ch);
+}
+
+.agent-md-list[data-marker-digits="3"] {
+  padding-inline-start: calc(1.4em + 2ch);
+}
+
+.agent-md-list[data-marker-digits="4"] {
+  padding-inline-start: calc(1.4em + 3ch);
+}
+
 .agent-md-list li {
   margin: 0;
 }
