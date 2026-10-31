@@ -10,11 +10,11 @@
  * UI ≠ authority: Space switches never mint Capsule/Carrier grants.
  */
 
-import { shellState } from "./shell-core.js?v=home-20261031a";
+import { shellState } from "./shell-core.js?v=home-20261031b";
 import {
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20261031a";
+} from "./shell-window-geometry.js?v=home-20261031b";
 
 const DESKTOP_STAGE = "desktop";
 /* Singleton Agent Space — the Assistant's room, pinned far left of the ring.

@@ -628,10 +628,18 @@ generic Browser capsules still speak the Runtime Browser ABI, not raw host input
 APIs. Browser commands such as address navigation, back, forward, and reload
 remain Runtime/provider input calls; the Selkies control service applies them
 over private CDP and returns the current page state with `direct_network=false`.
-The product raster is fixed at 1920x1080 with DPR 1. Home resizes only the
-viewer using `object-fit: contain`, and maps input through decoded-video
-coordinates. Home CSS dimensions never resize the guest compositor or page
-raster.
+Home sends the visible Browser content size after the remote display has its
+first decoded frame. Runtime forwards the resize to the Engine, which holds
+native input while it changes the compositor, Chromium window and page viewport
+as one transaction. Width and height are independent, rounded to even pixels,
+and limited to 320..3840 by 240..2160 with an area cap of 2,073,600 pixels.
+Larger stages scale down proportionally to that cap. It keeps the encoded area
+within the 1920x1080 budget for the 16 Mbps video profile.
+The Engine uses device scale factor 1 and preserves page zoom. It verifies the
+layout viewport, including scrollbars, in an isolated JavaScript world. Home
+uses `object-fit: contain` and maps input through decoded-video coordinates.
+After the resize ACK, pointer mapping waits for matching decoded dimensions,
+with a one-second limit so a stalled stream can recover.
 Browser status polling consumes that page state, including `can_go_back` and
 `can_go_forward`, so visible navigation follows Chromium's actual history
 instead of a UI-side shadow model. Address-bar submits in an active hosted
@@ -661,10 +669,11 @@ service, writes target diagnostics, and stays in the foreground until `/shutdown
 or process termination cleans up the target. The smoke above is now only a `--verify
 --cleanup-after-verify` wrapper around this launcher, so the tested path and the
 launched path do not drift. The launcher defaults to a product H.264
-profile (`x264enc`, fixed 1920x1080 stream/page raster at DPR 1, 30 fps,
-16 Mbps) and exposes `--selkies-encoder`, `--selkies-framerate`,
-`--selkies-video-bitrate`, and `--selkies-h264-crf` for codec tuning. Raster
-size and resolution mode are not operator configuration.
+profile (`x264enc`, initial 1920x1080 stream/page raster, device scale factor 1,
+30 fps, 16 Mbps) and exposes `--selkies-encoder`, `--selkies-framerate`,
+`--selkies-video-bitrate`, and `--selkies-h264-crf` for codec tuning. The visible
+Browser stage supplies resize intent within the encoded-area cap. A hosted
+control service needs the guest writer socket and XRandR to apply that intent.
 Helper Rust binaries are built into a shared
 `${XDG_CACHE_HOME:-$HOME/.cache}/elastos/browser-selkies-cargo-target` cache by
 default, not into each session directory. Per-launch Browser startup must not
@@ -679,11 +688,15 @@ single-writer user-data directory. This is the current hosted-provider bridge
 toward principal-owned Browser state; the final protected object root remains
 `localhost://Users/<principal>/BrowserProfiles/...` or an equivalent encrypted
 provider-owned root.
-The invariant is one fixed 1920x1080 compositor, capture surface, and page
-raster at DPR 1. The earlier dynamic CDP viewport path is retired because a
-smaller emulated viewport left blank right/bottom regions inside the encoded
-frame. Browser window resize changes only the contained viewer; decoded frame
-progress and decoded-video coordinate mapping must remain stable.
+The Engine owns one compositor, capture surface and Chromium window geometry.
+It publishes a new size after all three settle and restores the prior size if a
+transaction fails. Selkies carries media and input; its datachannel resize
+commands are filtered by the writer gate. Retired writer IDs use a bounded
+history, so repeated resizes leave capacity for later operator control.
+The Engine queues resize while an operator lease exists. The owner-input
+Runtime route currently returns control to the owner before forwarding the
+request. Preserving an operator lease across that route requires Runtime
+scheduling support.
 `browser-engine-adapter` accepts supervisor timeouts up to 300 seconds because
 per-launch hosted session supervisors may need more than the old 30-second proof
 limit. A configured adapter-level `control_socket_path` is no longer sufficient
@@ -693,7 +706,14 @@ returned by the launch result for that specific page.
 Each Browser profile is owned by one VM session so the principal-owned profile
 disk is mounted writable in exactly one place. That VM can host multiple Browser page
 sessions through `/pages` and `/pages/:id/*`; opening a second Browser page
-must not recycle or kill the first page. Operators can inspect a launched target
+must preserve the first page. Resize requires one page on the shared display.
+With several pages it returns `resize_shared_display`; without a guest gate
+socket or XRandR it returns `resize_unavailable`. These typed refusals use an
+input result with `accepted=false` and `resize_error`, so Runtime keeps the page
+active and the viewer can retry. Docker-hosted targets without those guest
+controls retain their existing raster. A page dialog returns
+`resize_dialog_open` until the user closes it.
+Operators can inspect a launched target
 state through `GET /status` on the Selkies control socket. It returns
 `elastos.browser.selkies-control.status/v1` with `active_pages`, `page_ids`,
 `single_session`, `single_vm_session=true`, and `direct_network=false`; this is

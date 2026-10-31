@@ -21,6 +21,7 @@ export function bindBrowserInputSurface({
   getInputOwner,
   sameInputOwner,
   getCurrentView,
+  inputBlocked = () => false,
   keyboardCapture,
   pasteHostClipboardIntoRemote,
   readHostClipboardText,
@@ -113,6 +114,7 @@ export function bindBrowserInputSurface({
   }
 
   function browserPointFromEvent(event, clampToMedia = false) {
+    if (inputBlocked()) return null;
     const target = remoteVideo;
     if (!target || target.hidden) {
       return null;
@@ -131,8 +133,8 @@ export function bindBrowserInputSurface({
       return null;
     }
     return {
-      x: Math.max(0, Math.min(width, x)),
-      y: Math.max(0, Math.min(height, y)),
+      x: Math.max(0, Math.min(width - 1, Math.floor(x))),
+      y: Math.max(0, Math.min(height - 1, Math.floor(y))),
     };
   }
 
@@ -220,12 +222,14 @@ export function bindBrowserInputSurface({
   }
 
   function queueWheelInput(point, deltaX, deltaY) {
+    if (inputBlocked()) return;
     wheelDelta.x += deltaX;
     wheelDelta.y += deltaY;
     window.clearTimeout(wheelTimer);
     wheelTimer = window.setTimeout(() => {
       const delta = wheelDelta;
       wheelDelta = { x: 0, y: 0 };
+      if (inputBlocked()) return;
       sendBrowserInput(
         {
           type: "wheel",

@@ -1,3 +1,4 @@
+import { observeBrowserStage, createBrowserFrameFence } from "./browser-resize.js?v=browser-20261031a";
 import { createBrowserLocationController } from "./browser-location.js?v=browser-20260523b";
 import {
   DEFAULT_URL,
@@ -18,8 +19,8 @@ import {
   runtimePageOwner,
   sameRuntimePageOwner,
 } from "./browser-page-cleanup.js?v=browser-20260727a";
-import { DATACHANNEL_INPUT_SETTLE_MS, selkiesMessagesForInput } from "./browser-input.js?v=browser-20261022b";
-import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20261022e";
+import { DATACHANNEL_INPUT_SETTLE_MS, selkiesMessagesForInput } from "./browser-input.js?v=browser-20261031a";
+import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20261031a";
 import {
   browserMetricsText,
   friendlyOpenError,
@@ -37,7 +38,9 @@ const PAGE_STATUS_AFTER_INPUT_DELAY_MS = 650;
 const PAGE_STATUS_AFTER_SCROLL_DELAY_MS = 1200;
 const PAGE_STATUS_AFTER_INPUT_FOLLOWUP_DELAYS_MS = [650, 1800, 3500, 6500];
 const PAGE_HEARTBEAT_INTERVAL_MS = 60_000;
-const BROWSER_OPEN_POLL_INTERVAL_MS = 1_200;
+// The open job has no push channel; its status read is a local job lookup, so
+// a short interval costs little and shows the display as soon as it is ready.
+const BROWSER_OPEN_POLL_INTERVAL_MS = 250;
 const BROWSER_OPEN_POLL_TIMEOUT_MS = 5 * 60_000;
 const BROWSER_OPEN_ELAPSED_VISIBLE_SECONDS = 5;
 const LIBRARY_FILE_PICKER_MAX_BYTES = 16 * 1024 * 1024;
@@ -642,6 +645,7 @@ function runtimeViewerOwnerActive(owner) {
 function finalizeRuntimePageClose(owner) {
   if (sameRuntimePageOwner(currentRuntimePageOwner(), owner)) {
     currentPage = null;
+    resetPageInputDelivery();
     currentPageGeneration = 0;
     restoredViewerOwner = null;
     currentBrowserEngineId = "";
@@ -1673,6 +1677,15 @@ function releaseDragButton(event, dragOwner) {
   noteDatachannelSend();
 }
 
+// Delivery receipts belong to one page and its display channel.
+function resetPageInputDelivery() {
+  lastDatachannelInputAt = 0;
+  datachannelDrainedAt = 0;
+  datachannelSendDisplay = null;
+  datachannelSendGeneration = 0;
+  resizeFrameFence.reset();
+}
+
 // The datachannel has no guest ack, so Runtime-route input that follows a
 // datachannel send waits until the drain is observed and the guest has had
 // the settle delay after it. It fails rather than reorder.
@@ -1722,6 +1735,7 @@ async function dispatchBrowserInput(
   }
   const requiresRuntimeRoute =
     event?.type === "browser_command" ||
+    event?.type === "resize" ||
     // A following text insertion needs the Engine's completed click/focus,
     // rather than only a successful send on a different transport.
     event?.type === "click" ||
@@ -1778,6 +1792,7 @@ async function dispatchBrowserInput(
         (currentPage?.page_id !== inputPageId || libraryPickerRequest?.requestId !== event.request_id)) {
       throw new Error("The Browser file request changed. Check the page before trying again.");
     }
+    if (event?.type === "resize" && response?.resize_error) return response;
     handleFileChooserFromStatus(response);
     syncViewFromResponse(response);
     if (response.actual_url) {
@@ -1862,6 +1877,7 @@ remoteDisplay = createBrowserRemoteDisplay({
   },
   setActiveBrowserPage: () => {
     document.body.dataset.browserPage = "active";
+    stageResize.opened();
   },
   setDisplayInput: (input, protocol) => {
     currentDisplayInput = input;
@@ -2353,6 +2369,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
       throw new Error("Browser could not use the selected Exit Node.");
     }
     currentPage = openedPage;
+    resetPageInputDelivery();
     currentPageGeneration = nextPageGeneration++;
     openedOwner = currentRuntimePageOwner();
     if (unsettledRuntimeOpen === openSettlement) {
@@ -2659,6 +2676,20 @@ profileResetCommit?.addEventListener("click", () => {
   });
 });
 
+const resizeOwner = () => currentPage?.page_id && currentDisplayMode === PRODUCT_DISPLAY_MODE
+  && remoteDisplay?.isTrackReady() && !unloadCleanupStarted && !homeWindowCloseInFlight
+  ? `${currentPage.page_id}:${currentPageGeneration}` : null;
+const resizeFrameFence = createBrowserFrameFence(remoteVideo);
+const stageResize = observeBrowserStage({
+  stage: renderPanel,
+  getOwner: resizeOwner,
+  send: (event, owner) => resizeFrameFence.run(() => sendBrowserInput(event, {
+    focus: false, isStale: () => owner !== resizeOwner(),
+  })),
+  onError: error => showStatus(error?.message || "Browser could not resize the page. Resize the window to try again."),
+});
+window.addEventListener("pagehide", () => stageResize.stop(), { once: true });
+
 bindBrowserInputSurface({
   copyRemoteClipboardToHost,
   friendlyOpenError,
@@ -2666,6 +2697,7 @@ bindBrowserInputSurface({
   getInputOwner: currentRuntimePageOwner,
   sameInputOwner: sameRuntimePageOwner,
   getCurrentView: () => currentView,
+  inputBlocked: () => resizeFrameFence.blocked(),
   keyboardCapture,
   pasteHostClipboardIntoRemote,
   readHostClipboardText: homeClipboard.readText,
@@ -2775,6 +2807,7 @@ async function restoreRuntimePageViewer(summary) {
   const owner = runtimePageOwner(page, nextPageGeneration);
   if (!owner) throw new Error("Runtime could not restore Browser cleanup authority.");
   currentPage = page;
+  resetPageInputDelivery();
   currentPageGeneration = nextPageGeneration++;
   runtimeOwnershipTerminallyAbsent = false;
   if (page.recovery_state === "cleanup_pending") {

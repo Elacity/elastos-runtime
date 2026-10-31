@@ -25,14 +25,14 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20261031a";
-import { registerStageGesture, registerStageLayer } from "./shell-popovers.js?v=home-20261031a";
+} from "./shell-core.js?v=home-20261031b";
+import { registerStageGesture, registerStageLayer } from "./shell-popovers.js?v=home-20261031b";
 import {
   bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20261031a";
+} from "./shell-chrome.js?v=home-20261031b";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -59,14 +59,14 @@ import {
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20261031a";
+} from "./shell-surface.js?v=home-20261031b";
 import {
   assistantFaceActive,
   assistantSpaceActive,
   hideAssistantFace,
   postToAssistantFrame,
   retireAssistantSpace,
-} from "./shell-assistant-face.js?v=home-20261031a";
+} from "./shell-assistant-face.js?v=home-20261031b";
 import {
   attachAuthorizedTarget,
   closeWindow,
@@ -82,50 +82,50 @@ import {
   acceptHomeNavigation,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20261031a";
+} from "./shell-windows.js?v=home-20261031b";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
   toggleShortcutsOverlay,
-} from "./shell-keyboard.js?v=home-20261031a";
+} from "./shell-keyboard.js?v=home-20261031b";
 import {
   bindSpotlight,
   hideSpotlight,
   showSpotlight,
-} from "./shell-spotlight.js?v=home-20261031a";
+} from "./shell-spotlight.js?v=home-20261031b";
 import {
   bindNotificationCenter,
   hideNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20261031a";
+} from "./shell-notifications.js?v=home-20261031b";
 import {
   bindSetupSheet,
   holdHomeSetupAct,
   syncSetupSheet,
-} from "./shell-setup-sheet.js?v=home-20261031a";
+} from "./shell-setup-sheet.js?v=home-20261031b";
 import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20261031a";
+} from "./shell-menubar.js?v=home-20261031b";
 import {
   bindQuickLook,
   hideQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20261031a";
-import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20261031a";
+} from "./shell-quicklook.js?v=home-20261031b";
+import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20261031b";
 import {
   bindSpaceEdgePeek,
   bindSpacePager,
-} from "./shell-stages.js?v=home-20261031a";
-import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20261031a";
+} from "./shell-stages.js?v=home-20261031b";
+import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20261031b";
 import {
   bindControlCentre,
   hideControlCentre,
   syncControlCentre,
-} from "./shell-control-centre.js?v=home-20261031a";
+} from "./shell-control-centre.js?v=home-20261031b";
 import {
   bindWalletRail,
   hideWalletRail,
@@ -135,7 +135,7 @@ import {
   walletRailFrame,
   walletRailOpen,
   walletRailSessionMounted,
-} from "./shell-wallet-rail.js?v=home-20261031a";
+} from "./shell-wallet-rail.js?v=home-20261031b";
 import {
   bindInboxRail,
   retireInboxRail,
@@ -145,13 +145,13 @@ import {
   inboxRailFrame,
   inboxRailOpen,
   inboxRailSessionMounted,
-} from "./shell-inbox-rail.js?v=home-20261031a";
-import { bindFormFactor, FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20261031a";
-import { bindPhoneDock } from "./shell-phone-dock.js?v=home-20261031a";
-import { bindPhoneStage, resetPhoneStage } from "./shell-phone-stage.js?v=home-20261031a";
-import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20261031a";
-import { bindTouchLongPress } from "./shell-touch.js?v=home-20261031a";
-import { bindFullscreenToggle } from "./shell-fullscreen.js?v=home-20261031a";
+} from "./shell-inbox-rail.js?v=home-20261031b";
+import { bindFormFactor, FORM_FACTOR_EVENT, isPhone } from "./shell-form-factor.js?v=home-20261031b";
+import { bindPhoneDock } from "./shell-phone-dock.js?v=home-20261031b";
+import { bindPhoneStage, resetPhoneStage } from "./shell-phone-stage.js?v=home-20261031b";
+import { bindCapsuleLayout } from "./shell-capsule-layout.js?v=home-20261031b";
+import { bindTouchLongPress } from "./shell-touch.js?v=home-20261031b";
+import { bindFullscreenToggle } from "./shell-fullscreen.js?v=home-20261031b";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";

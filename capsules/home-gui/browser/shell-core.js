@@ -1,5 +1,5 @@
-import { isPhone } from "./shell-form-factor.js?v=home-20261031a";
-import { normalizePhoneHomeIds, normalizePhoneHomePages } from "./shell-phone-home.js?v=home-20261031a";
+import { isPhone } from "./shell-form-factor.js?v=home-20261031b";
+import { normalizePhoneHomeIds, normalizePhoneHomePages } from "./shell-phone-home.js?v=home-20261031b";
 
 export let desktop = document.querySelector("#desktop");
 export let desktopBackdrop = document.querySelector(".desktop-backdrop");

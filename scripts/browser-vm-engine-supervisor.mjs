@@ -300,16 +300,48 @@ function vmControlEnvFingerprintFields({ dataDir, platform, root }) {
   return env;
 }
 
-function vmControlConfigFingerprint({ config, controlService, dataDir, platform, root }) {
-  return sha256Json({
+// The owner pipe binds the service lifetime to one Runtime. Two Runtimes of
+// the same Home (gateway and its local runtime) share one control socket, so
+// prewarm also compares the owner-independent fingerprint.
+function vmControlConfigFingerprints({ config, controlService, dataDir, platform, root }) {
+  const shared = {
     config,
-    owner: process.env[PARENT_PIPE_ENV] || null,
     env: vmControlEnvFingerprintFields({ dataDir, platform, root }),
     artifacts: {
       control_service: controlServiceArtifactFingerprints(controlService),
       launcher: controlServiceArtifactFingerprints(config.launcher_program),
     },
-  });
+  };
+  return {
+    full: sha256Json({ ...shared, owner: process.env[PARENT_PIPE_ENV] || null }),
+    withoutOwner: sha256Json(shared),
+  };
+}
+
+function traceEnabled() {
+  const value = process.env.ELASTOS_BROWSER_VM_TRACE;
+  return value !== undefined && value !== "0";
+}
+
+function controlServiceLogPath(dataDir) {
+  return process.env[CONTROL_SERVICE_LOG_ENV] || path.join(dataDir, "logs/browser-vm-control-service.log");
+}
+
+// ELASTOS_BROWSER_VM_TRACE timing marks share the control-service log, so one
+// file orders the Runtime-side supervisor calls with the service's events.
+function traceEvent(dataDir, event, fields = {}) {
+  if (!traceEnabled()) return;
+  try {
+    const logPath = controlServiceLogPath(dataDir);
+    fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(logPath, `${JSON.stringify({
+      schema: "elastos.browser.vm-engine-supervisor.trace/v1",
+      event,
+      ts: new Date().toISOString(),
+      pid: process.pid,
+      ...fields,
+    })}\n`);
+  } catch {}
 }
 
 function sleep(ms) {
@@ -598,15 +630,11 @@ function sanitizedVmControlServiceEnv({ config, dataDir, root, platform }) {
   return serviceEnv;
 }
 
-export function startLocalVmControlService({ controlSocket, dataDir, platform, root, expectedFingerprint }) {
-  if (!localVmControlServiceAvailable({ dataDir, platform })) return false;
-  const controlService = process.env[CONTROL_SERVICE_ENV] || path.join(dataDir, "bin/browser-vm-control-service");
-  const launcher = localControlLauncherForPlatform({ dataDir, platform });
-
-  const config = applyRemoteVzControlDefaults({
+function vmControlServiceConfig({ controlSocket, dataDir, platform }) {
+  return applyRemoteVzControlDefaults({
     schema: "elastos.browser.vm-control-service.config/v1",
     control_socket_path: controlSocket,
-    launcher_program: launcher,
+    launcher_program: localControlLauncherForPlatform({ dataDir, platform }),
     launcher_args: [],
     persistent_launcher: true,
     max_active_pages: vmControlMaxActivePages(),
@@ -618,9 +646,17 @@ export function startLocalVmControlService({ controlSocket, dataDir, platform, r
     launch_timeout_ms: Number(process.env.ELASTOS_BROWSER_VM_CONTROL_LAUNCH_TIMEOUT_MS || "150000"),
     shutdown_timeout_ms: Number(process.env.ELASTOS_BROWSER_VM_CONTROL_SHUTDOWN_TIMEOUT_MS || "30000"),
   });
-  config.config_fingerprint = expectedFingerprint ||
-    vmControlConfigFingerprint({ config, controlService, dataDir, platform, root });
-  const logPath = process.env[CONTROL_SERVICE_LOG_ENV] || path.join(dataDir, "logs/browser-vm-control-service.log");
+}
+
+export function startLocalVmControlService({ controlSocket, dataDir, platform, root, fingerprints }) {
+  if (!localVmControlServiceAvailable({ dataDir, platform })) return false;
+  const controlService = process.env[CONTROL_SERVICE_ENV] || path.join(dataDir, "bin/browser-vm-control-service");
+  const config = vmControlServiceConfig({ controlSocket, dataDir, platform });
+  const { full, withoutOwner } = fingerprints ||
+    vmControlConfigFingerprints({ config, controlService, dataDir, platform, root });
+  config.config_fingerprint = full;
+  config.config_fingerprint_without_owner = withoutOwner;
+  const logPath = controlServiceLogPath(dataDir);
   fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
   const ownerFd = parentPipeFd(true);
   const logFd = fs.openSync(logPath, "a");
@@ -682,8 +718,14 @@ async function probeVmControlSocket(controlSocket, timeoutMs = 1000) {
   }
 }
 
-function vmControlStatusMatches(status, expectedFingerprint) {
-  return status?.config_fingerprint === expectedFingerprint;
+// A launch needs the exact service, owner included. Prewarm keeps a live
+// service that differs only by its owning Runtime; the launching Runtime
+// reconciles ownership when it opens a page.
+function vmControlStatusMatches(status, fingerprints, { prewarm = false } = {}) {
+  if (status?.config_fingerprint === fingerprints.full) return true;
+  return prewarm &&
+    typeof status?.config_fingerprint_without_owner === "string" &&
+    status.config_fingerprint_without_owner === fingerprints.withoutOwner;
 }
 
 function vmControlHasEffects(status) {
@@ -742,14 +784,14 @@ async function stopStaleVmControlService(status, controlSocket) {
   );
 }
 
-async function waitForMatchingVmControlStatus(controlSocket, expectedFingerprint, timeoutMs) {
+async function waitForMatchingVmControlStatus(controlSocket, fingerprints, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let last = { kind: "absent" };
   while (Date.now() < deadline) {
     last = await probeVmControlSocket(controlSocket, 1000);
     if (
       last.kind === "verified" &&
-      vmControlStatusMatches(last.status, expectedFingerprint)
+      vmControlStatusMatches(last.status, fingerprints)
     ) {
       return last.status;
     }
@@ -839,44 +881,27 @@ function releaseStartupLock(lockPath, lock) {
   }
 }
 
-async function ensureVmControlAvailable({ controlSocket, dataDir, platform, root }) {
-  const launcher = localControlLauncherForPlatform({ dataDir, platform });
+// Returns how the service was obtained, for ELASTOS_BROWSER_VM_TRACE.
+async function ensureVmControlAvailable({ controlSocket, dataDir, platform, root, prewarm = false }) {
   const controlService = process.env[CONTROL_SERVICE_ENV] || path.join(dataDir, "bin/browser-vm-control-service");
-  const controlConfig = applyRemoteVzControlDefaults({
-    schema: "elastos.browser.vm-control-service.config/v1",
-    control_socket_path: controlSocket,
-    launcher_program: launcher,
-    launcher_args: [],
-    persistent_launcher: true,
-    max_active_pages: vmControlMaxActivePages(),
-    idle_vm_keepalive_ms: Number(process.env.ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS || "0"),
-    reuse_idle_vms: process.env.ELASTOS_BROWSER_VM_REUSE_IDLE_VMS === "1",
-    hibernation_mode: process.env.ELASTOS_BROWSER_VM_HIBERNATION === "1" && platform.startsWith("darwin-")
-      ? "vz_save_restore"
-      : "off",
-    launch_timeout_ms: Number(process.env.ELASTOS_BROWSER_VM_CONTROL_LAUNCH_TIMEOUT_MS || "150000"),
-    shutdown_timeout_ms: Number(process.env.ELASTOS_BROWSER_VM_CONTROL_SHUTDOWN_TIMEOUT_MS || "30000"),
-  });
-  const expectedFingerprint = vmControlConfigFingerprint({
-    config: controlConfig,
+  const fingerprints = vmControlConfigFingerprints({
+    config: vmControlServiceConfig({ controlSocket, dataDir, platform }),
     controlService,
     dataDir,
     platform,
     root,
   });
+  const matches = (status) => vmControlStatusMatches(status, fingerprints, { prewarm });
 
   const existing = await probeVmControlSocket(controlSocket, 1200);
-  if (
-    existing.kind === "verified" &&
-    vmControlStatusMatches(existing.status, expectedFingerprint)
-  ) {
-    return;
+  if (existing.kind === "verified" && matches(existing.status)) {
+    return "reused";
   }
   if (
     existing.kind === "verified" &&
     !localVmControlServiceAvailable({ dataDir, platform })
   ) {
-    return;
+    return "reused_unmanaged";
   }
   if (existing.kind === "unverified") {
     throw launchError(
@@ -895,11 +920,8 @@ async function ensureVmControlAvailable({ controlSocket, dataDir, platform, root
     }
     try {
       const lockedExisting = await probeVmControlSocket(controlSocket, 1000);
-      if (
-        lockedExisting.kind === "verified" &&
-        vmControlStatusMatches(lockedExisting.status, expectedFingerprint)
-      ) {
-        return;
+      if (lockedExisting.kind === "verified" && matches(lockedExisting.status)) {
+        return "reused";
       }
       if (lockedExisting.kind === "verified") {
         await stopStaleVmControlService(lockedExisting.status, controlSocket);
@@ -920,12 +942,12 @@ async function ensureVmControlAvailable({ controlSocket, dataDir, platform, root
         dataDir,
         platform,
         root,
-        expectedFingerprint,
+        fingerprints,
       })) {
         throw new Error("Browser VM control socket is unavailable");
       }
-      await waitForMatchingVmControlStatus(controlSocket, expectedFingerprint, 7000);
-      return;
+      await waitForMatchingVmControlStatus(controlSocket, fingerprints, 7000);
+      return lockedExisting.kind === "verified" ? "replaced" : "started";
     } finally {
       releaseStartupLock(lockPath, startupLock);
     }
@@ -1008,7 +1030,10 @@ async function main() {
     if (!controlSocket) {
       fail(`${CONTROL_SOCKET_ENV} is required for Browser VM prewarm`);
     }
-    await ensureVmControlAvailable({ controlSocket, dataDir, platform, root });
+    const startedAt = Date.now();
+    traceEvent(dataDir, "prewarm_start");
+    const control = await ensureVmControlAvailable({ controlSocket, dataDir, platform, root, prewarm: true });
+    traceEvent(dataDir, "prewarm_done", { control, latency_ms: Date.now() - startedAt });
     const status = await getJsonOverUnix(controlSocket, "/status", 1000);
     process.stdout.write(`${JSON.stringify({
       schema: "elastos.browser.vm-engine-prewarm/v1",
@@ -1042,13 +1067,17 @@ async function main() {
 
   const controlSocket = process.env[CONTROL_SOCKET_ENV] || "";
   if (controlSocket) {
-    await ensureVmControlAvailable({ controlSocket, dataDir, platform, root });
+    const startedAt = Date.now();
+    traceEvent(dataDir, "launch_supervisor_start", { stream_id: request.stream_id });
+    const control = await ensureVmControlAvailable({ controlSocket, dataDir, platform, root });
+    traceEvent(dataDir, "launch_control_ready", { control, latency_ms: Date.now() - startedAt });
     await delegateToVmControl({
       controlSocket,
       request,
       timeoutMs: Number(process.env.ELASTOS_BROWSER_VM_ENGINE_TIMEOUT_MS || "165000"),
       platform,
     });
+    traceEvent(dataDir, "launch_supervisor_done", { latency_ms: Date.now() - startedAt });
     return;
   }
 

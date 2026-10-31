@@ -22,18 +22,17 @@ import {
   WINDOW_TOP_INSET,
   WINDOW_BOTTOM_INSET,
   pushUiPreferencesToFrameWindow,
-} from "./shell-core.js?v=home-20261031a";
+} from "./shell-core.js?v=home-20261031b";
 import {
   fitWindowBounds,
-  fitWindowToBrowserAspect,
-  fitWindowToLargestBrowserAspect,
+  fitBrowserWindow,
   applyWindowPlacement,
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20261031a";
+} from "./shell-window-geometry.js?v=home-20261031b";
 import {
   agentSpaceEngaged,
   applyFullscreenStageFromPlacement,
@@ -53,8 +52,8 @@ import {
   syncStagePresentation,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20261031a";
-import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261031a";
+} from "./shell-stages.js?v=home-20261031b";
+import { showAssistantFace } from "./shell-assistant-face.js?v=home-20261031b";
 
 let windowHooks = null;
 let pendingSystemRecoverySave = null;
@@ -1906,7 +1905,7 @@ async function createBrowserTargetWindow(targetId, options = {}) {
   } else if (launched.target === "browser" && node.dataset.maximized === "true") {
     node.dataset.maximized = "false";
     node.dataset.browserMaximized = "true";
-    fitWindowToLargestBrowserAspect(node);
+    fitBrowserWindow(node);
   }
   const activeSpace = getActiveStageId();
   const entry = {
@@ -2050,7 +2049,7 @@ function fitLaunchedWindow(entry) {
     return;
   }
   if (entry.targetId === "browser") {
-    fitWindowToBrowserAspect(entry.node);
+    fitBrowserWindow(entry.node);
     rememberWindowRestoreBounds(entry.node);
     return;
   }
@@ -2454,7 +2453,7 @@ function toggleWindowMaximize(id) {
   if (entry.targetId === "browser") {
     node.dataset.maximized = "false";
     node.dataset.browserMaximized = "true";
-    fitWindowToLargestBrowserAspect(node);
+    fitBrowserWindow(node);
     focusWindow(id);
     persistBrowserSession();
     return;

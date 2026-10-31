@@ -30,21 +30,21 @@ import {
   LAYER_STATE,
   registerShellPopover,
   registerStageLayer,
-} from "./shell-popovers.js?v=home-20261031a";
+} from "./shell-popovers.js?v=home-20261031b";
 import {
   agentStageId,
   bindAgentSpace,
   getActiveStageId,
   isAgentSpace,
   setActiveStage,
-} from "./shell-stages.js?v=home-20261031a";
-import { isPhone } from "./shell-form-factor.js?v=home-20261031a";
+} from "./shell-stages.js?v=home-20261031b";
+import { isPhone } from "./shell-form-factor.js?v=home-20261031b";
 import {
   createAssistantFrameReadiness,
   normalizeHomeAgentBrowserUrl,
   normalizeHomeAgentViewerPayload,
-} from "./home-agent-message-contract.js?v=home-20261031a";
-import { bindAssistantMark } from "./shell-assistant-mark.js?v=home-20261031a";
+} from "./home-agent-message-contract.js?v=home-20261031b";
+import { bindAssistantMark } from "./shell-assistant-mark.js?v=home-20261031b";
 
 const FACE_ID = "assistant-face";
 const TARGET_ID = "assistant";
