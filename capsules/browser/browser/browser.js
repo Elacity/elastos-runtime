@@ -2690,11 +2690,10 @@ const stageResize = observeBrowserStage({
     focus: false, isStale: () => owner !== resizeOwner(),
   }), event),
   onError: error => {
-    // After the retry also fails, pointer input resumes on the geometry the guest still shows.
-    const kept = resizeFrameFence.recover();
-    if (kept) showStatus(`Browser could not resize the page; it stays at ${kept.width}×${kept.height}.`);
-    else if (kept === null) showStatus("Browser could not resize the page. Resize the window to try again.");
-    else showStatus(error?.message || "Browser could not resize the page. Resize the window to try again.");
+    // After the retry also fails, pointer input resumes on a frame the guest can still be showing.
+    showStatus(resizeFrameFence.recover()
+      ? "Browser could not confirm the new size."
+      : error?.message || "Browser could not resize the page. Resize the window to try again.");
   },
 });
 window.addEventListener("pagehide", () => stageResize.stop(), { once: true });
