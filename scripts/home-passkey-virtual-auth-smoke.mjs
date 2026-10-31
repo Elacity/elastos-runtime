@@ -1618,18 +1618,12 @@ async function embeddedBrowserDebugState(windowLocator, appFrame) {
   return { geometry, frame };
 }
 
-function assertEmbeddedBrowserAspect(geometry) {
+function assertEmbeddedBrowserStage(geometry) {
   const panel = geometry?.panel;
   assert(
     panel && panel.width > 0 && panel.height > 0,
     "Embedded Browser geometry did not expose a render panel",
     geometry,
-  );
-  const ratio = panel.width / panel.height;
-  assert(
-    Math.abs(ratio - (16 / 9)) <= 0.04,
-    "Embedded Browser render panel is not fitted to the 16:9 remote display aspect",
-    { ratio, geometry },
   );
 }
 
@@ -3577,7 +3571,7 @@ async function checkBrowserEmbeddedUiInput(page, baselineToken) {
     const clickX = Math.max(1, Math.min(panelBox.width - 1, BROWSER_INPUT_CLICK_X));
     const clickY = Math.max(1, Math.min(panelBox.height - 1, BROWSER_INPUT_CLICK_Y));
     const initialGeometry = await embeddedBrowserGeometry(windowLocator, appFrame);
-    assertEmbeddedBrowserAspect(initialGeometry);
+    assertEmbeddedBrowserStage(initialGeometry);
     if (BROWSER_OPEN_DISPLAY_MODE === "webrtc_remote_display") {
       const initialStatus = await checkBrowserPageStatus(appFrame, browserToken, pageId);
       const displaySession = initialStatus.display_session || {};

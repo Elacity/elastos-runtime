@@ -42,8 +42,448 @@ const VM_LOG_NAMES = [
 ];
 const MAX_WEBSOCKET_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_BROWSER_FILE_UPLOAD_BYTES = 16 * 1024 * 1024;
-const PRODUCT_RASTER_WIDTH = 1920;
-const PRODUCT_RASTER_HEIGHT = 1080;
+export const browserX11GeometrySource = String.raw`"""Native Chromium geometry. The control service owns the writer gate and timeout."""
+import ctypes as C
+from collections import deque
+import json
+import os
+import re
+import sys
+
+SCHEMA = "elastos.browser.x11-geometry/v1"
+MAX_NODES, MAX_DEPTH, MAX_TEXT = 256, 8, 256
+MAX_CLASS_DIAGNOSTICS, MAX_CLASS_RAW = 8, 32
+Window = C.c_ulong
+
+
+class GeometryError(RuntimeError):
+    def __init__(self, message, evidence=None):
+        super().__init__(message)
+        self.evidence = evidence
+
+
+class WindowAttributes(C.Structure):
+    _fields_ = [("x", C.c_int), ("y", C.c_int), ("width", C.c_int),
+                ("height", C.c_int), ("border_width", C.c_int), ("depth", C.c_int),
+                ("visual", C.c_void_p), ("root", Window), ("window_class", C.c_int),
+                ("bit_gravity", C.c_int), ("win_gravity", C.c_int),
+                ("backing_store", C.c_int), ("backing_planes", C.c_ulong),
+                ("backing_pixel", C.c_ulong), ("save_under", C.c_int),
+                ("colormap", C.c_ulong), ("map_installed", C.c_int),
+                ("map_state", C.c_int), ("all_event_masks", C.c_long),
+                ("your_event_mask", C.c_long), ("do_not_propagate_mask", C.c_long),
+                ("override_redirect", C.c_int), ("screen", C.c_void_p)]
+
+
+class ErrorEvent(C.Structure):
+    _fields_ = [("type", C.c_int), ("display", C.c_void_p),
+                ("resourceid", C.c_ulong), ("serial", C.c_ulong),
+                ("error_code", C.c_ubyte), ("request_code", C.c_ubyte),
+                ("minor_code", C.c_ubyte)]
+
+
+ErrorHandler = C.CFUNCTYPE(C.c_int, C.c_void_p, C.POINTER(ErrorEvent))
+
+
+class X11:
+    """Own one connection. An injected library lets tests exercise custody without X11."""
+    def __init__(self, display, library=None):
+        if not re.fullmatch(r":[0-9]{1,5}(?:\.[0-9]{1,2})?", display):
+            raise GeometryError("A local DISPLAY is required")
+        self.lib = library if library is not None else C.CDLL("libX11.so.6")
+        pointer = C.c_void_p
+        signatures = {
+            "XOpenDisplay": ([C.c_char_p], pointer),
+            "XCloseDisplay": ([pointer], C.c_int),
+            "XDefaultRootWindow": ([pointer], Window),
+            "XGetWindowAttributes": ([pointer, Window, C.POINTER(WindowAttributes)], C.c_int),
+            "XQueryTree": ([pointer, Window, C.POINTER(Window), C.POINTER(Window),
+                            C.POINTER(C.POINTER(Window)), C.POINTER(C.c_uint)], C.c_int),
+            "XTranslateCoordinates": ([pointer, Window, Window, C.c_int, C.c_int,
+                                       C.POINTER(C.c_int), C.POINTER(C.c_int), C.POINTER(Window)], C.c_int),
+            "XInternAtom": ([pointer, C.c_char_p, C.c_int], C.c_ulong),
+            "XGetWindowProperty": ([pointer, Window, C.c_ulong, C.c_long, C.c_long,
+                                    C.c_int, C.c_ulong, C.POINTER(C.c_ulong),
+                                    C.POINTER(C.c_int), C.POINTER(C.c_ulong),
+                                    C.POINTER(C.c_ulong), C.POINTER(pointer)], C.c_int),
+            "XFree": ([pointer], C.c_int),
+            "XSync": ([pointer, C.c_int], C.c_int),
+            "XSetErrorHandler": ([pointer], pointer),
+            "XGrabServer": ([pointer], C.c_int),
+            "XUngrabServer": ([pointer], C.c_int),
+            "XMoveResizeWindow": ([pointer, Window, C.c_int, C.c_int, C.c_uint, C.c_uint], C.c_int),
+        }
+        for name, (args, result) in signatures.items():
+            function = getattr(self.lib, name)
+            function.argtypes, function.restype = args, result
+        self.errors, self.display, self.atoms = [], None, {}
+        self.class_diagnostics = []
+        self.handler = ErrorHandler(self._error)
+        self.previous = self.lib.XSetErrorHandler(C.cast(self.handler, pointer))
+        try:
+            self.display = self.lib.XOpenDisplay(display.encode("ascii"))
+            if not self.display:
+                raise GeometryError("Cannot open local display")
+        except BaseException:
+            self.lib.XSetErrorHandler(self.previous)
+            raise
+
+    def _error(self, _display, event):
+        # Xlib's default handler exits the process; retain bounded protocol errors instead.
+        if len(self.errors) < 8:
+            self.errors.append((int(event.contents.error_code), int(event.contents.request_code)))
+        return 0
+
+    def _sync(self):
+        self.lib.XSync(self.display, 0)
+        if self.errors:
+            code, request = self.errors[0]
+            self.errors.clear()
+            raise GeometryError(f"X11 protocol error {code} during request {request}")
+
+    def close(self):
+        if self.display:
+            display, self.display = self.display, None
+            try:
+                self.lib.XCloseDisplay(display)
+            finally:
+                self.lib.XSetErrorHandler(self.previous)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def root(self):
+        root = int(self.lib.XDefaultRootWindow(self.display))
+        self._sync()
+        if not root:
+            raise GeometryError("X11 root is missing")
+        return root
+
+    def attributes(self, window):
+        value = WindowAttributes()
+        status = self.lib.XGetWindowAttributes(self.display, window, C.byref(value))
+        self._sync()
+        if not status:
+            raise GeometryError("Cannot read X11 window attributes")
+        return {name: int(getattr(value, name)) for name in
+                ("x", "y", "width", "height", "border_width", "map_state", "override_redirect")}
+
+    def tree(self, window, limit):
+        root, parent, count = Window(), Window(), C.c_uint()
+        children = C.POINTER(Window)()
+        try:
+            status = self.lib.XQueryTree(self.display, window, C.byref(root), C.byref(parent),
+                                         C.byref(children), C.byref(count))
+            self._sync()
+            if not status:
+                raise GeometryError("Cannot query X11 window tree")
+            if count.value > limit:
+                raise GeometryError("X11 traversal node limit exceeded")
+            if count.value and not children:
+                raise GeometryError("X11 window tree returned missing children")
+            return int(parent.value), [int(children[index]) for index in range(count.value)]
+        finally:
+            if children:
+                self.lib.XFree(C.cast(children, C.c_void_p))
+
+    def children(self, window, limit):
+        return self.tree(window, limit)[1]
+
+    def parent(self, window):
+        return self.tree(window, MAX_NODES)[0]
+
+    def grab(self):
+        self.lib.XGrabServer(self.display)
+        self._sync()
+
+    def ungrab(self):
+        self.lib.XUngrabServer(self.display)
+        self._sync()
+
+    def move_resize(self, window, geometry):
+        self.lib.XMoveResizeWindow(self.display, window, geometry["x"], geometry["y"],
+                                   geometry["width"], geometry["height"])
+        self._sync()
+
+    def atom(self, name):
+        if name not in self.atoms:
+            self.atoms[name] = int(self.lib.XInternAtom(self.display, name.encode("ascii"), 1))
+            self._sync()
+        return self.atoms[name]
+
+    def property(self, window, name, expected_type, expected_format, limit):
+        atom, wanted = self.atom(name), self.atom(expected_type)
+        if not atom or not wanted:
+            return None
+        actual, size, count, remaining = C.c_ulong(), C.c_int(), C.c_ulong(), C.c_ulong()
+        data = C.c_void_p()
+        try:
+            status = self.lib.XGetWindowProperty(self.display, window, atom, 0,
+                (limit + 3) // 4, 0, 0, C.byref(actual), C.byref(size),
+                C.byref(count), C.byref(remaining), C.byref(data))
+            self._sync()
+            if status != 0:
+                raise GeometryError("Cannot read X11 window property")
+            if actual.value == 0:
+                return None
+            if actual.value != wanted or size.value != expected_format:
+                raise GeometryError("X11 property type differs from contract")
+            if remaining.value or count.value > limit // (expected_format // 8):
+                raise GeometryError("X11 property exceeds property bound")
+            if count.value and not data:
+                raise GeometryError("X11 property returned missing data")
+            if expected_format == 32:
+                # Xlib expands wire-format 32-bit values into native unsigned longs.
+                # https://www.x.org/releases/X11R7.6/doc/libX11/specs/libX11/libX11.html
+                return [int(C.cast(data, C.POINTER(C.c_ulong))[i]) & 0xffffffff
+                        for i in range(count.value)]
+            return C.string_at(data, count.value) if count.value else b""
+        finally:
+            if data.value:
+                self.lib.XFree(data)
+
+    def wm_class(self, window):
+        value = self.property(window, "WM_CLASS", "STRING", 8, MAX_TEXT)
+        if value is None:
+            return None
+        parts = value.split(b"\0")
+        # ICCCM defines two terminated strings; the whole property is bounded.
+        # https://xorg.freedesktop.org/archive/current/doc/xorg-docs/icccm/icccm.html
+        if len(value) <= MAX_TEXT and len(parts) == 3 and not parts[-1]:
+            try:
+                return [item.decode("utf-8", "strict") for item in parts[:2]]
+            except UnicodeDecodeError:
+                pass
+        # Octet separators preserve readable evidence through token-shaped log redaction.
+        diagnostic = {"xid": hex(window), "length": len(value),
+                      "parts": len(parts), "part_lengths": [len(part) for part in parts[:4]],
+                      "terminal_nul": value.endswith(b"\0"),
+                      "raw_hex": value[:MAX_CLASS_RAW].hex(":"), "truncated": len(value) > MAX_CLASS_RAW}
+        if len(self.class_diagnostics) < MAX_CLASS_DIAGNOSTICS:
+            self.class_diagnostics.append(diagnostic)
+        # A malformed unrelated client is not a candidate. A Chromium-looking
+        # malformed class cannot safely be discarded beside a valid candidate.
+        if b"chromium" in value.lower():
+            raise GeometryError("Malformed Chromium WM_CLASS; " + class_diagnostic_text(diagnostic))
+        return None
+
+    def pid(self, window):
+        value = self.property(window, "_NET_WM_PID", "CARDINAL", 32, 4)
+        if value is None or len(value) != 1 or not 0 < value[0] <= 0x7fffffff:
+            raise GeometryError("Matching Chromium window lacks a valid _NET_WM_PID")
+        return value[0]
+
+    def position(self, window, root):
+        x, y, child = C.c_int(), C.c_int(), Window()
+        status = self.lib.XTranslateCoordinates(self.display, window, root, 0, 0,
+                                                C.byref(x), C.byref(y), C.byref(child))
+        self._sync()
+        if not status:
+            raise GeometryError("Cannot translate Chromium coordinates to root")
+        return x.value, y.value
+
+
+def class_diagnostic_text(value):
+    return f"WM_CLASS@{value['xid']} len={value['length']} parts={value['parts']} lens={value['part_lengths']} nul={value['terminal_nul']} hex={value['raw_hex']} truncated={value['truncated']}"
+
+
+def observe(backend):
+    """Pure selection/traversal policy; backend injection opens no connection."""
+    root = backend.root()
+    root_attributes = backend.attributes(root)
+    queue, seen, matches = deque([(root, 0)]), set(), []
+    while queue:
+        window, depth = queue.popleft()
+        if window in seen:
+            raise GeometryError("X11 window tree repeated a window")
+        seen.add(window)
+        if len(seen) > MAX_NODES:
+            raise GeometryError("X11 traversal node limit exceeded")
+        attributes = root_attributes if window == root else backend.attributes(window)
+        if attributes["map_state"] != 2:  # IsViewable: unmapped descendants cannot qualify.
+            continue
+        classes = backend.wm_class(window) if window != root else None
+        if classes and any(value.casefold() == "chromium" for value in classes):
+            if backend.parent(window) == root:
+                pid = backend.pid(window)
+                if type(pid) is not int or not 0 < pid <= 0x7fffffff:
+                    raise GeometryError("Matching Chromium window lacks a valid _NET_WM_PID")
+                x, y = backend.position(window, root)
+                if attributes["width"] <= 0 or attributes["height"] <= 0:
+                    raise GeometryError("Matching Chromium window has invalid dimensions")
+                matches.append({"xid": hex(window), "parent_xid": hex(backend.parent(window)),
+                    "pid": pid, "wm_class": classes,
+                    "x": x, "y": y, "width": attributes["width"],
+                    "height": attributes["height"], "border_width": attributes["border_width"],
+                    "override_redirect": bool(attributes["override_redirect"])})
+        children = backend.children(window, MAX_NODES - len(seen) - len(queue))
+        if children and depth >= MAX_DEPTH:
+            raise GeometryError("X11 traversal depth limit exceeded")
+        queue.extend((child, depth + 1) for child in children)
+    diagnostics = getattr(backend, "class_diagnostics", [])[:MAX_CLASS_DIAGNOSTICS]
+    if len(matches) != 1:
+        message = f"Expected one visible Chromium window; found {len(matches)}"
+        if diagnostics:
+            message += "; " + class_diagnostic_text(diagnostics[0])
+        raise GeometryError(message)
+    return {"schema": SCHEMA, "ok": True, "nodes": len(seen),
+            "root": {"xid": hex(root), "width": root_attributes["width"],
+                     "height": root_attributes["height"]}, "window": matches[0],
+            "class_diagnostics": diagnostics}
+
+
+def integer(value, low, high, label):
+    if type(value) is not int or not low <= value <= high:
+        raise GeometryError("Invalid " + label)
+    return value
+
+
+def xid(value):
+    if not isinstance(value, str) or not re.fullmatch(r"0x[0-9a-fA-F]{1,8}", value):
+        raise GeometryError("Invalid XID")
+    return integer(int(value, 16), 1, 0xffffffff, "XID")
+
+
+def root_geometry(value):
+    if not isinstance(value, dict):
+        raise GeometryError("Invalid root geometry")
+    width = integer(value.get("width"), 320, 3840, "root width")
+    height = integer(value.get("height"), 240, 2160, "root height")
+    if width % 2 or height % 2:
+        raise GeometryError("root dimensions must be even")
+    return {"width": width, "height": height}
+
+
+def window_geometry(value):
+    if not isinstance(value, dict):
+        raise GeometryError("Invalid window geometry")
+    return {"x": integer(value.get("x"), -3840, 3840, "window x"),
+            "y": integer(value.get("y"), -2160, 2160, "window y"),
+            "width": integer(value.get("width"), 1, 3840, "window width"),
+            "height": integer(value.get("height"), 1, 2160, "window height")}
+
+
+def validate_request(payload):
+    if not isinstance(payload, dict) or set(payload) != {"identity", "root", "window", "restore"}:
+        raise GeometryError("Invalid configure payload")
+    if type(payload["restore"]) is not bool:
+        raise GeometryError("restore flag must be boolean")
+    identity = payload["identity"]
+    if not isinstance(identity, dict) or identity.get("schema") != SCHEMA or identity.get("ok") is not True:
+        raise GeometryError("Invalid saved observation")
+    root, window = identity.get("root"), identity.get("window")
+    if not isinstance(root, dict) or not isinstance(window, dict):
+        raise GeometryError("Invalid saved identity")
+    saved_root, saved_window = root_geometry(root), window_geometry(window)
+    root_id, window_id, parent_id = xid(root.get("xid")), xid(window.get("xid")), xid(window.get("parent_xid"))
+    if root_id == window_id or parent_id != root_id or type(window.get("border_width")) is not int or window["border_width"] != 0:
+        raise GeometryError("client must be root-parented with zero border")
+    integer(window.get("pid"), 1, 0x7fffffff, "PID")
+    if type(window.get("override_redirect")) is not bool:
+        raise GeometryError("Invalid saved window attributes")
+    classes = window.get("wm_class")
+    if (not isinstance(classes, list) or len(classes) != 2 or any(not isinstance(value, str) for value in classes)
+            or sum(len(value.encode("utf-8")) for value in classes) + 2 > MAX_TEXT
+            or not any(value.casefold() == "chromium" for value in classes)):
+        raise GeometryError("Invalid saved Chromium identity")
+    requested_root, requested_window = root_geometry(payload["root"]), window_geometry(payload["window"])
+    if payload["restore"]:
+        if requested_root != saved_root or requested_window != saved_window:
+            raise GeometryError("Restore geometry differs from the saved baseline")
+    elif requested_window != {"x": 0, "y": 0, **requested_root}:
+        raise GeometryError("Apply window must exactly cover the requested root")
+    return identity, requested_root, requested_window
+
+
+def same_identity(actual, expected, requested_root):
+    if xid(actual["root"]["xid"]) != xid(expected["root"]["xid"]):
+        raise GeometryError("root XID changed")
+    if root_geometry(actual["root"]) != requested_root:
+        raise GeometryError("Actual root differs from requested dimensions")
+    current, saved = actual["window"], expected["window"]
+    if (xid(current["xid"]) != xid(saved["xid"]) or xid(current["parent_xid"]) != xid(saved["parent_xid"])
+            or any(current.get(key) != saved.get(key) for key in ("pid", "wm_class", "override_redirect"))):
+        raise GeometryError("Selected Chromium identity changed")
+    if xid(current["parent_xid"]) != xid(actual["root"]["xid"]) or current["border_width"] != 0:
+        raise GeometryError("client parent or border changed")
+
+
+def configure(backend, payload):
+    """Explicit mutation. The authenticated caller owns the writer lease."""
+    identity, requested_root, requested_window = validate_request(payload)
+    attempted = False
+    before = server_after = after = None
+    failure = None
+    errors = []
+    try:
+        # Set up finally before the request: even a failed grab sync may hold the server.
+        backend.grab()
+        before = observe(backend)
+        same_identity(before, identity, requested_root)
+        attempted = True
+        backend.move_resize(xid(identity["window"]["xid"]), requested_window)
+        server_after = observe(backend)
+        same_identity(server_after, identity, requested_root)
+        if window_geometry(server_after["window"]) != requested_window:
+            raise GeometryError("Server did not apply the requested native geometry")
+    except Exception as error:
+        errors.append({"stage": "configure", "error": str(error)[:240]})
+        failure = error
+    finally:
+        try:
+            backend.ungrab()
+        except Exception as error:
+            errors.append({"stage": "ungrab", "error": str(error)[:240]})
+            failure = GeometryError(f"{failure}; ungrab: {error}" if failure else f"ungrab: {error}")
+    # Chromium can process ConfigureNotify only after release of the server grab.
+    # Re-query now; the caller separately checks later CDP, DOM and media evidence.
+    if attempted:
+        try:
+            after = observe(backend)
+            same_identity(after, identity, requested_root)
+            if window_geometry(after["window"]) != requested_window:
+                raise GeometryError("Native geometry changed after releasing the server")
+        except Exception as error:
+            errors.append({"stage": "post-observation", "error": str(error)[:240]})
+            failure = GeometryError(f"{failure}; post-observation: {error}" if failure else str(error))
+    if failure is not None:
+        raise GeometryError(str(failure), {"before": before, "server_after": server_after,
+                                          "after": after, "configure_attempted": attempted, "errors": errors}) from failure
+    after["configure"] = {"restore": payload["restore"], "requested": requested_window,
+                           "server_verified": True, "before": before["window"]}
+    return after
+
+
+def main():
+    try:
+        args = sys.argv[1:]
+        payload = None
+        if args:
+            if len(args) != 2 or args[0] != "--configure" or len(args[1]) > 32768:
+                raise GeometryError("Use --configure with one bounded JSON payload")
+            payload = json.loads(args[1])
+            validate_request(payload)
+        with X11(os.environ.get("DISPLAY") or ":40") as backend:
+            result = observe(backend) if payload is None else configure(backend, payload)
+        print(json.dumps(result, separators=(",", ":")))
+        return 0
+    except Exception as error:
+        result = {"schema": SCHEMA, "ok": False, "error": str(error)[:240]}
+        if isinstance(error, GeometryError) and error.evidence is not None:
+            result["configure_evidence"] = error.evidence
+        print(json.dumps(result, separators=(",", ":")), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+`;
+
+const INITIAL_DISPLAY_WIDTH = 1920;
+const INITIAL_DISPLAY_HEIGHT = 1080;
 const WALLET_RUNTIME_BINDING = "__elastosBrowserWalletRuntime";
 const WALLET_RUNTIME_RESULT = "__elastosBrowserWalletRuntimeResult";
 const WALLET_RUNTIME_ORIGIN = "null";
@@ -461,14 +901,9 @@ function readIceServersConfig(value) {
 }
 
 function readDisplaySurfaceConfig(value) {
-  const streamWidth = numberOr(value?.stream_width, PRODUCT_RASTER_WIDTH);
-  const streamHeight = numberOr(value?.stream_height, PRODUCT_RASTER_HEIGHT);
-  if (
-    streamWidth !== PRODUCT_RASTER_WIDTH ||
-    streamHeight !== PRODUCT_RASTER_HEIGHT
-  ) {
-    fail("display_surface must use the fixed 1920x1080 product raster");
-  }
+  const streamWidth = numberOr(value?.stream_width, INITIAL_DISPLAY_WIDTH);
+  const streamHeight = numberOr(value?.stream_height, INITIAL_DISPLAY_HEIGHT);
+  validateBrowserGeometry(streamWidth, streamHeight);
   return {
     stream: { width: streamWidth, height: streamHeight },
   };
@@ -587,6 +1022,207 @@ function readIceUrls(value, index) {
 
 function numberOr(value, defaultValue) {
   return Number.isInteger(value) && value > 0 ? value : defaultValue;
+}
+
+export function validateBrowserGeometry(width, height) {
+  if (!Number.isInteger(width) || !Number.isInteger(height) ||
+      width < 320 || width > 3840 || height < 240 || height > 2160 ||
+      width % 2 || height % 2 || width * height > 8_294_400) {
+    throw Object.assign(new Error("Invalid Browser geometry"), { code: "invalid_request" });
+  }
+}
+
+function browserGeometryCommand(program, args) {
+  const result = spawnSync(program, args, { encoding: "utf8", timeout: 2500, maxBuffer: 32768,
+    env: { ...process.env, DISPLAY: process.env.DISPLAY || ":40" } });
+  if (result.error || result.status !== 0) {
+    throw new Error(`${program} geometry command failed: ${String(result.stderr || result.error || result.status).slice(0, 240)}`);
+  }
+  return result.stdout;
+}
+
+function browserRandrGeometry(run) {
+  const raw = run("xrandr", ["--current"]);
+  const size = raw.match(/current\s+(\d+)\s+x\s+(\d+)/);
+  const output = raw.match(/^(\S+) connected/m)?.[1];
+  if (!size || !output) throw new Error("RandR did not report the Browser display");
+  return { width: Number(size[1]), height: Number(size[2]), output, raw };
+}
+
+// Explicit timings preserve exact even dimensions, including 390px portrait.
+// Xvfb's startup allocation supplies the maximum; cvt is not required.
+export function applyBrowserDisplayMode(width, height, run = browserGeometryCommand) {
+  validateBrowserGeometry(width, height);
+  const before = browserRandrGeometry(run);
+  if (before.width === width && before.height === height) return before;
+  const mode = `elastos_${width}x${height}`;
+  if (!before.raw.split(/\s+/).includes(mode)) {
+    const ht = width + 160, vt = height + 45;
+    run("xrandr", ["--newmode", mode, (ht * vt * 60 / 1e6).toFixed(6),
+      String(width), String(width + 48), String(width + 80), String(ht),
+      String(height), String(height + 3), String(height + 8), String(vt), "+hsync", "-vsync"]);
+    try {
+      run("xrandr", ["--addmode", before.output, mode]);
+    } catch (error) {
+      // An unattached mode is absent from --current; retire it here so repeated
+      // refused modes cannot accumulate outside the normal retention pass.
+      try { run("xrandr", ["--rmmode", mode]); } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "Browser mode creation and cleanup failed");
+      }
+      throw error;
+    }
+  }
+  run("xrandr", ["--fb", `${width}x${height}`, "--output", before.output, "--mode", mode]);
+  const actual = browserRandrGeometry(run);
+  if (actual.width !== width || actual.height !== height) throw new Error("RandR geometry differs from the request");
+  return actual;
+}
+
+export function pruneBrowserDisplayModes(keep, run = browserGeometryCommand) {
+  const current = browserRandrGeometry(run);
+  const retained = new Set([...keep, current].map(size => `elastos_${size.width}x${size.height}`));
+  for (const mode of new Set(current.raw.match(/\belastos_\d+x\d+\b/g) || [])) {
+    if (retained.has(mode)) continue;
+    run("xrandr", ["--delmode", current.output, mode]);
+    run("xrandr", ["--rmmode", mode]);
+  }
+}
+
+function browserNativeGeometry(payload) {
+  const args = ["-c", browserX11GeometrySource];
+  if (payload) args.push("--configure", JSON.stringify(payload));
+  const value = JSON.parse(browserGeometryCommand("python3", args));
+  if (value?.schema !== "elastos.browser.x11-geometry/v1" || value.ok !== true) {
+    throw new Error("Invalid Browser X11 geometry");
+  }
+  return value;
+}
+
+export async function setBrowserPageGeometry(cdp, { width, height }) {
+  await cdp.request("Emulation.setDeviceMetricsOverride", {
+    width, height, deviceScaleFactor: 1, mobile: false, screenWidth: width, screenHeight: height,
+  });
+}
+
+function sameBrowserGeometry(actual, expected) {
+  return actual?.width === expected.width && actual?.height === expected.height;
+}
+
+const browserResizeTails = new WeakMap();
+export function resizeBrowserPage(page, event, overrides = {}) {
+  // One X root backs this service. Page queues also serialize ordinary input;
+  // this queue keeps geometry transactions from different pages ordered.
+  const previous = browserResizeTails.get(page.config) || Promise.resolve();
+  const pending = previous.catch(() => {}).then(() => transactBrowserGeometry(page, event, overrides));
+  browserResizeTails.set(page.config, pending);
+  return pending;
+}
+
+async function transactBrowserGeometry(page, event, overrides) {
+  const { width, height, sequence } = event;
+  validateBrowserGeometry(width, height);
+  if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+    throw Object.assign(new Error("Invalid Browser resize sequence"), { code: "invalid_request" });
+  }
+  if (sequence <= (page.resizeSequence || 0)) {
+    throw Object.assign(new Error("Stale Browser resize sequence"), { code: "invalid_request" });
+  }
+  page.resizeSequence = sequence;
+  const io = { gate: browserInputWriterGate, mode: applyBrowserDisplayMode,
+    native: browserNativeGeometry, prune: pruneBrowserDisplayModes, wait: sleep, ...overrides };
+  const cdp = page.browserPage?._cdp;
+  if (!cdp || page.closed) throw new Error("Browser page is unavailable for resize");
+  const targetId = page.browserPage.target_id;
+  const snapshot = async () => {
+    const native = io.native();
+    const window = await cdp.request("Browser.getWindowForTarget", { targetId });
+    const layout = await cdp.request("Page.getLayoutMetrics");
+    const dom = await cdp.request("Runtime.evaluate", { returnByValue: true,
+      expression: "({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,screenWidth:screen.width,screenHeight:screen.height,outerWidth,outerHeight})" });
+    return { native, window, layout: layout.cssVisualViewport, viewport: dom.result?.value };
+  };
+  const verify = async (saved, size, windowBounds, viewport = size) => {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const actual = await snapshot();
+      const n = actual.native.window, old = saved.native.window;
+      if (page.closed || page.browserPage.target_id !== targetId ||
+          actual.native.root.xid !== saved.native.root.xid ||
+          actual.window.windowId !== saved.window.windowId ||
+          ["xid", "parent_xid", "pid", "override_redirect", "border_width"].some(key => n[key] !== old[key]) ||
+          JSON.stringify(n.wm_class) !== JSON.stringify(old.wm_class)) throw new Error("Browser resize identity changed");
+      if (sameBrowserGeometry(actual.native.root, size) && sameBrowserGeometry(n, windowBounds) &&
+          n.x === windowBounds.x && n.y === windowBounds.y &&
+          sameBrowserGeometry(actual.window.bounds, windowBounds) &&
+          actual.window.bounds.left === windowBounds.x && actual.window.bounds.top === windowBounds.y &&
+          actual.window.bounds.windowState === saved.window.bounds.windowState &&
+          actual.layout?.clientWidth === viewport.width && actual.layout?.clientHeight === viewport.height &&
+          sameBrowserGeometry(actual.viewport, viewport) && actual.viewport.dpr === 1 &&
+          actual.viewport.screenWidth === size.width && actual.viewport.screenHeight === size.height) return actual;
+      await io.wait(50);
+    }
+    throw new Error("Browser geometry did not settle");
+  };
+  const publish = size => {
+    page.config.displaySurface.stream = { ...size };
+    Object.assign(page.browserPage, size);
+    if (page.displaySession) Object.assign(page.displaySession, size);
+  };
+  const admission = crypto.randomBytes(16).toString("hex"), effect = crypto.randomBytes(16).toString("hex");
+  let held = false, begun = false, changed = false, before, actual, failure;
+  const rememberFailure = error => { failure = failure ? new AggregateError([failure, error], "Browser resize or restore failed") : error; };
+  try {
+    await io.gate("acquire", admission, 30000); held = true;
+    await io.gate("begin", admission, undefined, effect); begun = true;
+    before = await snapshot();
+    validateBrowserGeometry(before.native.root.width, before.native.root.height);
+    if (before.window.bounds.windowState !== "fullscreen" || before.viewport?.dpr !== 1 ||
+        !Number.isInteger(before.viewport.width) || before.viewport.width < 1 || before.viewport.width > 3840 ||
+        !Number.isInteger(before.viewport.height) || before.viewport.height < 1 || before.viewport.height > 2160) {
+      throw new Error("Browser resize requires its fullscreen DPR-1 Chromium window");
+    }
+    const size = { width, height }, bounds = { x: 0, y: 0, ...size };
+    io.prune([before.native.root, size]);
+    changed = true;
+    io.mode(width, height);
+    io.native({ identity: before.native, root: size, window: bounds, restore: false });
+    await setBrowserPageGeometry(cdp, size);
+    actual = await verify(before, size, bounds);
+    io.prune([before.native.root, size]);
+    publish(size);
+  } catch (error) {
+    rememberFailure(error);
+    if (before && changed) {
+      const size = { width: before.native.root.width, height: before.native.root.height };
+      const { x, y, width: oldWidth, height: oldHeight } = before.native.window;
+      const bounds = { x, y, width: oldWidth, height: oldHeight };
+      // Each restore gets a chance even if an earlier step failed.
+      for (const restore of [
+        () => io.mode(size.width, size.height),
+        () => io.native({ identity: before.native, root: size, window: bounds, restore: true }),
+        () => cdp.request("Emulation.setDeviceMetricsOverride", {
+          width: before.viewport.width, height: before.viewport.height, deviceScaleFactor: 1,
+          mobile: false, screenWidth: size.width, screenHeight: size.height,
+        }),
+        async () => { await verify(before, size, bounds, before.viewport); publish(size); },
+        () => io.prune([size]),
+      ]) {
+        try { await restore(); } catch (restoreError) { rememberFailure(restoreError); }
+      }
+    }
+  } finally {
+    if (begun) { try { await io.gate("settle", admission, undefined, effect); } catch (error) { rememberFailure(error); } }
+    if (held) { try { await io.gate("release", admission); } catch (error) { rememberFailure(error); } }
+  }
+  if (failure) throw failure;
+  return { width, height, sequence, view: { schema: "elastos.browser.view/v1",
+    mode: "webrtc_remote_display", width, height },
+    display_session: publicDisplaySession(page.displaySession),
+    // Blink outerWidth reads ChromeClient::RootWindowRect, while BrowserViewLayout
+    // has a 500px main-window contents minimum. These can differ from the X11
+    // drawable at portrait widths. Use the verified inner viewport for layout.
+    // chromium/src: chrome/browser/ui/views/frame/browser_view_layout.h and
+    // third_party/blink/renderer/core/frame/local_dom_window.cc
+    viewport: actual.viewport };
 }
 
 export function browserDisplayMetrics(config) {
@@ -6126,6 +6762,8 @@ async function main() {
           display_backend: "selkies_gstreamer_webrtc",
           backend_class: "product_compositor",
           display_session: publicDisplaySession(page.displaySession),
+          view: { schema: "elastos.browser.view/v1", mode: "webrtc_remote_display",
+            ...page.config.displaySurface.stream },
           input_protocol: "selkies_v1",
           audio: page.webrtcMedia.audio,
           video: page.webrtcMedia.video,
@@ -6210,8 +6848,10 @@ async function main() {
           return;
         }
         if (body?.event?.type === "resize") {
-          httpJson(res, 400, {
-            error: "Browser guest raster is fixed at 1920x1080",
+          const geometry = await resizeBrowserPage(page, body.event);
+          httpJson(res, 200, {
+            schema: "elastos.browser.input-result/v1", page_id: pageId,
+            accepted: true, ...geometry, direct_network: false,
           });
           return;
         }

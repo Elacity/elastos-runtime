@@ -379,24 +379,30 @@ function containedMediaSize(viewerWidth, viewerHeight, mediaWidth, mediaHeight) 
   };
 }
 
-async function assertViewerResizeContinuity(page, width, height) {
+async function assertViewerResizeContinuity(page, width, height, resize) {
   let before = null;
   await waitFor(
     async () => {
       before = await remoteVideoElementState(page);
-      return before?.video_width === 1920 && before?.video_height === 1080;
+      return before?.video_width > 0 && before?.video_height > 0;
     },
     10_000,
-    "fixed 1920x1080 remote video before viewer resize",
+    "remote video before viewer resize",
   );
   await page.setViewportSize({ width, height });
+  const size = { width: Math.max(320, Math.min(3840, Math.round(width / 2) * 2)),
+    height: Math.max(240, Math.min(2160, Math.round(height / 2) * 2)) };
+  const applied = await resize(size);
+  if (applied.accepted !== true || applied.width !== size.width || applied.height !== size.height) {
+    throw new Error("Guest did not accept viewer geometry");
+  }
   let after = null;
   await waitFor(
     async () => {
       after = await remoteVideoElementState(page);
       return (
-        after?.video_width === 1920 &&
-        after?.video_height === 1080 &&
+        after?.video_width === size.width &&
+        after?.video_height === size.height &&
         Math.abs(Number(after.client_width || 0) - width) <= 2 &&
         Math.abs(Number(after.client_height || 0) - height) <= 2 &&
         after.object_fit === "contain" &&
@@ -407,14 +413,14 @@ async function assertViewerResizeContinuity(page, width, height) {
       );
     },
     10_000,
-    "fixed remote video continuity after viewer resize",
+    "remote video geometry and continuity after viewer resize",
   );
-  const content = containedMediaSize(width, height, 1920, 1080);
+  const content = containedMediaSize(width, height, size.width, size.height);
   return {
     viewer_width: width,
     viewer_height: height,
-    guest_raster_width: 1920,
-    guest_raster_height: 1080,
+    guest_raster_width: size.width,
+    guest_raster_height: size.height,
     video_width: Number(after?.video_width || 0),
     video_height: Number(after?.video_height || 0),
     client_width: Number(after?.client_width || 0),
@@ -424,7 +430,7 @@ async function assertViewerResizeContinuity(page, width, height) {
     object_fit: after?.object_fit || "",
     frame_progress: true,
     input_mapping: "decoded_video_coordinates",
-    guest_resize_requests: 0,
+    guest_resize_requests: 1,
   };
 }
 
@@ -803,7 +809,13 @@ async function main() {
       height: Number(session.height || launchedPage.view?.height || 720),
     };
     const resizeGate = args.resizeWidth > 0
-      ? await assertViewerResizeContinuity(page, args.resizeWidth, args.resizeHeight)
+      ? await assertViewerResizeContinuity(page, args.resizeWidth, args.resizeHeight, async size => {
+          const result = expectOk(await adapter.request({ op: "input", page_id: pageId,
+            principal_id: "person:local:hosted-product-webrtc-smoke",
+            event: { type: "resize", ...size, sequence: Date.now() * 1000 } }), "resize");
+          Object.assign(displaySize, size);
+          return result;
+        })
       : null;
     const media = args.requireMedia
       ? await assertRemoteMediaPlayback(args.cdpEndpoint, args.url, args.timeoutMs, sendInput, displaySize)

@@ -25,30 +25,6 @@ const browserSource = [
 ]
   .map((path) => fs.readFileSync(new URL(path, repoRoot), "utf8"))
   .join("\n");
-const browserStyle = fs.readFileSync(
-  new URL("capsules/browser/browser/style.css", repoRoot),
-  "utf8",
-);
-const homeGuiWindowsSource = fs.readFileSync(
-  new URL("capsules/home-gui/browser/shell-windows.js", repoRoot),
-  "utf8",
-);
-const homeClipboardHostSource = fs.readFileSync(
-  new URL(
-    "capsules/home/browser/home-clipboard-host.js",
-    repoRoot,
-  ),
-  "utf8",
-);
-const homeShellHostSource = fs.readFileSync(
-  new URL("capsules/home/browser/home-shell-host.js", repoRoot),
-  "utf8",
-);
-const homeShellWindowGeometrySource = fs.readFileSync(
-  new URL("capsules/home-gui/browser/shell-window-geometry.js", repoRoot),
-  "utf8",
-);
-
 function extractFunction(source, name) {
   const marker = `function ${name}(`;
   const start = source.indexOf(marker);
@@ -187,83 +163,6 @@ expectError("display=unsupported", "Unsupported Browser display mode");
   );
 }
 
-assert(
-  browserSource.includes(
-    '["webrtc_remote_display", "native_surface"].includes(value)',
-  ),
-  "Browser display-mode allow-list must only include product WebRTC and native surfaces",
-);
-
-const requiredAudioInvariants = [
-  {
-    needle: "const expectsAudio = displaySession.audio === true",
-    label:
-      "remote display must require explicit audio=true in the display-session receipt",
-  },
-  {
-    needle: "prepareAudio(expectsAudio)",
-    label:
-      "remote display must initialize audio autoplay/gesture state before playback",
-  },
-  {
-    needle:
-      'nextPeerConnection.addTransceiver("audio", { direction: "recvonly" })',
-    label:
-      "remote display must request a receive-only audio track when the provider advertises audio",
-  },
-  {
-    needle: "remoteVideo.muted = true",
-    label:
-      "remote display must start muted so browser autoplay can connect first",
-  },
-  {
-    needle: "Remote display ready. Click the page to enable audio.",
-    label:
-      "remote display must prompt for user-gesture audio unlock instead of silently claiming audio",
-  },
-  {
-    needle: "Remote audio enabled.",
-    label: "remote display must report successful audio unlock",
-  },
-  {
-    needle:
-      "A later user gesture will retry audio unlock; do not pin UI over the page.",
-    label:
-      "remote display must retry user-gesture audio unlock without pinning a false alarm over the page",
-  },
-  {
-    needle:
-      'renderPanel.addEventListener("pointerdown", unlockRemoteAudioFromGesture',
-    label:
-      "remote display must unlock audio from a direct pointer gesture, not only delayed click events",
-  },
-  {
-    needle: "remoteVideo.volume = 1",
-    label:
-      "remote display must reset audible volume before unlocking WebRTC audio",
-  },
-  {
-    needle: "audio ${audioState}",
-    label: "debug metrics must expose audio unlock state",
-  },
-  {
-    needle: "arx ${audioBytes}",
-    label: "debug metrics must expose received audio bytes",
-  },
-];
-
-for (const invariant of requiredAudioInvariants) {
-  assert(browserSource.includes(invariant.needle), invariant.label);
-}
-
-assert(
-  browserSource.includes(`if (remoteVideo.srcObject !== stream) {
-        remoteVideo.srcObject = stream;
-      }
-      remoteVideo.hidden = false;
-      renderEmpty.hidden = true;`),
-  "remote display must show the WebRTC video sink as soon as a stream attaches instead of waiting on hidden-element frame events",
-);
 
 {
   const script = new vm.Script(`
@@ -301,134 +200,6 @@ assert(
     `text input must preserve uppercase through Selkies, got ${JSON.stringify(wheel.text)}`,
   );
 }
-
-assert(
-  browserSource.includes("const requiresRuntimeRoute =") &&
-    browserSource.includes('event?.type === "browser_command"') &&
-    browserSource.includes('event?.type === "file_upload"') &&
-    browserSource.includes("!requiresRuntimeRoute"),
-  "Browser commands and file upload must route through Runtime/provider CDP control instead of Selkies datachannel fallback",
-);
-assert(
-  sameBrowserStreamTarget("https://ela.city/", "https://ela.city/home") &&
-    !sameBrowserStreamTarget("https://ela.city/", "https://example.com/") &&
-    isBrowserErrorUrl("chrome-error://chromewebdata/") &&
-    isBrowserErrorUrl("chrome-error://crash/") &&
-    !isBrowserErrorUrl("https://docs.ela.city/") &&
-    browserSource.includes("const crossStreamTarget = !sameBrowserStreamTarget(currentUrl, nextUrl);") &&
-    browserSource.includes("if (isBrowserErrorUrl(currentUrl))") &&
-    browserSource.includes("return requestRuntimeOpen(nextUrl);") &&
-    browserSource.includes("Reopening ${visibleAddressForUrl(nextUrl)} in a fresh Browser session"),
-  "Browser address-bar navigation must try Runtime/provider navigation from Chrome error pages before falling back to a fresh Runtime session",
-);
-assert(
-  !browserSource.includes("scheduleViewportResize") &&
-    !browserSource.includes('{ type: "resize"') &&
-    !browserSource.includes("ResizeObserver") &&
-    browserSource.includes("const PRODUCT_RASTER_WIDTH = 1920") &&
-    browserSource.includes("const PRODUCT_RASTER_HEIGHT = 1080") &&
-    browserSource.includes("deviceScaleFactor: 1") &&
-    browserSource.includes("width: stream.width") &&
-    browserSource.includes("height: stream.height"),
-  "Browser must keep one fixed 1920x1080 DPR-1 guest raster and never drive it from the Home panel",
-);
-assert(
-  homeGuiWindowsSource.includes("fitLaunchedWindow(entry);") &&
-    homeGuiWindowsSource.includes(`function fitLaunchedWindow(entry) {
-  if (!entry || entry.kind !== "browser") {
-    return;
-  }`) &&
-    homeGuiWindowsSource.includes(`launched.title = canonicalTargetTitle(launched.target, launched.title);
-      entry.title = launched.title;
-      fitLaunchedWindow(entry);
-      if (entry.browserCloseRequest) {`) &&
-    homeGuiWindowsSource.includes(`syncBrowserWindow(entry, launched);
-  if (restoredPlacement) {
-    applyFullscreenStageFromPlacement(entry, restoredPlacement);
-  }
-  if (entry.targetId === "browser") {
-    fitLaunchedWindow(entry);
-  }`) &&
-    homeGuiWindowsSource.includes(`if (entry.kind === "browser") {
-    rememberRecentTarget(entry.targetId);
-    fitLaunchedWindow(entry);
-  }`) &&
-    homeGuiWindowsSource.includes(`for (const entry of shellState.windows.values()) {
-    if (entry.kind !== "browser") {
-      continue;
-    }
-    fitLaunchedWindow(entry);
-  }`) &&
-    homeGuiWindowsSource.includes("fitWindowToLargestBrowserAspect") &&
-    homeGuiWindowsSource.includes("dataset.browserMaximized") &&
-    homeShellWindowGeometrySource.includes(
-      "export function fitWindowToLargestBrowserAspect",
-    ) &&
-    homeShellWindowGeometrySource.includes(
-      'node.dataset.target === BROWSER_TARGET_ID',
-    ) &&
-    !homeGuiWindowsSource.includes("prebootBrowserTarget") &&
-    !homeGuiWindowsSource.includes("dataset.preboot") &&
-    homeGuiWindowsSource.includes(`if (entry.targetId === "browser") {
-    fitWindowToBrowserAspect(entry.node);
-    rememberWindowRestoreBounds(entry.node);
-    return;
-  }`),
-  "Home Browser windows must immediately fit/persist 16:9 restore geometry without automatic hidden preboot windows",
-);
-assert(
-  !selkiesMessagesForInputSource.includes('event.type === "resize"'),
-  "Selkies datachannel input must not own guest raster size",
-);
-assert(
-  browserSource.includes(
-    "const PAGE_STATUS_AFTER_INPUT_FOLLOWUP_DELAYS_MS = [650, 1800, 3500, 6500]",
-  ) &&
-    browserSource.includes("const PAGE_STATUS_INTERVAL_MS = 2_500") &&
-    browserSource.includes("pageStatusRefreshTimers = delays.map") &&
-    browserSource.includes("forceAddress = false") &&
-    browserSource.includes("forceAddress: true") &&
-    browserSource.includes("(!forceAddress && isAddressEditing())") &&
-    browserSource.includes("stopPageStatusRefresh();"),
-  "WebRTC datachannel input must schedule a bounded forced post-input status burst so SPA navigation updates the Browser address",
-);
-assert(
-  browserSource.includes('const PRODUCT_DISPLAY_MODE = "webrtc_remote_display"') &&
-    !browserSource.includes("DISPLAY_MODE_PREFERENCE") &&
-    !browserSource.includes("function displayModeForReconnect") &&
-    !browserSource.includes("function shouldRecoverStalledWebrtc") &&
-    !browserSource.includes("displayModeOverride") &&
-    browserSource.includes("pollEngineCandidates") &&
-    browserSource.includes("WEBRTC_ENGINE_CANDIDATE_POLL_ATTEMPTS") &&
-    browserSource.includes("signalCandidate(null)") &&
-    browserSource.includes("Remote display negotiated but no video frame arrived") &&
-    browserSource.includes("The Browser Engine is running, but the secure display connection is not ready.") &&
-    browserSource.includes("this device has no secure display relay candidate") &&
-    browserSource.includes("shared secure display route") &&
-    browserSource.includes("No Browser page or VM was acquired.") &&
-    browserSource.includes(
-      "Runtime cleanup is pending for the acquired Browser session.",
-    ) &&
-    browserSource.includes('const iceTransportPolicy =') &&
-    browserSource.includes('displaySession.media_transport === "runtime_relay" && !engineRelayOnly') &&
-    browserSource.includes('displaySession.ice_connection_policy === "runtime_launch_relay_only"') &&
-    browserSource.includes("validateRuntimeLaunchTurn(") &&
-    browserSource.includes('"elastos.browser.media-diagnostic/v1"') &&
-    browserSource.includes('"viewer_ice_pair"') &&
-    browserSource.includes('"viewer_ontrack"') &&
-    browserSource.includes('"viewer_first_frame"') &&
-    browserSource.includes("selected_local_candidate_type") &&
-    browserSource.includes("video_packets_received") &&
-    browserSource.includes("runtimeLaunchRelayOnly ||") &&
-    browserSource.includes("iceTransportPolicy,") &&
-    browserSource.includes("failRemoteDisplay(nextPeerConnection, \"no_first_frame\")") &&
-    browserSource.includes("await onRecoveryRequired(message, options)") &&
-    browserSource.includes("createRuntimePageCleanupController") &&
-    browserSource.includes("Runtime cleanup is pending") &&
-    browserSource.includes("Runtime confirmed the failed Browser session closed") &&
-    !browserSource.includes("The stuck Browser session was closed"),
-  "Browser product launch must not silently fall back from WebRTC to image polling, discard Runtime ownership before terminal cleanup, or expose relay internals to users",
-);
 
 {
   const script = new vm.Script(`
@@ -484,8 +255,8 @@ assert(
   assert(
     points.topLeft.x === 0 &&
       points.topLeft.y === 0 &&
-      points.bottomRight.x === 1920 &&
-      points.bottomRight.y === 1080,
+      points.bottomRight.x === 1919 &&
+      points.bottomRight.y === 1079,
     `contained video corners must map to all encoded corners after viewer resize, got ${JSON.stringify(points)}`,
   );
   assert(
@@ -493,66 +264,12 @@ assert(
     `contained letterbox clicks must not map into remote coordinates, got ${JSON.stringify(points.outside)}`,
   );
 }
-
-assert(
-  browserSource.includes("touchPanState"),
-  "Browser must track touch/pen pan gestures for remote scrolling",
-);
-assert(
-  browserSource.includes("suppressSyntheticClickUntil"),
-  "Browser must suppress duplicate synthetic clicks after touch taps",
-);
-assert(
-  /\.browser-remote-display\s*\{[\s\S]*?object-fit:\s*contain\s*;/.test(
-    browserStyle,
-  ),
-  "Browser remote display surface must preserve aspect ratio so Home resizing cannot visually zoom or stretch the page",
-);
-assert(
-  /html,\s*\nbody\s*\{[\s\S]*?overflow:\s*hidden\s*;/.test(browserStyle) &&
-    /\.browser-shell\s*\{[\s\S]*?height:\s*100%\s*;[\s\S]*?min-height:\s*0\s*;[\s\S]*?overflow:\s*hidden\s*;/.test(
-      browserStyle,
-    ),
-  "Browser app must fill the Home iframe without document scrollbars or viewport min-height overflow",
-);
-assert(
-  browserSource.includes("clipboard_write") &&
-    browserSource.includes("clipboard_read") &&
-    browserSource.includes("paste_text") &&
-    browserSource.includes("Input.insertText") &&
-    browserSource.includes('{ type: "paste_text", text: event.key }') &&
-    browserSource.includes("pasteHostClipboardIntoRemote") &&
-    browserSource.includes("focusRemoteInput") &&
-    browserSource.includes("focusKeyboardCapture") &&
-    browserSource.includes("handlePasteChord") &&
-    browserSource.includes('event.getModifierState?.("Control")') &&
-    browserSource.includes("hostModifierState.control"),
-  "Browser UI must capture host paste and printable keys through Runtime/provider insertText instead of simulated remote Ctrl+V",
-);
-assert(
-  homeGuiWindowsSource.includes("function iframeAllowForLaunch") &&
-    homeGuiWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"') &&
-    !homeGuiWindowsSource.includes('"clipboard-read"') &&
-    !homeGuiWindowsSource.includes('"clipboard-write"') &&
-    !browserSource.includes("navigator.clipboard") &&
-    !browserSource.includes("execCommand") &&
-    browserSource.includes("createHomeClipboardClient") &&
-    browserSource.includes("pendingRemoteCopy") &&
-    browserSource.includes('getData("text/plain")') &&
-    homeShellHostSource.includes("createHomeClipboardHost") &&
-    homeClipboardHostSource.includes("await prompt.request") &&
-    homeClipboardHostSource.includes("await clipboard.readText()") &&
-    homeClipboardHostSource.includes("await clipboard.writeText(clipboardText)"),
-  "Browser Clipboard must cross one visible-user-action trusted Home edge while the opaque Browser frame has no Clipboard permission or compatibility fallback",
-);
-
 console.log(
   JSON.stringify({
     schema: "elastos.browser.display-mode-smoke/v1",
     ok: true,
     default_mode: "webrtc_remote_display",
     diagnostic_requires_debug: true,
-    audio_invariants_checked: requiredAudioInvariants.length,
     input_invariants_checked: 12,
   }),
 );

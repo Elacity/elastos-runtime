@@ -499,3 +499,17 @@ test("settle starts at the observed drain, not at the first check", async () => 
   h.requests[0].ack();
   assert.equal((await typed).status, "fulfilled");
 });
+
+test("resize uses the Runtime page input route and holds later pointer input until ACK", async () => {
+  const h = harness();
+  const event = { type: "resize", width: 390, height: 1200, sequence: 7 };
+  const resize = h.submit(event), click = h.submit({ type: "click", x: 0, y: 0 });
+  await nextTurn();
+  assert.deepEqual(h.requests.map(request => request.event), [event]);
+  assert.deepEqual(h.sends, []);
+  h.requests[0].ack({ accepted: true, width: 390, height: 1200, sequence: 7 });
+  await nextTurn();
+  assert.deepEqual(h.requests[1].event, { type: "click", x: 0, y: 0 });
+  h.requests[1].ack();
+  assert.ok((await Promise.all([resize, click])).every(result => result.status === "fulfilled"));
+});

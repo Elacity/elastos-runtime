@@ -131,8 +131,8 @@ export function bindBrowserInputSurface({
       return null;
     }
     return {
-      x: Math.max(0, Math.min(width, x)),
-      y: Math.max(0, Math.min(height, y)),
+      x: Math.max(0, Math.min(width - 1, Math.floor(x))),
+      y: Math.max(0, Math.min(height - 1, Math.floor(y))),
     };
   }
 

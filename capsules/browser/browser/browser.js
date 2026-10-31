@@ -1,3 +1,4 @@
+import { observeBrowserStage } from "./browser-resize.js?v=browser-20261031a";
 import { createBrowserLocationController } from "./browser-location.js?v=browser-20260523b";
 import {
   DEFAULT_URL,
@@ -18,8 +19,8 @@ import {
   runtimePageOwner,
   sameRuntimePageOwner,
 } from "./browser-page-cleanup.js?v=browser-20260727a";
-import { DATACHANNEL_INPUT_SETTLE_MS, selkiesMessagesForInput } from "./browser-input.js?v=browser-20261022b";
-import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20261022e";
+import { DATACHANNEL_INPUT_SETTLE_MS, selkiesMessagesForInput } from "./browser-input.js?v=browser-20261031a";
+import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20261031a";
 import {
   browserMetricsText,
   friendlyOpenError,
@@ -1722,6 +1723,7 @@ async function dispatchBrowserInput(
   }
   const requiresRuntimeRoute =
     event?.type === "browser_command" ||
+    event?.type === "resize" ||
     // A following text insertion needs the Engine's completed click/focus,
     // rather than only a successful send on a different transport.
     event?.type === "click" ||
@@ -2381,6 +2383,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
         `Browser display mode ${currentDisplayMode || "none"} is not supported by this host.`,
       );
     }
+    stageResize.opened();
     await connectRemoteDisplay(openedPage.display_session, openedPage);
     publishRuntimePageForHost(currentPage);
     startPageStatusPolling();
@@ -2659,6 +2662,19 @@ profileResetCommit?.addEventListener("click", () => {
   });
 });
 
+const resizeOwner = () => currentPage?.page_id && currentDisplayMode === PRODUCT_DISPLAY_MODE
+  && !unloadCleanupStarted && !homeWindowCloseInFlight
+  ? `${currentPage.page_id}:${currentPageGeneration}` : null;
+const stageResize = observeBrowserStage({
+  stage: renderPanel,
+  getOwner: resizeOwner,
+  send: (event, owner) => sendBrowserInput(event, {
+    focus: false, isStale: () => owner !== resizeOwner(),
+  }),
+  onError: () => showStatus("Browser could not resize the page. Resize the window to try again.", { sticky: true }),
+});
+window.addEventListener("pagehide", () => stageResize.stop(), { once: true });
+
 bindBrowserInputSurface({
   copyRemoteClipboardToHost,
   friendlyOpenError,
@@ -2824,6 +2840,7 @@ async function restoreRuntimePageViewer(summary) {
     currentPage = { ...currentPage, display_session: display };
     publishRuntimePageForHost(currentPage);
     await connecting;
+    stageResize.opened();
     return true;
   } catch (error) {
     if (statusPromise) await statusPromise.catch(() => null);
