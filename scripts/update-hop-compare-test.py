@@ -58,8 +58,8 @@ class CiCapacityTests(unittest.TestCase):
         self.apps.mkdir()
         for name in observer.CI_XCODE_APPS:
             (self.apps / name).mkdir()
-        self.active = self.apps / "Xcode_15.4.app"
-        self.override = self.apps / "Xcode_16.2.app"
+        self.active = self.apps / "Xcode_16.4.app"
+        self.override = self.apps / "Xcode_26.3.app"
 
     def test_reclaim_preserves_both_selected_apps_and_measures_each_deletion(self):
         removed = []
@@ -70,15 +70,15 @@ class CiCapacityTests(unittest.TestCase):
             return SimpleNamespace(total=1000, free=100 + 100 * len(removed))
         # Reclaim stops as soon as the planned growth fits the free bytes.
         receipt = observer.cli_reclaim_xcode(self.apps, {self.active, self.override}, 300, measure, remove)
-        self.assertEqual(removed, ["Xcode_15.0.1.app", "Xcode_15.1.app"])
+        self.assertEqual(removed, ["Xcode_16.app", "Xcode_16.1.app"])
         self.assertEqual(receipt["status"], "ready")
         self.assertEqual(receipt["free_bytes_after"], 300)
         self.assertEqual(receipt["planned_growth_bytes"], 300)
         self.assertTrue(self.active.is_dir() and self.override.is_dir())
-        self.assertTrue((self.apps / "Xcode_15.2.app").exists())
+        self.assertTrue((self.apps / "Xcode_16.2.app").exists())
 
     def test_alias_and_unlisted_apps_are_preserved_and_shortfall_fails_closed(self):
-        candidate = self.apps / "Xcode_15.0.1.app"
+        candidate = self.apps / "Xcode_16.app"
         candidate.rmdir()
         candidate.symlink_to(self.active, target_is_directory=True)
         (self.apps / "Xcode_99.app").mkdir()
@@ -96,7 +96,7 @@ class CiCapacityTests(unittest.TestCase):
         self.assertTrue(candidate.is_symlink() and (self.apps / "Xcode_99.app").exists())
 
     def test_reclaim_refuses_unexpected_selected_ancestry_and_symlink_roots(self):
-        outside = self.root / "Xcode_15.4.app"
+        outside = self.root / "Xcode_16.4.app"
         outside.mkdir()
         measure, remove = lambda: SimpleNamespace(total=1000, free=100), lambda path: path.rmdir()
         with self.assertRaisesRegex(ValueError, "selected Xcode ancestry"):

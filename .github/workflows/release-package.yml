@@ -101,7 +101,7 @@ jobs:
   mac:
     name: Apple silicon N and N+1
     needs: admit
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 300
     permissions:
       contents: read
